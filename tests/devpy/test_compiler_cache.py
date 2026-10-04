@@ -54,30 +54,20 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("explicit", selected)
         self.assertEqual("custom", env["RUSTC_WRAPPER"])
 
-    def test_auto_prefers_supported_kache(self):
-        selected, env = self.configure(installed={"kache", "sccache"})
-        self.assertEqual("kache", selected)
-        self.assertEqual(str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"])
-        self.assertNotIn("SCCACHE_CACHE_SIZE", env)
-
-    def test_production_auto_skips_unqualified_kache(self):
+    def test_auto_preserves_sccache_until_kache_debug_fidelity_is_qualified(self):
         with mock.patch("builtins.print") as output:
-            selected, env = self.configure(
-                installed={"kache", "sccache"}, allow_automatic_kache=False
-            )
+            selected, env = self.configure(installed={"kache", "sccache"})
         self.assertEqual("sccache", selected)
         self.assertEqual(
             str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"]
         )
         output.assert_any_call(
             "  ⚠ kache unavailable; using sccache: "
-            "not qualified for automatic production debug-symbol builds"
+            "requires explicit opt-in because macOS restored-archive debug-symbol fidelity is unqualified"
         )
 
-    def test_production_explicit_kache_remains_opt_in(self):
-        selected, env = self.configure(
-            "kache", installed={"kache", "sccache"}, allow_automatic_kache=False
-        )
+    def test_explicit_kache_remains_opt_in(self):
+        selected, env = self.configure("kache", installed={"kache", "sccache"})
         self.assertEqual("kache", selected)
         self.assertEqual(
             str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
@@ -124,11 +114,10 @@ class CompilerCacheTests(unittest.TestCase):
         warning = self.dev._sccache_limit_warning("twenty gigs")
         self.assertIn("unsupported cache size", warning)
 
-    def test_auto_uses_kache_when_sccache_is_unavailable(self):
+    def test_auto_does_not_use_unqualified_kache_when_sccache_is_unavailable(self):
         selected, env = self.configure(installed={"kache"})
-        self.assertEqual("kache", selected)
-        self.assertEqual(str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"])
-        self.assertNotIn("SCCACHE_CACHE_SIZE", env)
+        self.assertEqual("none", selected)
+        self.assertNotIn("RUSTC_WRAPPER", env)
 
     def test_none_disables_automatic_wrapper(self):
         selected, env = self.configure("none", installed={"kache", "sccache"})
@@ -237,24 +226,22 @@ class CompilerCacheTests(unittest.TestCase):
                 self.assertRegex(socket_path.name, r"^[0-9a-f]{16}\.sock$")
             run.assert_called_once()
 
-    def test_auto_reports_missing_kache_before_sccache_fallback(self):
+    def test_auto_reports_explicit_opt_in_requirement_before_sccache_fallback(self):
         with mock.patch("builtins.print") as output:
             selected, _ = self.configure(installed={"sccache"})
         self.assertEqual("sccache", selected)
         output.assert_any_call(
-            "  ⚠ kache unavailable; using sccache: not installed or not on PATH"
+            "  ⚠ kache unavailable; using sccache: "
+            "requires explicit opt-in because macOS restored-archive debug-symbol fidelity is unqualified"
         )
 
-    def test_auto_reports_invalid_configured_kache_binary(self):
-        with mock.patch("builtins.print") as output:
-            selected, _ = self.configure(
-                env={"PHOENIX_KACHE_BIN": "missing/kache"}, installed={"sccache"}
+    def test_explicit_kache_reports_invalid_configured_binary(self):
+        with self.assertRaisesRegex(SystemExit, "PHOENIX_KACHE_BIN.*missing/kache"):
+            self.configure(
+                "kache",
+                env={"PHOENIX_KACHE_BIN": "missing/kache"},
+                installed=set(),
             )
-        self.assertEqual("sccache", selected)
-        output.assert_any_call(
-            "  ⚠ kache unavailable; using sccache: "
-            "PHOENIX_KACHE_BIN is not an executable file: missing/kache"
-        )
 
     def test_kache_disabled_auto_falls_back_to_sccache(self):
         selected, env = self.configure(

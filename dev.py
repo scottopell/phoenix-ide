@@ -4997,10 +4997,7 @@ def _usable_sccache(binary: str | None) -> tuple[str | None, str | None]:
 
 
 def _configure_compiler_cache(
-    requested: str | None = None,
-    *,
-    cargo_cwd: Path | None = None,
-    allow_automatic_kache: bool = True,
+    requested: str | None = None, *, cargo_cwd: Path | None = None
 ) -> str:
     """Configure the compiler cache without overriding an explicit wrapper."""
     if "RUSTC_WRAPPER" in os.environ:
@@ -5019,14 +5016,14 @@ def _configure_compiler_cache(
         return "none"
 
     automatic = backend == "auto"
-    wants_kache = backend == "kache" or (automatic and allow_automatic_kache)
+    wants_kache = backend == "kache"
     kache_binary = _absolute_executable(_kache_binary()) if wants_kache else None
     sccache_binary = _absolute_executable(shutil.which("sccache"))
     kache_version = None
     kache_error = (
         None
         if wants_kache
-        else "not qualified for automatic production debug-symbol builds"
+        else "requires explicit opt-in because macOS restored-archive debug-symbol fidelity is unqualified"
     )
     if wants_kache and _environment_flag("KACHE_DISABLED"):
         kache_error = "KACHE_DISABLED is set"
@@ -5064,10 +5061,7 @@ def _configure_compiler_cache(
                 return "none"
     elif backend == "kache":
         if not kache_binary:
-            raise SystemExit(
-                "requested compiler cache 'kache' is not installed; put it on PATH "
-                "or set PHOENIX_KACHE_BIN"
-            )
+            raise SystemExit(f"requested compiler cache 'kache' is unavailable: {kache_error}")
         if kache_error:
             raise SystemExit(f"requested compiler cache 'kache' is incompatible: {kache_error}")
     elif backend == "sccache":
@@ -5109,18 +5103,11 @@ def _configure_compiler_cache(
 
 
 def _compiler_cache_subprocess_env(
-    requested: str | None = None,
-    *,
-    cargo_cwd: Path | None = None,
-    allow_automatic_kache: bool = True,
+    requested: str | None = None, *, cargo_cwd: Path | None = None
 ) -> tuple[str, dict[str, str]]:
     original = os.environ.copy()
     try:
-        selected = _configure_compiler_cache(
-            requested,
-            cargo_cwd=cargo_cwd,
-            allow_automatic_kache=allow_automatic_kache,
-        )
+        selected = _configure_compiler_cache(requested, cargo_cwd=cargo_cwd)
         return selected, os.environ.copy()
     finally:
         os.environ.clear()
@@ -7758,10 +7745,7 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
         raise SystemExit(f"production build worktree is dirty before Rust compilation:\n{build_tree_status}")
     
     # Build Rust
-    _, build_env = _compiler_cache_subprocess_env(
-        cargo_cwd=PROD_BUILD_WORKTREE,
-        allow_automatic_kache=False,
-    )
+    _, build_env = _compiler_cache_subprocess_env(cargo_cwd=PROD_BUILD_WORKTREE)
     needs_cross = target and sys.platform != "linux"
     if needs_cross:
         raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")
