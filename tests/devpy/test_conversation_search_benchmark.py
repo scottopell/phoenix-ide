@@ -34,7 +34,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
             "environment":{"host":"host","platform":"test","processor":"test","cpu_count":"2"}, "sqlite_pragmas":{"sqlite_version":"test","journal_mode":"wal","synchronous":2,"busy_timeout_ms":300000,"foreign_keys":True,"query_only":False},
             "runtime": {"worker_threads":2,"measurement_clock":"monotonic"}, "explain_enabled": False,
-            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}, "native_compiler":{"path":"cc","sha256":"hash","version":"version"}},
+            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}, "native_compiler":{"path":"cc","sha256":"a"*64,"version":"version"}},
             "expected_case_surface_set": [["case", "tool"]],
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20,"scope":"Global","visibility":"All","grouping":"None","match_mode":"FinalTokenPrefix","lexical_expression":"x"}}],
             "measurement_digest":"harness", "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":float(__import__("time").time_ns()), "completed_at_unix":float(__import__("time").time_ns()),
@@ -236,7 +236,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
 
     def test_native_compiler_identity_change_refuses_comparison(self):
         before=self._complete_run();after=self._complete_run()
-        after["build_configuration"]["native_compiler"]["sha256"]="different binary"
+        after["build_configuration"]["native_compiler"]["sha256"]="b"*64
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);(root/"before.json").write_text(json.dumps(before));(root/"after.json").write_text(json.dumps(after))
             with self.assertRaisesRegex(SystemExit,"measurement regime"):
@@ -251,6 +251,18 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         for key in ["TARGET_CC","HOST_CC","CC_aarch64_apple_darwin","CC_KNOWN_WRAPPER_CUSTOM","CROSS_COMPILE"]:
             with mock.patch.dict("os.environ",{key:"gcc"}),mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
                 with self.assertRaisesRegex(SystemExit,"native compiler selection unsupported"):bench._build_configuration()
+
+    def test_build_record_schema_matrix_and_effective_selectors(self):
+        original=self._complete_run()["build_configuration"]
+        for field in original:
+            run=self._complete_run();del run["build_configuration"][field]
+            with self.assertRaises(SystemExit):bench._validate_run(run,"bad")
+            run=self._complete_run();run["build_configuration"][field]=None
+            with self.assertRaises(SystemExit):bench._validate_run(run,"bad")
+        for key in ["RUSTC","RUSTC_WRAPPER","RUSTC_WORKSPACE_WRAPPER","CARGO_BUILD_RUSTC","CARGO_BUILD_RUSTC_WRAPPER","CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"]:
+            with mock.patch.dict("os.environ",{key:"alternate"}):
+                with self.assertRaisesRegex(SystemExit,"alternate Cargo compiler"):bench._build_configuration()
+        with self.assertRaises(SystemExit):bench.parser().parse_args(["prepare","--force"])
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
@@ -449,7 +461,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 return CompletedProcess()
 
             with mock.patch.object(bench, "_ensure_ignored_artifacts"), mock.patch.object(bench, "_ensure_clean_source"), mock.patch.object(
-                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}, "native_compiler":{"path":"cc","sha256":"hash","version":"version"}}
+                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}, "native_compiler":{"path":"cc","sha256":"a"*64,"version":"version"}}
             ), mock.patch.object(bench, "_git_commit", return_value="commit"), mock.patch.object(bench.platform, "platform", return_value="platform"), mock.patch.object(
                 bench.platform, "processor", return_value="processor"
             ), mock.patch.object(bench.subprocess, "Popen", side_effect=fake_popen):
