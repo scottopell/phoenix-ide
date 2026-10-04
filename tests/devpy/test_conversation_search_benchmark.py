@@ -75,6 +75,54 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 self.assertEqual(bench.run(args), 0)
             self.assertFalse((root / "runs" / ".same.reserved").exists())
 
+    def test_atomic_replacement_failure_preserves_previous_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "scenarios.json"
+            path.write_text("previous")
+            with mock.patch.object(bench.os, "replace", side_effect=OSError("full")):
+                with self.assertRaises(OSError): bench._write_atomic_private(path, "new")
+            self.assertEqual(path.read_text(), "previous")
+            self.assertEqual([p.name for p in Path(d).iterdir()], ["scenarios.json"])
+
+    def test_capture_lock_prevents_pending_recovery_by_second_writer(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            args = type("Args", (), {"artifacts":str(root)})()
+            def nested(_):
+                with self.assertRaisesRegex(SystemExit, "already active"): bench.snapshot(args)
+                return 0
+            with mock.patch.object(bench, "_snapshot_locked", side_effect=nested):
+                self.assertEqual(bench.snapshot(args), 0)
+
+    def test_signal_handlers_cleanup_and_restore(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "capture-manifest.json").write_text("{}")
+            args = type("Args", (), {"artifacts":str(root),"label":"signal"})()
+            previous = bench.signal.getsignal(bench.signal.SIGTERM)
+            def interrupted(_):
+                bench.signal.getsignal(bench.signal.SIGTERM)(bench.signal.SIGTERM, None)
+            with mock.patch.object(bench, "_run_reserved", side_effect=interrupted):
+                with self.assertRaises(KeyboardInterrupt): bench.run(args)
+            self.assertIs(bench.signal.getsignal(bench.signal.SIGTERM), previous)
+            self.assertFalse((root / "runs" / ".signal.reserved").exists())
+
+    def test_same_host_overlap_is_rejected(self):
+        before = self._complete_run(started_at_unix=1, completed_at_unix=3)
+        after = self._complete_run(started_at_unix=2, completed_at_unix=4)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); (root/"before.json").write_text(json.dumps(before)); (root/"after.json").write_text(json.dumps(after))
+            with self.assertRaisesRegex(SystemExit, "overlap"):
+                bench.compare(type("Args", (), {"before":str(root/"before.json"),"after":str(root/"after.json")})())
+
+    def test_custom_cargo_home_config_is_hashed_without_contents(self):
+        with tempfile.TemporaryDirectory() as d:
+            config = Path(d) / "config.toml"; config.write_text('[build]\nrustflags=["-Copt-level=2"]\n')
+            with mock.patch.dict("os.environ", {"CARGO_HOME":d}), mock.patch.object(bench.subprocess, "check_output", return_value="host: test"):
+                recorded = bench._build_configuration()
+            self.assertEqual(recorded["cargo_config_hashes"][str(config)], bench._hash(config))
+            self.assertNotIn("opt-level", json.dumps(recorded))
+
     def test_snapshot_captures_committed_wal_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
