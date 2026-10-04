@@ -47,3 +47,18 @@ The prepared-artifact paired path is deliberately narrower than ordinary release
 - `./dev.py prod deploy --release latest` — latest stable release resolved once.
 - `./dev.py prod status` — launchd PID/runtime identity and durable transaction result.
 - `./dev.py prod restart` — restart the installed process in place without rebuilding or changing installed configuration.
+
+## Exact-source devmbp upgrade receipt
+
+On 2026-10-04, transaction `20261004T185609Z-8f1cdf96` committed the protected
+prepared candidate `f5f98d7b2e51b112157e12c2b23d62c1a3c58d71` on devmbp, using
+controller `a31cddc3c0165606bb98bbb0f62fe8dfea2999a1`. Authenticated `/api/version`
+reported the exact full candidate SHA and `socket_activated=true`. Installed
+environment equality was verified against the predecessor snapshot; migration
+69 advanced to 112 while retaining 1009 physical conversation rows and all prior
+visible conversation IDs/working directories. A verified private matched
+predecessor database/binary/plist proof is retained server-local; no backup data
+is published. Activation succeeded, so production rollback was not exercised.
+Disposable failure/restore fixtures and 143 deployment/restart tests passed on
+both hosts. Owner turn resumption remains separately verified; idle projection
+does not prove provider rejection was resolved.
