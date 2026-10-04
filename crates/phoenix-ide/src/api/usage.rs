@@ -117,13 +117,25 @@ fn unknown_turn_cost() -> TurnCost {
 
 fn model_pricing(model: &str) -> Option<ModelPricing> {
     match model {
+        "claude-opus-5-5" => Some(ModelPricing {
+            input: 4.00,
+            output: 20.00,
+            cache_write: 5.00,
+            cache_read: 0.20,
+        }),
         "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" => Some(ModelPricing {
             input: 15.00,
             output: 75.00,
             cache_write: 18.75,
             cache_read: 1.50,
         }),
-        "claude-sonnet-5" | "claude-sonnet-4-6" => Some(ModelPricing {
+        "claude-sonnet-5-5" | "claude-sonnet-5" => Some(ModelPricing {
+            input: 2.00,
+            output: 10.00,
+            cache_write: 2.50,
+            cache_read: 0.20,
+        }),
+        "claude-sonnet-4-6" => Some(ModelPricing {
             input: 3.00,
             output: 15.00,
             cache_write: 3.75,
@@ -187,6 +199,7 @@ fn model_pricing(model: &str) -> Option<ModelPricing> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn calculate_turn_cost(
     model: &str,
     input: i64,
@@ -196,6 +209,27 @@ pub(crate) fn calculate_turn_cost(
 ) -> TurnCost {
     model_pricing(model).map_or_else(unknown_turn_cost, |p| {
         p.cost(input, output, cache_write, cache_read)
+    })
+}
+
+pub(crate) fn calculate_turn_cost_for_tier(
+    model: &str,
+    service_tier: phoenix_core::domain::llm_types::ServiceTier,
+    input: i64,
+    output: i64,
+    cache_write: i64,
+    cache_read: i64,
+) -> TurnCost {
+    model_pricing(model).map_or_else(unknown_turn_cost, |mut pricing| {
+        if model == "claude-opus-5-5"
+            && service_tier == phoenix_core::domain::llm_types::ServiceTier::Fast
+        {
+            pricing.input *= 2.0;
+            pricing.output *= 2.0;
+            pricing.cache_write *= 2.0;
+            pricing.cache_read *= 2.0;
+        }
+        pricing.cost(input, output, cache_write, cache_read)
     })
 }
 
@@ -402,6 +436,7 @@ pub struct TurnPoint {
     pub reasoning_tokens: Option<f64>,
     pub effort_source: phoenix_core::domain::llm_types::EffortSource,
     pub effort_level: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    pub service_tier: phoenix_core::domain::llm_types::ServiceTier,
     pub cache_write_tokens: f64,
     pub cache_read_tokens: f64,
     pub total_tokens: f64,
@@ -743,7 +778,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
             row.cache_read_tokens,
             row.turns,
         );
-        let cost = calculate_turn_cost(&row.model, i, o, cw, cr);
+        let cost = calculate_turn_cost_for_tier(&row.model, row.service_tier, i, o, cw, cr);
         daily_map
             .entry(row.day.clone())
             .or_default()
@@ -831,7 +866,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
                 started_at: row.started_at.clone(),
                 totals: Totals::default(),
             });
-        let cost = calculate_turn_cost(&row.model, i, o, cw, cr);
+        let cost = calculate_turn_cost_for_tier(&row.model, row.service_tier, i, o, cw, cr);
         acc.totals.add(i, o, cw, cr, t, cost);
         if row.started_at < acc.started_at {
             acc.started_at.clone_from(&row.started_at);
@@ -923,6 +958,7 @@ pub async fn usage_conversation_detail(
                 reasoning_tokens: r.tokens.reasoning_tokens.map(|tokens| tokens as f64),
                 effort_source: r.effort_source,
                 effort_level: r.effort_level,
+                service_tier: r.service_tier,
                 cache_write_tokens: r.tokens.cache_creation_tokens as f64,
                 cache_read_tokens: r.tokens.cache_read_tokens as f64,
                 total_tokens: (r.tokens.input_tokens
@@ -976,7 +1012,7 @@ mod tests {
         assert_eq!(t.output_tokens, 500_000.0);
         assert_eq!(t.total_tokens, 2_750_000.0);
         assert_eq!(t.turns, 2.0);
-        assert_eq!(t.cost.estimated_usd, 3.0);
+        assert_eq!(t.cost.estimated_usd, 2.0);
         assert_eq!(t.cost.unknown_turns, 1.0);
         assert!(!t.cost.pricing_known);
     }
@@ -984,7 +1020,7 @@ mod tests {
     #[test]
     fn cost_calculation_prices_each_token_category() {
         let cost = calculate_turn_cost(
-            "claude-sonnet-5",
+            "claude-sonnet-4-6",
             1_000_000,
             2_000_000,
             3_000_000,
@@ -996,6 +1032,58 @@ mod tests {
         assert_eq!(cost.cache_write_usd, Some(11.25));
         assert_eq!(cost.cache_read_usd, Some(1.2));
         assert_eq!(cost.total_usd, Some(45.45));
+    }
+
+    #[test]
+    fn sonnet_55_uses_its_own_standard_rates() {
+        let cost = calculate_turn_cost(
+            "claude-sonnet-5-5",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        assert!(cost.pricing_known);
+        assert_eq!(cost.input_usd, Some(2.0));
+        assert_eq!(cost.output_usd, Some(10.0));
+        assert_eq!(cost.cache_write_usd, Some(2.5));
+        assert_eq!(cost.cache_read_usd, Some(0.2));
+        assert_eq!(
+            cost.total_usd,
+            calculate_turn_cost(
+                "claude-sonnet-5",
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                1_000_000
+            )
+            .total_usd
+        );
+        assert_eq!(cost.total_usd, Some(14.7));
+    }
+
+    #[test]
+    fn opus_55_fast_mode_uses_double_standard_rates() {
+        use phoenix_core::domain::llm_types::ServiceTier;
+
+        let standard = calculate_turn_cost_for_tier(
+            "claude-opus-5-5",
+            ServiceTier::Standard,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        let fast = calculate_turn_cost_for_tier(
+            "claude-opus-5-5",
+            ServiceTier::Fast,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        assert_eq!(standard.total_usd, Some(29.20));
+        assert_eq!(fast.total_usd, Some(58.40));
     }
 
     #[test]
@@ -1024,6 +1112,30 @@ mod tests {
         assert_eq!(luna.cache_write_usd, Some(1.25));
         assert_eq!(luna.cache_read_usd, Some(0.1));
         assert_eq!(luna.total_usd, Some(8.35));
+    }
+
+    #[test]
+    fn gpt_61_sol_pricing_is_unknown_without_per_request_long_context_data() {
+        use phoenix_core::domain::llm_types::ServiceTier;
+        for tier in [ServiceTier::Standard, ServiceTier::Fast] {
+            let cost =
+                calculate_turn_cost_for_tier("gpt-6.1-sol", tier, 300_000, 100_000, 20_000, 50_000);
+            assert!(!cost.pricing_known);
+            assert_eq!(cost.total_usd, None);
+        }
+    }
+
+    #[test]
+    fn gpt_6_sol_luna_pricing_is_unknown_without_per_request_long_context_data() {
+        use phoenix_core::domain::llm_types::ServiceTier;
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            let standard =
+                calculate_turn_cost_for_tier(model, ServiceTier::Standard, 100_000, 10_000, 0, 0);
+            let fast =
+                calculate_turn_cost_for_tier(model, ServiceTier::Fast, 100_000, 10_000, 0, 0);
+            assert!(!standard.pricing_known);
+            assert!(!fast.pricing_known);
+        }
     }
 
     #[test]
@@ -1068,7 +1180,7 @@ mod tests {
         );
         totals.finish_cost();
 
-        assert_eq!(totals.cost.estimated_usd, 7.0);
+        assert_eq!(totals.cost.estimated_usd, 6.0);
         assert_eq!(totals.cost.unknown_turns, 0.0);
         assert!(totals.cost.pricing_known);
     }

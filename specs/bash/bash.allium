@@ -26,7 +26,7 @@
 --     within a ResourceScope but do NOT survive a Phoenix restart (see
 --     specs/tmux-integration/ for the persistent path)
 --
--- Requirement traceability: REQ-BASH-001 through REQ-BASH-015,
+-- Requirement traceability: REQ-BASH-001 through REQ-BASH-016,
 --   REQ-BASH-WS-001, REQ-BASH-WS-002. REQ-BASH-011 (command safety) is
 --   enforced by the permission seam (specs/permissions/) and is not modelled
 --   as a bash run-path rule here. REQ-BASH-010a..010c (terminal-edge
@@ -238,6 +238,9 @@ entity Handle {
     -- distinguish concurrent handles without having to remember which id
     -- was which ("b-3 = dev server, b-4 = test runner").
     label: String?
+
+    -- Canonical spawn directory retained immutably for runtime discovery.
+    working_dir: String
 
     -- Lifecycle state.
     status: HandleStatus
@@ -461,6 +464,7 @@ rule HandleSpawned {
         handle_id:        h_id,
         cmd:              cmd,
         label:            label,
+        working_dir:      selected_target.canonical_working_dir,
         status:           running,
         started_at:       now(),
         ring_bytes_used:  0,
@@ -497,9 +501,35 @@ rule HandleSpawned {
         --      RunExceedsWait, depending on which event fires first.
 }
 
+-- REQ-BASH-016: the Coordinator runtime surface discovers only its live
+-- controlled handles. Exact stop is admitted only while that same live
+-- incarnation remains registered; signaling failure preserves the live row and
+-- is reported rather than presented as absence.
+rule CoordinatorLiveHandleStop {
+    when: CoordinatorRequestsExactStop(handle_id)
+
+    let h = Handle{handle_id: handle_id}
+
+    requires: h.controller_scope.kind = coordinator
+    requires: h.status in { running, kill_pending_kernel }
+
+    ensures: IncarnationBoundSignalRequested(h)
+    ensures: StopAccepted() or StopFailureReported()
+}
+
 -- REQ-BASH-005, REQ-BASH-WS-001: run rejected because the work scope is at
 -- its cap. Both conversations of a continuation chain count against the one
 -- per-ResourceScope cap. No handle is created.
+rule BashIsolationMatchesWorkScopeAuthority {
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
+    ensures: BashIsolationDerivedFromWorkScopeAuthority(conversation)
+
+    @guidance
+        -- Restricted WorkScope authority selects the Explore OS sandbox.
+        -- Work authority selects unsandboxed Bash.
+        -- Conversation mode otherwise remains provenance, not authority.
+}
+
 rule RunRejectedByCap {
     when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
 

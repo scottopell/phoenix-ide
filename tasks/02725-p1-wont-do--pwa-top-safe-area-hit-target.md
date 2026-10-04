@@ -1,0 +1,4 @@
+Implement the admitted narrow roadmap task 17010: fix the installed-iPhone top safe-area hit-target defect without taking on the broader task 24711 multi-shell rotation/keyboard program. Establish one top-edge owner, preserve ordinary Safari spacing, avoid guessed device padding and double insets, and cover load/navigation/scroll/rotation/keyboard plus Safari-vs-installed-PWA behavior where automation can prove it. Prepare a real-phone acceptance path and retain an explicit physical-device gate; emulator evidence is not physical acceptance. Do not edit ProductConversationPage.tsx while the profile repair owner is active.
+
+
+Duplicate of allocated task 17010. This temporary ID was created only because the original coordinator-only untracked task was not visible in local refs. The supplied source path was unavailable on this host; task 17010 was transferred from the complete user-provided source body. Retained as wont-do for an explicit audit trail.

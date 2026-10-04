@@ -1,3 +1,9 @@
+# Superseded by task 21006
+
+The GPT-5.4-era 1M claim and possible automatic enablement below are stale. Do not implement this task. Task 21006 has model-specific Codex catalog evidence and requires explicit opt-in with a 272K default; its implementation belongs in a separate PR.
+
+---
+
 Codex backend supports a 1M-token max for gpt-5.4 and codex-auto-review via opt-in (`max_context_window: 1000000` in `~/.codex/models_cache.json`). Phoenix declares 272K default for all codex-backed models — matches the default cap, but leaves the higher ceiling on the table for users who could use it.
 
 Investigation needed:

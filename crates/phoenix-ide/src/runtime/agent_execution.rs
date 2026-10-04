@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use phoenix_agents::{AgentConfig, AgentDefinition, ExecutionCandidate, ExecutionSelection};
 use phoenix_core::domain::llm_types::ModelEffort;
-use phoenix_llm::{EffortCapabilities, ExecutionRoute};
+use phoenix_llm::{legacy_model_replacement, EffortCapabilities, ExecutionRoute};
 
 #[derive(Clone)]
 struct ResolvedAgent {
@@ -13,6 +13,7 @@ struct ResolvedAgent {
 #[derive(Clone, Default)]
 pub(super) struct SpawnCatalog {
     agents: BTreeMap<String, ResolvedAgent>,
+    unavailable_agents: BTreeMap<String, String>,
     tiers: BTreeMap<String, ExecutionCandidate>,
     routes: Vec<ExecutionRoute>,
 }
@@ -35,6 +36,7 @@ impl SpawnCatalog {
                     Ok(candidate) => Some(candidate),
                     Err(error) => {
                         tracing::warn!(agent = %agent.name, %error, "named worker unavailable; excluded from spawn choices");
+                        catalog.unavailable_agents.insert(agent.name.clone(), error);
                         continue;
                     }
                 },
@@ -66,16 +68,14 @@ impl SpawnCatalog {
         candidates: &[ExecutionCandidate],
     ) -> Result<ExecutionCandidate, String> {
         for (index, candidate) in candidates.iter().enumerate() {
-            if self
-                .route(&candidate.model, &candidate.connection)
-                .is_some()
-            {
-                self.validate(candidate)?;
-                if index > 0 {
-                    tracing::info!(model = %candidate.model, connection = %candidate.connection, skipped = index, "selected configured execution fallback");
-                }
-                return Ok(candidate.clone());
+            let Some(candidate) = self.resolve_candidate(candidate)? else {
+                continue;
+            };
+            self.validate(&candidate)?;
+            if index > 0 {
+                tracing::info!(model = %candidate.model, connection = %candidate.connection, skipped = index, "selected configured execution fallback");
             }
+            return Ok(candidate);
         }
         Err("No configured model/connection candidate is available".to_string())
     }
@@ -84,6 +84,30 @@ impl SpawnCatalog {
         self.routes
             .iter()
             .find(|route| route.model == model && route.connection == connection)
+    }
+
+    fn resolve_candidate(
+        &self,
+        candidate: &ExecutionCandidate,
+    ) -> Result<Option<ExecutionCandidate>, String> {
+        if self
+            .route(&candidate.model, &candidate.connection)
+            .is_some()
+        {
+            return Ok(Some(candidate.clone()));
+        }
+        let Some(replacement) = legacy_model_replacement(&candidate.model) else {
+            return Ok(None);
+        };
+        if self.route(replacement, &candidate.connection).is_none() {
+            return Err(self.execution_error(&format!(
+                "Retired model '{}' requires replacement '{}' through '{}', but that route is unavailable",
+                candidate.model, replacement, candidate.connection
+            )));
+        }
+        let mut resolved = candidate.clone();
+        resolved.model = replacement.to_string();
+        Ok(Some(resolved))
     }
 
     fn validate(&self, candidate: &ExecutionCandidate) -> Result<(), String> {
@@ -131,6 +155,9 @@ impl SpawnCatalog {
         let agent = agent_type
             .map(|name| {
                 self.agents.get(name).ok_or_else(|| {
+                    if let Some(error) = self.unavailable_agents.get(name) {
+                        return format!("Agent '{name}' is unavailable: {error}");
+                    }
                     let alternatives = if self.agents.is_empty() {
                         "No named workers are callable. Omit agent_type for a generic worker."
                             .to_string()
@@ -154,11 +181,19 @@ impl SpawnCatalog {
                 model,
                 connection,
                 reasoning_effort,
-            }) => ExecutionCandidate {
-                model: model.clone(),
-                connection: connection.clone(),
-                reasoning_effort: *reasoning_effort,
-            },
+            }) => {
+                let requested = ExecutionCandidate {
+                    model: model.clone(),
+                    connection: connection.clone(),
+                    reasoning_effort: *reasoning_effort,
+                };
+                if self.route(model, connection).is_none() {
+                    return Err(self.execution_error(&format!(
+                        "Model '{model}' through '{connection}' was not advertised"
+                    )));
+                }
+                requested
+            }
             None => {
                 if let Some(execution) = agent.and_then(|agent| agent.execution.clone()) {
                     execution
@@ -188,7 +223,11 @@ impl SpawnCatalog {
         })
     }
 
-    pub fn schema(&self) -> serde_json::Value {
+    pub fn tool_definition(
+        &self,
+        resolved_parent_model_id: &str,
+        parent_is_builtin: bool,
+    ) -> phoenix_core::domain::llm_types::ToolDefinition {
         use phoenix_tools::Tool;
         use phoenix_tools::{SpawnAgentsTool, SpawnModelChoice};
         let choices = self
@@ -203,12 +242,22 @@ impl SpawnCatalog {
                 },
             })
             .collect();
-        SpawnAgentsTool::with_execution_choices(
+        let tool = SpawnAgentsTool::with_execution_choices(
             self.agents.values().map(|a| a.definition.clone()).collect(),
             self.tiers.keys().cloned().collect(),
             choices,
         )
-        .input_schema()
+        .with_parallel_work_capability(if parent_is_builtin {
+            resolved_parent_model_id
+        } else {
+            ""
+        });
+        phoenix_core::domain::llm_types::ToolDefinition {
+            name: tool.name().to_string(),
+            description: tool.description(),
+            input_schema: tool.input_schema(),
+            defer_loading: false,
+        }
     }
 }
 
@@ -269,10 +318,34 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
         assert!(catalog
             .select(Some("unavailable"), None, "sol", None)
             .is_err());
-        let schema = catalog.schema();
-        let agents = &schema["properties"]["tasks"]["items"]["properties"]["agent_type"]["enum"];
+        let definition = catalog.tool_definition("gpt-5.6-luna", true);
+        let agents = &definition.input_schema["properties"]["tasks"]["items"]["properties"]
+            ["agent_type"]["enum"];
         assert_eq!(agents, &serde_json::json!(["reviewer"]));
-        assert!(!schema.to_string().contains("opus"));
+        assert!(!definition.input_schema.to_string().contains("opus"));
+    }
+
+    #[test]
+    fn tool_definition_uses_one_qualification_for_description_and_schema() {
+        let catalog =
+            SpawnCatalog::resolve(&AgentConfig::default(), vec![route("gpt-6-sol", "codex")]);
+        let qualified = catalog.tool_definition("gpt-6-sol", true);
+        assert!(qualified.description.contains("may run in parallel"));
+        assert!(qualified
+            .input_schema
+            .to_string()
+            .contains("may run in parallel"));
+
+        for definition in [
+            catalog.tool_definition("gpt-6-luna", true),
+            catalog.tool_definition("gpt-6-sol", false),
+        ] {
+            assert!(definition.description.contains("one at a time per parent"));
+            assert!(definition
+                .input_schema
+                .to_string()
+                .contains("one at a time per parent"));
+        }
     }
 
     #[test]
@@ -440,6 +513,91 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
         assert!(catalog
             .select(Some("reviewer"), Some(&selection), "sol", None)
             .is_err());
+    }
+
+    #[test]
+    fn retired_named_pin_uses_exact_replacement() {
+        let config = phoenix_agents::parse_config(
+            r#"
+version = 1
+[agents.legacy]
+description = "Legacy worker"
+instructions = "Review."
+execution = [{model = "gpt-5.4-mini", connection = "codex", reasoning_effort = "low"}]
+"#,
+        )
+        .unwrap();
+        let catalog = SpawnCatalog::resolve(&config, vec![route("gpt-5.6-luna", "codex")]);
+        let named = catalog
+            .select(Some("legacy"), None, "gpt-5.6-luna", None)
+            .unwrap();
+        assert_eq!(named.execution.model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn explicit_retired_model_does_not_remap_to_available_replacement() {
+        let catalog =
+            SpawnCatalog::resolve(&AgentConfig::default(), vec![route("gpt-5.6-sol", "codex")]);
+        let selection = ExecutionSelection::Model {
+            model: "gpt-5.4".to_string(),
+            connection: "codex".to_string(),
+            reasoning_effort: None,
+        };
+
+        let Err(error) = catalog.select(None, Some(&selection), "gpt-5.6-sol", None) else {
+            panic!("explicit unavailable model must not be remapped");
+        };
+        assert!(error.contains("Model 'gpt-5.4' through 'codex' was not advertised"));
+    }
+
+    #[test]
+    fn retired_unavailable_replacement_stops_before_later_candidate() {
+        let config = phoenix_agents::parse_config(
+            r#"
+version = 1
+[agents.legacy]
+description = "Legacy worker"
+instructions = "Review."
+execution = [
+ {model = "gpt-5.4", connection = "codex"},
+ {model = "gpt-5.6-luna", connection = "codex"}
+]
+"#,
+        )
+        .unwrap();
+        let catalog = SpawnCatalog::resolve(
+            &config,
+            vec![
+                route("gpt-5.6-luna", "codex"),
+                route("gpt-5.6-sol", "openai_responses"),
+            ],
+        );
+        let Err(error) = catalog.select(Some("legacy"), None, "gpt-5.6-luna", None) else {
+            panic!("unavailable required replacement must stop fallback");
+        };
+        assert!(error.contains("requires replacement 'gpt-5.6-sol' through 'codex'"));
+    }
+
+    #[test]
+    fn configured_exact_route_precedes_legacy_pin_replacement() {
+        let explicit = ExecutionSelection::Model {
+            model: "gpt-5.5".into(),
+            connection: "openai_responses".into(),
+            reasoning_effort: Some(ModelEffort::High),
+        };
+        let catalog = SpawnCatalog::resolve(
+            &AgentConfig::default(),
+            vec![
+                route("gpt-5.5", "openai_responses"),
+                route("gpt-5.6-sol", "codex"),
+            ],
+        );
+
+        let selected = catalog
+            .select(None, Some(&explicit), "gpt-5.6-sol", None)
+            .unwrap();
+        assert_eq!(selected.execution.model, "gpt-5.5");
+        assert_eq!(selected.execution.connection, "openai_responses");
     }
 
     #[test]

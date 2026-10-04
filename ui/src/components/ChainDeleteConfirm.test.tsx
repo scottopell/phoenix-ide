@@ -26,6 +26,7 @@ const makeMember = (
 
 const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
   root_conv_id: 'r',
+  product_conversation_id: 'pc-r',
   chain_name: 'auth refactor',
   display_name: 'auth refactor',
   archived: false,

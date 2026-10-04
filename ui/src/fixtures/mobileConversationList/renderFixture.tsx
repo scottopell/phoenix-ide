@@ -17,7 +17,10 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
   useAppTouchContainment(true);
   const [showArchived, setShowArchived] = useState(scenario.kind === 'archived');
   const fixtureData = getMobileConversationListFixtureData(scenario);
-  const totalConversations = fixtureData.conversations.length + fixtureData.archivedConversations.length;
+  const totalConversations = fixtureData.conversations.length
+    + fixtureData.archivedConversations.length
+    + (fixtureData.productConversations?.length ?? 0)
+    + (fixtureData.archivedProductConversations?.length ?? 0);
 
   useEffect(() => {
     delete document.documentElement.dataset['mobileConversationListFixtureReady'];
@@ -38,6 +41,11 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
         <ConversationList
           conversations={fixtureData.conversations}
           archivedConversations={fixtureData.archivedConversations}
+          {...(fixtureData.productConversations === undefined ? {} : {
+            productConversations: fixtureData.productConversations,
+            archivedProductConversations: fixtureData.archivedProductConversations ?? [],
+            productRowsAuthoritative: true,
+          })}
           showArchived={showArchived}
           onToggleArchived={() => setShowArchived((value) => !value)}
           onNewConversation={() => {}}
@@ -45,6 +53,10 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
           onDelete={() => {}}
           onRename={() => {}}
           onConversationClick={() => {}}
+          onProductConversationClick={() => {}}
+          onProductConversationRename={() => {}}
+          onProductConversationClose={() => {}}
+          onProductConversationDelete={() => {}}
           listDensity="mobile"
           authChip={<span className="mobile-conversation-list-fixture-auth">✓</span>}
           utilityActions={(

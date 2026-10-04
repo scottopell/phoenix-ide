@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 OLD = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
-NEW = {"version": "2.0.0", "git_sha": "bbbbbbbbbbbb"}
+NEW = {"version": "2.0.0", "git_sha": "b" * 40}
 
 
 def load_helper(path):
@@ -67,7 +67,7 @@ def policy(helper, root, unit):
 
 
 def wrapper(fixture, identity, *, wrong=False, startup_delay=0):
-    mismatch = " --report-git-sha cccccccccccc" if wrong else ""
+    mismatch = f" --report-git-sha {'c' * 40}" if wrong else ""
     delay = f" --startup-delay {startup_delay}" if startup_delay else ""
     return (
         "#!/bin/sh\n"

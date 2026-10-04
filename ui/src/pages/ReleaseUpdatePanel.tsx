@@ -36,7 +36,7 @@ function stateText(state: string): string {
     activating: 'Activating and verifying',
     committed: 'Update committed',
     precondition_failed: 'Preparation failed before disruption',
-    activation_failed_rolled_back: 'Activation failed; previous release restored and verified',
+    activation_failed_rolled_back: 'Activation failed; runtime changes rolled back and verified (database not restored)',
     activation_failed_rollback_failed: 'Activation and rollback failed — offline recovery required',
     rejected_concurrent: 'Another deployment already owns the host claim',
   } as Record<string, string>)[state] ?? state.replaceAll('_', ' ');

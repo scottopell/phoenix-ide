@@ -14,7 +14,7 @@ use phoenix_db::LocalAttemptAuthority;
 use phoenix_workflow::{ClaimOutcome, LeaseExpiry, ProcessIncarnation, Timestamp};
 use tokio::sync::watch;
 
-use crate::runtime::RuntimeManager;
+use crate::runtime::{AddressedConversationEventDispatcher, RuntimeManager};
 use crate::state_machine::Event;
 
 const DISCOVERY_BATCH_LIMIT: usize = 64;
@@ -55,6 +55,23 @@ fn fresh_process_incarnation() -> ProcessIncarnation {
     ProcessIncarnation(u64::from_le_bytes(bytes))
 }
 
+pub(crate) async fn dispatch_standalone(
+    manager: Arc<RuntimeManager>,
+    conversation_id: &str,
+) -> Result<(), String> {
+    DirectTurnWorker::new(
+        manager.db().workflow_repository(),
+        Arc::new(ProductionDirectTurnDispatcher {
+            addressed: AddressedConversationEventDispatcher::new(manager.clone()),
+        }),
+        Arc::new(SystemClock),
+        fresh_process_incarnation(),
+    )
+    .dispatch_conversation_once(conversation_id)
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn run(
     manager: Arc<RuntimeManager>,
     kick_rx: watch::Receiver<u64>,
@@ -62,10 +79,13 @@ pub(crate) async fn run(
 ) {
     let worker = DirectTurnWorker::new(
         manager.db().workflow_repository(),
-        Arc::new(ProductionDirectTurnDispatcher { manager }),
+        Arc::new(ProductionDirectTurnDispatcher {
+            addressed: AddressedConversationEventDispatcher::new(manager.clone()),
+        }),
         Arc::new(SystemClock),
         fresh_process_incarnation(),
-    );
+    )
+    .with_watch_delivery(manager);
     if let Err(error) = worker.run_loop(kick_rx, ready_tx).await {
         match error {
             StartupReconciliationError::Retryable(error) => {
@@ -122,6 +142,7 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
+    watch_delivery: Option<Arc<RuntimeManager>>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -145,8 +166,20 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             dispatcher,
             clock,
             process_incarnation,
+            watch_delivery: None,
             #[cfg(test)]
             pre_dispatch_hook: None,
+        }
+    }
+
+    fn with_watch_delivery(mut self, manager: Arc<RuntimeManager>) -> Self {
+        self.watch_delivery = Some(manager);
+        self
+    }
+
+    async fn deliver_watch_events(&self) {
+        if let Some(manager) = &self.watch_delivery {
+            crate::coordinator_watch_delivery::deliver_pass(manager).await;
         }
     }
 
@@ -187,7 +220,8 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         }
         let _ = ready_tx.send(());
 
-        let mut wait = match self.dispatch_accepted_turns().await {
+        let initial_discovery = self.dispatch_accepted_turns().await;
+        let mut wait = match initial_discovery {
             Ok(wait) => wait,
             Err(error) => match StartupReconciliationError::from(error) {
                 StartupReconciliationError::Retryable(error) => {
@@ -197,6 +231,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
             },
         };
+        self.deliver_watch_events().await;
         loop {
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
@@ -208,7 +243,8 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     }
                 }
             }
-            wait = match self.run_once().await {
+            let discovery = self.run_once().await;
+            wait = match discovery {
                 Ok(wait) => wait,
                 Err(error) => match StartupReconciliationError::from(error) {
                     StartupReconciliationError::Retryable(error) => {
@@ -218,6 +254,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
                 },
             };
+            self.deliver_watch_events().await;
         }
     }
 
@@ -265,6 +302,30 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
     ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
         self.settle_terminal_obligations().await?;
         self.dispatch_accepted_turns().await
+    }
+
+    pub(crate) async fn dispatch_conversation_once(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+        let mut cursor = None;
+        loop {
+            let page = self
+                .terminal_discovery
+                .list_accepted(cursor, DISCOVERY_BATCH_LIMIT)
+                .await
+                .map_err(crate::runtime::DatabaseTerminalRecoveryError::Retryable)?;
+            for candidate in page.candidates {
+                if candidate.conversation.0 == conversation_id {
+                    self.dispatch_candidate(candidate, self.clock.now()).await?;
+                }
+            }
+            if page.next_cursor.is_none() || page.next_cursor == cursor {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        Ok(())
     }
 
     async fn dispatch_accepted_turns(
@@ -530,13 +591,13 @@ pub(crate) trait TerminalObligationDispatcher: Send + Sync + 'static {
 }
 
 struct ProductionDirectTurnDispatcher {
-    manager: Arc<RuntimeManager>,
+    addressed: AddressedConversationEventDispatcher,
 }
 
 #[async_trait]
 impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
     async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
-        let handle = self.manager.get_or_create(conversation_id).await?;
+        let handle = self.addressed.resolve(conversation_id).await?;
         if !matches!(
             *handle.state_rx.borrow(),
             phoenix_core::domain::sm_state::ConvState::Idle
@@ -544,31 +605,32 @@ impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
         ) {
             return Err("direct-turn reducer cannot accept a new user turn".to_string());
         }
-        handle
-            .event_tx
-            .send(event)
-            .await
-            .map_err(|error| format!("Failed to send direct-turn event: {error}"))
+        self.addressed.dispatch_resolved(&handle, event).await
     }
 }
 
 #[async_trait]
 impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
     fn acquire_local_authority(&self) -> Result<Box<dyn Send>, ()> {
-        self.manager
+        self.addressed
+            .manager
             .acquire_local_authority_pass()
             .map(|owner| Box::new(owner) as Box<dyn Send>)
     }
 
     fn signal_fatal_local_authority(&self) {
-        self.manager
+        self.addressed
+            .manager
             .signal_fatal_local_authority("direct_turn_terminal_recovery");
     }
 
     async fn reconcile_startup_parents(
         &self,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
-        self.manager.reconcile_startup_obligated_parents().await
+        self.addressed
+            .manager
+            .reconcile_startup_obligated_parents()
+            .await
     }
 
     async fn settle_terminal_obligation(
@@ -576,6 +638,7 @@ impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
         conversation_id: &str,
     ) -> Result<TerminalObligationSettlement, crate::runtime::DatabaseTerminalRecoveryError> {
         let recovery = self
+            .addressed
             .manager
             .settle_database_terminal_obligation(conversation_id)
             .await?;
@@ -590,10 +653,16 @@ impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
                 TerminalObligationSettlement::Committed
             }
         };
-        self.manager
+        self.addressed
+            .manager
             .complete_database_terminal_recovery(conversation_id, recovery)
             .await;
-        if let Err(error) = self.manager.resume_pending_close_settlements().await {
+        if let Err(error) = self
+            .addressed
+            .manager
+            .resume_pending_close_settlements()
+            .await
+        {
             tracing::error!(%error, %conversation_id, "failed to re-evaluate Close settlement after direct-turn terminal recovery");
         }
         Ok(outcome)
@@ -1029,6 +1098,7 @@ mod tests {
     fn prepared_payload(message_id: &str) -> PreparedDirectTurnPayload {
         PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: format!("text-{message_id}"),
                 images: Vec::new(),
                 files: Vec::new(),

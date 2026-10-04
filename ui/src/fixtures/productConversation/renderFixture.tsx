@@ -1,6 +1,8 @@
+import { ProductConversationAliasRedirect } from '../../App';
+import { CoordinatorPage } from '../../pages/CoordinatorPage';
 import { FocusScopeProvider } from '../../hooks/useFocusScope';
 import { useEffect, useRef, useState } from 'react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useParams, useLocation } from 'react-router-dom';
 import { ChainProvider } from '../../chain';
 import { useDocumentViewportOwnership } from '../../components/viewportRoutes';
 import { FileExplorerProvider } from '../../components/FileExplorer';
@@ -12,6 +14,13 @@ import { ProductConversationPage } from '../../pages/ProductConversationPage';
 import '../../index.css';
 import { installProductConversationFixtureApi } from './mockApi';
 import type { ProductConversationScenario } from './types';
+
+function FixtureLocation() {
+  const location = useLocation();
+  useEffect(() => { document.documentElement.dataset['sourceFixtureLocation'] = `${location.pathname}${location.search}${location.hash}`; }, [location]);
+  return null;
+}
+function FixtureAlias() { const { slug } = useParams(); return <ProductConversationAliasRedirect reference={slug} />; }
 
 interface Props {
   scenario: ProductConversationScenario;
@@ -89,7 +98,8 @@ function ProductConversationFixtureBody({ scenario }: Props) {
       data-product-conversation-fixture={scenario.id}
       {...(ready ? { 'data-product-conversation-fixture-ready': scenario.id } : {})}
     >
-      <MemoryRouter initialEntries={[`/product-conversations/fixture-product-conversation${fixtureHash}`]}>
+      <MemoryRouter initialEntries={[new URLSearchParams(window.location.search).get('fixtureEntry') ?? `/product-conversations/fixture-product-conversation${fixtureHash}`]}>
+        <FixtureLocation />
         <FocusScopeProvider>
           <ConversationProvider>
             {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
@@ -100,6 +110,8 @@ function ProductConversationFixtureBody({ scenario }: Props) {
                 <ViewerSlotProvider scopeKey="fixture-product-conversation" browserSessionActive={false}>
                   <FileExplorerProvider>
                     <Routes>
+                      <Route path="/c/:slug" element={<FixtureAlias />} />
+                      <Route path="/global/:slug" element={<CoordinatorPage />} />
                       <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
                     </Routes>
                   </FileExplorerProvider>

@@ -37,6 +37,45 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn checked_deadline(timeout: Duration) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(timeout)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BrowserOperationPhase {
+    Navigation,
+    Evaluation,
+    Resize,
+    WaitForSelector,
+    TypeFocus,
+    TypeClear,
+    TypeInput,
+}
+
+impl std::fmt::Display for BrowserOperationPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Navigation => "navigation",
+            Self::Evaluation => "JavaScript evaluation",
+            Self::Resize => "viewport resize",
+            Self::WaitForSelector => "selector wait helper",
+            Self::TypeFocus => "type focus readiness",
+            Self::TypeClear => "type clear",
+            Self::TypeInput => "type input",
+        })
+    }
+}
+
+async fn operation_phase<T>(
+    phase: BrowserOperationPhase,
+    timeout: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| format!("Browser {phase} timed out after {timeout:?}"))
+}
+
 // ============================================================================
 // browser_navigate (REQ-BT-001)
 // ============================================================================
@@ -99,12 +138,18 @@ impl Tool for BrowserNavigateTool {
         guard.last_activity = std::time::Instant::now();
 
         // Navigate with timeout
-        let result = tokio::time::timeout(timeout, guard.page.goto(&input.url)).await;
+        let result = operation_phase(
+            BrowserOperationPhase::Navigation,
+            timeout,
+            guard.page.goto(&input.url),
+        )
+        .await;
 
         match result {
             Ok(Ok(_)) => {
                 // Detect React and enrich the navigate result with __phoenix hints
-                let react_info = match tokio::time::timeout(
+                let react_info = match operation_phase(
+                    BrowserOperationPhase::Evaluation,
                     Duration::from_secs(2),
                     guard
                         .page
@@ -123,7 +168,7 @@ impl Tool for BrowserNavigateTool {
                 }
             }
             Ok(Err(e)) => ToolOutput::error(format!("Navigation failed: {e}")),
-            Err(_) => ToolOutput::error(format!("Timeout after {timeout:?} waiting for page load")),
+            Err(error) => ToolOutput::error(error),
         }
     }
 }
@@ -210,7 +255,12 @@ impl Tool for BrowserEvalTool {
             .build()
             .unwrap();
 
-        let result = tokio::time::timeout(timeout, guard.page.evaluate(params)).await;
+        let result = operation_phase(
+            BrowserOperationPhase::Evaluation,
+            timeout,
+            guard.page.evaluate(params),
+        )
+        .await;
 
         match result {
             Ok(Ok(eval_result)) => {
@@ -258,7 +308,7 @@ impl Tool for BrowserEvalTool {
                 }
             }
             Ok(Err(e)) => ToolOutput::error(format!("JavaScript error: {e}")),
-            Err(_) => ToolOutput::error(format!("Timeout after {timeout:?}")),
+            Err(error) => ToolOutput::error(error),
         }
     }
 }
@@ -621,12 +671,17 @@ impl Tool for BrowserResizeTool {
             Err(e) => return ToolOutput::error(e),
         };
 
-        let result = tokio::time::timeout(timeout, guard.page.execute(params)).await;
+        let result = operation_phase(
+            BrowserOperationPhase::Resize,
+            timeout,
+            guard.page.execute(params),
+        )
+        .await;
 
         match result {
             Ok(Ok(_)) => ToolOutput::success("done"),
             Ok(Err(e)) => ToolOutput::error(format!("Resize failed: {e}")),
-            Err(_) => ToolOutput::error(format!("Timeout after {timeout:?}")),
+            Err(error) => ToolOutput::error(error),
         }
     }
 }
@@ -726,8 +781,14 @@ impl Tool for BrowserWaitForSelectorTool {
 
         loop {
             // Check if element exists/is visible
-            match guard.page.evaluate(check_script.clone()).await {
-                Ok(result) => {
+            match operation_phase(
+                BrowserOperationPhase::WaitForSelector,
+                timeout.saturating_sub(start.elapsed()),
+                guard.page.evaluate(check_script.clone()),
+            )
+            .await
+            {
+                Ok(Ok(result)) => {
                     if let Ok(found) = result.into_value::<bool>() {
                         if found {
                             let elapsed = start.elapsed();
@@ -739,7 +800,7 @@ impl Tool for BrowserWaitForSelectorTool {
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Check if it's a selector syntax error
                     let err_str = e.to_string();
                     if err_str.contains("SyntaxError")
@@ -751,6 +812,13 @@ impl Tool for BrowserWaitForSelectorTool {
                         ));
                     }
                     // Other errors might be transient, continue polling
+                }
+                Err(_) => {
+                    return ToolOutput::error(format!(
+                        "Browser selector wait helper timed out after {timeout:?}: element '{}' not found{}",
+                        input.selector,
+                        if input.visible { " or not visible" } else { "" }
+                    ));
                 }
             }
 
@@ -849,10 +917,25 @@ impl Tool for BrowserClickTool {
             let start = std::time::Instant::now();
 
             loop {
-                if let Ok(result) = guard.page.evaluate(check_script.clone()).await {
-                    if let Ok(true) = result.into_value::<bool>() {
-                        break;
+                match operation_phase(
+                    BrowserOperationPhase::WaitForSelector,
+                    timeout.saturating_sub(start.elapsed()),
+                    guard.page.evaluate(check_script.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => {
+                        if let Ok(true) = result.into_value::<bool>() {
+                            break;
+                        }
                     }
+                    Err(_) => {
+                        return ToolOutput::error(format!(
+                            "Browser selector wait helper timed out after {timeout:?} waiting for element '{}'",
+                            input.selector
+                        ));
+                    }
+                    _ => {}
                 }
                 if start.elapsed() >= timeout {
                     return ToolOutput::error(format!(
@@ -903,6 +986,45 @@ struct TypeInput {
 
 pub struct BrowserTypeTool;
 
+async fn focus_element_until(
+    page: &chromiumoxide::Page,
+    selector: &str,
+    deadline: std::time::Instant,
+) -> Result<chromiumoxide::element::Element, String> {
+    let selector_json = serde_json::to_string(selector).unwrap();
+    match operation_phase(
+        BrowserOperationPhase::TypeFocus,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        async {
+            let element = page
+                .find_element(selector)
+                .await
+                .map_err(|error| format!("Could not find element '{selector}': {error}"))?;
+            element
+                .click()
+                .await
+                .map_err(|error| format!("Failed to focus element: {error}"))?;
+            loop {
+                let result = page
+                    .evaluate(format!(
+                        "document.activeElement === document.querySelector({selector_json})"
+                    ))
+                    .await
+                    .map_err(|error| format!("Failed to verify element focus: {error}"))?;
+                if result.into_value::<bool>().unwrap_or(false) {
+                    return Ok::<_, String>(element);
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => Err(message),
+    }
+}
+
 #[async_trait]
 impl Tool for BrowserTypeTool {
     fn name(&self) -> &'static str {
@@ -944,7 +1066,7 @@ impl Tool for BrowserTypeTool {
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
-        let _timeout = input
+        let timeout = input
             .timeout
             .as_deref()
             .and_then(parse_duration)
@@ -957,43 +1079,47 @@ impl Tool for BrowserTypeTool {
         };
 
         let guard = session.read().await;
-
-        // Find the element
-        let element = match guard.page.find_element(&input.selector).await {
-            Ok(el) => el,
-            Err(e) => {
-                return ToolOutput::error(format!(
-                    "Could not find element '{}': {}",
-                    input.selector, e
-                ));
-            }
+        let Some(deadline) = checked_deadline(timeout) else {
+            return ToolOutput::error(
+                "Invalid timeout: duration exceeds the supported deadline range",
+            );
         };
 
-        // Click to focus
-        if let Err(e) = element.click().await {
-            return ToolOutput::error(format!("Failed to focus element: {e}"));
-        }
-
-        // Small delay to ensure focus
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let selector = serde_json::to_string(&input.selector).unwrap();
+        let element = match focus_element_until(&guard.page, &input.selector, deadline).await {
+            Ok(element) => element,
+            Err(message) => return ToolOutput::error(message),
+        };
 
         // Clear existing text if requested
         if input.clear {
-            // Select all and delete
-            if let Err(e) = guard
-                .page
-                .evaluate(format!(
-                    "document.querySelector({}).select()",
-                    serde_json::to_string(&input.selector).unwrap()
-                ))
-                .await
+            match operation_phase(
+                BrowserOperationPhase::TypeClear,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                guard
+                    .page
+                    .evaluate(format!("document.querySelector({selector}).select()")),
+            )
+            .await
             {
-                return ToolOutput::error(format!("Failed to select text: {e}"));
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Failed to select text: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
             }
-
-            // Press backspace to delete selected text
-            if let Err(e) = element.press_key("Backspace").await {
-                return ToolOutput::error(format!("Failed to clear text: {e}"));
+            match operation_phase(
+                BrowserOperationPhase::TypeClear,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                element.press_key("Backspace"),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Failed to clear text: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
             }
         }
 
@@ -1003,14 +1129,34 @@ impl Tool for BrowserTypeTool {
         for (i, part) in parts.iter().enumerate() {
             // Type the text part
             if !part.is_empty() {
-                if let Err(e) = element.type_str(part).await {
-                    return ToolOutput::error(format!("Type failed: {e}"));
+                match operation_phase(
+                    BrowserOperationPhase::TypeInput,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                    element.type_str(part),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return ToolOutput::error(format!("Type failed: {error}"));
+                    }
+                    Err(message) => return ToolOutput::error(message),
                 }
             }
             // Add Enter between parts (not after last)
             if i < parts.len() - 1 {
-                if let Err(e) = element.press_key("Enter").await {
-                    return ToolOutput::error(format!("Failed to press Enter: {e}"));
+                match operation_phase(
+                    BrowserOperationPhase::TypeInput,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                    element.press_key("Enter"),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return ToolOutput::error(format!("Failed to press Enter: {error}"));
+                    }
+                    Err(message) => return ToolOutput::error(message),
                 }
             }
         }
@@ -1315,4 +1461,48 @@ async fn dispatch_key_cdp(
     }
 
     ToolOutput::success(format!("Pressed {chord} [cdp]"))
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+
+    #[test]
+    fn typing_deadline_rejects_unrepresentable_duration() {
+        assert!(checked_deadline(Duration::from_secs(30)).is_some());
+        assert!(checked_deadline(Duration::MAX).is_none());
+    }
+
+    #[tokio::test]
+    async fn operation_phase_preserves_success_error_and_phase_timeout() {
+        let value = operation_phase(
+            BrowserOperationPhase::Navigation,
+            Duration::from_secs(5),
+            async { Ok::<_, &str>(42) },
+        )
+        .await
+        .expect("phase completes")
+        .expect("operation succeeds");
+        assert_eq!(value, 42);
+
+        let error = operation_phase(
+            BrowserOperationPhase::Resize,
+            Duration::from_secs(5),
+            async { Err::<(), _>("CDP rejected resize") },
+        )
+        .await
+        .expect("phase completes")
+        .expect_err("operation error is preserved");
+        assert_eq!(error, "CDP rejected resize");
+
+        let timeout = operation_phase(
+            BrowserOperationPhase::Evaluation,
+            Duration::ZERO,
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("pending operation times out");
+        assert!(timeout.contains("JavaScript evaluation"));
+        assert!(timeout.contains("0ns"));
+    }
 }

@@ -41,6 +41,11 @@ class BareSupervisorUnitTests(unittest.TestCase):
         with mock.patch.object(supervisor, "proc_start_time", return_value=101):
             self.assertFalse(supervisor.direct_child_matches(child, identity))
 
+    def test_status_reports_startup_bound_supervisor_digest(self):
+        with tempfile.TemporaryDirectory() as td:
+            owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
+            self.assertEqual(supervisor.SUPERVISOR_SHA256, owner.status()["supervisor_sha256"])
+
     def test_dispatch_stop_preserves_supervisor(self):
         with tempfile.TemporaryDirectory() as td:
             owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
@@ -151,7 +156,7 @@ class BareTransactionTests(unittest.TestCase):
         value = {
             "manifest_version": 1,
             "transaction_id": self.transaction_id,
-            "expected": {"version": "2.0.0", "git_sha": "b" * 12},
+            "expected": {"version": "2.0.0", "git_sha": "b" * 40},
             "previous": {"version": "1.0.0", "git_sha": "a" * 12} if previous else None,
             "expected_health_url": "http://127.0.0.1:49155/api/version",
             "previous_health_url": "http://127.0.0.1:49155/api/version" if previous else None,
@@ -175,7 +180,7 @@ class BareTransactionTests(unittest.TestCase):
     def test_activation_accepts_only_transaction_id_and_manifest_hash(self):
         path = self.manifest()
         owner = supervisor.Supervisor(self.layout)
-        owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(42, 100, supervisor.RuntimeIdentity("2.0.0", "b" * 12)))
+        owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(42, 100, supervisor.RuntimeIdentity("2.0.0", "b" * 40)))
         state = owner.activate(self.transaction_id, supervisor.sha256(path))
         self.assertEqual("committed", state)
         self.assertEqual("new binary", self.layout.binary.read_text())
@@ -183,6 +188,42 @@ class BareTransactionTests(unittest.TestCase):
         self.assertEqual("b" * 40, self.layout.deployed_sha.read_text().strip())
         self.assertFalse(self.layout.active_file.exists())
         self.assertEqual("committed", __import__("json").loads(self.layout.status_file.read_text())["state"])
+
+    def test_candidate_identity_requires_full_source_commit_equality(self):
+        for git_sha in ("b" * 12, "c" * 40, "B" * 40):
+            with self.subTest(git_sha=git_sha):
+                self.reset_transaction()
+                path = self.manifest()
+                raw = __import__("json").loads(path.read_text())
+                raw["expected"]["git_sha"] = git_sha
+                path.chmod(0o600)
+                path.write_text(__import__("json").dumps(raw))
+                path.chmod(0o400)
+                self.transaction.chmod(0o500)
+                owner = supervisor.Supervisor(self.layout)
+                with self.assertRaisesRegex(supervisor.SupervisorError, "candidate|source commit"):
+                    owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+
+    def test_previous_identity_accepts_only_legacy_or_full_sha(self):
+        for git_sha in ("a" * 12, "a" * 40):
+            with self.subTest(git_sha=git_sha):
+                supervisor.validate_previous_identity(supervisor.RuntimeIdentity("1.0.0", git_sha))
+        for git_sha in ("a" * 11, "a" * 13, "A" * 40):
+            with self.subTest(git_sha=git_sha):
+                with self.assertRaisesRegex(supervisor.SupervisorError, "previous runtime identity"):
+                    supervisor.validate_previous_identity(supervisor.RuntimeIdentity("1.0.0", git_sha))
+
+    def test_previous_deployed_sha_remains_full_length(self):
+        path = self.manifest(previous=True)
+        raw = __import__("json").loads(path.read_text())
+        raw["previous_deployed_sha"] = "a" * 12
+        path.chmod(0o600)
+        path.write_text(__import__("json").dumps(raw))
+        path.chmod(0o400)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "previous deployed SHA"):
+            supervisor.Supervisor(self.layout).validated_transaction(
+                self.transaction_id, supervisor.sha256(path)
+            )
 
     def test_identity_failure_restores_previous_runtime(self):
         self.layout.binary.parent.mkdir(parents=True)
@@ -246,7 +287,7 @@ class BareTransactionTests(unittest.TestCase):
     def test_completed_transaction_cannot_be_replayed(self):
         path = self.manifest()
         owner = supervisor.Supervisor(self.layout)
-        owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(42, 100, supervisor.RuntimeIdentity("2.0.0", "b" * 12)))
+        owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(42, 100, supervisor.RuntimeIdentity("2.0.0", "b" * 40)))
         owner.activate(self.transaction_id, supervisor.sha256(path))
         with self.assertRaisesRegex(supervisor.SupervisorError, "already been used"):
             owner.activate(self.transaction_id, supervisor.sha256(path))
@@ -339,7 +380,7 @@ class BareTransactionTests(unittest.TestCase):
                 owner.transaction_status(manifest, manifest_hash, "activating", phase=phase)
                 owner.stop_recorded_orphan = mock.Mock()
                 owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(
-                    44, 102, supervisor.RuntimeIdentity("2.0.0", "b" * 12)
+                    44, 102, supervisor.RuntimeIdentity("2.0.0", "b" * 40)
                 ))
 
                 owner.reconcile()
@@ -407,7 +448,7 @@ class BareTransactionTests(unittest.TestCase):
         owner.transaction_status(manifest, manifest_hash, "committed")
         owner.stop_recorded_orphan = mock.Mock()
         owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(
-            45, 103, supervisor.RuntimeIdentity("2.0.0", "b" * 12)
+            45, 103, supervisor.RuntimeIdentity("2.0.0", "b" * 40)
         ))
 
         owner.reconcile()
@@ -415,7 +456,7 @@ class BareTransactionTests(unittest.TestCase):
         owner.start_child.assert_called_once_with(
             [str(self.layout.binary)],
             mock.ANY,
-            supervisor.RuntimeIdentity("2.0.0", "b" * 12),
+            supervisor.RuntimeIdentity("2.0.0", "b" * 40),
             "http://127.0.0.1:49155/api/version",
             1,
         )
@@ -435,7 +476,7 @@ class BareTransactionTests(unittest.TestCase):
         owner.transaction_status(manifest, manifest_hash, "committed")
         owner.stop_recorded_orphan = mock.Mock()
         owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(
-            46, 104, supervisor.RuntimeIdentity("2.0.0", "b" * 12)
+            46, 104, supervisor.RuntimeIdentity("2.0.0", "b" * 40)
         ))
 
         owner.reconcile()

@@ -159,6 +159,7 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
                 });
             }
             ConvState::CancellingTool {
+                cause: CancelCause::UserRequested,
                 tool_use_id,
                 skipped_tools,
                 completed_results: vec![],
@@ -679,14 +680,20 @@ proptest! {
         }
     }
 
-    // Invariant 6: PersistState effect always emitted on state change
+    // Invariant 6: every state change has exactly one persistence owner.
     #[test]
     fn prop_state_changes_persist(state in arb_state(), event in arb_event()) {
         if let Ok(result) = transition(&state, &test_context(), event) {
             if result.new_state != state {
-                prop_assert!(
-                    result.effects.iter().any(|e| matches!(e, Effect::PersistState)),
-                    "State changed but no PersistState effect: {:?} -> {:?}",
+                let persistence_owners = result.effects.iter().filter(|effect| matches!(
+                    effect,
+                    Effect::PersistState | Effect::ApproveTask { .. }
+                )).count();
+                prop_assert_eq!(
+                    persistence_owners,
+                    1,
+                    "State change has {} persistence owners: {:?} -> {:?}",
+                    persistence_owners,
                     state,
                     result.new_state
                 );
@@ -918,6 +925,7 @@ proptest! {
         #[allow(clippy::wildcard_enum_match_arm)]
         match &tr.new_state {
             ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
                 tool_use_id,
                 skipped_tools,
                 ..
@@ -960,6 +968,7 @@ proptest! {
         let assistant_message = AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None);
 
         let state = ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
             tool_use_id: tool_use_id.clone(),
             skipped_tools: skipped.clone(),
             completed_results: vec![],
@@ -1015,6 +1024,7 @@ proptest! {
         let assistant_message = AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None);
 
         let state = ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
             tool_use_id: tool_use_id.clone(),
             skipped_tools: skipped.clone(),
             completed_results: vec![],
@@ -1986,6 +1996,7 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                 }
                 LlmOutcome::Response {
                     content,
+                    provider_replay: None,
                     tool_calls,
                     end_turn: true,
                     usage: Usage::default(),
@@ -2246,6 +2257,7 @@ proptest! {
             input: serde_json::json!({}),
         }];
         let state = ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
             tool_use_id: tool_use_id.clone(),
             skipped_tools: vec![],
             completed_results: vec![],

@@ -36,7 +36,7 @@ UNIT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
 TRANSACTION_RE = re.compile(r"[0-9a-f]{32}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}")
+LEGACY_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}")
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 RELEASE_TAG_RE = re.compile(r"v[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 SOURCE_KINDS = {"local_head", "published_release"}
@@ -252,11 +252,20 @@ def validate_service_user(name: str) -> None:
         raise ValidationError("service user must not be root")
 
 
-def validate_identity(identity: Identity, description: str) -> None:
+def validate_candidate_identity(identity: Identity, source_commit: str) -> None:
     if not VERSION_RE.fullmatch(identity.version):
-        raise ValidationError(f"{description} has malformed version")
-    if not EMBEDDED_SHA_RE.fullmatch(identity.git_sha):
-        raise ValidationError(f"{description} has malformed embedded git SHA")
+        raise ValidationError("candidate identity has malformed version")
+    if not GIT_SHA_RE.fullmatch(identity.git_sha):
+        raise ValidationError("candidate identity must contain a full lowercase git SHA")
+    if identity.git_sha != source_commit:
+        raise ValidationError("candidate identity does not match source commit")
+
+
+def validate_previous_identity(identity: Identity) -> None:
+    if not VERSION_RE.fullmatch(identity.version):
+        raise ValidationError("previous identity has malformed version")
+    if not (LEGACY_GIT_SHA_RE.fullmatch(identity.git_sha) or GIT_SHA_RE.fullmatch(identity.git_sha)):
+        raise ValidationError("previous identity has malformed git SHA")
 
 
 def validate_health_url(value: Optional[str], description: str) -> None:
@@ -295,15 +304,13 @@ def validate_manifest(manifest_path: Path, manifest: Manifest, policy: Validatio
             raise ValidationError("published candidate has malformed release tag")
         if manifest.release_commit != manifest.source_commit:
             raise ValidationError("published candidate release commit does not match source commit")
-    validate_identity(manifest.expected, "candidate identity")
+    validate_candidate_identity(manifest.expected, manifest.source_commit)
     if manifest.previous is not None:
-        validate_identity(manifest.previous, "previous identity")
+        validate_previous_identity(manifest.previous)
     validate_health_url(manifest.expected_health_url, "candidate health URL")
     validate_health_url(manifest.previous_health_url, "previous health URL")
     if manifest.previous_deployed_sha is not None and not GIT_SHA_RE.fullmatch(manifest.previous_deployed_sha):
         raise ValidationError("previous deployed SHA is malformed")
-    if not manifest.source_commit.startswith(manifest.expected.git_sha):
-        raise ValidationError("candidate identity does not match source commit")
     if manifest.targets != policy.targets:
         raise ValidationError("manifest target paths are not allowed")
     validate_service_user(manifest.service_user)

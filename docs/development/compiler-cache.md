@@ -12,7 +12,7 @@ Phoenix supports the qualified released Kache `0.26.0` command contract. Downloa
 
 `PHOENIX_COMPILER_CACHE` accepts:
 
-- `auto` (default): use compatible Kache first, otherwise sccache, otherwise no cache;
+- `auto` (default): use a usable sccache, otherwise no cache; Kache requires explicit opt-in while restored debug fidelity is unqualified;
 - `kache`: require compatible Kache and a working daemon;
 - `sccache`: require sccache;
 - `none`: disable Phoenix's automatic wrapper.
@@ -21,7 +21,7 @@ Phoenix supports the qualified released Kache `0.26.0` command contract. Downloa
 
 `KACHE_DISABLED=1` makes Kache unavailable under the same rules. An sccache candidate must execute its version probe successfully before selection.
 
-Production builds are deliberately narrower: `auto` excludes Kache v0.26.0 and falls through to sccache/no cache because restored macOS dependency archives emitted unresolved-object `dsymutil` warnings. Matching binary/`.dSYM` UUIDs and successful compilation did not prove source-level debug fidelity. Explicit `PHOENIX_COMPILER_CACHE=kache` remains an informed opt-in; it does not change that unqualified status.
+Every automatic build path excludes Kache v0.26.0 and falls through to sccache/no cache because restored macOS dependency archives emitted unresolved-object `dsymutil` warnings. Matching binary/`.dSYM` UUIDs and successful compilation did not prove source-level debug fidelity, including for development binaries. Explicit `PHOENIX_COMPILER_CACHE=kache` remains an informed opt-in; it does not change that open fidelity blocker.
 
 Phoenix-generated cache variables are scoped to direct Cargo subprocesses and the E2E harness that owns a Cargo build, so starting Phoenix does not force agent-executed Cargo commands in other repositories through Phoenix's selected cache. Relative backend cache/socket/config paths are normalized against the invoking directory before daemon startup. The Kache daemon starts from the same Cargo working directory as its wrapper, so implicit project-local configuration cannot diverge across production-build worktrees.
 
@@ -29,7 +29,7 @@ Kache-specific settings (`KACHE_CACHE_DIR`, `KACHE_SOCKET_PATH`) and sccache-spe
 
 Under pressure, retain the capped cache plus only targets for worktrees still in active use; inspect Kache's `stats`/`clean --dry-run` guidance or sccache's native stats before deleting anything. Do not sum clone-aware target `du` values to choose what to remove, and do not broadly purge active caches or whole target trees as routine setup.
 
-## Why `auto` prefers Kache
+## Why Kache is usable explicitly but not the default
 
 A limited devmbp comparison used official arm64 releases Kache 0.26.0 and sccache 0.18.0, Rust/Cargo 1.95.0, macOS 26.4.1, and APFS. Three fresh-cache runs each executed `cargo check -p phoenix-core --locked` with `CARGO_INCREMENTAL=0`: cold population in source A, a touched same-worktree crate rebuild, then an empty-target restore in detached source B.
 
@@ -38,7 +38,7 @@ A limited devmbp comparison used official arm64 releases Kache 0.26.0 and sccach
 | Kache 0.26.0 | 57.196, 49.783, 42.789 (**49.783**) | 1.011, 0.814, 0.862 (**0.862**) | 26.462, 21.200, 23.094 (**23.094**) |
 | sccache 0.18.0 | 42.244, 35.524, 30.799 (**35.524**) | 1.033, 0.883, 0.905 (**0.905**) | 35.008, 29.643, 28.846 (**29.643**) |
 
-Kache was slower to populate, tied for normal edits at this sample size, and faster for the intended empty-target cross-worktree restore. Its final sample reported 250 local hits, 253 misses, 0 errors/fallbacks, 49.7% hit rate, 251,559,534 restored bytes, and 100% zero-copy restore. sccache reported one Rust hit and 382 Rust misses across relocated sources (its 356 total hits were mostly C/C++/assembler), with no cache read/write errors or timeouts. These results justify preferring Kache for Phoenix's multi-worktree shape while retaining explicit `sccache` and `none` escapes; they are not a general performance promise.
+Kache was slower to populate, tied for normal edits at this sample size, and faster for the intended empty-target cross-worktree restore. Its final sample reported 250 local hits, 253 misses, 0 errors/fallbacks, 49.7% hit rate, 251,559,534 restored bytes, and 100% zero-copy restore. sccache reported one Rust hit and 382 Rust misses across relocated sources (its 356 total hits were mostly C/C++/assembler), with no cache read/write errors or timeouts. These results establish useful Kache cross-worktree behavior but do not justify automatic adoption without source-level debug fidelity; they are not a general performance or correctness promise.
 
 A later bounded physical-growth repeat at exact Phoenix source `be1dfae` used two fresh isolated runs per backend in interleaved order, official Kache 0.26.0 versus released sccache 0.18.0, 1 GiB cache caps, retained cache plus both targets, and the same cold/edit/cross-worktree `phoenix-core` workload:
 
@@ -63,7 +63,7 @@ macOS exposes no unprivileged per-extent unique-allocation total for an arbitrar
 
 ## Validation boundary
 
-Validated locally: macOS arm64 release binary, version probe, daemon startup over a short explicit socket, Rust compilation, APFS reflink restore, normal development/check selection, and a successful native `./dev.py prod build` without activation. The production binary and its `.dSYM` had matching UUIDs, but Kache emitted missing-intermediate-object `dsymutil` warnings for restored dependency archives. Source-level debug fidelity was not validated, so production `auto` excludes Kache and explicit Kache remains an informed opt-in. This is reported rather than hidden because cache acceleration must not be confused with debug-symbol correctness.
+Validated locally: macOS arm64 release binary, version probe, daemon startup over a short explicit socket, Rust compilation, APFS reflink restore, normal development/check selection, and a successful native `./dev.py prod build` without activation. The production binary and its `.dSYM` had matching UUIDs, but Kache emitted missing-intermediate-object `dsymutil` warnings for restored dependency archives. Source-level debug fidelity was not validated, so every `auto` path excludes Kache and explicit Kache remains an informed opt-in. This is reported rather than hidden because cache acceleration must not be confused with debug-symbol correctness.
 
 Deterministic tests cover Linux command/environment shaping, and hosted Linux CI exercises the ordinary check suite without requiring either optional executable. Not validated by this comparison: Windows behavior; Linux Kache executable restore/signing/debug-symbol behavior with the released binary; source-level fidelity of restored macOS debug symbols; cross-device filesystems without reflinks; remote/S3 caches; or production activation. Phoenix makes no compatibility or performance guarantee for those paths.
 

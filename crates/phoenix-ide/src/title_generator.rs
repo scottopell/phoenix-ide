@@ -44,9 +44,11 @@ pub async fn generate_title(
     let request = LlmRequest {
         system: vec![],
         messages: vec![LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(prompt)],
         }],
+        provider_replay: None,
         tools: vec![],
         max_tokens: Some(max_output_tokens.map_or(50, |limit| limit.min(50))), // Title should be very short
         effective_effort,
@@ -128,9 +130,11 @@ pub async fn generate_chain_name(
     let request = LlmRequest {
         system: vec![],
         messages: vec![LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(prompt)],
         }],
+        provider_replay: None,
         tools: vec![],
         max_tokens: Some(max_output_tokens.map_or(50, |limit| limit.min(50))), // Name should be very short
         effective_effort,

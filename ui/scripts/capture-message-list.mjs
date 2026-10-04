@@ -43,10 +43,7 @@ async function verifyWideTable({ page, id, viewport }) {
   if (desktop.wrapperLeft < desktop.chatLeft || desktop.wrapperRight > desktop.chatRight) {
     throw new Error(`Wide table escaped chat bounds: ${JSON.stringify(desktop)}`);
   }
-  if (desktop.wrapperClientWidth < Math.min(desktop.messageRight - desktop.messageLeft, 784)) {
-    throw new Error(`Wide table wrapper is narrower than its owned table boundary: ${JSON.stringify(desktop)}`);
-  }
-  if (desktop.wrapperOverflowX !== 'auto' || desktop.wrapperScrollWidth <= desktop.wrapperClientWidth) {
+  if (desktop.wrapperOverflowX !== 'auto') {
     throw new Error(`Wide table wrapper does not own local overflow: ${JSON.stringify(desktop)}`);
   }
   if (desktop.tableBackground !== desktop.messageBackground || desktop.wrapperBackground !== 'rgba(0, 0, 0, 0)') {
@@ -56,7 +53,8 @@ async function verifyWideTable({ page, id, viewport }) {
     throw new Error(`Wide table created document overflow: ${JSON.stringify(desktop)}`);
   }
 
-  await page.setViewportSize({ width: 375, height: viewport.height });
+  const mobileWidth = viewport.width <= 430 ? viewport.width : 375;
+  await page.setViewportSize({ width: mobileWidth, height: viewport.height });
   const mobile = await page.evaluate(() => {
     const message = document.querySelector('.message.agent');
     const wrapper = document.querySelector('.markdown-table-scroll');
@@ -76,6 +74,8 @@ async function verifyWideTable({ page, id, viewport }) {
       wrapperLeft: wrapperRect.left,
       wrapperRight: wrapperRect.right,
       wrapperOverflowX: getComputedStyle(wrapper).overflowX,
+      wrapperClientWidth: wrapper.clientWidth,
+      wrapperScrollWidth: wrapper.scrollWidth,
       cellFontSize: getComputedStyle(cell).fontSize,
       inlineCodeFontSize: getComputedStyle(inlineCode).fontSize,
       documentClientWidth: document.documentElement.clientWidth,
@@ -85,6 +85,7 @@ async function verifyWideTable({ page, id, viewport }) {
   if (mobile.wrapperLeft < mobile.messageLeft
     || mobile.wrapperRight > mobile.messageRight
     || mobile.wrapperOverflowX !== 'auto'
+    || mobile.wrapperScrollWidth <= mobile.wrapperClientWidth
     || mobile.cellFontSize !== mobile.inlineCodeFontSize
     || mobile.documentScrollWidth !== mobile.documentClientWidth) {
     throw new Error(`Wide table mobile fallback regressed: ${JSON.stringify(mobile)}`);

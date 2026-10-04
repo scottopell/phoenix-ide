@@ -137,7 +137,7 @@ enum ConversationErrorKind {
     | content_filter
 }
 enum ToolOutcome { success | error | cancelled }
-enum SubAgentOutcome { success | failure | timed_out }
+enum SubAgentOutcome { success | implicit_completion | failure | timed_out }
 enum RecoveryKind { credential }
 enum RecoveryResumeTarget { conversation_turn | continuation_summary }
 enum TaskApprovalDecision {
@@ -154,6 +154,7 @@ enum AutoContinuationPhase {
     | ownership_transferred
     | dispatch_accepted
     | message_settled
+    | superseded
     | failed
 }
 enum ContinuationOpeningAuthority {
@@ -278,6 +279,7 @@ entity Conversation {
     -- Context tracking (REQ-BED-012)
     context_usage_ratio: Decimal
     model_context_window: Integer
+    resolved_model_id: String
 
 
     -- Core status transitions (shared)
@@ -365,10 +367,6 @@ entity Conversation {
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
 
-    -- Entity-level invariants
-    invariant OneWorkSubAgent {
-        write_capable_sub_agents.count <= 1
-    }
 }
 
 -- Parent conversations: user-facing. Can propose tasks, recover from auth
@@ -680,7 +678,9 @@ rule CancelDuringSubAgentWait {
 rule LastSubAgentDuringCancellation {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = cancelling_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count = 1
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
     ensures: conversation.core_status = idle
     ensures: AgentDone(conversation)
@@ -689,7 +689,9 @@ rule LastSubAgentDuringCancellation {
 rule SubAgentResultDuringCancellation {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = cancelling_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count > 1
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
 }
 
@@ -824,18 +826,34 @@ rule UserDismissesError {
 rule SubAgentReportsResultMorePending {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = awaiting_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count > 1
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
 }
 
 rule LastSubAgentReportsResult {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = awaiting_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count = 1
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
+}
+
+rule DuplicateSubAgentResultIsIdempotent {
+    when: SubAgentReportsResult(conversation, result)
+    requires: conversation.core_status in { awaiting_sub_agents, cancelling_sub_agents }
+    requires: result.agent_id not in conversation.sub_agents_pending
+    requires: conversation.sub_agents_completed.any(r => r.agent_id = result.agent_id)
+    ensures: DuplicateSubAgentResultAccepted(conversation, result.agent_id)
+    ensures: conversation.sub_agents_pending = previous(conversation.sub_agents_pending)
+    ensures: conversation.sub_agents_completed = previous(conversation.sub_agents_completed)
+    ensures: LlmDispatchCountForSubAgent(conversation, result.agent_id)
+        = previous(LlmDispatchCountForSubAgent(conversation, result.agent_id))
 }
 
 ------------------------------------------------------------
@@ -1172,6 +1190,9 @@ rule UserApprovesTaskCurrentConversation {
         objective: conversation.approved_task_objective
     }
     ensures: WriteAuthorityPersistedBeforeResume(conversation)
+    ensures: ApprovalAdoptionPersistedAtomically(conversation)
+    ensures: RuntimeCapabilitiesMatchPersistedAuthority(conversation)
+    ensures: NoPostApprovalExecutionUsesRestrictedAuthority(conversation)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
@@ -1183,6 +1204,23 @@ rule UserApprovesTaskCurrentConversation {
         -- not transition product lifecycle, product mode, work-scope attachment,
         -- continuation topology, provenance, or branch/worktree state beyond the
         -- approval checkpoint itself.
+        --
+        -- The approval adoption operation is the sole persistence owner for the
+        -- destination state, approved objective, Work authority, and approval
+        -- context message. They commit in one transaction before runtime capability
+        -- publication; no later generic state write repeats that committed state.
+        --
+        -- If capability publication fails after commit, actor retirement preserves the
+        -- stream reservation and directly rematerializes the conversation from durable
+        -- state; unfinished-turn discovery is not the recovery owner. If bounded
+        -- rematerialization attempts fail, the reservation is released so clients
+        -- reconnect and can initiate reconstruction.
+        --
+        -- An operation-scoped obligation, bound by foreign key to the approval context
+        -- message and deriving its sequence from that message, preserves the first
+        -- post-approval request across restart. A later durable
+        -- agent message or any state progression out of LlmRequesting retires it;
+        -- the lifetime approved objective never owns later requests.
         --
         -- ApprovalRereadSnapshot / ApprovalMatchesReviewedSnapshot bind approval to
         -- the reviewed repo-relative path, task kind, and content digest. The
@@ -1383,7 +1421,7 @@ rule ProspectiveAutoContinuationSettingChanged {
 
 rule AdmittedAutomaticContinuationUsesManualOperation {
     when: AutomaticContinuationAdmissionRuns(admission, new_conv)
-    requires: admission.phase not in { message_settled, failed }
+    requires: admission.phase not in { message_settled, superseded, failed }
     requires: admission.predecessor.parent_status = context_exhausted
     requires: admission.no_progress_attempts < config.max_auto_continuation_attempts_without_durable_progress
     ensures: ContinuationSuccessorOperationRuns(
@@ -1399,9 +1437,22 @@ rule AdmittedAutomaticContinuationUsesManualOperation {
         -- compare-and-commit and resolve to its winner.
 }
 
+rule ManualContinuationWinnerSupersedesAutomaticAdmission {
+    when: ContinuationSuccessorAttemptLosesRace(conversation, requested_handoff, first_message_id)
+    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, superseded, failed }:
+        requires: conversation.continued_in_conv_id != absent
+        requires: not SuccessorOpeningAcceptedExactlyOnce(
+            conversation.continued_in_conv_id,
+            admission.first_message_id,
+            admission.continuation_summary_message_id)
+        requires: committed_successor_opening_message_id(conversation) != admission.first_message_id
+        ensures: admission.phase = superseded
+        ensures: not SafeManualContinuationRetryOffered(admission)
+}
+
 rule AutomaticContinuationDurablePhaseAdvances {
     when: AutomaticContinuationDurableProgress(admission, phase)
-    requires: admission.phase not in { message_settled, failed }
+    requires: admission.phase not in { message_settled, superseded, failed }
     requires: phase = next_auto_continuation_phase(admission.phase)
     ensures: admission.phase = phase
     ensures: admission.no_progress_attempts = 0
@@ -1433,20 +1484,18 @@ rule AutomaticContinuationBreakerPersistsActionableFailure {
     ensures: SafeManualContinuationRetryOffered(admission)
 }
 
-rule FailedAutomaticContinuationUsesAcceptedManualPayload {
+rule FailedAutomaticContinuationUsesPersistedWinner {
     when: UserRetriesFailedAutomaticContinuation(admission, new_conv)
     requires: admission.phase = failed
-    ensures: ContinuationSuccessorOperationRuns(
+    ensures: ContinuationSuccessorOperationRunsWithPersistedWinner(
         admission.predecessor,
         new_conv,
-        accepted_auto_continuation_payload(admission),
-        admission.first_message_id,
-        generated_predecessor_context)
+        admission)
 }
 
 rule ServerRestartResumesAdmittedAutomaticContinuation {
     when: ServerRestarted(conversation)
-    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, failed }:
+    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, superseded, failed }:
         ensures: AutomaticContinuationAdmissionRuns(admission, auto_continuation_successor_identity(admission))
 }
 
@@ -2300,6 +2349,27 @@ rule ModeChangeNotification {
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
 --
+--   ApprovalAdoptionPersistedAtomically(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when the approved objective, WorkScope authority,
+--       post-approval conversation state, and approved-plan context message
+--       commit in one transaction before runtime capability publication.
+--
+--   RuntimeCapabilitiesMatchPersistedAuthority(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when tool definitions, tool dispatch, Bash isolation,
+--       tool context, and Work-child admission all derive from the authority
+--       persisted on conversation's attached WorkScope.
+--
+--   NoPostApprovalExecutionUsesRestrictedAuthority(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when no provider request or tool execution admitted after
+--       Work authority persistence uses a pre-approval Restricted capability
+--       projection. False while any capability consumer remains stale.
+--
 --   retirement_inventory_is_complete_and_sealed(
 --       product_conversation: ProductConversation,
 --       attempt_id: String
@@ -2311,6 +2381,17 @@ rule ModeChangeNotification {
 --       tmux, and worktree identities captured before retirement began. False
 --       when any target or inspection is absent, unsealed, superseded, or belongs
 --       to another attempt.
+--
+--   admitted_sub_agent_count(conversation: Conversation) -> Integer
+--       Returns the durable number of child identities admitted for the tool
+--       round represented by conversation's pending and completed collections.
+--
+--   no_duplicate_agent_ids(results: List<SubAgentResult>) -> Boolean
+--       True exactly when each child identity occurs at most once.
+--
+--   SubAgentFanInSettled(conversation: Conversation) -> Boolean
+--       True exactly when the parent leaves sub-agent awaiting or cancellation
+--       fan-in through the ordinary settlement path.
 --
 --   user_resumable(error_kind: ConversationErrorKind) -> Boolean
 --       True exactly for auth, rate_limit, usage_limit_reached, network,
@@ -2329,6 +2410,35 @@ rule ModeChangeNotification {
 --       or other later transcript row makes the predicate false. Acceptance
 --       identity alone is insufficient: the qualifying transcript tail and
 --       exact queue-row absence are both required.
+--
+--   active_materialized_turn_owns_conversation(conversation: Conversation) -> Boolean
+--       True exactly when the latest accepted runtime direct turn is materialized,
+--       nonterminal, generation-current, and still owns this conversation.
+--
+--   durable_execution_occurrence_owns_first_response(conversation: Conversation) -> Boolean
+--       True exactly when an accepted wake, seeded fork, or interaction response
+--       occurrence still owns its first model response.
+--
+--   newer_queued_steering_awaits_dispatch(conversation: Conversation) -> Boolean
+--       True exactly when accepted steering newer than the exhausted recovery
+--       owner remains queued for dispatch.
+--
+--   pending_approval_owns_next_transition(conversation: Conversation) -> Boolean
+--       True exactly when task approval remains required before model dispatch
+--       or terminal settlement.
+--
+--   recoverable_tool_results_await_model_step(conversation: Conversation) -> Boolean
+--       True exactly when that active turn has a complete persisted tool-result
+--       round whose next model step has not settled. An interrupted or
+--       unknown-effect tool must first be represented by an explicit error result.
+--
+--   restart_recovery_exhausted(conversation: Conversation) -> Boolean
+--       True exactly when the active turn has reached the bounded count of restart
+--       recoveries within the same user turn.
+--
+--   transcript_suggests_unfinished_work(conversation: Conversation) -> Boolean
+--       True when transcript text or shape could look unfinished but no typed
+--       durable owner authorizes execution.
 --
 --   continuation_summary_message_id(operation_id: String) -> String
 --       Returns the immutable identity of the predecessor summary message
@@ -2351,6 +2461,16 @@ rule ModeChangeNotification {
 --       ownership; runtime acceptance of dispatch; or settlement of the opening
 --       message. It never infers progress from an in-memory attempt.
 --
+--   ContinuationSuccessorOperationRunsWithPersistedWinner(
+--       predecessor: Conversation,
+--       new_conv: Conversation,
+--       admission: AutoContinuationAdmission
+--   ) -> Boolean
+--       Runs or rearms the persisted winning continuation intent with its exact
+--       handoff bytes, message identity, opening authority, user agent, and
+--       matching expansion policy. If no winner has been reserved, it uses the
+--       admission's immutable generated payload and identity.
+--
 --   accepted_auto_continuation_payload(
 --       admission: AutoContinuationAdmission
 --   ) -> String
@@ -2369,9 +2489,10 @@ rule ModeChangeNotification {
 --       admission: AutoContinuationAdmission
 --   ) -> Boolean
 --       True when the persisted actionable failure offers explicit retry or
---       fallback through ContinuationSuccessorOperationRuns with the same
---       predecessor summary, first-message identity, and generated-context
---       authority.
+--       fallback through ContinuationSuccessorOperationRunsWithPersistedWinner,
+--       preserving the reserved winner's exact bytes, identity, authority, user
+--       agent, and matching expansion policy. Before reservation it uses the
+--       admission's immutable generated payload and identity.
 --
 --   auto_continuation_successor_identity(
 --       admission: AutoContinuationAdmission
@@ -2473,7 +2594,9 @@ rule ModeChangeNotification {
 -- Every rule that changes status implicitly requires state persistence
 -- before side effects execute.
 
--- REQ-BED-007: ordinary interrupted turns restart from idle. Durable
+-- REQ-BED-007: interrupted provider requests without an independently
+-- recoverable obligation restart from idle. An active materialized direct turn
+-- with safely persisted tool results remains the sole recovery baton. Durable
 -- continuation operations retain their operation identity and recovery state.
 rule RuntimeRecreatesUserResumableError {
     when: RuntimeStarts(conversation)
@@ -2492,12 +2615,49 @@ rule ServerRestartOrdinaryConversation {
     when: ServerRestarted(conversation)
     requires: conversation.is_busy
     requires: not committed_steering_turn_awaiting_first_response(conversation)
+    requires: not active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: conversation.core_status not in {
         awaiting_continuation,
         recoverable_continuation_failure
     }
     requires: conversation.parent_status != awaiting_recovery
         or conversation.recovery_resume_target = conversation_turn
+    ensures: conversation.core_status = idle
+}
+
+rule ServerRestartOwedDirectTurn {
+    when: ServerRestarted(conversation)
+    requires: active_materialized_turn_owns_conversation(conversation)
+    requires: recoverable_tool_results_await_model_step(conversation)
+    requires: not restart_recovery_exhausted(conversation)
+    ensures: LlmRequestDispatched(conversation)
+
+    @guidance
+        -- The exact accepted-turn identity and generation authorize recovery.
+        -- Startup discovers the durable owner without browser or SSE activity.
+        -- In-flight or unknown-effect tools are first materialized as explicit
+        -- interrupted results and are never replayed. Continuation transfers the
+        -- single obligation through its durable operation rather than creating
+        -- concurrent predecessor and successor owners.
+}
+
+rule ServerRestartExhaustedDirectTurn {
+    when: ServerRestarted(conversation)
+    requires: active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
+    requires: not newer_queued_steering_awaits_dispatch(conversation)
+    requires: not pending_approval_owns_next_transition(conversation)
+    requires: restart_recovery_exhausted(conversation)
+    ensures: conversation.core_status = error
+    ensures: not active_materialized_turn_owns_conversation(conversation)
+}
+
+rule ServerRestartWithoutDurableOwner {
+    when: ServerRestarted(conversation)
+    requires: not active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
+    requires: transcript_suggests_unfinished_work(conversation)
     ensures: conversation.core_status = idle
 }
 
@@ -2565,9 +2725,20 @@ invariant GraceTurnOutcome {
 -- REQ-BED-004: Tool round atomicity
 -- tool_use count = tool_result count at checkpoint time.
 
--- REQ-BED-008: Sub-agent fan-in conservation
--- pending + completed = total spawned (constant).
--- Enforced by construction: each SubAgentReportsResult moves one.
+-- REQ-BED-008: Sub-agent fan-in conservation. Every accepted result removes
+-- the same durable child identity from pending and adds one completed outcome;
+-- duplicates leave both collections and parent dispatch unchanged.
+invariant SubAgentFanInConservesAdmittedChildren {
+    for c in Conversations where c.core_status in { awaiting_sub_agents, cancelling_sub_agents }:
+        c.sub_agents_pending.count + c.sub_agents_completed.count
+            = admitted_sub_agent_count(c)
+        and no_duplicate_agent_ids(c.sub_agents_completed)
+}
+
+invariant ParentSettlementRequiresCompleteSubAgentFanIn {
+    for c in Conversations:
+        SubAgentFanInSettled(c) implies c.sub_agents_pending?.count = 0
+}
 
 invariant ThresholdOrdering {
     config.context_continuation_threshold > config.context_warning_threshold
@@ -2595,6 +2766,15 @@ invariant AutoContinuationAdmissionProvenanceMatchesOperation {
             continuation_summary_message_id(admission.continuation_operation_id)
         and admission.first_message_id =
             auto_continuation_first_message_id(admission.continuation_operation_id)
+}
+
+invariant SupersededAutoContinuationHasDifferentSuccessorAcceptance {
+    for admission in AutoContinuationAdmission where admission.phase = superseded:
+        admission.predecessor.continued_in_conv_id != absent
+        and not SuccessorOpeningAcceptedExactlyOnce(
+            admission.predecessor.continued_in_conv_id,
+            admission.first_message_id,
+            admission.continuation_summary_message_id)
 }
 
 invariant SettledAutoContinuationHasExactlyOneSuccessorAcceptance {

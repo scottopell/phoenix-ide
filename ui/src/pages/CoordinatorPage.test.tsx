@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
 import { COORDINATOR_BRIEFING_PROMPT } from './coordinatorBriefing';
@@ -9,6 +9,11 @@ const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     ensureGlobalCoordinator: vi.fn(),
     resolveCoordinatorRoute: vi.fn(),
+    getCoordinatorAutomaticContinuation: vi.fn(),
+    updateCoordinatorAutomaticContinuation: vi.fn(),
+    listLiveCoordinatorBashHandles: vi.fn(),
+    listActiveCoordinatorWatches: vi.fn(),
+    stopLiveCoordinatorBashHandle: vi.fn(),
   },
 }));
 
@@ -48,7 +53,8 @@ function renderPage(initialEntry = '/global/conv-coordinator') {
 }
 
 function CurrentPath() {
-  return <div>{useLocation().pathname}</div>;
+  const location = useLocation();
+  return <div>{`${location.pathname}${location.search}${location.hash}`}</div>;
 }
 
 const coordinatorConversation = (): Conversation => ({
@@ -67,9 +73,83 @@ const coordinatorConversation = (): Conversation => ({
 
 describe('CoordinatorPage', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     vi.clearAllMocks();
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
+    apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([]);
+    apiMock.listActiveCoordinatorWatches.mockResolvedValue([]);
+    apiMock.stopLiveCoordinatorBashHandle.mockResolvedValue(undefined);
+    apiMock.getCoordinatorAutomaticContinuation.mockResolvedValue({
+      aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-product' },
+      auto_continue_on_context_exhaustion: false,
+      admission: null,
+    });
+    apiMock.updateCoordinatorAutomaticContinuation.mockResolvedValue({
+      aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-product' },
+      auto_continue_on_context_exhaustion: true,
+      admission: null,
+    });
+  });
+
+  it('shows the current server-backed watch inventory with readable names and secondary IDs', async () => {
+    apiMock.listActiveCoordinatorWatches.mockResolvedValue([{
+      product_conversation_id: 'product-readable',
+      transcript_id: 'transcript-readable',
+      transcript_slug: 'fix-readable-target',
+      display_name: 'Fix readable target',
+      project_path: '/repo/phoenix',
+      state: 'idle',
+    }]);
+    renderPage();
+    expect(await screen.findByRole('region', { name: 'Active watches' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Fix readable target' })).toHaveAttribute('href', '/product-conversations/product-readable');
+    expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/fix-readable-target');
+    expect(screen.getByTitle('ProductConversation ID')).toHaveTextContent('product-readable');
+  });
+
+  it('removes ended watches when the current server inventory refreshes', async () => {
+    apiMock.listActiveCoordinatorWatches
+      .mockResolvedValueOnce([{
+        product_conversation_id: 'product-ended', transcript_id: 'transcript-ended', transcript_slug: null,
+        display_name: 'Ending watch', project_path: null, state: 'idle',
+      }])
+      .mockResolvedValue([]);
+    renderPage();
+    expect(await screen.findByRole('link', { name: 'Ending watch' })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Active watches' })).not.toBeInTheDocument(), { timeout: 3_000 });
+  });
+
+  it('retains the last successful watch inventory and reports refresh failure', async () => {
+    apiMock.listActiveCoordinatorWatches
+      .mockResolvedValueOnce([{
+        product_conversation_id: 'product-retained', transcript_id: 'transcript-retained', transcript_slug: null,
+        display_name: 'Retained watch', project_path: null, state: 'idle',
+      }])
+      .mockRejectedValue(new Error('offline'));
+    renderPage();
+    expect(await screen.findByRole('link', { name: 'Retained watch' })).toBeInTheDocument();
+    expect(await screen.findByRole('status', {}, { timeout: 3_000 })).toHaveTextContent('Could not refresh active watches');
+    expect(screen.getByRole('link', { name: 'Retained watch' })).toBeInTheDocument();
+  });
+
+  it('shows only server-reported live Coordinator commands with inspect navigation', async () => {
+    apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([{
+      handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123, can_stop: true,
+    }]);
+
+    renderPage('/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source');
+
+    const running = await screen.findByRole('region', { name: 'Running commands' });
+    expect(running).toHaveTextContent('UI tests');
+    expect(running).toHaveTextContent('pnpm test');
+    expect(running).toHaveTextContent('/repo/ui');
+    expect(running).toHaveTextContent('started');
+    expect(running).toHaveTextContent('b-live');
+    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    fireEvent.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
+    expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
   });
 
   it('mounts only the shared conversation runtime with the briefing action', async () => {
@@ -78,13 +158,31 @@ describe('CoordinatorPage', () => {
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
     const action = screen.getByRole('button', { name: /Brief me/ });
     expect(action).toHaveAttribute('data-prompt', COORDINATOR_BRIEFING_PROMPT);
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not send messages or change anything.');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('fresh current-work facts through query_database');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not send messages, change anything, or start a polling loop.');
 
     expect(screen.queryByRole('heading', { name: 'Coordinator' })).not.toBeInTheDocument();
     expect(screen.queryByRole('tablist', { name: 'Coordinator view' })).not.toBeInTheDocument();
     expect(screen.queryByRole('navigation', { name: 'Coordinator sections' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Coordinator work')).not.toBeInTheDocument();
     expect(screen.queryByText('Current work context is attached to each Coordinator message.')).not.toBeInTheDocument();
+  });
+
+  it('loads and immediately persists the Global Coordinator automatic-continuation toggle', async () => {
+    renderPage();
+
+    const control = await screen.findByTestId('automatic-continuation-control');
+    fireEvent.click(control.querySelector('summary')!);
+    const checkbox = screen.getByRole('checkbox', { name: 'Automatically accept future generated handoffs and continue' });
+    await waitFor(() => {
+      expect(apiMock.getCoordinatorAutomaticContinuation).toHaveBeenCalledTimes(1);
+      expect(checkbox).toBeEnabled();
+      expect(checkbox).not.toBeChecked();
+    });
+
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(apiMock.updateCoordinatorAutomaticContinuation).toHaveBeenCalledWith(true));
+    expect(await screen.findByText('Saved')).toBeInTheDocument();
   });
 
   it('marks bootstrap loading and errors for overlay placement', async () => {
@@ -118,9 +216,9 @@ describe('CoordinatorPage', () => {
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('ordinary-conversation');
   });
 
-  it('mounts a historical Coordinator chain member without canonicalizing it', async () => {
+  it('canonicalizes a historical Coordinator chain member without exposing aggregate controls', async () => {
     render(
-      <MemoryRouter initialEntries={['/global/old-coordinator#message-source']}>
+      <MemoryRouter initialEntries={['/global/old-coordinator?view=history#message-source']}>
         <Routes>
           <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
         </Routes>
@@ -128,7 +226,16 @@ describe('CoordinatorPage', () => {
     );
 
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
-    expect(screen.getByText('/global/old-coordinator')).toBeInTheDocument();
+    expect(screen.getByText('/global/old-coordinator?view=history#message-source')).toBeInTheDocument();
+    expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('old-coordinator');
+    expect(await screen.findByTestId('automatic-continuation-control')).toBeInTheDocument();
+  });
+
+  it('keeps an unavailable exact source member in the Coordinator error layout', async () => {
+    apiMock.resolveCoordinatorRoute.mockResolvedValueOnce({ coordinator_id: null });
+    renderPage('/global/missing-source?source_tool=call#message-source');
+    expect(await screen.findByText('Original source conversation unavailable')).toHaveClass('coordinator-page-status');
+    expect(screen.queryByText('Shared conversation runtime /global')).not.toBeInTheDocument();
   });
 
   it('replaces a stale Coordinator continuation URL with the singleton route', async () => {

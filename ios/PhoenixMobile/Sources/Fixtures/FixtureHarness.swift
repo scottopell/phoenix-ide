@@ -576,7 +576,7 @@ private extension FixtureScenario {
                 accessibilityID: "fixture.footer.readOnly"))
     }
 
-    static var outboxEntries: [OutboxEntry] {
+    internal static var outboxEntries: [OutboxEntry] {
         let fixedDate = Date(timeIntervalSince1970: 1_735_786_800)
         return [
             .init(localId: "outbox-pending", conversationId: "fixture-conv", text: "Queued offline", images: [], status: .pending, acceptedByServer: false, createdAt: fixedDate, acceptedAt: nil, lastError: nil, attemptCount: 0),
@@ -611,22 +611,41 @@ private extension FixtureScenario {
                     ]),
                 ]),
                 display_data: nil,
+                created_at: "2025-01-02T03:04:05Z", origin: .userApi),
+            .init(
+                message_id: "m-internal-input",
+                conversation_id: "fixture-conv",
+                sequence_id: 2,
+                message_type: "user",
+                content: .object(["text": .string("Check the status for the parent conversation")]),
+                display_data: nil,
+                created_at: "2025-01-02T03:04:05Z",
+                origin: .internalConversation(productConversationId: "pc-parent", transcriptId: "parent-row")),
+            .init(
+                message_id: "m-historical-input",
+                conversation_id: "fixture-conv",
+                sequence_id: 3,
+                message_type: "user",
+                content: .object(["text": .string("Cached input with no verified sender")]),
+                display_data: nil,
                 created_at: "2025-01-02T03:04:05Z"),
             .init(
                 message_id: "m-skill",
                 conversation_id: "fixture-conv",
-                sequence_id: 2,
+                sequence_id: 4,
                 message_type: "skill",
                 content: .object([
+                    "trigger": .string("/phoenix-development"),
                     "name": .string("phoenix-development"),
-                    "description": .string("Deterministic skill row"),
+                    "body": .string("Expanded skill prompt must not appear in transcript"),
                 ]),
                 display_data: nil,
-                created_at: "2025-01-02T03:04:06Z"),
+                created_at: "2025-01-02T03:04:06Z",
+                origin: .internalConversation(productConversationId: "pc-parent", transcriptId: "parent-row")),
             .init(
                 message_id: "m-system",
                 conversation_id: "fixture-conv",
-                sequence_id: 3,
+                sequence_id: 5,
                 message_type: "system",
                 content: .object(["text": .string("Deterministic system note")]),
                 display_data: nil,
@@ -634,7 +653,7 @@ private extension FixtureScenario {
             .init(
                 message_id: "m-continuation",
                 conversation_id: "fixture-conv",
-                sequence_id: 4,
+                sequence_id: 6,
                 message_type: "continuation",
                 content: .object(["text": .string("Continued from an earlier transcript")]),
                 display_data: nil,
@@ -642,7 +661,7 @@ private extension FixtureScenario {
             .init(
                 message_id: "m-agent-1",
                 conversation_id: "fixture-conv",
-                sequence_id: 5,
+                sequence_id: 7,
                 message_type: "agent",
                 content: .array([
                     .object([
@@ -674,7 +693,7 @@ private extension FixtureScenario {
             .init(
                 message_id: "m-tool-1",
                 conversation_id: "fixture-conv",
-                sequence_id: 6,
+                sequence_id: 8,
                 message_type: "tool",
                 content: .object([
                     "tool_use_id": .string("tool-bash-1"),

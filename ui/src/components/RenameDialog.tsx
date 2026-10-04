@@ -4,10 +4,14 @@ import { useRegisterFocusScope } from '../hooks/useFocusScope';
 interface RenameDialogProps {
   visible: boolean;
   currentName: string;
-  onRename: (newName: string) => void;
+  onRename: (newName: string) => void | Promise<void>;
   onGenerate?: () => Promise<void>;
   onCancel: () => void;
   error: string | undefined;
+  normalizeInput?: (value: string) => string;
+  isValidName?: (value: string) => boolean;
+  helpText?: string;
+  maxLength?: number;
 }
 
 export function RenameDialog({
@@ -17,6 +21,10 @@ export function RenameDialog({
   onGenerate,
   onCancel,
   error,
+  normalizeInput = (value) => value.toLowerCase().replace(/[^a-z0-9-]/g, '-'),
+  isValidName = (value) => /^[a-z0-9-]+$/.test(value),
+  helpText = 'Use lowercase letters, numbers, and hyphens only',
+  maxLength,
 }: RenameDialogProps) {
   const [name, setName] = useState(currentName);
   const [generating, setGenerating] = useState(false);
@@ -46,12 +54,17 @@ export function RenameDialog({
     if (!generating) onCancel();
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (generating) return;
     const trimmed = name.trim();
     if (trimmed && trimmed !== currentName) {
-      onRename(trimmed);
+      setGenerating(true);
+      try {
+        await onRename(trimmed);
+      } finally {
+        setGenerating(false);
+      }
     }
   };
 
@@ -67,7 +80,7 @@ export function RenameDialog({
     }
   };
 
-  const isValid = name.trim().length > 0 && /^[a-z0-9-]+$/.test(name.trim());
+  const isValid = name.trim().length > 0 && isValidName(name.trim());
 
   if (!visible) return null;
 
@@ -86,14 +99,15 @@ export function RenameDialog({
             ref={inputRef}
             type="text"
             value={name}
-            onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-'))}
+            onChange={(e) => setName(normalizeInput(e.target.value))}
             placeholder="conversation-name"
             className="rename-input"
             disabled={generating}
+            maxLength={maxLength}
           />
           {error && <p className="error-text">{error}</p>}
           {!isValid && name.trim() && (
-            <p className="help-text">Use lowercase letters, numbers, and hyphens only</p>
+            <p className="help-text">{helpText}</p>
           )}
           {onGenerate && (
             <button

@@ -787,6 +787,7 @@ fn spawn_child(
         ctx.resource_access.authority(),
         cmd.to_string(),
         label,
+        spawn_context.working_dir.clone(),
         pgid,
         pid,
         ring_bytes_cap,
@@ -1323,6 +1324,30 @@ async fn run_wait(
 // ---------------------------------------------------------------------------
 // Kill
 // ---------------------------------------------------------------------------
+
+/// Stops one exact live handle after the caller has established its controller scope.
+///
+/// # Errors
+///
+/// Returns [`BashError::HandleNotFound`] when the handle is missing, terminal, or owned by a
+/// different resource scope.
+pub async fn stop_exact_handle_for_scope(
+    registry: &crate::BashHandleRegistry,
+    owner: &phoenix_core::work_scope::ResourceScopeKey,
+    handle_id: &str,
+) -> Result<(), BashError> {
+    registry
+        .signal_exact_registered_handle(&HandleId::new(handle_id.to_string()), owner, libc::SIGTERM)
+        .await
+        .map_err(|error| BashError::SpawnFailed {
+            error_message: error.to_string(),
+        })?
+        .then_some(())
+        .ok_or_else(|| BashError::HandleNotFound {
+            handle_id: handle_id.to_string(),
+        })?;
+    Ok(())
+}
 
 async fn run_kill(
     handle_id: &str,
@@ -2121,6 +2146,7 @@ mod tests {
             HandleId::new("b-1"),
             "emitter".into(),
             None,
+            std::path::PathBuf::from("/tmp"),
             1234,
             1234,
             RING_BUFFER_BYTES,

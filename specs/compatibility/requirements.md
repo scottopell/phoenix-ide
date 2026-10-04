@@ -100,19 +100,37 @@ THE SYSTEM SHALL format that integer as a human-readable date and time only at a
 
 ---
 
-### REQ-COMP-006 — Qualified Compiler-Cache Compatibility
+### REQ-COMP-006 — Legacy Direct Authority Repair Is Forward-Only
 
-WHEN Phoenix automatically selects Kache for a Rust build subprocess
+WHEN a database upgrade encounters a Direct conversation whose attached `WorkScope` is classified as Restricted Explore
+THE SYSTEM SHALL migrate that `WorkScope` to Direct authority
+AND SHALL leave WorkScopes classified as Work unchanged
+AND SHALL NOT infer a downgrade or rollback guarantee from this forward repair
+
+**Rationale:** Direct conversations are write-authorized by contract. Repairing legacy rows restores that contract without expanding project-wide rollback guarantees.
+
+### REQ-COMP-007 — Accepted source-locator upgrade preserves fingerprints
+
+WHEN an accepted version-2 direct-turn payload predates source-call locators
+THE SYSTEM SHALL reconstruct its original locator-absent encoding and verify its original stored fingerprint before recovery or replay.
+
+THE SYSTEM SHALL retain the accepted payload, origin, and fingerprint without rewriting them or substituting a later invocation locator.
+
+THE SYSTEM SHALL reject any payload whose fingerprint matches neither its current encoding nor the specifically supported historical encoding.
+
+---
+
+### REQ-COMP-008 — Qualified Compiler-Cache Compatibility
+
+WHEN Phoenix automatically selects a compiler cache
+THE SYSTEM SHALL select an sccache executable that passes its version probe or no compiler cache
+AND SHALL report the fallback reason and backend actually selected
+AND SHALL NOT automatically select Kache while restored-archive source-level debug fidelity is unqualified
+
+WHEN an operator explicitly selects Kache
 THE SYSTEM SHALL require the executable to report exactly version `0.26.0`
-AND SHALL require its local daemon to accept the configured socket
-
-WHEN Kache is absent, disabled, reports another version, or cannot start its daemon
-THE SYSTEM SHALL fall through to an sccache executable that passes its version probe and then to no compiler cache
-AND SHALL report the fallback reason and the backend actually selected
-
-WHEN a production build uses automatic compiler-cache selection
-THE SYSTEM SHALL exclude a backend whose restored-archive debug-symbol fidelity is not qualified on that build platform
-AND SHALL preserve explicit operator selection as an opt-in rather than silently substituting it
+AND SHALL require its local daemon to report readiness on the configured socket
+AND SHALL report that debug-symbol fidelity remains unqualified
 
 WHEN an operator explicitly selects Kache or sccache
 THE SYSTEM SHALL fail actionably if that backend is unusable
@@ -127,6 +145,6 @@ THE SYSTEM SHALL scope automatically generated compiler-cache environment variab
 AND SHALL NOT propagate them into the Phoenix server or agent-executed commands
 
 THE SYSTEM SHALL guarantee this contract only for selection and local subprocess setup
-AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or executable/debug-symbol fidelity outside the validated platform scope
+AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or restored-archive source-level debug fidelity
 
-**Rationale:** Compiler caching is an optional development optimization. Exact qualification and subprocess scoping prevent an accelerator from becoming an implicit tool-version or unrelated-project compatibility promise.
+**Rationale:** Compiler caching is an optional development optimization. Exact qualification, explicit opt-in for unqualified fidelity, and subprocess scoping prevent an accelerator from becoming an implicit correctness or compatibility promise.

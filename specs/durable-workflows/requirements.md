@@ -536,6 +536,22 @@ WHEN a completed provider result has not yet committed its terminal-obligation r
 THE SYSTEM SHALL retain the exact process-owned response transition and SHALL NOT replace it with database reconstruction
 AND after the terminal-obligation record commits, bounded settlement retry exhaustion SHALL actively rematerialize the owning runtime from that durable record without requiring client or SSE activity.
 
+### REQ-DWF-CHAT-016: Active Direct Turn Is the Restart Baton
+
+WHEN startup finds a materialized runtime direct turn that still owns its conversation
+THE SYSTEM SHALL classify any owed post-tool model step from that exact accepted-turn identity and generation
+AND SHALL NOT create restart work from transcript shape, assistant prose, or system-prompt text alone.
+
+WHEN the owned turn has safely persisted a complete tool-result round
+THE SYSTEM SHALL proactively materialize its runtime and dispatch exactly one next model step without client activity.
+An in-flight or unknown-effect tool SHALL first reconcile to typed terminal evidence or an explicit interrupted error result and SHALL NOT be blindly replayed.
+
+Cancellation, terminal settlement, pending approval, newer accepted input, continuation transfer, and wake delivery SHALL remain owned by their existing typed authorities.
+Restart discovery SHALL consume those authorities rather than introduce a second queue, scheduler, or lifecycle.
+
+WHEN repeated restart recovery for the exact turn reaches its no-progress bound
+THE SYSTEM SHALL atomically persist an explicit failed projection, advance the generation, release conversation ownership, and dispatch no further provider or tool effect for that turn.
+
 ### REQ-DWF-CHAT-015: Lifecycle Settlement Uses Exact Accepted-Turn Identity
 
 WHEN destructive lifecycle orchestration must settle durable direct-turn work before

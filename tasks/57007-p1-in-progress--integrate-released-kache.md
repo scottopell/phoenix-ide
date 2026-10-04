@@ -1,6 +1,6 @@
 # Integrate released Kache v0.26.0 into Phoenix development workflows
 
-Task identity: approved provisionally as 57005 before current-main integration; current main already owned 57005 for merged PR #781 (`repair-tmux-test-watchdog-process-containment`). After rebasing, `taskmd new` allocated unique ID 57006 for this commission.
+Task identity: approved provisionally as 57005 before current-main integration; current main already owned 57005 for merged PR #781 (`repair-tmux-test-watchdog-process-containment`). `taskmd new` then allocated 57006, but a later current-main integration found that main had since assigned 57006 to `tmux-watchdog-cleanup-diagnostics`. `taskmd new` allocated current identity 57007 for this commission; no existing task was renumbered.
 
 ## Observed journey
 

@@ -1,0 +1,17 @@
+.conversation-alias-fallback {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  }
+
+.conversation-alias-fallback__status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: .5rem 1rem;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-color);
+  }

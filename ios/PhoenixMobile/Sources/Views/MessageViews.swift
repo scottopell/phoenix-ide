@@ -31,7 +31,7 @@ struct MessageView: View {
             if message.content["is_meta"]?.boolValue == true {
                 SystemNote(text: noteText, style: .secondary)
             } else {
-                UserMessageView(content: message.content)
+                UserMessageView(content: message.content, origin: message.inputOrigin)
             }
         case "agent":
             AgentMessageView(content: message.content)
@@ -41,8 +41,8 @@ struct MessageView: View {
             SystemNote(text: noteText, style: .red)
         case "skill":
             // Payload is {trigger, name, body} where body is the expanded
-            // prompt — show what the user typed, not the expansion.
-            SkillRow(content: message.content)
+            // prompt — show the trigger, not the expansion.
+            SkillRow(content: message.content, origin: message.inputOrigin)
         case "system", "continuation":
             SystemNote(text: noteText, style: .secondary)
         default:
@@ -78,15 +78,42 @@ struct MessageView: View {
     }
 }
 
-/// A skill invocation, shown as the user's command (`/verify …`), with the
-/// expanded prompt body deliberately hidden.
+private struct SourceServerURLKey: EnvironmentKey { static let defaultValue = "" }
+extension EnvironmentValues {
+    var sourceServerURL: String {
+        get { self[SourceServerURLKey.self] }
+        set { self[SourceServerURLKey.self] = newValue }
+    }
+}
+
+struct InputOriginHeader: View {
+    @Environment(\.sourceServerURL) private var serverURL
+    let origin: InputOrigin
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(origin.label).textSelection(.enabled)
+            if let url = origin.sourceCallURL(serverURL: serverURL) {
+                Link("Open originating send call", destination: url)
+            } else if origin.sourceCallUnavailable {
+                Text("Original send call unavailable (not recorded)")
+                if let url = origin.sourceTranscriptURL(serverURL: serverURL) {
+                    Link("Open recorded source transcript", destination: url)
+                }
+            }
+        }.font(.caption).foregroundStyle(.secondary)
+    }
+}
+
+/// A skill invocation shows its trigger without exposing the expanded prompt.
 struct SkillRow: View {
     let content: JSONValue
+    let origin: InputOrigin
 
     var body: some View {
         HStack {
-            Spacer(minLength: 40)
-            VStack(alignment: .trailing, spacing: 4) {
+            if origin.isUserApiInput { Spacer(minLength: 40) }
+            VStack(alignment: origin.isUserApiInput ? .trailing : .leading, spacing: 4) {
+                InputOriginHeader(origin: origin)
                 Label(trigger, systemImage: "wand.and.stars")
                     .font(.callout.monospaced())
                     .padding(.horizontal, 10)
@@ -104,6 +131,7 @@ struct SkillRow: View {
                     }
                 }
             }
+            if !origin.isUserApiInput { Spacer(minLength: 40) }
         }
     }
 
@@ -116,16 +144,18 @@ struct SkillRow: View {
 
 struct UserMessageView: View {
     let content: JSONValue
+    let origin: InputOrigin
 
     var body: some View {
         HStack {
-            Spacer(minLength: 40)
-            VStack(alignment: .trailing, spacing: 4) {
+            if origin.isUserApiInput { Spacer(minLength: 40) }
+            VStack(alignment: origin.isUserApiInput ? .trailing : .leading, spacing: 4) {
+                InputOriginHeader(origin: origin)
                 Text(content["text"]?.stringValue ?? content.compactDescription)
                     .font(.body)
                     .padding(10)
-                    .background(Color.accentColor)
-                    .foregroundStyle(.white)
+                    .background(origin.isUserApiInput ? Color.accentColor : Color.secondary.opacity(0.12))
+                    .foregroundStyle(origin.isUserApiInput ? Color.white : Color.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 if let images = content["images"]?.arrayValue, !images.isEmpty {
                     ImageStrip(images: images, maxHeight: 140)
@@ -144,9 +174,10 @@ struct UserMessageView: View {
                     }
                 }
             }
+            if !origin.isUserApiInput { Spacer(minLength: 40) }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("message.user")
+        .accessibilityIdentifier(origin.isUserApiInput ? "message.user" : "message.input")
     }
 }
 

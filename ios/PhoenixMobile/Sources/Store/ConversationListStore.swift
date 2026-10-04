@@ -84,14 +84,67 @@ final class ConversationListStore {
             let fresh = try await api.listConversations()
             guard generation == startedGeneration else { return }
             externalMutationGeneration += 1
+            let missingProvisioningShells = await confirmedMissingProvisioningShells(
+                api: api,
+                fresh: fresh + Array(upsertsDuringRefresh.values))
+            guard generation == startedGeneration,
+                  !Task.isCancelled,
+                  refreshToken == token
+            else { return }
             apply(Self.merging(
                 fresh,
-                preserving: upsertsDuringRefresh,
+                preserving: missingProvisioningShells.merging(upsertsDuringRefresh) { _, upsert in upsert },
                 excluding: exclusionsDuringRefresh))
             lastError = nil
         } catch {
             guard generation == startedGeneration else { return }
             lastError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func provisioningShells() -> [String: Conversation] {
+        Dictionary(uniqueKeysWithValues: conversations.compactMap { conversation in
+            guard ConversationState.parse(conversation.state).isProvisioningCreationShell else {
+                return nil
+            }
+            return (conversation.aggregateIdentity, conversation)
+        })
+    }
+
+    func confirmedMissingProvisioningShellRows(
+        api: PhoenixAPI,
+        fresh: [Conversation]
+    ) async -> [Conversation] {
+        Array(await confirmedMissingProvisioningShells(api: api, fresh: fresh).values)
+    }
+
+    private func confirmedMissingProvisioningShells(
+        api: PhoenixAPI,
+        fresh: [Conversation]
+    ) async -> [String: Conversation] {
+        let candidates = Self.preservingMissing(provisioningShells(), in: fresh)
+        var confirmed: [String: Conversation] = [:]
+        for (aggregateId, conversation) in candidates {
+            do {
+                _ = try await api.getProductConversation(reference: aggregateId)
+                confirmed[aggregateId] = conversation
+            } catch APIError.http(status: 404, body: _) {
+                continue
+            } catch {
+                confirmed[aggregateId] = conversation
+            }
+        }
+        return confirmed
+    }
+
+    nonisolated static func preservingMissing(
+        _ preserved: [String: Conversation],
+        in fresh: [Conversation]
+    ) -> [String: Conversation] {
+        let freshAggregates = Set(fresh.map(\.aggregateIdentity))
+        return preserved.filter { aggregateIdentity, conversation in
+            !freshAggregates.contains(aggregateIdentity)
+                && ConversationState.parse(conversation.state).isProvisioningCreationShell
         }
     }
 
@@ -101,13 +154,12 @@ final class ConversationListStore {
         excluding exclusions: Set<String> = []
     ) -> [Conversation] {
         var byId = Dictionary(uniqueKeysWithValues: fresh
-            .filter { $0.archived != true && !exclusions.contains($0.aggregateIdentity) }
+            .filter { !exclusions.contains($0.aggregateIdentity) }
             .map { ($0.aggregateIdentity, $0) })
-        for (id, conversation) in upserts
-        where conversation.archived != true && !exclusions.contains(id) {
+        for (id, conversation) in upserts where !exclusions.contains(id) {
             byId[id] = conversation
         }
-        return Array(byId.values)
+        return byId.values.map(Self.terminalizingHistory)
     }
 
     private func rebuildIndexes(from cache: Cache) {
@@ -157,11 +209,12 @@ final class ConversationListStore {
         })
         return fresh.map { incoming in
             guard let existing = existingByAggregate[incoming.aggregateIdentity] else {
-                return incoming
+                return Self.terminalizingHistory(incoming)
             }
-            return Conversation(
+            return Self.terminalizingHistory(Conversation(
                 id: incoming.id,
                 product_conversation_id: incoming.product_conversation_id,
+                chain_root_id: incoming.chain_root_id,
                 slug: incoming.slug,
                 title: incoming.title,
                 model: incoming.model,
@@ -174,13 +227,22 @@ final class ConversationListStore {
                 branch_name: incoming.branch_name,
                 task_title: existing.task_title,
                 archived: incoming.archived,
+                product_close_action: incoming.product_close_action,
                 project_name: incoming.project_name,
                 conv_mode_label: incoming.conv_mode_label,
                 presentation_mode: incoming.presentation_mode,
                 requires_action: incoming.requires_action,
                 transcript_generation: incoming.transcript_generation,
-                runtime_role: incoming.runtime_role)
+                runtime_role: incoming.runtime_role))
         }
+    }
+
+    nonisolated static func terminalizingHistory(_ conversation: Conversation) -> Conversation {
+        guard conversation.archived == true else { return conversation }
+        var history = conversation
+        history.presentation_mode = "done"
+        history.requires_action = false
+        return history
     }
 
     private func apply(_ fresh: [Conversation]) {
@@ -216,9 +278,16 @@ final class ConversationListStore {
     }
 
     @discardableResult
-    func applyExternal(_ fresh: [Conversation], startedAt token: ExternalRefreshToken) -> Bool {
+    func applyExternal(
+        _ fresh: [Conversation],
+        preserving localRows: [Conversation] = [],
+        startedAt token: ExternalRefreshToken
+    ) -> Bool {
         guard canApplyExternal(startedAt: token) else { return false }
-        apply(Self.merging(fresh, preserving: [:]))
+        let preservedByAggregate = Dictionary(uniqueKeysWithValues: localRows.map {
+            ($0.aggregateIdentity, $0)
+        })
+        apply(Self.merging(fresh, preserving: preservedByAggregate))
         lastError = nil
         return true
     }
@@ -226,20 +295,10 @@ final class ConversationListStore {
     /// Merge a single updated conversation (e.g. after creation or an SSE
     /// update in an open session) without waiting for a full refresh.
     func upsert(_ conversation: Conversation) {
+        let conversation = Self.terminalizingHistory(conversation)
         if lastRefreshed == nil { lastRefreshed = Date() }
         externalMutationGeneration += 1
         let aggregateIdentity = conversation.aggregateIdentity
-        if conversation.archived == true {
-            if isRefreshing {
-                upsertsDuringRefresh[aggregateIdentity] = nil
-                exclusionsDuringRefresh.insert(aggregateIdentity)
-            }
-            conversations.removeAll { $0.aggregateIdentity == aggregateIdentity }
-            transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateIdentity }
-            aggregateToCachedTranscript[aggregateIdentity] = nil
-            persistCache()
-            return
-        }
         if isRefreshing {
             exclusionsDuringRefresh.remove(aggregateIdentity)
             upsertsDuringRefresh[aggregateIdentity] = conversation
@@ -266,6 +325,36 @@ final class ConversationListStore {
             .map(\.conversation)
     }
 
+    func projectHistory(aggregateId: String) {
+        guard let index = conversations.firstIndex(where: { $0.aggregateIdentity == aggregateId }) else {
+            return
+        }
+        let existing = conversations[index]
+        upsert(Conversation(
+            id: existing.id,
+            product_conversation_id: existing.product_conversation_id,
+            chain_root_id: existing.chain_root_id,
+            slug: existing.slug,
+            title: existing.title,
+            model: existing.model,
+            cwd: existing.cwd,
+            created_at: existing.created_at,
+            updated_at: existing.updated_at,
+            message_count: existing.message_count,
+            state: existing.state,
+            state_updated_at: existing.state_updated_at,
+            branch_name: existing.branch_name,
+            task_title: existing.task_title,
+            archived: true,
+            product_close_action: nil,
+            project_name: existing.project_name,
+            conv_mode_label: existing.conv_mode_label,
+            presentation_mode: "done",
+            requires_action: false,
+            transcript_generation: existing.transcript_generation,
+            runtime_role: existing.runtime_role))
+    }
+
     func remove(aggregateId: String) {
         externalMutationGeneration += 1
         upsertsDuringRefresh[aggregateId] = nil
@@ -280,6 +369,12 @@ final class ConversationListStore {
 
     func aggregateId(forTranscriptRowId transcriptRowId: String) -> String? {
         transcriptToAggregate[transcriptRowId]
+    }
+
+    func transcriptRowIds(forAggregateId aggregateId: String) -> [String] {
+        transcriptToAggregate.compactMap { transcriptId, mappedAggregateId in
+            mappedAggregateId == aggregateId ? transcriptId : nil
+        }
     }
 
     func cachedTranscriptRowId(forAggregateId aggregateId: String) -> String? {

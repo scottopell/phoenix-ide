@@ -114,6 +114,7 @@ entirely.
 | **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ✅ Complete | All handles are stored under durable WorkScope identity; globally unique IDs and controller metadata preserve Coordinator continuation control |
 | **REQ-BASH-WS-002:** Hard-Delete Cascade Respects Inheritor Scope | ❌ New | `cascade_bash_on_delete` consults inheritor `WorkScope` and skips teardown on scope match, like `cascade_terminal/browser_on_delete` |
 | **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill, and compact conversation summaries retain identity/status/duration/output-tail rather than a generic done badge |
+| **REQ-BASH-016:** Coordinator Live-Handle Surface | ✅ Complete | Process-local discovery exposes only live Coordinator-controlled handles with immutable spawn cwd; output uses the authorized inspector, and exact stop is incarnation-bound and offered only on supported hosts |
 
 The branch-observation slice is implemented: bash-handle terminal completion reconciles
 WorkScope-scoped local Git state into durable observed-branch and PR-association facts, then

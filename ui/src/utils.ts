@@ -10,6 +10,12 @@ export function formatShortcut(shortcut: string): string {
   return shortcut.replace(/Ctrl/g, isMac ? 'Cmd' : 'Ctrl');
 }
 
+export function formatGitShaForDisplay(gitSha: string): string {
+  const match = /^([0-9a-f]{40})(-dirty)?$/.exec(gitSha);
+  if (!match) return gitSha;
+  return `${match[1]!.slice(0, 12)}${match[2] ?? ''}`;
+}
+
 export function escapeHtml(str: string): string {
   if (!str) return '';
   return str

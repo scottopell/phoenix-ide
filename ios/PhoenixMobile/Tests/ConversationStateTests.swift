@@ -95,9 +95,11 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(
             parse("{\"type\":\"awaiting_recovery\",\"message\":\"Retrying\"}"),
             .awaitingRecovery(message: "Retrying"))
-        XCTAssertEqual(parse("{\"type\":\"provisioning\"}"), .provisioning)
+        XCTAssertEqual(
+            parse("{\"type\":\"provisioning\",\"job_id\":\"creation-job\"}"),
+            .provisioning(jobId: "creation-job"))
         XCTAssertTrue(ConversationState.awaitingRecovery(message: "Retrying").isCancellable)
-        XCTAssertTrue(ConversationState.provisioning.isCancellable)
+        XCTAssertTrue(ConversationState.provisioning(jobId: "creation-job").isCancellable)
     }
 
     func testErrorCarriesMessage() {

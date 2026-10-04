@@ -37,9 +37,11 @@ pub async fn suggest_commands(
     let request = LlmRequest {
         system: vec![SystemContent::cached(SUGGEST_SYSTEM)],
         messages: vec![LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(query)],
         }],
+        provider_replay: None,
         tools: vec![],
         max_tokens: Some(
             max_output_tokens.map_or(MAX_SUGGEST_TOKENS, |limit| limit.min(MAX_SUGGEST_TOKENS)),

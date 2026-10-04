@@ -24,7 +24,8 @@ use super::lifecycle_handlers::{
     retry_close_retirement, task_feedback,
 };
 use super::product_conversations::{
-    get_product_conversation, list_product_conversation_creations, list_product_conversations,
+    close_product_conversation, get_product_conversation, list_product_conversation_creations,
+    list_product_conversations, rename_product_conversation,
 };
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
@@ -106,6 +107,7 @@ async fn trajectory_export_handler(
 const STREAMING_ROUTES: &[&str] = &[
     "/api/conversations/:id/stream",
     "/api/chains/:rootId/stream",
+    "/api/product-conversations/events",
     "/api/share/:token/events",
     "/api/conversations/:id/terminal",
     "/api/terminal/global",
@@ -127,6 +129,7 @@ pub fn create_router(state: AppState) -> Router {
 
     let router = router
         // Static assets (embedded or filesystem fallback)
+        .merge(crate::api::product_conversations::automatic_continuation_routes())
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
         .route("/preview/*filepath", get(serve_preview_file))
@@ -138,12 +141,24 @@ pub fn create_router(state: AppState) -> Router {
             get(list_product_conversations),
         )
         .route(
+            "/api/product-conversations/events",
+            get(stream_aggregate_events),
+        )
+        .route(
             "/api/product-conversations/creation",
             get(list_product_conversation_creations),
         )
         .route(
             "/api/product-conversations/:reference",
             get(get_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/:reference/title",
+            axum::routing::patch(rename_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/:reference/close",
+            axum::routing::post(close_product_conversation),
         )
         .route(
             "/api/product-conversations/:reference/route",
@@ -371,6 +386,18 @@ pub fn create_router(state: AppState) -> Router {
         // `ResourceScopeKey::stable_key()`; `:handle_id` names a bash handle in that
         // scope. See `specs/process-inspector/` REQ-PINSP-005.
         .route("/api/bash/:handle_id/inspect", get(inspect_bash_handle))
+        .route(
+            "/api/coordinator/bash/live",
+            get(list_live_coordinator_bash_handles),
+        )
+        .route(
+            "/api/coordinator/watches",
+            get(list_active_coordinator_watches),
+        )
+        .route(
+            "/api/coordinator/bash/:handle_id/stop",
+            post(stop_live_coordinator_bash_handle),
+        )
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
         .route(
@@ -2142,6 +2169,7 @@ async fn create_product_conversation(
         },
     };
     let intent = crate::db::ProductCreationIntent {
+        origin: phoenix_db::ProductCreationOrigin::UserApi,
         cwd: canonical_cwd,
         objective: req.objective,
         model: Some(req.model),
@@ -4034,6 +4062,108 @@ struct InspectQuery {
 /// belongs to the handle's owning work scope, reads the output window for the
 /// optional `since` cursor via the existing ring/tombstone read helpers, and
 /// attaches a request-time process-group resource sample iff the handle is live.
+#[derive(serde::Serialize)]
+struct LiveCoordinatorBashHandle {
+    handle_id: String,
+    command: String,
+    label: Option<String>,
+    cwd: String,
+    started_at_ms: u128,
+    can_stop: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveCoordinatorWatchResponse {
+    product_conversation_id: String,
+    transcript_id: String,
+    transcript_slug: Option<String>,
+    display_name: String,
+    project_path: Option<String>,
+    state: String,
+}
+
+async fn list_active_coordinator_watches(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ActiveCoordinatorWatchResponse>>, AppError> {
+    let snapshots = state.db.list_coordinator_watches().await.map_err(|error| {
+        AppError::Internal(format!("failed to list Coordinator watches: {error}"))
+    })?;
+    Ok(Json(
+        snapshots
+            .into_iter()
+            .map(|watch| ActiveCoordinatorWatchResponse {
+                product_conversation_id: watch.product_conversation_id.to_string(),
+                transcript_id: watch.current_transcript_id,
+                transcript_slug: watch.transcript_slug,
+                display_name: watch.display_name,
+                project_path: watch.project_path,
+                state: serde_json::to_value(&watch.current_state)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("type")
+                            .and_then(|kind| kind.as_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "active".to_string()),
+            })
+            .collect(),
+    ))
+}
+
+async fn list_live_coordinator_bash_handles(
+    State(state): State<AppState>,
+) -> Json<Vec<LiveCoordinatorBashHandle>> {
+    let handles = state
+        .runtime
+        .bash_handles()
+        .live_coordinator_handles()
+        .await;
+    Json(
+        handles
+            .into_iter()
+            .map(|handle| LiveCoordinatorBashHandle {
+                handle_id: handle.handle_id.0.clone(),
+                command: handle.cmd.clone(),
+                label: handle.label.clone(),
+                cwd: handle.working_dir.to_string_lossy().into_owned(),
+                started_at_ms: handle
+                    .started_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_millis()),
+                can_stop: phoenix_tools::bash::exact_stop_supported(),
+            })
+            .collect(),
+    )
+}
+
+async fn stop_live_coordinator_bash_handle(
+    State(state): State<AppState>,
+    Path(handle_id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    match phoenix_tools::bash::stop_exact_handle_for_scope(
+        state.runtime.bash_handles().as_ref(),
+        &phoenix_core::work_scope::ResourceScopeKey::Coordinator,
+        &handle_id,
+    )
+    .await
+    {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(error) => Err(coordinator_stop_error(&handle_id, error)),
+    }
+}
+
+fn coordinator_stop_error(handle_id: &str, error: phoenix_tools::bash::BashError) -> AppError {
+    match error {
+        phoenix_tools::bash::BashError::HandleNotFound { .. } => AppError::NotFound(format!(
+            "handle {handle_id} not found or not controllable by Coordinator"
+        )),
+        error => AppError::Internal(format!(
+            "failed to stop Coordinator Bash handle {handle_id}: {error:?}"
+        )),
+    }
+}
+
 async fn inspect_bash_handle(
     State(state): State<AppState>,
     Path(handle_id): Path<String>,
@@ -4050,7 +4180,11 @@ async fn inspect_bash_handle(
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
     let actor = resolved.actor;
-    let actor_scope = resolved.scope;
+    let actor_scope = if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        crate::work_scope::ResourceScopeKey::Coordinator
+    } else {
+        resolved.scope
+    };
 
     let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
         &handle_id,
@@ -4117,15 +4251,37 @@ async fn get_system_prompt(
     // Mirror the mode context the live request uses (worktree boundaries,
     // Explore guidance) so the inspected prompt matches what the model sees.
     let mode_context = crate::runtime::conv_mode_to_context(&conversation.conv_mode);
-    let explore_bash = if matches!(
+    let resource_authority =
+        crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conversation)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    let has_approved_explore_authority = resource_authority.authority
+        == crate::work_scope::ResourceAuthority::Work
+        && matches!(
+            mode_context,
+            crate::system_prompt::ModeContext::Explore { .. }
+        )
+        && state
+            .runtime
+            .db()
+            .get_approved_task_objective(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .is_some();
+    let prompt_authority = if matches!(
         mode_context,
         crate::system_prompt::ModeContext::Explore { .. }
-    ) && state.platform.has_sandbox()
+    ) && !has_approved_explore_authority
     {
-        phoenix_core::domain::sm_state::ExploreBashCapability::Sandboxed
+        crate::work_scope::ResourceAuthority::Restricted
     } else {
-        phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
+        resource_authority.authority
     };
+    let explore_bash = crate::system_prompt::explore_bash_prompt_capability(
+        prompt_authority,
+        Some(&mode_context),
+        crate::tools::ExploreToolPolicy::from_platform(&state.platform).bash(),
+    );
     let system_prompt = if is_coordinator {
         let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
         crate::system_prompt::build_coordinator_system_prompt(
@@ -4296,6 +4452,10 @@ async fn read_stream_init_messages_with_tail(
     ))
 }
 
+async fn stream_aggregate_events(State(state): State<AppState>) -> impl IntoResponse {
+    super::sse::aggregate_event_stream(state.runtime.subscribe_aggregate_events())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_conversation(
     State(state): State<AppState>,
@@ -4317,7 +4477,10 @@ async fn stream_conversation(
         let stored_model = stale_model
             .clone()
             .unwrap_or_else(|| state.llm_registry.default_model_id());
-        let model_id = state.llm_registry.resolve_model_id(&stored_model);
+        let model_id = state
+            .llm_registry
+            .resolve_model_id(&stored_model)
+            .unwrap_or(stored_model);
         if !state.llm_registry.supports_service_tier(
             &model_id,
             phoenix_core::domain::llm_types::ServiceTier::Fast,
@@ -4581,6 +4744,7 @@ async fn send_chat(
     let outcome = service
         .send(crate::send_chat_service::SendChatRequest {
             conversation_id: id,
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             text: req.text,
             message_id: req.message_id,
             images: req.images,
@@ -5424,24 +5588,39 @@ async fn cancel_steering_message(
 ///   - 404 if the parent id does not exist
 ///   - 409 if the parent is not in `ContextExhausted` state
 ///   - 500 on DB/transaction failure
+fn continuation_expansion_policy(
+    authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+) -> crate::send_chat_service::MessageExpansionPolicy {
+    match authority {
+        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => {
+            crate::send_chat_service::MessageExpansionPolicy::LiteralText
+        }
+        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => {
+            crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext
+        }
+    }
+}
+
 async fn dispatch_continuation_handoff(
     state: &AppState,
     intent: crate::db::ContinuationDispatchIntent,
 ) -> (ContinueConversationStatus, Option<String>) {
     let parent_id = intent.parent_conversation_id.clone();
     let conversation_id = intent.successor_conversation_id.clone();
+    let expansion_policy = continuation_expansion_policy(intent.opening_authority);
     let dispatch = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
         state.runtime.clone(),
     )
     .send(crate::send_chat_service::SendChatRequest {
         conversation_id: conversation_id.clone(),
+        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
         text: intent.handoff,
         message_id: intent.message_id.as_str().to_string(),
         images: Vec::new(),
         files: Vec::new(),
         user_agent: intent.user_agent,
-        expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
+        expansion_policy,
     })
     .await;
     match dispatch {
@@ -5508,6 +5687,19 @@ fn continuation_message_id(
     })
 }
 
+fn automatic_retry_phase_for_turn_state(
+    state: crate::send_chat_service::AutomaticRetryTurnState,
+    reserved_phase: phoenix_core::domain::product_conversation::AutomaticContinuationPhase,
+) -> Option<phoenix_core::domain::product_conversation::AutomaticContinuationPhase> {
+    match state {
+        crate::send_chat_service::AutomaticRetryTurnState::RearmedWithAdmission => None,
+        crate::send_chat_service::AutomaticRetryTurnState::AlreadyAccepted => Some(
+            phoenix_core::domain::product_conversation::AutomaticContinuationPhase::DispatchAccepted,
+        ),
+        crate::send_chat_service::AutomaticRetryTurnState::NoAcceptedTurn => Some(reserved_phase),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn continue_conversation(
     State(state): State<AppState>,
@@ -5516,23 +5708,128 @@ async fn continue_conversation(
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
     use crate::db::{ContinueOutcome, DbError};
 
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let _product_admission = state
+        .runtime
+        .lock_product_message_admission(parent.product_conversation_id.as_str())
+        .await;
+
     if req.handoff.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Continuation handoff must not be empty.".to_string(),
         ));
     }
-    let message_id = continuation_message_id(req.message_id.clone())?;
+    let mut automatic_retry_phase = None;
+    let _automatic_retry_authority = if req.retry_failed_automatic {
+        Some(
+            state
+                .runtime
+                .acquire_local_authority_pass()
+                .map_err(|()| AppError::Internal("local authority is closed".to_string()))?,
+        )
+    } else {
+        None
+    };
+    let failed_admission = if req.retry_failed_automatic {
+        state
+            .runtime
+            .db()
+            .automatic_continuation_admission(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .filter(|admission| {
+                admission.phase
+                    == phoenix_core::domain::product_conversation::AutomaticContinuationPhase::Failed
+            })
+    } else {
+        None
+    };
+    let (message_id, handoff, user_agent, opening_authority) = if let Some(admission) =
+        failed_admission
+    {
+        let summary = state
+            .runtime
+            .db()
+            .get_message_by_id_in_conversation(&id, &admission.summary_message_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        let crate::db::MessageContent::Continuation(summary) = summary.content else {
+            return Err(AppError::Internal(
+                "automatic continuation summary has the wrong message type".to_string(),
+            ));
+        };
+        let mut retry_phase = admission.resume_phase;
+        if let Some(intent) = state
+            .runtime
+            .db()
+            .continuation_dispatch_intent(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+        {
+            if retry_phase
+                == phoenix_core::domain::product_conversation::AutomaticContinuationPhase::Admitted
+            {
+                retry_phase = phoenix_core::domain::product_conversation::AutomaticContinuationPhase::SuccessorReserved;
+            }
+            let (handoff, expansion_policy) = match intent.opening_authority {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => (
+                    summary.summary.as_str(),
+                    crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext,
+                ),
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => (
+                    intent.handoff.as_str(),
+                    crate::send_chat_service::MessageExpansionPolicy::LiteralText,
+                ),
+            };
+            let service = crate::send_chat_service::SendChatApplicationService::new(
+                state.runtime.db().clone(),
+                state.runtime.clone(),
+            );
+            let turn_state = service
+                .rearm_exact_terminal_turn(
+                    &id,
+                    &intent.successor_conversation_id,
+                    &intent.message_id,
+                    handoff,
+                    intent.user_agent.clone(),
+                    expansion_policy,
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            automatic_retry_phase = automatic_retry_phase_for_turn_state(turn_state, retry_phase);
+        } else {
+            automatic_retry_phase = Some(retry_phase);
+        }
+        (
+            admission.first_message_id,
+            summary.summary,
+            Some("phoenix-automatic-continuation".to_string()),
+            phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+        )
+    } else {
+        (
+            continuation_message_id(req.message_id.clone())?,
+            req.handoff,
+            req.user_agent,
+            phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        )
+    };
 
     let (outcome, intent) = state
         .runtime
         .db()
         .continue_conversation_with_intent(
             &id,
-            crate::db::NewContinuationDispatchIntent::user_authorized(
+            crate::db::NewContinuationDispatchIntent {
                 message_id,
-                req.handoff,
-                req.user_agent,
-            ),
+                handoff,
+                user_agent,
+                opening_authority,
+            },
         )
         .await
         .map_err(|e| match e {
@@ -5556,6 +5853,15 @@ async fn continue_conversation(
             }
             other => AppError::Internal(other.to_string()),
         })?;
+
+    if let Some(retry_phase) = automatic_retry_phase {
+        state
+            .runtime
+            .db()
+            .retry_failed_automatic_continuation(&id, retry_phase)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    }
 
     match outcome {
         ContinueOutcome::Created(new_conv) => {
@@ -5951,7 +6257,10 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         ))));
     }
 
-    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
+    let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
+    let cleanup =
+        run_runtime_resource_cleanup_cascade(&state.runtime, &conv, &deleting_conversation_ids)
+            .await?;
 
     if let Err(error) = state
         .runtime
@@ -5992,6 +6301,7 @@ async fn scope_still_owned_after_delete(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
 ) -> Result<bool, AppError> {
     let id = conv.id.as_str();
 
@@ -6028,7 +6338,9 @@ async fn scope_still_owned_after_delete(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(conversations.into_iter().any(|candidate| {
-        candidate.id != id && crate::runtime::conversation_attachment_retains_work_scope(&candidate)
+        candidate.id != id
+            && !deleting_conversation_ids.contains(&candidate.id)
+            && crate::runtime::conversation_attachment_retains_work_scope(&candidate)
     }))
 }
 
@@ -6120,16 +6432,10 @@ pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
 /// last live conversation on the scope is the one being deleted, every
 /// cascade tears down. Projects retains a conv-shaped API: it inspects
 /// `conv.conv_mode` for the branch/worktree mode discriminant.
-pub(super) async fn run_resource_cleanup_cascade(
-    state: &AppState,
-    conv: &crate::db::Conversation,
-) -> Result<ResourceCleanupReceipt, AppError> {
-    run_runtime_resource_cleanup_cascade(&state.runtime, conv).await
-}
-
 pub(crate) async fn run_runtime_resource_cleanup_cascade(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
 ) -> Result<ResourceCleanupReceipt, AppError> {
     let id = conv.id.as_str();
     let resolved_authority =
@@ -6141,7 +6447,9 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
     // terminal, browser) so they all honor the same any-live-owner signal.
-    let scope_still_owned = scope_still_owned_after_delete(runtime, conv, &work_scope).await?;
+    let scope_still_owned =
+        scope_still_owned_after_delete(runtime, conv, &work_scope, deleting_conversation_ids)
+            .await?;
     let inheritor_scope = scope_still_owned.then_some(&work_scope);
 
     // Step 2: bash handles. Preserve iff the scope is still owned by a live
@@ -6299,7 +6607,29 @@ async fn delete_conversation(
 /// on success. Loss of fatal-authority admission or DB row deletion fails the
 /// request; bash / tmux / projects cleanup failures log WARN and continue per
 /// REQ-BED-032.
-pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+pub(super) enum PreparedHardDelete {
+    AlreadyDeleted,
+    Ready {
+        conversation: Box<crate::db::Conversation>,
+        cleanup: ResourceCleanupReceipt,
+        _authority: crate::runtime::AdmittedOperation,
+    },
+}
+
+impl PreparedHardDelete {
+    pub(super) fn release_authority(self) -> Option<Box<crate::db::Conversation>> {
+        match self {
+            Self::AlreadyDeleted => None,
+            Self::Ready { conversation, .. } => Some(conversation),
+        }
+    }
+}
+
+pub(super) async fn prepare_hard_delete_cascade(
+    state: &AppState,
+    id: &str,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
+) -> Result<PreparedHardDelete, AppError> {
     let mut owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
     })?;
@@ -6347,7 +6677,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         delete_conversation_attachments(id).await;
         broadcast_conversation_hard_deleted(state, id).await;
         state.runtime.kick_creation_worker();
-        return Ok(());
+        return Ok(PreparedHardDelete::AlreadyDeleted);
     }
 
     if conv.state.is_busy() {
@@ -6392,7 +6722,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    let _owner = cleanup_pending_fork_orphans_on_delete(state, &conv, owner.transfer()).await?;
+    let authority = cleanup_pending_fork_orphans_on_delete(state, &conv, owner.transfer()).await?;
 
     // Steps 2-5: bash handles, tmux server, project worktree, browser
     // session. Cleanup-step failures log WARN and continue; a
@@ -6400,30 +6730,121 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // retry. Shared with archive /
     // abandon / mark-merged so the resource teardown is byte-for-byte
     // identical.
-    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
+    let cleanup =
+        run_runtime_resource_cleanup_cascade(&state.runtime, &conv, deleting_conversation_ids)
+            .await?;
 
-    // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
-    // rows. This is the only step whose failure is fatal to the request
-    // — partial cleanup above is non-fatal but a missing row deletion
-    // means the user's "delete this conversation" never actually
-    // happened.
-    if let Err(error) = state.runtime.db().delete_conversation(id).await {
-        reopen_bash_after_failed_lifecycle_mutation(state, &conv, &cleanup).await;
-        return Err(AppError::Internal(format!(
-            "Failed to delete conversation row: {error}"
-        )));
+    Ok(PreparedHardDelete::Ready {
+        conversation: Box::new(conv),
+        cleanup,
+        _authority: authority,
+    })
+}
+
+pub(super) async fn reopen_prepared_hard_delete(state: &AppState, prepared: &PreparedHardDelete) {
+    if let PreparedHardDelete::Ready {
+        conversation,
+        cleanup,
+        ..
+    } = prepared
+    {
+        reopen_bash_after_failed_lifecycle_mutation(state, conversation, cleanup).await;
     }
+}
 
-    // Scope retirement belongs to explicit scope cleanup, not to a terminal
-    // transcript transition. The row deletion above removes this conversation's
-    // ownership claim; runtime inventory and the database CAS independently
-    // recheck the remaining in-memory and durable obligations.
-    retire_work_scope_after_hard_delete(state, &conv).await;
+pub(super) async fn finalize_hard_deleted_conversation_resources(
+    state: &AppState,
+    conversation: &crate::db::Conversation,
+) {
+    retire_work_scope_after_hard_delete(state, conversation).await;
+    delete_conversation_attachments(&conversation.id).await;
+}
 
-    delete_conversation_attachments(id).await;
-
+pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    let member_ids = state
+        .db
+        .conversation_delete_member_ids(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if member_ids.is_empty() {
+        let deleting_conversation_ids = std::collections::HashSet::new();
+        prepare_hard_delete_cascade(state, id, &deleting_conversation_ids).await?;
+        return Ok(());
+    }
+    let deleting_conversation_ids = member_ids.iter().cloned().collect();
+    let mut prepared = Vec::with_capacity(member_ids.len());
+    for member_id in &member_ids {
+        match prepare_hard_delete_cascade(state, member_id, &deleting_conversation_ids).await {
+            Ok(member) => prepared.push(member),
+            Err(error) => {
+                for member in &prepared {
+                    reopen_prepared_hard_delete(state, member).await;
+                }
+                return Err(error);
+            }
+        }
+    }
+    if !prepared.is_empty()
+        && prepared
+            .iter()
+            .all(|member| matches!(member, PreparedHardDelete::AlreadyDeleted))
+    {
+        return Ok(());
+    }
+    if prepared
+        .iter()
+        .any(|member| matches!(member, PreparedHardDelete::AlreadyDeleted))
+    {
+        for member in &prepared {
+            reopen_prepared_hard_delete(state, member).await;
+        }
+        return Err(AppError::Internal(
+            "aggregate members disagreed on creation cleanup state".to_string(),
+        ));
+    }
+    let aggregate_deleted = match state
+        .runtime
+        .db()
+        .delete_conversation_with_aggregate_result(id)
+        .await
+    {
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+            aggregate_deleted,
+        )) => aggregate_deleted,
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+            for member in &prepared {
+                reopen_prepared_hard_delete(state, member).await;
+            }
+            return Err(AppError::Internal(format!(
+                "Failed to delete conversation row: {error}"
+            )));
+        }
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+            state
+                .runtime
+                .signal_fatal_local_authority("conversation_hard_delete_commit");
+            return Err(AppError::Internal(
+                "conversation deletion lost local commit authority".to_string(),
+            ));
+        }
+    };
+    let conversations = prepared
+        .into_iter()
+        .filter_map(PreparedHardDelete::release_authority)
+        .collect::<Vec<_>>();
+    for conversation in &conversations {
+        finalize_hard_deleted_conversation_resources(state, conversation).await;
+    }
     broadcast_conversation_hard_deleted(state, id).await;
-
+    if aggregate_deleted {
+        let product_conversation_id = conversations
+            .first()
+            .map(|conversation| conversation.product_conversation_id.to_string())
+            .ok_or_else(|| {
+                AppError::Internal("deleted aggregate had no prepared members".to_string())
+            })?;
+        broadcast_aggregate_hard_deleted(state, id, &product_conversation_id, member_ids).await;
+    }
     Ok(())
 }
 
@@ -6478,10 +6899,30 @@ async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
     if let Some(handle) = state.runtime.try_get_handle(id).await {
         let _ = handle
             .broadcast_tx
-            .send_hard_deleted_and_close(id.to_string());
+            .send_hard_deleted_and_close(id.to_string(), vec![id.to_string()]);
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
-        let _ = tx.send_hard_deleted_and_close(id.to_string());
+        let _ = tx.send_hard_deleted_and_close(id.to_string(), vec![id.to_string()]);
+    }
+}
+
+pub(super) async fn broadcast_aggregate_hard_deleted(
+    state: &AppState,
+    _root_id: &str,
+    product_conversation_id: &str,
+    deleted_conversation_ids: Vec<String>,
+) {
+    state.runtime.publish_aggregate_hard_deleted(
+        product_conversation_id.to_string(),
+        deleted_conversation_ids.clone(),
+    );
+    for member_id in deleted_conversation_ids {
+        if let Some(handle) = state.runtime.try_get_handle(&member_id).await {
+            handle.broadcast_tx.close_publication();
+        }
+        if let Some(tx) = state.runtime.take_evicted_broadcaster(&member_id).await {
+            tx.close_publication();
+        }
     }
 }
 
@@ -6586,6 +7027,7 @@ async fn cascade_project_target(
             Some((String::new(), worktree_path.to_string(), false))
         }
         ConvMode::Direct
+        | ConvMode::AttachedWorkChild
         | ConvMode::Explore {
             worktree_path: None,
             ..
@@ -9348,6 +9790,7 @@ pub(crate) mod hard_delete_cascade_tests {
             _request: &phoenix_llm::LlmRequest,
         ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
             Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
                 content: vec![],
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),
@@ -9359,6 +9802,50 @@ pub(crate) mod hard_delete_cascade_tests {
         fn model_id(&self) -> &str {
             "claude-sonnet-5"
         }
+    }
+
+    #[test]
+    fn automatic_retry_resumes_from_highest_durable_turn_phase() {
+        use crate::send_chat_service::AutomaticRetryTurnState;
+        use phoenix_core::domain::product_conversation::AutomaticContinuationPhase;
+
+        assert_eq!(
+            automatic_retry_phase_for_turn_state(
+                AutomaticRetryTurnState::AlreadyAccepted,
+                AutomaticContinuationPhase::SuccessorReserved,
+            ),
+            Some(AutomaticContinuationPhase::DispatchAccepted)
+        );
+        assert_eq!(
+            automatic_retry_phase_for_turn_state(
+                AutomaticRetryTurnState::NoAcceptedTurn,
+                AutomaticContinuationPhase::SuccessorReserved,
+            ),
+            Some(AutomaticContinuationPhase::SuccessorReserved)
+        );
+        assert_eq!(
+            automatic_retry_phase_for_turn_state(
+                AutomaticRetryTurnState::RearmedWithAdmission,
+                AutomaticContinuationPhase::SuccessorReserved,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn continuation_dispatch_preserves_persisted_opening_authority() {
+        use phoenix_core::domain::product_conversation::ContinuationOpeningAuthority;
+
+        assert_eq!(
+            continuation_expansion_policy(ContinuationOpeningAuthority::UserAuthorizedInstruction),
+            crate::send_chat_service::MessageExpansionPolicy::LiteralText
+        );
+        assert_eq!(
+            continuation_expansion_policy(
+                ContinuationOpeningAuthority::GeneratedPredecessorContext
+            ),
+            crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext
+        );
     }
 
     /// Construct a minimal `AppState` backed by an in-memory database.
@@ -9471,9 +9958,14 @@ pub(crate) mod hard_delete_cascade_tests {
         create_approved_explore(&state, id).await;
         let conversation = state.db.get_conversation(id).await.expect("conversation");
 
-        let receipt = super::run_runtime_resource_cleanup_cascade(&state.runtime, &conversation)
-            .await
-            .expect("lifecycle cleanup");
+        let deleting_conversation_ids = std::collections::HashSet::from([conversation.id.clone()]);
+        let receipt = super::run_runtime_resource_cleanup_cascade(
+            &state.runtime,
+            &conversation,
+            &deleting_conversation_ids,
+        )
+        .await
+        .expect("lifecycle cleanup");
         assert_eq!(
             receipt.work_scope,
             crate::resource_authority::resolve_resource_authority(&state.db, &conversation)
@@ -9519,6 +10011,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .update_steering_queue(
                 "conv-reconcile",
                 &[crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "queued".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -10154,6 +10647,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let now = chrono::Utc::now();
         let messages = vec![
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 sequence_id: 1,
                 message_id: "u1".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10164,6 +10658,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 sequence_id: 2,
                 message_id: "a1".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10176,6 +10671,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 sequence_id: 3,
                 message_id: "sys".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10186,6 +10682,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 sequence_id: 4,
                 message_id: "a2".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10198,6 +10695,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 sequence_id: 5,
                 message_id: "skill".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10213,6 +10711,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 sequence_id: 6,
                 message_id: "a3".to_string(),
                 conversation_id: "conv".to_string(),
@@ -11293,6 +11792,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let exact = latest_stream_transcript_coverage(
             &[crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "m1".to_string(),
                 conversation_id: "c".to_string(),
                 sequence_id: 1,
@@ -11312,6 +11812,7 @@ pub(crate) mod hard_delete_cascade_tests {
     fn transcript_coverage_reports_tail_for_short_long_and_oversized_fallback_snapshots() {
         let short = latest_stream_transcript_coverage(
             &[crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "m1".to_string(),
                 conversation_id: "c".to_string(),
                 sequence_id: 2,
@@ -11328,6 +11829,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let long = latest_stream_transcript_coverage(
             &[crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "m2".to_string(),
                 conversation_id: "c".to_string(),
                 sequence_id: 99,
@@ -11974,6 +12476,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-1"),
             "npm run dev".into(),
             Some("dev".into()),
+            std::path::PathBuf::from("/tmp"),
             4321,
             1234,
             RING_BUFFER_BYTES,
@@ -12160,6 +12663,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-1"),
             "sleep 30".into(),
             Some("sleeper".into()),
+            std::path::PathBuf::from("/tmp"),
             pgid,
             pid,
             RING_BUFFER_BYTES,
@@ -12244,6 +12748,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-1"),
             "echo bye".into(),
             None,
+            std::path::PathBuf::from("/tmp"),
             7,
             7,
             RING_BUFFER_BYTES,
@@ -12296,6 +12801,79 @@ pub(crate) mod hard_delete_cascade_tests {
         );
     }
 
+    #[test]
+    fn coordinator_stop_preserves_not_found_and_signaling_failures() {
+        let not_found = super::coordinator_stop_error(
+            "b-missing",
+            phoenix_tools::bash::BashError::HandleNotFound {
+                handle_id: "b-missing".into(),
+            },
+        );
+        assert!(matches!(not_found, AppError::NotFound(_)));
+
+        let signaling_failure = super::coordinator_stop_error(
+            "b-live",
+            phoenix_tools::bash::BashError::SpawnFailed {
+                error_message: "pidfd_send_signal failed".into(),
+            },
+        );
+        assert!(
+            matches!(signaling_failure, AppError::Internal(message) if message.contains("pidfd_send_signal failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_can_inspect_coordinator_controlled_handle() {
+        use phoenix_tools::bash::handle::{FinalCause, Handle, HandleId};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+
+        let state = make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("coordinator");
+        let owner = crate::scope("coordinator-handle-owner");
+        let handle = Handle::new_live_for_actor(
+            crate::work_scope::ResourceScopeKey::Coordinator,
+            HandleId::new("b-coordinator"),
+            coordinator.id.clone(),
+            crate::work_scope::ResourceAuthority::Restricted,
+            "printf coordinator-output".into(),
+            None,
+            std::path::PathBuf::from("/tmp"),
+            7,
+            7,
+            RING_BUFFER_BYTES,
+        );
+        handle
+            .transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(0) },
+                std::time::Duration::from_millis(1),
+                std::time::SystemTime::now(),
+                phoenix_tools::bash::handle::TOMBSTONE_TAIL_LINES,
+            )
+            .await;
+        state
+            .runtime
+            .bash_handles()
+            .register_existing_handle(&owner, handle)
+            .await;
+
+        let Json(inspection) = super::inspect_bash_handle(
+            State(state),
+            Path("b-coordinator".to_string()),
+            Query(super::InspectQuery {
+                conversation_id: coordinator.id,
+                since: None,
+            }),
+        )
+        .await
+        .expect("Coordinator-controlled handle must be visible to the Coordinator");
+
+        assert_eq!(inspection.handle_id, "b-coordinator");
+    }
+
     #[tokio::test]
     async fn inspect_unknown_handle_is_not_found() {
         let state = make_test_state().await;
@@ -12340,6 +12918,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-1"),
             "npm run dev".into(),
             Some("dev".into()),
+            std::path::PathBuf::from("/tmp"),
             4321,
             1234,
             RING_BUFFER_BYTES,
@@ -12450,6 +13029,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let payload = PreparedDirectTurnPayload::from_parts(
             SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "pending".to_string(),
                 images: vec![],
                 files: vec![],
@@ -12737,6 +13317,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("materialize idle runtime");
         let entry = crate::state_machine::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "run after cancellation".to_string(),
             llm_text: None,
             images: Vec::new(),
@@ -12756,6 +13337,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .acknowledged_event_tx
             .send(crate::runtime::AcknowledgedEventRequest {
                 event: Event::SteerMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: entry.text.clone(),
                     llm_text: entry.llm_text.clone(),
                     images: entry.images.clone(),
@@ -12827,6 +13409,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("create");
         accept_unmaterialized_direct_turn(&state, conversation_id).await;
         let entry = crate::state_machine::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "survive failed wake".to_string(),
             llm_text: None,
             images: Vec::new(),
@@ -13822,21 +14405,192 @@ pub(crate) mod hard_delete_cascade_tests {
     async fn chain_delete_handler_removes_every_member() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cd-a", "cd-b", "cd-c"]).await;
+        let root = state.db.get_conversation("cd-a").await.expect("root");
+        let subordinate = state
+            .db
+            .create_conversation_with_project(
+                "cd-agent",
+                "cd-agent",
+                "/tmp",
+                false,
+                Some("cd-a"),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("subordinate participant");
+        assert_eq!(
+            subordinate.product_conversation_id,
+            root.product_conversation_id
+        );
         mark_chain_history(&state, "cd-a").await;
+        let mut events = state.runtime.subscribe_aggregate_events();
 
-        let _ = crate::api::chains::delete_chain_handler(
+        let response = crate::api::chains::delete_chain_handler(
             axum::extract::State(state.clone()),
             axum::extract::Path("cd-a".to_string()),
         )
         .await
         .expect("chain delete");
+        assert_eq!(
+            response.0.outcome,
+            crate::api::types::ChainDeleteOutcome::Deleted {
+                deleted_conversation_ids: vec![
+                    "cd-agent".to_string(),
+                    "cd-a".to_string(),
+                    "cd-b".to_string(),
+                    "cd-c".to_string(),
+                ],
+            }
+        );
 
-        for id in ["cd-a", "cd-b", "cd-c"] {
+        for id in ["cd-a", "cd-b", "cd-c", "cd-agent"] {
             assert!(
                 state.db.get_conversation(id).await.is_err(),
                 "{id} must be gone after chain delete"
             );
         }
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("aggregate hard-delete event timeout")
+            .expect("aggregate hard-delete event");
+        assert!(matches!(
+            event,
+            SseEvent::ConversationHardDeleted {
+                conversation_id,
+                deleted_conversation_ids,
+                ..
+            } if conversation_id == root.product_conversation_id.as_str()
+                && deleted_conversation_ids
+                    == vec!["cd-agent", "cd-a", "cd-b", "cd-c"]
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "aggregate deletion must emit exactly one hard-delete event"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_delete_retry_after_success_is_idempotent_success() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["retry-a", "retry-b"]).await;
+        mark_chain_history(&state, "retry-a").await;
+
+        let _ = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("retry-a".to_string()),
+        )
+        .await
+        .expect("first delete");
+        let retry = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("retry-a".to_string()),
+        )
+        .await
+        .expect("missing aggregate is an idempotent success");
+
+        assert!(retry.0.success);
+        assert_eq!(
+            retry.0.outcome,
+            crate::api::types::ChainDeleteOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_chain_deletes_recheck_absence_after_admission_serialization() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["overlap-a", "overlap-b"]).await;
+        mark_chain_history(&state, "overlap-a").await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        state
+            .runtime
+            .install_hard_delete_barrier(Arc::clone(&barrier))
+            .await;
+
+        let first = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::api::chains::delete_chain_handler(
+                    axum::extract::State(state),
+                    axum::extract::Path("overlap-a".to_string()),
+                )
+                .await
+            })
+        };
+        barrier.wait().await;
+        let second = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::api::chains::delete_chain_handler(
+                    axum::extract::State(state),
+                    axum::extract::Path("overlap-a".to_string()),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        barrier.wait().await;
+
+        assert!(
+            first
+                .await
+                .expect("first delete task")
+                .expect("first delete")
+                .0
+                .success
+        );
+        assert!(
+            second
+                .await
+                .expect("second delete task")
+                .expect("overlap is idempotent")
+                .0
+                .success
+        );
+        assert!(state.db.get_conversation("overlap-a").await.is_err());
+        assert!(state.db.get_conversation("overlap-b").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chain_delete_propagates_root_database_failure() {
+        let state = make_test_state().await;
+        state.db.pool().close().await;
+
+        let error = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("unreadable-root".to_string()),
+        )
+        .await
+        .expect_err("database failure must not become idempotent success");
+
+        assert!(matches!(error, AppError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn chain_delete_propagates_root_decode_failure() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["decode-a", "decode-b"]).await;
+        sqlx::query("UPDATE conversations SET user_initiated = 'not-a-bool' WHERE id = 'decode-a'")
+            .execute(state.db.pool())
+            .await
+            .expect("corrupt persisted state");
+
+        let error = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("decode-a".to_string()),
+        )
+        .await
+        .expect_err("decode failure must not become idempotent success");
+
+        assert!(matches!(error, AppError::Internal(_)));
     }
 
     #[tokio::test]
@@ -14748,6 +15502,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-parent"),
             "npm run dev".into(),
             Some("dev".into()),
+            std::path::PathBuf::from("/tmp"),
             4321,
             1234,
             RING_BUFFER_BYTES,
@@ -15101,7 +15856,10 @@ pub(crate) mod hard_delete_cascade_tests {
         // must propagate rather than swallow to "assume live".
         state.db.pool().close().await;
 
-        let result = run_resource_cleanup_cascade(&state, &conv).await;
+        let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
+        let result =
+            run_runtime_resource_cleanup_cascade(&state.runtime, &conv, &deleting_conversation_ids)
+                .await;
 
         assert!(
             matches!(result, Err(AppError::Internal(_))),
@@ -15334,6 +16092,7 @@ mod regenerate_conversation_name_tests {
         async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
             match self {
                 StubLlm::Ok(text) => Ok(LlmResponse {
+                    provider_replay: None,
                     content: vec![ContentBlock::text(*text)],
                     end_turn: true,
                     usage: Usage::default(),
@@ -15572,6 +16331,7 @@ mod upgrade_model_state_guard_tests {
     impl LlmService for StubLlm {
         async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
             Ok(LlmResponse {
+                provider_replay: None,
                 content: vec![ContentBlock::text("stub")],
                 end_turn: true,
                 usage: Usage::default(),
@@ -16539,6 +17299,7 @@ mod attachment_storage_tests {
         let payload = PreparedDirectTurnPayload {
             v: PreparedDirectTurnPayload::VERSION,
             submitted: SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "msg-direct-turn-files".to_string(),
                 text: "with attachments".to_string(),
                 images: vec![],

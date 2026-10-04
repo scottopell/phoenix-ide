@@ -1,6 +1,6 @@
 # ADR-022: The Coordinator uses bounded relational evidence
 
-- **Status:** Partially superseded by ADR-027
+- **Status:** Partially superseded by ADR-027 and ADR-066 (automatic snapshot injection)
 - **Date:** 2026-07-21
 - **Supersedes:** ADR-021's decision to retain the inferred open-work projection
 - **Affects:** REQ-GR-001–005, REQ-GR-007–011A

@@ -645,6 +645,8 @@ impl ProviderStreamTelemetry {
 pub struct LlmRequest {
     pub system: Vec<SystemContent>,
     pub messages: Vec<LlmMessage>,
+    /// Durable provider-private replay data for the active exchange, if any.
+    pub provider_replay: Option<super::provider_replay::AnthropicReplayPayload>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub effective_effort: EffectiveEffort,
@@ -709,6 +711,10 @@ impl SystemContent {
 #[derive(Debug, Clone)]
 pub struct LlmMessage {
     pub role: MessageRole,
+    /// Durable source identity for transcript-backed messages. Stateless
+    /// requests use None. Provider-private replay uses this to locate the exact
+    /// owning assistant response after filtering/projection.
+    pub source_message_id: Option<String>,
     pub content: Vec<ContentBlock>,
 }
 
@@ -935,6 +941,9 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: Vec<ContentBlock>,
+    /// Private replay update returned beside public content. Never persisted as
+    /// ordinary message content or serialized to clients.
+    pub provider_replay: Option<super::provider_replay::AnthropicReplayUpdate>,
     pub end_turn: bool,
     pub usage: Usage,
     pub stream_telemetry: ProviderStreamTelemetry,
@@ -945,6 +954,7 @@ impl LlmResponse {
     pub fn non_streaming(content: Vec<ContentBlock>, end_turn: bool, usage: Usage) -> Self {
         Self {
             content,
+            provider_replay: None,
             end_turn,
             usage,
             stream_telemetry: ProviderStreamTelemetry::non_streaming(),
@@ -1055,6 +1065,7 @@ mod attempt_capture_tests {
         let request = LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: Some(50),
             effective_effort: EffectiveEffort::native_known(ModelEffort::Max),

@@ -12,6 +12,7 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     /// additive-optional: legacy `/api/conversations` rows omit it; nil means
     /// the transcript-row id is the only available identity.
     var product_conversation_id: String?
+    var chain_root_id: String?
     var slug: String?
     var title: String?
     var model: String?
@@ -24,6 +25,8 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     var branch_name: String?
     var task_title: String?
     var archived: Bool?
+    // Additive optional for pre-aggregate persisted list/session caches (REQ-IOS-014).
+    var product_close_action: ProductConversationCloseAction?
     var project_name: String?
     var conv_mode_label: String?
     /// Server-derived display mode: idle | working | needs_action | error |
@@ -91,7 +94,7 @@ struct ProductConversationListRow: Codable, Equatable, Sendable {
     var product_conversation_id: String
     var canonical_route: String
     var canonical_root: ProductConversationTranscriptRow
-    var ordinary_lifecycle: ProductConversationOrdinaryLifecycle
+    var lifecycle: ProductConversationLifecycle
     var latest_transcript_row_id: String
     var updated_at: String
     var presentation: ProductConversationPresentation
@@ -125,6 +128,71 @@ struct ProductConversationTranscriptRow: Codable, Equatable, Sendable {
 enum ProductConversationOrdinaryLifecycle: String, Codable, Equatable, Sendable {
     case open
     case history
+}
+
+enum ProductConversationLifecycle: Codable, Equatable, Sendable {
+    case open(closeAction: ProductConversationCloseAction)
+    case history
+
+    private enum CodingKeys: String, CodingKey { case state, close_action }
+    private enum State: String, Codable { case open, history }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(State.self, forKey: .state) {
+        case .open:
+            self = .open(closeAction: try container.decode(ProductConversationCloseAction.self, forKey: .close_action))
+        case .history:
+            self = .history
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .open(let closeAction):
+            try container.encode(State.open, forKey: .state)
+            try container.encode(closeAction, forKey: .close_action)
+        case .history:
+            try container.encode(State.history, forKey: .state)
+        }
+    }
+}
+
+enum ProductConversationCloseAction: Codable, Equatable, Hashable, Sendable {
+    case available
+    case unavailable(reason: ProductConversationCloseUnavailableReason)
+
+    private enum CodingKeys: String, CodingKey { case availability, reason }
+    private enum Availability: String, Codable { case available, unavailable }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Availability.self, forKey: .availability) {
+        case .available:
+            self = .available
+        case .unavailable:
+            self = .unavailable(reason: try container.decode(ProductConversationCloseUnavailableReason.self, forKey: .reason))
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .available:
+            try container.encode(Availability.available, forKey: .availability)
+        case .unavailable(let reason):
+            try container.encode(Availability.unavailable, forKey: .availability)
+            try container.encode(reason, forKey: .reason)
+        }
+    }
+}
+
+enum ProductConversationCloseUnavailableReason: String, Codable, Equatable, Hashable, Sendable {
+    case active_close_attempt
+    case awaiting_task_approval
+    case awaiting_continuation
+    case handed_off_without_continuation
 }
 
 enum ProductConversationPresentation: Codable, Equatable, Sendable {
@@ -380,6 +448,95 @@ struct ProductConversationCloseResidual: Codable, Equatable, Sendable {
     var detail: String?
 }
 
+struct SourceToolCall: Codable, Equatable, Sendable {
+    let message_id: String
+    let tool_use_id: String
+}
+
+enum InputOrigin: Codable, Equatable, Sendable {
+    case unknownHistorical
+    case userApi
+    case internalConversation(productConversationId: String, transcriptId: String, sourceCall: SourceToolCall? = nil)
+    case systemGenerated
+    case subscriptionEvent(eventId: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, product_conversation_id, transcript_id, event_id, source_call
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(String.self, forKey: .kind) {
+        case "unknown_historical": self = .unknownHistorical
+        case "user_api": self = .userApi
+        case "internal_conversation":
+            self = .internalConversation(
+                productConversationId: try container.decode(String.self, forKey: .product_conversation_id),
+                transcriptId: try container.decode(String.self, forKey: .transcript_id),
+                sourceCall: try container.decodeIfPresent(SourceToolCall.self, forKey: .source_call))
+        case "system_generated": self = .systemGenerated
+        case "subscription_event":
+            self = .subscriptionEvent(eventId: try container.decode(String.self, forKey: .event_id))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind, in: container, debugDescription: "Unrecognized input origin")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .unknownHistorical: try container.encode("unknown_historical", forKey: .kind)
+        case .userApi: try container.encode("user_api", forKey: .kind)
+        case let .internalConversation(productId, transcriptId, sourceCall):
+            try container.encode("internal_conversation", forKey: .kind)
+            try container.encode(productId, forKey: .product_conversation_id)
+            try container.encode(transcriptId, forKey: .transcript_id)
+            try container.encode(sourceCall, forKey: .source_call)
+        case .systemGenerated: try container.encode("system_generated", forKey: .kind)
+        case let .subscriptionEvent(eventId):
+            try container.encode("subscription_event", forKey: .kind)
+            try container.encode(eventId, forKey: .event_id)
+        }
+    }
+
+    func sourceTranscriptURL(serverURL: String) -> URL? {
+        guard case let .internalConversation(_, transcriptId, _) = self,
+              let base = URL(string: serverURL),
+              base.scheme == "https" || base.scheme == "http", base.host != nil else { return nil }
+        return base.appendingPathComponent("c").appendingPathComponent(transcriptId)
+    }
+
+    func sourceCallURL(serverURL: String) -> URL? {
+        guard case let .internalConversation(_, transcriptId, sourceCall) = self,
+              let sourceCall, let base = sourceTranscriptURL(serverURL: serverURL),
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
+        components.queryItems = [URLQueryItem(name: "source_transcript", value: transcriptId), URLQueryItem(name: "source_tool", value: sourceCall.tool_use_id)]
+        components.fragment = "message-\(sourceCall.message_id)"
+        return components.url
+    }
+
+    var sourceCallUnavailable: Bool {
+        if case .internalConversation(_, _, nil) = self { return true }
+        return false
+    }
+
+    var isUserApiInput: Bool {
+        self == .userApi
+    }
+
+    var label: String {
+        switch self {
+        case .unknownHistorical: "Unknown input"
+        case .userApi: "User API"
+        case let .internalConversation(productId, transcriptId, _):
+            "Conversation from @transcript:\(transcriptId) (conversation ID \(productId))"
+        case .systemGenerated: "System input"
+        case .subscriptionEvent: "Conversation event"
+        }
+    }
+}
+
 struct Message: Codable, Identifiable, Equatable, Sendable {
     var message_id: String
     var conversation_id: String?
@@ -389,7 +546,11 @@ struct Message: Codable, Identifiable, Equatable, Sendable {
     var display_data: JSONValue?
     var created_at: String?
 
+    // nil is a cached pre-provenance message, never evidence of a user API send.
+    var origin: InputOrigin? = nil
+
     var id: String { message_id }
+    var inputOrigin: InputOrigin { origin ?? .unknownHistorical }
 
     var createdAtDate: Date? {
         created_at.flatMap { Conversation.parseDate($0) }
