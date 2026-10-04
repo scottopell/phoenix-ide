@@ -182,3 +182,11 @@ Current first-sample label explicitly excludes eager pool/connection setup; it i
 a first retrieval after pool setup with uncontrolled OS cache, not cold-start latency.
 Representative broad/selective candidates must have eligible hits under the actual
 service request before their sequences. No additional measurement campaign performed.
+
+Freshness validation uses the existing production `Fts5Retriever::is_fresh_for`
+source-extraction fingerprints and physical-row presence, plus orphan checks.
+It does not independently hash physical FTS text or certify arbitrary cache
+corruption. REQ-RET-008 owns index-cache reconciliation; this benchmark neither
+changes that production authority nor repairs the private captured fixture.
+A physical-text/sourcehash mismatch remains a separate DB invariant question,
+not a new benchmark reconciliation engine.

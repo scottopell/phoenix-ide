@@ -65,7 +65,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
     def test_label_reservation_refuses_second_writer(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / "capture-manifest.json").write_text("{}")
+            (root / "capture-manifest.json").write_text(json.dumps({"kind":"conversation-search-fixture"}))
             args = type("Args", (), {"artifacts":str(root), "label":"same"})()
             def nested(_):
                 with self.assertRaisesRegex(SystemExit, "reserved"):
@@ -117,7 +117,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
     def test_signal_handlers_cleanup_and_restore(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / "capture-manifest.json").write_text("{}")
+            (root / "capture-manifest.json").write_text(json.dumps({"kind":"conversation-search-fixture"}))
             args = type("Args", (), {"artifacts":str(root),"label":"signal"})()
             previous = bench.signal.getsignal(bench.signal.SIGTERM)
             def interrupted(_):
@@ -224,7 +224,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             db.write_bytes(b"fixture")
             fixture_hash = bench._hash(db)
             (root / "capture-manifest.json").write_text(json.dumps({
-                "kind": "conversation-search-fixture", "snapshot_path": str(db),
+                "kind":"conversation-search-fixture", "snapshot_path": str(db),
                 "sha256": fixture_hash, "size_bytes": db.stat().st_size,
                 "source_path": str(root / "source.db"),
             }))
@@ -246,7 +246,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             db.write_bytes(b"fixture")
             fixture_hash = bench._hash(db)
             (root / "capture-manifest.json").write_text(json.dumps({
-                "snapshot_path": str(db), "sha256": fixture_hash, "size_bytes": db.stat().st_size,
+                "kind":"conversation-search-fixture", "snapshot_path": str(db), "sha256": fixture_hash, "size_bytes": db.stat().st_size,
                 "schema_digest": "schema", "migration_ledger": [],
                 "source_path": str(root / "source.db"),
             }))
@@ -263,7 +263,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             db.write_bytes(b"fixture")
             fixture_hash = bench._hash(db)
             (root / "capture-manifest.json").write_text(json.dumps({
-                "snapshot_path": str(db), "sha256": fixture_hash, "size_bytes": db.stat().st_size,
+                "kind":"conversation-search-fixture", "snapshot_path": str(db), "sha256": fixture_hash, "size_bytes": db.stat().st_size,
                 "schema_digest": "schema", "migration_ledger": [],
                 "source_path": str(root / "source.db"),
             }))
@@ -388,7 +388,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
     def test_report_separates_runs_surfaces_and_discards_successful_warmup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "capture-manifest.json").write_text("{}")
+            (root / "capture-manifest.json").write_text(json.dumps({"kind":"conversation-search-fixture"}))
             runs = root / "runs"
             runs.mkdir()
             samples = self._complete_run()["samples"]
@@ -448,7 +448,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             db.write_bytes(b"fixture")
             fixture_hash = bench._hash(db)
             (root / "capture-manifest.json").write_text(json.dumps({
-                "kind": "conversation-search-fixture", "snapshot_path": str(db),
+                "kind":"conversation-search-fixture", "snapshot_path": str(db),
                 "sha256": fixture_hash, "size_bytes": db.stat().st_size,
                 "source_path": str(root / "source.db"),
             }))
