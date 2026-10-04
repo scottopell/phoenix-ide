@@ -262,7 +262,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         for key in ["RUSTC","RUSTC_WRAPPER","RUSTC_WORKSPACE_WRAPPER","CARGO_BUILD_RUSTC","CARGO_BUILD_RUSTC_WRAPPER","CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"]:
             with mock.patch.dict("os.environ",{key:"alternate"}):
                 with self.assertRaisesRegex(SystemExit,"alternate Cargo compiler"):bench._build_configuration()
-        with self.assertRaises(SystemExit):bench.parser().parse_args(["prepare","--force"])
+        with mock.patch.object(__import__("sys"),"argv",["benchmark","prepare","--force"]):
+            with self.assertRaises(SystemExit):bench.main()
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
