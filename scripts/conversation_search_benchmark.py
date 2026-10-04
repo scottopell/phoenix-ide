@@ -769,7 +769,7 @@ def _run_reserved(args) -> int:
     fixture_before = _fixture_fingerprint(db)
     run_uuid = uuid.uuid4().hex
     measurement_digest = _measurement_digest()
-    launched_commit = env["PHOENIX_SEARCH_BENCH_COMMIT"]
+    launched_commit = _git_commit()
     started_at_unix = time.time()
     output_tmp = result_dir / f'.{label}.json.{os.getpid()}.tmp'
     _remove_private(output_tmp)
@@ -782,7 +782,7 @@ def _run_reserved(args) -> int:
         PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST=str(manifest), PHOENIX_SEARCH_BENCH_OUT=str(output_tmp),
         PHOENIX_SEARCH_BENCH_SCHEMA_DIGEST=str(capture.get("schema_digest", "")),
         PHOENIX_SEARCH_BENCH_MIGRATION_LEDGER=json.dumps(capture.get("migration_ledger")),
-        PHOENIX_SEARCH_BENCH_COMMIT=_git_commit(), PHOENIX_SEARCH_BENCH_HOST=platform.node(),
+        PHOENIX_SEARCH_BENCH_COMMIT=launched_commit, PHOENIX_SEARCH_BENCH_HOST=platform.node(),
         PHOENIX_SEARCH_BENCH_PLATFORM=platform.platform(), PHOENIX_SEARCH_BENCH_PROCESSOR=platform.processor() or "unknown",
         PHOENIX_SEARCH_BENCH_CPU_COUNT=str(os.cpu_count() or 1))
     process = subprocess.Popen(
