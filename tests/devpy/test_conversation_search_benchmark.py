@@ -37,10 +37,43 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
             "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":1.0, "completed_at_unix":2.0,
             "explain_plans": [], "samples": samples,
-            "fixture_validation":{"index_fresh":True}, "tool_oracle_regime":"none historical", "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
+            "fixture_validation":{"transcript_count":1,"freshness_batch_size":64,"locator_orphans":0,"missing_physical_rows":0,"unlocated_physical_rows":0}, "tool_oracle_regime":"none historical", "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
         }
         value.update(overrides)
         return value
+
+    def test_staged_files_require_root_ignore(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / ".gitignore").write_text("private/*\n")
+            with mock.patch.object(bench, "__file__", str(repo / "scripts" / "helper.py")):
+                bench._ensure_ignored_artifacts(repo / "private")
+                (repo / ".gitignore").write_text("private/captured.db\nprivate/capture-manifest.json\nprivate/scenarios.json\nprivate/report.md\nprivate/runs/\n")
+                with self.assertRaisesRegex(SystemExit, "unignored"):
+                    bench._ensure_ignored_artifacts(repo / "private")
+
+    def test_exact_freshness_and_target_flags(self):
+        for evidence in [{"index_fresh": True}, {**self._complete_run()["fixture_validation"], "locator_orphans":1}]:
+            with self.assertRaisesRegex(SystemExit, "freshness"):
+                bench._validate_run(self._complete_run(fixture_validation=evidence), "bad")
+        with mock.patch.dict("os.environ", {"CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS":"-C target-cpu=native", "CARGO_REGISTRY_TOKEN":"secret"}), mock.patch.object(bench.subprocess, "check_output", return_value="version"):
+            env = bench._build_configuration()["environment"]
+            self.assertIn("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", env)
+            self.assertNotIn("CARGO_REGISTRY_TOKEN", env)
+
+    def test_label_reservation_refuses_second_writer(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "capture-manifest.json").write_text("{}")
+            args = type("Args", (), {"artifacts":str(root), "label":"same"})()
+            def nested(_):
+                with self.assertRaisesRegex(SystemExit, "reserved"):
+                    bench.run(args)
+                return 0
+            with mock.patch.object(bench, "_run_reserved", side_effect=nested):
+                self.assertEqual(bench.run(args), 0)
+            self.assertFalse((root / "runs" / ".same.reserved").exists())
 
     def test_snapshot_captures_committed_wal_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
