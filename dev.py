@@ -4953,6 +4953,9 @@ def _usable_sccache(binary: str | None) -> tuple[str | None, str | None]:
     version, error = _command_version(binary)
     if error:
         return None, error
+    assert version is not None
+    if re.fullmatch(r"sccache \d+\.\d+\.\d+(?:[-+][^ ]+)?", version) is None:
+        return None, f"unrecognized version output: {version}"
     return version, None
 
 

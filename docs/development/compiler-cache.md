@@ -25,6 +25,8 @@ Phoenix-generated cache variables are scoped to direct Cargo subprocesses and th
 
 Kache-specific settings (`KACHE_CACHE_DIR`, `KACHE_SOCKET_PATH`) and sccache-specific settings (`SCCACHE_DIR`, `SCCACHE_CACHE_SIZE`) remain separate. Phoenix does not install tools, purge caches, configure remotes, or replace either tool's garbage-collection policy.
 
+Under pressure, retain the capped cache plus only targets for worktrees still in active use; inspect Kache's `stats`/`clean --dry-run` guidance or sccache's native stats before deleting anything. Do not sum clone-aware target `du` values to choose what to remove, and do not broadly purge active caches or whole target trees as routine setup.
+
 ## Why `auto` prefers Kache
 
 A limited devmbp comparison used official arm64 releases Kache 0.26.0 and sccache 0.18.0, Rust/Cargo 1.95.0, macOS 26.4.1, and APFS. Three fresh-cache runs each executed `cargo check -p phoenix-core --locked` with `CARGO_INCREMENTAL=0`: cold population in source A, a touched same-worktree crate rebuild, then an empty-target restore in detached source B.
@@ -35,6 +37,17 @@ A limited devmbp comparison used official arm64 releases Kache 0.26.0 and sccach
 | sccache 0.18.0 | 42.244, 35.524, 30.799 (**35.524**) | 1.033, 0.883, 0.905 (**0.905**) | 35.008, 29.643, 28.846 (**29.643**) |
 
 Kache was slower to populate, tied for normal edits at this sample size, and faster for the intended empty-target cross-worktree restore. Its final sample reported 250 local hits, 253 misses, 0 errors/fallbacks, 49.7% hit rate, 251,559,534 restored bytes, and 100% zero-copy restore. sccache reported one Rust hit and 382 Rust misses across relocated sources (its 356 total hits were mostly C/C++/assembler), with no cache read/write errors or timeouts. These results justify preferring Kache for Phoenix's multi-worktree shape while retaining explicit `sccache` and `none` escapes; they are not a general performance promise.
+
+A later bounded physical-growth repeat at exact Phoenix source `be1dfae` used two fresh isolated runs per backend in interleaved order, official Kache 0.26.0 versus released sccache 0.18.0, 1 GiB cache caps, retained cache plus both targets, and the same cold/edit/cross-worktree `phoenix-core` workload:
+
+| Backend | Cold seconds (2 runs; median) | Edit seconds (median) | Cross-worktree seconds (median) | Total APFS free-space loss (2 runs; median) | Retained tree allocated blocks (median) |
+|---|---:|---:|---:|---:|---:|
+| Kache 0.26.0 | 35.730, 34.056 (**34.893**) | 0.811, 0.795 (**0.803**) | 18.154, 18.231 (**18.193**) | 318,078,976, 338,120,704 (**328,099,840 bytes**) | 872,357,888 bytes |
+| sccache 0.18.0 | 27.465, 28.677 (**28.071**) | 0.709, 0.714 (**0.712**) | 24.786, 24.686 (**24.736**) | 673,988,608, 676,515,840 (**675,252,224 bytes**) | 727,277,568 bytes |
+
+Kache again traded slower cold population for faster cross-worktree restore. Its native final-run accounting reported a 267,583,057-byte store capped at 1,073,741,824 bytes, only 1,478,431 private store bytes, 266,104,626 bytes cloned into targets with full clone coverage, 250 local hits, 253 misses, and a 49.7% hit rate. sccache's final cache was 111,780,250 bytes under the 1 GiB cap and again recorded one Rust hit versus 382 Rust misses across relocated sources, with zero cache errors/read errors/write errors/timeouts. All twelve compile/check phases succeeded.
+
+The retained-path block sum is deliberately not called unique physical use: it double-counts APFS shared extents, which is why Kache's value is larger even while its isolated volume delta is smaller. The APFS free-space measurement bracketed each phase with `sync` and a two-second settle; paired idle samples varied from -86,016 to +1,146,880 bytes, while unrelated host allocation can still enter a build-length bracket. The volume delta is the best available unprivileged estimate of **extra physical growth for the whole isolated workload**, not inode ownership or exact per-extent truth. Kache can still increase disk use—especially through retained targets—and neither backend fixes chronic pressure by itself.
 
 A single isolated run through actual Phoenix entry points also succeeded for both backends. Fresh-cache `./dev.py check --lanes rust` took 607.14 seconds with Kache and 668.42 seconds with sccache; fresh-target `build_rust()` took 109.22 and 241.03 seconds respectively. These are order-sensitive single samples, not significance evidence. The full acceptance run, `PHOENIX_COMPILER_CACHE=kache ./dev.py check --all`, completed all 19 lanes in 1,051.4 seconds.
 

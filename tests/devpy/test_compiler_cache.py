@@ -209,6 +209,17 @@ class CompilerCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "KACHE_DISABLED"):
             self.configure("kache", env={"KACHE_DISABLED": "1"}, installed={"kache"})
 
+    def test_sccache_probe_requires_recognizable_version(self):
+        for output in ("exit code 0", "", "other 0.18.0"):
+            with self.subTest(output=output), mock.patch.object(
+                self.dev,
+                "_command_version",
+                return_value=(output, None),
+            ):
+                version, error = self.dev._usable_sccache("/bin/sccache")
+                self.assertIsNone(version)
+                self.assertIn("unrecognized version output", error or "")
+
     def test_explicit_sccache_rejects_failed_version_probe(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             self.dev.shutil, "which", return_value="/bin/sccache"
