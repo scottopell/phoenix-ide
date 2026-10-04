@@ -34,7 +34,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "runtime": {"worker_threads": 2}, "explain_enabled": False,
             "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}},
             "expected_case_surface_set": [["case", "tool"]],
-            "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
+            "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20,"scope":"global","visibility":"All","grouping":"messages","match_mode":"NaturalLanguageRecall","lexical_expression":"x"}}],
             "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":float(__import__("time").time_ns()), "completed_at_unix":float(__import__("time").time_ns()),
             "explain_plans": [], "samples": samples,
             "fixture_validation":{"transcript_count":1,"freshness_batch_size":64,"locator_orphans":0,"missing_physical_rows":0,"unlocated_physical_rows":0}, "tool_oracle_regime":"none historical", "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
@@ -126,6 +126,31 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit,"build configuration"): bench._validate_run(run,"bad")
         run=self._complete_run(); run["samples"][0]["result_identity"]=["changed"]
         with self.assertRaisesRegex(SystemExit,"output mismatch"): bench._validate_run(run,"bad")
+
+    def test_unsafe_lock_and_invalid_samples_are_refused(self):
+        for duration in [-1, True, float("nan"), float("inf")]:
+            run=self._complete_run();run["samples"][0]["duration_ms"]=duration
+            with self.assertRaisesRegex(SystemExit,"duration"):bench._validate_run(run,"bad")
+        run=self._complete_run(case_policies=[{"garbage":1}])
+        with self.assertRaisesRegex(SystemExit,"policies"):bench._validate_run(run,"bad")
+        with tempfile.TemporaryDirectory() as d:
+            parent=Path(d);root=parent/"artifact";root.mkdir();target=parent/"foreign";target.write_text("keep");target.chmod(0o644)
+            (root/".capture-lock").symlink_to(target)
+            with self.assertRaises(OSError):bench.snapshot(type("Args",(),{"artifacts":str(root)})())
+            self.assertEqual(target.stat().st_mode&0o777,0o644)
+
+    def test_wal_capture_preserves_source_files_and_committed_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent=Path(d);source=parent/"source.db";conn=sqlite3.connect(source)
+            conn.execute("pragma journal_mode=wal");conn.execute("create table x(v)");conn.execute("insert into x values(42)");conn.commit()
+            initial={p.name for p in parent.iterdir()}
+            reader=sqlite3.connect(bench._uri(source),uri=True);backup=sqlite3.connect(":memory:");reader.backup(backup)
+            self.assertEqual(backup.execute("select v from x").fetchall(),[(42,)])
+            reader.close();backup.close();self.assertEqual({p.name for p in parent.iterdir()},initial);conn.close()
+            initial={p.name for p in parent.iterdir()};artifact=parent/"artifact"
+            with self.assertRaisesRegex(SystemExit,"WAL capture requires"):
+                bench.snapshot(type("Args",(),{"artifacts":str(artifact),"source":str(source),"force":False,"busy_timeout":1,"deadline":10,"retries":1})())
+            self.assertEqual({p.name for p in parent.iterdir()if p!=artifact},initial)
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
