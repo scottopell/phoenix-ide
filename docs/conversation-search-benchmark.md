@@ -12,7 +12,7 @@ conversation data and are private; `conversation-search-benchmark/` is ignored.
   --artifacts conversation-search-benchmark
 ./dev.py conversation-search prepare --artifacts conversation-search-benchmark
 # Replacing frozen scenarios is destructive and requires an explicit override:
-# ./dev.py conversation-search prepare --artifacts conversation-search-benchmark --force
+# Scenarios are immutable after preparation; use a new dedicated directory for a new suite.
 ```
 
 First obtain a consistent standalone OFFLINE snapshot by an operator-supported
@@ -239,3 +239,8 @@ owner PID for operator inspection. Automatic stale-owner reclamation, reboot
 recovery and process-identity authentication are not supported. Confirm no
 active benchmark process before removing a stale reservation manually; no
 samples from an interrupted suite are accepted.
+
+Build support is deliberately constrained to a plain host bundled release build.
+Custom Cargo runners/linkers/incremental overrides are unsupported. This is
+not an exhaustive hermetic toolchain identity guarantee: use a controlled
+host/configuration and compare recorded effective inputs, not arbitrary wrappers.

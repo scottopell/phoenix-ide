@@ -118,6 +118,7 @@ def _measurement_digest() -> str:
 
 
 def _build_configuration() -> dict:
+    if any((key.startswith("CARGO_TARGET_") and key.endswith(("_RUNNER","_LINKER"))) or key.endswith("INCREMENTAL") for key in os.environ): raise SystemExit("custom runner/linker/incremental overrides unsupported")
     if any(key in os.environ for key in ("CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")): raise SystemExit("alternate Cargo compiler selectors unsupported")
     if "LIBSQLITE3_SYS_USE_PKG_CONFIG" in os.environ and os.environ["LIBSQLITE3_SYS_USE_PKG_CONFIG"] != "0": raise SystemExit("external SQLite linkage unsupported for this benchmark; use pinned bundled build")
     """Capture compiler, Cargo, target, profile, and feature inputs to the run."""
@@ -705,10 +706,18 @@ def prepare(args) -> int:
     _write_atomic_private(scenarios_path, json.dumps(scenario_manifest, indent=2)+'\n')
     print(f'wrote frozen scenarios: {scenarios_path}'); return 0
 
+def _validate_before_run(outdir):
+    if not all((outdir/name).is_file() for name in ("captured.db","capture-manifest.json","scenarios.json")): raise SystemExit("run requires valid existing fixture and scenarios")
+    capture = json.loads((outdir/"capture-manifest.json").read_text())
+    fixture = outdir/"captured.db"
+    if capture.get("sha256") != _hash(fixture) or capture.get("size_bytes") != fixture.stat().st_size: raise SystemExit("fixture manifest mismatch")
+
+
 def run(args) -> int:
     if type(args.timeout) not in (int,float) or not math.isfinite(args.timeout) or args.timeout <= 0: raise SystemExit("run timeout must be finite positive")
     outdir = _artifact_root(args.artifacts)
     _ensure_ignored_artifacts(outdir)
+    _validate_before_run(outdir)
     result_dir = outdir / "runs"
     _private(result_dir)
     _label(args.label)
@@ -1000,6 +1009,14 @@ def _validate_run(run: dict, name: str) -> dict:
     ) or len({tuple(pair) for pair in expected_set}) != len(expected_set):
         raise SystemExit(f"refusing comparison: {name} has invalid expected case/surface set")
     digests = {}
+    if run["explain_enabled"]:
+        plans=run.get("explain_plans")
+        if not isinstance(plans,list) or len(plans)!=len(run["expected_case_surface_set"]): raise SystemExit("incomplete EXPLAIN evidence")
+        by_key={(p.get("case_id"),p.get("surface")):p for p in plans if isinstance(p,dict)}
+        if set(by_key)!={tuple(pair) for pair in run["expected_case_surface_set"]}: raise SystemExit("incomplete EXPLAIN cases")
+        for p in run["case_policies"]:
+            entry=by_key[(p["case_id"],p["surface"])]
+            if entry.get("policy")!=p["policy"] or not isinstance(entry.get("query"),str) or not isinstance(entry.get("plan"),list) or not entry["plan"] or not all(isinstance(line,str) and line for line in entry["plan"]): raise SystemExit("invalid EXPLAIN plan")
     phases = {}
     for sample in run["samples"]:
         key = (sample.get("case_id"), sample.get("surface"))
