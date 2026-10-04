@@ -83,6 +83,7 @@ pub struct ActiveDirectTurnSettlement {
     pub terminal: ActiveDirectTurnTerminal,
     pub state: ConvState,
     pub state_updated_at: DateTime<Utc>,
+    pub execution_occurrence_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1456,6 +1457,45 @@ impl DatabaseStorage {
     pub fn inner(&self) -> &Database {
         &self.db
     }
+
+    pub async fn settle_active_direct_turn_if_occurrence_unchanged(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<bool, String> {
+        let expectation = settlement
+            .execution_occurrence_message_id
+            .as_deref()
+            .map_or(
+                phoenix_db::workflow::ExecutionOccurrenceExpectation::Absent,
+                phoenix_db::workflow::ExecutionOccurrenceExpectation::Exact,
+            );
+        let repo = self.db.workflow_repository();
+        repo.terminalize_authoritative_turn_if_occurrence_unchanged(
+            &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                command: direct_turn_terminal_command(
+                    &settlement.turn,
+                    settlement.terminal.clone(),
+                ),
+                projection: Some(phoenix_db::workflow::PersistedConversationProjection {
+                    state: settlement.state.clone(),
+                    state_updated_at: settlement.state_updated_at,
+                }),
+                provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                    &settlement.conversation_id,
+                    &settlement.state,
+                ),
+            },
+            expectation,
+        )
+        .await
+        .map(|outcome| {
+            matches!(
+                outcome,
+                phoenix_db::workflow::TerminalizeAuthoritativeTurnOutcome::Settled(_)
+            )
+        })
+        .map_err(|error| error.to_string())
+    }
 }
 
 fn direct_turn_terminal_command(
@@ -1945,7 +1985,7 @@ impl MessageStore for DatabaseStorage {
         settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String> {
         let repo = self.db.workflow_repository();
-        repo.terminalize_authoritative_turn(
+        repo.terminalize_authoritative_turn_with_occurrence(
             &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
                 command: direct_turn_terminal_command(
                     &settlement.turn,
@@ -1960,6 +2000,7 @@ impl MessageStore for DatabaseStorage {
                     &settlement.state,
                 ),
             },
+            settlement.execution_occurrence_message_id.as_deref(),
         )
         .await
         .map(|_| ())

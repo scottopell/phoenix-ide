@@ -3,7 +3,7 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentTranscript, SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, ToolUseBlock, UserMessage, QueuedUserMessage, TerminalToolResultHighlight } from './MessageComponents';
+import { SubAgentTranscript, SubAgentStatus, AgentMessage, SendConversationMessageView, ToolOnlyAgentTurnGroup, ToolUseBlock, UnwatchResultView, UserMessage, QueuedUserMessage, TerminalToolResultHighlight, WatchingResultView } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -14,6 +14,87 @@ import { ForkProposalReview } from './ForkProposalReview';
 import { createInitialAtom } from '../conversation/atom';
 import { buildRenderUnits } from '../conversation/renderUnits';
 import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
+
+describe('Global coordinator tool results', () => {
+  it('renders queued delivery truthfully with recipient navigation', () => {
+    render(
+      <MemoryRouter>
+        <SendConversationMessageView response={{
+          outcome: 'queued_as_steering', target: '@conv:product-1', conversation_id: 'transcript-1', message_id: 'message-1',
+        }} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText('Queued as steering')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/product-conversations/product-1');
+    expect(screen.getByRole('link', { name: 'Open receiving transcript' })).toHaveAttribute('href', '/c/transcript-1');
+    expect(screen.getByText('@conv:product-1')).toBeInTheDocument();
+    expect(screen.getByText(/recipient understanding or completion is not implied/i)).toBeInTheDocument();
+  });
+
+  it('renders rejected delivery without implying acceptance', () => {
+    render(
+      <MemoryRouter>
+        <SendConversationMessageView response={{
+          outcome: 'rejected', target: '@transcript:transcript-2', conversation_id: 'transcript-2', message_id: 'message-2',
+          reason_code: 'invalid_state_for_message', message: 'Recipient cannot accept messages in this state',
+        }} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText('Rejected')).toBeInTheDocument();
+    expect(screen.getByText('Recipient cannot accept messages in this state')).toBeInTheDocument();
+    expect(screen.getByText('message-2')).toBeInTheDocument();
+    expect(screen.getByText('invalid_state_for_message')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open target transcript' })).toHaveAttribute('href', '/c/transcript-2');
+    expect(screen.queryByText(/understanding or completion/i)).not.toBeInTheDocument();
+  });
+
+  it('renders unwatch outcomes without claiming the watch list is empty', () => {
+    const { rerender } = render(
+      <MemoryRouter><UnwatchResultView response={{ product_conversation_id: 'product-2', ended: true }} /></MemoryRouter>,
+    );
+    expect(screen.getByText('Watch ended')).toBeInTheDocument();
+    expect(screen.queryByText('No active watches.')).not.toBeInTheDocument();
+
+    rerender(<MemoryRouter><UnwatchResultView response={{ product_conversation_id: 'product-2', ended: false }} /></MemoryRouter>);
+    expect(screen.getByText('Watch not found')).toBeInTheDocument();
+  });
+
+  it('links the authoritative Bash environment owner and keeps IDs secondary', () => {
+    render(
+      <MemoryRouter>
+        <ToolUseBlock
+          block={{ type: 'tool_use', id: 'bash-owner', name: 'bash', input: { cmd: 'pwd', wait_seconds: 1 } }}
+          result={{
+            message_id: 'result-owner', sequence_id: 2, conversation_id: 'coordinator', message_type: 'tool', created_at: new Date().toISOString(),
+            content: { tool_use_id: 'bash-owner', result: JSON.stringify({ command: 'pwd', output: '/repo', status: 'completed' }) },
+            display_data: { coordinator_environment: {
+              owner_name: 'Readable owner', owner_product_conversation_id: 'product-owner',
+              work_scope_id: 'scope-owner', cwd: '/repo', project_path: '/repo',
+            } },
+          }}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole('link', { name: 'Readable owner' })).toHaveAttribute('href', '/product-conversations/product-owner');
+    expect(screen.getByRole('link', { name: 'Readable owner' })).toHaveAttribute('title', 'Owning conversation: Readable owner');
+    expect(screen.getByText('scope-owner')).not.toBeVisible();
+  });
+
+  it('renders active watches with stable and current transcript links', () => {
+    render(
+      <MemoryRouter>
+        <WatchingResultView response={[{
+          product_conversation_id: 'product-3', current_transcript_id: 'transcript-3', current_state: { type: 'Idle' },
+        }]} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/product-conversations/product-3');
+    expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/transcript-3');
+    expect(screen.getByText('product-3')).toBeInTheDocument();
+    expect(screen.getByText('Idle')).toBeInTheDocument();
+  });
+});
 
 let mockDensity: 'full' | 'compact' = 'full';
 

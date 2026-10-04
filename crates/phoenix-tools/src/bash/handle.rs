@@ -209,6 +209,8 @@ pub struct Handle {
     /// entry of the cap-reached error. See REQ-BASH-002 / REQ-BASH-010 and
     /// the `Handle.label` field in `bash.allium`.
     pub label: Option<String>,
+    /// Canonical working directory captured at spawn time.
+    pub working_dir: std::path::PathBuf,
     pub started_at: SystemTime,
     /// The current handle state. Always written through
     /// [`Self::transition_to_terminal`].
@@ -233,6 +235,7 @@ impl std::fmt::Debug for Handle {
             .field("launch_identity", &self.launch_identity)
             .field("cmd", &self.cmd)
             .field("label", &self.label)
+            .field("working_dir", &self.working_dir)
             .field("started_at", &self.started_at)
             .finish_non_exhaustive()
     }
@@ -256,6 +259,78 @@ fn successful_group_signal_outcome(
     }
 }
 
+#[cfg(target_os = "linux")]
+struct PidfdGuard {
+    pidfd: libc::c_int,
+    stopped: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PidfdGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if self.stopped {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd,
+                    libc::SIGCONT,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+            libc::close(self.pidfd);
+        }
+    }
+}
+
+#[must_use]
+pub fn exact_stop_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+            if pidfd < 0 {
+                return false;
+            }
+            let Ok(pidfd) = libc::c_int::try_from(pidfd) else {
+                return false;
+            };
+            let signal_admitted = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    0,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            } == 0;
+            let supported = signal_admitted
+                && libc::id_t::try_from(pidfd).is_ok_and(|pidfd_id| {
+                    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                    let status = unsafe {
+                        libc::waitid(
+                            libc::P_PIDFD,
+                            pidfd_id,
+                            info.as_mut_ptr(),
+                            libc::WSTOPPED | libc::WNOHANG,
+                        )
+                    };
+                    status == 0
+                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+                });
+            unsafe {
+                libc::close(pidfd);
+            }
+            supported
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 impl Handle {
     /// Construct a fresh live handle for a freshly spawned child.
     ///
@@ -264,13 +339,14 @@ impl Handle {
     /// supplied by the agent on the run call (REQ-BASH-002).
     // pgid/pid mirror the `Handle` entity field names from `bash.allium`;
     // renaming for clippy's similar-names lint would diverge from the spec.
-    #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
     #[must_use]
     pub fn new_live(
         controller_scope: ResourceScopeKey,
         handle_id: HandleId,
         cmd: String,
         label: Option<String>,
+        working_dir: std::path::PathBuf,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -282,6 +358,7 @@ impl Handle {
             ResourceAuthority::Work,
             cmd,
             label,
+            working_dir,
             pgid,
             pid,
             ring_bytes_cap,
@@ -297,6 +374,7 @@ impl Handle {
         authority: ResourceAuthority,
         cmd: String,
         label: Option<String>,
+        working_dir: std::path::PathBuf,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -308,6 +386,7 @@ impl Handle {
             authority,
             cmd,
             label,
+            working_dir,
             pgid,
             pid,
             ring_bytes_cap,
@@ -323,6 +402,7 @@ impl Handle {
         authority: ResourceAuthority,
         cmd: String,
         label: Option<String>,
+        working_dir: std::path::PathBuf,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -335,6 +415,7 @@ impl Handle {
             authority,
             cmd,
             label,
+            working_dir,
             pgid,
             pid,
             ring_bytes_cap,
@@ -351,6 +432,7 @@ impl Handle {
         authority: ResourceAuthority,
         cmd: String,
         label: Option<String>,
+        working_dir: std::path::PathBuf,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -369,6 +451,7 @@ impl Handle {
             authority,
             cmd,
             label,
+            working_dir,
             started_at: SystemTime::now(),
             state: RwLock::new(Arc::new(HandleState::Live(live))),
             kill_attempt: RwLock::new(None),
@@ -576,18 +659,19 @@ impl Handle {
                 Err(error)
             };
         }
+        let pidfd = libc::c_int::try_from(pidfd)
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let mut pidfd = PidfdGuard {
+            pidfd,
+            stopped: false,
+        };
         if current_process_identity(live.pid) != Some(self.launch_identity.process) {
-            let pidfd = i32::try_from(pidfd)
-                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-            if unsafe { libc::close(pidfd) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
             return Ok(None);
         }
         let stopped = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                pidfd,
+                pidfd.pidfd,
                 libc::SIGSTOP,
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
@@ -596,7 +680,8 @@ impl Handle {
         let result = if stopped != 0 {
             Err(std::io::Error::last_os_error())
         } else {
-            let pidfd_id = libc::id_t::try_from(pidfd)
+            pidfd.stopped = true;
+            let pidfd_id = libc::id_t::try_from(pidfd.pidfd)
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
             loop {
@@ -627,12 +712,15 @@ impl Handle {
                         let resumed = unsafe {
                             libc::syscall(
                                 libc::SYS_pidfd_send_signal,
-                                pidfd,
+                                pidfd.pidfd,
                                 libc::SIGCONT,
                                 std::ptr::null::<libc::siginfo_t>(),
                                 0,
                             )
                         };
+                        if resumed == 0 {
+                            pidfd.stopped = false;
+                        }
                         if let Some(error) = signal_error {
                             Err(error)
                         } else {
@@ -671,11 +759,6 @@ impl Handle {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         };
-        let pidfd =
-            i32::try_from(pidfd).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-        if unsafe { libc::close(pidfd) } != 0 && result.is_ok() {
-            return Err(std::io::Error::last_os_error());
-        }
         result
     }
 
@@ -777,6 +860,7 @@ mod tests {
             HandleId::new("b-1"),
             "echo hi".into(),
             None,
+            std::path::PathBuf::from("/tmp"),
             12345,
             12345,
             super::super::ring::RING_BUFFER_BYTES,

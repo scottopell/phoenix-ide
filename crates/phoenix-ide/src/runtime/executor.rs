@@ -385,6 +385,7 @@ enum StartupSteeringDrainOutcome {
 pub(crate) enum StartupLlmRecovery {
     SettleInterrupted,
     ResumeCommittedSteering,
+    ResumeOwedBaton,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2572,6 +2573,9 @@ where
                             StartupLlmRecovery::ResumeCommittedSteering => {
                                 self.resume_committed_steering_request().await
                             }
+                            StartupLlmRecovery::ResumeOwedBaton => {
+                                self.resume_owed_baton_request().await
+                            }
                             StartupLlmRecovery::SettleInterrupted => {
                                 Box::pin(self.settle_interrupted_llm_request()).await
                             }
@@ -2597,6 +2601,9 @@ where
         }
 
         // REQ-BED-030: crash recovery for AwaitingRecovery.
+        if let Some(ack) = self.startup_llm_recovery_ack.take() {
+            let _ = ack.send(Ok(()));
+        }
 
         if let ConvState::AwaitingContinuation { request } = &self.state {
             tracing::info!(
@@ -3888,6 +3895,7 @@ where
                                     .clone(),
                                 state: self.state.clone(),
                                 state_updated_at: self.state_updated_at,
+                                execution_occurrence_message_id: None,
                             })
                         }
                         _ => None,
@@ -3983,6 +3991,7 @@ where
                             .clone(),
                         state: self.state.clone(),
                         state_updated_at: self.state_updated_at,
+                        execution_occurrence_message_id: None,
                     };
                     match self
                         .storage
@@ -4600,6 +4609,7 @@ where
             terminal: terminal.as_ref().clone(),
             state: self.state.clone(),
             state_updated_at: self.state_updated_at,
+            execution_occurrence_message_id: None,
         };
         let parent = self
             .turn_span
@@ -6417,6 +6427,7 @@ where
                                             },
                                             state: self.state.clone(),
                                             state_updated_at: self.state_updated_at,
+                                            execution_occurrence_message_id: None,
                                         },
                                     )
                                     .instrument(
@@ -6711,6 +6722,7 @@ where
                         terminal: terminal.clone(),
                         state: self.state.clone(),
                         state_updated_at: self.state_updated_at,
+                        execution_occurrence_message_id: None,
                     };
                     self.persist_checkpoint_with_terminal_obligation(data, &settlement, admitted)
                         .await
@@ -7177,6 +7189,36 @@ where
         }
     }
 
+    async fn resume_owed_baton_request(&mut self) -> Result<(), String> {
+        let Some(expected) = self.active_direct_turn.as_ref() else {
+            return Err("owed-baton recovery has no active direct-turn identity".to_string());
+        };
+        let current = self
+            .storage
+            .load_active_direct_turn(&self.context.conversation_id)
+            .await?;
+        let still_owned = current.as_ref().is_some_and(|loaded| {
+            loaded.active().turn_id == expected.turn_id
+                && loaded.active().generation == expected.generation
+        });
+        if !still_owned {
+            tracing::info!(
+                conversation_id = %self.context.conversation_id,
+                turn_id = expected.turn_id.0,
+                generation = expected.generation,
+                "Suppressing stale restart baton after durable ownership changed"
+            );
+            self.active_direct_turn = None;
+            let committed = self
+                .storage
+                .get_state_snapshot(&self.context.conversation_id)
+                .await?;
+            self.install_live_state(committed.state, committed.state_updated_at, false)?;
+            return Ok(());
+        }
+        self.resume_committed_steering_request().await
+    }
+
     async fn settle_interrupted_llm_request(&mut self) -> Result<(), String> {
         let attempt = match self.state {
             ConvState::LlmRequesting { attempt } => attempt,
@@ -7200,6 +7242,7 @@ where
                     },
                     state: state.clone(),
                     state_updated_at,
+                    execution_occurrence_message_id: None,
                 })
                 .await?;
             self.state = state.clone();
@@ -8623,6 +8666,7 @@ where
                 terminal: terminal.clone(),
                 state: self.state.clone(),
                 state_updated_at: self.state_updated_at,
+                execution_occurrence_message_id: None,
             };
             return self
                 .persist_terminal_sub_agent_results(
@@ -21575,6 +21619,7 @@ mod steer_drain_detector_tests {
             terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
             state: ConvState::Idle,
             state_updated_at: Utc::now(),
+            execution_occurrence_message_id: None,
         };
         let mut rx = rt.broadcast_tx.subscribe();
         let data = CheckpointData::tool_round(

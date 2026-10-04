@@ -561,7 +561,7 @@ impl Fts5Retriever {
             if excluding {
                 sql.push_str(" AND meta.conversation_id NOT IN (");
             } else {
-                sql.push_str(" AND meta.conversation_id IN (");
+                sql.push_str(" AND +meta.conversation_id IN (");
             }
             for i in 0..scope_ids.len() {
                 if i > 0 {
@@ -1547,6 +1547,83 @@ mod tests {
             .unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].message_id, "m2");
+    }
+
+    #[tokio::test]
+    async fn scoped_results_match_global_filter_before_limit_for_numeric_text_ids() {
+        let db = seed().await;
+        for id in ["00123", "9007199254740993", "123"] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        db.add_message(
+            "scope-out-strong",
+            "123",
+            &MessageContent::user("scopeproof ".repeat(32)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "scope-in-1",
+            "00123",
+            &MessageContent::user("scopeproof"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "scope-in-2",
+            "9007199254740993",
+            &MessageContent::user("scopeproof"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let retriever = db.fts_retriever();
+        let scope = ["00123".to_string(), "9007199254740993".to_string()];
+        let limit = 2;
+        let scoped_request = RetrievalRequest {
+            query: "scopeproof".to_string(),
+            scope: RetrievalScope::Conversations(scope.to_vec()),
+            visibility: RetrievalVisibility::All,
+            grouping: RetrievalGrouping::None,
+            match_mode: RetrievalMatchMode::ExactTerms,
+            limit,
+        };
+        let scoped = retriever.retrieve(scoped_request).await.unwrap();
+
+        // The unbounded global candidate set is the reference for applying the
+        // same scope and limit in Rust. A bounded global query would be an
+        // invalid oracle because the stronger out-of-scope hit would starve it.
+        let global = retriever
+            .retrieve(RetrievalRequest {
+                query: "scopeproof".to_string(),
+                scope: RetrievalScope::Global,
+                visibility: RetrievalVisibility::All,
+                grouping: RetrievalGrouping::None,
+                match_mode: RetrievalMatchMode::ExactTerms,
+                limit: usize::MAX,
+            })
+            .await
+            .unwrap();
+        assert_eq!(global[0].conversation_id, "123");
+        let expected = global
+            .into_iter()
+            .filter(|hit| scope.contains(&hit.conversation_id))
+            .take(limit)
+            .collect::<Vec<_>>();
+        assert_eq!(scoped.len(), limit);
+        assert_eq!(
+            format!("{scoped:?}"),
+            format!("{expected:?}"),
+            "scoped retrieval must equal global ranking filtered before limiting"
+        );
     }
 
     #[tokio::test]

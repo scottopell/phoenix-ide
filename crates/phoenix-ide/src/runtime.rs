@@ -49,7 +49,7 @@ use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 pub type ProductionRuntime =
     ConversationRuntime<DatabaseStorage, RegistryLlmClient, ToolRegistryExecutor>;
 
-use crate::db::{ConvMode, Database};
+use crate::db::{ConvMode, Database, ExecutionOccurrenceTerminal};
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
 use chrono::{DateTime, Utc};
@@ -749,6 +749,35 @@ enum BashLifecycleBridgeAction {
     Ignore,
     Broadcast,
     Reconcile,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BatonRecovery {
+    turn: ActiveDirectTurn,
+    decision: recovery::RecoveryDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutionOccurrenceDisposition {
+    Resume,
+    Completed,
+    RestartLoopDetected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutionOccurrenceRecovery {
+    source_message_id: String,
+    disposition: ExecutionOccurrenceDisposition,
+}
+
+impl ExecutionOccurrenceRecovery {
+    fn needs_resume(&self) -> bool {
+        self.disposition == ExecutionOccurrenceDisposition::Resume
+    }
+
+    fn restart_loop_detected(&self) -> bool {
+        self.disposition == ExecutionOccurrenceDisposition::RestartLoopDetected
+    }
 }
 
 type StartupLlmRecoveryReceipt = oneshot::Receiver<Result<(), String>>;
@@ -3715,30 +3744,154 @@ impl RuntimeManager {
         *self.startup_obligated_conversations.write().await = conversation_ids;
     }
 
-    pub async fn settle_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
-        let conversation_ids = self
+    async fn startup_llm_recovery_conversation_ids(&self) -> Result<Vec<String>, String> {
+        let mut ids = self
             .db
             .llm_requesting_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
+        ids.extend(
+            self.db
+                .owed_baton_conversation_ids()
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        ids.extend(
+            self.db
+                .execution_occurrence_conversation_ids()
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        ids.extend(
+            self.db
+                .queued_steering_conversation_ids()
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    async fn execution_occurrence_recovery(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ExecutionOccurrenceRecovery>, String> {
+        let Some(source_message_id) = self
+            .db
+            .latest_execution_occurrence_message_id(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        for _ in 0..3 {
+            let messages = self
+                .db
+                .get_recovery_messages_from_source(conversation_id, &source_message_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !messages.iter().any(|message| {
+                matches!(
+                    message.message_type,
+                    phoenix_core::domain::db_schema::MessageType::Agent
+                )
+            }) {
+                let disposition = if recovery::restart_recovery_exhausted(&messages) {
+                    ExecutionOccurrenceDisposition::RestartLoopDetected
+                } else {
+                    ExecutionOccurrenceDisposition::Resume
+                };
+                return Ok(Some(ExecutionOccurrenceRecovery {
+                    source_message_id,
+                    disposition,
+                }));
+            }
+            let tail = self
+                .db
+                .get_recovery_tail_status(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let decision = recovery::decide_recovery(&messages, &tail);
+            let disposition = match decision.reason {
+                recovery::RecoveryReason::TranscriptChanged => continue,
+                recovery::RecoveryReason::RestartLoopDetected => {
+                    ExecutionOccurrenceDisposition::RestartLoopDetected
+                }
+                _ if decision.needs_auto_continue => ExecutionOccurrenceDisposition::Resume,
+                _ => ExecutionOccurrenceDisposition::Completed,
+            };
+            return Ok(Some(ExecutionOccurrenceRecovery {
+                source_message_id,
+                disposition,
+            }));
+        }
+        Err(
+            "restart transcript changed repeatedly during execution occurrence classification"
+                .to_string(),
+        )
+    }
+
+    async fn startup_resumable_owner(
+        &self,
+        conversation_id: &str,
+        conversation: &crate::db::Conversation,
+        baton_recovery: Option<&BatonRecovery>,
+        has_resumable_occurrence: bool,
+    ) -> Result<bool, String> {
+        Ok(
+            matches!(conversation.state, ConvState::SeededLlmRequesting { .. })
+                || baton_recovery.is_some_and(|recovery| recovery.decision.needs_auto_continue)
+                || has_resumable_occurrence
+                || self
+                    .db
+                    .has_pending_approval_request(conversation_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                || self
+                    .db
+                    .has_committed_steering_turn(conversation_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+        )
+    }
+
+    pub async fn settle_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
+        let conversation_ids = self.startup_llm_recovery_conversation_ids().await?;
         for conversation_id in conversation_ids {
             let conversation = self
                 .db
                 .get_conversation(&conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            let resumable_owner =
-                matches!(conversation.state, ConvState::SeededLlmRequesting { .. })
-                    || self
-                        .db
-                        .has_pending_approval_request(&conversation_id)
-                        .await
-                        .map_err(|error| error.to_string())?
-                    || self
-                        .db
-                        .has_committed_steering_turn(&conversation_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
+            let baton_recovery = self.owned_baton_recovery(&conversation_id).await?;
+            let has_queued_steering = self.has_queued_steering(&conversation_id).await?;
+            let occurrence_recovery = self.execution_occurrence_recovery(&conversation_id).await?;
+            let has_resumable_occurrence = occurrence_recovery
+                .as_ref()
+                .is_some_and(ExecutionOccurrenceRecovery::needs_resume);
+            if self
+                .settle_startup_recovery_owners(
+                    &conversation_id,
+                    &conversation.state,
+                    occurrence_recovery.as_ref(),
+                    baton_recovery.as_ref(),
+                    has_queued_steering,
+                    has_resumable_occurrence,
+                )
+                .await?
+            {
+                continue;
+            }
+            let resumable_owner = self
+                .startup_resumable_owner(
+                    &conversation_id,
+                    &conversation,
+                    baton_recovery.as_ref(),
+                    has_resumable_occurrence,
+                )
+                .await?;
             let stored_model_id = conversation
                 .model
                 .unwrap_or_else(|| self.llm_registry.default_model_id());
@@ -3755,6 +3908,8 @@ impl RuntimeManager {
                     &conversation_id,
                     &error,
                     resumable_owner,
+                    baton_recovery.as_ref(),
+                    occurrence_recovery.as_ref(),
                 )
                 .await?;
                 continue;
@@ -3771,6 +3926,8 @@ impl RuntimeManager {
                         &conversation_id,
                         &error.to_string(),
                         resumable_owner,
+                        baton_recovery.as_ref(),
+                        occurrence_recovery.as_ref(),
                     )
                     .await?;
                     continue;
@@ -3800,48 +3957,417 @@ impl RuntimeManager {
             .map_err(|_| "runtime exited before acknowledging startup LLM recovery".to_string())?
     }
 
+    async fn settle_startup_recovery_owners(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        occurrence: Option<&ExecutionOccurrenceRecovery>,
+        baton: Option<&BatonRecovery>,
+        has_queued_steering: bool,
+        has_resumable_occurrence: bool,
+    ) -> Result<bool, String> {
+        if self
+            .settle_restart_exhaustion(
+                conversation_id,
+                occurrence,
+                baton,
+                has_queued_steering,
+                has_resumable_occurrence,
+            )
+            .await?
+        {
+            return Ok(true);
+        }
+        let settled_occurrence = self
+            .settle_occurrence_unless_deferred(conversation_id, occurrence, has_queued_steering)
+            .await?;
+        let Some(baton_state) = self
+            .remaining_baton_state(
+                conversation_id,
+                state,
+                settled_occurrence,
+                has_queued_steering || baton.is_some(),
+            )
+            .await?
+        else {
+            return Ok(true);
+        };
+        self.settle_nonresumable_idle_baton(
+            conversation_id,
+            &baton_state,
+            baton,
+            has_queued_steering || has_resumable_occurrence,
+        )
+        .await
+    }
+
+    async fn remaining_baton_state(
+        &self,
+        conversation_id: &str,
+        prior_state: &ConvState,
+        settled_occurrence: bool,
+        has_remaining_authority: bool,
+    ) -> Result<Option<ConvState>, String> {
+        if !settled_occurrence {
+            return Ok(Some(prior_state.clone()));
+        }
+        if !has_remaining_authority {
+            return Ok(None);
+        }
+        self.db
+            .get_conversation(conversation_id)
+            .await
+            .map(|conversation| Some(conversation.state))
+            .map_err(|error| error.to_string())
+    }
+
+    async fn settle_nonresumable_idle_baton(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        baton_recovery: Option<&BatonRecovery>,
+        has_newer_authority: bool,
+    ) -> Result<bool, String> {
+        let Some(recovery) = baton_recovery.filter(|recovery| {
+            matches!(state, ConvState::Idle)
+                && !has_newer_authority
+                && !recovery.decision.needs_auto_continue
+        }) else {
+            return Ok(false);
+        };
+        self.persist_nonresumable_baton_settlement(
+            conversation_id,
+            &recovery.turn,
+            recovery.decision.reason.clone(),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn settle_restart_exhaustion(
+        &self,
+        conversation_id: &str,
+        occurrence: Option<&ExecutionOccurrenceRecovery>,
+        baton_recovery: Option<&BatonRecovery>,
+        has_queued_steering: bool,
+        has_resumable_occurrence: bool,
+    ) -> Result<bool, String> {
+        if has_queued_steering {
+            return Ok(false);
+        }
+        let exhausted_occurrence_owns_baton = occurrence
+            .is_some_and(ExecutionOccurrenceRecovery::restart_loop_detected)
+            && baton_recovery.is_some();
+        if let Some(occurrence) = occurrence
+            .filter(|occurrence| occurrence.restart_loop_detected() && baton_recovery.is_some())
+        {
+            let current_source = self
+                .db
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if current_source.as_deref() != Some(occurrence.source_message_id.as_str()) {
+                return Ok(true);
+            }
+        }
+        let baton_recovery_exhausted = !has_resumable_occurrence
+            && baton_recovery.is_some_and(|recovery| {
+                recovery.decision.reason == recovery::RecoveryReason::RestartLoopDetected
+            });
+        if !exhausted_occurrence_owns_baton && !baton_recovery_exhausted {
+            return Ok(false);
+        }
+        self.persist_restart_loop_failure(
+            conversation_id,
+            &baton_recovery
+                .expect("exhausted baton recovery has an owner")
+                .turn,
+            occurrence
+                .filter(|occurrence| occurrence.restart_loop_detected())
+                .map(|occurrence| occurrence.source_message_id.as_str()),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn settle_occurrence_unless_deferred(
+        &self,
+        conversation_id: &str,
+        occurrence: Option<&ExecutionOccurrenceRecovery>,
+        has_queued_steering: bool,
+    ) -> Result<bool, String> {
+        if has_queued_steering
+            && occurrence.is_some_and(ExecutionOccurrenceRecovery::restart_loop_detected)
+        {
+            let occurrence = occurrence.expect("guarded exhausted occurrence");
+            self.db
+                .settle_execution_occurrence(
+                    conversation_id,
+                    &occurrence.source_message_id,
+                    &ExecutionOccurrenceTerminal::Failed {
+                        reason: "Restart recovery was superseded by newer accepted steering."
+                            .to_string(),
+                    },
+                    &ConvState::Idle,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        self.settle_execution_occurrence_recovery(conversation_id, occurrence)
+            .await
+    }
+
+    async fn settle_execution_occurrence_recovery(
+        &self,
+        conversation_id: &str,
+        occurrence: Option<&ExecutionOccurrenceRecovery>,
+    ) -> Result<bool, String> {
+        let Some(occurrence) = occurrence else {
+            return Ok(false);
+        };
+        let (terminal, state) = match occurrence.disposition {
+            ExecutionOccurrenceDisposition::Resume => return Ok(false),
+            ExecutionOccurrenceDisposition::Completed => {
+                (ExecutionOccurrenceTerminal::Completed, ConvState::Idle)
+            }
+            ExecutionOccurrenceDisposition::RestartLoopDetected => {
+                let message =
+                    "Automatic restart recovery stopped after repeated crashes for this accepted input."
+                        .to_string();
+                (
+                    ExecutionOccurrenceTerminal::Failed {
+                        reason: message.clone(),
+                    },
+                    ConvState::Error {
+                        message,
+                        error_kind: crate::db::ErrorKind::InvalidRequest,
+                        resets_at: None,
+                    },
+                )
+            }
+        };
+        self.db
+            .settle_execution_occurrence(
+                conversation_id,
+                &occurrence.source_message_id,
+                &terminal,
+                &state,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn has_queued_steering(&self, conversation_id: &str) -> Result<bool, String> {
+        self.db
+            .get_steering_queue(conversation_id)
+            .await
+            .map(|entries| !entries.is_empty())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn owed_baton_needs_auto_continue(&self, conversation_id: &str) -> Result<bool, String> {
+        Ok(self
+            .owned_baton_recovery(conversation_id)
+            .await?
+            .is_some_and(|recovery| recovery.decision.needs_auto_continue))
+    }
+
+    async fn owned_baton_recovery(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<BatonRecovery>, String> {
+        let storage = DatabaseStorage::new(self.db.clone());
+        let Some(turn) = storage.load_active_direct_turn(conversation_id).await? else {
+            return Ok(None);
+        };
+        let LoadedActiveDirectTurn::Materialized { active: turn, .. } = turn else {
+            return Ok(None);
+        };
+        for _ in 0..3 {
+            let messages = self
+                .db
+                .get_recovery_messages(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let tail = self
+                .db
+                .get_recovery_tail_status(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let decision = recovery::decide_recovery(&messages, &tail);
+            if decision.reason != recovery::RecoveryReason::TranscriptChanged {
+                return Ok(Some(BatonRecovery { turn, decision }));
+            }
+        }
+        Err("restart transcript changed repeatedly during durable baton classification".to_string())
+    }
+
+    async fn settle_classified_baton(
+        &self,
+        storage: &DatabaseStorage,
+        settlement: ActiveDirectTurnSettlement,
+    ) -> Result<(), String> {
+        let classified = settlement.turn.clone();
+        let conversation_id = settlement.conversation_id.clone();
+        if let Err(error) = storage
+            .settle_active_direct_turn_if_occurrence_unchanged(&settlement)
+            .await
+        {
+            let active = storage.load_active_direct_turn(&conversation_id).await?;
+            if active.is_some_and(|active| {
+                let active = active.active();
+                active.turn_id == classified.turn_id && active.generation == classified.generation
+            }) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_nonresumable_baton_settlement(
+        &self,
+        conversation_id: &str,
+        turn: &ActiveDirectTurn,
+        reason: recovery::RecoveryReason,
+    ) -> Result<(), String> {
+        let storage = DatabaseStorage::new(self.db.clone());
+        let terminal = ActiveDirectTurnTerminal::Failed {
+            reason: format!(
+                "Restart recovery settled without durable terminal evidence: {reason:?}"
+            ),
+        };
+        self.settle_classified_baton(
+            &storage,
+            ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: turn.clone(),
+                terminal,
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+                execution_occurrence_message_id: None,
+            },
+        )
+        .await
+    }
+
+    async fn persist_restart_loop_failure(
+        &self,
+        conversation_id: &str,
+        turn: &ActiveDirectTurn,
+        execution_occurrence_message_id: Option<&str>,
+    ) -> Result<(), String> {
+        let storage = DatabaseStorage::new(self.db.clone());
+        let message =
+            "Automatic restart recovery stopped after repeated crashes in the same user turn."
+                .to_string();
+        self.settle_classified_baton(
+            &storage,
+            ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: turn.clone(),
+                terminal: ActiveDirectTurnTerminal::Failed {
+                    reason: message.clone(),
+                },
+                state: ConvState::Error {
+                    message,
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                    resets_at: None,
+                },
+                state_updated_at: Utc::now(),
+                execution_occurrence_message_id: execution_occurrence_message_id
+                    .map(str::to_string),
+            },
+        )
+        .await
+    }
+
     async fn persist_startup_llm_initialization_failure(
         &self,
         conversation_id: &str,
         initialization_error: &str,
         resumable_owner: bool,
+        baton_recovery: Option<&BatonRecovery>,
+        occurrence_recovery: Option<&ExecutionOccurrenceRecovery>,
     ) -> Result<(), String> {
         let state_updated_at = Utc::now();
-        let storage = DatabaseStorage::new(self.db.clone());
-        if let Some(turn) = storage.load_active_direct_turn(conversation_id).await? {
-            storage
-                .settle_active_direct_turn(&ActiveDirectTurnSettlement {
-                    conversation_id: conversation_id.to_string(),
-                    turn: turn.into_active(),
-                    terminal: ActiveDirectTurnTerminal::Failed {
+        let error_state = ConvState::Error {
+            message: format!(
+                "The server restarted while this accepted request was pending, and recovery could not initialize: {initialization_error}"
+            ),
+            error_kind: crate::db::ErrorKind::InvalidRequest,
+            resets_at: None,
+        };
+        let occurrence_recovery = if let Some(classified) = occurrence_recovery {
+            let current_source = self
+                .db
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if current_source.as_deref() != Some(classified.source_message_id.as_str()) {
+                return Ok(());
+            }
+            Some(classified)
+        } else {
+            None
+        };
+        if let Some(baton_recovery) = baton_recovery {
+            let settlement = ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: baton_recovery.turn.clone(),
+                terminal: ActiveDirectTurnTerminal::Failed {
+                    reason: initialization_error.to_string(),
+                },
+                state: if self.has_queued_steering(conversation_id).await? {
+                    ConvState::Idle
+                } else if resumable_owner {
+                    error_state
+                } else {
+                    ConvState::Idle
+                },
+                state_updated_at,
+                execution_occurrence_message_id: occurrence_recovery
+                    .map(|occurrence| occurrence.source_message_id.clone()),
+            };
+            return self
+                .settle_classified_baton(&DatabaseStorage::new(self.db.clone()), settlement)
+                .await;
+        }
+        if let Some(occurrence) = occurrence_recovery {
+            let committed = self
+                .db
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let settlement_state =
+                if matches!(committed.state, ConvState::AwaitingUserResponse { .. })
+                    || self.has_queued_steering(conversation_id).await?
+                {
+                    committed.state
+                } else {
+                    error_state.clone()
+                };
+            self.db
+                .settle_execution_occurrence(
+                    conversation_id,
+                    &occurrence.source_message_id,
+                    &ExecutionOccurrenceTerminal::Failed {
                         reason: initialization_error.to_string(),
                     },
-                    state: if resumable_owner {
-                        ConvState::Error {
-                            message: format!(
-                                "The server restarted while this accepted request was pending, and recovery could not initialize: {initialization_error}"
-                            ),
-                            error_kind: crate::db::ErrorKind::InvalidRequest,
-                            resets_at: None,
-                        }
-                    } else {
-                        ConvState::Idle
-                    },
-                    state_updated_at,
-                })
+                    &settlement_state,
+                )
                 .await
-        } else {
-            let state = ConvState::Error {
-                message: format!(
-                    "The server restarted while this model request was in progress, and recovery could not initialize: {initialization_error}"
-                ),
-                error_kind: crate::db::ErrorKind::InvalidRequest,
-                resets_at: None,
-            };
-            storage
-                .update_state(conversation_id, &state, state_updated_at)
-                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
         }
+        let fallback_state = if self.has_queued_steering(conversation_id).await? {
+            ConvState::Idle
+        } else {
+            error_state
+        };
+        DatabaseStorage::new(self.db.clone())
+            .update_state(conversation_id, &fallback_state, state_updated_at)
+            .await
     }
 
     pub async fn start_direct_turn_worker(
@@ -4947,7 +5473,7 @@ impl RuntimeManager {
                                     ),
                                     provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
                                         &conversation_id,
-                                        &conversation.state,
+                                    &conversation.state,
                                     ),
                                 },
                             )
@@ -5469,12 +5995,12 @@ impl RuntimeManager {
         };
 
         let recovery_started = std::time::Instant::now();
-        let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
+        let mut active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
             &storage,
             conversation_id,
         )
         .await?;
-        let recovered_terminal_obligation = self
+        let mut recovered_terminal_obligation = self
             .load_active_direct_turn_terminal_obligation(conversation_id)
             .await?
             .filter(|obligation| {
@@ -5483,11 +6009,18 @@ impl RuntimeManager {
                         && loaded.active().generation == obligation.expected_generation
                 })
             });
+        let occurrence_recovery = self.execution_occurrence_recovery(conversation_id).await?;
+        let mut has_resumable_occurrence = occurrence_recovery
+            .as_ref()
+            .is_some_and(ExecutionOccurrenceRecovery::needs_resume);
+        if has_resumable_occurrence {
+            recovered_terminal_obligation = None;
+        }
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
         let (startup_llm_recovery_ack_tx, startup_llm_recovery_ack_rx) = oneshot::channel();
         let startup_llm_recovery_ack = Arc::new(AsyncMutex::new(Some(startup_llm_recovery_ack_rx)));
-        let (initial_state, initial_state_updated_at, needs_auto_continue) =
+        let (mut initial_state, mut initial_state_updated_at, mut needs_auto_continue) =
             if let Some(obligation) = &recovered_terminal_obligation {
                 (
                     obligation.projection.state.clone(),
@@ -5497,6 +6030,67 @@ impl RuntimeManager {
             } else {
                 self.determine_resume_state(conversation_id).await?
             };
+        if recovered_terminal_obligation.is_none() && initial_state != conv.state {
+            let projected = if has_resumable_occurrence {
+                self.db
+                    .project_execution_occurrence_requesting(
+                        conversation_id,
+                        &occurrence_recovery
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "resumable execution occurrence lost its source identity"
+                                    .to_string()
+                            })?
+                            .source_message_id,
+                        &initial_state,
+                        &initial_state_updated_at,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else if needs_auto_continue {
+                if let Some(turn) = active_direct_turn.as_ref() {
+                    self.db
+                        .project_active_direct_turn_requesting(
+                            conversation_id,
+                            turn.active().turn_id.0,
+                            turn.active().generation,
+                            &initial_state,
+                            &initial_state_updated_at,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+            if !projected {
+                let committed = self
+                    .db
+                    .get_conversation(conversation_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                initial_state = committed.state;
+                initial_state_updated_at = committed.state_updated_at;
+                needs_auto_continue = false;
+                has_resumable_occurrence = false;
+                active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
+                    &storage,
+                    conversation_id,
+                )
+                .await?;
+                recovered_terminal_obligation = self
+                    .load_active_direct_turn_terminal_obligation(conversation_id)
+                    .await?
+                    .filter(|obligation| {
+                        active_direct_turn.as_ref().is_some_and(|loaded| {
+                            loaded.active().turn_id == obligation.turn_id
+                                && loaded.active().generation == obligation.expected_generation
+                        })
+                    });
+            }
+        }
         tracing::Span::current().record(
             "runtime.recovery_projection_ms",
             u64::try_from(recovery_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -5518,6 +6112,8 @@ impl RuntimeManager {
             };
         let resumable_owner = startup_creation_completion.is_some()
             || matches!(initial_state, ConvState::SeededLlmRequesting { .. })
+            || needs_auto_continue
+            || has_resumable_occurrence
             || self
                 .db
                 .has_pending_approval_request(conversation_id)
@@ -5528,13 +6124,20 @@ impl RuntimeManager {
                 .has_committed_steering_turn(conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-        let startup_llm_recovery = if resumable_owner {
+        let materialized_baton = matches!(
+            active_direct_turn,
+            Some(LoadedActiveDirectTurn::Materialized { .. })
+        );
+        let startup_llm_recovery = if needs_auto_continue && materialized_baton {
+            crate::runtime::executor::StartupLlmRecovery::ResumeOwedBaton
+        } else if resumable_owner {
             crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
         } else {
             crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
         };
 
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
+            let is_materialized = matches!(loaded, LoadedActiveDirectTurn::Materialized { .. });
             let active = loaded.into_active();
             if let Some(obligation) = recovered_terminal_obligation {
                 let terminal = match obligation.terminal {
@@ -5556,12 +6159,15 @@ impl RuntimeManager {
                         terminal,
                         state: obligation.projection.state,
                         state_updated_at: obligation.projection.state_updated_at,
+                        execution_occurrence_message_id: None,
                     },
                 )
                 .await?;
                 None
-            } else {
+            } else if is_materialized {
                 Some(active)
+            } else {
+                None
             }
         } else {
             None
@@ -5653,18 +6259,16 @@ impl RuntimeManager {
             let mut restart_admission = self.acquire_local_authority_pass().map_err(|()| {
                 "runtime admission closed before restart marker persistence".to_string()
             })?;
-            if let Err(error) = self
-                .persist_and_broadcast_system_message(
-                    &mut restart_admission,
-                    &broadcaster,
-                    conversation_id,
-                    restart_msg,
-                )
-                .await
-            {
-                tracing::warn!(conv_id = %conversation_id, error = %error,
-                    "Failed to inject restart system message");
-            }
+            self.persist_and_broadcast_system_message(
+                &mut restart_admission,
+                &broadcaster,
+                conversation_id,
+                restart_msg,
+            )
+            .await
+            .map_err(|error| {
+                format!("failed to persist required restart recovery marker: {error}")
+            })?;
             tracing::info!(conv_id = %conversation_id, "Will auto-continue interrupted conversation");
         }
 
@@ -6423,6 +7027,54 @@ impl RuntimeManager {
     /// post-resume `SseEvent::StateChange` carries the real entry time, not
     /// the runtime-construction time (specs/working-phase-visibility/
     /// REQ-WPV-001).
+    async fn persisted_llm_auto_continue(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+    ) -> Result<Option<bool>, String> {
+        if matches!(state, ConvState::Idle) && self.has_queued_steering(conversation_id).await? {
+            return Ok(Some(true));
+        }
+        if !matches!(state, ConvState::LlmRequesting { .. }) {
+            return Ok(None);
+        }
+        if self.owed_baton_needs_auto_continue(conversation_id).await? {
+            return Ok(Some(true));
+        }
+        self.has_persisted_llm_request_owner(conversation_id)
+            .await
+            .map(|owned| owned.then_some(false))
+    }
+
+    async fn preserved_restart_state(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Option<(ConvState, DateTime<Utc>, bool)> {
+        if state.is_terminal() {
+            return Some((state.clone(), state_updated_at, false));
+        }
+        let startup_obligated = self
+            .startup_obligated_conversations
+            .read()
+            .await
+            .contains(conversation_id);
+        let preserved = match state {
+            ConvState::ToolExecuting { .. } | ConvState::CancellingTool { .. } => startup_obligated,
+            ConvState::Provisioning { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::RecoverableContinuationFailure { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::SeededLlmRequesting { .. } => true,
+            ConvState::Error { error_kind, .. } => error_kind.is_user_resumable(),
+            _ => false,
+        };
+        preserved.then(|| (state.clone(), state_updated_at, false))
+    }
+
     async fn determine_resume_state(
         &self,
         conversation_id: &str,
@@ -6437,57 +7089,41 @@ impl RuntimeManager {
             .map_err(|e| e.to_string())?;
 
         let row_state_updated_at = conv.state_updated_at;
-
-        if matches!(conv.state, ConvState::LlmRequesting { .. })
+        if matches!(conv.state, ConvState::AwaitingUserResponse { .. })
             && self
-                .has_persisted_llm_request_owner(conversation_id)
-                .await?
+                .db
+                .has_interaction_response_execution_occurrence(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+            && !self
+                .db
+                .interaction_response_has_post_source_agent(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
         {
-            return Ok((conv.state, row_state_updated_at, false));
+            return Ok((ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true));
         }
 
-        if conv.state.is_terminal() {
-            tracing::debug!(
-                conv_id = %conversation_id,
-                state = ?std::mem::discriminant(&conv.state),
-                "Restoring persisted terminal state"
-            );
-            return Ok((conv.state, row_state_updated_at, false));
+        if let Some(auto_continue) = self
+            .persisted_llm_auto_continue(conversation_id, &conv.state)
+            .await?
+        {
+            return Ok((conv.state, row_state_updated_at, auto_continue));
         }
 
-        match &conv.state {
-            ConvState::ToolExecuting { .. } | ConvState::CancellingTool { .. }
-                if self
-                    .startup_obligated_conversations
-                    .read()
-                    .await
-                    .contains(conversation_id) =>
-            {
-                return Ok((conv.state, row_state_updated_at, false));
-            }
-            ConvState::Provisioning { .. }
-            | ConvState::AwaitingContinuation { .. }
-            | ConvState::RecoverableContinuationFailure { .. }
-            | ConvState::AwaitingRecovery { .. }
-            | ConvState::AwaitingTaskApproval { .. }
-            | ConvState::AwaitingUserResponse { .. }
-            | ConvState::SeededLlmRequesting { .. } => {
-                tracing::debug!(
-                    conv_id = %conversation_id,
-                    state = ?std::mem::discriminant(&conv.state),
-                    "Restoring persisted state (survives restart)"
-                );
-                return Ok((conv.state, row_state_updated_at, false));
-            }
-            ConvState::Error { error_kind, .. } if error_kind.is_user_resumable() => {
-                tracing::debug!(
-                    conv_id = %conversation_id,
-                    ?error_kind,
-                    "Restoring persisted user-resumable Error"
-                );
-                return Ok((conv.state, row_state_updated_at, false));
-            }
-            _ => {}
+        if let Some(preserved) = self
+            .preserved_restart_state(conversation_id, &conv.state, row_state_updated_at)
+            .await
+        {
+            return Ok(preserved);
+        }
+
+        if self
+            .execution_occurrence_recovery(conversation_id)
+            .await?
+            .is_some_and(|occurrence| occurrence.needs_resume())
+        {
+            return Ok((ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true));
         }
 
         let messages = self
@@ -6502,6 +7138,15 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
         let decision = recovery::decide_recovery(&messages, &tail_status);
+        if decision.needs_auto_continue
+            && !self.owed_baton_needs_auto_continue(conversation_id).await?
+            && !self
+                .execution_occurrence_recovery(conversation_id)
+                .await?
+                .is_some_and(|occurrence| occurrence.needs_resume())
+        {
+            return Ok((conv.state, row_state_updated_at, false));
+        }
 
         tracing::debug!(
             conv_id = %conversation_id,
@@ -9843,6 +10488,14 @@ mod scope_liveness_tests {
         requests: std::sync::atomic::AtomicUsize,
     }
 
+    struct PersistedStateRecordingLlm {
+        db: crate::db::Database,
+        conversation_id: String,
+        observed_state: std::sync::Mutex<Option<ConvState>>,
+        entered: Notify,
+        release: Notify,
+    }
+
     struct FailingLlm;
 
     #[async_trait::async_trait]
@@ -9869,6 +10522,36 @@ mod scope_liveness_tests {
         ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: Vec::new(),
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for PersistedStateRecordingLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            let conversation = self
+                .db
+                .get_conversation(&self.conversation_id)
+                .await
+                .map_err(|error| phoenix_llm::LlmError::invalid_request(error.to_string()))?;
+            *self.observed_state.lock().expect("observed state lock") = Some(conversation.state);
+            self.entered.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.release.notified())
+                .await
+                .expect("test released provider");
             Ok(phoenix_llm::LlmResponse {
                 provider_replay: None,
                 content: Vec::new(),
@@ -11975,7 +12658,26 @@ mod scope_liveness_tests {
     }
 
     async fn materialize_restart_direct_turn(manager: &RuntimeManager, conversation_id: &str) {
-        materialize_restart_direct_turn_encoding(manager, conversation_id, false).await;
+        manager
+            .db()
+            .create_conversation(conversation_id, "restart", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        materialize_restart_direct_turn_on_existing_conversation(manager, conversation_id).await;
+    }
+
+    async fn materialize_restart_direct_turn_on_existing_conversation(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+    ) {
+        materialize_restart_direct_turn_encoding(
+            manager,
+            conversation_id,
+            false,
+            "restart-user-message",
+            1,
+        )
+        .await;
     }
 
     #[allow(clippy::too_many_lines)] // Shared fixture covers acceptance, claiming, and materialization.
@@ -11983,6 +12685,8 @@ mod scope_liveness_tests {
         manager: &RuntimeManager,
         conversation_id: &str,
         historical_source: bool,
+        message_id: &str,
+        sequence_id: i64,
     ) {
         use phoenix_core::domain::sm_event::{
             PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
@@ -11996,11 +12700,6 @@ mod scope_liveness_tests {
             ProcessIncarnation, Timestamp, TurnOutcome,
         };
 
-        manager
-            .db()
-            .create_conversation(conversation_id, "restart", "/tmp", true, None, None)
-            .await
-            .expect("create conversation");
         let identity = SubmittedDirectTurnIdentity {
             origin: if historical_source {
                 phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
@@ -12019,7 +12718,7 @@ mod scope_liveness_tests {
             text: "resume exactly this turn".to_string(),
             images: Vec::new(),
             files: Vec::new(),
-            message_id: "restart-user-message".to_string(),
+            message_id: message_id.to_string(),
             user_agent: None,
             skill_invocation: None,
             expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
@@ -12037,7 +12736,7 @@ mod scope_liveness_tests {
         let repo = manager.db().workflow_repository();
         let accepted = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-                client_key: ClientTurnKey::new("restart-user-message").expect("client key"),
+                client_key: ClientTurnKey::new(message_id).expect("client key"),
                 prepared: PreparedTurn::from_exact_payload(
                     &conversation,
                     if historical_source {
@@ -12076,7 +12775,7 @@ mod scope_liveness_tests {
             turn_id,
             authority: claim.authority.expect("claim authority"),
             prepared: payload,
-            sequence_id: 1,
+            sequence_id,
             created_at: Timestamp(3),
             accepted_state: ConvState::LlmRequesting { attempt: 1 },
             state_updated_at: Utc::now(),
@@ -12088,13 +12787,2192 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn startup_resumes_materialized_tool_result_baton_without_browser_kick() {
+        use phoenix_core::domain::db_schema::ToolResult;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-owed-tool-result";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::ToolExecuting {
+                    current_tool: ToolCall::new(
+                        "tool-running",
+                        ToolInput::Bash(
+                            phoenix_core::domain::bash_types::BashInvocation::from_context(
+                                phoenix_core::domain::bash_types::BashToolInput::run(
+                                    "printf 'unknown external effect'",
+                                ),
+                            )
+                            .expect("valid disposable bash input"),
+                        ),
+                    ),
+                    remaining_tools: Vec::new(),
+                    completed_results: Vec::<ToolResult>::new(),
+                    pending_sub_agents: Vec::new(),
+                    assistant_message: AssistantMessage::new(
+                        "restart-assistant-tool-use".to_string(),
+                        vec![ContentBlock::tool_use(
+                            "tool-running",
+                            "bash",
+                            serde_json::json!({"op": "run", "cmd": "printf 'unknown external effect'"}),
+                        )],
+                        None,
+                        None,
+                    ),
+                },
+            )
+            .await
+            .expect("persist interrupted tool round");
+
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("materialize interrupted tool result");
+        assert!(manager
+            .db()
+            .has_owed_baton(conversation_id)
+            .await
+            .expect("classify durable baton"));
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("startup resolves durable baton");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let messages = manager.db().get_messages(conversation_id).await.unwrap();
+        assert!(messages.iter().any(|message| {
+            matches!(
+                &message.content,
+                crate::db::MessageContent::Tool(tool)
+                    if tool.tool_use_id == "tool-running" && tool.is_error
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancelled_direct_turn_is_not_resumed_from_tool_result_tail() {
+        use crate::runtime::traits::{
+            ActiveDirectTurnSettlement, ActiveDirectTurnTerminal, MessageStore,
+        };
+        use phoenix_core::domain::db_schema::ToolContent;
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-cancelled-baton";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .add_message(
+                "cancelled-agent-tool-use",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                        "cancelled-tool",
+                        "think",
+                        serde_json::json!({"thoughts": "cancelled"}),
+                    ),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "cancelled-tool-result",
+                conversation_id,
+                &crate::db::MessageContent::Tool(ToolContent {
+                    tool_use_id: "cancelled-tool".to_string(),
+                    content: "interrupted".to_string(),
+                    is_error: true,
+                    images: Vec::new(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let storage = DatabaseStorage::new(manager.db().clone());
+        let active = MessageStore::load_active_direct_turn(&storage, conversation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active();
+        MessageStore::settle_active_direct_turn(
+            &storage,
+            &ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: active,
+                terminal: ActiveDirectTurnTerminal::Cancelled,
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+                execution_occurrence_message_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+        let handle = manager
+            .get_or_create(conversation_id)
+            .await
+            .expect("client open may materialize idle runtime but cannot recreate work");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(*handle.state_rx.borrow(), ConvState::Idle);
+    }
+
+    #[tokio::test]
+    async fn newer_queued_input_joins_owed_baton_before_single_dispatch() {
+        use phoenix_core::domain::db_schema::{MessageContent, ToolResult};
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{AssistantMessage, ThinkInput, ToolCall, ToolInput};
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-baton-newer-input";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::ToolExecuting {
+                    current_tool: ToolCall::new(
+                        "older-tool",
+                        ToolInput::Think(ThinkInput {
+                            thoughts: "older".to_string(),
+                        }),
+                    ),
+                    remaining_tools: Vec::new(),
+                    completed_results: Vec::<ToolResult>::new(),
+                    pending_sub_agents: Vec::new(),
+                    assistant_message: AssistantMessage::new(
+                        "older-assistant".to_string(),
+                        vec![ContentBlock::tool_use(
+                            "older-tool",
+                            "think",
+                            serde_json::json!({"thoughts": "older"}),
+                        )],
+                        None,
+                        None,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        manager.db().reset_all_to_idle().await.unwrap();
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                    text: "newer accepted direction".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "newer-direction".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "newer-direction-fingerprint",
+            )
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(manager
+            .db()
+            .get_steering_queue(conversation_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .db()
+            .get_messages(conversation_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| matches!(&message.content, MessageContent::User(user) if user.text == "newer accepted direction")));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn exhausted_baton_drains_newer_accepted_input_before_failure() {
+        use crate::runtime::recovery::RESTART_SYSTEM_MESSAGE_MARKER;
+        use phoenix_core::domain::db_schema::{SystemContent, ToolContent};
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-exhausted-with-newer-input";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        for (message_id, content) in [
+            (
+                "exhausted-agent",
+                crate::db::MessageContent::agent(vec![ContentBlock::tool_use(
+                    "exhausted-tool",
+                    "think",
+                    serde_json::json!({"thoughts": "old"}),
+                )]),
+            ),
+            (
+                "exhausted-tool-result",
+                crate::db::MessageContent::Tool(ToolContent {
+                    tool_use_id: "exhausted-tool".to_string(),
+                    content: "interrupted".to_string(),
+                    is_error: true,
+                    images: Vec::new(),
+                }),
+            ),
+            (
+                "exhausted-restart-1",
+                crate::db::MessageContent::System(SystemContent {
+                    text: format!("{RESTART_SYSTEM_MESSAGE_MARKER} first"),
+                }),
+            ),
+            (
+                "exhausted-restart-2",
+                crate::db::MessageContent::System(SystemContent {
+                    text: format!("{RESTART_SYSTEM_MESSAGE_MARKER} second"),
+                }),
+            ),
+        ] {
+            manager
+                .db()
+                .add_message(message_id, conversation_id, &content, None, None)
+                .await
+                .unwrap();
+        }
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-occurrence-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted input before crashes"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'exhausted-occurrence-input', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        for index in 0..2 {
+            manager
+                .db()
+                .add_message(
+                    &format!("queued-occurrence-restart-{index}"),
+                    conversation_id,
+                    &crate::db::MessageContent::System(SystemContent {
+                        text: RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                    text: "new direction after crashes".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "post-crash-direction".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "post-crash-direction-fingerprint",
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            manager.settle_persisted_llm_requests(),
+        )
+        .await
+        .expect("startup recovery acknowledged queued input")
+        .unwrap();
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(manager
+            .db()
+            .get_steering_queue(conversation_id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_crash_terminalizes_baton_as_explicit_failure() {
+        use crate::runtime::recovery::RESTART_SYSTEM_MESSAGE_MARKER;
+        use phoenix_core::domain::db_schema::{SystemContent, ToolContent};
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-loop-bounded-failure";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        for (message_id, content) in [
+            (
+                "loop-agent-1",
+                crate::db::MessageContent::agent(vec![ContentBlock::tool_use(
+                    "loop-tool-1",
+                    "think",
+                    serde_json::json!({"thoughts": "first"}),
+                )]),
+            ),
+            (
+                "loop-tool-result-1",
+                crate::db::MessageContent::Tool(ToolContent {
+                    tool_use_id: "loop-tool-1".to_string(),
+                    content: "interrupted".to_string(),
+                    is_error: true,
+                    images: Vec::new(),
+                }),
+            ),
+            (
+                "loop-restart-1",
+                crate::db::MessageContent::System(SystemContent {
+                    text: format!("{RESTART_SYSTEM_MESSAGE_MARKER} first"),
+                }),
+            ),
+            (
+                "loop-agent-2",
+                crate::db::MessageContent::agent(vec![ContentBlock::tool_use(
+                    "loop-tool-2",
+                    "think",
+                    serde_json::json!({"thoughts": "second"}),
+                )]),
+            ),
+            (
+                "loop-tool-result-2",
+                crate::db::MessageContent::Tool(ToolContent {
+                    tool_use_id: "loop-tool-2".to_string(),
+                    content: "interrupted".to_string(),
+                    is_error: true,
+                    images: Vec::new(),
+                }),
+            ),
+            (
+                "loop-restart-2",
+                crate::db::MessageContent::System(SystemContent {
+                    text: format!("{RESTART_SYSTEM_MESSAGE_MARKER} second"),
+                }),
+            ),
+            (
+                "loop-agent-3",
+                crate::db::MessageContent::agent(vec![ContentBlock::tool_use(
+                    "loop-tool-3",
+                    "think",
+                    serde_json::json!({"thoughts": "third"}),
+                )]),
+            ),
+            (
+                "loop-tool-result-3",
+                crate::db::MessageContent::Tool(ToolContent {
+                    tool_use_id: "loop-tool-3".to_string(),
+                    content: "interrupted".to_string(),
+                    is_error: true,
+                    images: Vec::new(),
+                }),
+            ),
+        ] {
+            manager
+                .db()
+                .add_message(message_id, conversation_id, &content, None, None)
+                .await
+                .unwrap();
+        }
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conversation = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        assert!(matches!(conversation.state, ConvState::Error { .. }));
+        assert!(!manager.db().has_owed_baton(conversation_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn startup_ignores_tool_result_without_active_direct_turn_baton() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-prose-only";
+        manager
+            .db()
+            .create_conversation(conversation_id, "idle", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "prose-user",
+                conversation_id,
+                &crate::db::MessageContent::user("please follow through after restart"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "prose-assistant",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text(
+                        "I promise to continue after restart.",
+                    ),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!manager.db().has_owed_baton(conversation_id).await.unwrap());
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn global_startup_resumes_materialized_tool_result_baton() {
+        use phoenix_core::domain::db_schema::ToolResult;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{AssistantMessage, ToolCall, ToolInput};
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let coordinator = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        materialize_restart_direct_turn_on_existing_conversation(&manager, &coordinator.id).await;
+        manager
+            .db()
+            .update_conversation_state(
+                &coordinator.id,
+                &ConvState::ToolExecuting {
+                    current_tool: ToolCall::new(
+                        "global-deploy-followthrough",
+                        ToolInput::Bash(
+                            phoenix_core::domain::bash_types::BashInvocation::from_context(
+                                phoenix_core::domain::bash_types::BashToolInput::run(
+                                    "printf 'disposable deployment followthrough'",
+                                ),
+                            )
+                            .expect("valid disposable bash input"),
+                        ),
+                    ),
+                    remaining_tools: Vec::new(),
+                    completed_results: Vec::<ToolResult>::new(),
+                    pending_sub_agents: Vec::new(),
+                    assistant_message: AssistantMessage::new(
+                        "global-deploy-assistant".to_string(),
+                        vec![ContentBlock::tool_use(
+                            "global-deploy-followthrough",
+                            "bash",
+                            serde_json::json!({"op": "run", "cmd": "printf 'disposable deployment followthrough'"}),
+                        )],
+                        None,
+                        None,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        manager.db().reset_all_to_idle().await.unwrap();
+        manager
+            .db()
+            .update_conversation_state(&coordinator.id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_mixed_text_and_tool_result_baton() {
+        use phoenix_core::domain::db_schema::ToolContent;
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-nonresumable-idle-baton";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .add_message(
+                "nonresumable-agent",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    ContentBlock::text("The requested work is complete."),
+                    ContentBlock::tool_use(
+                        "nonresumable-tool",
+                        "think",
+                        serde_json::json!({"thoughts": "done"}),
+                    ),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "nonresumable-tool-result",
+                conversation_id,
+                &crate::db::MessageContent::Tool(ToolContent {
+                    tool_use_id: "nonresumable-tool".to_string(),
+                    content: "done".to_string(),
+                    is_error: false,
+                    images: Vec::new(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_typed_wake_and_interaction_occurrences() {
+        for (source_kind, conversation_id) in [
+            ("wake", "restart-adopted-wake"),
+            ("seeded_fork", "restart-seeded-fork"),
+            ("interaction_response", "restart-interaction-response"),
+        ] {
+            let llm = Arc::new(RecordingLlm {
+                requests: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+            manager
+                .db()
+                .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            manager
+                .db()
+                .add_message(
+                    &format!("{conversation_id}-input"),
+                    conversation_id,
+                    &crate::db::MessageContent::user("accepted durable input"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO steering_execution_occurrences
+                     (conversation_id, message_id, source_kind)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(conversation_id)
+            .bind(format!("{conversation_id}-input"))
+            .bind(source_kind)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+
+            manager.settle_persisted_llm_requests().await.unwrap();
+
+            assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn interaction_response_occurrence_wins_over_nonresumable_baton_shape() {
+        let conversation_id = "restart-interaction-response-with-baton";
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let llm = Arc::new(PersistedStateRecordingLlm {
+            db: db.clone(),
+            conversation_id: conversation_id.to_string(),
+            observed_state: std::sync::Mutex::new(None),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "interaction-response-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'interaction-response-input', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        let settle = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.settle_persisted_llm_requests().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), llm.entered.notified())
+            .await
+            .expect("provider entered");
+        {
+            let observed_state = llm.observed_state.lock().expect("observed state lock");
+            assert!(matches!(
+                observed_state.as_ref(),
+                Some(ConvState::LlmRequesting { .. })
+            ));
+        }
+        llm.release.notify_one();
+        settle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_less_occurrence_recovery_is_bounded() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-response-less-occurrence-exhausted";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "response-less-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'response-less-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        for index in 0..2 {
+            manager
+                .db()
+                .add_message(
+                    &format!("response-less-marker-{index}"),
+                    conversation_id,
+                    &crate::db::MessageContent::System(crate::db::SystemContent {
+                        text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let occurrence = manager
+            .execution_occurrence_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            occurrence.disposition,
+            ExecutionOccurrenceDisposition::RestartLoopDetected
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_occurrence_also_settles_active_baton() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-completed-occurrence-active-baton";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .add_message(
+                "completed-occurrence-source",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'completed-occurrence-source', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "completed-occurrence-response",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("done"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        let storage = DatabaseStorage::new(manager.db().clone());
+        assert!(storage
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_user_wait_with_interaction_response_resumes_provider() {
+        let conversation_id = "restart-stale-user-wait-response";
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let llm = Arc::new(PersistedStateRecordingLlm {
+            db: db.clone(),
+            conversation_id: conversation_id.to_string(),
+            observed_state: std::sync::Mutex::new(None),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        manager
+            .db()
+            .create_conversation(conversation_id, "wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "accepted-interaction-response",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'accepted-interaction-response', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::AwaitingUserResponse {
+                    questions: Vec::new(),
+                    tool_use_id: "answered-question".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let settle = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.settle_persisted_llm_requests().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), llm.entered.notified())
+            .await
+            .expect("provider entered");
+        assert!(matches!(
+            llm.observed_state
+                .lock()
+                .expect("observed state lock")
+                .as_ref(),
+            Some(ConvState::LlmRequesting { .. })
+        ));
+        llm.release.notify_one();
+        settle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_up_wait_blocks_interaction_response_recovery() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-follow-up-question";
+        manager
+            .db()
+            .create_conversation(conversation_id, "wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "answered-interaction",
+                conversation_id,
+                &crate::db::MessageContent::user("first answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'answered-interaction', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "follow-up-agent",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("follow up"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let wait = ConvState::AwaitingUserResponse {
+            questions: Vec::new(),
+            tool_use_id: "follow-up-question".to_string(),
+        };
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &wait)
+            .await
+            .unwrap();
+
+        let (state, _, auto_continue) = manager
+            .determine_resume_state(conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(state, wait);
+        assert!(!auto_continue);
+    }
+
+    #[tokio::test]
+    async fn queue_only_initialization_failure_remains_idle() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-queue-only-invalid-cwd";
+        manager
+            .db()
+            .create_conversation(
+                conversation_id,
+                "queued",
+                "/definitely/missing/queue-only-cwd",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                    text: "queued input".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "queue-only-steering".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "queue-only-fingerprint",
+            )
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Idle
+        ));
+        assert_eq!(
+            manager
+                .db()
+                .steering_queue_depth(conversation_id)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn initialization_failure_settles_ownerless_occurrence() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-occurrence-invalid-model";
+        manager
+            .db()
+            .create_conversation(
+                conversation_id,
+                "typed input",
+                "/definitely/missing/restart-recovery-cwd",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_model_and_effort(
+                conversation_id,
+                "claude-sonnet-5",
+                Some(phoenix_core::domain::llm_types::ModelEffort::High),
+                ServiceTier::Standard,
+                "anthropic",
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "invalid-model-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'invalid-model-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                    text: "queued after initialization failure".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "initialization-failure-steering".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "initialization-failure-fingerprint",
+            )
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert!(manager
+            .startup_llm_recovery_conversation_ids()
+            .await
+            .unwrap()
+            .contains(&conversation_id.to_string()));
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn text_only_response_settles_execution_occurrence_without_redispatch() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-occurrence-text-settled";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "occurrence-text-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'occurrence-text-input', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "occurrence-text-response",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("settled response"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_marker_preserves_exact_batched_wake_occurrence() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-occurrence-batched-wake-marker";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for (message_id, terminal) in [
+            ("resumable-wake", "Completed"),
+            ("later-cancelled-wake", "Cancelled"),
+        ] {
+            manager
+                .db()
+                .add_message(
+                    message_id,
+                    conversation_id,
+                    &crate::db::MessageContent::user("wake"),
+                    Some(&serde_json::json!({
+                        "type": "wake_result",
+                        "adopted": true,
+                        "terminal": { terminal: {} },
+                    })),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'resumable-wake', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "wake-restart-marker",
+                conversation_id,
+                &crate::db::MessageContent::System(crate::db::SystemContent {
+                    text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovery = manager
+            .execution_occurrence_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.source_message_id, "resumable-wake");
+        assert_eq!(recovery.disposition, ExecutionOccurrenceDisposition::Resume);
+    }
+
+    #[tokio::test]
+    async fn classified_baton_settlement_does_not_touch_replacement_turn() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-classified-baton-replaced";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let classified = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let storage = DatabaseStorage::new(manager.db().clone());
+        storage
+            .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: classified.turn.clone(),
+                terminal: ActiveDirectTurnTerminal::Completed,
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+                execution_occurrence_message_id: None,
+            })
+            .await
+            .unwrap();
+        materialize_restart_direct_turn_encoding(
+            &manager,
+            conversation_id,
+            false,
+            "replacement-user-message",
+            4,
+        )
+        .await;
+        let replacement = storage
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active();
+        assert_ne!(replacement.turn_id, classified.turn.turn_id);
+
+        manager
+            .db()
+            .add_message(
+                "replacement-interaction-response",
+                conversation_id,
+                &crate::db::MessageContent::user("replacement answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'replacement-interaction-response', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        manager
+            .persist_nonresumable_baton_settlement(
+                conversation_id,
+                &classified.turn,
+                recovery::RecoveryReason::LastMessageNotTool,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .load_active_direct_turn(conversation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active(),
+            replacement
+        );
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-interaction-response")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_conflict_still_settles_classified_occurrence() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-terminal-conflict-occurrence";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let classified = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "conflicted-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'conflicted-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        DatabaseStorage::new(manager.db().clone())
+            .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: classified.turn.clone(),
+                terminal: ActiveDirectTurnTerminal::Completed,
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+                execution_occurrence_message_id: None,
+            })
+            .await
+            .unwrap();
+
+        manager
+            .persist_restart_loop_failure(
+                conversation_id,
+                &classified.turn,
+                Some("conflicted-occurrence"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn newly_adopted_occurrence_blocks_exhausted_baton_failure() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-exhausted-new-occurrence";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let classified = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "new-exhaustion-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("new accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'new-exhaustion-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let prior_state = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap()
+            .state;
+
+        manager
+            .persist_restart_loop_failure(conversation_id, &classified.turn, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new-exhaustion-occurrence")
+        );
+        assert!(DatabaseStorage::new(manager.db().clone())
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            prior_state
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_occurrence_blocks_initialization_failure_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-initialization-occurrence-replaced";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let baton = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for message_id in [
+            "classified-initialization-occurrence",
+            "replacement-initialization-occurrence",
+        ] {
+            manager
+                .db()
+                .add_message(
+                    message_id,
+                    conversation_id,
+                    &crate::db::MessageContent::user("wake"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'replacement-initialization-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let classified = ExecutionOccurrenceRecovery {
+            source_message_id: "classified-initialization-occurrence".to_string(),
+            disposition: ExecutionOccurrenceDisposition::Resume,
+        };
+
+        let prior_state = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap()
+            .state;
+
+        manager
+            .persist_startup_llm_initialization_failure(
+                conversation_id,
+                "invalid model",
+                true,
+                Some(&baton),
+                Some(&classified),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-initialization-occurrence")
+        );
+        assert!(DatabaseStorage::new(manager.db().clone())
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            prior_state
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_occurrence_blocks_stale_exhausted_baton_failure() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-exhausted-occurrence-replaced";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let baton = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for message_id in ["exhausted-old-occurrence", "replacement-new-occurrence"] {
+            manager
+                .db()
+                .add_message(
+                    message_id,
+                    conversation_id,
+                    &crate::db::MessageContent::user("wake"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'replacement-new-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let stale = ExecutionOccurrenceRecovery {
+            source_message_id: "exhausted-old-occurrence".to_string(),
+            disposition: ExecutionOccurrenceDisposition::RestartLoopDetected,
+        };
+
+        assert!(manager
+            .settle_restart_exhaustion(conversation_id, Some(&stale), Some(&baton), false, false,)
+            .await
+            .unwrap());
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-new-occurrence")
+        );
+        assert!(DatabaseStorage::new(manager.db().clone())
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn exhausted_wake_occurrence_atomically_releases_baton() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-interaction-occurrence-exhausted";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-interaction-response",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'exhausted-interaction-response', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        for index in 0..2 {
+            manager
+                .db()
+                .add_message(
+                    &format!("exhausted-interaction-marker-{index}"),
+                    conversation_id,
+                    &crate::db::MessageContent::System(crate::db::SystemContent {
+                        text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        let storage = DatabaseStorage::new(manager.db().clone());
+        assert!(storage
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn exhausted_ownerless_occurrence_settles_as_failure() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-occurrence-exhausted";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'exhausted-occurrence', 'seeded_fork')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-tool-request",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                        id: "exhausted-tool".to_string(),
+                        name: "think".to_string(),
+                        input: serde_json::json!({"thoughts": "recover"}),
+                    },
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-tool-result",
+                conversation_id,
+                &crate::db::MessageContent::Tool(phoenix_core::domain::db_schema::ToolContent {
+                    tool_use_id: "exhausted-tool".to_string(),
+                    content: "done".to_string(),
+                    is_error: false,
+                    images: Vec::new(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for index in 0..2 {
+            manager
+                .db()
+                .add_message(
+                    &format!("exhausted-marker-{index}"),
+                    conversation_id,
+                    &crate::db::MessageContent::System(crate::db::SystemContent {
+                        text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let recovery = manager
+            .execution_occurrence_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovery.disposition,
+            ExecutionOccurrenceDisposition::RestartLoopDetected
+        );
+        assert!(manager
+            .settle_execution_occurrence_recovery(conversation_id, Some(&recovery))
+            .await
+            .unwrap());
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_occurrence_settlement_preserves_replacement_occurrence() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-occurrence-replaced-before-settlement";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "classified-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'classified-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "classified-response",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("settled response"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let classified = manager
+            .execution_occurrence_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            classified.disposition,
+            ExecutionOccurrenceDisposition::Completed
+        );
+
+        manager
+            .db()
+            .add_message(
+                "replacement-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("newer accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'replacement-occurrence', 'wake')
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 message_id = excluded.message_id,
+                 source_kind = excluded.source_kind",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        assert!(!manager
+            .settle_execution_occurrence_recovery(conversation_id, Some(&classified))
+            .await
+            .unwrap());
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-occurrence")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One fixture proves the occurrence across its full state lifecycle.
+    async fn typed_occurrence_preserves_wait_and_tool_states_until_idle_settlement() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-occurrence-wait";
+        manager
+            .db()
+            .create_conversation(conversation_id, "wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "occurrence-wait-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'occurrence-wait-input', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::AwaitingUserResponse {
+                    questions: Vec::new(),
+                    tool_use_id: "question".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        manager
+            .db()
+            .add_message(
+                "occurrence-agent-response",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("settled"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::ToolExecuting {
+                    current_tool: phoenix_core::domain::sm_state::ToolCall::new(
+                        "occurrence-agent-tool",
+                        phoenix_core::domain::sm_state::ToolInput::Think(
+                            phoenix_core::domain::sm_state::ThinkInput {
+                                thoughts: "continue".to_string(),
+                            },
+                        ),
+                    ),
+                    remaining_tools: Vec::new(),
+                    completed_results: Vec::new(),
+                    pending_sub_agents: Vec::new(),
+                    assistant_message: phoenix_core::domain::sm_state::AssistantMessage::new(
+                        "occurrence-agent-response".to_string(),
+                        vec![phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                            "occurrence-agent-tool",
+                            "think",
+                            serde_json::json!({"thoughts": "continue"}),
+                        )],
+                        None,
+                        None,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn turn_terminalization_preserves_newer_execution_occurrence() {
+        use crate::runtime::traits::{
+            ActiveDirectTurnSettlement, ActiveDirectTurnTerminal, MessageStore,
+        };
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "terminal-preserves-newer-occurrence";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .add_message(
+                "newer-wake-input",
+                conversation_id,
+                &crate::db::MessageContent::user("newer durable wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'newer-wake-input', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let storage = DatabaseStorage::new(manager.db().clone());
+        let active = MessageStore::load_active_direct_turn(&storage, conversation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active();
+
+        MessageStore::settle_active_direct_turn(
+            &storage,
+            &ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: active,
+                terminal: ActiveDirectTurnTerminal::Completed,
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+                execution_occurrence_message_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn typed_occurrence_persists_requesting_before_provider_dispatch() {
+        let conversation_id = "restart-occurrence-persisted-requesting";
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let llm = Arc::new(PersistedStateRecordingLlm {
+            db: db.clone(),
+            conversation_id: conversation_id.to_string(),
+            observed_state: std::sync::Mutex::new(None),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "occurrence-persist-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'occurrence-persist-input', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        let settle = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.settle_persisted_llm_requests().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), llm.entered.notified())
+            .await
+            .expect("provider entered");
+        {
+            let observed_state = llm.observed_state.lock().expect("observed state lock");
+            assert!(
+                matches!(
+                    observed_state.as_ref(),
+                    Some(ConvState::LlmRequesting { .. })
+                ),
+                "provider observed {observed_state:?}"
+            );
+        }
+        llm.release.notify_one();
+        settle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_marker_failure_prevents_unbounded_provider_dispatch() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-marker-persistence-failure";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .add_message(
+                "marker-failure-agent",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                        "marker-failure-tool",
+                        "think",
+                        serde_json::json!({"thoughts": "resume"}),
+                    ),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "marker-failure-tool-result",
+                conversation_id,
+                &crate::db::MessageContent::Tool(phoenix_core::domain::db_schema::ToolContent {
+                    tool_use_id: "marker-failure-tool".to_string(),
+                    content: "interrupted".to_string(),
+                    is_error: true,
+                    images: Vec::new(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager.db().reset_all_to_idle().await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_restart_marker
+             BEFORE INSERT ON messages
+             WHEN NEW.content LIKE '%server-restart-auto-continue%'
+             BEGIN SELECT RAISE(FAIL, 'injected restart marker failure'); END",
+        )
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        let result = manager.settle_persisted_llm_requests().await;
+
+        assert!(result
+            .expect_err("required restart marker failure must abort startup recovery")
+            .contains("required restart recovery marker"));
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(manager.db().has_owed_baton(conversation_id).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn startup_settles_pre_source_locator_turn_without_redispatch() {
         let llm = Arc::new(RecordingLlm {
             requests: std::sync::atomic::AtomicUsize::new(0),
         });
         let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
         let id = "restart-pre-source-locator";
-        materialize_restart_direct_turn_encoding(&manager, id, true).await;
+        manager
+            .db()
+            .create_conversation(id, "restart", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        materialize_restart_direct_turn_encoding(&manager, id, true, "restart-user-message", 1)
+            .await;
         manager.db().reset_all_to_idle().await.unwrap();
         manager.settle_persisted_llm_requests().await.unwrap();
         assert_eq!(

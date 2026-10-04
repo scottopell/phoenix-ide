@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { api } from '../api';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { api, type ActiveCoordinatorWatch, type LiveCoordinatorBashHandle } from '../api';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
@@ -12,6 +12,118 @@ const ConversationPage = lazy(() =>
 interface CoordinatorPageFixtureData {
   coordinatorId: string;
   conversation: ReactNode;
+}
+
+function GlobalActiveWatches() {
+  const [watches, setWatches] = useState<ActiveCoordinatorWatch[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const value = await api.listActiveCoordinatorWatches();
+        if (!cancelled) { setWatches(value); setError(null); }
+      } catch {
+        if (!cancelled) setError('Could not refresh active watches');
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 2_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+
+  if (watches.length === 0 && !error) return null;
+  return (
+    <section className="global-active-watches" aria-label="Active watches">
+      <strong>Watching</strong>
+      {error && <span className="coordinator-error" role="status">{error}</span>}
+      {watches.map((watch) => (
+        <div className="global-active-watch" key={watch.product_conversation_id}>
+          <div>
+            <Link to={`/product-conversations/${watch.product_conversation_id}`}>{watch.display_name}</Link>
+            <span>{watch.state}</span>
+          </div>
+          {watch.project_path && <code>{watch.project_path}</code>}
+          <div>
+            <Link to={`/c/${encodeURIComponent(watch.transcript_slug || watch.transcript_id)}`}>current transcript</Link>
+            <code title="ProductConversation ID">{watch.product_conversation_id}</code>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function GlobalLiveCommands() {
+  const location = useLocation();
+  const [handles, setHandles] = useState<LiveCoordinatorBashHandle[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [stopping, setStopping] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const value = await api.listLiveCoordinatorBashHandles();
+        if (!cancelled) { setHandles(value); setError(null); }
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load live commands');
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+
+  const inspectTarget = (handleId: string) => {
+    const search = new URLSearchParams(location.search);
+    search.set('viewer', 'inspect');
+    search.set('handle', handleId);
+    return { pathname: location.pathname, search: `?${search.toString()}`, hash: location.hash };
+  };
+
+  if (handles.length === 0 && !error) return null;
+  return (
+    <section className="global-live-commands" aria-label="Running commands">
+      <strong>Running</strong>
+      {error && <span className="global-live-commands-error" role="status">{error}</span>}
+      {handles.map((handle) => (
+        <div className="global-live-command" key={handle.handle_id}>
+          <div>
+            {handle.label && <strong>{handle.label}</strong>}
+            <code>{handle.command}</code>
+            <span>{handle.cwd} · started {new Date(handle.started_at_ms).toLocaleString()}</span>
+            <span>{handle.handle_id}</span>
+          </div>
+          <div className="global-live-command-actions">
+            <Link to={inspectTarget(handle.handle_id)}>output →</Link>
+            {handle.can_stop && <button type="button" disabled={stopping.has(handle.handle_id)} onClick={() => {
+              setStopping((current) => new Set(current).add(handle.handle_id));
+              void api.stopLiveCoordinatorBashHandle(handle.handle_id)
+                .then(() => undefined)
+                .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to stop command'))
+                .finally(() => setStopping((current) => {
+                  const next = new Set(current);
+                  next.delete(handle.handle_id);
+                  return next;
+                }));
+            }}>{stopping.has(handle.handle_id) ? 'stopping…' : 'stop'}</button>}
+          </div>
+        </div>
+      ))}
+    </section>
+  );
 }
 
 export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
@@ -88,6 +200,13 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         <div className="coordinator-page__automatic-continuation">
           <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
         </div>
+      )}
+
+      {!fixtureData && !loading && !error && (
+        <>
+          <GlobalActiveWatches />
+          <GlobalLiveCommands />
+        </>
       )}
 
       <section className="coordinator-conversation" aria-label="Coordinator conversation">

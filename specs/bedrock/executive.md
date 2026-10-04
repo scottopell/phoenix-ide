@@ -24,7 +24,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking |
 | **REQ-BED-005:** Cancellation Handling | ✅ Complete | Synthetic tool results for cancelled tools |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
-| **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; ordinary turns resume from idle, committed steering turns retain bounded first-response recovery ownership, and durable continuation operations retain recovery state |
+| **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |
 | **REQ-BED-008:** Sub-Agent Spawning | 🚧 Partial | Existing spawning/fan-in is live; atomic admission, exact pending removal, idempotent duplicate acceptance, and complete-fan-in settlement remain to be implemented |
 | **REQ-BED-009:** Sub-Agent Isolation | ✅ Complete | Tool set restriction defined |
 | **REQ-BED-010:** Fixed Working Directory | ✅ Complete | Set at creation, passed to tools |

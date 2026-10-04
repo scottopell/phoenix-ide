@@ -2411,6 +2411,35 @@ rule ModeChangeNotification {
 --       identity alone is insufficient: the qualifying transcript tail and
 --       exact queue-row absence are both required.
 --
+--   active_materialized_turn_owns_conversation(conversation: Conversation) -> Boolean
+--       True exactly when the latest accepted runtime direct turn is materialized,
+--       nonterminal, generation-current, and still owns this conversation.
+--
+--   durable_execution_occurrence_owns_first_response(conversation: Conversation) -> Boolean
+--       True exactly when an accepted wake, seeded fork, or interaction response
+--       occurrence still owns its first model response.
+--
+--   newer_queued_steering_awaits_dispatch(conversation: Conversation) -> Boolean
+--       True exactly when accepted steering newer than the exhausted recovery
+--       owner remains queued for dispatch.
+--
+--   pending_approval_owns_next_transition(conversation: Conversation) -> Boolean
+--       True exactly when task approval remains required before model dispatch
+--       or terminal settlement.
+--
+--   recoverable_tool_results_await_model_step(conversation: Conversation) -> Boolean
+--       True exactly when that active turn has a complete persisted tool-result
+--       round whose next model step has not settled. An interrupted or
+--       unknown-effect tool must first be represented by an explicit error result.
+--
+--   restart_recovery_exhausted(conversation: Conversation) -> Boolean
+--       True exactly when the active turn has reached the bounded count of restart
+--       recoveries within the same user turn.
+--
+--   transcript_suggests_unfinished_work(conversation: Conversation) -> Boolean
+--       True when transcript text or shape could look unfinished but no typed
+--       durable owner authorizes execution.
+--
 --   continuation_summary_message_id(operation_id: String) -> String
 --       Returns the immutable identity of the predecessor summary message
 --       committed by that continuation operation.
@@ -2565,7 +2594,9 @@ rule ModeChangeNotification {
 -- Every rule that changes status implicitly requires state persistence
 -- before side effects execute.
 
--- REQ-BED-007: ordinary interrupted turns restart from idle. Durable
+-- REQ-BED-007: interrupted provider requests without an independently
+-- recoverable obligation restart from idle. An active materialized direct turn
+-- with safely persisted tool results remains the sole recovery baton. Durable
 -- continuation operations retain their operation identity and recovery state.
 rule RuntimeRecreatesUserResumableError {
     when: RuntimeStarts(conversation)
@@ -2584,12 +2615,49 @@ rule ServerRestartOrdinaryConversation {
     when: ServerRestarted(conversation)
     requires: conversation.is_busy
     requires: not committed_steering_turn_awaiting_first_response(conversation)
+    requires: not active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: conversation.core_status not in {
         awaiting_continuation,
         recoverable_continuation_failure
     }
     requires: conversation.parent_status != awaiting_recovery
         or conversation.recovery_resume_target = conversation_turn
+    ensures: conversation.core_status = idle
+}
+
+rule ServerRestartOwedDirectTurn {
+    when: ServerRestarted(conversation)
+    requires: active_materialized_turn_owns_conversation(conversation)
+    requires: recoverable_tool_results_await_model_step(conversation)
+    requires: not restart_recovery_exhausted(conversation)
+    ensures: LlmRequestDispatched(conversation)
+
+    @guidance
+        -- The exact accepted-turn identity and generation authorize recovery.
+        -- Startup discovers the durable owner without browser or SSE activity.
+        -- In-flight or unknown-effect tools are first materialized as explicit
+        -- interrupted results and are never replayed. Continuation transfers the
+        -- single obligation through its durable operation rather than creating
+        -- concurrent predecessor and successor owners.
+}
+
+rule ServerRestartExhaustedDirectTurn {
+    when: ServerRestarted(conversation)
+    requires: active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
+    requires: not newer_queued_steering_awaits_dispatch(conversation)
+    requires: not pending_approval_owns_next_transition(conversation)
+    requires: restart_recovery_exhausted(conversation)
+    ensures: conversation.core_status = error
+    ensures: not active_materialized_turn_owns_conversation(conversation)
+}
+
+rule ServerRestartWithoutDurableOwner {
+    when: ServerRestarted(conversation)
+    requires: not active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
+    requires: transcript_suggests_unfinished_work(conversation)
     ensures: conversation.core_status = idle
 }
 

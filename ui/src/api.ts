@@ -1300,6 +1300,24 @@ export const streamApi = {
   subscribeToChainStream,
 };
 
+export interface LiveCoordinatorBashHandle {
+  handle_id: string;
+  command: string;
+  label: string | null;
+  cwd: string;
+  started_at_ms: number;
+  can_stop: boolean;
+}
+
+export interface ActiveCoordinatorWatch {
+  product_conversation_id: string;
+  transcript_id: string;
+  transcript_slug: string | null;
+  display_name: string;
+  project_path: string | null;
+  state: string;
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -2022,6 +2040,23 @@ export const api = {
     });
     if (!resp.ok) throw new Error('Failed to stop browser session');
     return resp.json();
+  },
+
+  async listActiveCoordinatorWatches(): Promise<ActiveCoordinatorWatch[]> {
+    const resp = await fetch('/api/coordinator/watches');
+    if (!resp.ok) throw new Error('Failed to list active watches');
+    return resp.json();
+  },
+
+  async listLiveCoordinatorBashHandles(): Promise<LiveCoordinatorBashHandle[]> {
+    const resp = await fetch('/api/coordinator/bash/live');
+    if (!resp.ok) throw new Error('Failed to list live Coordinator bash handles');
+    return resp.json();
+  },
+
+  async stopLiveCoordinatorBashHandle(handleId: string): Promise<void> {
+    const resp = await fetch(`/api/coordinator/bash/${encodeURIComponent(handleId)}/stop`, { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to stop live Coordinator bash handle');
   },
 
   /** One handle's combined inspection snapshot — identity + state, an output
