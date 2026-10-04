@@ -138,7 +138,7 @@ def _build_configuration() -> dict:
     }
     host = next((line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:")), None)
     cargo_home = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
-    if any(key == "TARGET_CC" or key in {"HOST_CC", "CC_KNOWN_WRAPPER_CUSTOM", "CROSS_COMPILE"} or key.startswith("CC_") for key in os.environ): raise SystemExit("custom/cross native compiler selection unsupported")
+    if any(key == "TARGET_CC" or key in {"HOST_CC", "CC_KNOWN_WRAPPER_CUSTOM", "CROSS_COMPILE", "CRATE_CC_NO_DEFAULTS"} or key.startswith("CC_") for key in os.environ): raise SystemExit("custom/cross native compiler selection unsupported")
     selector = forwarded.get("CC", "cc")
     if any(key.startswith("CC_") or key=="HOST_CC" for key in forwarded) or any(ch.isspace() for ch in selector) or (forwarded.get("CARGO_BUILD_TARGET") and forwarded["CARGO_BUILD_TARGET"] != host):
         raise SystemExit("custom/cross native compiler selection unsupported; use plain host CC executable")

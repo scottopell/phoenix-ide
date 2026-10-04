@@ -254,7 +254,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit,"finite positive"):
                     bench.run(type("Args",(),{"timeout":timeout})())
                 launch.assert_not_called()
-        for key in ["TARGET_CC","HOST_CC","CC_aarch64_apple_darwin","CC_KNOWN_WRAPPER_CUSTOM","CROSS_COMPILE"]:
+        for key in ["TARGET_CC","HOST_CC","CC_aarch64_apple_darwin","CC_KNOWN_WRAPPER_CUSTOM","CROSS_COMPILE","CRATE_CC_NO_DEFAULTS"]:
             with mock.patch.dict("os.environ",{key:"gcc"}),mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
                 with self.assertRaisesRegex(SystemExit,"native compiler selection unsupported"):bench._build_configuration()
 
@@ -270,6 +270,14 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit,"alternate Cargo compiler"):bench._build_configuration()
         with mock.patch.object(__import__("sys"),"argv",["benchmark","prepare","--force"]):
             with self.assertRaises(SystemExit):bench.main()
+
+    def test_selective_tool_candidate_uses_exact_not_palette_prefix(self):
+        conn=sqlite3.connect(":memory:");conn.execute("create virtual table message_fts using fts5(text)")
+        conn.execute("insert into message_fts(text) values('abcdef')")
+        conn.executemany("insert into message_fts(text) values(?)",[("abcdefgh",)]*1001)
+        self.assertEqual(bench._selective_term(conn,"abcdef"),"abcdef")
+        self.assertEqual(conn.execute('select count(*) from message_fts where message_fts match ?', ('"abcdef"',)).fetchone()[0],1)
+        self.assertEqual(conn.execute('select count(*) from message_fts where message_fts match ?', ('"abcdef"*',)).fetchone()[0],1002)
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
