@@ -26,12 +26,18 @@ vi.mock('./ConversationPage', () => ({
   ConversationPage: ({
     routePrefix,
     composerQuickAction,
+    stateBarExtension,
   }: {
     routePrefix?: string;
     composerQuickAction?: { label: string; compactLabel: string; prompt: string };
+    stateBarExtension?: { summary: React.ReactNode; details: React.ReactNode };
   }) => (
     <div>
       Shared conversation runtime {routePrefix}
+      <div data-testid="mock-statebar">
+        {stateBarExtension?.summary}
+        {stateBarExtension?.details}
+      </div>
       {composerQuickAction && (
         <button type="button" data-prompt={composerQuickAction.prompt}>
           {composerQuickAction.compactLabel}
@@ -102,7 +108,10 @@ describe('CoordinatorPage', () => {
       state: 'idle',
     }]);
     renderPage();
+    const activity = await screen.findByLabelText('Global activity settings');
+    expect(activity).toHaveTextContent('Watching 1');
     expect(await screen.findByRole('region', { name: 'Active watches' })).toBeInTheDocument();
+
     expect(screen.getByRole('link', { name: 'Fix readable target' })).toHaveAttribute('href', '/product-conversations/product-readable');
     expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/fix-readable-target');
     expect(screen.getByTitle('ProductConversation ID')).toHaveTextContent('product-readable');
@@ -140,11 +149,15 @@ describe('CoordinatorPage', () => {
 
     renderPage('/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source');
 
+    await waitFor(() => expect(screen.getByLabelText('Global activity settings')).toHaveTextContent('Running 1'));
     const running = await screen.findByRole('region', { name: 'Running commands' });
     expect(running).toHaveTextContent('UI tests');
     expect(running).toHaveTextContent('pnpm test');
+    expect(running).toHaveTextContent('Started');
+    const commandDetails = screen.getAllByText('Details').at(-1)?.closest('details');
+    expect(commandDetails).not.toHaveAttribute('open');
+    fireEvent.click(commandDetails!.querySelector('summary')!);
     expect(running).toHaveTextContent('/repo/ui');
-    expect(running).toHaveTextContent('started');
     expect(running).toHaveTextContent('b-live');
     expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
     fireEvent.click(screen.getByRole('button', { name: 'stop' }));
@@ -172,6 +185,7 @@ describe('CoordinatorPage', () => {
     renderPage();
 
     const control = await screen.findByTestId('automatic-continuation-control');
+    expect(screen.getByTestId('mock-statebar')).toContainElement(control);
     fireEvent.click(control.querySelector('summary')!);
     const checkbox = screen.getByRole('checkbox', { name: 'Automatically accept future generated handoffs and continue' });
     await waitFor(() => {

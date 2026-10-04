@@ -1,0 +1,3 @@
+# Global activity belongs in the existing bottom conversation panel
+
+Correct the merged Global UI layout without changing watch, Bash, or auto-continue semantics. Remove top-level Watching, Running, and Auto-continue chrome and integrate compact counts plus expandable authoritative details into the existing bottom conversation StateBar/settings surface. Preserve readable identity, output/stop authority, navigation provenance, drafts, composer height, accessibility, mobile scaling, and safe-area behavior. Qualify real Global routes at 393px and desktop in light/dark, collapsed/expanded, including keyboard/composer inspection. Do not merge or deploy.

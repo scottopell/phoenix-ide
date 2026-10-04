@@ -14,9 +14,17 @@ interface CoordinatorPageFixtureData {
   conversation: ReactNode;
 }
 
-function GlobalActiveWatches() {
+function humanizeState(state: string): string {
+  return state.replaceAll('_', ' ').replace(/^./, (first) => first.toUpperCase());
+}
+
+function GlobalActiveWatches({ onCount }: { onCount: (count: number) => void }) {
   const [watches, setWatches] = useState<ActiveCoordinatorWatch[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    onCount(watches.length);
+  }, [onCount, watches.length]);
 
   useEffect(() => {
     let cancelled = false;
@@ -47,24 +55,29 @@ function GlobalActiveWatches() {
         <div className="global-active-watch" key={watch.product_conversation_id}>
           <div>
             <Link to={`/product-conversations/${watch.product_conversation_id}`}>{watch.display_name}</Link>
-            <span>{watch.state}</span>
+            <span>{humanizeState(watch.state)}</span>
           </div>
-          {watch.project_path && <code>{watch.project_path}</code>}
-          <div>
-            <Link to={`/c/${encodeURIComponent(watch.transcript_slug || watch.transcript_id)}`}>current transcript</Link>
+          <Link to={`/c/${encodeURIComponent(watch.transcript_slug || watch.transcript_id)}`}>current transcript</Link>
+          <details className="global-activity-metadata">
+            <summary>Details</summary>
+            {watch.project_path && <code>{watch.project_path}</code>}
             <code title="ProductConversation ID">{watch.product_conversation_id}</code>
-          </div>
+          </details>
         </div>
       ))}
     </section>
   );
 }
 
-function GlobalLiveCommands() {
+function GlobalLiveCommands({ onCount }: { onCount: (count: number) => void }) {
   const location = useLocation();
   const [handles, setHandles] = useState<LiveCoordinatorBashHandle[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    onCount(handles.length);
+  }, [handles.length, onCount]);
 
   useEffect(() => {
     let cancelled = false;
@@ -103,8 +116,12 @@ function GlobalLiveCommands() {
           <div>
             {handle.label && <strong>{handle.label}</strong>}
             <code>{handle.command}</code>
-            <span>{handle.cwd} · started {new Date(handle.started_at_ms).toLocaleString()}</span>
-            <span>{handle.handle_id}</span>
+            <span>Started {new Date(handle.started_at_ms).toLocaleString()}</span>
+            <details className="global-activity-metadata">
+              <summary>Details</summary>
+              <code>{handle.cwd}</code>
+              <code>{handle.handle_id}</code>
+            </details>
           </div>
           <div className="global-live-command-actions">
             <Link to={inspectTarget(handle.handle_id)}>output →</Link>
@@ -136,6 +153,9 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
   const [topologyRevision, setTopologyRevision] = useState(0);
+  const [watchCount, setWatchCount] = useState(0);
+  const [runningCount, setRunningCount] = useState(0);
+  const [automaticContinuationStatus, setAutomaticContinuationStatus] = useState('…');
   const consumedTopologyRevision = useRef(0);
 
   useEffect(() => {
@@ -191,28 +211,37 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     return () => { cancelled = true; };
   }, [fixtureData, navigate, slug, topologyRevision]);
 
+  const stateBarExtension = fixtureData ? undefined : {
+    summary: (
+      <span className="global-statebar-summary" aria-label="Global activity settings">
+        <span>Watching {watchCount}</span>
+        <span>Running {runningCount}</span>
+        <span>Auto {automaticContinuationStatus}</span>
+      </span>
+    ),
+    details: (
+      <div className="global-statebar-activity__details">
+        <AutomaticContinuationControl
+          scope={{ kind: 'coordinator' }}
+          onStatusChange={setAutomaticContinuationStatus}
+        />
+        <GlobalActiveWatches onCount={setWatchCount} />
+        <GlobalLiveCommands onCount={setRunningCount} />
+      </div>
+    ),
+  };
+
   return (
     <main className="coordinator-page">
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
-      {!loading && !error && resolvedCoordinatorId === slug && (
-        <div className="coordinator-page__automatic-continuation">
-          <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
-        </div>
-      )}
 
-      {!fixtureData && !loading && !error && (
-        <>
-          <GlobalActiveWatches />
-          <GlobalLiveCommands />
-        </>
-      )}
 
       <section className="coordinator-conversation" aria-label="Coordinator conversation">
         {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
-            <ConversationPage routePrefix="/global" composerQuickAction={COORDINATOR_QUICK_ACTION} />
+            <ConversationPage routePrefix="/global" composerQuickAction={COORDINATOR_QUICK_ACTION} stateBarExtension={stateBarExtension} />
           </Suspense>
         ) : null}
       </section>

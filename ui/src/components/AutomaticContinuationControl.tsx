@@ -18,13 +18,14 @@ export type AutomaticContinuationScope =
 
 interface AutomaticContinuationControlProps {
   scope: AutomaticContinuationScope;
+  onStatusChange?: (status: string) => void;
 }
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
 
-export function AutomaticContinuationControl({ scope }: AutomaticContinuationControlProps) {
+export function AutomaticContinuationControl({ scope, onStatusChange }: AutomaticContinuationControlProps) {
   const [view, setView] = useState<AutomaticContinuationView | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -152,6 +153,13 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
   const admission = view?.admission ?? null;
   const phaseLabel = admission ? PHASE_LABELS[admission.phase] : null;
   const failedAdmission = admission?.phase === 'failed' ? admission : null;
+  const compactStatus = loading
+    ? '…'
+    : `${enabled ? 'On' : 'Off'}${phaseLabel ? ` · ${phaseLabel}` : ''}`;
+
+  useEffect(() => {
+    onStatusChange?.(compactStatus);
+  }, [compactStatus, onStatusChange]);
   const detailsRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {

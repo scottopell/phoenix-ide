@@ -91,6 +91,7 @@ function renderStateBar({
   terminalLauncher,
   availableModels,
   onUpgradeModel,
+  conversationExtension,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -108,6 +109,7 @@ function renderStateBar({
   terminalLauncher?: ComponentProps<typeof StateBar>['terminalLauncher'];
   availableModels?: ComponentProps<typeof StateBar>['availableModels'];
   onUpgradeModel?: ComponentProps<typeof StateBar>['onUpgradeModel'];
+  conversationExtension?: ComponentProps<typeof StateBar>['conversationExtension'];
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
@@ -129,6 +131,9 @@ function renderStateBar({
   }
   if (onUpgradeModel !== undefined) {
     props.onUpgradeModel = onUpgradeModel;
+  }
+  if (conversationExtension !== undefined) {
+    props.conversationExtension = conversationExtension;
   }
   if (continuation) {
     props.continuation = continuation;
@@ -154,6 +159,26 @@ function renderStateBar({
     </MemoryRouter>,
   );
 }
+
+describe('StateBar conversation extension', () => {
+  it('uses the existing mobile expansion control for extension details', () => {
+    setMobileViewport(true);
+    renderStateBar({
+      conversationExtension: {
+        summary: <span>Watching 2 Running 1 Auto On</span>,
+        details: <div>Global activity details</div>,
+      },
+    });
+
+    expect(screen.getByText('Watching 2 Running 1 Auto On')).toBeVisible();
+    expect(screen.getByText('Global activity details')).not.toBeVisible();
+
+    fireEvent.click(document.querySelector('.statebar-chevron')!);
+
+    expect(screen.getByText('Global activity details')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Collapse status bar' })).toHaveAttribute('aria-expanded', 'true');
+  });
+});
 
 describe('mobile terminal launcher', () => {
   it('reveals terminal status only in expanded details and opens it directly', () => {
