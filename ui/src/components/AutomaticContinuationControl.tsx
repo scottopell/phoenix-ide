@@ -18,7 +18,7 @@ export type AutomaticContinuationScope =
 
 interface AutomaticContinuationControlProps {
   scope: AutomaticContinuationScope;
-  onStatusChange?: (status: string) => void;
+  onStatusChange?: (status: string, requiresAttention: boolean) => void;
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -158,8 +158,8 @@ export function AutomaticContinuationControl({ scope, onStatusChange }: Automati
     : `${enabled ? 'On' : 'Off'}${phaseLabel ? ` · ${phaseLabel}` : ''}`;
 
   useEffect(() => {
-    onStatusChange?.(compactStatus);
-  }, [compactStatus, onStatusChange]);
+    onStatusChange?.(compactStatus, failedAdmission !== null);
+  }, [compactStatus, failedAdmission, onStatusChange]);
   const detailsRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {

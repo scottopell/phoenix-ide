@@ -108,7 +108,7 @@ describe('CoordinatorPage', () => {
       state: 'idle',
     }]);
     renderPage();
-    const activity = await screen.findByLabelText('Global activity settings');
+    const activity = (await screen.findByText(/Watching [\d…]/)).closest('.global-statebar-summary')!;
     await waitFor(() => expect(activity).toHaveTextContent('Watching 1'));
     expect(await screen.findByRole('region', { name: 'Active watches' })).toBeInTheDocument();
 
@@ -149,7 +149,7 @@ describe('CoordinatorPage', () => {
 
     renderPage('/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source');
 
-    await waitFor(() => expect(screen.getByLabelText('Global activity settings')).toHaveTextContent('Running 1'));
+    await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
     const running = await screen.findByRole('region', { name: 'Running commands' });
     expect(running).toHaveTextContent('UI tests');
     expect(running).toHaveTextContent('pnpm test');

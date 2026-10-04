@@ -46,10 +46,22 @@
 
 .global-statebar-summary {
   display: flex;
+  min-width: 0;
   gap: 10px;
+  overflow: hidden;
   align-items: center;
   font-size: 0.78rem;
   white-space: nowrap;
+}
+
+.global-statebar-summary > span {
+  flex: 0 0 auto;
+}
+
+.global-statebar-summary__auto {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .global-statebar-activity__details {

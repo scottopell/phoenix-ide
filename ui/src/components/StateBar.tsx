@@ -79,6 +79,7 @@ export type ContinuationState =
 export interface StateBarConversationExtension {
   summary: ReactNode;
   details: ReactNode;
+  requiresAttention?: boolean;
 }
 
 interface StateBarProps {
@@ -537,12 +538,33 @@ export function StateBar({
   const usesCompactLayout = useIsCompactLayout();
   const [mobileExpanded, setMobileExpanded] = useState(false);
   const [conversationExtensionExpanded, setConversationExtensionExpanded] = useState(false);
+  const [composerClearance, setComposerClearance] = useState(64);
   // Collapse the mobile-expanded section when the viewport widens past
   // mobile — otherwise a user who expanded on phone, rotated to landscape,
   // would see a desktop bar with a stale "expanded" affordance.
   useEffect(() => {
     if (!usesCompactLayout) setMobileExpanded(false);
   }, [usesCompactLayout]);
+
+  useEffect(() => {
+    if (!conversationExtension?.requiresAttention) return;
+    if (usesCompactLayout) {
+      setMobileExpanded(true);
+    } else {
+      setConversationExtensionExpanded(true);
+    }
+  }, [conversationExtension?.requiresAttention, usesCompactLayout]);
+
+  useLayoutEffect(() => {
+    if (!conversationExtension || usesCompactLayout) return;
+    const inputArea = document.getElementById("input-area");
+    if (!inputArea) return;
+    const update = () => setComposerClearance(inputArea.getBoundingClientRect().height + 16);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(inputArea);
+    return () => observer.disconnect();
+  }, [conversationExtension, usesCompactLayout]);
   const pickerTriggerRef = useRef<HTMLButtonElement>(null);
   const conversationIdentityRef = useRef(conversation?.id);
   const modelMutationGenerationRef = useRef(0);
@@ -1680,6 +1702,7 @@ export function StateBar({
             <div
               id="statebar-conversation-extension-details"
               className="statebar-conversation-extension-details"
+              style={{ bottom: `calc(100% + ${composerClearance}px)` }}
               hidden={!conversationExtensionExpanded}
             >
               {conversationExtension.details}

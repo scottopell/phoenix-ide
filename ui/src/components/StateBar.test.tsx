@@ -161,6 +161,20 @@ function renderStateBar({
 }
 
 describe('StateBar conversation extension', () => {
+  it('reveals extension recovery details when attention is required', () => {
+    setMobileViewport(true);
+    renderStateBar({
+      conversationExtension: {
+        summary: <span>Auto On · Failed</span>,
+        details: <div>Retry automatic continuation</div>,
+        requiresAttention: true,
+      },
+    });
+
+    expect(screen.getByText('Retry automatic continuation')).toBeVisible();
+    expect(document.querySelector('.statebar-chevron')).toHaveAttribute('aria-expanded', 'true');
+  });
+
   it('uses the existing mobile expansion control for extension details', () => {
     setMobileViewport(true);
     renderStateBar({

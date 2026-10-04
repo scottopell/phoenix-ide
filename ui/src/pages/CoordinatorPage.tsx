@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api, type ActiveCoordinatorWatch, type LiveCoordinatorBashHandle } from '../api';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
@@ -18,13 +18,11 @@ function humanizeState(state: string): string {
   return state.replaceAll('_', ' ').replace(/^./, (first) => first.toUpperCase());
 }
 
-function GlobalActiveWatches({ onCount }: { onCount: (count: number) => void }) {
+type ActivityCount = number | null;
+
+function GlobalActiveWatches({ onCount }: { onCount: (count: ActivityCount) => void }) {
   const [watches, setWatches] = useState<ActiveCoordinatorWatch[]>([]);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    onCount(watches.length);
-  }, [onCount, watches.length]);
 
   useEffect(() => {
     let cancelled = false;
@@ -34,9 +32,9 @@ function GlobalActiveWatches({ onCount }: { onCount: (count: number) => void }) 
       inFlight = true;
       try {
         const value = await api.listActiveCoordinatorWatches();
-        if (!cancelled) { setWatches(value); setError(null); }
+        if (!cancelled) { setWatches(value); setError(null); onCount(value.length); }
       } catch {
-        if (!cancelled) setError('Could not refresh active watches');
+        if (!cancelled) { setError('Could not refresh active watches'); onCount(null); }
       } finally {
         inFlight = false;
       }
@@ -44,7 +42,7 @@ function GlobalActiveWatches({ onCount }: { onCount: (count: number) => void }) 
     void refresh();
     const timer = window.setInterval(() => void refresh(), 2_000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, []);
+  }, [onCount]);
 
   if (watches.length === 0 && !error) return null;
   return (
@@ -69,15 +67,11 @@ function GlobalActiveWatches({ onCount }: { onCount: (count: number) => void }) 
   );
 }
 
-function GlobalLiveCommands({ onCount }: { onCount: (count: number) => void }) {
+function GlobalLiveCommands({ onCount }: { onCount: (count: ActivityCount) => void }) {
   const location = useLocation();
   const [handles, setHandles] = useState<LiveCoordinatorBashHandle[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState<Set<string>>(() => new Set());
-
-  useEffect(() => {
-    onCount(handles.length);
-  }, [handles.length, onCount]);
 
   useEffect(() => {
     let cancelled = false;
@@ -87,9 +81,9 @@ function GlobalLiveCommands({ onCount }: { onCount: (count: number) => void }) {
       inFlight = true;
       try {
         const value = await api.listLiveCoordinatorBashHandles();
-        if (!cancelled) { setHandles(value); setError(null); }
+        if (!cancelled) { setHandles(value); setError(null); onCount(value.length); }
       } catch (reason) {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load live commands');
+        if (!cancelled) { setError(reason instanceof Error ? reason.message : 'Failed to load live commands'); onCount(null); }
       } finally {
         inFlight = false;
       }
@@ -97,7 +91,7 @@ function GlobalLiveCommands({ onCount }: { onCount: (count: number) => void }) {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5_000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, []);
+  }, [onCount]);
 
   const inspectTarget = (handleId: string) => {
     const search = new URLSearchParams(location.search);
@@ -153,9 +147,10 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
   const [topologyRevision, setTopologyRevision] = useState(0);
-  const [watchCount, setWatchCount] = useState(0);
-  const [runningCount, setRunningCount] = useState(0);
+  const [watchCount, setWatchCount] = useState<ActivityCount>(null);
+  const [runningCount, setRunningCount] = useState<ActivityCount>(null);
   const [automaticContinuationStatus, setAutomaticContinuationStatus] = useState('…');
+  const [automaticContinuationNeedsAttention, setAutomaticContinuationNeedsAttention] = useState(false);
   const consumedTopologyRevision = useRef(0);
 
   useEffect(() => {
@@ -211,24 +206,30 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     return () => { cancelled = true; };
   }, [fixtureData, navigate, slug, topologyRevision]);
 
+  const handleAutomaticContinuationStatus = useCallback((status: string, requiresAttention: boolean) => {
+    setAutomaticContinuationStatus(status);
+    setAutomaticContinuationNeedsAttention(requiresAttention);
+  }, []);
+
   const stateBarExtension = fixtureData ? undefined : {
     summary: (
-      <span className="global-statebar-summary" aria-label="Global activity settings">
-        <span>Watching {watchCount}</span>
-        <span>Running {runningCount}</span>
-        <span>Auto {automaticContinuationStatus}</span>
+      <span className="global-statebar-summary">
+        <span>Watching {watchCount ?? '…'}</span>
+        <span>Running {runningCount ?? '…'}</span>
+        <span className="global-statebar-summary__auto" title={`Auto-continue ${automaticContinuationStatus}`}>Auto {automaticContinuationStatus}</span>
       </span>
     ),
     details: (
       <div className="global-statebar-activity__details">
         <AutomaticContinuationControl
           scope={{ kind: 'coordinator' }}
-          onStatusChange={setAutomaticContinuationStatus}
+          onStatusChange={handleAutomaticContinuationStatus}
         />
         <GlobalActiveWatches onCount={setWatchCount} />
         <GlobalLiveCommands onCount={setRunningCount} />
       </div>
     ),
+    requiresAttention: automaticContinuationNeedsAttention,
   };
 
   return (

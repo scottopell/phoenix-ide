@@ -629,7 +629,6 @@
   position: absolute;
   z-index: 40;
   right: 0;
-  bottom: calc(100% + 64px);
   width: min(560px, calc(100vw - 24px));
   max-height: min(60dvh, 520px);
   overflow-y: auto;
@@ -643,6 +642,10 @@
 .statebar-conversation-extension-summary {
   min-width: 0;
   color: var(--text-muted);
+}
+
+.statebar-conversation-extension-summary > * {
+  min-width: 0;
 }
 
 @media (width <= 1024px) {

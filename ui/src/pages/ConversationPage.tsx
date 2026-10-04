@@ -2106,20 +2106,6 @@ function ConversationPageContent({
         </div>
       );
     }
-    if (inspectViewerOpen && inspectSlot) {
-      return (
-        <div id="app">
-          <Suspense fallback={null}>
-            <ProcessInspectorPanel
-              handleId={inspectSlot.handleId}
-              conversationId={conversationId}
-              onClose={handleCloseInspector}
-              inline
-            />
-          </Suspense>
-        </div>
-      );
-    }
     if (messageViewerOpen && messageSlot) {
       return (
         <div id="app">
