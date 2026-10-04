@@ -92,6 +92,8 @@ external entity TargetService {
 --   Candidate binary, plist, rollback inputs, hashes, signature, manifest and
 --   embedded identity are valid and host-resident; persisted metadata contains
 --   no plist environment values.
+--   Paired preparation also physically reserves DB-plus-WAL snapshot capacity
+--   and atomic-restore capacity before production stop.
 -- activation_claim_available() -> Boolean
 --   No active or unresolved deployment or restart owns the host-level claim.
 -- helper_is_launchd_owned(transaction) -> Boolean
@@ -135,6 +137,12 @@ external entity TargetService {
 --   is bound to the recorded clean controller source and protocol. The controller
 --   and candidate commits may be equal when that independently bound helper is
 --   valid.
+-- PairedRecoveryVerified(transaction, service)
+--   Separately requested retained-helper recovery verified matched database,
+--   runtime/configuration and predecessor identity before releasing ownership.
+-- CandidateStartupReady(transaction)
+--   Emitted after quiesce and paired snapshot proof verification, before
+--   candidate install/start; ordinary sources use their prepared inputs.
 -- candidate_startup_proof_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, paired_database_proof_is_valid
 --   holds and the verified snapshot follows exclusive offline ownership proof
@@ -218,19 +226,25 @@ rule ActivateCandidate {
     requires: transaction.state = prepared
     requires: helper_is_launchd_owned(transaction)
     requires: preparation_complete(transaction)
-    requires: candidate_startup_proof_is_valid(transaction)
     ensures: transaction.state = activating
-    ensures: atomic_candidate_install(transaction)
 
     @guidance
         -- Revalidate hashes, acquire the host lock, check bootout/bootstrap
         -- results, and poll launchd state and PID to bounded deadlines.
 }
 
+rule CandidateStartupPrepared {
+    when: CandidateStartupReady(transaction)
+    requires: transaction.state = activating
+    requires: candidate_startup_proof_is_valid(transaction)
+    ensures: atomic_candidate_install(transaction)
+}
+
 rule CommitVerifiedCandidate {
     when: CandidateRuntimeObserved(transaction, service)
     requires: transaction.state = activating
     requires: exact_identity_running(service, transaction.expected)
+    requires: candidate_startup_proof_is_valid(transaction)
     ensures: transaction.state = committed
     ensures: DeployedShaWritten(transaction.source_commit)
     ensures: DurableStatusWritten(transaction)
@@ -271,6 +285,17 @@ rule PreserveRollbackFailure {
     ensures: transaction.rollback_failure = rollback_failure
     ensures: DurableStatusWritten(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
+}
+
+rule RecoverRetainedPairedTransaction {
+    when: PairedRecoveryVerified(transaction, service)
+    requires: transaction.state = activation_failed_rollback_failed
+    requires: transaction.source_kind = prepared_artifact
+    requires: active_claim_retained(transaction)
+    requires: paired_predecessor_start_order_is_valid(transaction)
+    requires: exact_previous_restored(transaction, service)
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: DurableStatusWritten(transaction)
 }
 
 rule PreservePreparedRecoveryFailure {

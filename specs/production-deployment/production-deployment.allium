@@ -138,6 +138,12 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   is bound to the recorded clean controller source and protocol. The controller
 --   and candidate commits may be equal when that independently bound helper is
 --   valid.
+-- PairedRecoveryVerified(transaction)
+--   Separately requested retained-helper recovery verified matched database,
+--   runtime/configuration and predecessor identity before releasing ownership.
+-- CandidateStartupReady(transaction)
+--   Emitted after quiesce and paired snapshot proof verification, before
+--   candidate install/start; ordinary sources use their prepared inputs.
 -- candidate_startup_proof_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, paired_database_proof_is_valid
 --   holds and the verified predecessor snapshot follows exclusive offline proof
@@ -324,8 +330,15 @@ rule IndependentOwnerBeginsActivation {
     requires: current_claim_matches(transaction)
     requires: handoff_valid_for_backend(transaction, handoff)
     requires: backend_owner_independent(transaction, handoff)
-    requires: candidate_startup_proof_is_valid(transaction)
+    requires: preparation_complete(transaction)
     ensures: transaction.state = activating
+}
+
+rule CandidateStartupPrepared {
+    when: CandidateStartupReady(transaction)
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    requires: candidate_startup_proof_is_valid(transaction)
     ensures: atomic_install_complete(transaction)
 }
 
@@ -334,6 +347,7 @@ rule CommitVerifiedCandidate {
     requires: transaction.state = activating
     requires: current_claim_matches(transaction)
     requires: exact_candidate_running(transaction)
+    requires: candidate_startup_proof_is_valid(transaction)
     ensures: transaction.state = committed
     ensures: DeployedShaWritten(transaction.source_commit)
     ensures: DurableStatusWritten(transaction)
@@ -377,6 +391,16 @@ rule PreserveRollbackFailure {
     ensures: transaction.rollback_failure = rollback_failure
     ensures: DurableStatusWritten(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
+}
+
+rule RecoverRetainedPairedTransaction {
+    when: PairedRecoveryVerified(transaction)
+    requires: transaction.state = activation_failed_rollback_failed
+    requires: transaction.source_kind = prepared_artifact
+    requires: current_claim_matches(transaction)
+    requires: supported_recovery_verified(transaction)
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: DurableStatusWritten(transaction)
 }
 
 rule PreservePreparedRecoveryFailure {

@@ -89,8 +89,10 @@ The artifact directory is trusted operator input downloaded from the protected
 preparation run. The controller validates local contents, not the receipt's
 workflow origin; establish the run/source association before invocation.
 
-Paired activation snapshots the stopped legacy database through SQLite's backup
-API only after bounded `lsof` exclusivity proof. It requires an existing
+Before production stop, paired activation physically reserves private snapshot
+and atomic-restore capacity sized for the database plus committed WAL and margin.
+It snapshots the stopped legacy database through SQLite's backup API only after
+bounded `lsof` exclusivity proof. It requires an existing
 migration ledger at version 69 or earlier and no ProductConversation tables.
 The private transaction directory, backup, proof, and active claim are retained
 for recovery. Candidate health failure restores the verified matching database,
@@ -99,3 +101,11 @@ restore proof fails, service remains stopped with rollback failure; do not delet
 that transaction or restart blindly. Inspect the proof, run SQLite integrity
 checks offline, and restore the matching predecessor binary, plist, and database
 before starting it.
+
+For a retained `activation_failed_rollback_failed` transaction, never remove the
+active marker merely because its helper exited. Repair the named failed proof,
+then run `./dev.py prod recover-paired TRANSACTION_ID`. This hands recovery to the
+byte-bound retained helper, which verifies offline ownership and snapshot/context,
+restores the matching database/binary/plist, and verifies predecessor identity
+before claim release. Any unverified recovery attempts teardown and retains the
+claim. The command is not a general downgrade or an activation retry.

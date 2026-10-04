@@ -28,6 +28,7 @@ import sqlite3
 import stat
 from pathlib import Path
 from typing import Callable, Optional
+from contextlib import closing
 
 HANDOFF_PROTOCOL_VERSION = 1
 FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -58,6 +59,24 @@ class PairedDatabaseUpgrade:
     controller_source_commit: str
     controller_helper_sha256: str
     controller_helper_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class PairedDatabaseUpgrade:
+    """The sole structural representation of the feature-scoped DB snapshot."""
+    database_path: str
+    backup_path: str
+    proof_path: str
+    controller_source_commit: str
+    controller_helper_sha256: str
+    controller_helper_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class DatabaseCapacityReservation:
+    backup_path: Path
+    restore_path: Path
+    capacity_bytes: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -284,6 +303,18 @@ def _paired_path_context(manifest: Manifest) -> tuple[Path, Path, Path, Path]:
     return database, backup, proof, _private_transaction_dir(backup.parent)
 
 
+def _restore_capacity_path(manifest: Manifest, database: Optional[Path] = None) -> Path:
+    if database is None:
+        database, _backup, _proof, _transaction = _paired_path_context(manifest)
+    transaction_id = manifest.transaction_id
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
+        raise ActivationError("paired transaction id cannot name a restore reservation")
+    path = database.parent / f".{database.name}.restore-{transaction_id}"
+    if path.is_symlink() or path.resolve(strict=False) == database.resolve(strict=False):
+        raise ActivationError("restore reservation path is unsafe")
+    return path
+
+
 def assert_database_exclusive(manifest: Manifest) -> None:
     """Prove that no process still owns the database or SQLite sidecars."""
     database, _backup, _proof, _transaction = _paired_path_context(manifest)
@@ -359,36 +390,104 @@ def _plist_database_path(path: Path) -> Optional[str]:
         raise ActivationError("launchd plist is unreadable") from exc
 
 
-def create_database_backup(manifest: Manifest) -> None:
-    """Take a SQLite backup API snapshot, never a raw copy of a live database."""
+def _source_capacity_bytes(database: Path) -> int:
+    """Reserve the live DB, WAL, and a page-sized margin before stopping it."""
+    try:
+        database_size = database.stat().st_size
+        wal_size = database.with_name(database.name + "-wal").stat().st_size if database.with_name(database.name + "-wal").exists() else 0
+        with closing(_readonly_connection(database)) as connection:
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise ActivationError("could not measure paired database capacity") from exc
+    margin = max(page_size, 4096) * 2
+    return database_size + wal_size + margin
+
+
+def _allocate_private_sqlite(path: Path, size: int) -> None:
+    if path.exists() or path.is_symlink():
+        raise ActivationError("database capacity reservation already exists")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("CREATE TABLE capacity_seed (value INTEGER)")
+            connection.commit()
+        with path.open("r+b") as stream:
+            stream.seek(0, os.SEEK_END)
+            remaining = max(0, size - stream.tell())
+            zeros = b"\0" * (1024 * 1024)
+            while remaining:
+                written = stream.write(zeros[: min(remaining, len(zeros))])
+                if written <= 0:
+                    raise OSError("capacity reservation made no progress")
+                remaining -= written
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.stat().st_blocks * 512 < size:
+            raise OSError("filesystem did not allocate reserved capacity")
+    except (OSError, sqlite3.Error) as exc:
+        path.unlink(missing_ok=True)
+        raise ActivationError("could not reserve paired database capacity") from exc
+
+
+def reserve_database_capacity(manifest: Manifest) -> DatabaseCapacityReservation:
+    """Hold backup and restore space while the service is stopped."""
+    if manifest.paired_database_upgrade is None:
+        raise ActivationError("paired database upgrade is not configured")
+    database, backup, proof, transaction_dir = _paired_path_context(manifest)
+    _regular_nosymlink(database, "paired database")
+    _private_transaction_dir(transaction_dir)
+    restore = _restore_capacity_path(manifest, database)
+    for path, description in ((restore, "restore reservation"),):
+        if not path.is_absolute() or path.is_symlink():
+            raise ActivationError(f"{description} path must be absolute and non-symlink")
+    capacity = _source_capacity_bytes(database)
+    # Never replace an existing protected snapshot: recovery must retain it.
+    if backup.exists() or backup.is_symlink() or proof.exists() or proof.is_symlink():
+        raise ActivationError("paired recovery snapshot is already present")
+    _allocate_private_sqlite(backup, capacity)
+    try:
+        _allocate_private_sqlite(restore, capacity)
+    except BaseException:
+        backup.unlink(missing_ok=True)
+        raise
+    return DatabaseCapacityReservation(backup, restore, capacity)
+
+
+def _reservation_still_sufficient(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
+    database, _backup, _proof, _transaction = _paired_path_context(manifest)
+    required = _source_capacity_bytes(database)
+    for path in (reservation.backup_path, reservation.restore_path):
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
+            raise ActivationError("paired database capacity reservation is unavailable")
+        if path.stat().st_size < required or path.stat().st_blocks * 512 < required:
+            raise ActivationError("paired database grew beyond its reserved capacity")
+
+
+def create_database_backup(manifest: Manifest, reservation: Optional[DatabaseCapacityReservation] = None) -> None:
+    """Take a SQLite backup API snapshot into the held destination."""
     if manifest.paired_database_upgrade is None:
         return
     assert_database_exclusive(manifest)
     source, backup, proof_path, transaction_dir = _paired_path_context(manifest)
     _regular_nosymlink(source, "paired database")
     _private_transaction_dir(transaction_dir)
-    temporary: Optional[Path] = None
+    if reservation is None:
+        reservation = reserve_database_capacity(manifest)
+    if reservation.backup_path != backup:
+        raise ActivationError("database backup reservation does not match manifest")
     try:
-        # A transaction cannot fall back to an older snapshot after a failed proof.
-        backup.unlink(missing_ok=True)
-        proof_path.unlink(missing_ok=True)
-        for suffix in ("-wal", "-shm"):
-            backup.with_name(backup.name + suffix).unlink(missing_ok=True)
-        from contextlib import closing
-        fd, temporary_name = tempfile.mkstemp(prefix=f".{backup.name}.", suffix=".snapshot", dir=transaction_dir)
-        os.fchmod(fd, 0o600)
-        os.close(fd)
-        temporary = Path(temporary_name)
         source_uri = "file:" + urllib.parse.quote(str(source), safe="/") + "?mode=ro"
-        with closing(sqlite3.connect(source_uri, uri=True, timeout=2)) as source_db, closing(sqlite3.connect(temporary)) as backup_db:
+        with closing(sqlite3.connect(source_uri, uri=True, timeout=2)) as source_db, closing(sqlite3.connect(backup)) as backup_db:
             backup_db.execute("PRAGMA journal_mode=DELETE")
             source_db.backup(backup_db)
             backup_db.commit()
         for suffix in ("-wal", "-shm"):
-            temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
-        with temporary.open("rb") as stream:
+            backup.with_name(backup.name + suffix).unlink(missing_ok=True)
+        with backup.open("rb") as stream:
             os.fsync(stream.fileno())
-        os.replace(temporary, backup)
         fsync_dir(transaction_dir)
         _regular_nosymlink(backup, "database backup")
         validate_database(backup)
@@ -406,8 +505,6 @@ def create_database_backup(manifest: Manifest) -> None:
             "controller_helper_sha256": manifest.paired_database_upgrade.controller_helper_sha256,
         }, sort_keys=True) + "\n").encode(), 0o600)
     except (sqlite3.Error, OSError, ValueError) as exc:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
         raise ActivationError(f"database snapshot failed: {exc}") from exc
 
 
@@ -447,11 +544,26 @@ def restore_database(manifest: Manifest) -> None:
         raise ActivationError("database backup must be private")
     validate_database(backup)
     _regular_nosymlink(database, "paired database")
+    reserved = _restore_capacity_path(manifest, database)
+    if not reserved.exists():
+        _allocate_private_sqlite(reserved, backup.stat().st_size)
+    _regular_nosymlink(reserved, "database restore capacity")
+    if reserved.stat().st_mode & 0o777 != 0o600 or reserved.stat().st_blocks * 512 < backup.stat().st_size:
+        raise ActivationError("database restore capacity is unverified")
+    with backup.open("rb") as source, reserved.open("r+b") as target:
+        shutil.copyfileobj(source, target)
+        target.truncate(source.tell())
+        target.flush()
+        os.fsync(target.fileno())
+    validate_database(reserved)
+    if sha256(reserved) != proof["sha256"]:
+        raise ActivationError("prepared database restore checksum mismatch")
     for sidecar in database_paths(manifest)[1:]:
         if sidecar.is_symlink():
             raise ActivationError("SQLite sidecar must not be a symlink")
         sidecar.unlink(missing_ok=True)
-    atomic_install(backup, database, 0o600)
+    os.replace(reserved, database)
+    fsync_dir(database.parent)
     validate_database(database)
 
 
@@ -737,6 +849,7 @@ def activate(manifest: Manifest) -> str:
 
         prepared_installs: list[Path] = []
         prepared_rollback: Optional[tuple[Path, Path]] = None
+        capacity_reservation: Optional[DatabaseCapacityReservation] = None
         try:
             validate_manifest_identities(manifest)
             validate_manifest_mode(manifest)
@@ -774,6 +887,9 @@ def activate(manifest: Manifest) -> str:
                 manifest.rollback_plist_sha256,
             )):
                 raise ActivationError("first-install rollback inputs are inconsistent")
+            if manifest.paired_database_upgrade is not None:
+                validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+                capacity_reservation = reserve_database_capacity(manifest)
         except Exception as exc:
             for prepared in prepared_installs:
                 prepared.unlink(missing_ok=True)
@@ -794,7 +910,9 @@ def activate(manifest: Manifest) -> str:
                 # Exclusivity is meaningful only after launchd confirms teardown.
                 assert_database_exclusive(manifest)
                 validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
-                create_database_backup(manifest)
+                assert capacity_reservation is not None
+                _reservation_still_sufficient(manifest, capacity_reservation)
+                create_database_backup(manifest, capacity_reservation)
             commit_atomic_install(prepared_candidate[0], Path(manifest.target_binary))
             commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
             launchctl.start(old_pid)
@@ -829,6 +947,38 @@ def activate(manifest: Manifest) -> str:
                 prepared.unlink(missing_ok=True)
 
 
+def recover_paired(manifest: Manifest) -> str:
+    with Path(manifest.lock_path).open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another deployment operation owns recovery") from exc
+        validate_manifest_identities(manifest)
+        validate_manifest_mode(manifest)
+        if manifest.paired_database_upgrade is None:
+            raise ActivationError("paired recovery requires a paired transaction")
+        claim = Path(manifest.active_path)
+        status = json.loads(Path(manifest.status_path).read_text())
+        if claim.read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or status.get("state") != "activation_failed_rollback_failed":
+            raise ActivationError("paired recovery must own the retained failed transaction")
+        launchctl = Launchctl(manifest)
+        try:
+            restore(manifest, launchctl, None)
+            write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"))
+            return "activation_failed_rolled_back"
+        except Exception as exc:
+            failure = str(exc)
+            try:
+                launchctl.stop()
+                state, pid = launchctl.inspect()
+                if state != "not_loaded" or pid is not None:
+                    raise ActivationError("paired recovery teardown is unconfirmed")
+            except Exception as teardown:
+                failure += f"; recovery teardown failed: {teardown}"
+            write_status(manifest, "activation_failed_rollback_failed", failure=status.get("failure"), rollback_failure=failure)
+            return "activation_failed_rollback_failed"
+
+
 def status_is_durable_terminal(manifest: Manifest) -> bool:
     try:
         status = json.loads(Path(manifest.status_path).read_text())
@@ -846,7 +996,7 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("activate", nargs="?")
+    parser.add_argument("command", nargs="?", choices=["activate", "recover-paired"])
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--helper-label")
@@ -862,15 +1012,16 @@ def main() -> int:
         manifest = Manifest.load(args.manifest)
         if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
             raise ActivationError("helper identity does not match the immutable manifest")
-        state = activate(manifest)
+        state = recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
         if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(state, flush=True)
-        return 0 if state == "committed" else 1
+        return 0 if state == "committed" or (args.command == "recover-paired" and state == "activation_failed_rolled_back") else 1
     except ConcurrentDeploy as exc:
         if manifest is not None:
             try:
-                write_status(manifest, "rejected_concurrent", failure=str(exc))
+                state = "activation_failed_rollback_failed" if args.command == "recover-paired" else "rejected_concurrent"
+                write_status(manifest, state, failure=str(exc))
             finally:
                 if status_is_durable_terminal(manifest):
                     release_claim(manifest)

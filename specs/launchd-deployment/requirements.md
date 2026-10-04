@@ -82,6 +82,10 @@ A restart shall require the already-installed runtime to report a complete 40-ch
 
 ### REQ-LDD-017 — Supported prepared-artifact paired deployment
 
+Before quiescing production, paired preparation shall physically reserve private database-plus-WAL snapshot and atomic-restore capacity. Capacity failure shall be reported before disruption; after quiesce required size shall be checked against the held reservation.
+
+Failed paired claims shall not advise marker removal based solely on helper absence. Explicit retained-helper recovery shall verify offline ownership, snapshot/context, matching restoration and predecessor identity before releasing the claim; failed verification shall attempt teardown, preserve the claim, and report unconfirmed teardown.
+
 WHEN an operator supplies `prod deploy --prepared-artifact DIR --expected-full-commit SHA --paired-database-upgrade`
 THE SYSTEM SHALL require macOS launchd, require all three options together, reject `--release`, first install, and any database path change, and preserve the installed plist's environment and PATH without changing credential or model defaults.
 

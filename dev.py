@@ -9649,6 +9649,7 @@ def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> Pr
         raise SystemExit("prepared standalone artifact is not Developer ID Application signed")
     if not re.search(r"^CodeDirectory .*flags=.*runtime", codesign_metadata, re.MULTILINE) or "Timestamp=" not in codesign_metadata:
         raise SystemExit("prepared standalone artifact lacks hardened-runtime or timestamp codesign metadata")
+    binary.chmod(binary.stat().st_mode | 0o100)
     identity = RuntimeIdentity.from_value(_binary_identity(binary))
     if identity.version != version or identity.git_sha != expected_full_commit:
         raise SystemExit("prepared standalone artifact identity does not match receipt and expected commit")
@@ -9792,11 +9793,33 @@ def _release_launchd_restart_claim(transaction_id: str) -> bool:
         return _release_launchd_restart_claim_unlocked(transaction_id)
 
 
+def _paired_recovery_refusal(owner: str | None) -> str | None:
+    if owner is None:
+        return None
+    try:
+        status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if status is not None and status.get("transaction_id") == owner and status.get("source_kind") == "prepared_artifact" and status.get("state") == "activation_failed_rollback_failed":
+        return (
+            f"paired recovery for {owner} is unverified. Do not remove its active marker or start any runtime. "
+            "Preserve the private snapshot/proof and matching predecessor binary/config. "
+            "Recovery must confirm stopped service and exclusive database ownership, verify the paired proof, "
+            "restore the matching database/runtime/config, and verify predecessor identity before releasing this claim. "
+            "Use prod recover-paired with the retained transaction; if its proof fails, keep the service stopped."
+        )
+    return None
+
+
 def _claim_launchd_deploy(transaction_id: str) -> None:
     LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     LAUNCHD_DEPLOY_DIR.chmod(0o700)
     with _launchd_claim_lock():
         owner = _deploy_claim_owner()
+        refusal = _paired_recovery_refusal(owner)
+        if refusal is not None:
+            raise ConcurrentLaunchdOperation(refusal)
+
         if owner and LAUNCHD_DEPLOY_STATUS_PATH.exists():
             if _status_is_terminal_for_owner(
                 LAUNCHD_DEPLOY_STATUS_PATH, owner, _DEPLOY_TERMINAL_STATES
@@ -9835,6 +9858,9 @@ def _claim_launchd_restart(transaction_id: str) -> None:
         LAUNCHD_RESTART_DIR.chmod(0o700)
         with _launchd_claim_lock():
             deploy_owner = _deploy_claim_owner()
+            refusal = _paired_recovery_refusal(deploy_owner)
+            if refusal is not None:
+                raise ConcurrentLaunchdOperation(refusal)
             if deploy_owner and _status_is_terminal_for_owner(
                 LAUNCHD_DEPLOY_STATUS_PATH, deploy_owner, _DEPLOY_TERMINAL_STATES
             ):
@@ -9971,6 +9997,32 @@ def _helper_plist(
         "StandardOutPath": str(log_path),
         "StandardErrorPath": str(log_path),
     }, fmt=plistlib.FMT_XML)
+
+
+def cmd_prod_recover_paired(transaction_id: str) -> None:
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9_-]+", transaction_id):
+        raise SystemExit("paired recovery requires macOS and a safe transaction ID")
+    staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    manifest_path = staging / "manifest.json"
+    payload = json.loads(manifest_path.read_text())
+    paired = payload.get("paired_database_upgrade")
+    if not isinstance(paired, dict) or _paired_recovery_refusal(transaction_id) is None or _deploy_claim_owner() != transaction_id:
+        raise SystemExit("no matching failed paired transaction owns recovery")
+    helper = Path(paired["controller_helper_path"])
+    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != paired["controller_helper_sha256"]:
+        raise SystemExit("retained paired controller helper binding is invalid")
+    label = payload["helper_label"]
+    observed = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True)
+    missing = f'Could not find service "{label}" in domain for user gui: {os.getuid()}'
+    if observed.returncode == 0 or missing not in observed.stdout + observed.stderr:
+        raise SystemExit("paired helper absence is unconfirmed; inspect it before recovery")
+    plist = plistlib.loads(_helper_plist(label, helper, manifest_path, staging / "recovery.log", Path(sys.executable)))
+    plist["ProgramArguments"][2] = "recover-paired"
+    helper_plist = staging / "recovery-helper.plist"
+    helper_plist.write_bytes(plistlib.dumps(plist))
+    helper_plist.chmod(0o600)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)], check=True)
+    print(f"Verified paired recovery handed to retained controller for {transaction_id}; inspect prod status. Claim remains until matching restore and predecessor verification succeed.")
 
 
 def _restart_helper_plist(
@@ -11059,6 +11111,8 @@ def main():
     deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
     deploy_parser.add_argument("--expected-full-commit", help="Exact full SHA for --prepared-artifact")
     deploy_parser.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
+    recover_parser = prod_sub.add_parser("recover-paired", help="Verify and restore a retained failed paired transaction")
+    recover_parser.add_argument("transaction_id")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(
@@ -11233,6 +11287,8 @@ def main():
                     backend=args.controller_backend,
                 ),
             )
+        elif args.prod_command == "recover-paired":
+            cmd_prod_recover_paired(args.transaction_id)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":
