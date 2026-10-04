@@ -32,7 +32,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
             "environment": {"host": "host"}, "sqlite_pragmas": {"read_only": True},
             "runtime": {"worker_threads": 2}, "explain_enabled": False,
-            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}},
+            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}},
             "expected_case_surface_set": [["case", "tool"]],
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
             "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":float(__import__("time").time_ns()), "completed_at_unix":float(__import__("time").time_ns()),
@@ -109,6 +109,23 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit,"ownership"):
                 bench.snapshot(type("Args",(),{"artifacts":str(root)})())
             self.assertEqual(root.stat().st_mode & 0o777,0o755)
+
+    def test_incomplete_capture_is_preserved_and_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); (root/".capture-pending").write_text("unknown owner")
+            partial=root/".captured.db.123.tmp"; partial.write_bytes(b"partial")
+            src=root.parent/"unused-source"; src.write_bytes(b"source")
+            try:
+                with self.assertRaisesRegex(SystemExit,"incomplete prior capture"):
+                    bench.snapshot(type("Args",(),{"artifacts":str(root),"source":str(src)})())
+                self.assertEqual(partial.read_bytes(),b"partial")
+            finally: src.unlink()
+
+    def test_result_identity_and_config_evidence_are_required(self):
+        run=self._complete_run(); del run["build_configuration"]["cargo_config_hashes"]
+        with self.assertRaisesRegex(SystemExit,"build configuration"): bench._validate_run(run,"bad")
+        run=self._complete_run(); run["samples"][0]["result_identity"]=["changed"]
+        with self.assertRaisesRegex(SystemExit,"output mismatch"): bench._validate_run(run,"bad")
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
@@ -306,7 +323,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 return CompletedProcess()
 
             with mock.patch.object(bench, "_ensure_ignored_artifacts"), mock.patch.object(bench, "_ensure_clean_source"), mock.patch.object(
-                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}}
+                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}}
             ), mock.patch.object(bench, "_git_commit", return_value="commit"), mock.patch.object(bench.platform, "platform", return_value="platform"), mock.patch.object(
                 bench.platform, "processor", return_value="processor"
             ), mock.patch.object(bench.subprocess, "Popen", side_effect=fake_popen):

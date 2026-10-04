@@ -542,14 +542,8 @@ def _snapshot_locked(args) -> int:
     _private(outdir)
     dest = requested
     pending = outdir / ".capture-pending"
-    if pending.exists() and not (outdir / "capture-manifest.json").exists():
-        allowed = {"captured.db", ".capture-pending", ".capture-lock"}
-        if any(path.name not in allowed and not re.fullmatch(r"\.captured\.db\.\d+\.tmp(?:-journal|-wal|-shm)?", path.name) for path in outdir.iterdir()):
-            raise SystemExit("partial capture contains unrecognized files; refusing recovery")
-        for staged in outdir.glob(".captured.db.*.tmp*"):
-            _remove_private(staged)
-        _remove_private(dest)
-        _remove_private(pending)
+    if pending.exists():
+        raise SystemExit("incomplete prior capture; preserved files; choose a new dedicated artifact directory")
     if (outdir / "capture-manifest.json").exists(): raise SystemExit("existing capture manifest; use a new dedicated directory")
     if dest.exists(): raise SystemExit('fixture exists; capture into a new dedicated directory (replacement unsupported)')
     source_conn = sqlite3.connect(_uri(source), uri=True, timeout=args.busy_timeout)
@@ -636,10 +630,10 @@ def _snapshot_locked(args) -> int:
         os.replace(tmp, dest)
         os.chmod(dest, 0o600)
         _write_atomic_private(outdir/'capture-manifest.json', json.dumps(manifest, indent=2)+'\n')
-        _remove_private(outdir / ".capture-pending")
     except BaseException:
         dest.unlink(missing_ok=True)
         raise
+    _remove_private(outdir / ".capture-pending")
     print(f'captured immutable fixture: {dest}\nsha256: {manifest["sha256"]}\ncounts: {manifest["counts"]}')
     print(f'next: ./dev.py conversation-search prepare --artifacts {outdir}')
     return 0
@@ -931,7 +925,7 @@ def _validate_run(run: dict, name: str) -> dict:
     build = run["build_configuration"]
     if not isinstance(build, dict) or any(
         key not in build or not isinstance(build[key], (str, list, dict))
-        for key in ("rustc_version_verbose", "cargo_version", "target", "profile", "features", "environment")
+        for key in ("rustc_version_verbose", "cargo_version", "target", "profile", "features", "environment", "cargo_config_hashes")
     ):
         raise SystemExit(f"refusing comparison: {name} has invalid build configuration")
     if not isinstance(run["samples"], list) or not run["samples"]:
@@ -958,8 +952,9 @@ def _validate_run(run: dict, name: str) -> dict:
             raise SystemExit(f"refusing comparison: {name} has errors/timeouts for {key[0]} ({key[1]})")
         if not isinstance(sample.get("duration_ms"), (int, float)):
             raise SystemExit(f"refusing comparison: {name} has invalid duration for {key[0]} ({key[1]})")
-        prior = digests.setdefault(key, digest)
-        if prior != digest:
+        evidence = (count, tuple(identity), digest)
+        prior = digests.setdefault(key, evidence)
+        if prior != evidence:
             raise SystemExit(f"refusing comparison: output mismatch for {key[0]} ({key[1]}) in {name}")
         phases.setdefault(key, {}).setdefault(phase, []).append(sample)
     expected_warm = run["measured_warm_runs"]

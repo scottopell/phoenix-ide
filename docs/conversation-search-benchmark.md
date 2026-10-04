@@ -190,3 +190,9 @@ corruption. REQ-RET-008 owns index-cache reconciliation; this benchmark neither
 changes that production authority nor repairs the private captured fixture.
 A physical-text/sourcehash mismatch remains a separate DB invariant question,
 not a new benchmark reconciliation engine.
+
+Interrupted capture policy is fail-closed: preserve incomplete prior files and
+choose a NEW dedicated artifact directory. No automatic capture recovery,
+partial-file deletion, replacement or compatibility guarantee is provided.
+A failure removing the completed pending marker does not delete a published
+verified fixture/manifest.
