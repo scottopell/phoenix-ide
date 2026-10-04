@@ -141,6 +141,7 @@ def _measurement_digest() -> str:
 
 
 def _build_configuration() -> dict:
+    if os.environ.get("LIBSQLITE3_SYS_USE_PKG_CONFIG"): raise SystemExit("external SQLite linkage unsupported for this benchmark; use pinned bundled build")
     """Capture compiler, Cargo, target, profile, and feature inputs to the run."""
     repo = Path(__file__).parents[1]
     try:
@@ -721,7 +722,8 @@ def run(args) -> int:
     _ensure_ignored_artifacts(outdir)
     result_dir = outdir / "runs"
     _private(result_dir)
-    reservation = result_dir / f".{_label(args.label)}.reserved"
+    _label(args.label)
+    reservation = result_dir / ".active-run.reserved"
     try:
         fd = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
@@ -960,6 +962,17 @@ def _validate_run(run: dict, name: str) -> dict:
         value=run[field]
         if type(value) not in (int,float) or not math.isfinite(value): raise SystemExit(f"refusing comparison: {name} invalid interval")
     if run["started_at_unix"] > run["completed_at_unix"]: raise SystemExit(f"refusing comparison: {name} reversed interval")
+    shapes = {
+        "environment": {"host","platform","processor","cpu_count"},
+        "sqlite_pragmas": {"max_connections","acquire_timeout_secs","read_only","sqlite_version","journal_mode","synchronous","busy_timeout","foreign_keys","query_only"},
+        "runtime": {"worker_threads","measurement_clock"},
+    }
+    for key, shape in shapes.items():
+        if not isinstance(run[key],dict) or set(run[key]) != shape: raise SystemExit(f"invalid execution metadata: {key}")
+    env = run["environment"]; pragmas=run["sqlite_pragmas"]
+    if any(not isinstance(env[k],str) or not env[k].strip() for k in ("host","platform","processor")) or not str(env["cpu_count"]).isdigit() or int(env["cpu_count"])<=0: raise SystemExit("invalid environment values")
+    if pragmas["read_only"] is not True or any(type(pragmas[k]) is not int or pragmas[k]<0 for k in ("max_connections","acquire_timeout_secs","synchronous","busy_timeout","foreign_keys","query_only")) or pragmas["max_connections"]<1 or pragmas["foreign_keys"] not in (0,1) or pragmas["query_only"] not in (0,1) or pragmas["journal_mode"] not in ("delete","truncate","persist","memory","wal","off") or not isinstance(pragmas["sqlite_version"],str) or not pragmas["sqlite_version"]: raise SystemExit("invalid SQLite values")
+    if run["runtime"]["measurement_clock"] != "monotonic" or type(run["runtime"]["worker_threads"]) is not int or run["runtime"]["worker_threads"] <= 0: raise SystemExit("invalid runtime")
     freshness = run["fixture_validation"]
     shape = {"transcript_count", "freshness_batch_size", "locator_orphans", "missing_physical_rows", "unlocated_physical_rows"}
     if not isinstance(freshness, dict) or set(freshness) != shape or any(type(v) is not int for v in freshness.values()) or freshness["transcript_count"] < 0 or freshness["freshness_batch_size"] <= 0 or any(freshness[k] != 0 for k in shape - {"transcript_count", "freshness_batch_size"}):

@@ -223,3 +223,13 @@ does not promise resumable sample checkpointing or partial-suite recovery.
 Snapshot ingestion requires a NEW EMPTY directory; even lock-only roots are
 refused before permission changes. Existing recognized fixtures remain readable
 by prepare/run, not replaceable by snapshot ingestion.
+
+Supported compilation is the pinned bundled SQLite build only. Alternate
+pkg-config/library override builds are refused, not assigned a general library
+identity mechanism. One artifact-wide active-run reservation prevents accidental
+second commands; it is not a scheduler or a guarantee against unrelated host
+load. Single-operator/no competing host load remains a measurement precondition.
+Locator metadata corruption, like physical-text corruption, remains the separate
+production freshness-authority assessment59007; this rig uses that authority,
+not a shadow reconciliation/provenance engine. Historical returned provenance
+was independently checked from source rows for the paired fixture.
