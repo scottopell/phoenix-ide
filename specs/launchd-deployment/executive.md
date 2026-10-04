@@ -10,6 +10,14 @@ Rollback restores runtime artifacts and service state, not the SQLite database. 
 
 Live production deployment remains an explicitly gated operator action; automated validation uses disposable resources.
 
+The prepared-artifact paired path is deliberately narrower than ordinary release deployment: the prepared standalone binary remains byte-identical and is only strict-codesign checked (not ad-hoc resigned), while the clean controller `HEAD` supplies the helper. Its private transaction directory retains the SQLite backup/proof and active claim for manual recovery; snapshot, open-file, path, ledger, or health proof failures fail closed rather than silently starting an unproven runtime.
+
+## Paired prepared-artifact surface
+
+- `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --paired-database-upgrade` is macOS launchd-only and rejects release aliases, first install, or a mismatched installed database path.
+- The receipt must identify the exact host-target standalone basename, submission UUID, full SHA, Developer ID/hardened/timestamp codesign evidence, and qualified notarization/ticket/Gatekeeper/helper evidence. Standalone `spctl` is not imposed because notarization may be stapled only to the containing app.
+- Recovery is fail-closed: do not delete the paired transaction or claim, manually inspect the retained proof and run offline SQLite integrity checks before restoring/starting the predecessor.
+
 ## Requirement coverage
 
 | Requirement | Implementation / verification |
@@ -30,6 +38,7 @@ Live production deployment remains an explicitly gated operator action; automate
 | REQ-LDD-014 | `launchd_prod_restart`, `launchd_restart_helper.restart`; unit tests and disposable launchd restart journey |
 | REQ-LDD-015 | `_claim_launchd_restart`, `/api/version` socket-activation report, restart helper LaunchAgent handoff; runtime-activation, mutual-exclusion, and secret-redaction tests |
 | REQ-LDD-016 | `launchd_restart_helper.wait_for_identity`, restart status; restart requires an installed full-SHA identity and does not reuse the predecessor-only 12-character rollback allowance |
+| REQ-LDD-017 | `_prepare_prepared_artifact`, paired structural manifest, SQLite backup API, legacy ledger/table preflight, and fail-closed proof validation; focused helper tests cover ordinary activation regression |
 
 ## Operator surfaces
 

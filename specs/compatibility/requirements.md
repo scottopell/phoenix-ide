@@ -118,3 +118,7 @@ THE SYSTEM SHALL reconstruct its original locator-absent encoding and verify its
 THE SYSTEM SHALL retain the accepted payload, origin, and fingerprint without rewriting them or substituting a later invocation locator.
 
 THE SYSTEM SHALL reject any payload whose fingerprint matches neither its current encoding nor the specifically supported historical encoding.
+
+### REQ-COMP-008 — Explicit paired upgrade boundary
+
+WHEN the supported macOS launchd ProductConversation upgrade is selected explicitly, THE SYSTEM MAY provide an automated paired SQLite snapshot and rollback only within that feature's normative contract. THE SYSTEM SHALL preserve the project-wide prohibition on a generic automatic database rollback subsystem and SHALL fail closed when exclusive ownership, snapshot integrity, or restoration proof is unavailable.

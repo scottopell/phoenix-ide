@@ -70,3 +70,32 @@ Use the deploy helper instead of manual `launchctl load` / `launchctl unload`:
 tail -f ~/.phoenix-ide/prod.log
 ./dev.py prod stop
 ```
+
+## Prepared-artifact paired upgrade (manual recovery)
+
+The supported paired path is explicit and launchd-only:
+
+```bash
+./dev.py prod deploy --prepared-artifact DIR --expected-full-commit FULL_SHA --paired-database-upgrade
+```
+
+`DIR` must contain the protected prepare-main receipt and exact standalone
+`phoenix_ide-{host-target}-prepared-{FULL_SHA:12}` binary. The candidate is
+strict-codesign checked without ad-hoc resigning; the clean controller checkout
+supplies and byte-binds the activation helper. Installed plist environment and
+PATH are reused, and the configured database path must match candidate and
+predecessor plists.
+The artifact directory is trusted operator input downloaded from the protected
+preparation run. The controller validates local contents, not the receipt's
+workflow origin; establish the run/source association before invocation.
+
+Paired activation snapshots the stopped legacy database through SQLite's backup
+API only after bounded `lsof` exclusivity proof. It requires an existing
+migration ledger at version 69 or earlier and no ProductConversation tables.
+The private transaction directory, backup, proof, and active claim are retained
+for recovery. Candidate health failure restores the verified matching database,
+binary and plist before predecessor startup. If stop, ownership, snapshot or
+restore proof fails, service remains stopped with rollback failure; do not delete
+that transaction or restart blindly. Inspect the proof, run SQLite integrity
+checks offline, and restore the matching predecessor binary, plist, and database
+before starting it.

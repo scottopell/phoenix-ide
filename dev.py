@@ -8920,6 +8920,7 @@ class ProdSourceKind(enum.Enum):
     # A restart reuses the already-installed binary verbatim; the backend owns
     # whether installed configuration is preserved or refreshed.
     INSTALLED_RESTART = "installed_restart"
+    PREPARED_ARTIFACT = "prepared_artifact"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9037,6 +9038,8 @@ class ProdDeployControllerOptions:
     expected_asset_sha256: str | None = None
     transaction_id: str | None = None
     backend: str | None = None
+    prepared_artifact: Path | None = None
+    paired_database_upgrade: bool = False
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
         if release is None:
@@ -9593,6 +9596,66 @@ def _prepare_release_candidate(
     )
 
 
+def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> PreparedCandidate:
+    """Validate one protected prepare-main standalone artifact without resigning it."""
+    if sys.platform != "darwin":
+        raise SystemExit("--prepared-artifact is supported only on macOS launchd")
+    if re.fullmatch(r"[0-9a-f]{40}", expected_full_commit) is None:
+        raise SystemExit("--expected-full-commit must be a full 40-character lowercase git SHA")
+    if not directory.is_dir() or directory.is_symlink():
+        raise SystemExit("prepared artifact must be a real directory")
+    machine = platform.machine().lower()
+    target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}.get(machine)
+    if target is None:
+        raise SystemExit(f"unsupported macOS architecture {machine!r}")
+    receipt = directory / f"PREPARATION-RECEIPT-{target}.json"
+    if not receipt.is_file() or receipt.is_symlink():
+        raise SystemExit(f"prepared artifact is missing {receipt.name}")
+    try:
+        metadata = json.loads(receipt.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("prepared artifact receipt is unreadable") from exc
+    if metadata.get("operation") != "prepare-main" or metadata.get("target") != target:
+        raise SystemExit("prepared artifact receipt is not for prepare-main and this host architecture")
+    if metadata.get("commit") != expected_full_commit:
+        raise SystemExit("prepared artifact receipt commit does not match --expected-full-commit")
+    version = metadata.get("version")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}", version):
+        raise SystemExit("prepared artifact receipt has no valid full version")
+    checks = metadata.get("checks")
+    required = {"developer_id_signature": "verified", "hardened_runtime": "verified", "notarization": "accepted", "stapled_ticket": "validated", "gatekeeper": "accepted", "embedded_helper_bytes": "identical"}
+    if not isinstance(checks, dict) or any(checks.get(key) != value for key, value in required.items()):
+        raise SystemExit("prepared artifact receipt lacks accepted signing/notarization/Gatekeeper/helper checks")
+    submission_uuid = checks.get("notarization_submission_id")
+    if metadata.get("schema") != 1 or not isinstance(submission_uuid, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", submission_uuid):
+        raise SystemExit("prepared artifact receipt has no valid submission UUID")
+    digests = metadata.get("sha256")
+    if not isinstance(digests, dict):
+        raise SystemExit("prepared artifact receipt lacks standalone checksum")
+    expected_name = f"phoenix_ide-{target}-prepared-{expected_full_commit[:12]}"
+    digest = digests.get(expected_name)
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest.lower()) is None:
+        raise SystemExit(f"prepared artifact receipt lacks checksum for exact standalone {expected_name}")
+    binary = directory / expected_name
+    if not binary.is_file() or binary.is_symlink() or _file_sha256(binary) != digest.lower():
+        raise SystemExit("prepared standalone artifact checksum mismatch")
+    try:
+        subprocess.run(["codesign", "--verify", "--strict", str(binary)], check=True, capture_output=True, text=True)
+        verification = subprocess.run(["codesign", "--display", "--verbose=4", str(binary)], check=True, capture_output=True, text=True)
+        codesign_metadata = (verification.stdout or "") + (verification.stderr or "")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit("prepared standalone artifact failed strict codesign verification") from exc
+    if not re.search(r"Authority=Developer ID Application:", codesign_metadata):
+        raise SystemExit("prepared standalone artifact is not Developer ID Application signed")
+    if not re.search(r"^CodeDirectory .*flags=.*runtime", codesign_metadata, re.MULTILINE) or "Timestamp=" not in codesign_metadata:
+        raise SystemExit("prepared standalone artifact lacks hardened-runtime or timestamp codesign metadata")
+    identity = RuntimeIdentity.from_value(_binary_identity(binary))
+    if identity.version != version or identity.git_sha != expected_full_commit:
+        raise SystemExit("prepared standalone artifact identity does not match receipt and expected commit")
+    return PreparedCandidate(binary=binary, source_kind=ProdSourceKind.PREPARED_ARTIFACT, source_commit=expected_full_commit, identity=identity)
+
+
+
 def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
     binary = prod_build(target=target)
     source_commit = subprocess.run(
@@ -9657,9 +9720,45 @@ def _status_is_terminal_for_owner(
 ) -> bool:
     try:
         status = json.loads(status_path.read_text())
+        if (
+            status.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
+            and status.get("state") == "activation_failed_rollback_failed"
+        ):
+            return False
         return status.get("transaction_id") == owner and status.get("state") in terminal_states
     except (OSError, json.JSONDecodeError):
         return False
+
+
+def _transaction_has_paired_manifest(transaction: Path) -> bool:
+    """Fail closed when deciding whether a transaction may be pruned."""
+    manifest = transaction / "manifest.json"
+    try:
+        payload = json.loads(manifest.read_text())
+    except FileNotFoundError:
+        return True
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not isinstance(payload, dict) or payload.get("paired_database_upgrade") is not None
+
+
+def _prune_launchd_deploy_transactions(transactions_dir: Path, current_transaction_id: str) -> None:
+    preserved = {current_transaction_id}
+    try:
+        old_transactions = sorted(
+            (
+                path
+                for path in transactions_dir.iterdir()
+                if path.is_dir() and path.name not in preserved
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    prunable = [path for path in old_transactions if not _transaction_has_paired_manifest(path)]
+    for old in prunable[5:]:
+        shutil.rmtree(old, ignore_errors=True)
 
 
 def _release_launchd_deploy_claim_unlocked(transaction_id: str) -> bool:
@@ -9906,7 +10005,7 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
 
 def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = None) -> tuple[dict[str, str], Path | None]:
     env: dict[str, str] = {}
-    if controller is not None and controller.enabled:
+    if controller is not None and (controller.enabled or controller.prepared_artifact is not None):
         try:
             installed = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
             installed.pop("PHOENIX_VERSION", None)
@@ -9928,7 +10027,7 @@ def launchd_prod_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
-    if controller.enabled:
+    if controller.enabled and controller.prepared_artifact is None:
         release, _expected_full_commit = controller.require_exact_release(release)
     launchd_env, _env_file = _launchd_candidate_env(controller)
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
@@ -9969,20 +10068,19 @@ def launchd_prod_deploy(
         })
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
         transactions_dir.mkdir(parents=True, exist_ok=True)
-        old_transactions = sorted(
-            (path for path in transactions_dir.iterdir() if path.is_dir()),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for old in old_transactions[5:]:
-            shutil.rmtree(old, ignore_errors=True)
+        _prune_launchd_deploy_transactions(transactions_dir, transaction_id)
         staging.mkdir(parents=True)
         staging.chmod(0o700)
-        prepared = (
-            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
-            if release
-            else _prepare_local_candidate(target=None)
-        )
+        if controller.prepared_artifact is not None:
+            if release or not controller.paired_database_upgrade or controller.expected_full_commit is None:
+                raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together and exclude --release")
+            prepared = _prepare_prepared_artifact(controller.prepared_artifact, controller.expected_full_commit)
+        else:
+            prepared = (
+                _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
+                if release
+                else _prepare_local_candidate(target=None)
+            )
         binary = prepared.binary
         selected_identity = prepared.identity
         release_tag = prepared.release_tag
@@ -9994,10 +10092,11 @@ def launchd_prod_deploy(
         if binary != candidate_binary:
             shutil.copy2(binary, candidate_binary)
         candidate_binary.chmod(0o755)
-        subprocess.run(
-            ["codesign", "--force", "--sign", "-", "--identifier", LAUNCHD_LABEL, str(candidate_binary)],
-            check=True,
-        )
+        if prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT:
+            subprocess.run(
+                ["codesign", "--force", "--sign", "-", "--identifier", LAUNCHD_LABEL, str(candidate_binary)],
+                check=True,
+            )
         subprocess.run(["codesign", "--verify", "--strict", str(candidate_binary)], check=True)
         observed_identity = RuntimeIdentity.from_value(_binary_identity(candidate_binary))
         if observed_identity != selected_identity:
@@ -10007,9 +10106,21 @@ def launchd_prod_deploy(
         env_file = _env_file
         if env_file:
             print(f"  Loaded env from {env_file}")
-        path_str, path_source = capture_login_shell_path()
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+            path_str = env_overrides.get("PATH")
+            if not path_str:
+                raise SystemExit("prepared-artifact deployment requires installed launchd PATH")
+            path_source = "installed launchd plist"
+        else:
+            path_str, path_source = capture_login_shell_path()
         print_launchd_path_report(path_str, path_source)
         plist_content = generate_launchd_plist(selected_identity.version, extra_env=env_overrides, path_override=path_str)
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+            installed_config = dict(env_overrides)
+            installed_config["PHOENIX_VERSION"] = selected_identity.version
+            paired_plist = plistlib.loads(plist_content.encode())
+            paired_plist["EnvironmentVariables"] = installed_config
+            plist_content = plistlib.dumps(paired_plist).decode()
         candidate_plist = staging / "candidate.plist"
         candidate_plist.write_text(plist_content)
         candidate_plist.chmod(0o600)
@@ -10037,7 +10148,14 @@ def launchd_prod_deploy(
             ) = _resolve_rollback_identity(rollback_binary, previous_env)
 
         helper = staging / "activate.py"
-        _materialize_helper(source_commit, helper, source_kind)
+        controller_source_commit = None
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+            controller_source_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+            if re.fullmatch(r"[0-9a-f]{40}", controller_source_commit) is None:
+                raise SystemExit("controller source commit is not a full lowercase git SHA")
+            if subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip():
+                raise SystemExit("prepared-artifact deployment requires a clean controller checkout")
+        _materialize_helper(controller_source_commit or source_commit, helper, "local_head" if controller_source_commit else source_kind)
         python_executable = Path(sys.executable).resolve()
         protocol = subprocess.run(
             [str(python_executable), str(helper), "--protocol-version"],
@@ -10106,6 +10224,14 @@ def launchd_prod_deploy(
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
             "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
             "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
+            "paired_database_upgrade": ({
+                "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
+                "backup_path": str(staging / "database-backup.sqlite3"),
+                "proof_path": str(staging / "database-backup-proof.json"),
+                "controller_source_commit": controller_source_commit,
+                "controller_helper_sha256": _file_sha256(helper) if controller_source_commit else None,
+                "controller_helper_path": str(helper) if controller_source_commit else None,
+            } if controller.paired_database_upgrade else None),
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_json_atomic(staging / "manifest.json", manifest)
@@ -10565,16 +10691,23 @@ def cmd_prod_deploy(
 ):
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
+    supplied = (controller.prepared_artifact is not None, controller.paired_database_upgrade)
+    if any(supplied) and (not all(supplied) or controller.expected_full_commit is None):
+        raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together")
+    if controller.prepared_artifact is not None and (sys.platform != "darwin" or controller.backend not in (None, "launchd")):
+        raise SystemExit("prepared artifact paired deployment is supported only by macOS launchd")
+    if controller.prepared_artifact is not None and release:
+        raise SystemExit("prepared artifact paired deployment excludes --release")
     env = controller.require_backend()
-    if controller.enabled and not release:
+    if controller.enabled and not release and controller.prepared_artifact is None:
         raise SystemExit("controller mode requires --release")
-    if not release:
+    if not release and controller.prepared_artifact is None:
         print("Running pre-deploy checks...\n")
         cmd_check(gate=False, pretty=pretty)
         print()
 
     if env == "launchd":
-        if controller.enabled:
+        if controller.enabled or controller.prepared_artifact is not None:
             launchd_prod_deploy(release, controller=controller)
         else:
             launchd_prod_deploy(release)
@@ -10918,6 +11051,9 @@ def main():
     deploy_parser.add_argument("--controller-expected-asset-name", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-asset-sha256", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
+    deploy_parser.add_argument("--expected-full-commit", help="Exact full SHA for --prepared-artifact")
+    deploy_parser.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(
@@ -11083,10 +11219,12 @@ def main():
                 controller=ProdDeployControllerOptions(
                     enabled=args.controller_mode,
                     exact_release_tag=args.controller_release_tag,
-                    expected_full_commit=args.controller_expected_full_commit,
+                    expected_full_commit=args.expected_full_commit or args.controller_expected_full_commit,
                     expected_asset_name=args.controller_expected_asset_name,
                     expected_asset_sha256=args.controller_expected_asset_sha256,
                     transaction_id=args.transaction_id,
+                    prepared_artifact=args.prepared_artifact,
+                    paired_database_upgrade=args.paired_database_upgrade,
                     backend=args.controller_backend,
                 ),
             )

@@ -40,7 +40,7 @@ If activation fails after disruption, the system shall atomically restore and bo
 
 Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit shortened identity for a candidate, release asset, helper, or general downgrade path and shall not establish cross-version compatibility.
 
-Automated rollback shall not restore a database or guarantee that the restored binary can use a database changed by the candidate; database rollback remains governed by `specs/compatibility/requirements.md`.
+Ordinary runtime-only rollback shall not restore a database or guarantee predecessor compatibility with candidate-mutated data. The explicit paired ProductConversation upgrade shall restore the verified matching database and runtime before predecessor startup under REQ-LDD-017; other rollback behavior remains governed by `specs/compatibility/requirements.md`.
 
 ### REQ-LDD-009 — Truthful durable result
 
@@ -79,3 +79,16 @@ Before signaling Phoenix, the system shall validate that the running process rep
 ### REQ-LDD-016 — Exact, truthful restart result
 
 A restart shall require the already-installed runtime to report a complete 40-character lowercase embedded git SHA and shall commit only after launchd reports a new target PID and `/api/version` reports the same exact runtime identity, with the installed artifact hashes unchanged. The rollback-only legacy identity allowance in REQ-LDD-008 shall not authorize restart of a shortened-identity installation. The system shall durably distinguish preparation failure, concurrent rejection, verified success, and failure after signaling; it shall not claim rollback when no installation artifact changed.
+
+### REQ-LDD-017 — Supported prepared-artifact paired deployment
+
+WHEN an operator supplies `prod deploy --prepared-artifact DIR --expected-full-commit SHA --paired-database-upgrade`
+THE SYSTEM SHALL require macOS launchd, require all three options together, reject `--release`, first install, and any database path change, and preserve the installed plist's environment and PATH without changing credential or model defaults.
+
+THE SYSTEM SHALL accept only a protected `prepare-main` receipt for the host architecture whose exact full commit, version, Developer ID signature, hardened runtime, accepted notarization, stapled ticket, Gatekeeper result, embedded-helper equivalence, and standalone SHA-256 bytes all verify. The candidate source kind SHALL be `prepared_artifact`, distinct from the clean controller HEAD source commit. The system SHALL never ad-hoc resign the prepared binary.
+
+THE handoff manifest SHALL structurally record the paired ProductConversation database-upgrade mode, exact controller source commit, helper bytes, captured predecessor binary/plist identities, database path, durable SQLite backup proof, and rollback state. The helper SHALL reject missing or inconsistent fields and SHALL require the controller helper bytes to match the recorded clean controller source and protocol.
+
+After backend-managed quiesce confirms the predecessor stopped, THE helper SHALL prove no other process has the database, WAL, or SHM open using bounded macOS `lsof`, take a SQLite backup-API snapshot into a private mode-700 transaction directory with a mode-600 database, validate integrity, and durably verify the snapshot before candidate startup. It SHALL never raw-copy a live database.
+
+IF candidate activation or health verification fails, THE helper SHALL stop the candidate first, re-prove exclusive offline ownership, restore and integrity-check the matching snapshot while removing stale WAL/SHM only under that proof, atomically restore the predecessor binary/plist, and start the predecessor only after database restoration. If any proof fails it SHALL leave the service stopped, persist actionable recovery status, and retain the active claim. Existing runtime-only rollback remains unchanged. A snapshot failure before candidate startup MAY restart the unchanged predecessor only after explicit unchanged proof.

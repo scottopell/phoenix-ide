@@ -23,6 +23,9 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.parse
+import sqlite3
+import stat
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -44,6 +47,17 @@ TERMINAL_STATES = {
 class Identity:
     version: str
     git_sha: str
+
+
+@dataclasses.dataclass(frozen=True)
+class PairedDatabaseUpgrade:
+    """The sole structural representation of the feature-scoped DB snapshot."""
+    database_path: str
+    backup_path: str
+    proof_path: str
+    controller_source_commit: str
+    controller_helper_sha256: str
+    controller_helper_path: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,6 +97,8 @@ class Manifest:
     created_at: str
     transition_timeout_secs: float = 30.0
     health_timeout_secs: float = 120.0
+    # None is intentional for pre-feature runtime-only manifests.
+    paired_database_upgrade: Optional[PairedDatabaseUpgrade] = None
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
@@ -93,6 +109,12 @@ class Manifest:
             )
         raw["expected"] = Identity(**raw["expected"])
         raw["previous"] = Identity(**raw["previous"]) if raw.get("previous") else None
+        paired = raw.get("paired_database_upgrade")
+        raw["paired_database_upgrade"] = PairedDatabaseUpgrade(**paired) if paired else None
+        # Runtime-only manifests written before the paired feature omit the field.
+        raw.pop("database_mode", None)
+        for legacy_key in ("database_path", "database_backup_path", "database_backup_sha256", "database_backup_verified", "database_proof_path", "controller_source_commit", "controller_helper_sha256", "controller_helper_path"):
+            raw.pop(legacy_key, None)
         return cls(**raw)
 
 
@@ -199,12 +221,238 @@ def verify_staged(path: Optional[str], expected_hash: Optional[str], description
     if not path or not expected_hash:
         raise ActivationError(f"missing {description}")
     candidate = Path(path)
-    if not candidate.is_file():
-        raise ActivationError(f"{description} is not a regular file")
+    try:
+        stat = candidate.lstat()
+    except OSError as exc:
+        raise ActivationError(f"{description} is unavailable") from exc
+    if not candidate.is_file() or not __import__("stat").S_ISREG(stat.st_mode) or candidate.is_symlink():
+        raise ActivationError(f"{description} is not a regular non-symlink file")
     actual = sha256(candidate)
     if actual != expected_hash:
         raise ActivationError(f"{description} checksum mismatch")
     return candidate
+
+
+def database_paths(manifest: Manifest) -> tuple[Path, ...]:
+    if manifest.paired_database_upgrade is None:
+        raise ActivationError("paired database upgrade is not configured")
+    database = Path(manifest.paired_database_upgrade.database_path)
+    return tuple(database.parent / name for name in (database.name, database.name + "-wal", database.name + "-shm"))
+
+
+def _regular_nosymlink(path: Path, description: str, *, required: bool = True) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        if required:
+            raise ActivationError(f"{description} is unavailable")
+        return
+    except OSError as exc:
+        raise ActivationError(f"{description} is unavailable") from exc
+    if not stat.S_ISREG(mode) or path.is_symlink():
+        raise ActivationError(f"{description} is not a regular non-symlink file")
+
+
+def _private_transaction_dir(path: Path) -> Path:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        path.mkdir(parents=True, mode=0o700)
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        raise ActivationError("paired transaction directory is unavailable") from exc
+    if not stat.S_ISDIR(mode) or path.is_symlink() or (mode & 0o777) != 0o700:
+        raise ActivationError("paired transaction directory must be a private 0700 directory")
+    return path
+
+
+def _paired_path_context(manifest: Manifest) -> tuple[Path, Path, Path, Path]:
+    paired = manifest.paired_database_upgrade
+    if paired is None:
+        raise ActivationError("paired database upgrade is not configured")
+    database = Path(paired.database_path)
+    backup = Path(paired.backup_path)
+    proof = Path(paired.proof_path)
+    for path, description in ((database, "paired database"), (backup, "database backup"), (proof, "database proof")):
+        if not path.is_absolute() or path.is_symlink():
+            raise ActivationError(f"{description} path must be absolute and non-symlink")
+    if backup.parent != proof.parent:
+        raise ActivationError("database backup and proof must share one transaction directory")
+    resolved = {path.resolve(strict=False) for path in (database, backup, proof)}
+    if len(resolved) != 3:
+        raise ActivationError("database backup and proof must not alias the database or each other")
+    return database, backup, proof, _private_transaction_dir(backup.parent)
+
+
+def assert_database_exclusive(manifest: Manifest) -> None:
+    """Prove that no process still owns the database or SQLite sidecars."""
+    database, _backup, _proof, _transaction = _paired_path_context(manifest)
+    if not database.exists():
+        raise ActivationError("paired database does not exist")
+    _regular_nosymlink(database, "paired database")
+    paths = []
+    for path in database_paths(manifest):
+        if path.exists() or path.is_symlink():
+            _regular_nosymlink(path, "SQLite database sidecar")
+            paths.append(path)
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-t", "--", *map(str, paths)],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ActivationError("could not prove database exclusivity") from exc
+    if result.returncode not in (0, 1) or result.stderr.strip():
+        raise ActivationError("could not prove database exclusivity")
+    owners = {line.strip() for line in (result.stdout or "").splitlines() if line.strip()}
+    if owners:
+        raise ActivationError("database remains open by another process")
+
+
+def _readonly_connection(path: Path) -> sqlite3.Connection:
+    if not path.is_absolute() or path.is_symlink():
+        raise ActivationError("SQLite path must be an absolute non-symlink file")
+    uri = "file:" + urllib.parse.quote(str(path), safe="/") + "?mode=ro"
+    try:
+        return sqlite3.connect(uri, uri=True, timeout=2)
+    except sqlite3.Error as exc:
+        raise ActivationError("could not open SQLite database read-only") from exc
+
+
+def validate_database(path: Path) -> None:
+    from contextlib import closing
+    try:
+        with closing(_readonly_connection(path)) as connection:
+            result = connection.execute("PRAGMA integrity_check").fetchone()
+    except sqlite3.Error as exc:
+        raise ActivationError(f"SQLite integrity check failed: {exc}") from exc
+    if result != ("ok",):
+        raise ActivationError(f"SQLite integrity check returned {result!r}")
+
+
+def validate_legacy_database(path: Path) -> None:
+    """Read-only gate for the one supported 69 -> ProductConversation upgrade."""
+    from contextlib import closing
+    try:
+        with closing(_readonly_connection(path)) as connection:
+            ledger = connection.execute(
+                "SELECT COALESCE(MAX(version), -1) FROM _migrations"
+            ).fetchone()
+            if ledger is None or ledger[0] < 0 or ledger[0] > 69:
+                raise ActivationError("paired upgrade requires an existing migration ledger at version <= 69")
+            product_tables = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('product_conversations', 'product_conversation_members') LIMIT 1"
+            ).fetchone()
+            if product_tables is not None:
+                raise ActivationError("paired upgrade requires a legacy database without ProductConversation tables")
+    except sqlite3.Error as exc:
+        raise ActivationError("paired legacy database preflight failed") from exc
+
+
+def _plist_database_path(path: Path) -> Optional[str]:
+    try:
+        with path.open("rb") as stream:
+            plist = plistlib.load(stream)
+        value = plist.get("EnvironmentVariables", {}).get("PHOENIX_DB_PATH")
+        return str(value) if value is not None else None
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        raise ActivationError("launchd plist is unreadable") from exc
+
+
+def create_database_backup(manifest: Manifest) -> None:
+    """Take a SQLite backup API snapshot, never a raw copy of a live database."""
+    if manifest.paired_database_upgrade is None:
+        return
+    assert_database_exclusive(manifest)
+    source, backup, proof_path, transaction_dir = _paired_path_context(manifest)
+    _regular_nosymlink(source, "paired database")
+    _private_transaction_dir(transaction_dir)
+    temporary: Optional[Path] = None
+    try:
+        # A transaction cannot fall back to an older snapshot after a failed proof.
+        backup.unlink(missing_ok=True)
+        proof_path.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm"):
+            backup.with_name(backup.name + suffix).unlink(missing_ok=True)
+        from contextlib import closing
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{backup.name}.", suffix=".snapshot", dir=transaction_dir)
+        os.fchmod(fd, 0o600)
+        os.close(fd)
+        temporary = Path(temporary_name)
+        source_uri = "file:" + urllib.parse.quote(str(source), safe="/") + "?mode=ro"
+        with closing(sqlite3.connect(source_uri, uri=True, timeout=2)) as source_db, closing(sqlite3.connect(temporary)) as backup_db:
+            backup_db.execute("PRAGMA journal_mode=DELETE")
+            source_db.backup(backup_db)
+            backup_db.commit()
+        for suffix in ("-wal", "-shm"):
+            temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, backup)
+        fsync_dir(transaction_dir)
+        _regular_nosymlink(backup, "database backup")
+        validate_database(backup)
+        observed = sha256(backup)
+        atomic_write(proof_path, (json.dumps({
+            "transaction_id": manifest.transaction_id,
+            "source_commit": manifest.source_commit,
+            "database": str(source),
+            "sha256": observed,
+            "candidate_binary_sha256": manifest.candidate_binary_sha256,
+            "candidate_plist_sha256": manifest.candidate_plist_sha256,
+            "previous_binary_sha256": manifest.rollback_binary_sha256,
+            "previous_plist_sha256": manifest.rollback_plist_sha256,
+            "controller_source_commit": manifest.paired_database_upgrade.controller_source_commit,
+            "controller_helper_sha256": manifest.paired_database_upgrade.controller_helper_sha256,
+        }, sort_keys=True) + "\n").encode(), 0o600)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise ActivationError(f"database snapshot failed: {exc}") from exc
+
+
+def restore_database(manifest: Manifest) -> None:
+    if manifest.paired_database_upgrade is None:
+        return
+    assert_database_exclusive(manifest)
+    database, backup_path, proof_path, transaction_dir = _paired_path_context(manifest)
+    _private_transaction_dir(transaction_dir)
+    _regular_nosymlink(proof_path, "database proof")
+    if proof_path.stat().st_mode & 0o777 != 0o600:
+        raise ActivationError("database proof must be private")
+    try:
+        proof = json.loads(proof_path.read_text())
+        expected_hash = proof["sha256"]
+        if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise ActivationError("paired database snapshot proof has an invalid checksum")
+        expected = {
+            "transaction_id": manifest.transaction_id,
+            "source_commit": manifest.source_commit,
+            "database": manifest.paired_database_upgrade.database_path,
+            "candidate_binary_sha256": manifest.candidate_binary_sha256,
+            "candidate_plist_sha256": manifest.candidate_plist_sha256,
+            "previous_binary_sha256": manifest.rollback_binary_sha256,
+            "previous_plist_sha256": manifest.rollback_plist_sha256,
+            "controller_source_commit": manifest.paired_database_upgrade.controller_source_commit,
+            "controller_helper_sha256": manifest.paired_database_upgrade.controller_helper_sha256,
+        }
+        if any(proof.get(key) != value for key, value in expected.items()):
+            raise ActivationError("paired database snapshot proof context does not match manifest")
+    except ActivationError:
+        raise
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ActivationError("paired database snapshot proof is unavailable") from exc
+    backup = verify_staged(str(backup_path), expected_hash, "database backup")
+    if backup.stat().st_mode & 0o777 != 0o600:
+        raise ActivationError("database backup must be private")
+    validate_database(backup)
+    _regular_nosymlink(database, "paired database")
+    for sidecar in database_paths(manifest)[1:]:
+        if sidecar.is_symlink():
+            raise ActivationError("SQLite sidecar must not be a symlink")
+        sidecar.unlink(missing_ok=True)
+    atomic_install(backup, database, 0o600)
+    validate_database(database)
 
 
 class Launchctl:
@@ -349,10 +597,18 @@ def restore(
     launchctl: Launchctl,
     prepared_rollback: Optional[tuple[Path, Path]] = None,
 ) -> None:
+    # Candidate stop is always attempted before any paired database restoration.
     try:
         launchctl.stop()
+        if manifest.paired_database_upgrade is not None:
+            state, pid = launchctl.inspect()
+            if state != "not_loaded" or pid is not None:
+                raise ActivationError("candidate remains loaded after stop")
     except ActivationError:
-        pass
+        if manifest.paired_database_upgrade is not None:
+            raise
+    if manifest.paired_database_upgrade is not None:
+        restore_database(manifest)
     if manifest.previous is None:
         if manifest.rollback_binary is not None or manifest.rollback_plist is not None:
             raise ActivationError("first-install rollback inputs are inconsistent")
@@ -414,6 +670,38 @@ def request_helper_bootout(uid: int, helper_label: str) -> None:
     )
 
 
+def validate_manifest_mode(manifest: Manifest) -> None:
+    paired = manifest.paired_database_upgrade
+    if manifest.source_kind == "prepared_artifact" and paired is None:
+        raise ActivationError("prepared artifact requires paired database mode")
+    if paired is not None:
+        if manifest.source_kind != "prepared_artifact":
+            raise ActivationError("paired database mode requires a prepared artifact candidate")
+        if not FULL_GIT_SHA_RE.fullmatch(paired.controller_source_commit):
+            raise ActivationError("paired mode requires exact controller source binding")
+        if not paired.controller_helper_sha256 or not paired.controller_helper_path:
+            raise ActivationError("paired mode requires helper equivalence binding")
+        for raw_path in (paired.database_path, paired.backup_path, paired.proof_path, paired.controller_helper_path):
+            if not Path(raw_path).is_absolute() or Path(raw_path).is_symlink():
+                raise ActivationError("paired mode paths must be absolute non-symlinks")
+        helper = Path(paired.controller_helper_path)
+        running_helper = Path(__file__).resolve()
+        if helper.resolve() != running_helper:
+            raise ActivationError("paired mode helper path is not the running helper")
+        if not helper.is_file() or sha256(helper) != paired.controller_helper_sha256:
+            raise ActivationError("controller helper bytes changed")
+        _database, _backup, _proof, _transaction_dir = _paired_path_context(manifest)
+        if _transaction_dir != helper.parent:
+            raise ActivationError("paired snapshot must belong to the helper transaction")
+        if manifest.previous is None or manifest.rollback_binary_sha256 is None or manifest.rollback_plist_sha256 is None:
+            raise ActivationError("paired mode requires a predecessor")
+        database = str(Path(paired.database_path))
+        if _plist_database_path(Path(manifest.candidate_plist)) != database or _plist_database_path(Path(manifest.rollback_plist or "")) != database:
+            raise ActivationError("paired database path differs between candidate, predecessor, and manifest")
+
+
+
+
 def validate_manifest_identities(manifest: Manifest) -> None:
     if (
         not VERSION_RE.fullmatch(manifest.expected.version)
@@ -448,6 +736,7 @@ def activate(manifest: Manifest) -> str:
         prepared_rollback: Optional[tuple[Path, Path]] = None
         try:
             validate_manifest_identities(manifest)
+            validate_manifest_mode(manifest)
             candidate_binary = verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "candidate binary")
             candidate_plist = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "candidate plist")
             with candidate_plist.open("rb") as stream:
@@ -492,8 +781,17 @@ def activate(manifest: Manifest) -> str:
         write_status(manifest, "activating")
         disrupted = False
         try:
+            if manifest.paired_database_upgrade is not None:
+                # Production owns the database until launchd stops it; only the
+                # read-only legacy shape gate is safe before disruption.
+                validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
             old_pid = launchctl.stop()
             disrupted = True
+            if manifest.paired_database_upgrade is not None:
+                # Exclusivity is meaningful only after launchd confirms teardown.
+                assert_database_exclusive(manifest)
+                validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+                create_database_backup(manifest)
             commit_atomic_install(prepared_candidate[0], Path(manifest.target_binary))
             commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
             launchctl.start(old_pid)
@@ -525,6 +823,10 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
         return (
             status.get("transaction_id") == manifest.transaction_id
             and status.get("state") in TERMINAL_STATES
+            and not (
+                manifest.paired_database_upgrade is not None
+                and status.get("state") == "activation_failed_rollback_failed"
+            )
         )
     except (OSError, json.JSONDecodeError):
         return False

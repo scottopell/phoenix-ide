@@ -5,6 +5,7 @@ import json
 import os
 import plistlib
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -93,7 +94,329 @@ def make_manifest(root: Path, *, expected=None, previous=None):
     )
 
 
+def make_paired_manifest(root: Path, database: Path) -> helper.Manifest:
+    manifest = make_manifest(root)
+    plist = plistlib.dumps({"EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)}})
+    for name in ("candidate_plist", "rollback_plist"):
+        path = root / name
+        path.write_bytes(plist)
+    transaction = root / "transaction"
+    transaction.mkdir(mode=0o700)
+    copied_helper = transaction / "copied-helper.py"
+    shutil.copy2(Path(helper.__file__), copied_helper)
+    copied_helper.chmod(0o700)
+    return helper.dataclasses.replace(
+        manifest,
+        source_kind="prepared_artifact",
+        candidate_plist=str(root / "candidate_plist"),
+        candidate_plist_sha256=helper.sha256(root / "candidate_plist"),
+        rollback_plist=str(root / "rollback_plist"),
+        rollback_plist_sha256=helper.sha256(root / "rollback_plist"),
+        paired_database_upgrade=helper.PairedDatabaseUpgrade(
+            database_path=str(database),
+            backup_path=str(transaction / "backup.sqlite3"),
+            proof_path=str(transaction / "proof.json"),
+            controller_source_commit="c" * 40,
+            controller_helper_sha256=helper.sha256(copied_helper),
+            controller_helper_path=str(copied_helper),
+        ),
+    )
+
+
 class ActivationTests(unittest.TestCase):
+    def test_paired_sqlite_backup_is_private_and_context_bound(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            database = root / "legacy.db"
+            with sqlite3.connect(database) as conn:
+                conn.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                conn.execute("INSERT INTO _migrations VALUES (69, 'legacy')")
+                conn.execute("CREATE TABLE preserved (value TEXT)")
+                conn.execute("INSERT INTO preserved VALUES ('original')")
+            manifest = make_paired_manifest(root, database)
+            copied_helper = Path(manifest.paired_database_upgrade.controller_helper_path)
+            lsof = subprocess.CompletedProcess([], 1, "", "")
+            with mock.patch.object(helper, "__file__", str(copied_helper)), \
+                 mock.patch.object(helper.subprocess, "run", return_value=lsof):
+                helper.validate_manifest_mode(manifest)
+                helper.validate_legacy_database(database)
+                helper.create_database_backup(manifest)
+            backup = Path(manifest.paired_database_upgrade.backup_path)
+            proof = json.loads(Path(manifest.paired_database_upgrade.proof_path).read_text())
+            self.assertEqual("original", sqlite3.connect(backup).execute("SELECT value FROM preserved").fetchone()[0])
+            self.assertEqual(manifest.transaction_id, proof["transaction_id"])
+            self.assertEqual(0o600, backup.stat().st_mode & 0o777)
+            self.assertEqual(0o700, backup.parent.stat().st_mode & 0o777)
+            self.assertFalse((backup.parent / (backup.name + "-wal")).exists())
+            self.assertFalse((backup.parent / (backup.name + "-shm")).exists())
+
+    def test_paired_legacy_gate_rejects_product_conversations_without_mutation(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            database = Path(td) / "legacy.db"
+            with sqlite3.connect(database) as conn:
+                conn.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                conn.execute("INSERT INTO _migrations VALUES (69, 'legacy')")
+                conn.execute("CREATE TABLE product_conversations (id TEXT PRIMARY KEY)")
+            with self.assertRaisesRegex(helper.ActivationError, "without ProductConversation"):
+                helper.validate_legacy_database(database)
+            self.assertIn("product_conversations", sqlite3.connect(database).execute("SELECT name FROM sqlite_master").fetchall()[1][0])
+    def _paired_snapshot(self, root: Path):
+        import sqlite3
+        database = root / "legacy.db"
+        with sqlite3.connect(database) as conn:
+            conn.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            conn.execute("INSERT INTO _migrations VALUES (69, 'legacy')")
+            conn.execute("CREATE TABLE preserved (value TEXT)")
+            conn.execute("INSERT INTO preserved VALUES ('original')")
+        manifest = make_paired_manifest(root, database)
+        copied_helper = Path(manifest.paired_database_upgrade.controller_helper_path)
+        with mock.patch.object(helper, "__file__", str(copied_helper)), \
+             mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            helper.validate_manifest_mode(manifest)
+            helper.create_database_backup(manifest)
+        return manifest, database
+
+    def _full_paired_fixture(self, root: Path):
+        import sqlite3
+
+        database = root / "legacy.db"
+        with sqlite3.connect(database) as conn:
+            conn.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            conn.execute("INSERT INTO _migrations VALUES (69, 'legacy')")
+            conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            conn.execute("INSERT INTO users VALUES (1, 'original')")
+        manifest = make_paired_manifest(root, database)
+        target_binary = Path(manifest.target_binary)
+        target_plist = Path(manifest.target_plist)
+        target_binary.write_bytes(Path(manifest.rollback_binary).read_bytes())
+        target_plist.write_bytes(Path(manifest.rollback_plist).read_bytes())
+        copied_helper = root / "transaction" / "copied-helper.py"
+        shutil.copy2(Path(helper.__file__), copied_helper)
+        copied_helper.chmod(0o700)
+        paired = manifest.paired_database_upgrade
+        assert paired is not None
+        manifest = helper.dataclasses.replace(
+            manifest,
+            paired_database_upgrade=helper.dataclasses.replace(
+                paired,
+                controller_helper_path=str(copied_helper),
+                controller_helper_sha256=helper.sha256(copied_helper),
+            ),
+        )
+        return manifest, database, target_binary, target_plist, copied_helper
+
+    def _activate_full_paired(self, root: Path, *, health_failure=None, stop_failure=None, lsof=None, corrupt_backup=False):
+        import sqlite3
+
+        manifest, database, target_binary, target_plist, copied_helper = self._full_paired_fixture(root)
+        original_binary = target_binary.read_bytes()
+        original_plist = target_plist.read_bytes()
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id + "\n")
+        events = []
+
+        class PairedFakeLaunchctl(FakeLaunchctl):
+            def __init__(self, current):
+                super().__init__(current)
+                self.loaded = True
+                self.pid = 100
+                self.starts = 0
+
+            def inspect(self):
+                return ("running", self.pid) if self.loaded else ("not_loaded", None)
+
+            def stop(self):
+                events.append("stop")
+                if stop_failure is not None and self.starts >= 1:
+                    raise stop_failure
+                old_pid = self.pid
+                self.loaded = False
+                return old_pid
+
+            def start(self, old_pid):
+                del old_pid
+                self.starts += 1
+                events.append("start")
+                if self.starts == 1:
+                    with sqlite3.connect(database) as conn:
+                        conn.execute("INSERT INTO _migrations VALUES (70, 'product')")
+                        conn.execute("CREATE TABLE product_conversations (id TEXT PRIMARY KEY)")
+                        conn.execute("UPDATE users SET name = 'candidate' WHERE id = 1")
+                self.pid += 1
+                self.loaded = True
+                return self.pid
+
+        launchctl = PairedFakeLaunchctl(manifest)
+        failure = health_failure
+        def verify(_manifest, identity, **_kwargs):
+            if identity == manifest.expected:
+                if corrupt_backup:
+                    Path(manifest.paired_database_upgrade.backup_path).write_bytes(b"corrupt")
+                if failure is not None:
+                    raise failure
+
+        lsof_result = lsof or subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(helper, "__file__", str(copied_helper)), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "wait_for_identity", side_effect=verify), \
+             mock.patch.object(helper.subprocess, "run", return_value=lsof_result):
+            state = helper.activate(manifest)
+        return state, manifest, database, target_binary, target_plist, original_binary, original_plist, claim, events, launchctl
+
+    def test_full_paired_activate_success_preserves_candidate_database(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as td:
+            state, manifest, database, target_binary, target_plist, _old_binary, _old_plist, _claim, events, launchctl = self._activate_full_paired(Path(td))
+            self.assertEqual("committed", state)
+            self.assertEqual(["stop", "start"], events)
+            self.assertEqual(1, launchctl.starts)
+            with sqlite3.connect(database) as conn:
+                self.assertEqual((70,), conn.execute("SELECT MAX(version) FROM _migrations").fetchone())
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'product_conversations'").fetchone())
+                self.assertEqual(("candidate",), conn.execute("SELECT name FROM users WHERE id = 1").fetchone())
+            self.assertEqual(b"new binary", target_binary.read_bytes())
+            self.assertEqual(Path(manifest.candidate_plist).read_bytes(), target_plist.read_bytes())
+
+    def test_full_paired_activate_health_failure_restores_database_and_predecessor(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as td:
+            result = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("forced health failure"))
+            state, manifest, database, target_binary, target_plist, old_binary, old_plist, claim, events, launchctl = result
+            self.assertEqual("activation_failed_rolled_back", state)
+            self.assertEqual(["stop", "start", "stop", "start"], events)
+            self.assertEqual(2, launchctl.starts)
+            with sqlite3.connect(database) as conn:
+                self.assertEqual((69,), conn.execute("SELECT MAX(version) FROM _migrations").fetchone())
+                self.assertIsNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'product_conversations'").fetchone())
+                self.assertEqual(("original",), conn.execute("SELECT name FROM users WHERE id = 1").fetchone())
+            self.assertEqual(old_binary, target_binary.read_bytes())
+            self.assertEqual(old_plist, target_plist.read_bytes())
+            self.assertTrue(claim.exists(), "failed rollback must retain the active claim")
+            self.assertEqual(manifest.transaction_id, claim.read_text().strip())
+            self.assertEqual("activation_failed_rolled_back", json.loads(Path(manifest.status_path).read_text())["state"])
+
+    def test_full_paired_activate_snapshot_failure_does_not_start_predecessor(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            helper, "create_database_backup", side_effect=helper.ActivationError("snapshot failed")
+        ):
+            result = self._activate_full_paired(Path(td))
+        state, _manifest, _database, _target_binary, _target_plist, _old_binary, _old_plist, _claim, events, launchctl = result
+        self.assertEqual("activation_failed_rollback_failed", state)
+        self.assertEqual(["stop", "stop"], events)
+        self.assertEqual(0, launchctl.starts)
+
+    def test_full_paired_activate_restore_corruption_does_not_start_predecessor(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._activate_full_paired(
+                Path(td), health_failure=helper.ActivationError("forced health failure"), corrupt_backup=True
+            )
+        state, _manifest, _database, _target_binary, _target_plist, _old_binary, _old_plist, _claim, events, launchctl = result
+        self.assertEqual("activation_failed_rollback_failed", state)
+        self.assertEqual(["stop", "start", "stop"], events)
+        self.assertEqual(1, launchctl.starts)
+
+    def test_full_paired_activate_candidate_stop_failure_does_not_start_predecessor(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._activate_full_paired(
+                Path(td), health_failure=helper.ActivationError("forced health failure"),
+                stop_failure=helper.ActivationError("candidate stop failed"),
+            )
+        state, _manifest, _database, _target_binary, _target_plist, _old_binary, _old_plist, _claim, events, launchctl = result
+        self.assertEqual("activation_failed_rollback_failed", state)
+        self.assertEqual(["stop", "start", "stop"], events)
+        self.assertEqual(1, launchctl.starts)
+
+    def test_full_paired_activate_lsof_warning_after_stop_does_not_start_predecessor(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._activate_full_paired(
+                Path(td), lsof=subprocess.CompletedProcess([], 1, "", "lsof warning after stop")
+            )
+        state, _manifest, _database, _target_binary, _target_plist, _old_binary, _old_plist, _claim, events, launchctl = result
+        self.assertEqual("activation_failed_rollback_failed", state)
+        self.assertEqual(["stop", "stop"], events)
+        self.assertEqual(0, launchctl.starts)
+
+    def test_paired_lsof_warning_cannot_prove_ownership_without_leaking_stderr(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest, _database = self._paired_snapshot(root)
+            warning = "lsof: warning: /private/secret/token"
+            with mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", warning)):
+                with self.assertRaisesRegex(helper.ActivationError, "could not prove database exclusivity") as raised:
+                    helper.assert_database_exclusive(manifest)
+            self.assertNotIn("secret", str(raised.exception))
+
+    def test_corrupt_backup_and_proof_context_fail_without_restarting_predecessor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest, database = self._paired_snapshot(root)
+            backup = Path(manifest.paired_database_upgrade.backup_path)
+            backup.write_bytes(b"corrupt")
+            launchctl = mock.Mock()
+            launchctl.stop.return_value = None
+            launchctl.inspect.return_value = ("not_loaded", None)
+            with mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+                with self.assertRaises(helper.ActivationError):
+                    helper.restore(manifest, launchctl)
+            launchctl.start.assert_not_called()
+            proof = Path(manifest.paired_database_upgrade.proof_path)
+            proof.write_text(json.dumps({"transaction_id": "wrong"}))
+            with mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+                with self.assertRaisesRegex(helper.ActivationError, "proof"):
+                    helper.restore_database(manifest)
+            self.assertTrue(database.exists())
+
+    def test_candidate_stop_failure_never_starts_predecessor_in_paired_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest, _database = self._paired_snapshot(root)
+            launchctl = mock.Mock()
+            launchctl.stop.side_effect = helper.ActivationError("stop failed")
+            with self.assertRaises(helper.ActivationError):
+                helper.restore(manifest, launchctl)
+            launchctl.start.assert_not_called()
+
+    def test_paired_helper_binding_rejects_arbitrary_helper_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            database = root / "legacy.db"
+            database.write_bytes(b"sqlite")
+            manifest = make_paired_manifest(root, database)
+            paired = manifest.paired_database_upgrade
+            assert paired is not None
+            bad = root / "lookalike-helper.py"
+            bad.write_bytes(Path(helper.__file__).read_bytes())
+            manifest = helper.dataclasses.replace(
+                manifest,
+                paired_database_upgrade=helper.dataclasses.replace(
+                    paired, controller_helper_path=str(bad), controller_helper_sha256=helper.sha256(bad)
+                ),
+            )
+            with self.assertRaisesRegex(helper.ActivationError, "not the running helper"):
+                helper.validate_manifest_mode(manifest)
+
+    def test_snapshot_failure_removes_old_backup_and_proof(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            database = root / "legacy.db"
+            database.write_bytes(b"not sqlite")
+            manifest = make_paired_manifest(root, database)
+            paired = manifest.paired_database_upgrade
+            assert paired is not None
+            backup = Path(paired.backup_path)
+            proof = Path(paired.proof_path)
+            backup.write_bytes(b"old backup")
+            proof.write_text("old proof")
+            with mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+                with self.assertRaises(helper.ActivationError):
+                    helper.create_database_backup(manifest)
+            self.assertFalse(backup.exists())
+            self.assertFalse(proof.exists())
+
     def test_manifest_rejects_short_candidate_before_disruption(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(
@@ -646,6 +969,42 @@ class PreparationTests(unittest.TestCase):
              ):
             with self.assertRaisesRegex(SystemExit, "does not exactly match selected HEAD"):
                 self.dev._prepare_local_candidate(target=None)
+
+    def test_failed_paired_claim_blocks_later_deploy_and_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active = root / "active"
+            status = root / "status.json"
+            active.write_text("broken-pair\n")
+            status.write_text(json.dumps({"transaction_id": "broken-pair", "state": "activation_failed_rollback_failed", "source_kind": "prepared_artifact"}))
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", root / "restart"), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"):
+                self.assertFalse(self.dev._status_is_terminal_for_owner(status, "broken-pair", self.dev._DEPLOY_TERMINAL_STATES))
+                for admission in (self.dev._claim_launchd_deploy, self.dev._claim_launchd_restart):
+                    with self.subTest(admission=admission.__name__), self.assertRaises(SystemExit):
+                        admission("new-operation")
+                    self.assertEqual(active.read_text(), "broken-pair\n")
+
+    def test_pruning_preserves_paired_and_unknown_transactions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for i in range(8):
+                ordinary = root / f"ordinary-{i}"
+                ordinary.mkdir()
+                (ordinary / "manifest.json").write_text(json.dumps({"paired_database_upgrade": None}))
+                os.utime(ordinary, (100 + i, 100 + i))
+            for name, content in (("paired", json.dumps({"paired_database_upgrade": {"backup_path": "private"}})), ("unreadable", "invalid-json"), ("unknown", None)):
+                transaction = root / name
+                transaction.mkdir()
+                if content is not None:
+                    (transaction / "manifest.json").write_text(content)
+                os.utime(transaction, (1, 1))
+            self.dev._prune_launchd_deploy_transactions(root, "current")
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["ordinary-3", "ordinary-4", "ordinary-5", "ordinary-6", "ordinary-7", "paired", "unknown", "unreadable"])
 
     def test_claim_release_is_transaction_owned(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -1259,6 +1618,202 @@ class PreparationTests(unittest.TestCase):
             config,
         )
         self.assertIn("64    *  BJN", config)
+
+class PreparedArtifactTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dev = load(ROOT / "dev.py", "devpy_prepared_artifact_test")
+
+    def _valid_artifact(self, root: Path, *, commit: str = "a" * 40, target: str = "aarch64-apple-darwin"):
+        version = "1.2.3"
+        name = f"phoenix_ide-{target}-prepared-{commit[:12]}"
+        binary = root / name
+        binary.write_bytes(b"prepared standalone binary")
+        receipt = root / f"PREPARATION-RECEIPT-{target}.json"
+        receipt.write_text(json.dumps({
+            "schema": 1,
+            "operation": "prepare-main",
+            "target": target,
+            "commit": commit,
+            "version": version,
+            "checks": {
+                "developer_id_signature": "verified",
+                "hardened_runtime": "verified",
+                "notarization": "accepted",
+                "stapled_ticket": "validated",
+                "gatekeeper": "accepted",
+                "embedded_helper_bytes": "identical",
+                "notarization_submission_id": "123e4567-e89b-12d3-a456-426614174000",
+            },
+            "sha256": {name: self.dev._file_sha256(binary)},
+        }))
+        return binary, receipt, commit, target, version, name
+
+    def _prepare(self, root: Path, commit: str = "a" * 40):
+        with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev.platform, "machine", return_value="arm64"):
+            return self.dev._prepare_prepared_artifact(root, commit)
+
+    def _assert_rejected_before_codesign(self, root: Path, message: str, *, commit: str = "a" * 40):
+        with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev.platform, "machine", return_value="arm64"), \
+             mock.patch.object(self.dev.subprocess, "run") as run, \
+             mock.patch.object(self.dev, "_binary_identity") as identity:
+            with self.assertRaisesRegex(SystemExit, message):
+                self.dev._prepare_prepared_artifact(root, commit)
+        run.assert_not_called()
+        identity.assert_not_called()
+
+    def test_valid_receipt_uses_exact_standalone_name_and_separate_codesign_outputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary, _receipt, commit, _target, version, name = self._valid_artifact(root)
+            verify = subprocess.CompletedProcess([], 0, "", "")
+            display = subprocess.CompletedProcess(
+                [], 0, "", "Authority=Developer ID Application: Example\n"
+                "CodeDirectory v=20500 flags=0x10000(runtime)\nTimestamp=2026-01-01\n"
+            )
+            with mock.patch.object(self.dev.subprocess, "run", side_effect=[verify, display]) as run, \
+                 mock.patch.object(
+                     self.dev, "_binary_identity",
+                     return_value=self.dev.RuntimeIdentity(version, commit),
+                 ) as identity:
+                candidate = self._prepare(root)
+        self.assertEqual(binary, candidate.binary)
+        self.assertEqual(name, binary.name)
+        self.assertEqual(self.dev.ProdSourceKind.PREPARED_ARTIFACT, candidate.source_kind)
+        self.assertEqual([call.args[0][:3] for call in run.call_args_list], [
+            ["codesign", "--verify", "--strict"],
+            ["codesign", "--display", "--verbose=4"],
+        ])
+        identity.assert_called_once_with(binary)
+
+    def test_zip_checksum_does_not_count_as_exact_standalone_binary_checksum(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary, receipt, commit, target, _version, _name = self._valid_artifact(Path(td))
+            metadata = json.loads(receipt.read_text())
+            digest = metadata["sha256"].pop(next(iter(metadata["sha256"])))
+            metadata["sha256"][f"phoenix_ide-{target}-prepared-{commit[:12]}.zip"] = digest
+            receipt.write_text(json.dumps(metadata))
+            self._assert_rejected_before_codesign(root, "exact standalone")
+            self.assertTrue(binary.exists())
+
+    def test_invalid_receipt_schema_submission_sha_and_metadata_fail_before_execution(self):
+        cases = [
+            ("schema", lambda metadata: metadata.update(schema=2), "valid submission UUID"),
+            ("submission", lambda metadata: metadata["checks"].update(notarization_submission_id="not-a-uuid"), "valid submission UUID"),
+            ("sha", lambda metadata: metadata["sha256"].update({next(iter(metadata["sha256"])): "bad"}), "exact standalone"),
+            ("metadata", lambda metadata: metadata["checks"].update(gatekeeper="rejected"), "accepted signing/notarization/Gatekeeper/helper checks"),
+        ]
+        for _name, mutate, message in cases:
+            with self.subTest(case=_name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                _binary, receipt, _commit, _target, _version, _standalone = self._valid_artifact(root)
+                metadata = json.loads(receipt.read_text())
+                mutate(metadata)
+                receipt.write_text(json.dumps(metadata))
+                self._assert_rejected_before_codesign(root, message)
+
+    def test_short_commit_wrong_target_and_binary_symlink_fail_before_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._assert_rejected_before_codesign(root, "full 40-character", commit="a" * 12)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _binary, receipt, _commit, _target, _version, _name = self._valid_artifact(root)
+            metadata = json.loads(receipt.read_text())
+            metadata["target"] = "x86_64-apple-darwin"
+            receipt.write_text(json.dumps(metadata))
+            self._assert_rejected_before_codesign(root, "this host architecture")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary, _receipt, _commit, _target, _version, _name = self._valid_artifact(root)
+            real = root / "real-binary"
+            binary.rename(real)
+            binary.symlink_to(real)
+            self._assert_rejected_before_codesign(root, "checksum mismatch")
+
+    def test_identity_mismatch_is_checked_against_receipt_and_expected_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary, _receipt, commit, _target, version, _name = self._valid_artifact(root)
+            codesign = subprocess.CompletedProcess(
+                [], 0, "Authority=Developer ID Application: Example\n"
+                "CodeDirectory v=20500 flags=runtime\nTimestamp=now\n", ""
+            )
+            with mock.patch.object(self.dev.subprocess, "run", side_effect=[codesign, codesign]), \
+                 mock.patch.object(
+                     self.dev, "_binary_identity",
+                     return_value=self.dev.RuntimeIdentity(version, "b" * 40),
+                 ) as identity:
+                with self.assertRaisesRegex(SystemExit, "identity does not match"):
+                    self._prepare(root)
+            identity.assert_called_once_with(binary)
+
+    def test_wrong_platform_is_rejected_before_receipt_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(self.dev.sys, "platform", "linux"), \
+                 mock.patch.object(self.dev.subprocess, "run") as run:
+                with self.assertRaisesRegex(SystemExit, "only on macOS launchd"):
+                    self.dev._prepare_prepared_artifact(Path(td), "a" * 40)
+            run.assert_not_called()
+
+    def test_cmd_prod_deploy_passes_unenabled_prepared_options_to_launchd(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            prepared_artifact=Path("prepared"), expected_full_commit="a" * 40,
+            paired_database_upgrade=True, transaction_id="tx-123",
+        )
+        with mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check:
+            self.dev.cmd_prod_deploy(controller=controller)
+        deploy.assert_called_once_with(None, controller=controller)
+        check.assert_not_called()
+
+    def test_cmd_prod_deploy_rejects_incomplete_prepared_artifact_options(self):
+        cases = [
+            (self.dev.ProdDeployControllerOptions(prepared_artifact=Path("prepared"), paired_database_upgrade=True), "required together"),
+            (self.dev.ProdDeployControllerOptions(prepared_artifact=Path("prepared"), expected_full_commit="a" * 40), "required together"),
+            (self.dev.ProdDeployControllerOptions(expected_full_commit="a" * 40, paired_database_upgrade=True), "required together"),
+        ]
+        for controller, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(SystemExit, message):
+                    self.dev.cmd_prod_deploy(controller=controller)
+
+    def test_cmd_prod_deploy_rejects_nonmac_and_release_for_prepared_artifact(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            prepared_artifact=Path("prepared"), expected_full_commit="a" * 40,
+            paired_database_upgrade=True,
+        )
+        with mock.patch.object(self.dev.sys, "platform", "linux"):
+            with self.assertRaisesRegex(SystemExit, "only by macOS launchd"):
+                self.dev.cmd_prod_deploy(controller=controller)
+        with mock.patch.object(self.dev.sys, "platform", "darwin"):
+            with self.assertRaisesRegex(SystemExit, "excludes --release"):
+                self.dev.cmd_prod_deploy("v1.2.3", controller=controller)
+
+    def test_prepared_controller_reads_installed_environment_and_preserves_path(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            prepared_artifact=Path("prepared"), expected_full_commit="a" * 40,
+            paired_database_upgrade=True,
+        )
+        installed = {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin",
+            "PHOENIX_PORT": "9443",
+            "PHOENIX_PASSWORD": "installed-secret",
+            "PHOENIX_VERSION": "old-version",
+        }
+        with mock.patch.object(self.dev, "_launchd_env_from_plist", return_value=dict(installed)) as read:
+            env, env_file = self.dev._launchd_candidate_env(controller)
+        self.assertEqual({key: value for key, value in installed.items() if key != "PHOENIX_VERSION"}, env)
+        self.assertEqual(installed["PATH"], env["PATH"])
+        self.assertIsNone(env_file)
+        read.assert_called_once_with(self.dev.LAUNCHD_PLIST_PATH)
+
 
 if __name__ == "__main__":
     unittest.main()
