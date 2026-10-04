@@ -51,7 +51,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             (repo / ".gitignore").write_text("private/\n")
             with mock.patch.object(bench, "__file__", str(repo / "scripts" / "helper.py")):
                 bench._ensure_ignored_artifacts(repo / "private")
-                (repo / ".gitignore").write_text("private/captured.db\nprivate/capture-manifest.json\nprivate/scenarios.json\nprivate/report.md\nprivate/runs/\n")
+                (repo / ".gitignore").write_text("private/captured.db\nprivate/capture-manifest.json\nprivate/scenarios.json\nprivate/report.md\nprivate/runs/\nprivate/__private_staged_probe__\n")
                 with self.assertRaisesRegex(SystemExit, "unignored"):
                     bench._ensure_ignored_artifacts(repo / "private")
 
