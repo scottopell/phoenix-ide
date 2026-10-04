@@ -136,7 +136,12 @@ def _build_configuration() -> dict:
         }
     }
     host = next((line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:")), None)
+    config_paths = [Path.home() / ".cargo" / "config", Path.home() / ".cargo" / "config.toml"]
+    project = Path(__file__).parents[1].resolve()
+    config_paths += [parent / ".cargo" / name for parent in [project, *project.parents] for name in ("config", "config.toml")]
+    config_hashes = {str(path): _hash(path) for path in config_paths if path.is_file()}
     return {
+        "cargo_config_hashes": config_hashes,
         "rustc_version_verbose": rustc,
         "cargo_version": cargo,
         "target": forwarded.get("CARGO_BUILD_TARGET") or forwarded.get("TARGET") or host,
@@ -664,7 +669,7 @@ def prepare(args) -> int:
         'expected_case_surface_set': _expected_case_surface_set(scenarios),
         'scenarios': scenarios,
     }
-    _write_private(scenarios_path, json.dumps(scenario_manifest, indent=2)+'\n')
+    _write_atomic_private(scenarios_path, json.dumps(scenario_manifest, indent=2)+'\n')
     print(f'wrote frozen scenarios: {scenarios_path}'); return 0
 
 def run(args) -> int:
@@ -678,9 +683,14 @@ def run(args) -> int:
     except FileExistsError:
         raise SystemExit("run label already reserved; inspect the existing owner before removing reservation")
     os.close(fd)
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt("benchmark interrupted; child group will be stopped")
+    for sig in handlers: signal.signal(sig, interrupted)
     try:
         return _run_reserved(args)
     finally:
+        for sig, previous in handlers.items(): signal.signal(sig, previous)
         reservation.unlink(missing_ok=True)
 
 
@@ -950,6 +960,8 @@ def compare(args) -> int:
     b = json.loads(Path(args.after).read_text())
     validated_a = _validate_run(a, "before")
     validated_b = _validate_run(b, "after")
+    if a["environment"].get("host") == b["environment"].get("host") and max(a["started_at_unix"], b["started_at_unix"]) < min(a["completed_at_unix"], b["completed_at_unix"]):
+        raise SystemExit("refusing comparison: same-host run intervals overlap")
     if a["run_uuid"] == b["run_uuid"]:
         raise SystemExit("refusing comparison: same execution identity")
     keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "tool_oracle_regime", "fixture_validation", "measurement_regimes")
