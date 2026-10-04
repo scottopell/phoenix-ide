@@ -604,6 +604,10 @@
   outline-offset: 2px;
 }
 
+#state-bar:has(.statebar-conversation-extension-summary, .statebar-conversation-extension) {
+  z-index: 60;
+}
+
 .statebar-conversation-extension {
   position: relative;
   flex: 0 0 auto;

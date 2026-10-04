@@ -30,6 +30,7 @@ export function AutomaticContinuationControl({ scope, onStatusChange }: Automati
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [failedValue, setFailedValue] = useState<boolean | null>(null);
   const [retrying, setRetrying] = useState(false);
   const requestGeneration = useRef(0);
@@ -48,6 +49,7 @@ export function AutomaticContinuationControl({ scope, onStatusChange }: Automati
     setSaving(false);
     setFeedback(null);
     savePending.current = false;
+    setLoadFailed(false);
     retryPending.current = false;
     setFailedValue(null);
     setRetrying(false);
@@ -63,11 +65,13 @@ export function AutomaticContinuationControl({ scope, onStatusChange }: Automati
           if (requestGeneration.current === generation && viewRevision.current === revision) {
             setView(next);
             setFeedback(null);
+            setLoadFailed(false);
           }
         })
         .catch((error: unknown) => {
           if (initial && requestGeneration.current === generation) {
             setFeedback(errorMessage(error, 'Failed to load automatic continuation setting'));
+            setLoadFailed(true);
           }
         })
         .finally(() => {
@@ -153,13 +157,13 @@ export function AutomaticContinuationControl({ scope, onStatusChange }: Automati
   const admission = view?.admission ?? null;
   const phaseLabel = admission ? PHASE_LABELS[admission.phase] : null;
   const failedAdmission = admission?.phase === 'failed' ? admission : null;
-  const compactStatus = loading
+  const compactStatus = loading || view === null
     ? '…'
     : `${enabled ? 'On' : 'Off'}${phaseLabel ? ` · ${phaseLabel}` : ''}`;
 
   useEffect(() => {
-    onStatusChange?.(compactStatus, failedAdmission !== null);
-  }, [compactStatus, failedAdmission, onStatusChange]);
+    onStatusChange?.(compactStatus, failedAdmission !== null || loadFailed);
+  }, [compactStatus, failedAdmission, loadFailed, onStatusChange]);
   const detailsRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
