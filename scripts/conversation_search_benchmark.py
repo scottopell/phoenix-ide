@@ -49,6 +49,12 @@ def _artifact_root(value: str) -> Path:
     raw = Path(value).expanduser().absolute()
     if raw.is_symlink():
         raise SystemExit("refusing symlinked artifact root")
+    manifest_path = raw / "capture-manifest.json"
+    if manifest_path.is_file():
+        try: manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError): raise SystemExit("invalid artifact ownership manifest")
+        if manifest.get("kind") != "conversation-search-fixture":
+            raise SystemExit("invalid artifact ownership manifest")
     if raw.exists() and any(raw.iterdir()) and not (raw / "capture-manifest.json").is_file() and not (raw / ".capture-pending").is_file() and set(path.name for path in raw.iterdir()) != {".capture-lock"}:
         raise SystemExit("refusing nonempty unrecognized artifact root; choose a dedicated directory")
     return raw.resolve()
@@ -133,10 +139,10 @@ def _build_configuration() -> dict:
     forwarded = {
         key: value
         for key, value in os.environ.items()
-        if key.startswith("CARGO_PROFILE_") or re.fullmatch(r"CARGO_TARGET_[A-Z0-9_]+_(RUSTFLAGS|LINKER|RUNNER)", key) or key in {"CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_JOBS"}
+        if re.fullmatch(r"(?:CC|CXX|CFLAGS|CXXFLAGS|AR|ARFLAGS)_[A-Za-z0-9_]+", key) or key.startswith("CARGO_PROFILE_") or re.fullmatch(r"CARGO_TARGET_[A-Z0-9_]+_(RUSTFLAGS|LINKER|RUNNER)", key) or key in {"CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_JOBS"}
         or key in {
             "RUSTFLAGS", "RUSTUP_TOOLCHAIN", "TARGET", "PROFILE", "RUSTC",
-            "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CC", "CXX", "CFLAGS", "CXXFLAGS", "AR", "ARFLAGS", "HOST_CC", "HOST_CFLAGS",
         }
     }
     host = next((line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:")), None)
@@ -443,7 +449,7 @@ def _carry_run_metadata(
     run["run_uuid"] = run_uuid
     run["started_at_unix"] = started_at_unix
     run["completed_at_unix"] = completed_at_unix
-    _write_private(path, json.dumps(run, indent=2) + "\n")
+    _write_atomic_private(path, json.dumps(run, indent=2) + "\n")
 
 
 def _recover_fallback_call_ids(conn, columns: set[str]) -> list[str]:
@@ -544,6 +550,7 @@ def _snapshot_locked(args) -> int:
             _remove_private(staged)
         _remove_private(dest)
         _remove_private(pending)
+    if (outdir / "capture-manifest.json").exists(): raise SystemExit("existing capture manifest; use a new dedicated directory")
     if dest.exists(): raise SystemExit('fixture exists; capture into a new dedicated directory (replacement unsupported)')
     source_conn = sqlite3.connect(_uri(source), uri=True, timeout=args.busy_timeout)
     try:
