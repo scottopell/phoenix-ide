@@ -331,16 +331,21 @@ class ActivationTests(unittest.TestCase):
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute("SELECT MAX(version) FROM _migrations").fetchone()[0], 69)
 
-    def test_recovery_entrypoint_exception_preserves_failed_status_and_claim(self):
-        with tempfile.TemporaryDirectory() as td:
-            manifest, *_ = self._full_paired_fixture(Path(td))
-            Path(manifest.active_path).write_text(manifest.transaction_id + "\n")
-            helper.write_status(manifest, "activating")
-            args = ["helper", "recover-paired", "--manifest", "unused", "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
-            with mock.patch.object(helper.sys, "argv", args), mock.patch.object(helper.Manifest, "load", return_value=manifest), mock.patch.object(helper, "recover_paired", side_effect=helper.ActivationError("early proof rejected")), mock.patch.object(helper, "request_helper_bootout"):
-                self.assertEqual(helper.main(), 1)
-            self.assertEqual(json.loads(Path(manifest.status_path).read_text())["state"], "activation_failed_rollback_failed")
-            self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
+    def test_recovery_entrypoint_errors_preserve_prior_diagnostics_and_claim(self):
+        for exception in (helper.ActivationError("early proof rejected"), helper.ConcurrentDeploy("recovery lock occupied")):
+            with self.subTest(exception=type(exception).__name__), tempfile.TemporaryDirectory() as td:
+                manifest, *_ = self._full_paired_fixture(Path(td))
+                Path(manifest.active_path).write_text(manifest.transaction_id + "\n")
+                helper.write_status(manifest, "activation_failed_rollback_failed", failure="original activation", rollback_failure="prior restore failure")
+                args = ["helper", "recover-paired", "--manifest", "unused", "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+                with mock.patch.object(helper.sys, "argv", args), mock.patch.object(helper.Manifest, "load", return_value=manifest), mock.patch.object(helper, "recover_paired", side_effect=exception), mock.patch.object(helper, "request_helper_bootout"):
+                    self.assertEqual(helper.main(), 1)
+                status = json.loads(Path(manifest.status_path).read_text())
+                self.assertEqual(status["state"], "activation_failed_rollback_failed")
+                self.assertEqual(status["failure"], "original activation")
+                self.assertIn("prior restore failure", status["rollback_failure"])
+                self.assertIn(str(exception), status["rollback_failure"])
+                self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
 
     def test_repeated_recovery_failure_retains_claim_and_stops_unverified_runtime(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1721,6 +1726,20 @@ class PreparationTests(unittest.TestCase):
             }))
             self.dev._print_launchd_deploy_status()
         self.assertFalse(any("STALE:" in str(call) for call in output.call_args_list))
+
+    def test_stale_paired_status_uses_verified_recovery_not_marker_removal(self):
+        stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
+        for state in ("prepared", "activating"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                status = root / "status.json"
+                status.write_text(json.dumps({"transaction_id": "tx", "state": state, "source_kind": "prepared_artifact", "updated_at": stale}))
+                with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch("builtins.print") as output:
+                    self.dev._print_launchd_deploy_status()
+                rendered = " ".join(str(c) for c in output.call_args_list)
+                self.assertIn("recover-paired", rendered)
+                self.assertIn("Do not remove", rendered)
+                self.assertNotIn("clearing the active marker", rendered)
 
     def test_preparing_transaction_reports_stale_recovery(self):
         stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=7)).isoformat()

@@ -947,6 +947,18 @@ def activate(manifest: Manifest) -> str:
                 prepared.unlink(missing_ok=True)
 
 
+def record_recovery_error(manifest: Manifest, error: str) -> None:
+    try:
+        prior = json.loads(Path(manifest.status_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        prior = {}
+    if prior.get("transaction_id") != manifest.transaction_id:
+        prior = {}
+    previous = prior.get("rollback_failure")
+    merged = f"{previous}; recovery attempt failed: {error}" if previous else error
+    write_status(manifest, "activation_failed_rollback_failed", failure=prior.get("failure"), rollback_failure=merged)
+
+
 def recover_paired(manifest: Manifest) -> str:
     with Path(manifest.lock_path).open("a+") as lock:
         try:
@@ -998,7 +1010,7 @@ def recover_paired(manifest: Manifest) -> str:
                     raise ActivationError("paired recovery teardown is unconfirmed")
             except Exception as teardown:
                 failure += f"; recovery teardown failed: {teardown}"
-            write_status(manifest, "activation_failed_rollback_failed", failure=status.get("failure"), rollback_failure=failure)
+            record_recovery_error(manifest, failure)
             return "activation_failed_rollback_failed"
 
 
@@ -1043,8 +1055,10 @@ def main() -> int:
     except ConcurrentDeploy as exc:
         if manifest is not None:
             try:
-                state = "activation_failed_rollback_failed" if args.command == "recover-paired" else "rejected_concurrent"
-                write_status(manifest, state, failure=str(exc))
+                if args.command == "recover-paired":
+                    record_recovery_error(manifest, str(exc))
+                else:
+                    write_status(manifest, "rejected_concurrent", failure=str(exc))
             finally:
                 if status_is_durable_terminal(manifest):
                     release_claim(manifest)
@@ -1052,7 +1066,7 @@ def main() -> int:
         return 1
     except Exception as exc:
         if manifest is not None and args.command == "recover-paired":
-            write_status(manifest, "activation_failed_rollback_failed", rollback_failure=str(exc))
+            record_recovery_error(manifest, str(exc))
         if manifest is not None and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)

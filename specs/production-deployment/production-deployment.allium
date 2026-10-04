@@ -194,6 +194,12 @@ variant BareLinuxHandoff : DeploymentHandoff {
 -- backend_owner_independent(transaction, handoff) -> Boolean
 --   launchd owns a one-shot LaunchAgent, systemd owns a root transient unit,
 --   or the persistent bare-Linux supervisor owns activation and its child.
+-- helper_capacity_reserved(transaction) -> Boolean
+--   After handoff and before production stop, the launchd paired helper holds
+--   private DB-plus-WAL snapshot and atomic-restore capacity. True for other
+--   sources/backends with their prepared capacity.
+-- HelperCapacityVerified(transaction)
+--   Independent helper confirmed its pre-stop capacity reservation.
 -- handoff_valid_for_backend(transaction, handoff) -> Boolean
 --   The typed handoff variant corresponds to transaction.backend and all
 --   host-resident inputs match their declared hashes and allowed locations.
@@ -324,8 +330,16 @@ rule BareLinuxActivationHandedOff {
     ensures: transaction.state = handed_off
 }
 
+rule ReserveHelperCapacity {
+    when: HelperCapacityVerified(transaction)
+    requires: transaction.state = handed_off
+    requires: current_claim_matches(transaction)
+    ensures: helper_capacity_reserved(transaction)
+}
+
 rule IndependentOwnerBeginsActivation {
     when: ActivationOwnerAccepted(transaction, handoff)
+    requires: helper_capacity_reserved(transaction)
     requires: transaction.state = handed_off
     requires: current_claim_matches(transaction)
     requires: handoff_valid_for_backend(transaction, handoff)

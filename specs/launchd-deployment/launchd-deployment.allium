@@ -92,8 +92,12 @@ external entity TargetService {
 --   Candidate binary, plist, rollback inputs, hashes, signature, manifest and
 --   embedded identity are valid and host-resident; persisted metadata contains
 --   no plist environment values.
---   Paired preparation also physically reserves DB-plus-WAL snapshot capacity
---   and atomic-restore capacity before production stop.
+-- helper_capacity_reserved(transaction) -> Boolean
+--   After handoff, the helper physically reserves private snapshot and restore
+--   capacity for DB plus WAL and margin before production stop. True for
+--   ordinary sources, whose prepared runtime capacity is already held.
+-- HelperCapacityVerified(transaction)
+--   Emitted by the independent helper after successful capacity reservation.
 -- activation_claim_available() -> Boolean
 --   No active or unresolved deployment or restart owns the host-level claim.
 -- helper_is_launchd_owned(transaction) -> Boolean
@@ -221,9 +225,17 @@ rule HandoffActivation {
         -- target LaunchAgent is stopped. The initiating process may then end.
 }
 
+rule ReserveHelperCapacity {
+    when: HelperCapacityVerified(transaction)
+    requires: transaction.state = prepared
+    requires: helper_is_launchd_owned(transaction)
+    ensures: helper_capacity_reserved(transaction)
+}
+
 rule ActivateCandidate {
     when: ActivationHelperStarted(transaction)
     requires: transaction.state = prepared
+    requires: helper_capacity_reserved(transaction)
     requires: helper_is_launchd_owned(transaction)
     requires: preparation_complete(transaction)
     ensures: transaction.state = activating

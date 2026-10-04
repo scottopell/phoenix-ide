@@ -10673,7 +10673,11 @@ def _print_launchd_deploy_status() -> None:
                 + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
             )
             if age.total_seconds() > stale_after:
-                print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
+                refusal = _paired_recovery_refusal(deploy.get("transaction_id"))
+                if refusal is not None:
+                    print(f"    STALE: {refusal}")
+                else:
+                    print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
     except Exception as exc:
         print(f"  Last deploy: unreadable status ({type(exc).__name__})")
 
