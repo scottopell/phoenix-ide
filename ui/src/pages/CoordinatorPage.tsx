@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api, type ActiveCoordinatorWatch, type LiveCoordinatorBashHandle } from '../api';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
@@ -14,7 +14,13 @@ interface CoordinatorPageFixtureData {
   conversation: ReactNode;
 }
 
-function GlobalActiveWatches() {
+function humanizeState(state: string): string {
+  return state.replaceAll('_', ' ').replace(/^./, (first) => first.toUpperCase());
+}
+
+type ActivityCount = number | null;
+
+function GlobalActiveWatches({ onCount }: { onCount: (count: ActivityCount) => void }) {
   const [watches, setWatches] = useState<ActiveCoordinatorWatch[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -26,9 +32,9 @@ function GlobalActiveWatches() {
       inFlight = true;
       try {
         const value = await api.listActiveCoordinatorWatches();
-        if (!cancelled) { setWatches(value); setError(null); }
+        if (!cancelled) { setWatches(value); setError(null); onCount(value.length); }
       } catch {
-        if (!cancelled) setError('Could not refresh active watches');
+        if (!cancelled) { setError('Could not refresh active watches'); onCount(null); }
       } finally {
         inFlight = false;
       }
@@ -36,7 +42,7 @@ function GlobalActiveWatches() {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 2_000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, []);
+  }, [onCount]);
 
   if (watches.length === 0 && !error) return null;
   return (
@@ -47,20 +53,21 @@ function GlobalActiveWatches() {
         <div className="global-active-watch" key={watch.product_conversation_id}>
           <div>
             <Link to={`/product-conversations/${watch.product_conversation_id}`}>{watch.display_name}</Link>
-            <span>{watch.state}</span>
+            <span>{humanizeState(watch.state)}</span>
           </div>
-          {watch.project_path && <code>{watch.project_path}</code>}
-          <div>
-            <Link to={`/c/${encodeURIComponent(watch.transcript_slug || watch.transcript_id)}`}>current transcript</Link>
+          <Link to={`/c/${encodeURIComponent(watch.transcript_slug || watch.transcript_id)}`}>current transcript</Link>
+          <details className="global-activity-metadata">
+            <summary>Details</summary>
+            {watch.project_path && <code>{watch.project_path}</code>}
             <code title="ProductConversation ID">{watch.product_conversation_id}</code>
-          </div>
+          </details>
         </div>
       ))}
     </section>
   );
 }
 
-function GlobalLiveCommands() {
+function GlobalLiveCommands({ onCount }: { onCount: (count: ActivityCount) => void }) {
   const location = useLocation();
   const [handles, setHandles] = useState<LiveCoordinatorBashHandle[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -74,9 +81,9 @@ function GlobalLiveCommands() {
       inFlight = true;
       try {
         const value = await api.listLiveCoordinatorBashHandles();
-        if (!cancelled) { setHandles(value); setError(null); }
+        if (!cancelled) { setHandles(value); setError(null); onCount(value.length); }
       } catch (reason) {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load live commands');
+        if (!cancelled) { setError(reason instanceof Error ? reason.message : 'Failed to load live commands'); onCount(null); }
       } finally {
         inFlight = false;
       }
@@ -84,7 +91,7 @@ function GlobalLiveCommands() {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5_000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, []);
+  }, [onCount]);
 
   const inspectTarget = (handleId: string) => {
     const search = new URLSearchParams(location.search);
@@ -103,8 +110,12 @@ function GlobalLiveCommands() {
           <div>
             {handle.label && <strong>{handle.label}</strong>}
             <code>{handle.command}</code>
-            <span>{handle.cwd} · started {new Date(handle.started_at_ms).toLocaleString()}</span>
-            <span>{handle.handle_id}</span>
+            <span>Started {new Date(handle.started_at_ms).toLocaleString()}</span>
+            <details className="global-activity-metadata">
+              <summary>Details</summary>
+              <code>{handle.cwd}</code>
+              <code>{handle.handle_id}</code>
+            </details>
           </div>
           <div className="global-live-command-actions">
             <Link to={inspectTarget(handle.handle_id)}>output →</Link>
@@ -136,6 +147,10 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
   const [topologyRevision, setTopologyRevision] = useState(0);
+  const [watchCount, setWatchCount] = useState<ActivityCount>(null);
+  const [runningCount, setRunningCount] = useState<ActivityCount>(null);
+  const [automaticContinuationStatus, setAutomaticContinuationStatus] = useState('…');
+  const [automaticContinuationNeedsAttention, setAutomaticContinuationNeedsAttention] = useState(false);
   const consumedTopologyRevision = useRef(0);
 
   useEffect(() => {
@@ -191,28 +206,43 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     return () => { cancelled = true; };
   }, [fixtureData, navigate, slug, topologyRevision]);
 
+  const handleAutomaticContinuationStatus = useCallback((status: string, requiresAttention: boolean) => {
+    setAutomaticContinuationStatus(status);
+    setAutomaticContinuationNeedsAttention(requiresAttention);
+  }, []);
+
+  const stateBarExtension = fixtureData ? undefined : {
+    summary: (
+      <span className="global-statebar-summary">
+        <span>Watching {watchCount ?? '…'}</span>
+        <span>Running {runningCount ?? '…'}</span>
+        <span className="global-statebar-summary__auto" title={`Auto-continue ${automaticContinuationStatus}`}>Auto {automaticContinuationStatus}</span>
+      </span>
+    ),
+    details: (
+      <div className="global-statebar-activity__details">
+        <AutomaticContinuationControl
+          scope={{ kind: 'coordinator' }}
+          onStatusChange={handleAutomaticContinuationStatus}
+        />
+        <GlobalActiveWatches onCount={setWatchCount} />
+        <GlobalLiveCommands onCount={setRunningCount} />
+      </div>
+    ),
+    requiresAttention: automaticContinuationNeedsAttention,
+  };
+
   return (
     <main className="coordinator-page">
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
-      {!loading && !error && resolvedCoordinatorId === slug && (
-        <div className="coordinator-page__automatic-continuation">
-          <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
-        </div>
-      )}
 
-      {!fixtureData && !loading && !error && (
-        <>
-          <GlobalActiveWatches />
-          <GlobalLiveCommands />
-        </>
-      )}
 
       <section className="coordinator-conversation" aria-label="Coordinator conversation">
         {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
-            <ConversationPage routePrefix="/global" composerQuickAction={COORDINATOR_QUICK_ACTION} />
+            <ConversationPage routePrefix="/global" composerQuickAction={COORDINATOR_QUICK_ACTION} stateBarExtension={stateBarExtension} />
           </Suspense>
         ) : null}
       </section>

@@ -35,18 +35,6 @@
   right: 12px;
 }
 
-.coordinator-page__automatic-continuation {
-  position: relative;
-  z-index: 10;
-  align-self: flex-end;
-  flex: 0 0 auto;
-  margin: 12px 16px 8px;
-  padding: 4px 8px;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-}
-
 .coordinator-muted {
   color: var(--text-muted);
   font-size: 0.875rem;
@@ -56,13 +44,38 @@
   color: var(--accent-red);
 }
 
+.global-statebar-summary {
+  display: flex;
+  min-width: 0;
+  gap: 10px;
+  overflow: hidden;
+  align-items: center;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.global-statebar-summary > span {
+  flex: 0 0 auto;
+}
+
+.global-statebar-summary__auto {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.global-statebar-activity__details {
+  display: grid;
+  gap: 8px;
+}
+
 .global-active-watches {
   display: grid;
   flex: 0 0 auto;
   gap: 6px;
-  max-height: min(25dvh, 240px);
+  max-height: 220px;
   overflow-y: auto;
-  margin: 0 12px 8px;
+  margin: 0;
   padding: 8px 10px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
@@ -89,13 +102,28 @@
   font-size: 0.75rem;
 }
 
+.global-activity-metadata {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.global-activity-metadata summary {
+  cursor: pointer;
+}
+
+.global-activity-metadata code {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
 .global-live-commands {
   display: grid;
   flex: 0 0 auto;
   gap: 6px;
-  max-height: min(35dvh, 320px);
+  max-height: 260px;
   overflow-y: auto;
-  margin: 0 12px 8px;
+  margin: 0;
   padding: 8px 10px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
@@ -150,7 +178,14 @@
 }
 
 .global-live-commands-error {
-  margin: 0 12px 8px;
+  margin: 0;
   color: var(--accent-red);
   font-size: 0.85rem;
+}
+
+@media (width <= 768px) {
+  .global-statebar-summary {
+    gap: 4px;
+    font-size: max(0.68rem, 10px);
+  }
 }
