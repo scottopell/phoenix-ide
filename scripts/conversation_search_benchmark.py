@@ -86,6 +86,7 @@ def _ensure_ignored_artifacts(outdir: Path) -> None:
     if not relative.parts:
         raise SystemExit("refusing to write benchmark artifacts in the repository root")
     paths = [
+        outdir / "__private_staged_probe__",
         outdir / "captured.db",
         outdir / "capture-manifest.json",
         outdir / "scenarios.json",
@@ -128,7 +129,7 @@ def _build_configuration() -> dict:
     forwarded = {
         key: value
         for key, value in os.environ.items()
-        if key.startswith("CARGO_PROFILE_") or key in {"CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_JOBS"}
+        if key.startswith("CARGO_PROFILE_") or re.fullmatch(r"CARGO_TARGET_[A-Z0-9_]+_(RUSTFLAGS|LINKER|RUNNER)", key) or key in {"CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_JOBS"}
         or key in {
             "RUSTFLAGS", "RUSTUP_TOOLCHAIN", "TARGET", "PROFILE", "RUSTC",
             "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
@@ -667,6 +668,23 @@ def prepare(args) -> int:
     print(f'wrote frozen scenarios: {scenarios_path}'); return 0
 
 def run(args) -> int:
+    outdir = _artifact_root(args.artifacts)
+    _ensure_ignored_artifacts(outdir)
+    result_dir = outdir / "runs"
+    _private(result_dir)
+    reservation = result_dir / f".{_label(args.label)}.reserved"
+    try:
+        fd = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise SystemExit("run label already reserved; inspect the existing owner before removing reservation")
+    os.close(fd)
+    try:
+        return _run_reserved(args)
+    finally:
+        reservation.unlink(missing_ok=True)
+
+
+def _run_reserved(args) -> int:
     outdir=_artifact_root(args.artifacts); db=outdir/'captured.db'; scen=outdir/'scenarios.json'
     _ensure_ignored_artifacts(outdir)
     manifest=outdir/'capture-manifest.json'
@@ -872,6 +890,10 @@ def _validate_run(run: dict, name: str) -> dict:
     for key in required - {"samples", "migration_ledger", "build_configuration", "expected_case_surface_set"}:
         if not _metadata_has_values(run[key]):
             raise SystemExit(f"refusing comparison: {name} has empty metadata: {key}")
+    freshness = run["fixture_validation"]
+    shape = {"transcript_count", "freshness_batch_size", "locator_orphans", "missing_physical_rows", "unlocated_physical_rows"}
+    if not isinstance(freshness, dict) or set(freshness) != shape or any(type(v) is not int for v in freshness.values()) or freshness["transcript_count"] < 0 or freshness["freshness_batch_size"] <= 0 or any(freshness[k] != 0 for k in shape - {"transcript_count", "freshness_batch_size"}):
+        raise SystemExit(f"refusing comparison: {name} invalid fixture freshness record")
     build = run["build_configuration"]
     if not isinstance(build, dict) or any(
         key not in build or not isinstance(build[key], (str, list, dict))
