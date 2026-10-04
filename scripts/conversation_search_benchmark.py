@@ -489,7 +489,7 @@ def _selective_term(conn: sqlite3.Connection, query: str) -> str:
     for term in candidates:
         try:
             rows = conn.execute(
-                "SELECT rowid FROM message_fts WHERE message_fts MATCH ? LIMIT 1001", ('"' + term + '"*',)
+                "SELECT rowid FROM message_fts WHERE message_fts MATCH ? LIMIT 1001", ('"' + term + '"',)
             ).fetchall()
         except sqlite3.Error:
             continue
@@ -768,6 +768,8 @@ def _run_reserved(args) -> int:
         _remove_private(output)
     fixture_before = _fixture_fingerprint(db)
     run_uuid = uuid.uuid4().hex
+    measurement_digest = _measurement_digest()
+    launched_commit = env["PHOENIX_SEARCH_BENCH_COMMIT"]
     started_at_unix = time.time()
     output_tmp = result_dir / f'.{label}.json.{os.getpid()}.tmp'
     _remove_private(output_tmp)
@@ -860,8 +862,13 @@ def _run_reserved(args) -> int:
         run_uuid=run_uuid,
         started_at_unix=started_at_unix,
         completed_at_unix=completed_at_unix,
-        measurement_digest=_measurement_digest(),
+        measurement_digest=measurement_digest,
     )
+    _ensure_clean_source()
+    if _git_commit() != launched_commit or _measurement_digest() != measurement_digest:
+        _private(failure_output.parent)
+        os.replace(output_tmp, failure_output)
+        raise SystemExit("source changed before publication; private raw evidence retained")
     os.replace(output_tmp, output)
     os.chmod(output, 0o600)
     print(output); return 0
