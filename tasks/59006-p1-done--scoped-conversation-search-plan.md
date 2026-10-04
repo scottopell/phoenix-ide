@@ -9,3 +9,7 @@ Measured one-case gain remains ~59x with exact output, but late review r41745116
 ## Counterexample adjudication
 
 Using cached Rust-linked SQLite3.51.3 and production-shaped locator/source/conversation joins, hidden predicate, BM25/order/LIMIT/count/snippet,300kcommon rows15scope, native locator-first~77ms versusFTS-first~24ms; ANALYZE~78ms versus24ms. Exact claimed0.23→30ms regression not reproduced. Specific unsupported review claim dismissed with artifacts under private adjudication/; no universalSLO promise/arbitrarythreshold. Original actualpair source063a/42740 remains historical; current precomputed-oracle setup unmeasured. Ready for exacthead review/CI only, no merge/deploy.
+
+## Current main CI identity refresh
+
+Independent source0ab0a1d85 is unchanged. GitHub regenerated the synthetic merge from cc9df28e3 (tested successfully) to803fae0cce6d7d8807dc3653a4d64f4089ac34bd against unchanged mainabfdcf1; the new merge had no required check associations. This task-only update requests normal CI on the current main merge identity; no source change, new benchmark run, merge or deployment.
