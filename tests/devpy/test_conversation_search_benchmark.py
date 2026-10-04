@@ -44,7 +44,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
 
     def test_staged_files_require_root_ignore(self):
         with tempfile.TemporaryDirectory() as d:
-            repo = Path(d)
+            repo = Path(d).resolve()
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             (repo / ".gitignore").write_text("private/*\n")
             with mock.patch.object(bench, "__file__", str(repo / "scripts" / "helper.py")):
