@@ -327,6 +327,14 @@ impl GlobalReadService {
     }
 
     pub(crate) async fn search(&self, query: &str) -> Result<String, String> {
+        let hits = self.search_hits(query).await?;
+        self.format_search_hits(&hits).await
+    }
+
+    pub(crate) async fn search_hits(
+        &self,
+        query: &str,
+    ) -> Result<Vec<crate::db::RetrievedChunk>, String> {
         let query = query.trim();
         if query.is_empty() {
             return Err("query is required".to_string());
@@ -337,23 +345,34 @@ impl GlobalReadService {
                     .to_string(),
             );
         }
-        let coordinator_chain = self.coordinator_chain_ids().await?;
         let hits = self
             .message_retriever
-            .retrieve(RetrievalRequest::natural_language(
-                query,
-                RetrievalScope::GlobalExcluding(coordinator_chain),
-                SEARCH_TOP_K,
-            ))
+            .retrieve(self.search_request(query).await?)
             .await
             .map_err(|e| format!("search failed: {e}"))?;
+        Ok(hits)
+    }
+
+    pub(crate) async fn format_search_hits(
+        &self,
+        hits: &[crate::db::RetrievedChunk],
+    ) -> Result<String, String> {
         if hits.is_empty() {
             Ok("No matching messages found.".to_string())
         } else {
-            format_global_search_hits(self, &hits)
+            format_global_search_hits(self, hits)
                 .await
-                .map_err(|error| format!("search citation failed: {error}"))
+                .map_err(|e| format!("search citation failed: {e}"))
         }
+    }
+
+    pub(crate) async fn search_request(&self, query: &str) -> Result<RetrievalRequest, String> {
+        let coordinator_chain = self.coordinator_chain_ids().await?;
+        Ok(RetrievalRequest::natural_language(
+            query,
+            RetrievalScope::GlobalExcluding(coordinator_chain),
+            SEARCH_TOP_K,
+        ))
     }
 
     async fn coordinator_chain_ids(&self) -> Result<Vec<String>, String> {
@@ -525,7 +544,7 @@ async fn ordinary_product_citation(
         }))
 }
 
-async fn format_global_search_hits(
+pub(crate) async fn format_global_search_hits(
     service: &GlobalReadService,
     hits: &[crate::db::RetrievedChunk],
 ) -> Result<String, DbError> {
