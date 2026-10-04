@@ -7738,9 +7738,11 @@ where
                 .map(|block| estimate_text_tokens(&block.text))
                 .sum::<usize>()
                 + estimate_messages_tokens(&messages);
-            if estimated_prompt_tokens > self.context.context_window {
+            let estimated_request_tokens =
+                estimated_prompt_tokens.saturating_add(request_output_tokens);
+            if estimated_request_tokens > self.context.context_window {
                 return Err(format!(
-                    "Project Coordinator profile prompt exceeds context window after projecting provider messages: estimated {estimated_prompt_tokens} tokens > {} token window",
+                    "Project Coordinator profile prompt exceeds context window after projecting provider messages: estimated {estimated_request_tokens} prompt and output tokens > {} token window",
                     self.context.context_window
                 ));
             }

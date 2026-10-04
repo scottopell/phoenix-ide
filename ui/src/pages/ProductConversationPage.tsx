@@ -870,7 +870,7 @@ function ProductConversationHeader({
             onSaved={onCoordinatorProfileSaved}
           />
         )}
-        <AutomaticContinuationControl scope={{ kind: 'ordinary', reference: productConversationId }} />
+        <AutomaticContinuationControl scope={{ kind: 'ordinary', reference: snapshot.product_conversation_id }} />
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
             <summary>Work</summary>
@@ -1046,6 +1046,12 @@ function ProductConversationPageInner() {
     ];
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   }, [productConversationId, snapshot]);
+
+  useEffect(() => {
+    const refresh = () => setSnapshotRetry((retry) => retry + 1);
+    window.addEventListener('phoenix:automatic-continuation-updated', refresh);
+    return () => window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
+  }, []);
 
   useEffect(() => {
     if (!currentLatestProjection?.conversationId || !snapshot) return;
