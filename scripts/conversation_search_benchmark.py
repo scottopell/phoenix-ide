@@ -118,6 +118,7 @@ def _measurement_digest() -> str:
 
 
 def _build_configuration() -> dict:
+    if any(key in os.environ for key in ("CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")): raise SystemExit("alternate Cargo compiler selectors unsupported")
     if "LIBSQLITE3_SYS_USE_PKG_CONFIG" in os.environ and os.environ["LIBSQLITE3_SYS_USE_PKG_CONFIG"] != "0": raise SystemExit("external SQLite linkage unsupported for this benchmark; use pinned bundled build")
     """Capture compiler, Cargo, target, profile, and feature inputs to the run."""
     repo = Path(__file__).parents[1]
@@ -693,8 +694,8 @@ def prepare(args) -> int:
     ]
     conn.close()
     scenarios_path = outdir/'scenarios.json'
-    if scenarios_path.exists() and not getattr(args, "force", False):
-        raise SystemExit(f'frozen scenarios exist (use --force only to replace): {scenarios_path}')
+    if scenarios_path.exists():
+        raise SystemExit(f'frozen scenarios exist; use a new dedicated fixture directory: {scenarios_path}')
     scenario_manifest = {
         'version': 1,
         'fixture_sha256': capture['sha256'],
@@ -762,6 +763,7 @@ def _run_reserved(args) -> int:
         _remove_private(output)
     fixture_before = _fixture_fingerprint(db)
     run_uuid = uuid.uuid4().hex
+    scenario_hash = _hash(scen)
     measurement_digest = _measurement_digest()
     launched_commit = _git_commit()
     started_at_unix = time.time()
@@ -859,6 +861,7 @@ def _run_reserved(args) -> int:
         measurement_digest=measurement_digest,
     )
     _ensure_clean_source()
+    if _hash(outdir / "scenarios.json") != scenario_hash: raise SystemExit("scenario changed during run")
     if _git_commit() != launched_commit or _measurement_digest() != measurement_digest:
         _private(failure_output.parent)
         os.replace(output_tmp, failure_output)
@@ -985,6 +988,9 @@ def _validate_run(run: dict, name: str) -> dict:
     ):
         raise SystemExit(f"refusing comparison: {name} has invalid build configuration")
     if any(not isinstance(build[field],str) or not build[field].strip() for field in ("rustc_version_verbose", "cargo_version", "target", "profile")): raise SystemExit("missing compiler identity")
+    native=build["native_compiler"]
+    if not isinstance(native,dict) or set(native)!={"path","version","sha256"} or any(not isinstance(native[k],str) or not native[k] for k in native) or not re.fullmatch("[0-9a-f]{64}",native["sha256"]) or not isinstance(build["features"],list) or not isinstance(build["environment"],dict): raise SystemExit("invalid compiler build record")
+    if set(build) != {"native_compiler","cargo_config_hashes","release_profile","rustc_version_verbose","cargo_version","target","profile","features","environment"} or not all(isinstance(v,str) for v in build["features"]) or not isinstance(build["release_profile"],dict) or not isinstance(build["cargo_config_hashes"],dict) or not all(isinstance(k,str) and isinstance(v,str) and re.fullmatch("[0-9a-f]{64}",v) for k,v in build["cargo_config_hashes"].items()) or not all(isinstance(k,str) and isinstance(v,str) for k,v in build["environment"].items()): raise SystemExit("invalid compiler build record")
     if not isinstance(run["samples"], list) or not run["samples"]:
         raise SystemExit(f"refusing comparison: {name} has no samples")
     expected_set = run["expected_case_surface_set"]
@@ -1083,7 +1089,6 @@ def main():
     s.set_defaults(func=snapshot)
     for name in ('prepare','run','report'):
       x=sub.add_parser(name); x.add_argument('--artifacts',default=str(DEFAULT_ARTIFACTS)); x.set_defaults(func=globals()[name])
-    sub.choices['prepare'].add_argument('--force',action='store_true')
     sub.choices['run'].add_argument('--label',default='suite-1')
     sub.choices['run'].add_argument('--timeout',type=float,default=1800.0)
     sub.choices['run'].add_argument('--force',action='store_true')
