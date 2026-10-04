@@ -648,6 +648,79 @@ async fn deliver_pending(
                 current.receipt.terminal,
                 phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
             );
+            if manager
+                .try_get_handle(&current.conversation_id)
+                .await
+                .is_none()
+            {
+                let broadcaster = manager
+                    .conversation_broadcaster(&current.conversation_id)
+                    .await;
+                let (sequence_guard, sequence_ids) = broadcaster
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1)
+                    .map_err(|error| error.to_string())?;
+                let sequence_id = sequence_ids[0];
+                let materialized = repo
+                    .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
+                        workflow_id: current.workflow_id,
+                        delivery_id: current.canonical_delivery.delivery_id,
+                        conversation_id: current.conversation_id.clone(),
+                        rendered_content: rendered.clone(),
+                        display_data: display_data.clone(),
+                        auto_resume,
+                        created_at: now,
+                        sequence_id: Some(sequence_id),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let adopted = match materialized {
+                    MaterializePendingDeliveryMessageOutcome::Materialized(link) => {
+                        let _ = broadcaster
+                            .admitted_publication(&mut owner)
+                            .persisted_message(link.linked_message.message);
+                        matches!(
+                            repo.adopt_materialized_pending_for_conversation(
+                                &current.conversation_id,
+                                now,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?,
+                            WakeAdoptMaterializedPendingOutcome::Adopted(_)
+                        )
+                    }
+                    MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => matches!(
+                        repo.adopt_materialized_pending_for_conversation(
+                            &current.conversation_id,
+                            now,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?,
+                        WakeAdoptMaterializedPendingOutcome::Adopted(_)
+                    ),
+                    MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
+                        repo.suppress_pending_for_archived_conversation(&current, now)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        false
+                    }
+                };
+                drop(sequence_guard);
+                if adopted {
+                    manager.get_or_create(&current.conversation_id).await?;
+                }
+                if manager
+                    .db()
+                    .wake_delivery_requires_close_settlement_recheck(close_settlement_workflow_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    manager.resume_pending_close_settlements().await?;
+                }
+                cursor = Some(next_cursor);
+                continue;
+            }
             let handle = match manager.try_get_handle(&current.conversation_id).await {
                 Some(handle) => {
                     if !matches!(
@@ -1859,6 +1932,79 @@ mod tests {
             &wake.content,
             crate::db::MessageContent::User(user) if user.is_meta && user.text.contains("done")
         ));
+    }
+
+    #[tokio::test]
+    async fn no_runtime_wake_reserves_retained_broadcaster_sequence() {
+        let (db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-retained", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: scope,
+                    handle_id: "b-retained".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        )
+        .run_once()
+        .await
+        .unwrap();
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let retained = manager.conversation_broadcaster("conv").await;
+        for _ in 0..3 {
+            retained.next_seq();
+        }
+        let expected_wake_sequence = retained.current_seq() + 1;
+        let mut events = retained.subscribe();
+
+        deliver_pending(&manager, &repo, Timestamp(20))
+            .await
+            .unwrap();
+
+        let crate::runtime::SseEvent::Message { message: published } = events
+            .try_recv()
+            .expect("wake published on retained broadcaster")
+        else {
+            panic!("expected retained wake message publication")
+        };
+        assert_eq!(published.sequence_id, expected_wake_sequence);
+        let wake = db
+            .get_messages("conv")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.message_id == published.message_id)
+            .expect("published wake message persisted");
+        assert_eq!(wake.sequence_id, expected_wake_sequence);
+        let handle = manager
+            .try_get_handle("conv")
+            .await
+            .expect("adopted wake creates runtime");
+        assert!(handle.broadcast_tx.same_channel(&retained));
+        assert!(handle.broadcast_tx.current_seq() > wake.sequence_id);
     }
 
     #[tokio::test]
