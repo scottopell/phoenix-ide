@@ -34,7 +34,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
             "environment":{"host":"host","platform":"test","processor":"test","cpu_count":"2"}, "sqlite_pragmas":{"sqlite_version":"test","journal_mode":"wal","synchronous":2,"busy_timeout_ms":300000,"foreign_keys":True,"query_only":False},
             "runtime": {"worker_threads":2,"measurement_clock":"monotonic"}, "explain_enabled": False,
-            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}},
+            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}, "native_compiler":{"path":"cc","sha256":"hash","version":"version"}},
             "expected_case_surface_set": [["case", "tool"]],
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20,"scope":"Global","visibility":"All","grouping":"None","match_mode":"FinalTokenPrefix","lexical_expression":"x"}}],
             "measurement_digest":"harness", "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":float(__import__("time").time_ns()), "completed_at_unix":float(__import__("time").time_ns()),
@@ -431,7 +431,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 return CompletedProcess()
 
             with mock.patch.object(bench, "_ensure_ignored_artifacts"), mock.patch.object(bench, "_ensure_clean_source"), mock.patch.object(
-                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}}
+                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}, "native_compiler":{"path":"cc","sha256":"hash","version":"version"}}
             ), mock.patch.object(bench, "_git_commit", return_value="commit"), mock.patch.object(bench.platform, "platform", return_value="platform"), mock.patch.object(
                 bench.platform, "processor", return_value="processor"
             ), mock.patch.object(bench.subprocess, "Popen", side_effect=fake_popen):
@@ -568,12 +568,10 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 bench._counts = original
 
     def test_build_configuration_records_compiler_and_forwarded_environment(self):
-        with mock.patch.object(bench.subprocess, "check_output", side_effect=["rustc\nhost: x86_64-test\n", "cargo 1"]):
+        with mock.patch.object(bench.subprocess, "check_output", side_effect=["rustc\nhost: x86_64-test\n", "cargo 1", "native compiler"]):
             with mock.patch.dict("os.environ", {"RUSTFLAGS": "-C opt-level=3", "CARGO_BUILD_TARGET": "wasm32"}, clear=True):
-                config = bench._build_configuration()
-        self.assertEqual(config["target"], "wasm32")
-        self.assertEqual(config["environment"]["RUSTFLAGS"], "-C opt-level=3")
-        self.assertEqual(config["rustc_version_verbose"], "rustc\nhost: x86_64-test")
+                with self.assertRaisesRegex(SystemExit,"cross native compiler"):
+                    bench._build_configuration()
 
     def test_selective_term_requires_bounded_nonzero_match(self):
         conn = sqlite3.connect(":memory:")

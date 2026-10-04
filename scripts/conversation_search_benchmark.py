@@ -137,11 +137,18 @@ def _build_configuration() -> dict:
     }
     host = next((line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:")), None)
     cargo_home = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
+    selector = forwarded.get("CC", "cc")
+    if any(key.startswith("CC_") or key=="HOST_CC" for key in forwarded) or any(ch.isspace() for ch in selector) or (forwarded.get("CARGO_BUILD_TARGET") and forwarded["CARGO_BUILD_TARGET"] != host):
+        raise SystemExit("custom/cross native compiler selection unsupported; use plain host CC executable")
+    compiler = shutil.which(selector)
+    if not compiler: raise SystemExit("native compiler unavailable")
+    native_compiler = {"path":str(Path(compiler).resolve()), "sha256":_hash(Path(compiler)), "version":subprocess.check_output([compiler,"--version"], text=True).strip()}
     config_paths = [cargo_home / "config", cargo_home / "config.toml"]
     project = Path(__file__).parents[1].resolve()
     config_paths += [parent / ".cargo" / name for parent in [project, *project.parents] for name in ("config", "config.toml")]
     config_hashes = {("project/" + str(path.relative_to(project)) if path.is_relative_to(project) else str(path)): _hash(path) for path in config_paths if path.is_file()}
     return {
+        "native_compiler": native_compiler,
         "cargo_config_hashes": config_hashes,
         "release_profile": __import__("tomllib").loads((project / "Cargo.toml").read_text() if (project / "Cargo.toml").exists() else "").get("profile", {}).get("release", {}),
         "rustc_version_verbose": rustc,
@@ -972,7 +979,7 @@ def _validate_run(run: dict, name: str) -> dict:
     build = run["build_configuration"]
     if not isinstance(build, dict) or any(
         key not in build or not isinstance(build[key], (str, list, dict))
-        for key in ("rustc_version_verbose", "cargo_version", "target", "profile", "features", "environment", "cargo_config_hashes", "release_profile")
+        for key in ("rustc_version_verbose", "cargo_version", "target", "profile", "features", "environment", "cargo_config_hashes", "release_profile", "native_compiler")
     ):
         raise SystemExit(f"refusing comparison: {name} has invalid build configuration")
     if any(not isinstance(build[field],str) or not build[field].strip() for field in ("rustc_version_verbose", "cargo_version", "target", "profile")): raise SystemExit("missing compiler identity")
