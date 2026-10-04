@@ -115,3 +115,9 @@ the installed runtime/configuration still match the captured predecessor and the
 exclusively owned database remains legacy. It then creates a verified offline
 snapshot before restoring/restarting. A missing proof with changed runtime or
 modern database fails closed; it is not permission to discard the ownership fence.
+Unresolved paired rollback quarantines the runtime's LaunchAgent plist outside
+`~/Library/LaunchAgents`, with durable directory synchronization, so login does
+not auto-start an unverified job. Verified paired recovery reinstalls the matching
+predecessor plist after database restoration. Quarantine or teardown failure is
+reported explicitly; an active claim alone is not proof the operating system
+cannot run a job.

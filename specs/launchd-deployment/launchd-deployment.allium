@@ -53,6 +53,23 @@ entity DeployTransaction {
     updated_at: Timestamp
     failure: String?
     rollback_failure: String?
+
+    transitions state {
+        preparing -> prepared
+        preparing -> precondition_failed
+        preparing -> rejected_concurrent
+        prepared -> activating
+        prepared -> precondition_failed
+        prepared -> activation_failed_rolled_back
+        prepared -> activation_failed_rollback_failed
+        activating -> committed
+        activating -> activation_failed_rolled_back
+        activating -> activation_failed_rollback_failed
+        activation_failed_rollback_failed -> activation_failed_rolled_back
+        activation_failed_rollback_failed -> activation_failed_rollback_failed
+        terminal: committed, precondition_failed, activation_failed_rolled_back,
+                  rejected_concurrent
+    }
 }
 
 entity RestartTransaction {

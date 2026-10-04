@@ -427,6 +427,7 @@ def _allocate_private_sqlite(path: Path, size: int) -> None:
             os.fsync(stream.fileno())
         if path.stat().st_blocks * 512 < size:
             raise OSError("filesystem did not allocate reserved capacity")
+        fsync_dir(path.parent)
     except (OSError, sqlite3.Error) as exc:
         path.unlink(missing_ok=True)
         raise ActivationError("could not reserve paired database capacity") from exc
@@ -940,6 +941,11 @@ def activate(manifest: Manifest) -> str:
                             raise ActivationError("failed paired recovery teardown is unconfirmed")
                     except Exception as teardown_exc:
                         rollback_failure += f"; recovery teardown failed: {teardown_exc}"
+                if manifest.paired_database_upgrade is not None:
+                    try:
+                        quarantine_paired_plist(manifest)
+                    except Exception as quarantine:
+                        rollback_failure += f"; durable plist quarantine failed: {quarantine}"
                 write_status(manifest, "activation_failed_rollback_failed", failure=failure, rollback_failure=rollback_failure)
                 return "activation_failed_rollback_failed"
         finally:
@@ -947,7 +953,30 @@ def activate(manifest: Manifest) -> str:
                 prepared.unlink(missing_ok=True)
 
 
-def record_recovery_error(manifest: Manifest, error: str) -> None:
+def quarantine_paired_plist(manifest: Manifest) -> None:
+    if manifest.paired_database_upgrade is None:
+        return
+    target = Path(manifest.target_plist)
+    if target.is_symlink():
+        raise ActivationError("unresolved target plist must not be a symlink")
+    if not target.exists():
+        return
+    transaction = Path(manifest.paired_database_upgrade.proof_path).parent
+    fd, name = tempfile.mkstemp(prefix="unresolved-launchagent-", suffix=".plist.quarantined", dir=transaction)
+    os.close(fd)
+    destination = Path(name)
+    os.replace(target, destination)
+    destination.chmod(0o600)
+    fsync_dir(transaction)
+    fsync_dir(target.parent)
+
+
+def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = False) -> None:
+    if quarantine:
+        try:
+            quarantine_paired_plist(manifest)
+        except Exception as failure:
+            error += f"; durable plist quarantine failed: {failure}"
     try:
         prior = json.loads(Path(manifest.status_path).read_text())
     except (OSError, json.JSONDecodeError):
@@ -980,7 +1009,13 @@ def recover_paired(manifest: Manifest) -> str:
         try:
             paired = manifest.paired_database_upgrade
             if not Path(paired.proof_path).exists():
-                if sha256(Path(manifest.target_binary)) != manifest.rollback_binary_sha256 or sha256(Path(manifest.target_plist)) != manifest.rollback_plist_sha256:
+                plist = Path(manifest.target_plist)
+                if not plist.exists():
+                    matches = [p for p in Path(paired.proof_path).parent.glob("unresolved-launchagent-*.plist.quarantined") if not p.is_symlink() and sha256(p) == manifest.rollback_plist_sha256]
+                    if not matches:
+                        raise ActivationError("captured predecessor configuration is unverified")
+                    plist = matches[-1]
+                if sha256(Path(manifest.target_binary)) != manifest.rollback_binary_sha256 or sha256(plist) != manifest.rollback_plist_sha256:
                     raise ActivationError("interrupted transaction has no snapshot proof and runtime changes are unresolved")
                 launchctl.stop()
                 state, pid = launchctl.inspect()
@@ -1010,7 +1045,7 @@ def recover_paired(manifest: Manifest) -> str:
                     raise ActivationError("paired recovery teardown is unconfirmed")
             except Exception as teardown:
                 failure += f"; recovery teardown failed: {teardown}"
-            record_recovery_error(manifest, failure)
+            record_recovery_error(manifest, failure, quarantine=True)
             return "activation_failed_rollback_failed"
 
 

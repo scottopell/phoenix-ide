@@ -71,13 +71,18 @@ entity DeployTransaction {
         preparing -> rejected_concurrent
         prepared -> handed_off
         prepared -> precondition_failed
+        prepared -> activation_failed_rolled_back
+        prepared -> activation_failed_rollback_failed
         handed_off -> activating
+        handed_off -> activation_failed_rolled_back
+        handed_off -> activation_failed_rollback_failed
         activating -> committed
         activating -> activation_failed_rolled_back
         activating -> activation_failed_rollback_failed
+        activation_failed_rollback_failed -> activation_failed_rolled_back
+        activation_failed_rollback_failed -> activation_failed_rollback_failed
         terminal: committed, precondition_failed,
-                  activation_failed_rolled_back,
-                  activation_failed_rollback_failed, rejected_concurrent
+                  activation_failed_rolled_back, rejected_concurrent
     }
 }
 

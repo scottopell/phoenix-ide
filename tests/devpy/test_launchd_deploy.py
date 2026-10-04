@@ -312,6 +312,10 @@ class ActivationTests(unittest.TestCase):
                 self.assertEqual(events, ["stop", "start", "stop", "start", "stop"])
                 self.assertFalse(launchctl.loaded)
                 self.assertFalse(helper.status_is_durable_terminal(manifest))
+                self.assertFalse(Path(manifest.target_plist).exists())
+                quarantined = list(Path(manifest.paired_database_upgrade.proof_path).parent.glob("*.plist.quarantined"))
+                self.assertTrue(quarantined)
+                self.assertTrue(all(p.stat().st_mode & 0o777 == 0o600 for p in quarantined))
                 status = json.loads(Path(manifest.status_path).read_text())
                 self.assertNotIn("recovery teardown failed", status["rollback_failure"])
 
@@ -328,6 +332,8 @@ class ActivationTests(unittest.TestCase):
                 helper.release_claim(manifest)
             self.assertFalse(Path(manifest.active_path).exists())
             import sqlite3
+            self.assertTrue(Path(manifest.target_plist).exists())
+            self.assertEqual(helper.sha256(Path(manifest.target_plist)), manifest.rollback_plist_sha256)
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute("SELECT MAX(version) FROM _migrations").fetchone()[0], 69)
 
@@ -385,6 +391,14 @@ class ActivationTests(unittest.TestCase):
             manifest, *_ = self._full_paired_fixture(Path(td))
             with mock.patch.object(helper.os, "open", side_effect=OSError(28, "No space left on device")), self.assertRaisesRegex(helper.ActivationError, "reserve paired database capacity"):
                 helper.reserve_database_capacity(manifest)
+
+    def test_each_reservation_creation_fsyncs_its_parent(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest, *_ = self._full_paired_fixture(Path(td))
+            with mock.patch.object(helper, "fsync_dir") as sync:
+                reserved = helper.reserve_database_capacity(manifest)
+            sync.assert_any_call(reserved.backup_path.parent)
+            sync.assert_any_call(reserved.restore_path.parent)
 
     def test_capacity_reservation_includes_wal_and_is_consumed_by_sqlite_backup(self):
         import sqlite3
