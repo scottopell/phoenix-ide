@@ -141,7 +141,7 @@ def _measurement_digest() -> str:
 
 
 def _build_configuration() -> dict:
-    if os.environ.get("LIBSQLITE3_SYS_USE_PKG_CONFIG"): raise SystemExit("external SQLite linkage unsupported for this benchmark; use pinned bundled build")
+    if "LIBSQLITE3_SYS_USE_PKG_CONFIG" in os.environ and os.environ["LIBSQLITE3_SYS_USE_PKG_CONFIG"] != "0": raise SystemExit("external SQLite linkage unsupported for this benchmark; use pinned bundled build")
     """Capture compiler, Cargo, target, profile, and feature inputs to the run."""
     repo = Path(__file__).parents[1]
     try:

@@ -192,7 +192,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
     def test_complete_execution_shapes_and_unsupported_linkage(self):
         for key,value in [("environment",{"garbage":"x"}),("runtime",{"worker_threads":2}),("sqlite_pragmas",{"read_only":True})]:
             with self.assertRaisesRegex(SystemExit,"metadata"):bench._validate_run(self._complete_run(**{key:value}),"bad")
-        with mock.patch.dict("os.environ",{"LIBSQLITE3_SYS_USE_PKG_CONFIG":"1"}):
+        with mock.patch.dict("os.environ",{"LIBSQLITE3_SYS_USE_PKG_CONFIG":""}):
             with self.assertRaisesRegex(SystemExit,"external SQLite linkage unsupported"):bench._build_configuration()
         run=self._complete_run();run["environment"]["cpu_count"]="0"
         with self.assertRaisesRegex(SystemExit,"environment values"):bench._validate_run(run,"bad")
