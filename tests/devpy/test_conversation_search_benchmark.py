@@ -68,10 +68,10 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / "capture-manifest.json").write_text(json.dumps({"kind":"conversation-search-fixture"}))
-            args = type("Args", (), {"artifacts":str(root), "label":"same"})()
+            args = type("Args", (), {"artifacts":str(root), "label":"same","timeout":10})()
             def nested(_):
                 with self.assertRaisesRegex(SystemExit, "reserved"):
-                    bench.run(type("Args", (), {"artifacts":str(root), "label":"different"})())
+                    bench.run(type("Args", (), {"artifacts":str(root), "label":"different","timeout":10})())
                 return 0
             with mock.patch.object(bench, "_run_reserved", side_effect=nested):
                 self.assertEqual(bench.run(args), 0)
@@ -242,6 +242,16 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit,"measurement regime"):
                 bench.compare(type("Args",(),{"before":str(root/"before.json"),"after":str(root/"after.json")})())
 
+    def test_entry_timeouts_and_build_kind_compilers_fail_before_launch(self):
+        for timeout in [float("nan"),float("inf"),float("-inf"),0,-1,True]:
+            with mock.patch.object(bench.subprocess,"Popen") as launch:
+                with self.assertRaisesRegex(SystemExit,"finite positive"):
+                    bench.run(type("Args",(),{"timeout":timeout})())
+                launch.assert_not_called()
+        for key in ["TARGET_CC","HOST_CC","CC_aarch64_apple_darwin","CC_KNOWN_WRAPPER_CUSTOM","CROSS_COMPILE"]:
+            with mock.patch.dict("os.environ",{key:"gcc"}),mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
+                with self.assertRaisesRegex(SystemExit,"native compiler selection unsupported"):bench._build_configuration()
+
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "scenarios.json"
@@ -265,7 +275,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / "capture-manifest.json").write_text(json.dumps({"kind":"conversation-search-fixture"}))
-            args = type("Args", (), {"artifacts":str(root),"label":"signal"})()
+            args = type("Args", (), {"artifacts":str(root),"label":"signal","timeout":10})()
             previous = bench.signal.getsignal(bench.signal.SIGTERM)
             def interrupted(_):
                 bench.signal.getsignal(bench.signal.SIGTERM)(bench.signal.SIGTERM, None)
