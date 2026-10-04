@@ -110,6 +110,10 @@ WHEN Kache is absent, disabled, reports another version, or cannot start its dae
 THE SYSTEM SHALL fall through to an sccache executable that passes its version probe and then to no compiler cache
 AND SHALL report the fallback reason and the backend actually selected
 
+WHEN a production build uses automatic compiler-cache selection
+THE SYSTEM SHALL exclude a backend whose restored-archive debug-symbol fidelity is not qualified on that build platform
+AND SHALL preserve explicit operator selection as an opt-in rather than silently substituting it
+
 WHEN an operator explicitly selects Kache or sccache
 THE SYSTEM SHALL fail actionably if that backend is unusable
 AND SHALL NOT silently substitute another backend

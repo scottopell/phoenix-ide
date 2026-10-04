@@ -21,6 +21,8 @@ Phoenix supports the qualified released Kache `0.26.0` command contract. Downloa
 
 `KACHE_DISABLED=1` makes Kache unavailable under the same rules. An sccache candidate must execute its version probe successfully before selection.
 
+Production builds are deliberately narrower: `auto` excludes Kache v0.26.0 and falls through to sccache/no cache because restored macOS dependency archives emitted unresolved-object `dsymutil` warnings. Matching binary/`.dSYM` UUIDs and successful compilation did not prove source-level debug fidelity. Explicit `PHOENIX_COMPILER_CACHE=kache` remains an informed opt-in; it does not change that unqualified status.
+
 Phoenix-generated cache variables are scoped to direct Cargo subprocesses and the E2E harness that owns a Cargo build, so starting Phoenix does not force agent-executed Cargo commands in other repositories through Phoenix's selected cache. Relative backend cache/socket/config paths are normalized against the invoking directory before daemon startup. The Kache daemon starts from the same Cargo working directory as its wrapper, so implicit project-local configuration cannot diverge across production-build worktrees.
 
 Kache-specific settings (`KACHE_CACHE_DIR`, `KACHE_SOCKET_PATH`) and sccache-specific settings (`SCCACHE_DIR`, `SCCACHE_CACHE_SIZE`) remain separate. Phoenix does not install tools, purge caches, configure remotes, or replace either tool's garbage-collection policy.
@@ -61,7 +63,7 @@ macOS exposes no unprivileged per-extent unique-allocation total for an arbitrar
 
 ## Validation boundary
 
-Validated locally: macOS arm64 release binary, version probe, daemon startup over a short explicit socket, Rust compilation, APFS reflink restore, normal development/check selection, and a successful native `./dev.py prod build` without activation. The production binary and its `.dSYM` had matching UUIDs. Kache's store-time `dsymutil` nevertheless emitted missing-intermediate-object warnings for dependency archives; source-level debug fidelity was not validated, so explicit `sccache` or `none` remains the conservative escape for debugging that output. This is reported rather than hidden because cache acceleration must not be confused with debug-symbol correctness.
+Validated locally: macOS arm64 release binary, version probe, daemon startup over a short explicit socket, Rust compilation, APFS reflink restore, normal development/check selection, and a successful native `./dev.py prod build` without activation. The production binary and its `.dSYM` had matching UUIDs, but Kache emitted missing-intermediate-object `dsymutil` warnings for restored dependency archives. Source-level debug fidelity was not validated, so production `auto` excludes Kache and explicit Kache remains an informed opt-in. This is reported rather than hidden because cache acceleration must not be confused with debug-symbol correctness.
 
 Deterministic tests cover Linux command/environment shaping, and hosted Linux CI exercises the ordinary check suite without requiring either optional executable. Not validated by this comparison: Windows behavior; Linux Kache executable restore/signing/debug-symbol behavior with the released binary; source-level fidelity of restored macOS debug symbols; cross-device filesystems without reflinks; remote/S3 caches; or production activation. Phoenix makes no compatibility or performance guarantee for those paths.
 

@@ -19,7 +19,7 @@ class CompilerCacheTests(unittest.TestCase):
     def setUp(self):
         self.dev = load_devpy()
 
-    def configure(self, requested=None, *, env=None, installed=()):
+    def configure(self, requested=None, *, env=None, installed=(), **options):
         env = {} if env is None else env
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
             self.dev.shutil,
@@ -36,7 +36,7 @@ class CompilerCacheTests(unittest.TestCase):
             if "sccache" in installed
             else (None, "not installed or not on PATH"),
         ), mock.patch.object(self.dev, "_ensure_kache_daemon", return_value=None):
-            selected = self.dev._configure_compiler_cache(requested)
+            selected = self.dev._configure_compiler_cache(requested, **options)
             return selected, os.environ.copy()
 
     def test_all_cargo_lanes_enable_compiler_cache_setup(self):
@@ -59,6 +59,29 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("kache", selected)
         self.assertEqual(str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"])
         self.assertNotIn("SCCACHE_CACHE_SIZE", env)
+
+    def test_production_auto_skips_unqualified_kache(self):
+        with mock.patch("builtins.print") as output:
+            selected, env = self.configure(
+                installed={"kache", "sccache"}, allow_automatic_kache=False
+            )
+        self.assertEqual("sccache", selected)
+        self.assertEqual(
+            str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"]
+        )
+        output.assert_any_call(
+            "  ⚠ kache unavailable; using sccache: "
+            "not qualified for automatic production debug-symbol builds"
+        )
+
+    def test_production_explicit_kache_remains_opt_in(self):
+        selected, env = self.configure(
+            "kache", installed={"kache", "sccache"}, allow_automatic_kache=False
+        )
+        self.assertEqual("kache", selected)
+        self.assertEqual(
+            str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
+        )
 
     def test_auto_reports_none_when_no_backend_is_installed(self):
         with mock.patch("builtins.print") as output:
@@ -159,17 +182,52 @@ class CompilerCacheTests(unittest.TestCase):
         cargo_cwd = self.dev.Path("/detached/build")
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             self.dev.subprocess, "run", return_value=completed
-        ) as run:
+        ) as run, mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", return_value=None
+        ) as wait:
             self.assertIsNone(
                 self.dev._ensure_kache_daemon("/bin/kache", cargo_cwd=cargo_cwd)
             )
         self.assertEqual(cargo_cwd, run.call_args.kwargs["cwd"])
+        wait.assert_called_once_with("/bin/kache", cargo_cwd=cargo_cwd)
+
+    def test_kache_readiness_polls_until_running(self):
+        starting = mock.Mock(
+            returncode=0,
+            stdout='{"daemon_running":false,"socket":null}',
+            stderr="",
+        )
+        running = mock.Mock(
+            returncode=0,
+            stdout='{"daemon_running":true,"socket":"/tmp/kache.sock"}',
+            stderr="",
+        )
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.subprocess, "run", side_effect=(starting, running)
+        ), mock.patch.object(self.dev.time, "sleep"):
+            self.assertIsNone(self.dev._wait_for_kache_daemon("/bin/kache", timeout=1))
+
+    def test_kache_readiness_rejects_wrong_socket(self):
+        running = mock.Mock(
+            returncode=0,
+            stdout='{"daemon_running":true,"socket":"/tmp/other.sock"}',
+            stderr="",
+        )
+        with mock.patch.dict(
+            os.environ, {"KACHE_SOCKET_PATH": "/tmp/expected.sock"}, clear=True
+        ), mock.patch.object(self.dev.subprocess, "run", return_value=running):
+            error = self.dev._wait_for_kache_daemon("/bin/kache", timeout=1)
+        self.assertIn("unexpected socket", error or "")
 
     def test_daemon_socket_uses_private_owned_directory(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with self.subTest("socket path and permissions"), mock.patch.dict(
             os.environ, {"KACHE_CACHE_DIR": "/very/long/worktree/cache"}, clear=True
-        ), mock.patch.object(self.dev.subprocess, "run", return_value=completed) as run:
+        ), mock.patch.object(
+            self.dev.subprocess, "run", return_value=completed
+        ) as run, mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", return_value=None
+        ):
             with self.dev.tempfile.TemporaryDirectory() as temporary:
                 with mock.patch.object(self.dev.tempfile, "gettempdir", return_value=temporary):
                     self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
@@ -335,7 +393,7 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIsNotNone(calls[1][1])
 
     def test_subprocess_environment_reports_actual_backend_without_leaking(self):
-        def configure(_requested, *, cargo_cwd=None):
+        def configure(_requested, **_options):
             os.environ["RUSTC_WRAPPER"] = "/bin/sccache"
             return "sccache"
 

@@ -4897,6 +4897,43 @@ def _private_kache_socket_dir() -> Path:
     return directory
 
 
+def _wait_for_kache_daemon(
+    binary: str, *, cargo_cwd: Path | None = None, timeout: float = 2.0
+) -> str | None:
+    deadline = time.monotonic() + timeout
+    last_error = "daemon did not report readiness"
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [binary, "--json", "daemon"],
+                cwd=cargo_cwd,
+                capture_output=True,
+                text=True,
+                env=os.environ,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode == 0:
+                status = json.loads(result.stdout)
+                if status.get("daemon_running") is True:
+                    expected = os.environ.get("KACHE_SOCKET_PATH")
+                    actual = status.get("socket")
+                    if expected and actual and Path(actual).resolve() != Path(expected).resolve():
+                        return f"daemon reported unexpected socket {actual}; expected {expected}"
+                    if expected and not actual:
+                        last_error = "daemon readiness omitted configured socket"
+                    else:
+                        return None
+                else:
+                    last_error = "daemon did not report running"
+            else:
+                last_error = (result.stderr or result.stdout).strip() or f"status exit {result.returncode}"
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            last_error = str(error)
+        time.sleep(0.05)
+    return last_error
+
+
 def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str | None:
     cache_dir = os.environ.get("KACHE_CACHE_DIR")
     if os.name != "nt" and cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
@@ -4921,7 +4958,7 @@ def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str |
         return str(error)
     if result.returncode != 0:
         return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
-    return None
+    return _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
 
 
 def _absolute_executable(binary: str | None) -> str | None:
@@ -4960,7 +4997,10 @@ def _usable_sccache(binary: str | None) -> tuple[str | None, str | None]:
 
 
 def _configure_compiler_cache(
-    requested: str | None = None, *, cargo_cwd: Path | None = None
+    requested: str | None = None,
+    *,
+    cargo_cwd: Path | None = None,
+    allow_automatic_kache: bool = True,
 ) -> str:
     """Configure the compiler cache without overriding an explicit wrapper."""
     if "RUSTC_WRAPPER" in os.environ:
@@ -4979,11 +5019,15 @@ def _configure_compiler_cache(
         return "none"
 
     automatic = backend == "auto"
-    wants_kache = automatic or backend == "kache"
+    wants_kache = backend == "kache" or (automatic and allow_automatic_kache)
     kache_binary = _absolute_executable(_kache_binary()) if wants_kache else None
     sccache_binary = _absolute_executable(shutil.which("sccache"))
     kache_version = None
-    kache_error = None
+    kache_error = (
+        None
+        if wants_kache
+        else "not qualified for automatic production debug-symbol builds"
+    )
     if wants_kache and _environment_flag("KACHE_DISABLED"):
         kache_error = "KACHE_DISABLED is set"
     elif wants_kache and not kache_binary:
@@ -5065,11 +5109,18 @@ def _configure_compiler_cache(
 
 
 def _compiler_cache_subprocess_env(
-    requested: str | None = None, *, cargo_cwd: Path | None = None
+    requested: str | None = None,
+    *,
+    cargo_cwd: Path | None = None,
+    allow_automatic_kache: bool = True,
 ) -> tuple[str, dict[str, str]]:
     original = os.environ.copy()
     try:
-        selected = _configure_compiler_cache(requested, cargo_cwd=cargo_cwd)
+        selected = _configure_compiler_cache(
+            requested,
+            cargo_cwd=cargo_cwd,
+            allow_automatic_kache=allow_automatic_kache,
+        )
         return selected, os.environ.copy()
     finally:
         os.environ.clear()
@@ -7707,7 +7758,10 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
         raise SystemExit(f"production build worktree is dirty before Rust compilation:\n{build_tree_status}")
     
     # Build Rust
-    _, build_env = _compiler_cache_subprocess_env(cargo_cwd=PROD_BUILD_WORKTREE)
+    _, build_env = _compiler_cache_subprocess_env(
+        cargo_cwd=PROD_BUILD_WORKTREE,
+        allow_automatic_kache=False,
+    )
     needs_cross = target and sys.platform != "linux"
     if needs_cross:
         raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")

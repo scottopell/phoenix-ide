@@ -18,9 +18,11 @@ A controlled devmbp comparison shows a genuine tradeoff. Kache has higher cold-p
 
 ## Decision
 
-Automatic compiler-cache selection prefers Kache when the executable reports the qualified released `0.26.0` version and its daemon starts successfully. It otherwise falls through to sccache and then no cache, reporting the actual backend and fallback reason. Explicit Kache or sccache requests fail when unusable instead of changing backend. Explicit `none` and `RUSTC_WRAPPER` remain authoritative.
+Automatic compiler-cache selection for checks and development builds prefers Kache when the executable reports the qualified released `0.26.0` version and its daemon reports readiness on the configured socket. It otherwise falls through to sccache and then no cache, reporting the actual backend and fallback reason. Explicit Kache or sccache requests fail when unusable instead of changing backend. Explicit `none` and `RUSTC_WRAPPER` remain authoritative.
 
 The same selector owns checks, ordinary development builds, and production build preparation. Phoenix does not install cache tools, configure remotes, purge storage, or promise an acceleration. Support for another Kache release requires deliberate qualification rather than assumed cross-version compatibility.
+
+Production-build automatic selection excludes Kache because actual macOS restored dependency archives emitted unresolved-object `dsymutil` warnings; successful compilation and matching binary/`.dSYM` UUIDs do not prove source-level fidelity. Production therefore falls through to validated sccache or no cache. Explicit Kache remains an operator opt-in with this limitation documented.
 
 ## Consequences
 
