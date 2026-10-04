@@ -215,3 +215,11 @@ Published measured-source refs (source only; no private artifacts):
 The measured after diff contains only the same unary-plus scoped predicate
 and focused correctness test as independent PR838 (serialization test
 representation differs on main); measurement source is durably inspectable.
+
+Failed/interrupted suites are never accepted as measurements. Per-invocation
+failures retain raw evidence when the harness returns it; an outer termination
+may retain only a failure record, not completed in-memory samples. The rig
+does not promise resumable sample checkpointing or partial-suite recovery.
+Snapshot ingestion requires a NEW EMPTY directory; even lock-only roots are
+refused before permission changes. Existing recognized fixtures remain readable
+by prepare/run, not replaceable by snapshot ingestion.
