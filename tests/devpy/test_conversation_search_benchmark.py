@@ -96,10 +96,11 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 child.terminate(); child.wait(timeout=5); child.stdout.close()
 
     def test_native_flags_recorded_without_secret_registry_values(self):
-        with mock.patch.dict("os.environ", {"CC":"clang", "CFLAGS_aarch64_apple_darwin":"-O2", "LIBSQLITE3_FLAGS":"SQLITE_DEFAULT_CACHE_SIZE=-8000", "CARGO_REGISTRY_TOKEN":"secret"}), mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
+        with mock.patch.dict("os.environ", {"CC":"clang", "CFLAGS_aarch64_apple_darwin":"-O2", "LIBSQLITE3_FLAGS":"SQLITE_DEFAULT_CACHE_SIZE=-8000", "LIBSQLITE3_SYS_USE_PKG_CONFIG":"1", "CARGO_REGISTRY_TOKEN":"secret"}), mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
             env=bench._build_configuration()["environment"]
             self.assertEqual(env["CC"],"clang")
             self.assertEqual(env["LIBSQLITE3_FLAGS"],"SQLITE_DEFAULT_CACHE_SIZE=-8000")
+            self.assertEqual(env["LIBSQLITE3_SYS_USE_PKG_CONFIG"],"1")
             self.assertEqual(env["CFLAGS_aarch64_apple_darwin"],"-O2")
             self.assertNotIn("CARGO_REGISTRY_TOKEN",env)
 
@@ -113,13 +114,15 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
 
     def test_incomplete_capture_is_preserved_and_refused(self):
         with tempfile.TemporaryDirectory() as d:
-            root=Path(d); (root/".capture-pending").write_text("unknown owner")
+            root=Path(d); root.chmod(0o755); (root/".capture-pending").write_text("unknown owner")
             partial=root/".captured.db.123.tmp"; partial.write_bytes(b"partial")
             src=root.parent/"unused-source"; src.write_bytes(b"source")
             try:
                 with self.assertRaisesRegex(SystemExit,"incomplete prior capture"):
                     bench.snapshot(type("Args",(),{"artifacts":str(root),"source":str(src)})())
                 self.assertEqual(partial.read_bytes(),b"partial")
+                self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+                self.assertFalse((root/".capture-lock").exists())
             finally: src.unlink()
 
     def test_result_identity_and_config_evidence_are_required(self):

@@ -208,3 +208,10 @@ historical measurements remain valid evidence. The original live-online-capture
 acceptance is withdrawn: standard read-only online backup may alter SHM
 coordination bytes, which is not evidence application data changed. No custom
 VFS, permission changes, daemon, or new baseline campaign is introduced.
+
+Published measured-source refs (source only; no private artifacts):
+- Before: https://github.com/scottopell/phoenix-ide/commit/063a82ff25d9fa31ecc6d48b628196603a7a7638 (`evidence/scoped-search-measured-before`).
+- After: https://github.com/scottopell/phoenix-ide/commit/42740b6c1d84ceed48ad71e36553d6f996480e3c (`evidence/scoped-search-measured-after`).
+The measured after diff contains only the same unary-plus scoped predicate
+and focused correctness test as independent PR838 (serialization test
+representation differs on main); measurement source is durably inspectable.
