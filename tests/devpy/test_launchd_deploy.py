@@ -331,6 +331,17 @@ class ActivationTests(unittest.TestCase):
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute("SELECT MAX(version) FROM _migrations").fetchone()[0], 69)
 
+    def test_recovery_entrypoint_exception_preserves_failed_status_and_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest, *_ = self._full_paired_fixture(Path(td))
+            Path(manifest.active_path).write_text(manifest.transaction_id + "\n")
+            helper.write_status(manifest, "activating")
+            args = ["helper", "recover-paired", "--manifest", "unused", "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+            with mock.patch.object(helper.sys, "argv", args), mock.patch.object(helper.Manifest, "load", return_value=manifest), mock.patch.object(helper, "recover_paired", side_effect=helper.ActivationError("early proof rejected")), mock.patch.object(helper, "request_helper_bootout"):
+                self.assertEqual(helper.main(), 1)
+            self.assertEqual(json.loads(Path(manifest.status_path).read_text())["state"], "activation_failed_rollback_failed")
+            self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
+
     def test_repeated_recovery_failure_retains_claim_and_stops_unverified_runtime(self):
         with tempfile.TemporaryDirectory() as td:
             result = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("candidate failed"), predecessor_health_failure=helper.ActivationError("recovery failed"))

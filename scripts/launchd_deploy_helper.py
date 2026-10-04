@@ -1051,6 +1051,8 @@ def main() -> int:
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
+        if manifest is not None and args.command == "recover-paired":
+            write_status(manifest, "activation_failed_rollback_failed", rollback_failure=str(exc))
         if manifest is not None and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
