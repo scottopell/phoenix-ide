@@ -58,7 +58,7 @@ def _artifact_root(value: str) -> Path:
         except (OSError, ValueError): raise SystemExit("invalid artifact ownership manifest")
         if manifest.get("kind") != "conversation-search-fixture":
             raise SystemExit("invalid artifact ownership manifest")
-    if raw.exists() and any(raw.iterdir()) and not (raw / "capture-manifest.json").is_file() and set(path.name for path in raw.iterdir()) != {".capture-lock"}:
+    if raw.exists() and any(raw.iterdir()) and not (raw / "capture-manifest.json").is_file():
         raise SystemExit("refusing nonempty unrecognized artifact root; choose a dedicated directory")
     return raw.resolve()
 
@@ -135,7 +135,8 @@ def _measurement_digest() -> str:
     root=Path(__file__).parents[1]
     rust=(root/"crates/phoenix-ide/src/coordinator_tools.rs").read_text()
     loop=rust.split("async fn production_conversation_search_benchmark()",1)[1].split("    #[test]",1)[0]
-    digest=hashlib.sha256(Path(__file__).read_bytes()+loop.encode())
+    setup=(root/"crates/phoenix-db/src/lib.rs").read_text().split("pub async fn open_read_only",1)[1].split("pub async fn open(",1)[0]
+    digest=hashlib.sha256(Path(__file__).read_bytes()+loop.encode()+setup.encode())
     return digest.hexdigest()
 
 
@@ -530,6 +531,7 @@ def _stop_process(process) -> None:
 def snapshot(args) -> int:
     if fcntl is None: raise SystemExit("snapshot requires POSIX flock (macOS/Linux)")
     outdir = _artifact_root(args.artifacts)
+    if outdir.exists() and any(outdir.iterdir()): raise SystemExit("snapshot requires a new empty dedicated directory")
     _ensure_ignored_artifacts(outdir)
     _private(outdir)
     fd = os.open(outdir / ".capture-lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -546,7 +548,7 @@ def snapshot(args) -> int:
 
 def _snapshot_locked(args) -> int:
     source = Path(args.source).expanduser().resolve()
-    outdir = _artifact_root(args.artifacts)
+    outdir = Path(args.artifacts).expanduser().absolute()
     _ensure_ignored_artifacts(outdir)
     requested = outdir / "captured.db"
     if (
@@ -564,7 +566,7 @@ def _snapshot_locked(args) -> int:
         raise SystemExit("incomplete prior capture; preserved files; choose a new dedicated artifact directory")
     if (outdir / "capture-manifest.json").exists(): raise SystemExit("existing capture manifest; use a new dedicated directory")
     if dest.exists(): raise SystemExit('fixture exists; capture into a new dedicated directory (replacement unsupported)')
-    if source == (Path.home() / ".phoenix-ide" / "prod.db").resolve():
+    if source == (Path.home() / ".phoenix-ide" / "prod.db").resolve() or ((Path.home() / ".phoenix-ide" / "prod.db").exists() and os.path.samefile(source, Path.home() / ".phoenix-ide" / "prod.db")):
         raise SystemExit("live production source refused; supply a consistent offline snapshot")
     if not getattr(args, "offline_snapshot", False):
         raise SystemExit("explicit --offline-snapshot attestation required: source is a consistent standalone snapshot, not a live DB")
@@ -996,6 +998,8 @@ def _validate_run(run: dict, name: str) -> dict:
         identity = sample.get("result_identity")
         if not isinstance(count, int) or count < 0 or not isinstance(identity, list) or len(identity) != count:
             raise SystemExit(f"refusing comparison: {name} missing count/order evidence")
+        result=sample.get("result")
+        if not isinstance(result,str) or hashlib.sha256(result.encode()).hexdigest()!=sample.get("result_digest"): raise SystemExit("raw result digest mismatch")
         digest = sample.get("result_digest")
         phase = sample.get("phase")
         if not key[0] or not key[1] or not digest or not phase:

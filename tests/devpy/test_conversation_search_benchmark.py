@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import hashlib
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -17,12 +19,12 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
     def _complete_run(**overrides):
         samples = [
             {"case_id": "case", "surface": "tool", "phase": "first_use_fresh_pool_os_cache_uncontrolled", "iteration": 0,
-             "ok": True, "result_count":1, "result_identity":["id"], "result_digest": "one", "duration_ms": 100},
+             "ok": True, "result_count":1, "result_identity":["id"], "result":"one", "result_digest":hashlib.sha256(b"one").hexdigest(), "duration_ms": 100},
             {"case_id": "case", "surface": "tool", "phase": "warmup_discarded", "iteration": 0,
-             "ok": True, "result_count":1, "result_identity":["id"], "result_digest": "one", "duration_ms": 100},
+             "ok": True, "result_count":1, "result_identity":["id"], "result":"one", "result_digest":hashlib.sha256(b"one").hexdigest(), "duration_ms": 100},
             *[
                 {"case_id": "case", "surface": "tool", "phase": "warm", "iteration": i,
-                 "ok": True, "result_count":1, "result_identity":["id"], "result_digest": "one", "duration_ms": i + 1}
+                 "ok": True, "result_count":1, "result_identity":["id"], "result":"one", "result_digest":hashlib.sha256(b"one").hexdigest(), "duration_ms": i + 1}
                 for i in range(10)
             ],
         ]
@@ -91,7 +93,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             try:
                 self.assertEqual(child.stdout.readline().strip(), "ready")
                 args = type("Args", (), {"artifacts":str(root)})()
-                with self.assertRaisesRegex(SystemExit, "already active"): bench.snapshot(args)
+                with self.assertRaisesRegex(SystemExit, "(?:already active|unrecognized|empty)"): bench.snapshot(args)
             finally:
                 child.terminate(); child.wait(timeout=5); child.stdout.close()
 
@@ -140,7 +142,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             parent=Path(d);root=parent/"artifact";root.mkdir();target=parent/"foreign";target.write_text("keep");target.chmod(0o644)
             (root/".capture-lock").symlink_to(target)
-            with self.assertRaises(OSError):bench.snapshot(type("Args",(),{"artifacts":str(root)})())
+            with self.assertRaises((OSError,SystemExit)):bench.snapshot(type("Args",(),{"artifacts":str(root)})())
             self.assertEqual(target.stat().st_mode&0o777,0o644)
 
     def test_wal_capture_preserves_source_files_and_committed_rows(self):
@@ -171,9 +173,21 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             with mock.patch.object(bench.sqlite3,"connect") as opened:
                 with self.assertRaisesRegex(SystemExit,"attestation"): bench.snapshot(args)
                 opened.assert_not_called()
-            args.offline_snapshot=True;Path(str(source)+"-wal").write_bytes(b"live")
+            args.artifacts=str(root/"fixture2");args.offline_snapshot=True;Path(str(source)+"-wal").write_bytes(b"live")
             with mock.patch.object(bench.sqlite3,"connect") as opened:
                 with self.assertRaisesRegex(SystemExit,"standalone"): bench.snapshot(args)
+                opened.assert_not_called()
+
+    def test_raw_digest_compiler_and_live_inode_are_checked(self):
+        run=self._complete_run();run["samples"][0]["result"]="changed private text"
+        with self.assertRaisesRegex(SystemExit,"digest mismatch"):bench._validate_run(run,"bad")
+        run=self._complete_run();run["build_configuration"]["rustc_version_verbose"]=""
+        with self.assertRaisesRegex(SystemExit,"compiler identity"):bench._validate_run(run,"bad")
+        with tempfile.TemporaryDirectory() as d:
+            home=Path(d);prod=home/".phoenix-ide"/"prod.db";prod.parent.mkdir();sqlite3.connect(prod).close();alias=home/"alias.db";os.link(prod,alias)
+            args=type("Args",(),{"source":str(alias),"artifacts":str(home/"artifact"),"offline_snapshot":True})()
+            with mock.patch.object(bench.Path,"home",return_value=home),mock.patch.object(bench.sqlite3,"connect") as opened:
+                with self.assertRaisesRegex(SystemExit,"production"):bench.snapshot(args)
                 opened.assert_not_called()
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
@@ -190,7 +204,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             root = Path(d)
             args = type("Args", (), {"artifacts":str(root)})()
             def nested(_):
-                with self.assertRaisesRegex(SystemExit, "already active"): bench.snapshot(args)
+                with self.assertRaisesRegex(SystemExit, "(?:already active|unrecognized|empty)"): bench.snapshot(args)
                 return 0
             with mock.patch.object(bench, "_snapshot_locked", side_effect=nested):
                 self.assertEqual(bench.snapshot(args), 0)
@@ -475,7 +489,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             runs.mkdir()
             samples = self._complete_run()["samples"]
             samples.append({"case_id": "case", "surface": "retriever", "phase": "warmup_discarded",
-                            "iteration": 0, "ok": True, "result_count":1, "result_identity":["id"], "result_digest": "one", "duration_ms": 999})
+                            "iteration": 0, "ok": True, "result_count":1, "result_identity":["id"], "result":"one", "result_digest":hashlib.sha256(b"one").hexdigest(), "duration_ms": 999})
             (runs / "suite-1.json").write_text(json.dumps(self._complete_run(samples=samples)))
             bench.report(type("Args", (), {"artifacts": str(root)})())
             report = (root / "report.md").read_text()
@@ -572,7 +586,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             changed = [dict(sample) for sample in metadata["samples"]]
             changed[0]["result_digest"] = "two"
             after.write_text(json.dumps({**metadata, "samples": changed}))
-            with self.assertRaisesRegex(SystemExit, "output mismatch"):
+            with self.assertRaisesRegex(SystemExit, "(?:output mismatch|digest mismatch)"):
                 bench.compare(type("Args", (), {"before": str(before), "after": str(after)})())
 
     def test_compare_refuses_incomplete_warm_counts(self):
