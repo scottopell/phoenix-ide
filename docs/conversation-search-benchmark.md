@@ -8,14 +8,16 @@ conversation data and are private; `conversation-search-benchmark/` is ignored.
 
 ```sh
 ./dev.py conversation-search snapshot \
-  --source "$HOME/.phoenix-ide/prod.db" \
+  --source "/private/operator-snapshots/consistent-standalone.db" --offline-snapshot \
   --artifacts conversation-search-benchmark
 ./dev.py conversation-search prepare --artifacts conversation-search-benchmark
 # Replacing frozen scenarios is destructive and requires an explicit override:
 # ./dev.py conversation-search prepare --artifacts conversation-search-benchmark --force
 ```
 
-Capture uses SQLite's online backup API from a read-only source connection,
+First obtain a consistent standalone OFFLINE snapshot by an operator-supported
+process; never raw-copy a live SQLite file. Ingestion uses SQLite's backup API
+from the explicitly attested immutable offline source,
 retrying busy failures with a bounded deadline. It atomically creates
 `captured.db`, checks integrity on the copy, records its hash/counts, and
 recovers exact query text only from the two named observed calls. For the
