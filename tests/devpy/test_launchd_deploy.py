@@ -1780,7 +1780,8 @@ class PreparedArtifactTests(unittest.TestCase):
             prepared_artifact=Path("prepared"), expected_full_commit="a" * 40,
             paired_database_upgrade=True, transaction_id="tx-123",
         )
-        with mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+        with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
              mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
              mock.patch.object(self.dev, "cmd_check") as check:
             self.dev.cmd_prod_deploy(controller=controller)
