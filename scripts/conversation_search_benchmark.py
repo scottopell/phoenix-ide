@@ -149,6 +149,15 @@ def _build_configuration() -> dict:
     config_paths = [cargo_home / "config", cargo_home / "config.toml"]
     project = Path(__file__).parents[1].resolve()
     config_paths += [parent / ".cargo" / name for parent in [project, *project.parents] for name in ("config", "config.toml")]
+    def reject_custom_config(value):
+        if isinstance(value,dict):
+            for key,child in value.items():
+                if key in {"runner","linker","rustc","rustc-wrapper","rustc-workspace-wrapper","incremental"}: raise SystemExit("custom Cargo execution/compiler configuration unsupported")
+                reject_custom_config(child)
+        elif isinstance(value,list):
+            for child in value: reject_custom_config(child)
+    for path in config_paths:
+        if path.is_file(): reject_custom_config(__import__("tomllib").loads(path.read_text()))
     config_hashes = {("project/" + str(path.relative_to(project)) if path.is_relative_to(project) else str(path)): _hash(path) for path in config_paths if path.is_file()}
     return {
         "native_compiler": native_compiler,
@@ -790,13 +799,19 @@ def _run_reserved(args) -> int:
         PHOENIX_SEARCH_BENCH_COMMIT=launched_commit, PHOENIX_SEARCH_BENCH_HOST=platform.node(),
         PHOENIX_SEARCH_BENCH_PLATFORM=platform.platform(), PHOENIX_SEARCH_BENCH_PROCESSOR=platform.processor() or "unknown",
         PHOENIX_SEARCH_BENCH_CPU_COUNT=str(os.cpu_count() or 1))
-    process = subprocess.Popen(
-        cmd,
-        cwd=Path(__file__).parents[1],
-        env=env,
-        start_new_session=(os.name == "posix"),
-    )
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+    process = None
     try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=Path(__file__).parents[1],
+            env=env,
+            start_new_session=(os.name == "posix"),
+        )
+    finally:
+        if process is None: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         process.wait(timeout=args.timeout)
     except subprocess.TimeoutExpired as error:
         _stop_process(process)

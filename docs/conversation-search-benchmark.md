@@ -244,3 +244,10 @@ Build support is deliberately constrained to a plain host bundled release build.
 Custom Cargo runners/linkers/incremental overrides are unsupported. This is
 not an exhaustive hermetic toolchain identity guarantee: use a controlled
 host/configuration and compare recorded effective inputs, not arbitrary wrappers.
+
+Source stability is an operator precondition: do not edit this worktree or its
+search/benchmark dependencies while compilation/execution is active. Endpoint
+HEAD/cleanliness/digest checks detect persistent changes, not adversarial
+transient edits restored mid-build. The rig does not claim immutable checkout
+certification or create a snapshot-build platform; that threat model is outside
+the commissioned single-owner local benchmark.
