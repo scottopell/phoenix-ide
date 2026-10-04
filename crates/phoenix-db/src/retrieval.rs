@@ -1621,6 +1621,18 @@ mod tests {
         assert_eq!(scoped[0].message_id, "m2");
     }
 
+    #[test]
+    fn natural_language_tool_policy_is_exact_not_palette_prefix() {
+        let request = RetrievalRequest::natural_language("abcdef", RetrievalScope::Global, 20);
+        assert_eq!(request.match_mode(), RetrievalMatchMode::ExactTerms);
+        assert_eq!(
+            Fts5Retriever::lexical_expression(&request),
+            Some("\"abcdef\"".to_string())
+        );
+        let palette = RetrievalRequest::palette_conversation_search("abcdef", 20);
+        assert_eq!(palette.match_mode(), RetrievalMatchMode::FinalTokenPrefix);
+    }
+
     #[tokio::test]
     async fn scoped_results_match_global_filter_before_limit_for_numeric_text_ids() {
         let db = seed().await;
