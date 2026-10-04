@@ -100,38 +100,9 @@ def _ensure_ignored_artifacts(outdir: Path) -> None:
         raise SystemExit("refusing to write benchmark artifacts in the repository root")
     root_check = subprocess.run(["git", "check-ignore", "--quiet", str(relative) + "/"], cwd=repo)
     if root_check.returncode: raise SystemExit("refusing unignored dedicated artifact root; ignore the entire directory")
-    paths = [
-        outdir / "__private_staged_probe__",
-        outdir / "captured.db",
-        outdir / "capture-manifest.json",
-        outdir / "scenarios.json",
-        outdir / "report.md",
-        outdir / "runs",
-        outdir / "runs" / "failures",
-    ]
     tracked = subprocess.check_output(["git", "ls-files", "--", str(relative)], cwd=repo, text=True)
     if tracked.strip():
         raise SystemExit("refusing tracked benchmark artifacts")
-    for path in paths:
-        try:
-            candidate = path.relative_to(repo)
-            result = subprocess.run(
-                ["git", "check-ignore", "--quiet", "--", str(candidate)],
-                cwd=repo,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except OSError as error:
-            raise SystemExit(f"unable to verify ignored benchmark artifact path: {error}") from error
-        if result.returncode == 1:
-            raise SystemExit(
-                f"refusing unignored benchmark artifact path in repository: {path}; "
-                "add it to .gitignore or choose an external --artifacts directory"
-            )
-        if result.returncode != 0:
-            raise SystemExit(f"git check-ignore failed for benchmark artifact path: {path}")
-
 
 def _measurement_digest() -> str:
     root=Path(__file__).parents[1]
