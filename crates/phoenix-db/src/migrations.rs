@@ -1398,7 +1398,6 @@ FOR EACH ROW WHEN NOT EXISTS (
       ON root.product_conversation_id = pc.id
      AND root.runtime_role = 'user'
      AND root.parent_conversation_id IS NULL
-     AND root.user_initiated = 1
     WHERE pc.id = NEW.product_conversation_id
       AND pc.kind = 'ordinary'
 )
@@ -1435,7 +1434,6 @@ FOR EACH ROW WHEN NOT EXISTS (
       ON root.product_conversation_id = pc.id
      AND root.runtime_role = 'user'
      AND root.parent_conversation_id IS NULL
-     AND root.user_initiated = 1
     WHERE pc.id = NEW.product_conversation_id
       AND pc.kind = 'ordinary'
 )
@@ -1592,7 +1590,6 @@ FOR EACH ROW WHEN NOT EXISTS (
       ON root.product_conversation_id = pc.id
      AND root.runtime_role = 'user'
      AND root.parent_conversation_id IS NULL
-     AND root.user_initiated = 1
     WHERE pc.id = NEW.product_conversation_id
       AND pc.kind = 'ordinary'
 )
@@ -1626,7 +1623,6 @@ FOR EACH ROW WHEN NOT EXISTS (
       ON root.product_conversation_id = pc.id
      AND root.runtime_role = 'user'
      AND root.parent_conversation_id IS NULL
-     AND root.user_initiated = 1
     WHERE pc.id = NEW.product_conversation_id
       AND pc.kind = 'ordinary'
 )

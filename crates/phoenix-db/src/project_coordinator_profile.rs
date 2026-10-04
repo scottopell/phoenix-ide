@@ -443,7 +443,6 @@ async fn ensure_project_coordinator_profile_writable(
              WHERE product_conversation_id = ?1
                AND runtime_role = 'user'
                AND parent_conversation_id IS NULL
-               AND user_initiated = 1
          )",
     )
     .bind(product_conversation_id.as_str())
@@ -492,6 +491,15 @@ mod tests {
         product_conversation_id: &ProductConversationId,
         conversation_id: &str,
     ) {
+        insert_user_conversation(db, product_conversation_id, conversation_id, true).await;
+    }
+
+    async fn insert_user_conversation(
+        db: &Database,
+        product_conversation_id: &ProductConversationId,
+        conversation_id: &str,
+        user_initiated: bool,
+    ) {
         let scope_id = format!("scope-{conversation_id}");
         sqlx::query(
             "INSERT INTO work_scopes (
@@ -524,13 +532,14 @@ mod tests {
                  user_initiated, state, state_kind, state_updated_at, created_at,
                  updated_at, archived, transcript_generation, model, llm_language, cm_kind
              ) VALUES (?1, ?2, 'user', ?4,
-                       1, ?3, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                       ?5, ?3, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
                        '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
         )
         .bind(conversation_id)
         .bind(product_conversation_id.as_str())
         .bind(serde_json::json!({ "type": "idle" }).to_string())
         .bind(&scope_id)
+        .bind(user_initiated)
         .execute(&db.pool)
         .await
         .expect("insert user root conversation");
@@ -661,6 +670,140 @@ mod tests {
         assert!(insert_error
             .to_string()
             .contains("Project Coordinator profile requires ordinary ProductConversation"));
+    }
+
+    #[tokio::test]
+    async fn profile_remains_editable_after_initial_user_segment_deleted() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-continuation-survives").await;
+        let initial_conversation_id = format!("conv-{}", id.as_str());
+        let continuation_scope_id = "scope-continuation-survives";
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, created_at, updated_at,
+                 environment_kind, cwd, worktree_path, worktree_id, worktree_fingerprint
+             ) VALUES (
+                 ?1, 'work', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                 'allocated_worktree', '/tmp/project-coordinator-profile', '/tmp/project-coordinator-profile',
+                 'worktree-continuation-survives', 'fingerprint-continuation-survives'
+             )",
+        )
+        .bind(continuation_scope_id)
+        .execute(&db.pool)
+        .await
+        .expect("insert continuation work scope");
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+             VALUES (?1, ?2)",
+        )
+        .bind(continuation_scope_id)
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("insert continuation scope owner");
+        let mut tx = db.pool.begin().await.expect("begin continuation fixture");
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .expect("defer continuation fixture foreign keys");
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id, product_conversation_id
+             ) VALUES (?1, 'conv-continuation-survives', ?2)",
+        )
+        .bind(&initial_conversation_id)
+        .bind(id.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("insert continuation reservation");
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind("conv-continuation-survives")
+            .bind(&initial_conversation_id)
+            .execute(&mut *tx)
+            .await
+            .expect("link continuation edge");
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, runtime_role, work_scope_id,
+                 user_initiated, state, state_kind, state_updated_at, created_at,
+                 updated_at, archived, transcript_generation, model, llm_language, cm_kind
+             ) VALUES ('conv-continuation-survives', ?1, 'user', ?2,
+                       0, ?3, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                       '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
+        )
+        .bind(id.as_str())
+        .bind(continuation_scope_id)
+        .bind(serde_json::json!({ "type": "idle" }).to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert surviving continuation segment");
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(&initial_conversation_id)
+        .execute(&mut *tx)
+        .await
+        .expect("consume continuation reservation");
+        tx.commit().await.expect("commit continuation fixture");
+
+        db.write_project_coordinator_profile(&id, Some("initial charter"), 0)
+            .await
+            .expect("create profile");
+        sqlx::query("DELETE FROM conversations WHERE id = ?1")
+            .bind(initial_conversation_id)
+            .execute(&db.pool)
+            .await
+            .expect("delete initial segment row");
+
+        let surviving_user_roots: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations
+             WHERE product_conversation_id = ?1
+               AND runtime_role = 'user'
+               AND parent_conversation_id IS NULL
+               AND user_initiated = 0",
+        )
+        .bind(id.as_str())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count surviving continuation roots");
+        assert_eq!(surviving_user_roots, 1);
+
+        let updated = db
+            .write_project_coordinator_profile(&id, Some("updated charter"), 1)
+            .await
+            .expect("continuation keeps profile editable");
+        let updated_revision = match updated {
+            ProjectCoordinatorProfileWriteOutcome::Saved(ref profile)
+                if profile.revision() > 1 && profile.charter() == "updated charter" =>
+            {
+                profile.revision()
+            }
+            other => panic!("unexpected update outcome: {other:?}"),
+        };
+
+        let disabled = db
+            .write_project_coordinator_profile(&id, None, updated_revision)
+            .await
+            .expect("continuation keeps disable available");
+        let disabled_revision = match disabled {
+            ProjectCoordinatorProfileWriteOutcome::Disabled { revision }
+                if revision > updated_revision =>
+            {
+                revision
+            }
+            other => panic!("unexpected disable outcome: {other:?}"),
+        };
+
+        let reenabled = db
+            .write_project_coordinator_profile(&id, Some("reenabled charter"), disabled_revision)
+            .await
+            .expect("continuation keeps re-enable available");
+        assert!(matches!(
+            reenabled,
+            ProjectCoordinatorProfileWriteOutcome::Saved(ref profile)
+                if profile.revision() > disabled_revision && profile.charter() == "reenabled charter"
+        ));
     }
 
     #[tokio::test]
