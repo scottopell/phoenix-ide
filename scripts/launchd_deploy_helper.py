@@ -466,8 +466,11 @@ class Launchctl:
     def inspect(self) -> tuple[str, Optional[int]]:
         result = self.run(["launchctl", "print", self.target], capture_output=True, text=True)
         output = result.stdout + "\n" + result.stderr
-        if result.returncode != 0 or "Could not find service" in output:
+        absent = re.search(r'^\s*Could not find service "' + re.escape(self.manifest.label) + r'" in domain (?:gui/' + str(self.manifest.uid) + r'|for user gui: ' + str(self.manifest.uid) + r')\s*$', output, re.MULTILINE)
+        if absent is not None:
             return "not_loaded", None
+        if result.returncode != 0:
+            raise ActivationError(f"launchctl print failed with exit {result.returncode}; service absence is unconfirmed")
         state = "unknown"
         pid = None
         for raw in result.stdout.splitlines():
@@ -814,8 +817,8 @@ def activate(manifest: Manifest) -> str:
                 if manifest.paired_database_upgrade is not None:
                     try:
                         launchctl.stop()
-                        observed = launchctl.inspect()
-                        if observed["state"] != "not_loaded" or observed["pid"] is not None:
+                        state, pid = launchctl.inspect()
+                        if state != "not_loaded" or pid is not None:
                             raise ActivationError("failed paired recovery teardown is unconfirmed")
                     except Exception as teardown_exc:
                         rollback_failure += f"; recovery teardown failed: {teardown_exc}"

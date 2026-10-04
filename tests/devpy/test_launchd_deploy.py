@@ -312,6 +312,8 @@ class ActivationTests(unittest.TestCase):
                 self.assertEqual(events, ["stop", "start", "stop", "start", "stop"])
                 self.assertFalse(launchctl.loaded)
                 self.assertFalse(helper.status_is_durable_terminal(manifest))
+                status = json.loads(Path(manifest.status_path).read_text())
+                self.assertNotIn("recovery teardown failed", status["rollback_failure"])
 
     def test_full_paired_activate_snapshot_failure_does_not_start_predecessor(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
@@ -456,9 +458,23 @@ class ActivationTests(unittest.TestCase):
     def test_missing_service_text_is_treated_as_unloaded(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
-            result = subprocess.CompletedProcess([], 0, "", "Could not find service")
+            result = subprocess.CompletedProcess([], 113, "", f'Could not find service "{manifest.label}" in domain for user gui: {manifest.uid}')
             launchctl = helper.Launchctl(manifest, run=mock.Mock(return_value=result))
             self.assertEqual(("not_loaded", None), launchctl.inspect())
+
+    def test_unknown_launchctl_print_error_prevents_paired_restore(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_paired_manifest(Path(td), Path(td) / "database.sqlite3")
+            result = subprocess.CompletedProcess([], 5, "", "Input/output error")
+            launchctl = helper.Launchctl(manifest, run=mock.Mock(return_value=result))
+            with mock.patch.object(helper, "restore_database") as restore_database, mock.patch.object(helper, "atomic_install") as install:
+                with self.assertRaisesRegex(helper.ActivationError, "absence is unconfirmed"):
+                    helper.restore(manifest, launchctl)
+                restore_database.assert_not_called()
+                install.assert_not_called()
+            wrong_service = subprocess.CompletedProcess([], 113, "", 'Could not find service "unrelated" in domain for user gui: 501')
+            with mock.patch.object(launchctl, "run", return_value=wrong_service), self.assertRaises(helper.ActivationError):
+                launchctl.inspect()
 
     def test_bootout_timeout_marks_disruption_and_triggers_rollback(self):
         with tempfile.TemporaryDirectory() as td:
