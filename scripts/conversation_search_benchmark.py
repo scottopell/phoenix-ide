@@ -7,7 +7,10 @@ backup API and never opens the production database writable.
 from __future__ import annotations
 import argparse
 import hashlib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import platform
@@ -506,6 +509,7 @@ def _stop_process(process) -> None:
 
 
 def snapshot(args) -> int:
+    if fcntl is None: raise SystemExit("snapshot requires POSIX flock (macOS/Linux)")
     outdir = _artifact_root(args.artifacts)
     _ensure_ignored_artifacts(outdir)
     _private(outdir)

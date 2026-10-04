@@ -75,6 +75,26 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 self.assertEqual(bench.run(args), 0)
             self.assertFalse((root / "runs" / ".same.reserved").exists())
 
+    def test_capture_rejects_foreign_directory_without_chmod(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); (root / "foreign").write_text("keep"); root.chmod(0o755)
+            args = type("Args", (), {"artifacts":str(root)})()
+            with self.assertRaisesRegex(SystemExit, "unrecognized"): bench.snapshot(args)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+            self.assertFalse((root / ".capture-lock").exists())
+
+    def test_external_process_capture_lock_is_respected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); lock = root / ".capture-lock"
+            code = "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); time.sleep(30)"
+            child = subprocess.Popen([__import__("sys").executable, "-c", code, str(lock)], stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+                args = type("Args", (), {"artifacts":str(root)})()
+                with self.assertRaisesRegex(SystemExit, "already active"): bench.snapshot(args)
+            finally:
+                child.terminate(); child.wait(timeout=5); child.stdout.close()
+
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "scenarios.json"
