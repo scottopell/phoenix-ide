@@ -643,7 +643,7 @@ def _snapshot_locked(args) -> int:
             tmp.unlink(missing_ok=True)
     try:
         manifest = {'kind':'conversation-search-fixture','source_path':str(source),'source_provenance':'operator-attested consistent offline snapshot',
-          'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':tmp.stat().st_size,
+          'captured_at_unix':started,'snapshot_path':str(dest.resolve()),'size_bytes':tmp.stat().st_size,
           'sha256':_hash(tmp),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
           'logical_size_bytes':logical_size,'page_size_bytes':page_size,
           'counts':counts,'schema_digest':schema_digest,'migration_ledger':migration_ledger,
@@ -728,6 +728,7 @@ def run(args) -> int:
         fd = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         raise SystemExit("run label already reserved; inspect the existing owner before removing reservation")
+    os.write(fd, f"owner_pid={os.getpid()}\n".encode())
     os.close(fd)
     handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
     def interrupted(_signum, _frame):
@@ -964,14 +965,14 @@ def _validate_run(run: dict, name: str) -> dict:
     if run["started_at_unix"] > run["completed_at_unix"]: raise SystemExit(f"refusing comparison: {name} reversed interval")
     shapes = {
         "environment": {"host","platform","processor","cpu_count"},
-        "sqlite_pragmas": {"max_connections","acquire_timeout_secs","read_only","sqlite_version","journal_mode","synchronous","busy_timeout","foreign_keys","query_only"},
+        "sqlite_pragmas": {"sqlite_version","journal_mode","synchronous","busy_timeout_ms","foreign_keys","query_only"},
         "runtime": {"worker_threads","measurement_clock"},
     }
     for key, shape in shapes.items():
         if not isinstance(run[key],dict) or set(run[key]) != shape: raise SystemExit(f"invalid execution metadata: {key}")
     env = run["environment"]; pragmas=run["sqlite_pragmas"]
     if any(not isinstance(env[k],str) or not env[k].strip() for k in ("host","platform","processor")) or not str(env["cpu_count"]).isdigit() or int(env["cpu_count"])<=0: raise SystemExit("invalid environment values")
-    if pragmas["read_only"] is not True or any(type(pragmas[k]) is not int or pragmas[k]<0 for k in ("max_connections","acquire_timeout_secs","synchronous","busy_timeout","foreign_keys","query_only")) or pragmas["max_connections"]<1 or pragmas["foreign_keys"] not in (0,1) or pragmas["query_only"] not in (0,1) or pragmas["journal_mode"] not in ("delete","truncate","persist","memory","wal","off") or not isinstance(pragmas["sqlite_version"],str) or not pragmas["sqlite_version"]: raise SystemExit("invalid SQLite values")
+    if any(type(pragmas[k]) is not int or pragmas[k]<0 for k in ("synchronous","busy_timeout_ms")) or any(type(pragmas[k]) is not bool for k in ("foreign_keys","query_only")) or pragmas["journal_mode"] not in ("delete","truncate","persist","memory","wal","off") or not isinstance(pragmas["sqlite_version"],str) or not pragmas["sqlite_version"]: raise SystemExit("invalid SQLite values")
     if run["runtime"]["measurement_clock"] != "monotonic" or type(run["runtime"]["worker_threads"]) is not int or run["runtime"]["worker_threads"] <= 0: raise SystemExit("invalid runtime")
     freshness = run["fixture_validation"]
     shape = {"transcript_count", "freshness_batch_size", "locator_orphans", "missing_physical_rows", "unlocated_physical_rows"}

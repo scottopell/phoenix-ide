@@ -233,3 +233,9 @@ Locator metadata corruption, like physical-text corruption, remains the separate
 production freshness-authority assessment59007; this rig uses that authority,
 not a shadow reconciliation/provenance engine. Historical returned provenance
 was independently checked from source rows for the paired fixture.
+
+Run reservations fail closed after uncatchable termination; marker records
+owner PID for operator inspection. Automatic stale-owner reclamation, reboot
+recovery and process-identity authentication are not supported. Confirm no
+active benchmark process before removing a stale reservation manually; no
+samples from an interrupted suite are accepted.
