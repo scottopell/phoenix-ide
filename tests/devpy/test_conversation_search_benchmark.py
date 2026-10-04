@@ -32,8 +32,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "fixture_sha256": "a", "schema_digest": "schema", "migration_ledger": [],
             "scenario_digest": "s", "profile": "release",
             "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
-            "environment": {"host": "host"}, "sqlite_pragmas": {"read_only": True},
-            "runtime": {"worker_threads": 2}, "explain_enabled": False,
+            "environment":{"host":"host","platform":"test","processor":"test","cpu_count":"2"}, "sqlite_pragmas":{"max_connections":10,"acquire_timeout_secs":300,"read_only":True,"sqlite_version":"test","journal_mode":"wal","synchronous":2,"busy_timeout":300000,"foreign_keys":1,"query_only":0},
+            "runtime": {"worker_threads":2,"measurement_clock":"monotonic"}, "explain_enabled": False,
             "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}},
             "expected_case_surface_set": [["case", "tool"]],
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20,"scope":"Global","visibility":"All","grouping":"None","match_mode":"FinalTokenPrefix","lexical_expression":"x"}}],
@@ -71,11 +71,11 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             args = type("Args", (), {"artifacts":str(root), "label":"same"})()
             def nested(_):
                 with self.assertRaisesRegex(SystemExit, "reserved"):
-                    bench.run(args)
+                    bench.run(type("Args", (), {"artifacts":str(root), "label":"different"})())
                 return 0
             with mock.patch.object(bench, "_run_reserved", side_effect=nested):
                 self.assertEqual(bench.run(args), 0)
-            self.assertFalse((root / "runs" / ".same.reserved").exists())
+            self.assertFalse((root / "runs" / ".active-run.reserved").exists())
 
     def test_capture_rejects_foreign_directory_without_chmod(self):
         with tempfile.TemporaryDirectory() as d:
@@ -98,11 +98,10 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 child.terminate(); child.wait(timeout=5); child.stdout.close()
 
     def test_native_flags_recorded_without_secret_registry_values(self):
-        with mock.patch.dict("os.environ", {"CC":"clang", "CFLAGS_aarch64_apple_darwin":"-O2", "LIBSQLITE3_FLAGS":"SQLITE_DEFAULT_CACHE_SIZE=-8000", "LIBSQLITE3_SYS_USE_PKG_CONFIG":"1", "CARGO_REGISTRY_TOKEN":"secret"}), mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
+        with mock.patch.dict("os.environ", {"CC":"clang", "CFLAGS_aarch64_apple_darwin":"-O2", "LIBSQLITE3_FLAGS":"SQLITE_DEFAULT_CACHE_SIZE=-8000",  "CARGO_REGISTRY_TOKEN":"secret"}), mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
             env=bench._build_configuration()["environment"]
             self.assertEqual(env["CC"],"clang")
             self.assertEqual(env["LIBSQLITE3_FLAGS"],"SQLITE_DEFAULT_CACHE_SIZE=-8000")
-            self.assertEqual(env["LIBSQLITE3_SYS_USE_PKG_CONFIG"],"1")
             self.assertEqual(env["CFLAGS_aarch64_apple_darwin"],"-O2")
             self.assertNotIn("CARGO_REGISTRY_TOKEN",env)
 
@@ -190,6 +189,14 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit,"production"):bench.snapshot(args)
                 opened.assert_not_called()
 
+    def test_complete_execution_shapes_and_unsupported_linkage(self):
+        for key,value in [("environment",{"garbage":"x"}),("runtime",{"worker_threads":2}),("sqlite_pragmas",{"read_only":True})]:
+            with self.assertRaisesRegex(SystemExit,"metadata"):bench._validate_run(self._complete_run(**{key:value}),"bad")
+        with mock.patch.dict("os.environ",{"LIBSQLITE3_SYS_USE_PKG_CONFIG":"1"}):
+            with self.assertRaisesRegex(SystemExit,"external SQLite linkage unsupported"):bench._build_configuration()
+        run=self._complete_run();run["environment"]["cpu_count"]="0"
+        with self.assertRaisesRegex(SystemExit,"environment values"):bench._validate_run(run,"bad")
+
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "scenarios.json"
@@ -220,7 +227,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             with mock.patch.object(bench, "_run_reserved", side_effect=interrupted):
                 with self.assertRaises(KeyboardInterrupt): bench.run(args)
             self.assertIs(bench.signal.getsignal(bench.signal.SIGTERM), previous)
-            self.assertFalse((root / "runs" / ".signal.reserved").exists())
+            self.assertFalse((root / "runs" / ".active-run.reserved").exists())
 
     def test_same_host_overlap_is_rejected(self):
         before = self._complete_run(started_at_unix=1, completed_at_unix=3)
@@ -568,7 +575,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             before, after = root / "a.json", root / "b.json"
             base = self._complete_run()
             before.write_text(json.dumps(base))
-            after.write_text(json.dumps({**base, "run_uuid":"other", "started_at_unix":0.0,"completed_at_unix":1.0, "runtime": {"worker_threads": 3}}))
+            after.write_text(json.dumps({**base, "run_uuid":"other", "started_at_unix":0.0,"completed_at_unix":1.0, "runtime":{"worker_threads":3,"measurement_clock":"monotonic"}}))
             with self.assertRaisesRegex(SystemExit, "regime"):
                 bench.compare(type("Args", (), {"before": str(before), "after": str(after)})())
 
