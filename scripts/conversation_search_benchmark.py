@@ -152,7 +152,7 @@ def _build_configuration() -> dict:
         if re.fullmatch(r"(?:CC|CXX|CFLAGS|CXXFLAGS|AR|ARFLAGS)_[A-Za-z0-9_]+", key) or key.startswith("CARGO_PROFILE_") or re.fullmatch(r"CARGO_TARGET_[A-Z0-9_]+_(RUSTFLAGS|LINKER|RUNNER)", key) or key in {"CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_JOBS"}
         or key in {
             "RUSTFLAGS", "RUSTUP_TOOLCHAIN", "TARGET", "PROFILE", "RUSTC",
-            "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CC", "CXX", "CFLAGS", "CXXFLAGS", "AR", "ARFLAGS", "HOST_CC", "HOST_CFLAGS",
+            "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CC", "CXX", "CFLAGS", "CXXFLAGS", "AR", "ARFLAGS", "HOST_CC", "HOST_CFLAGS", "LIBSQLITE3_FLAGS", "SQLITE_MAX_VARIABLE_NUMBER", "SQLITE_MAX_EXPR_DEPTH",
         }
     }
     host = next((line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:")), None)

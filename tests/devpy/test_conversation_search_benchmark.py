@@ -96,9 +96,10 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 child.terminate(); child.wait(timeout=5); child.stdout.close()
 
     def test_native_flags_recorded_without_secret_registry_values(self):
-        with mock.patch.dict("os.environ", {"CC":"clang", "CFLAGS_aarch64_apple_darwin":"-O2", "CARGO_REGISTRY_TOKEN":"secret"}), mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
+        with mock.patch.dict("os.environ", {"CC":"clang", "CFLAGS_aarch64_apple_darwin":"-O2", "LIBSQLITE3_FLAGS":"SQLITE_DEFAULT_CACHE_SIZE=-8000", "CARGO_REGISTRY_TOKEN":"secret"}), mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
             env=bench._build_configuration()["environment"]
             self.assertEqual(env["CC"],"clang")
+            self.assertEqual(env["LIBSQLITE3_FLAGS"],"SQLITE_DEFAULT_CACHE_SIZE=-8000")
             self.assertEqual(env["CFLAGS_aarch64_apple_darwin"],"-O2")
             self.assertNotIn("CARGO_REGISTRY_TOKEN",env)
 
