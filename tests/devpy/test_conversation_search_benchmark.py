@@ -234,6 +234,14 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 args=type("Args",(),{"artifacts":str(Path(d)/"artifact"),"source":"unused", "deadline":deadline})()
                 with self.assertRaisesRegex(SystemExit,"finite positive"):bench.snapshot(args)
 
+    def test_native_compiler_identity_change_refuses_comparison(self):
+        before=self._complete_run();after=self._complete_run()
+        after["build_configuration"]["native_compiler"]["sha256"]="different binary"
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/"before.json").write_text(json.dumps(before));(root/"after.json").write_text(json.dumps(after))
+            with self.assertRaisesRegex(SystemExit,"build_configuration"):
+                bench.compare(type("Args",(),{"before":str(root/"before.json"),"after":str(root/"after.json")})())
+
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "scenarios.json"
