@@ -954,15 +954,15 @@ def _validate_run(run: dict, name: str) -> dict:
     policies = run["case_policies"]
     try:
         policy_keys = [(p["case_id"], p["surface"]) for p in policies]
-        assert len(set(policy_keys)) == len(policy_keys) and set(policy_keys) == {tuple(pair) for pair in run["expected_case_surface_set"]}
+        if not (len(set(policy_keys)) == len(policy_keys) and set(policy_keys) == {tuple(pair) for pair in run["expected_case_surface_set"]}): raise ValueError("invalid policy")
         for p in policies:
             v=p["policy"]
-            assert set(v)=={"scope","visibility","grouping","match_mode","limit","lexical_expression"}
-            assert type(v["limit"]) is int and v["limit"]>0
-            assert isinstance(v["scope"],str) and v["scope"] and v["visibility"] in {"All", "UserTopLevel"} and v["grouping"] in {"None", "BestPerConversation"} and v["match_mode"] in {"ExactTerms", "FinalTokenPrefix"} and isinstance(v["lexical_expression"], str) and v["lexical_expression"]
+            if not (set(v)=={"scope","visibility","grouping","match_mode","limit","lexical_expression"}): raise ValueError("invalid policy")
+            if not (type(v["limit"]) is int and v["limit"]>0): raise ValueError("invalid policy")
+            if not (isinstance(v["scope"],str) and v["scope"] and v["visibility"] in {"All", "UserTopLevel"} and v["grouping"] in {"None", "BestPerConversation"} and v["match_mode"] in {"ExactTerms", "FinalTokenPrefix"} and isinstance(v["lexical_expression"], str) and v["lexical_expression"]): raise ValueError("invalid policy")
             scope = v["scope"]
-            assert scope == "Global" or re.fullmatch(r'(?:Conversations|GlobalExcluding)\(\[.*\]\)', scope)
-    except (AssertionError,KeyError,TypeError): raise SystemExit(f"refusing comparison: {name} invalid case policies")
+            if not (scope == "Global" or re.fullmatch(r'(?:Conversations|GlobalExcluding)\(\[.*\]\)', scope)): raise ValueError("invalid policy")
+    except (ValueError,KeyError,TypeError): raise SystemExit(f"refusing comparison: {name} invalid case policies")
     build = run["build_configuration"]
     if not isinstance(build, dict) or any(
         key not in build or not isinstance(build[key], (str, list, dict))
