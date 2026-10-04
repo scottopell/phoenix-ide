@@ -189,7 +189,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 Path(kwargs["env"]["PHOENIX_SEARCH_BENCH_OUT"]).write_text("fresh")
                 return CompletedProcess()
 
-            with mock.patch.object(bench, "_ensure_clean_source"), mock.patch.object(
+            with mock.patch.object(bench, "_ensure_ignored_artifacts"), mock.patch.object(bench, "_ensure_clean_source"), mock.patch.object(
                 bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}}
             ), mock.patch.object(bench, "_git_commit", return_value="commit"), mock.patch.object(bench.platform, "platform", return_value="platform"), mock.patch.object(
                 bench.platform, "processor", return_value="processor"
