@@ -95,6 +95,21 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             finally:
                 child.terminate(); child.wait(timeout=5); child.stdout.close()
 
+    def test_native_flags_recorded_without_secret_registry_values(self):
+        with mock.patch.dict("os.environ", {"CC":"clang", "CFLAGS_aarch64_apple_darwin":"-O2", "CARGO_REGISTRY_TOKEN":"secret"}), mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
+            env=bench._build_configuration()["environment"]
+            self.assertEqual(env["CC"],"clang")
+            self.assertEqual(env["CFLAGS_aarch64_apple_darwin"],"-O2")
+            self.assertNotIn("CARGO_REGISTRY_TOKEN",env)
+
+    def test_invalid_marker_does_not_chmod_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); (root/"capture-manifest.json").write_text("{}")
+            root.chmod(0o755)
+            with self.assertRaisesRegex(SystemExit,"ownership"):
+                bench.snapshot(type("Args",(),{"artifacts":str(root)})())
+            self.assertEqual(root.stat().st_mode & 0o777,0o755)
+
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "scenarios.json"
