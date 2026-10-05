@@ -115,7 +115,8 @@ the installed runtime/configuration still match the captured predecessor and the
 exclusively owned database remains legacy. It resumes that verified unchanged
 predecessor without fabricating a snapshot or claiming database restoration.
 A missing proof with changed runtime or modern database fails closed; it is not permission to discard the ownership fence.
-An interrupted `preparing` transaction without a manifest uses the same command:
+An interrupted `preparing` transaction before handoff uses the same command,
+even if its immutable manifest was already persisted:
 only matching preparation metadata, a dead recorded PID, and confirmed helper
 absence permit terminal status and owned-claim release. A live or reused PID,
 missing metadata, or unknown launchctl error refuses recovery without touching

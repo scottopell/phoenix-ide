@@ -2,7 +2,7 @@
 
 ## Scope
 
-Safe replacement of Phoenix's native macOS production LaunchAgent from a local checkout or a published GitHub release. Linux deployment modes are outside this specification.
+Safe replacement of Phoenix's native macOS production LaunchAgent from exact checked local `HEAD`, an immutable published GitHub release, or the explicitly selected protected prepared-artifact paired upgrade under REQ-LDD-017. Linux deployment modes are outside this specification.
 
 ## Requirements
 
@@ -54,6 +54,8 @@ When status or deployment encounters a stale nonterminal transaction, the system
 
 The local command shall deploy exact local `HEAD` after checks and compilation and require the candidate to embed that complete 40-character lowercase commit SHA. The release command shall resolve one immutable published tag and its exact commit, select the host-architecture macOS asset, verify its `SHA256SUMS` entry, and require its complete 40-character lowercase embedded git SHA to equal that commit exactly; it shall not run repository checks, dependency installation, worktree mutation, or compilation.
 
+The explicitly selected prepared-artifact source SHALL be admitted only under REQ-LDD-017, without local rebuild or ad-hoc resigning; it SHALL NOT expand ordinary local/release rollback guarantees.
+
 WHEN `latest` is requested,
 THE release command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
 
@@ -62,7 +64,7 @@ THE release command SHALL require the tag, GitHub prerelease metadata, full embe
 
 ### REQ-LDD-012 — Unambiguous command surface
 
-The deployment command shall accept `prod deploy` for local `HEAD` and `prod deploy --release TAG|latest` for published releases, and shall reject positional versions with migration guidance rather than building a local source tag.
+The deployment command shall accept `prod deploy` for local `HEAD`, `prod deploy --release TAG|latest` for published releases, and the complete three-option prepared-artifact paired command under REQ-LDD-017, and shall reject positional versions with migration guidance rather than building a local source tag.
 
 ### REQ-LDD-013 — Disposable integration safety
 
@@ -91,8 +93,8 @@ THE SYSTEM SHALL require macOS launchd, require all three options together, reje
 
 THE SYSTEM SHALL accept only a protected `prepare-main` receipt for the host architecture whose exact full commit, version, Developer ID signature, hardened runtime, accepted notarization, stapled ticket, Gatekeeper result, embedded-helper equivalence, and standalone SHA-256 bytes all verify. The candidate source kind SHALL be `prepared_artifact`, distinct from the clean controller HEAD source commit. The system SHALL never ad-hoc resign the prepared binary.
 
-THE handoff manifest SHALL structurally record the paired ProductConversation database-upgrade mode, exact controller source commit, helper bytes, captured predecessor binary/plist identities, database path, durable SQLite backup proof, and rollback state. The helper SHALL reject missing or inconsistent fields and SHALL require the controller helper bytes to match the recorded clean controller source and protocol.
+THE handoff manifest SHALL structurally record the paired ProductConversation database-upgrade mode, exact controller source commit, helper bytes, captured predecessor binary/plist identities, database path, fixed private backup/proof destinations, and transaction identity. The snapshot proof and evolving rollback/status observations SHALL be separate durable records bound to that immutable manifest; they SHALL NOT be fabricated or added by mutating the handoff. The helper SHALL reject missing or inconsistent fields and SHALL require the controller helper bytes to match the recorded clean controller source and protocol.
 
 After backend-managed quiesce confirms the predecessor stopped, THE helper SHALL prove no other process has the database, WAL, or SHM open using bounded macOS `lsof`, take a SQLite backup-API snapshot into a private mode-700 transaction directory with a mode-600 database, validate integrity, and durably verify the snapshot before candidate startup. It SHALL never raw-copy a live database.
 
-IF candidate activation or health verification fails, THE helper SHALL stop the candidate first, re-prove exclusive offline ownership, restore and integrity-check the matching snapshot while removing stale WAL/SHM only under that proof, atomically restore the predecessor binary/plist, and start the predecessor only after database restoration. If any proof fails it SHALL leave the service stopped, persist actionable recovery status, and retain the active claim. Existing runtime-only rollback remains unchanged. Before a snapshot proof exists, a failure MAY resume the predecessor only after confirmed teardown, exclusive offline ownership, legacy ledger/table eligibility, and captured binary/configuration checksum equality prove that candidate mutation has not occurred. This path SHALL NOT claim database restoration. An interrupted pre-manifest preparation SHALL release only its matching claim after durable terminal status, a dead recorded preparation PID, and confirmed target helper absence; live, reused, missing, or unproven process identity SHALL retain ownership. Successful commit SHALL remove only the temporary database-adjacent restore reservation and fsync its parent, retaining the audit snapshot/proof.
+IF candidate activation or health verification fails, THE helper SHALL stop the candidate first, re-prove exclusive offline ownership, restore and integrity-check the matching snapshot while removing stale WAL/SHM only under that proof, atomically restore the predecessor binary/plist, and start the predecessor only after database restoration. If any proof fails it SHALL leave the service stopped, persist actionable recovery status, and retain the active claim. Existing runtime-only rollback remains unchanged. Before a snapshot proof exists, a failure MAY resume the predecessor only after confirmed teardown, exclusive offline ownership, legacy ledger/table eligibility, and captured binary/configuration checksum equality prove that candidate mutation has not occurred. This path SHALL NOT claim database restoration. An interrupted pre-handoff preparation, whether or not its immutable manifest has already been persisted, SHALL release only its matching claim after durable terminal status, a dead recorded preparation PID, and confirmed target helper absence; live, reused, missing, or unproven process identity SHALL retain ownership. Successful commit SHALL remove only the temporary database-adjacent restore reservation and fsync its parent, retaining the audit snapshot/proof.

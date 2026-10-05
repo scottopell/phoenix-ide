@@ -10022,7 +10022,15 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
         raise SystemExit("paired recovery requires macOS and a safe transaction ID")
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
-    if not manifest_path.exists():
+    try:
+        recovery_status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        recovery_status = {}
+    if not isinstance(recovery_status, dict):
+        recovery_status = {}
+    if recovery_status.get("transaction_id") == transaction_id and recovery_status.get("state") == "committed":
+        raise SystemExit("committed paired transactions cannot enter database rollback; inspect pending publication/cleanup guidance in prod status")
+    if not manifest_path.exists() or recovery_status.get("state") == "preparing":
         with _launchd_claim_lock():
             status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
             if _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("source_kind") != "prepared_artifact" or status.get("state") != "preparing":
@@ -10044,11 +10052,11 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
             status.update(
                 state="precondition_failed",
                 updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                failure="interrupted preparation ended before an activation manifest existed",
+                failure="interrupted preparation ended before activation handoff",
             )
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, status)
             _release_launchd_deploy_claim_unlocked(transaction_id)
-        print("Interrupted pre-manifest paired preparation verified; runtime/database untouched and ownership released.")
+        print("Interrupted pre-handoff paired preparation verified; runtime/database untouched and ownership released.")
         return
     payload = json.loads(manifest_path.read_text())
     paired = payload.get("paired_database_upgrade")

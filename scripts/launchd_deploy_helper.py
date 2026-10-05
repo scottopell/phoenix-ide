@@ -1141,6 +1141,8 @@ def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = 
         prior = {}
     if prior.get("transaction_id") != manifest.transaction_id:
         prior = {}
+    if prior.get("state") in {"committed", "preparing"}:
+        return
     previous = prior.get("rollback_failure")
     merged = f"{previous}; recovery attempt failed: {error}" if previous else error
     write_status(manifest, "activation_failed_rollback_failed", failure=prior.get("failure"), rollback_failure=merged)

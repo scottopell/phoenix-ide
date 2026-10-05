@@ -710,6 +710,15 @@ class ActivationTests(unittest.TestCase):
             result = subprocess.CompletedProcess([], 113, "", f'Could not find service "{manifest.label}" in domain for user gui: {manifest.uid}')
             launchctl = helper.Launchctl(manifest, run=mock.Mock(return_value=result))
             self.assertEqual(("not_loaded", None), launchctl.inspect())
+    def test_rejected_recovery_never_changes_committed_or_preparing_status(self):
+        for state in ("committed", "preparing"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
+                manifest, *_ = self._full_paired_fixture(Path(td))
+                helper.write_status(manifest, state, finalization_pending=state == "committed")
+                before = Path(manifest.status_path).read_bytes()
+                helper.record_recovery_error(manifest, "rejected state")
+                self.assertEqual(Path(manifest.status_path).read_bytes(), before)
+
     def test_absence_probe_requires_nonzero_print_and_exact_target_diagnostic(self):
         label, uid = "dev.phoenix.activation.test", 501
         diagnostic = f'Could not find service "{label}" in domain gui/{uid}'
@@ -1381,6 +1390,41 @@ class PreparationTests(unittest.TestCase):
                 self.dev.cmd_prod_recover_paired("early")
             self.assertFalse(active.exists())
             self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
+
+    def test_committed_recovery_refusal_never_bootstraps_or_rewrites_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staging = root / "transactions" / "committed"
+            staging.mkdir(parents=True)
+            (staging / "manifest.json").write_text(json.dumps({"paired_database_upgrade": {}}))
+            active, status = root / "active", root / "status.json"
+            active.write_text("committed\n")
+            payload = {"transaction_id": "committed", "source_kind": "prepared_artifact", "state": "committed", "finalization_pending": True}
+            status.write_text(json.dumps(payload))
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev.subprocess, "run") as run:
+                with self.assertRaisesRegex(SystemExit, "cannot enter database rollback"):
+                    self.dev.cmd_prod_recover_paired("committed")
+                run.assert_not_called()
+            self.assertEqual(json.loads(status.read_text()), payload)
+            self.assertTrue(active.exists())
+
+    def test_manifest_persisted_preparing_recovery_does_not_touch_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staging = root / "transactions" / "preparing"
+            staging.mkdir(parents=True)
+            manifest = staging / "manifest.json"
+            manifest.write_text(json.dumps({"paired_database_upgrade": {}}))
+            active, status = root / "active", root / "status.json"
+            active.write_text("preparing\n")
+            status.write_text(json.dumps({"transaction_id": "preparing", "source_kind": "prepared_artifact", "state": "preparing", "preparing_pid": 123}))
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                self.dev.cmd_prod_recover_paired("preparing")
+            self.assertEqual(run.call_count, 1)
+            self.assertNotIn("bootstrap", run.call_args.args[0])
+            self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
+            self.assertFalse(active.exists())
+            self.assertEqual(json.loads(manifest.read_text()), {"paired_database_upgrade": {}})
 
     def test_status_recovers_paired_guidance_from_claim_without_readable_status(self):
         for contents in (None, "{", "[]", "null"):

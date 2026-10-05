@@ -262,8 +262,9 @@ external entity TargetService {
 --   bootstrap inode so strict loaded-path restart verification remains valid.
 --   True for ordinary sources.
 -- pre_manifest_abandonment_verified(transaction) -> Boolean
---   Matching preparing status preceded owned claim publication, no manifest
---   exists, recorded preparation PID is dead, and helper absence is confirmed.
+--   Matching preparing status preceded owned claim publication, manifest
+--   is absent or exists before handoff; recorded preparation PID is dead and
+--   helper absence is confirmed. Manifest presence does not imply handoff.
 -- PreparedAbandonmentVerified(transaction)
 --   Operator requested recovery and pre_manifest_abandonment_verified holds.
 
@@ -271,9 +272,9 @@ external entity TargetService {
 --   Fallible staging completed under the already acquired preparation claim.
 -- PairedPreflightVerified(transaction, proof)
 --   Legacy path/schema and independent source/controller preflight was verified.
--- PairedOfflineOwnershipVerified(transaction, proof, ownership)
+-- PairedOfflineOwnershipVerified(transaction, ownership)
 --   Service teardown and bounded exclusive offline ownership were verified.
--- PairedSnapshotVerified(transaction, proof, ownership, snapshot)
+-- PairedSnapshotVerified(transaction, snapshot)
 --   Context-bound SQLite snapshot integrity was verified after offline ownership.
 -- HelperCapacityFailed(transaction, failure)
 --   Initial physical allocation failed after handoff but before target stop.
@@ -336,22 +337,24 @@ rule ObservePreparedPreflight {
 }
 
 rule ObserveOfflineOwnership {
-    when: PairedOfflineOwnershipVerified(transaction, proof, ownership)
+    when: PairedOfflineOwnershipVerified(transaction, ownership)
     requires: transaction.kind = PreparedArtifactDeployment
     requires: transaction.state = activating
     requires: transaction.paired_lifecycle_observation.kind = PreparedArtifactPreflight
     ensures: transaction.paired_lifecycle_observation = PreparedArtifactOfflineOwned.created(
-        prepared_artifact_proof: proof, offline_ownership_proof: ownership
+        prepared_artifact_proof: transaction.paired_lifecycle_observation.prepared_artifact_proof,
+        offline_ownership_proof: ownership
     )
 }
 
 rule ObserveSnapshotProof {
-    when: PairedSnapshotVerified(transaction, proof, ownership, snapshot)
+    when: PairedSnapshotVerified(transaction, snapshot)
     requires: transaction.kind = PreparedArtifactDeployment
     requires: transaction.state = activating
     requires: transaction.paired_lifecycle_observation.kind = PreparedArtifactOfflineOwned
     ensures: transaction.paired_lifecycle_observation = PreparedArtifactSnapshotVerified.created(
-        prepared_artifact_proof: proof, offline_ownership_proof: ownership,
+        prepared_artifact_proof: transaction.paired_lifecycle_observation.prepared_artifact_proof,
+        offline_ownership_proof: transaction.paired_lifecycle_observation.offline_ownership_proof,
         snapshot_integrity_proof: snapshot
     )
 }

@@ -2,7 +2,7 @@
 
 ## Current reality
 
-Native macOS production deployment prepares either local `HEAD` or a checksummed published release, requires the candidate's complete 40-character embedded SHA to equal the selected source commit, stages rollback inputs and a redacted manifest, and transfers activation to a distinct one-shot LaunchAgent. The helper serializes activation, performs atomic replacement, requires exact `/api/version` identity, and attempts verified runtime-artifact rollback on failure. A captured already-installed predecessor may retain a legacy 12-character identity only for that rollback verification. Durable status is reported by `./dev.py prod status`.
+Native macOS production deployment prepares local `HEAD`, a checksummed published release, or the explicitly selected protected prepared-artifact paired source, requires the candidate's complete 40-character embedded SHA to equal the selected source commit, stages rollback inputs and a redacted manifest, and transfers activation to a distinct one-shot LaunchAgent. The helper serializes activation, performs atomic replacement, requires exact `/api/version` identity, and attempts verified runtime-artifact rollback on failure. A captured already-installed predecessor may retain a legacy 12-character identity only for that rollback verification. Durable status is reported by `./dev.py prod status`.
 
 Installed-runtime restart is a separate launchd-owned transaction. It sends SIGHUP without unloading the socket-activated target, verifies a new PID with the same exact identity, preserves the binary, plist, environment, listener, and deployed SHA, and reports its own durable status without replacing deployment status.
 
@@ -22,7 +22,7 @@ The prepared-artifact paired path is deliberately narrower than ordinary release
 
 | Boundary | OS / filesystem state | Supported outcome and ownership |
 | --- | --- | --- |
-| Preparing, no manifest | Predecessor unchanged; matching status/PID precede claim | Dead preparation PID plus confirmed helper absence permit terminal status then owned-claim release; missing evidence/live or reused PID refuses |
+| Preparing, before handoff (manifest absent or persisted) | Predecessor unchanged; matching status/PID precede claim | Dead preparation PID plus confirmed helper absence permit terminal status then owned-claim release; missing evidence/live or reused PID refuses |
 | Helper admitted, before stop | Predecessor runs; private snapshot and DB-adjacent restore capacity physically allocated | Capacity failure reports precondition failure without disruption |
 | Stopped, before snapshot proof | Target service absent; predecessor plist quarantined; binary unchanged | Exclusive legacy DB plus captured binary/config hashes allow private predecessor resume; no DB restoration claimed; release unproven temporary allocations after verified terminal resume. Unknown ownership or modern DB stays stopped/fenced |
 | Snapshot verified, candidate installed/started | Matching snapshot/proof retained; candidate bootstraps private plist; no auto-loaded target plist | Install/start/health interruption retains claim and audit proof; login cannot discover an unverified candidate plist |
