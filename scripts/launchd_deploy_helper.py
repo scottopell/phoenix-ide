@@ -1558,11 +1558,34 @@ def resume_migration(manifest: Manifest) -> str:
             else:
                 raise ActivationError("preparing migration controller still alive")
         launchctl = Launchctl(manifest)
+        if status.get("state") == "migration_resumed":
+            validate_manifest_identities(manifest)
+            validate_manifest_mode(manifest)
+            verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "captured predecessor binary")
+            verify_staged(manifest.target_binary, manifest.rollback_binary_sha256, "resumed predecessor binary")
+            private = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "resumed private predecessor plist")
+            verify_staged(manifest.target_plist, manifest.rollback_plist_sha256, "published predecessor plist")
+            if not Path(manifest.target_plist).samefile(private):
+                raise ActivationError("resumed predecessor publication identity mismatch")
+            state, pid = launchctl.inspect()
+            if state not in {"running", "active"} or pid is None:
+                raise ActivationError("resumed predecessor is not running")
+            require_loaded_plist(manifest, launchctl, private)
+            wait_for_identity(manifest, manifest.previous, health_url=manifest.previous_health_url, health_insecure_tls=manifest.previous_health_insecure_tls, health_json=manifest.previous_health_json)
+            deployed = Path(manifest.deployed_sha_path)
+            if manifest.previous_deployed_sha is None:
+                if deployed.exists() or deployed.is_symlink():
+                    raise ActivationError("resumed predecessor deployed identity must remain absent")
+            else:
+                verify = deployed.read_text().strip()
+                if deployed.is_symlink() or verify != manifest.previous_deployed_sha:
+                    raise ActivationError("resumed predecessor deployed identity mismatch")
+            return "migration_resumed"
         prepared = []
         try:
             validate_manifest_identities(manifest)
             validate_manifest_mode(manifest)
-            if status.get("recovery_mode") is not None or status.get("state") == "migration_resumed":
+            if status.get("recovery_mode") is not None:
                 raise ActivationError("migration resume startup checkpoint exists; refuse startup replay")
             require_service_absent(launchctl)
             assert_database_exclusive(manifest)

@@ -43,6 +43,8 @@ class MigrationControllerTests(unittest.TestCase):
             }
             receipt_path = root / "receipt.json"
             receipt_path.write_text(json.dumps(receipt))
+            for path in (backup, rehearsal, receipt_path):
+                path.chmod(0o600)
             deploy = root / "deploy"
             staging = deploy / "transactions" / "test-modern"
             paths = {
@@ -143,6 +145,29 @@ class MigrationControllerTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 dev.launchd_prod_deploy(controller=options)
             self.assertFalse(dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+
+    def test_nonprivate_original_inputs_rejected_before_staging(self):
+        for kind in ("receipt", "backup", "rehearsal"):
+            for permission in (0o040, 0o020, 0o010, 0o004, 0o002, 0o001):
+                with self.subTest(kind=kind, permission=oct(permission)), self.deployment() as (_, staging, options, receipt, events, _):
+                    path = options.migration_backup_receipt if kind == "receipt" else Path(receipt[kind + "_path"])
+                    path.chmod(0o600 | permission)
+                    with self.assertRaisesRegex(SystemExit, "private"):
+                        dev.launchd_prod_deploy(controller=options)
+                    self.assertFalse(staging.exists())
+                    self.assertFalse(dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600 | permission)
+                    self.assertFalse(any(event[0] == "command" for event in events))
+
+    def test_staging_rechecks_original_backup_privacy(self):
+        with self.deployment() as (_, staging, _, receipt, _, _):
+            staging.mkdir(parents=True)
+            retained_helper = staging / "helper.py"
+            retained_helper.write_text("helper")
+            Path(receipt["backup_path"]).chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "private"):
+                dev._stage_ordinary_migration(receipt, staging, retained_helper)
+            self.assertFalse(list(staging.glob("migration-*.sqlite3")))
 
     def test_receipt_symlinks_and_hardlinks_rejected(self):
         with self.deployment() as (root, _, options, receipt, _, _):

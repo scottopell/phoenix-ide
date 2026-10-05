@@ -415,18 +415,85 @@ class ModernMigrationTests(unittest.TestCase):
         self.assertEqual(1, sum(isinstance(event, tuple) for event in self.backend.events))
         self.assertTrue(Path(self.manifest.active_path).exists())
 
-    def test_resume_post_terminal_retained_claim_fails_closed_without_replay(self):
+    def test_resume_post_terminal_retained_claim_finalizes_without_runtime_or_db_replay(self):
         self.fail_activation()
         self.restore_manually()
         self.assertEqual("migration_resumed", helper.resume_migration(self.manifest))
-        self.mutate()  # Later accepted writes must not be discarded by a retry.
-        before = Path(self.manifest.ordinary_migration.database_path).read_bytes()
-        starts = sum(isinstance(event, tuple) for event in self.backend.events)
-        self.assertEqual("migration_failed_stopped", helper.resume_migration(self.manifest))
-        self.assertEqual(starts, sum(isinstance(event, tuple) for event in self.backend.events))
-        self.assertEqual(("not_loaded", None), self.backend.state)
-        self.assertFalse(Path(self.manifest.target_plist).exists())
-        self.assertEqual(before, Path(self.manifest.ordinary_migration.database_path).read_bytes())
+        self.mutate()
+        database = Path(self.manifest.ordinary_migration.database_path)
+        before = database.read_bytes()
+        status = Path(self.manifest.status_path).read_bytes()
+        events = list(self.backend.events)
+        argv = ["helper", "resume-migration", "--manifest", "unused", "--helper-label", self.manifest.helper_label, "--uid", str(self.manifest.uid)]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(helper.Manifest, "load", return_value=self.manifest), mock.patch.object(helper, "validate_ordinary_receipt", side_effect=AssertionError("no offline DB validation after terminal success")):
+            self.assertEqual(0, helper.main())
+        self.assertEqual(events, self.backend.events)
+        self.assertEqual(("running", 123), self.backend.state)
+        self.assertTrue(Path(self.manifest.target_plist).samefile(self.manifest.rollback_plist))
+        self.assertEqual(before, database.read_bytes())
+        self.assertEqual(status, Path(self.manifest.status_path).read_bytes())
+        self.assertFalse(Path(self.manifest.active_path).exists())
+
+    def test_terminal_resume_verification_failure_preserves_success_and_owned_fence(self):
+        for defect in ("health", "binary", "private_plist", "published_plist", "loaded_plist", "stopped", "deployed_sha"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as td:
+                manifest, backend = fixture(Path(td).resolve())
+                helper.write_status(manifest, "migration_failed_stopped")
+                with mock.patch.object(helper, "__file__", manifest.ordinary_migration.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend):
+                    self.assertEqual("migration_resumed", helper.resume_migration(manifest))
+                    if defect == "health":
+                        self.health.side_effect = helper.ActivationError("identity mismatch")
+                    elif defect == "binary":
+                        Path(manifest.target_binary).write_bytes(b"wrong binary")
+                    elif defect == "private_plist":
+                        Path(manifest.rollback_plist).write_bytes(b"wrong private plist")
+                    elif defect == "published_plist":
+                        data = Path(manifest.target_plist).read_bytes()
+                        Path(manifest.target_plist).unlink()
+                        Path(manifest.target_plist).write_bytes(data)
+                    elif defect == "loaded_plist":
+                        backend.loaded = manifest.candidate_plist
+                    elif defect == "stopped":
+                        backend.state = ("not_loaded", None)
+                    else:
+                        Path(manifest.deployed_sha_path).write_text("c" * 40)
+                    status = Path(manifest.status_path).read_bytes()
+                    events = list(backend.events)
+                    with self.assertRaises((helper.ActivationError, OSError)):
+                        helper.resume_migration(manifest)
+                    self.assertEqual(status, Path(manifest.status_path).read_bytes())
+                    self.assertEqual(events, backend.events)
+                    self.assertTrue(Path(manifest.active_path).exists())
+                    self.assertTrue(Path(manifest.target_plist).exists())
+                    self.health.side_effect = None
+
+    def test_terminal_retry_preserves_absent_previous_deployed_marker(self):
+        self.manifest = dataclasses.replace(self.manifest, previous_deployed_sha=None)
+        self.backend.manifest = self.manifest
+        self.fail_activation()
+        self.restore_manually()
+        self.assertEqual("migration_resumed", helper.resume_migration(self.manifest))
+        events = list(self.backend.events)
+        self.assertEqual("migration_resumed", helper.resume_migration(self.manifest))
+        self.assertEqual(events, self.backend.events)
+        self.assertFalse(Path(self.manifest.deployed_sha_path).exists())
+
+    def test_terminal_claim_release_failure_can_retry_without_teardown(self):
+        self.fail_activation()
+        self.restore_manually()
+        self.assertEqual("migration_resumed", helper.resume_migration(self.manifest))
+        status = Path(self.manifest.status_path).read_bytes()
+        events = list(self.backend.events)
+        argv = ["helper", "resume-migration", "--manifest", "unused", "--helper-label", self.manifest.helper_label, "--uid", str(self.manifest.uid)]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(helper.Manifest, "load", return_value=self.manifest):
+            with mock.patch.object(helper, "release_claim", side_effect=OSError("claim release interrupted")):
+                self.assertEqual(1, helper.main())
+            self.assertTrue(Path(self.manifest.active_path).exists())
+            self.assertEqual(status, Path(self.manifest.status_path).read_bytes())
+            self.assertEqual(events, self.backend.events)
+            self.assertEqual(0, helper.main())
+        self.assertFalse(Path(self.manifest.active_path).exists())
+        self.assertEqual(events, self.backend.events)
 
     def test_activation_success_publishes_only_after_exact_identity_and_no_db_writes(self):
         before = Path(self.manifest.ordinary_migration.database_path).read_bytes()

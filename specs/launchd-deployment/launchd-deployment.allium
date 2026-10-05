@@ -557,8 +557,28 @@ rule ResumeManuallyRestoredMigration {
     @guidance
         -- Before predecessor startup persist predecessor_start_checkpoint.
         -- Verify captured runtime/private plist, publish, fsync and release owned claim.
-        -- Any failure retains offline fence; checkpoint retry refuses startup replay.
+        -- Failure before terminal success retains offline fence; an unresolved
+        -- checkpoint refuses startup replay. Terminal success uses claim finalization.
         -- Deploy/restart/stop may not clear a retained migration claim.
+}
+
+-- resumed_predecessor_finalization_verified(transaction, service) -> Boolean
+--   Retained helper binding/absence and operation lock, captured running predecessor
+--   identity/binary/private loaded and published plist inode, deployed identity.
+--   No stopped-database or backup-equivalence check against later accepted writes.
+
+rule FinalizeResumedMigrationClaim {
+    when: MigrationResumeRetried(transaction, service)
+    requires: transaction.state = migration_resumed
+    requires: transaction.ordinary_policy = modern_migration_stopped
+    requires: active_claim_retained(transaction)
+    requires: resumed_predecessor_finalization_verified(transaction, service)
+    ensures: transaction.state = migration_resumed
+    ensures: not DeploymentOwnsActivationClaim(transaction)
+
+    @guidance
+        -- Verify terminal success without startup, teardown, publication or DB replay.
+        -- Verification or claim-release failure preserves terminal status and fence.
 }
 
 rule RollBackFailedOrdinaryActivation {

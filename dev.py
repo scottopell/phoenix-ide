@@ -10059,14 +10059,17 @@ def _helper_plist(
     }, fmt=plistlib.FMT_XML)
 
 
-def _migration_regular_path(value: object) -> Path:
+def _migration_regular_path(value: object, *, private: bool = False) -> Path:
     if not isinstance(value, str):
         raise ValueError("migration path must be a string")
     path = Path(value)
     if not path.is_absolute() or str(path.resolve(strict=True)) != value or path.is_symlink() or not path.is_file():
         raise ValueError("migration path must be canonical and a regular non-symlink file")
-    if path.stat().st_nlink != 1:
+    info = path.stat()
+    if info.st_nlink != 1:
         raise ValueError("migration path must not be hardlinked")
+    if private and info.st_mode & 0o077:
+        raise ValueError("migration receipt, backup and rehearsal must be private (no group/other permissions)")
     return path
 
 
@@ -10076,14 +10079,14 @@ def _read_migration_backup_receipt(receipt_path: Path, installed_env: dict[str, 
         "rehearsal_path", "rehearsal_sha256", "previous_binary_sha256", "previous_plist_sha256",
     }
     try:
-        receipt = json.loads(_migration_regular_path(str(receipt_path)).read_text())
+        receipt = json.loads(_migration_regular_path(str(receipt_path), private=True).read_text())
         if not isinstance(receipt, dict) or set(receipt) != fields | {"schema"} or type(receipt["schema"]) is not int or receipt["schema"] != 1:
             raise ValueError("receipt must have exactly schema 1 fields")
         result = {key: receipt[key] for key in fields}
         for key in fields:
             if key.endswith("_sha256") and (not isinstance(result[key], str) or re.fullmatch(r"[0-9a-f]{64}", result[key]) is None):
                 raise ValueError("receipt SHA-256 is invalid")
-        paths = [_migration_regular_path(result[key]) for key in ("database_path", "backup_path", "rehearsal_path")]
+        paths = [_migration_regular_path(result[key], private=key != "database_path") for key in ("database_path", "backup_path", "rehearsal_path")]
         if len(set(paths)) != 3:
             raise ValueError("receipt database paths must be distinct")
         database = _migration_regular_path(str(installed_env.get("PHOENIX_DB_PATH", PROD_DB_PATH)))
@@ -10105,9 +10108,10 @@ def _read_migration_backup_receipt(receipt_path: Path, installed_env: dict[str, 
 def _stage_ordinary_migration(receipt: dict, staging: Path, helper: Path) -> dict:
     result = dict(receipt)
     for kind in ("backup", "rehearsal"):
+        source_path = _migration_regular_path(receipt[kind + "_path"], private=True)
         fd, name = tempfile.mkstemp(prefix=f"migration-{kind}-", suffix=".sqlite3", dir=staging)
         path = Path(name)
-        with os.fdopen(fd, "wb") as target, Path(receipt[kind + "_path"]).open("rb") as source:
+        with os.fdopen(fd, "wb") as target, source_path.open("rb") as source:
             shutil.copyfileobj(source, target)
             os.fchmod(target.fileno(), 0o600)
             target.flush()
