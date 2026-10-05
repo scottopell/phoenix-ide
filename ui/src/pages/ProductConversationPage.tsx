@@ -678,6 +678,14 @@ function RecallDisclosure({
   );
 }
 
+function compareProjectCoordinatorRevision(left: string, right: string): number {
+  const lhs = BigInt(left);
+  const rhs = BigInt(right);
+  if (lhs < rhs) return -1;
+  if (lhs > rhs) return 1;
+  return 0;
+}
+
 function ProjectCoordinatorSettings({
   snapshot,
   editable,
@@ -1272,13 +1280,16 @@ function ProductConversationPageInner() {
           const currentSnapshot = ownedSnapshotRef.current;
           const currentCanonicalId = currentSnapshot?.value.product_conversation_id;
           const accepted = currentCanonicalId === savedProductConversationId
-            && (currentSnapshot?.value.project_coordinator_revision ?? Number.POSITIVE_INFINITY) <= response.revision;
+            && compareProjectCoordinatorRevision(
+              currentSnapshot?.value.project_coordinator_revision ?? '0',
+              response.revision,
+            ) <= 0;
           snapshotRequestRef.current += 1;
           paginationRequestRef.current += 1;
           setLoadingOlder(false);
           setOwnedSnapshot((current) => {
             if (!accepted || current?.value.product_conversation_id !== savedProductConversationId) return current;
-            if (current.value.project_coordinator_revision > response.revision) return current;
+            if (compareProjectCoordinatorRevision(current.value.project_coordinator_revision, response.revision) > 0) return current;
             return {
               ...current,
               value: {

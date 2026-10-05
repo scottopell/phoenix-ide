@@ -1364,11 +1364,7 @@ const MIGRATION_113: &str = r"
 CREATE TABLE IF NOT EXISTS product_conversation_coordinator_profile_revisions (
     product_conversation_id TEXT PRIMARY KEY NOT NULL
         REFERENCES product_conversations(id) ON DELETE CASCADE,
-    revision INTEGER NOT NULL CHECK (
-        typeof(revision) = 'integer'
-        AND revision >= 0
-        AND revision <= 9007199254740991
-    ),
+    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0),
     last_write_token TEXT NOT NULL CHECK (typeof(last_write_token) = 'text' AND length(last_write_token) > 0),
     UNIQUE (product_conversation_id, revision)
 );

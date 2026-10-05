@@ -373,17 +373,17 @@ pub struct ProjectCoordinatorProfileView {
 pub enum ProjectCoordinatorProfileWriteRequest {
     Enable {
         charter: String,
-        expected_revision: i64,
+        expected_revision: String,
     },
     Disable {
-        expected_revision: i64,
+        expected_revision: String,
     },
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProjectCoordinatorProfileWriteResponse {
-    pub revision: i64,
+    pub revision: String,
     pub profile: Option<ProjectCoordinatorProfileView>,
 }
 
@@ -392,7 +392,7 @@ pub struct ProjectCoordinatorProfileWriteResponse {
 pub struct ProductConversationSnapshotView {
     pub product_conversation_id: String,
     pub close: Option<ProductConversationCloseView>,
-    pub project_coordinator_revision: i64,
+    pub project_coordinator_revision: String,
     pub canonical_route: String,
     pub requested_transcript_row_id: String,
     pub canonical_root: ProductConversationTranscriptRowView,

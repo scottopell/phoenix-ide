@@ -592,6 +592,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_revision_advances_beyond_javascript_safe_integer() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-large-revision").await;
+        let revision = 9_007_199_254_740_991_i64;
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profile_revisions
+             (product_conversation_id, revision, last_write_token) VALUES (?1, ?2, 'seed')",
+        )
+        .bind(id.as_str())
+        .bind(revision)
+        .execute(&db.pool)
+        .await
+        .expect("seed revision");
+        let saved = db
+            .write_project_coordinator_profile(&id, Some("charter"), revision)
+            .await
+            .expect("enable beyond JavaScript integer range");
+        assert!(
+            matches!(saved, ProjectCoordinatorProfileWriteOutcome::Saved(profile) if profile.revision() == revision + 1)
+        );
+        let disabled = db
+            .write_project_coordinator_profile(&id, None, revision + 1)
+            .await
+            .expect("disable beyond JavaScript integer range");
+        assert_eq!(
+            disabled,
+            ProjectCoordinatorProfileWriteOutcome::Disabled {
+                revision: revision + 2
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn direct_profile_insert_advances_revision_fence() {
         let db = Database::open_in_memory().await.expect("database");
         let id = ordinary(&db, "pc-project-coordinator-direct-insert").await;

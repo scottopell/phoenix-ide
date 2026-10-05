@@ -215,7 +215,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   return {
     product_conversation_id: 'pc-1',
     close: null,
-    project_coordinator_revision: overrides.project_coordinator_revision ?? 0,
+    project_coordinator_revision: overrides.project_coordinator_revision ?? '0',
     project_coordinator_profile: null,
     canonical_route: '/product-conversations/pc-1',
     requested_transcript_row_id: 'row-2',
@@ -388,7 +388,7 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getProductConversationSnapshot).mockReset();
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot());
     vi.mocked(api.putProjectCoordinatorProfile).mockReset();
-    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 0, profile: null });
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: '0', profile: null });
     vi.mocked(api.reportProductConversationOpen).mockClear();
     vi.mocked(api.getChain).mockReset();
     vi.mocked(api.getChain).mockResolvedValue(makeChain());
@@ -415,7 +415,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
       type: 'enable',
       charter: 'Coordinate this product.',
-      expected_revision: 0,
+      expected_revision: '0',
     }));
   });
 
@@ -433,7 +433,7 @@ describe('ProductConversationPage', () => {
       .mockResolvedValueOnce(makeSnapshot())
       .mockReturnValueOnce(staleSnapshot)
       .mockRejectedValueOnce(new Error('post-save refresh failed'));
-    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 1, profile: savedProfile });
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: '1', profile: savedProfile });
 
     renderPage('/product-conversations/pc-1');
     await waitForPageReady();
@@ -458,8 +458,8 @@ describe('ProductConversationPage', () => {
 
   it('does not let a delayed save response overwrite a newer profile revision', async () => {
     const { api } = await import('../api');
-    let resolveSave!: (profile: { revision: number; profile: NonNullable<ProductConversationSnapshotView['project_coordinator_profile']> }) => void;
-    const save = new Promise<{ revision: number; profile: NonNullable<ProductConversationSnapshotView['project_coordinator_profile']> }>((resolve) => {
+    let resolveSave!: (profile: { revision: string; profile: NonNullable<ProductConversationSnapshotView['project_coordinator_profile']> }) => void;
+    const save = new Promise<{ revision: string; profile: NonNullable<ProductConversationSnapshotView['project_coordinator_profile']> }>((resolve) => {
       resolveSave = resolve;
     });
     const savedRevisionOne = {
@@ -472,7 +472,7 @@ describe('ProductConversationPage', () => {
     };
     vi.mocked(api.getProductConversationSnapshot)
       .mockResolvedValueOnce(makeSnapshot())
-      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: newerRevision, project_coordinator_revision: 2 }))
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: newerRevision, project_coordinator_revision: '9007199254740993' }))
       .mockRejectedValueOnce(new Error('post-save refresh failed'));
     vi.mocked(api.putProjectCoordinatorProfile).mockReturnValue(save);
 
@@ -489,7 +489,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(screen.getByText('Coordinator ✓')).toBeInTheDocument());
 
     await act(async () => {
-      resolveSave({ revision: 1, profile: savedRevisionOne });
+      resolveSave({ revision: '9007199254740992', profile: savedRevisionOne });
       await save;
     });
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
@@ -510,7 +510,7 @@ describe('ProductConversationPage', () => {
       .mockResolvedValueOnce(makeSnapshot({ has_older: true, before: 'cursor-1' }))
       .mockReturnValueOnce(older)
       .mockRejectedValueOnce(new Error('post-save refresh failed'));
-    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 1, profile: savedProfile });
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: '1', profile: savedProfile });
 
     renderPage('/product-conversations/pc-1');
     await waitForPageReady();
@@ -536,9 +536,9 @@ describe('ProductConversationPage', () => {
     const savedProfile = { charter: 'Re-enabled', updated_at_unix_micros: 4 };
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
       project_coordinator_profile: null,
-      project_coordinator_revision: 3,
+      project_coordinator_revision: '3',
     }));
-    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 4, profile: savedProfile });
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: '4', profile: savedProfile });
 
     renderPage('/product-conversations/pc-1');
     await waitForPageReady();
@@ -550,7 +550,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
       type: 'enable',
       charter: savedProfile.charter,
-      expected_revision: 3,
+      expected_revision: '3',
     }));
   });
 
@@ -559,8 +559,8 @@ describe('ProductConversationPage', () => {
     const refreshedProfile = { charter: 'Server version', updated_at_unix_micros: 2 };
     const savedProfile = { charter: 'Local draft', updated_at_unix_micros: 3 };
     vi.mocked(api.getProductConversationSnapshot)
-      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: { charter: 'Base', updated_at_unix_micros: 1 }, project_coordinator_revision: 1 }))
-      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: refreshedProfile, project_coordinator_revision: 2 }));
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: { charter: 'Base', updated_at_unix_micros: 1 }, project_coordinator_revision: '1' }))
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: refreshedProfile, project_coordinator_revision: '2' }));
     vi.mocked(api.putProjectCoordinatorProfile)
       .mockRejectedValue(new Error('Profile changed elsewhere'));
 
@@ -572,7 +572,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenLastCalledWith('pc-1', {
       type: 'enable',
       charter: savedProfile.charter,
-      expected_revision: 1,
+      expected_revision: '1',
     }));
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
     expect(screen.getByLabelText('Charter')).toHaveValue(savedProfile.charter);
@@ -581,7 +581,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenLastCalledWith('pc-1', {
       type: 'enable',
       charter: savedProfile.charter,
-      expected_revision: 1,
+      expected_revision: '1',
     }));
   });
 
@@ -621,7 +621,7 @@ describe('ProductConversationPage', () => {
       resolveRefresh = resolve;
     });
     vi.mocked(api.getProductConversationSnapshot)
-      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: null, project_coordinator_revision: 0 }))
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: null, project_coordinator_revision: '0' }))
       .mockReturnValueOnce(refresh);
     vi.mocked(api.putProjectCoordinatorProfile).mockRejectedValue(new Error('transient save error'));
 
@@ -639,7 +639,7 @@ describe('ProductConversationPage', () => {
           charter: 'Eventually saved',
           updated_at_unix_micros: 1,
         },
-        project_coordinator_revision: 1,
+        project_coordinator_revision: '1',
       }));
       await refresh;
     });
@@ -656,14 +656,14 @@ describe('ProductConversationPage', () => {
           charter: 'Opened charter',
           updated_at_unix_micros: 1,
         },
-        project_coordinator_revision: 4,
+        project_coordinator_revision: '4',
       }))
       .mockResolvedValue(makeSnapshot({
         project_coordinator_profile: {
           charter: 'Other editor charter',
           updated_at_unix_micros: 2,
         },
-        project_coordinator_revision: 5,
+        project_coordinator_revision: '5',
       }));
     renderPage('/product-conversations/pc-1');
     await waitForPageReady();
@@ -677,7 +677,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
       type: 'enable',
       charter: 'Dirty draft',
-      expected_revision: 4,
+      expected_revision: '4',
     }));
   });
 
@@ -689,10 +689,10 @@ describe('ProductConversationPage', () => {
           charter: 'Saved charter',
           updated_at_unix_micros: 1,
         },
-        project_coordinator_revision: 7,
+        project_coordinator_revision: '7',
       }))
       .mockRejectedValueOnce(new Error('post-disable refresh failed'));
-    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 8, profile: null });
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: '8', profile: null });
     renderPage('/product-conversations/pc-1');
     await waitForPageReady();
 
@@ -702,7 +702,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
       type: 'disable',
-      expected_revision: 7,
+      expected_revision: '7',
     }));
     fireEvent.click(screen.getByText('Coordinator +'));
     expect(screen.getByText(/Revision 8\./)).toBeInTheDocument();
@@ -798,7 +798,7 @@ describe('ProductConversationPage', () => {
       ordinary_lifecycle: 'history',
       writable_transcript_row_id: null,
       project_coordinator_profile: { charter: 'retained charter', updated_at_unix_micros: 7 },
-      project_coordinator_revision: 7,
+      project_coordinator_revision: '7',
     }));
 
     renderPage('/product-conversations/pc-1');
@@ -820,7 +820,7 @@ describe('ProductConversationPage', () => {
       .mockResolvedValueOnce(makeSnapshot({
         product_conversation_id: 'pc-1',
         project_coordinator_profile: { charter: 'Conversation A charter', updated_at_unix_micros: 0 },
-        project_coordinator_revision: 0,
+        project_coordinator_revision: '0',
       }))
       .mockResolvedValueOnce(makeSnapshot({
         product_conversation_id: 'pc-2',

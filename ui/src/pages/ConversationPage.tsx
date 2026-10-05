@@ -206,7 +206,7 @@ interface EmbeddedConversationHostProps {
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   onCloseCompleted?: () => void;
-  systemPromptRevision?: number;
+  systemPromptRevision?: string;
 }
 
 interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
@@ -234,7 +234,7 @@ export function EmbeddedConversationPage({
   suppressMessageViewerOwner = false,
   onCloseCompleted,
   suppressTaskApprovalOwner = false,
-  systemPromptRevision = 0,
+  systemPromptRevision = '0',
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -321,7 +321,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner: boolean;
   suppressTaskApprovalOwner: boolean;
   onCloseCompleted?: () => void;
-  systemPromptRevision: number;
+  systemPromptRevision: string;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();

@@ -1862,8 +1862,8 @@ export const api = {
   async putProjectCoordinatorProfile(
     productConversationId: string,
     request:
-      | { type: 'enable'; charter: string; expected_revision: number }
-      | { type: 'disable'; expected_revision: number },
+      | { type: 'enable'; charter: string; expected_revision: string }
+      | { type: 'disable'; expected_revision: string },
   ): Promise<ProjectCoordinatorProfileWriteResponseType> {
     const resp = await fetch(
       `/api/product-conversations/${encodeURIComponent(productConversationId)}/project-coordinator-profile`,

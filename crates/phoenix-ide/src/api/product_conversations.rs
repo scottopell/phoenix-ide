@@ -228,10 +228,14 @@ pub async fn put_project_coordinator_profile(
         ProjectCoordinatorProfileWriteRequest::Enable {
             charter,
             expected_revision,
-        } => (Some(charter), expected_revision),
-        ProjectCoordinatorProfileWriteRequest::Disable { expected_revision } => {
-            (None, expected_revision)
-        }
+        } => (
+            Some(charter),
+            parse_project_coordinator_revision(&expected_revision)?,
+        ),
+        ProjectCoordinatorProfileWriteRequest::Disable { expected_revision } => (
+            None,
+            parse_project_coordinator_revision(&expected_revision)?,
+        ),
     };
     let _authority = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
@@ -262,9 +266,22 @@ pub async fn put_project_coordinator_profile(
         ProjectCoordinatorProfileWriteOutcome::Disabled { revision } => (revision, None),
     };
     Ok(Json(ProjectCoordinatorProfileWriteResponse {
-        revision,
+        revision: revision.to_string(),
         profile,
     }))
+}
+
+fn parse_project_coordinator_revision(revision: &str) -> Result<i64, AppError> {
+    revision
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value >= 0 && value.to_string() == revision)
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Project Coordinator revision must be a canonical nonnegative base-10 integer"
+                    .to_string(),
+            )
+        })
 }
 
 fn project_coordinator_ambiguous_commit_to_app(state: &AppState) -> AppError {
@@ -786,7 +803,7 @@ async fn snapshot_view(
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         canonical_route: canonical_route(&aggregate),
         close,
-        project_coordinator_revision,
+        project_coordinator_revision: project_coordinator_revision.to_string(),
         project_coordinator_profile,
 
         requested_transcript_row_id,
@@ -1243,6 +1260,100 @@ mod tests {
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
+
+    #[test]
+    fn project_coordinator_revision_wire_is_lossless_and_canonical() {
+        for revision in [
+            "0",
+            "9007199254740991",
+            "9007199254740992",
+            "9223372036854775807",
+        ] {
+            assert_eq!(
+                parse_project_coordinator_revision(revision)
+                    .unwrap()
+                    .to_string(),
+                revision
+            );
+        }
+        for invalid in ["", "-1", "+1", "01", " 1", "1.0", "9223372036854775808"] {
+            assert!(
+                parse_project_coordinator_revision(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        let response = ProjectCoordinatorProfileWriteResponse {
+            revision: "9007199254740993".to_string(),
+            profile: None,
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["revision"],
+            "9007199254740993"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_coordinator_router_round_trips_large_revision() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("profile-wire", "profile-wire", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let id = &root.product_conversation_id;
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profile_revisions
+             (product_conversation_id, revision, last_write_token) VALUES (?1, ?2, 'seed')",
+        )
+        .bind(id.as_str())
+        .bind(9_007_199_254_740_991_i64)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        let uri = format!("/api/product-conversations/{id}/project-coordinator-profile");
+        for (request, expected) in [
+            (
+                serde_json::json!({"type": "enable", "charter": "exact charter", "expected_revision": "9007199254740991"}),
+                "9007199254740992",
+            ),
+            (
+                serde_json::json!({"type": "disable", "expected_revision": "9007199254740992"}),
+                "9007199254740993",
+            ),
+        ] {
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(&uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["revision"], expected);
+        }
+        let snapshot = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/product-conversations/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot["project_coordinator_revision"], "9007199254740993");
+        assert!(snapshot["project_coordinator_profile"].is_null());
+    }
 
     #[tokio::test]
     async fn project_coordinator_ambiguous_commit_closes_local_authority() {
