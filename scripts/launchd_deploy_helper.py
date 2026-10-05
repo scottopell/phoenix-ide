@@ -1165,6 +1165,8 @@ def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = 
         prior = {}
     if prior.get("transaction_id") != manifest.transaction_id:
         prior = {}
+    if not prior or prior.get("transaction_id") != manifest.transaction_id:
+        return
     if prior.get("state") in {"committed", "preparing"}:
         return
     if prior.get("recovery_mode") is not None and prior.get("state") == "activation_failed_rolled_back":
@@ -1247,10 +1249,8 @@ def recover_paired(manifest: Manifest) -> str:
             status = read_status(manifest)
         except (OSError, json.JSONDecodeError):
             status = {}
-        if claim.read_text().strip() != manifest.transaction_id or status.get("transaction_id", manifest.transaction_id) != manifest.transaction_id or status.get("state") not in {None, "prepared", "activating", "activation_failed_rollback_failed"}:
+        if claim.read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"activating", "activation_failed_rollback_failed"}:
             raise ActivationError("paired recovery must own a retained unresolved transaction")
-        if status.get("state") in {"prepared", None} and not Path(manifest.paired_database_upgrade.proof_path).exists():
-            raise ActivationError("pre-activation state requires non-disruptive controller abandonment, not runtime rollback")
         launchctl = Launchctl(manifest)
         try:
             if status.get("recovery_mode") is not None:

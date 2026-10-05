@@ -1,4 +1,4 @@
-# ADR-075: Prepared-artifact paired launchd upgrade fails closed
+# ADR-076: Prepared-artifact paired launchd upgrade fails closed
 
 - **Status:** Accepted
 - **Date:** 2026-10-04

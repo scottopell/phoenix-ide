@@ -402,7 +402,7 @@ class ActivationTests(unittest.TestCase):
                         helper.recover_paired(manifest)
                     backend.assert_not_called()
                 helper.record_recovery_error(manifest, "malformed status")
-                self.assertEqual(json.loads(Path(manifest.status_path).read_text())["state"], "activation_failed_rollback_failed")
+                self.assertEqual(Path(manifest.status_path).read_text(), value)
 
     def test_loaded_plist_finalization_proof_rejects_lookalike_inode(self):
         with tempfile.TemporaryDirectory() as td:
@@ -596,7 +596,7 @@ class ActivationTests(unittest.TestCase):
                 backend.events = []
                 with mock.patch.object(helper, "__file__", str(copied_helper)), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "restore_deployed_sha"), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
                     if phase in ("prepared", None):
-                        with self.assertRaisesRegex(helper.ActivationError, "non-disruptive"):
+                        with self.assertRaises(helper.ActivationError):
                             helper.recover_paired(manifest)
                         self.assertEqual(backend.events, [])
                         continue

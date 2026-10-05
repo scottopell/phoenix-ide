@@ -1,13 +1,13 @@
-# ADR-076: Committed paired finalization is publication-only
+# ADR-077: Committed paired finalization is publication-only
 
 - **Status:** Accepted
 - **Date:** 2026-10-05
-- **Supersedes:** ADR-075 only for committed finalization and recovery-startup checkpoint
+- **Supersedes:** ADR-076 only for committed finalization and recovery-startup checkpoint
 - **Affects:** specs/launchd-deployment (REQ-LDD-017, REQ-LDD-018), specs/production-deployment (REQ-PD-018, REQ-PD-020), specs/compatibility (REQ-COMP-003)
 
 ## Context
 
-ADR-075 established prepared-artifact paired fail-closed database recovery.
+ADR-076 established prepared-artifact paired fail-closed database recovery.
 A committed interruption can leave plist publication or temporary cleanup pending,
 and a recovered predecessor may accept writes before terminal status is durable.
 Manual-only blocked finalization and replaying original activation/recovery were
@@ -47,7 +47,7 @@ release publication is authorized by this engineering decision.
 
 ## References
 
-- [ADR-075](075_prepared-artifact-paired-launchd-upgrade-fails-closed.md)
+- [ADR-076](076_prepared-artifact-paired-launchd-upgrade-fails-closed.md)
 - `specs/launchd-deployment/requirements.md` REQ-LDD-017 and REQ-LDD-018
 - `specs/production-deployment/requirements.md` REQ-PD-018 and REQ-PD-020
 - `specs/compatibility/requirements.md` REQ-COMP-003
