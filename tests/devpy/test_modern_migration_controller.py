@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import json
+import io
 import os
 import shutil
 import sqlite3
@@ -350,6 +351,7 @@ class MigrationControllerTests(unittest.TestCase):
                 with mock.patch.object(sys, "argv", argv):
                     self.assertEqual(helper.main(), 1)
                 self.assertEqual(helper.read_status(manifest)["state"], "migration_failed_stopped")
+                failed_projection = helper.read_status(manifest)
                 self.assertEqual(backend.state, ("not_loaded", None))
                 self.assertEqual(helper.ordinary_database_ledger(database, registry)[-1][0], 113)
                 shutil.copyfile(manifest.ordinary_migration.backup_path, database)
@@ -361,6 +363,7 @@ class MigrationControllerTests(unittest.TestCase):
                 status = Path(manifest.status_path).read_bytes()
                 self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_rolled_back")
                 self.assertEqual(helper.read_status(manifest)["recovery_mode"], "migration_resumed")
+                self.assertIn("Manual offline matched database restoration verified", helper.read_status(manifest)["failure"])
                 for consumer in (ROOT / "crates/phoenix-ide/src/api/release_updates.rs", ROOT / "ui/src/pages/ReleaseUpdatePanel.tsx"):
                     self.assertIn("activation_failed_rolled_back", consumer.read_text())
                 with sqlite3.connect(database) as connection:
@@ -371,8 +374,49 @@ class MigrationControllerTests(unittest.TestCase):
                 later = database.read_bytes()
                 database.unlink()
                 events = list(backend.events)
+                real_sync = helper.fsync_dir
+                failed_after_unlink = False
+                def sync_failure(path):
+                    nonlocal failed_after_unlink
+                    if path == Path(manifest.active_path).parent and not Path(manifest.active_path).exists() and not failed_after_unlink:
+                        failed_after_unlink = True
+                        raise OSError("claim directory sync failed after unlink")
+                    return real_sync(path)
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(helper, "fsync_dir", side_effect=sync_failure):
+                    self.assertEqual(helper.main(), 1)
+                self.assertTrue(failed_after_unlink)
+                self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
+                self.assertEqual(Path(manifest.status_path).read_bytes(), status)
+                self.assertEqual(backend.events, events)
+                print_output = io.StringIO()
+                with contextlib.redirect_stdout(print_output):
+                    dev._print_launchd_deploy_status()
+                self.assertIn("RECOVERY:", print_output.getvalue())
+                sync_events = []
+                def sync_success(path):
+                    if path == Path(manifest.active_path).parent:
+                        sync_events.append(Path(manifest.active_path).exists())
+                    return real_sync(path)
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(helper, "fsync_dir", side_effect=sync_success):
+                    self.assertEqual(helper.main(), 0)
+                self.assertIn(False, sync_events)
                 with mock.patch.object(sys, "argv", argv):
                     self.assertEqual(helper.main(), 0)
+                Path(manifest.active_path).write_text("another-owner")
+                with mock.patch.object(sys, "argv", argv):
+                    self.assertEqual(helper.main(), 1)
+                self.assertEqual(Path(manifest.active_path).read_text(), "another-owner")
+                Path(manifest.active_path).unlink()
+                print_output = io.StringIO()
+                with contextlib.redirect_stdout(print_output):
+                    dev._print_launchd_deploy_status()
+                self.assertNotIn("RECOVERY:", print_output.getvalue())
+                self.assertIn("Manual offline matched database restoration verified", print_output.getvalue())
+                if output := os.environ.get("PHOENIX_MIGRATION_TEST_PROJECTIONS"):
+                    destination = Path(output).resolve()
+                    if not destination.is_relative_to(ROOT):
+                        raise AssertionError("projection fixture must stay in test worktree")
+                    destination.write_text(json.dumps([failed_projection, helper.read_status(manifest)]))
                 self.assertEqual(backend.events, events)
                 self.assertEqual(Path(manifest.status_path).read_bytes(), status)
                 self.assertFalse(Path(manifest.active_path).exists())

@@ -92,6 +92,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [076](076_prepared-artifact-paired-launchd-upgrade-fails-closed.md) | Prepared artifacts pair a clean controller with private SQLite proof and fail-closed rollback | Accepted | REQ-LDD-017, REQ-PD-018, REQ-COMP-003, REQ-DESKTOP-REL-010 |
 | [077](077_committed-paired-finalization-is-publication-only.md) | Committed paired finalization is publication-only; recovered startup checkpoints forbid snapshot replay | Accepted | REQ-LDD-017, REQ-LDD-018, REQ-PD-018, REQ-PD-020, REQ-COMP-003 |
 | [080](080_explicit-modern-migration-activation-fails-stopped.md) | Explicit modern migration activation fails stopped pending manual matched restore | Accepted | REQ-LDD-019, REQ-PD-021, REQ-COMP-003 |
+| [081](081_manual-migration-resume-status-preserves-recovery-evidence.md) | Manual migration resume status preserves recovery evidence | Accepted | REQ-LDD-019, REQ-RU-008, REQ-COMP-003 |
 
 ## For agents: which decisions bind your task
 

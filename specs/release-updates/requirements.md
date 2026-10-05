@@ -69,6 +69,8 @@ The in-app update surface shall present installation as successful only when the
 
 If the backend records rollback, rollback failure, rejection, or another non-success terminal outcome, the in-app update surface shall say so explicitly and shall not imply that the attempted release became active.
 
+The status API shall preserve the optional backend `recovery_mode`. When terminal rollback records `migration_resumed`, the current update surface shall distinguish verified manual matched database restoration and captured predecessor resume from automatic runtime-only rollback. If a predecessor API omits that field, the current surface shall use generic runtime-verification language and display the persisted recovery explanation without inferring a database outcome. Manual resume shall include an explicit restoration explanation in the existing failure diagnostic consumed by the captured predecessor; this does not replace its embedded UI or guarantee that its generic heading is recovery-aware.
+
 ### REQ-RU-009 — Terminal and replay-safe audit trail
 
 The system shall preserve enough durable release-update identity to explain which preview was approved, which published tag and full commit were attempted, and which backend terminal outcome was observed after reconnect.

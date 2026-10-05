@@ -1,3 +1,7 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { resolve } from 'node:path';
+import type { ReleaseTransactionStatus } from '../generated/ReleaseTransactionStatus';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReleaseUpdatePanel } from './ReleaseUpdatePanel';
@@ -243,7 +247,7 @@ describe('ReleaseUpdatePanel', () => {
       .mockImplementationOnce(() => json(previous))
       .mockImplementationOnce(() => json({ ...previous, transaction_id: 'tx-handoff', state: 'activating' }));
     render(<ReleaseUpdatePanel />);
-    await screen.findByText(/runtime changes rolled back and verified \(database not restored\)/i);
+    await screen.findByText(/predecessor runtime verified — inspect recovery details for database outcome/i);
     fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
     fireEvent.click(screen.getByRole('button', { name: 'Approve and install' }));
     expect(await screen.findByText(/approval handed off/i)).toBeInTheDocument();
@@ -540,6 +544,45 @@ describe('ReleaseUpdatePanel', () => {
     expect(await screen.findByRole('button', { name: /install v1.1.0/i })).toBeInTheDocument();
   });
 
+  it('projects the failed-to-manually-restored lifecycle and old API fallback without claiming automatic restore', async () => {
+    const root = resolve(process.cwd(), '..');
+    const directory = mkdtempSync(resolve(root, 'target/migration-ui-projection-'));
+    const output = resolve(directory, 'statuses.json');
+    let statuses: Array<Record<string, unknown>>;
+    try {
+      execFileSync('python3', ['-m', 'unittest', 'tests.devpy.test_modern_migration_controller.MigrationControllerTests.test_actual_112_lifecycle_cleanup_failure_manual_restore_and_terminal_retry', '-q'], {
+        cwd: root, env: { ...process.env, PHOENIX_MIGRATION_TEST_PROJECTIONS: output }, stdio: 'pipe',
+      });
+      statuses = JSON.parse(readFileSync(output, 'utf8'));
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+    const project = (status: Record<string, unknown>): ReleaseTransactionStatus => ({
+      kind: 'present', transaction_id: status.transaction_id as string, state: status.state as string,
+      source_commit: status.source_commit as string, release_tag: status.release_tag as string,
+      expected_version: status.expected_version as string, expected_git_sha: status.expected_git_sha as string,
+      created_at: null, updated_at: null, failure: status.failure as string,
+      rollback_failure: null, recovery_mode: status.recovery_mode as string | undefined, stale: false,
+    });
+    let transaction = project(statuses[0]);
+    vi.mocked(fetch).mockImplementation(() => json({ ...snapshot, transaction }));
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText(/migration failed stopped/i);
+    transaction = project(statuses[1]);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
+    expect(await screen.findByText('● Activation failed; manual matched database restoration verified; captured predecessor resumed')).toBeInTheDocument();
+    expect(screen.queryByText(/database not restored/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/No automatic database restore was performed/i)).toBeInTheDocument();
+    const fetches = vi.mocked(fetch).mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+    expect(vi.mocked(fetch).mock.calls.length).toBe(fetches);
+    delete transaction.recovery_mode;
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
+    expect(await screen.findByText(/predecessor runtime verified — inspect recovery details for database outcome/i)).toBeInTheDocument();
+    expect(screen.getByText(/Manual offline matched database restoration verified/i)).toBeInTheDocument();
+    expect(screen.queryByText(/database not restored/i)).not.toBeInTheDocument();
+  });
+
   it.each([
     ['activation_failed_rollback_failed', 'launchd_managed'],
     ['ordinary_activation_failed_rollback_failed', 'launchd_managed'],
@@ -557,7 +600,7 @@ describe('ReleaseUpdatePanel', () => {
     };
     vi.mocked(fetch).mockImplementation(() => json(rolledBack));
     const view = render(<ReleaseUpdatePanel />);
-    expect(await screen.findByText(/runtime changes rolled back and verified \(database not restored\)/i)).toBeInTheDocument();
+    expect(await screen.findByText(/predecessor runtime verified — inspect recovery details for database outcome/i)).toBeInTheDocument();
 
     vi.mocked(fetch).mockImplementation(() => json({
       ...rolledBack,

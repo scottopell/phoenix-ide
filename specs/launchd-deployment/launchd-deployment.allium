@@ -598,6 +598,13 @@ rule FinalizeResumedMigrationClaim {
     @guidance
         -- Verify terminal success without startup, teardown, publication or DB replay.
         -- Verification or claim-release failure preserves terminal status and fence.
+        -- Claim removal fsyncs its parent after unlink. If that fsync fails,
+        -- re-establish matching claim for verification-only retry. CLI guidance
+        -- requires actual active ownership, never merely the last transaction ID.
+        -- An already-absent removal can be parent-fsynced after the same terminal
+        -- verification; a competing owner refuses finalization.
+        -- Preserve manual-restoration explanation in the predecessor's existing
+        -- failure diagnostic; current API also threads recovery_mode to the UI.
 }
 
 rule RollBackFailedOrdinaryActivation {

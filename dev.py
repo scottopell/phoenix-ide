@@ -9832,7 +9832,7 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
         manifest = {}
     if not isinstance(manifest, dict):
         manifest = {}
-    if _ordinary_migration_owned(owner, status) and not (
+    if _deploy_claim_owner() == owner and _ordinary_migration_owned(owner, status) and not (
         status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed"}
     ):
         return (
@@ -10181,7 +10181,9 @@ def cmd_prod_resume_migration(transaction_id: str) -> None:
         ordinary = payload["ordinary_migration"]
         if not isinstance(ordinary, dict) or payload.get("paired_database_upgrade") is not None or payload.get("source_kind") not in {"local_head", "published_release"}:
             raise ValueError("not an ordinary migration manifest")
-        if _deploy_claim_owner() != transaction_id or payload["transaction_id"] != transaction_id or payload["uid"] != os.getuid():
+        owner = _deploy_claim_owner()
+        terminal_resume = status.get("transaction_id") == transaction_id and status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") == "migration_resumed"
+        if (owner != transaction_id and not (owner is None and terminal_resume)) or payload["transaction_id"] != transaction_id or payload["uid"] != os.getuid():
             raise ValueError("migration resume claim/manifest mismatch")
         helper = _migration_regular_path(ordinary["controller_helper_path"])
         if helper.parent != staging or _file_sha256(helper) != ordinary["controller_helper_sha256"]:

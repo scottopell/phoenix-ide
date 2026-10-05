@@ -29,7 +29,10 @@ function authorityText(authority: ReleaseUpdateAuthority): string | null {
   }
 }
 
-function stateText(state: string): string {
+function stateText(state: string, recoveryMode?: string | null): string {
+  if (state === 'activation_failed_rolled_back' && recoveryMode === 'migration_resumed') {
+    return 'Activation failed; manual matched database restoration verified; captured predecessor resumed';
+  }
   return ({
     preparing: 'Preparing verified candidate',
     prepared: 'Candidate prepared',
@@ -37,7 +40,7 @@ function stateText(state: string): string {
     activating: 'Activating and verifying',
     committed: 'Update committed',
     precondition_failed: 'Preparation failed before disruption',
-    activation_failed_rolled_back: 'Activation failed; runtime changes rolled back and verified (database not restored)',
+    activation_failed_rolled_back: 'Activation failed; predecessor runtime verified — inspect recovery details for database outcome',
     activation_failed_rollback_failed: 'Activation and rollback failed — offline recovery required',
     ordinary_activation_failed_rollback_failed: 'Activation and rollback failed — offline recovery required',
     rejected_concurrent: 'Another deployment already owns the host claim',
@@ -62,7 +65,7 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
   return (
     <div className={`release-update__status release-update__status--${statusTone(transaction)}`}>
       <div className="release-update__status-head">
-        <strong>{TERMINAL_STATES.has(transaction.state) ? '●' : '…'} {stateText(transaction.state)}</strong>
+        <strong>{TERMINAL_STATES.has(transaction.state) ? '●' : '…'} {stateText(transaction.state, transaction.recovery_mode)}</strong>
         <code>{transaction.transaction_id}</code>
       </div>
       {(transaction.expected_version || transaction.expected_git_sha) && (

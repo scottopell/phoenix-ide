@@ -122,6 +122,8 @@ pub enum ReleaseTransactionStatus {
         updated_at: Option<String>,
         failure: Option<String>,
         rollback_failure: Option<String>,
+        #[ts(optional = nullable)]
+        recovery_mode: Option<String>,
         stale: bool,
     },
     Unreadable {
@@ -550,6 +552,7 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
         updated_at,
         failure: string("failure"),
         rollback_failure: string("rollback_failure"),
+        recovery_mode: string("recovery_mode"),
         stale: status_is_stale,
     }
 }
@@ -1011,6 +1014,67 @@ mod tests {
                 !stale,
                 "terminal failure must not be marked in-progress stale"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_migration_lifecycle_preserves_recovery_mode_after_claim_release() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let projections = tempfile::Builder::new()
+            .prefix("migration-projection-")
+            .tempdir_in(root.join("target"))
+            .unwrap();
+        let receipt = projections.path().join("statuses.json");
+        let result = std::process::Command::new("python3")
+            .args([
+                "-m",
+                "unittest",
+                "tests.devpy.test_modern_migration_controller.MigrationControllerTests.test_actual_112_lifecycle_cleanup_failure_manual_restore_and_terminal_retry",
+                "-q",
+            ])
+            .current_dir(&root)
+            .env("PHOENIX_MIGRATION_TEST_PROJECTIONS", &receipt)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(receipt).unwrap()).unwrap();
+        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        app.runtime_env = Arc::new(
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(projections.path()),
+        );
+        let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for status in statuses {
+            fs::write(&path, status.to_string()).unwrap();
+            let wire =
+                serde_json::to_value(read_status(&app, ReleaseUpdateBackend::BareLinux)).unwrap();
+            assert_eq!(wire["state"], status["state"]);
+            assert_eq!(
+                wire["recovery_mode"],
+                status
+                    .get("recovery_mode")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            );
+            assert_eq!(wire["failure"], status["failure"]);
+            if status["recovery_mode"] == "migration_resumed" {
+                assert_eq!(wire["stale"], false);
+                assert!(wire["failure"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Manual offline matched database restoration verified"));
+                let mut old_wire = wire;
+                old_wire.as_object_mut().unwrap().remove("recovery_mode");
+                assert!(old_wire["failure"]
+                    .as_str()
+                    .unwrap()
+                    .contains("No automatic database restore"));
+            }
         }
     }
 

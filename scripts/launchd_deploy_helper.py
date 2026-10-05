@@ -934,12 +934,21 @@ def release_claim(manifest: Manifest) -> bool:
     with claim_lock.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            if claim.read_text().strip() != manifest.transaction_id:
-                return False
-            claim.unlink()
-            return True
+            owner = claim.read_text().strip()
         except FileNotFoundError:
+            if manifest.ordinary_migration is not None and read_status(manifest).get("recovery_mode") == "migration_resumed":
+                fsync_dir(claim.parent)
+                return True
             return False
+        if owner != manifest.transaction_id:
+            return False
+        claim.unlink()
+        try:
+            fsync_dir(claim.parent)
+        except OSError:
+            atomic_write(claim, (manifest.transaction_id + "\n").encode())
+            raise
+        return True
 
 
 def request_helper_bootout(uid: int, helper_label: str) -> None:
@@ -1571,7 +1580,12 @@ def resume_migration(manifest: Manifest) -> str:
         if manifest.ordinary_migration is None or manifest.paired_database_upgrade is not None:
             raise ActivationError("migration resume requires an ordinary migration transaction")
         status = read_status(manifest)
-        if Path(manifest.active_path).read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"preparing", "prepared", "activating", "migration_failed_stopped", "activation_failed_rolled_back"}:
+        try:
+            owner = Path(manifest.active_path).read_text().strip()
+        except FileNotFoundError:
+            owner = None
+        terminal_resume = status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") == "migration_resumed"
+        if (owner != manifest.transaction_id and not (owner is None and terminal_resume)) or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"preparing", "prepared", "activating", "migration_failed_stopped", "activation_failed_rolled_back"}:
             raise ActivationError("migration resume must own a retained unresolved transaction")
         if status.get("state") in {"preparing", "prepared"}:
             pid = status.get("preparing_pid")
@@ -1647,7 +1661,7 @@ def resume_migration(manifest: Manifest) -> str:
             verify_staged(str(private), manifest.rollback_plist_sha256, "verified predecessor plist")
             restore_deployed_sha(manifest)
             commit_atomic_install(publication, published)
-            write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"), recovery_mode="migration_resumed")
+            write_status(manifest, "activation_failed_rolled_back", failure="Manual offline matched database restoration verified; captured predecessor resumed. No automatic database restore was performed. Candidate failure: " + str(status.get("failure") or "unknown"), recovery_mode="migration_resumed")
             return "migration_resumed"
         except Exception as exc:
             return fail_migration_stopped(manifest, launchctl, f"migration resume failed: {exc}")
@@ -1701,7 +1715,9 @@ def main() -> int:
         state = resume_migration(manifest) if args.command == "resume-migration" else finalize_paired(manifest) if args.command == "finalize-paired" else recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
         if (state in TERMINAL_STATES or (args.command == "resume-migration" and state == "migration_resumed")) and status_is_durable_terminal(manifest):
             fsync_dir(Path(manifest.status_path).parent)
-            release_claim(manifest)
+            released = release_claim(manifest)
+            if args.command == "resume-migration" and not released:
+                raise ActivationError("migration claim finalization did not confirm owned removal")
         print(state, flush=True)
         return 0 if state == "committed" or (args.command == "recover-paired" and state == "activation_failed_rolled_back") or (args.command == "resume-migration" and state == "migration_resumed") else 1
     except ConcurrentDeploy as exc:
