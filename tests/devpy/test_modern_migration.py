@@ -521,6 +521,14 @@ class ModernMigrationTests(unittest.TestCase):
         self.assertFalse(Path(self.manifest.active_path).exists())
         self.assertEqual(events, self.backend.events)
 
+    def emit_projection(self, status):
+        if output := os.environ.get("PHOENIX_MIGRATION_TEST_PROJECTIONS"):
+            path = Path(output).resolve()
+            if not path.is_relative_to(ROOT):
+                raise AssertionError("projection fixture must stay in worktree")
+            statuses = json.loads(path.read_text()) if path.exists() else []
+            path.write_text(json.dumps([*statuses, status]))
+
     def test_candidate_publication_crash_checkpoint_preserves_accepted_writes(self):
         class PowerLoss(BaseException):
             pass
@@ -571,6 +579,8 @@ class ModernMigrationTests(unittest.TestCase):
                     self.assertFalse(Path(manifest.target_plist).exists())
                     continue
                 self.assertEqual(helper.read_status(manifest)["state"], "committed")
+                if boundary == "publication_error":
+                    self.emit_projection(helper.read_status(manifest))
                 self.assertFalse(helper.status_is_durable_terminal(manifest))
                 with sqlite3.connect(database) as connection:
                     connection.execute("INSERT INTO preserved VALUES ('accepted after interruption')")
@@ -590,6 +600,8 @@ class ModernMigrationTests(unittest.TestCase):
                 self.assertEqual(before, database.read_bytes())
                 self.assertTrue(Path(manifest.target_plist).samefile(manifest.candidate_plist))
                 self.assertTrue(helper.status_is_durable_terminal(manifest))
+                if boundary == "publication_error":
+                    self.emit_projection(helper.read_status(manifest))
                 self.assertTrue(helper.release_claim(manifest))
                 self.assertFalse(Path(manifest.active_path).exists())
 

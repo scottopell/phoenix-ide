@@ -31,3 +31,5 @@ After reconnect, the UI hydrates the authoritative native status file. In-progre
 - Rust release identity and approval-binding tests in `api::release_updates::tests`
 - `ReleaseUpdatePanel.test.tsx` covers immutable preview, explicit approval, remote denial, unreadable status, verified rollback, and rollback failure
 - `./dev.py check` validates local repository lanes and generated TypeScript freshness; normal Linux CI checks x86_64-musl compatibility, and release CI builds both Linux musl targets
+
+Pending verified-candidate publication is projected through optional finalization_pending/committed_diagnostic. The current panel warns, displays publication-only recovery guidance, keeps polling and disables approval/reconciliation until finalized; missing predecessor fields retain established behavior. The consolidated crash lifecycle generates pending/finalized receipts consumed by API/UI tests.

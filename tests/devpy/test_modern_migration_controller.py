@@ -424,7 +424,8 @@ class MigrationControllerTests(unittest.TestCase):
                     destination = Path(output).resolve()
                     if not destination.is_relative_to(ROOT):
                         raise AssertionError("projection fixture must stay in test worktree")
-                    destination.write_text(json.dumps([failed_projection, helper.read_status(manifest)]))
+                    prior = json.loads(destination.read_text()) if destination.exists() else []
+                    destination.write_text(json.dumps([*prior, failed_projection, helper.read_status(manifest)]))
                 self.assertEqual(backend.events, events)
                 self.assertEqual(Path(manifest.status_path).read_bytes(), status)
                 self.assertFalse(Path(manifest.active_path).exists())

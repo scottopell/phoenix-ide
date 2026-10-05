@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { ReleaseTransactionStatus } from '../generated/ReleaseTransactionStatus';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -546,11 +546,12 @@ describe('ReleaseUpdatePanel', () => {
 
   it('projects the failed-to-manually-restored lifecycle and old API fallback without claiming automatic restore', async () => {
     const root = resolve(process.cwd(), '..');
+    mkdirSync(resolve(root, 'target'), { recursive: true });
     const directory = mkdtempSync(resolve(root, 'target/migration-ui-projection-'));
     const output = resolve(directory, 'statuses.json');
     let statuses: Array<Record<string, unknown>>;
     try {
-      execFileSync('python3', ['-m', 'unittest', 'tests.devpy.test_modern_migration_controller.MigrationControllerTests.test_actual_112_lifecycle_cleanup_failure_manual_restore_and_terminal_retry', '-q'], {
+      execFileSync('python3', ['-m', 'unittest', 'tests.devpy.test_modern_migration.ModernMigrationTests.test_candidate_publication_crash_checkpoint_preserves_accepted_writes', 'tests.devpy.test_modern_migration_controller.MigrationControllerTests.test_actual_112_lifecycle_cleanup_failure_manual_restore_and_terminal_retry', '-q'], {
         cwd: root, env: { ...process.env, PHOENIX_MIGRATION_TEST_PROJECTIONS: output }, stdio: 'pipe',
       });
       statuses = JSON.parse(readFileSync(output, 'utf8'));
@@ -561,14 +562,34 @@ describe('ReleaseUpdatePanel', () => {
       kind: 'present', transaction_id: String(status['transaction_id']), state: String(status['state']),
       source_commit: String(status['source_commit']), release_tag: String(status['release_tag']),
       expected_version: String(status['expected_version']), expected_git_sha: String(status['expected_git_sha']),
-      created_at: null, updated_at: null, failure: String(status['failure']),
-      rollback_failure: null, recovery_mode: typeof status['recovery_mode'] === 'string' ? status['recovery_mode'] : null, stale: false,
+      created_at: null, updated_at: null, failure: typeof status['failure'] === 'string' ? status['failure'] : null,
+      rollback_failure: null, recovery_mode: typeof status['recovery_mode'] === 'string' ? status['recovery_mode'] : null,
+      finalization_pending: typeof status['finalization_pending'] === 'boolean' ? status['finalization_pending'] : null,
+      committed_diagnostic: typeof status['committed_diagnostic'] === 'string' ? status['committed_diagnostic'] : null,
+      stale: false,
     });
-    const [failed, resumed] = statuses;
-    if (!failed || !resumed) throw new Error('Lifecycle must emit failure and resumed statuses');
-    let transaction = project(failed);
-    vi.mocked(fetch).mockImplementation(() => json({ ...snapshot, transaction }));
-    render(<ReleaseUpdatePanel />);
+    const [pending, completed, failed, resumed] = statuses;
+    if (!pending || !completed || !failed || !resumed) throw new Error('Lifecycle must emit pending/finalized and failed/resumed statuses');
+    let transaction = project(pending);
+    vi.mocked(fetch).mockImplementation((input) => json(String(input).includes('/transaction') ? transaction : { ...snapshot, transaction }));
+    const view = render(<ReleaseUpdatePanel />);
+    await screen.findByText(/publication finalization required; activation acceptance pending/i);
+    expect(screen.getByText(/candidate finalization interrupted: publish failed/i)).toBeInTheDocument();
+    expect(view.container.querySelector('.release-update__status--warning')).toBeInTheDocument();
+    expect(screen.queryByText(/Update committed/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/committed — verifying installed runtime/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Review and install/i })).not.toBeInTheDocument();
+    const pendingFetches = vi.mocked(fetch).mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2200); });
+    expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(pendingFetches);
+    expect(screen.queryByText(/transaction status is stale/i)).not.toBeInTheDocument();
+    transaction = project(completed);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
+    expect(await screen.findByText(/Update committed/i)).toBeInTheDocument();
+    expect(view.container.querySelector('.release-update__status--success')).toBeInTheDocument();
+    expect(screen.queryByText(/publication finalization required/i)).not.toBeInTheDocument();
+    transaction = project(failed);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
     await screen.findByText(/migration failed stopped/i);
     transaction = project(resumed);
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });

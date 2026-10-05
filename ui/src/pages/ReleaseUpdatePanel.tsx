@@ -29,6 +29,10 @@ function authorityText(authority: ReleaseUpdateAuthority): string | null {
   }
 }
 
+function transactionIsTerminal(transaction: Extract<ReleaseTransactionStatus, { kind: 'present' }>): boolean {
+  return TERMINAL_STATES.has(transaction.state) && transaction.finalization_pending !== true;
+}
+
 function stateText(state: string, recoveryMode?: string | null): string {
   if (state === 'activation_failed_rolled_back' && recoveryMode === 'migration_resumed') {
     return 'Activation failed; manual matched database restoration verified; captured predecessor resumed';
@@ -49,6 +53,7 @@ function stateText(state: string, recoveryMode?: string | null): string {
 
 function statusTone(transaction: ReleaseTransactionStatus): string {
   if (transaction.kind !== 'present') return 'muted';
+  if (transaction.finalization_pending === true) return 'warning';
   if (transaction.state === 'committed') return 'success';
   if (transaction.state === 'activation_failed_rolled_back') return 'warning';
   if (TERMINAL_STATES.has(transaction.state)) return 'danger';
@@ -65,7 +70,7 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
   return (
     <div className={`release-update__status release-update__status--${statusTone(transaction)}`}>
       <div className="release-update__status-head">
-        <strong>{TERMINAL_STATES.has(transaction.state) ? '●' : '…'} {stateText(transaction.state, transaction.recovery_mode)}</strong>
+        <strong>{transactionIsTerminal(transaction) ? '●' : '…'} {transaction.finalization_pending === true ? 'Verified candidate — publication finalization required; activation acceptance pending' : stateText(transaction.state, transaction.recovery_mode)}</strong>
         <code>{transaction.transaction_id}</code>
       </div>
       {(transaction.expected_version || transaction.expected_git_sha) && (
@@ -74,6 +79,8 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
       {transaction.source_commit && <div>Approved source commit: <code>{transaction.source_commit}</code></div>}
       {transaction.release_tag && <div>Approved release: <strong>{transaction.release_tag}</strong></div>}
       {transaction.updated_at && <div>Updated: {new Date(transaction.updated_at).toLocaleString()}</div>}
+      {transaction.finalization_pending === true && <div className="release-update__recovery">Publication is not finalized. Inspect <code>./dev.py prod status</code> and use the matching transaction’s publication-only recovery; do not restore an older database backup.</div>}
+      {transaction.committed_diagnostic && <div>{transaction.committed_diagnostic}</div>}
       {transaction.failure && <div>Failure: {transaction.failure}</div>}
       {transaction.rollback_failure && <div>Rollback failure: {transaction.rollback_failure}</div>}
       {transaction.stale && <div className="release-update__recovery">Status is stale. Inspect the backend deployment log and use <code>./dev.py prod status</code> for offline recovery.</div>}
@@ -123,7 +130,7 @@ export function ReleaseUpdatePanel({
     current: ReleaseTransactionStatus | null,
     next: ReleaseTransactionStatus,
   ): ReleaseTransactionStatus => {
-    if (current?.kind === 'present' && !TERMINAL_STATES.has(current.state) && next.kind !== 'present') {
+    if (current?.kind === 'present' && !transactionIsTerminal(current) && next.kind !== 'present') {
       setTransactionError(next.kind === 'unreadable'
         ? next.reason
         : 'Durable transaction status temporarily disappeared');
@@ -177,7 +184,7 @@ export function ReleaseUpdatePanel({
   }, [load]);
 
   const active = transaction?.kind === 'present'
-    && !TERMINAL_STATES.has(transaction.state);
+    && !transactionIsTerminal(transaction);
   const shouldPollTransaction = handoffTransactionId !== null
     || reconciliationTransactionId !== null
     || (!loading && snapshot === null && transaction === null)
@@ -200,7 +207,7 @@ export function ReleaseUpdatePanel({
             if (transaction.transaction_id === handoffTransactionId) {
               setHandoffTransactionId(null);
             }
-            if (transaction.state === 'committed') {
+            if (transaction.state === 'committed' && transactionIsTerminal(transaction)) {
               setReconciliationTransactionId(transaction.transaction_id);
               if (await load()) setReconciliationTransactionId(null);
             }
@@ -270,13 +277,14 @@ export function ReleaseUpdatePanel({
   const handoffPending = handoffTransactionId !== null;
   const approvalStatusSafe = !handoffPending && transactionError === null && (transaction?.kind === 'none'
     || (transaction?.kind === 'present'
-      && TERMINAL_STATES.has(transaction.state)
+      && transactionIsTerminal(transaction)
       && transaction.state !== 'activation_failed_rollback_failed'
       && (transaction.state !== 'ordinary_activation_failed_rollback_failed'
         || snapshot?.installation_ownership.kind === 'launchd_managed')));
   const availablePreview = snapshot?.preview.kind === 'available' ? snapshot.preview : null;
   const committedReleaseIsPreview = transaction?.kind === 'present'
     && transaction.state === 'committed'
+    && transactionIsTerminal(transaction)
     && availablePreview?.tag === transaction.release_tag
     && availablePreview.commit === transaction.source_commit;
   const discoveryFreshness = discoveryError && snapshot?.preview.kind === 'available'

@@ -124,6 +124,10 @@ pub enum ReleaseTransactionStatus {
         rollback_failure: Option<String>,
         #[ts(optional = nullable)]
         recovery_mode: Option<String>,
+        #[ts(optional = nullable)]
+        finalization_pending: Option<bool>,
+        #[ts(optional = nullable)]
+        committed_diagnostic: Option<String>,
         stale: bool,
     },
     Unreadable {
@@ -528,7 +532,11 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
             .map(|timestamp| timestamp.to_rfc3339())
     });
-    let terminal = TERMINAL_STATUS_STATES.contains(&state.as_str());
+    let finalization_pending = value
+        .get("finalization_pending")
+        .and_then(serde_json::Value::as_bool);
+    let terminal =
+        TERMINAL_STATUS_STATES.contains(&state.as_str()) && finalization_pending != Some(true);
     let status_is_stale = !terminal
         && updated_at
             .as_deref()
@@ -553,6 +561,8 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
         failure: string("failure"),
         rollback_failure: string("rollback_failure"),
         recovery_mode: string("recovery_mode"),
+        finalization_pending,
+        committed_diagnostic: string("committed_diagnostic"),
         stale: status_is_stale,
     }
 }
@@ -1020,6 +1030,7 @@ mod tests {
     #[tokio::test]
     async fn manual_migration_lifecycle_preserves_recovery_mode_after_claim_release() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        fs::create_dir_all(root.join("target")).unwrap();
         let projections = tempfile::Builder::new()
             .prefix("migration-projection-")
             .tempdir_in(root.join("target"))
@@ -1029,6 +1040,7 @@ mod tests {
             .args([
                 "-m",
                 "unittest",
+                "tests.devpy.test_modern_migration.ModernMigrationTests.test_candidate_publication_crash_checkpoint_preserves_accepted_writes",
                 "tests.devpy.test_modern_migration_controller.MigrationControllerTests.test_actual_112_lifecycle_cleanup_failure_manual_restore_and_terminal_retry",
                 "-q",
             ])
@@ -1062,6 +1074,20 @@ mod tests {
                     .unwrap_or(serde_json::Value::Null)
             );
             assert_eq!(wire["failure"], status["failure"]);
+            assert_eq!(
+                wire["finalization_pending"],
+                status
+                    .get("finalization_pending")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            );
+            assert_eq!(
+                wire["committed_diagnostic"],
+                status
+                    .get("committed_diagnostic")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            );
             if status["recovery_mode"] == "migration_resumed" {
                 assert_eq!(wire["stale"], false);
                 assert!(wire["failure"]

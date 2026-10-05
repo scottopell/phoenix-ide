@@ -71,6 +71,8 @@ If the backend records rollback, rollback failure, rejection, or another non-suc
 
 The status API shall preserve the optional backend `recovery_mode`. When terminal rollback records `migration_resumed`, the current update surface shall distinguish verified manual matched database restoration and captured predecessor resume from automatic runtime-only rollback. If a predecessor API omits that field, the current surface shall use generic runtime-verification language and display the persisted recovery explanation without inferring a database outcome. Manual resume shall include an explicit restoration explanation in the existing failure diagnostic consumed by the captured predecessor; this does not replace its embedded UI or guarantee that its generic heading is recovery-aware.
 
+The status API shall preserve optional `finalization_pending` and `committed_diagnostic`. A verified candidate with pending publication shall remain warning/non-accepted, display its diagnostic and publication-only recovery guidance, continue polling, and prohibit another approval. It shall not use the normal committed-success badge or installed-release reconciliation until finalization completes. Missing fields from a predecessor API retain its established terminal interpretation; the surface shall not invent unreported pending work.
+
 ### REQ-RU-009 — Terminal and replay-safe audit trail
 
 The system shall preserve enough durable release-update identity to explain which preview was approved, which published tag and full commit were attempted, and which backend terminal outcome was observed after reconnect.
