@@ -161,3 +161,22 @@ Recovery records a durable startup checkpoint before predecessor startup. After
 that point, a retry verifies/finalizes the running predecessor without replaying
 the original snapshot; unknown or stopped predecessor remains fenced for explicit
 operator investigation. This avoids deleting writes accepted after earlier recovery.
+
+## Explicit ordinary modern migration (stopped/fenced)
+
+This is separate from legacy prepared paired deployment. It accepts normal local HEAD or published release sources only and preserves installed environment/PATH:
+
+```bash
+./dev.py prod deploy --migration-backup-receipt /absolute/private/receipt.json
+./dev.py prod resume-migration TRANSACTION_ID
+```
+
+The service must already be stopped with exclusive database ownership. Before receipt creation, safely checkpoint/close SQLite and prove no remaining WAL/SHM/journal sidecars; do **not** discard possibly uncheckpointed sidecars. Create a private SQLite-backup-API snapshot and a restoration rehearsal file, fresh-open integrity/ledger checks, and fsync files/parents. Reserve capacity for retained copies in addition to operator backups. Receipt schema1 has exactly these keys (digests are lowercase SHA256; paths canonical absolute regular files):
+
+```json
+{"schema":1,"database_path":"/private/live.db","database_sha256":"HEX64","backup_path":"/private/backup.db","backup_sha256":"HEX64","rehearsal_path":"/private/rehearsal.db","rehearsal_sha256":"HEX64","previous_binary_sha256":"HEX64","previous_plist_sha256":"HEX64"}
+```
+
+The selected-source helper must advertise this capability; an older release helper refuses before handoff. It validates full logical schema/all-row equivalence between stopped database and backup/rehearsal, not just equal ledger or operator hashes. Backup bytes may differ from source after SQLite backup/VACUUM; rehearsal bytes must match backup. Receipts/backups/configuration stay private; they do not authenticate release provenance.
+
+After disruption, failure never auto-starts predecessor or restores SQLite. It attempts confirmed teardown, quarantines autoload plist, and retains transaction/claim with `migration_failed_stopped`; deploy/restart/stop refuse. Manually restore the matched backup offline, safely settle sidecars, and then invoke `prod resume-migration TXN`. That retained helper verifies exact restored bytes/content, captured binary/configuration, stopped ownership and helper absence before explicit predecessor startup. A persisted resume-start checkpoint refuses startup replay rather than risking writes accepted after startup. Unknown proof stays fenced; no manual claim removal, prepared eligibility widening, generic downgrade or Linux recovery is offered.

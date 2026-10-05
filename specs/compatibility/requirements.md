@@ -76,6 +76,8 @@ AND SHALL fail closed when exclusive ownership, snapshot integrity, or restorati
 
 ---
 
+The explicit ordinary macOS migration option in `specs/launchd-deployment/requirements.md` REQ-LDD-019 SHALL leave failed activation stopped/fenced pending manual offline matched database restoration. It SHALL NOT automatically restore a database or start an older runtime against candidate-mutated contents. Its validated offline backup/rehearsal is feature-owned admission evidence, not generic downgrade support.
+
 ### REQ-COMP-004 — Database Replacement Is Offline
 
 THE SYSTEM SHALL support one backend-managed Phoenix runtime version as the exclusive application owner of a production SQLite database

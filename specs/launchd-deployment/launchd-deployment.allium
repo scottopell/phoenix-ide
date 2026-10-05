@@ -11,7 +11,8 @@ config {
 enum TransactionState {
     preparing | prepared | activating | committed |
     precondition_failed | activation_failed_rolled_back |
-    activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed | rejected_concurrent
+    activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed | rejected_concurrent |
+    migration_failed_stopped | migration_resumed
 }
 enum RestartState {
     preparing | prepared | restarting | committed |
@@ -57,12 +58,15 @@ enum PairedRecoveryMode { snapshot_restored | unchanged_predecessor }
 
 enum FinalizationOutcome { not_committed | pending | complete }
 
+enum OrdinaryPolicy { runtime_artifact_rollback | modern_migration_stopped }
+
 entity DeployTransaction {
     id: String
     kind: LocalHeadDeployment | PublishedReleaseDeployment | PreparedArtifactDeployment
     source_commit: String
     expected: RuntimeIdentity
     previous: RuntimeIdentity?
+    ordinary_policy: OrdinaryPolicy
     state: TransactionState
     created_at: Timestamp
     updated_at: Timestamp
@@ -81,10 +85,15 @@ entity DeployTransaction {
         activating -> activation_failed_rolled_back
         activating -> activation_failed_rollback_failed
         activating -> ordinary_activation_failed_rollback_failed
+        activating -> migration_failed_stopped
+        migration_failed_stopped -> migration_failed_stopped
+        migration_failed_stopped -> migration_resumed
+        prepared -> migration_resumed
+        activating -> migration_resumed
         activation_failed_rollback_failed -> activation_failed_rolled_back
         activation_failed_rollback_failed -> activation_failed_rollback_failed
         terminal: committed, precondition_failed, activation_failed_rolled_back,
-                  ordinary_activation_failed_rollback_failed, rejected_concurrent
+                  ordinary_activation_failed_rollback_failed, rejected_concurrent, migration_resumed
     }
 }
 
@@ -511,9 +520,51 @@ rule RecordPairedFinalizationOutcome {
         -- Errors remain committed diagnostics; interruption retains pending and claim.
 }
 
+-- modern_receipt_and_stopped_ownership_verified(transaction) -> Boolean
+--   Exact retained helper/capability, stopped service, exclusive sidecar-free
+--   modern SQLite, integrity/complete ledger and logical schema/all-row equality.
+-- migration_predecessor_start_checkpoint_exists(transaction) -> Boolean
+--   Durable retained helper status records predecessor startup was attempted.
+-- manually_restored_database_and_predecessor_verified(transaction, service) -> Boolean
+--   Exact restored backup bytes/logical contents and captured predecessor
+--   identity/private configuration; no database restore is performed here.
+
+rule FailModernMigrationStopped {
+    when: ActivationFailed(transaction, service, failure)
+    requires: transaction.state = activating
+    requires: transaction.ordinary_policy = modern_migration_stopped
+    ensures: transaction.state = migration_failed_stopped
+    ensures: transaction.failure = failure
+    ensures: DurableStatusWritten(transaction)
+    ensures: not DatabaseRollbackClaimed(transaction)
+
+    @guidance
+        -- Confirm candidate teardown and quarantine autoload configuration.
+        -- Retain claim even if teardown is uncertain; never start predecessor.
+        -- Admission requires modern_receipt_and_stopped_ownership_verified.
+}
+
+rule ResumeManuallyRestoredMigration {
+    when: ManualMigrationResumeVerified(transaction, service)
+    requires: transaction.state in { prepared, activating, migration_failed_stopped }
+    requires: transaction.ordinary_policy = modern_migration_stopped
+    requires: active_claim_retained(transaction)
+    requires: not migration_predecessor_start_checkpoint_exists(transaction)
+    requires: manually_restored_database_and_predecessor_verified(transaction, service)
+    ensures: transaction.state = migration_resumed
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Before predecessor startup persist predecessor_start_checkpoint.
+        -- Verify captured runtime/private plist, publish, fsync and release owned claim.
+        -- Any failure retains offline fence; checkpoint retry refuses startup replay.
+        -- Deploy/restart/stop may not clear a retained migration claim.
+}
+
 rule RollBackFailedOrdinaryActivation {
     when: ActivationFailed(transaction, service, failure)
     requires: transaction.state = activating
+    requires: transaction.ordinary_policy = runtime_artifact_rollback
     requires: transaction.kind != PreparedArtifactDeployment
     requires: exact_previous_restored(transaction, service)
     ensures: transaction.state = activation_failed_rolled_back
@@ -597,6 +648,7 @@ rule RollBackFailedPreparedPairedActivation {
 rule PreserveRollbackFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
     requires: transaction.state = activating
+    requires: transaction.ordinary_policy = runtime_artifact_rollback
     ensures: transaction.kind = PreparedArtifactDeployment implies transaction.state = activation_failed_rollback_failed
     ensures: transaction.kind != PreparedArtifactDeployment implies transaction.state = ordinary_activation_failed_rollback_failed
     ensures: transaction.failure = failure

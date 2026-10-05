@@ -36,6 +36,7 @@ VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 
 TERMINAL_STATES = {
     "committed",
+    "migration_resumed",
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
@@ -59,6 +60,20 @@ class PairedDatabaseUpgrade:
     controller_source_commit: str
     controller_helper_sha256: str
     controller_helper_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class OrdinaryMigration:
+    database_path: str
+    database_sha256: str
+    backup_path: str
+    backup_sha256: str
+    rehearsal_path: str
+    rehearsal_sha256: str
+    previous_binary_sha256: str
+    previous_plist_sha256: str
+    controller_helper_path: str
+    controller_helper_sha256: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,6 +122,7 @@ class Manifest:
     health_timeout_secs: float = 120.0
     # None is intentional for pre-feature runtime-only manifests.
     paired_database_upgrade: Optional[PairedDatabaseUpgrade] = None
+    ordinary_migration: Optional[OrdinaryMigration] = None
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
@@ -119,6 +135,10 @@ class Manifest:
         raw["previous"] = Identity(**raw["previous"]) if raw.get("previous") else None
         paired = raw.get("paired_database_upgrade")
         raw["paired_database_upgrade"] = PairedDatabaseUpgrade(**paired) if paired else None
+        ordinary = raw.get("ordinary_migration")
+        if ordinary is not None and not isinstance(ordinary, dict):
+            raise ActivationError("ordinary migration must be an object")
+        raw["ordinary_migration"] = OrdinaryMigration(**ordinary) if ordinary is not None else None
         # Runtime-only manifests written before the paired feature omit the field.
         raw.pop("database_mode", None)
         for legacy_key in ("database_path", "database_backup_path", "database_backup_sha256", "database_backup_verified", "database_proof_path", "controller_source_commit", "controller_helper_sha256", "controller_helper_path"):
@@ -253,6 +273,7 @@ def write_status(
         "transaction_id": manifest.transaction_id,
         "state": state,
         "source_kind": manifest.source_kind,
+        **({"ordinary_migration": True} if manifest.ordinary_migration is not None else {}),
         "source_commit": manifest.source_commit,
         "release_tag": manifest.release_tag,
         "release_commit": manifest.release_commit,
@@ -267,6 +288,31 @@ def write_status(
         "recovery_mode": recovery_mode,
     }
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
+
+
+def ordinary_database_digest(path: Path) -> str:
+    import sqlite3
+
+    connection = sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
+    digest = hashlib.sha256()
+    try:
+        schema = connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+        digest.update(json.dumps(schema, separators=(",", ":")).encode())
+        for kind, name, _table, _sql in schema:
+            if kind != "table":
+                continue
+            quoted = '"' + name.replace('"', '""') + '"'
+            rows = []
+            for row in connection.execute(f"SELECT * FROM {quoted}"):
+                encoded = [("blob", value.hex()) if isinstance(value, bytes) else (type(value).__name__, value) for value in row]
+                rows.append(hashlib.sha256(json.dumps(encoded, separators=(",", ":"), ensure_ascii=True).encode()).digest())
+            digest.update(name.encode())
+            digest.update(len(rows).to_bytes(8, "big"))
+            for row in sorted(rows):
+                digest.update(row)
+        return digest.hexdigest()
+    finally:
+        connection.close()
 
 
 def verify_staged(path: Optional[str], expected_hash: Optional[str], description: str) -> Path:
@@ -286,9 +332,10 @@ def verify_staged(path: Optional[str], expected_hash: Optional[str], description
 
 
 def database_paths(manifest: Manifest) -> tuple[Path, ...]:
-    if manifest.paired_database_upgrade is None:
-        raise ActivationError("paired database upgrade is not configured")
-    database = Path(manifest.paired_database_upgrade.database_path)
+    mode = manifest.paired_database_upgrade or manifest.ordinary_migration
+    if mode is None:
+        raise ActivationError("explicit database mode is not configured")
+    database = Path(mode.database_path)
     return tuple(database.parent / name for name in (database.name, database.name + "-wal", database.name + "-shm"))
 
 
@@ -350,7 +397,10 @@ def _restore_capacity_path(manifest: Manifest, database: Optional[Path] = None) 
 
 def assert_database_exclusive(manifest: Manifest) -> None:
     """Prove that no process still owns the database or SQLite sidecars."""
-    database, _backup, _proof, _transaction = _paired_path_context(manifest)
+    if manifest.ordinary_migration is not None:
+        database = Path(manifest.ordinary_migration.database_path)
+    else:
+        database, _backup, _proof, _transaction = _paired_path_context(manifest)
     if not database.exists():
         raise ActivationError("paired database does not exist")
     _regular_nosymlink(database, "paired database")
@@ -898,8 +948,114 @@ def request_helper_bootout(uid: int, helper_label: str) -> None:
     )
 
 
+def private_activation(manifest: Manifest) -> bool:
+    return manifest.paired_database_upgrade is not None or manifest.ordinary_migration is not None
+
+
+def validate_ordinary_paths(manifest: Manifest) -> None:
+    migration = manifest.ordinary_migration
+    if migration is None:
+        raise ActivationError("ordinary migration is not configured")
+    paths = [Path(value) for value in (
+        migration.database_path, migration.backup_path, migration.rehearsal_path,
+        migration.controller_helper_path, manifest.candidate_binary, manifest.candidate_plist,
+        manifest.rollback_binary or "", manifest.rollback_plist or "",
+        manifest.target_binary, manifest.target_plist, manifest.status_path,
+        manifest.deployed_sha_path, manifest.active_path, manifest.lock_path, manifest.claim_lock_path,
+    )]
+    for path in paths:
+        if not path.is_absolute() or path.resolve(strict=False) != path or path.is_symlink():
+            raise ActivationError("ordinary migration paths must be absolute non-symlinks without traversal")
+    database, backup, rehearsal, helper = paths[:4]
+    transaction = _private_transaction_dir(helper.parent)
+    if any(path.parent != transaction for path in (backup, rehearsal, *paths[4:8])):
+        raise ActivationError("ordinary migration inputs must belong to the retained helper transaction")
+    if len({database, backup, rehearsal, helper}) != 4:
+        raise ActivationError("ordinary migration database and receipts must not alias")
+    if len(set(paths)) != len(paths):
+        raise ActivationError("ordinary migration database and runtime destinations must not alias")
+    for receipt in (database, backup, rehearsal):
+        if any(path.exists() and path.samefile(receipt) for path in paths[3:]):
+            raise ActivationError("ordinary migration runtime paths must not alias database receipts")
+    for path in (database, backup, rehearsal):
+        _regular_nosymlink(path, "ordinary migration database receipt")
+    if len({(path.stat().st_dev, path.stat().st_ino) for path in (database, backup, rehearsal)}) != 3:
+        raise ActivationError("ordinary migration databases must not be hardlinked")
+
+
+def ordinary_database_ledger(path: Path) -> tuple:
+    import sqlite3
+    for sidecar in (Path(str(path) + "-wal"), Path(str(path) + "-shm"), Path(str(path) + "-journal")):
+        if sidecar.exists() or sidecar.is_symlink():
+            raise ActivationError("ordinary migration requires offline SQLite sidecars quarantined by the operator")
+    uri = "file:" + urllib.parse.quote(str(path), safe="/") + "?mode=ro&immutable=1"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as connection:
+            if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                raise ActivationError("ordinary migration SQLite integrity check failed")
+            ledger = tuple(connection.execute("SELECT * FROM _migrations ORDER BY version").fetchall())
+    except sqlite3.Error as exc:
+        raise ActivationError("ordinary migration SQLite integrity/ledger check failed") from exc
+    if not ledger or not isinstance(ledger[-1][0], int) or ledger[-1][0] < 70:
+        raise ActivationError("ordinary migration requires a modern migration ledger at version >= 70")
+    if [row[0] for row in ledger] != list(range(1, ledger[-1][0] + 1)):
+        raise ActivationError("ordinary migration requires a complete contiguous modern ledger")
+    return ledger
+
+
+def validate_ordinary_receipt(manifest: Manifest, *, restored: bool = False) -> None:
+    migration = manifest.ordinary_migration
+    if migration is None:
+        raise ActivationError("ordinary migration is not configured")
+    validate_ordinary_paths(manifest)
+    expected_database = migration.backup_sha256 if restored else migration.database_sha256
+    database = verify_staged(migration.database_path, expected_database, "restored database" if restored else "initial database")
+    backup = verify_staged(migration.backup_path, migration.backup_sha256, "migration backup")
+    rehearsal = verify_staged(migration.rehearsal_path, migration.rehearsal_sha256, "migration rehearsal")
+    if migration.rehearsal_sha256 != migration.backup_sha256:
+        raise ActivationError("migration rehearsal bytes must equal the backup")
+    backup_ledger = ordinary_database_ledger(backup)
+    if any(path.exists() or path.is_symlink() for path in (*database_paths(manifest)[1:], database.parent / (database.name + "-journal"))):
+        raise ActivationError("checkpoint the stopped source database before migration admission; sidecars remain")
+    if ordinary_database_ledger(database) != backup_ledger or ordinary_database_ledger(rehearsal) != backup_ledger:
+        raise ActivationError("ordinary migration receipt ledger differs from backup")
+    if ordinary_database_digest(database) != ordinary_database_digest(backup) or ordinary_database_digest(rehearsal) != ordinary_database_digest(backup):
+        raise ActivationError("ordinary migration backup/rehearsal does not match stopped source contents")
+    verify_staged(manifest.rollback_binary, migration.previous_binary_sha256, "captured predecessor binary")
+    verify_staged(manifest.rollback_plist, migration.previous_plist_sha256, "captured predecessor plist")
+    # Immutable connections never checkpoint SQLite; hashes detect concurrent byte changes.
+    for path, expected in ((database, expected_database), (backup, migration.backup_sha256), (rehearsal, migration.rehearsal_sha256)):
+        if sha256(path) != expected:
+            raise ActivationError("ordinary migration database receipt changed during verification")
+
+
+def require_service_absent(launchctl: Launchctl) -> None:
+    state, pid = launchctl.inspect()
+    if state != "not_loaded" or pid is not None:
+        raise ActivationError("ordinary migration requires an exactly stopped service")
+
+
 def validate_manifest_mode(manifest: Manifest) -> None:
     paired = manifest.paired_database_upgrade
+    ordinary = manifest.ordinary_migration
+    if ordinary is not None:
+        if paired is not None:
+            raise ActivationError("ordinary migration and paired database mode are mutually exclusive")
+        if manifest.source_kind not in {"local_head", "published_release"}:
+            raise ActivationError("ordinary migration requires an ordinary local or release source")
+        if manifest.previous is None or not all((manifest.rollback_binary, manifest.rollback_plist, manifest.previous_health_url)) or manifest.previous_health_insecure_tls is None or manifest.previous_health_json is None:
+            raise ActivationError("ordinary migration requires a captured predecessor and endpoint")
+        if ordinary.previous_binary_sha256 != manifest.rollback_binary_sha256 or ordinary.previous_plist_sha256 != manifest.rollback_plist_sha256:
+            raise ActivationError("ordinary migration predecessor hashes differ from captured rollback inputs")
+        for value in (ordinary.database_sha256, ordinary.backup_sha256, ordinary.rehearsal_sha256, ordinary.previous_binary_sha256, ordinary.previous_plist_sha256, ordinary.controller_helper_sha256):
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ActivationError("ordinary migration requires exact SHA-256 bindings")
+        validate_ordinary_paths(manifest)
+        helper = verify_staged(ordinary.controller_helper_path, ordinary.controller_helper_sha256, "controller helper")
+        if helper != Path(__file__).resolve():
+            raise ActivationError("ordinary migration helper path is not the running retained helper")
+        if any(_plist_database_path(Path(path)) != ordinary.database_path for path in (manifest.candidate_plist, manifest.rollback_plist)):
+            raise ActivationError("ordinary migration database path differs between candidate, predecessor, and manifest")
     if manifest.source_kind == "prepared_artifact" and paired is None:
         raise ActivationError("prepared artifact requires paired database mode")
     if paired is not None:
@@ -976,7 +1132,7 @@ def activate(manifest: Manifest) -> str:
             prepared_installs.append(prepared_candidate_binary)
             prepared_candidate_plist = (
                 prepare_plist_publication(candidate_plist, Path(manifest.target_plist))
-                if manifest.paired_database_upgrade is not None
+                if private_activation(manifest)
                 else prepare_atomic_install(candidate_plist, Path(manifest.target_plist), 0o600)
             )
             prepared_installs.append(prepared_candidate_plist)
@@ -992,7 +1148,7 @@ def activate(manifest: Manifest) -> str:
                 prepared_installs.append(prepared_rollback_binary)
                 prepared_rollback_plist = (
                     prepare_plist_publication(rollback_plist, Path(manifest.target_plist))
-                    if manifest.paired_database_upgrade is not None
+                    if private_activation(manifest)
                     else prepare_atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
                 )
                 prepared_installs.append(prepared_rollback_plist)
@@ -1004,6 +1160,14 @@ def activate(manifest: Manifest) -> str:
                 manifest.rollback_plist_sha256,
             )):
                 raise ActivationError("first-install rollback inputs are inconsistent")
+            if manifest.ordinary_migration is not None:
+                require_service_absent(Launchctl(manifest))
+                assert_database_exclusive(manifest)
+                validate_ordinary_receipt(manifest)
+                verify_staged(manifest.target_binary, manifest.rollback_binary_sha256, "installed predecessor binary")
+                verify_staged(manifest.target_plist, manifest.rollback_plist_sha256, "installed predecessor plist")
+                if Path(manifest.active_path).read_text().strip() != manifest.transaction_id:
+                    raise ActivationError("ordinary migration does not own the transaction claim")
             if manifest.paired_database_upgrade is not None:
                 validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
                 capacity_reservation = reserve_database_capacity(manifest)
@@ -1025,14 +1189,23 @@ def activate(manifest: Manifest) -> str:
                 # Production owns the database until launchd stops it; only the
                 # read-only legacy shape gate is safe before disruption.
                 validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
-            old_pid = launchctl.stop()
+            if manifest.ordinary_migration is not None:
+                require_service_absent(launchctl)
+                assert_database_exclusive(manifest)
+                validate_ordinary_receipt(manifest)
+                verify_staged(manifest.target_binary, manifest.rollback_binary_sha256, "installed predecessor binary")
+                verify_staged(manifest.target_plist, manifest.rollback_plist_sha256, "installed predecessor plist")
+                old_pid = None
+            else:
+                old_pid = launchctl.stop()
             disrupted = True
-            if manifest.paired_database_upgrade is not None:
+            if private_activation(manifest):
                 quarantined_previous_plist = quarantine_paired_plist(manifest)
                 if quarantined_previous_plist is None:
                     raise ActivationError("paired predecessor plist is unavailable")
                 if sha256(quarantined_previous_plist) != manifest.rollback_plist_sha256:
                     raise ActivationError("captured predecessor plist checksum mismatch")
+            if manifest.paired_database_upgrade is not None:
                 # Exclusivity is meaningful only after launchd confirms teardown.
                 assert_database_exclusive(manifest)
                 validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
@@ -1042,35 +1215,40 @@ def activate(manifest: Manifest) -> str:
                 database_snapshot = True
             candidate_binary_mutated = True
             commit_atomic_install(prepared_candidate[0], Path(manifest.target_binary))
-            if manifest.paired_database_upgrade is None:
+            if not private_activation(manifest):
                 commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
                 launchctl.start(old_pid)
             else:
                 launchctl.start(old_pid, plist_path=manifest.candidate_plist)
             wait_for_identity(manifest, manifest.expected)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
-            paired_commit = manifest.paired_database_upgrade is not None
+            private_commit = private_activation(manifest)
             write_status(
-                manifest, "committed", finalization_pending=paired_commit,
-                committed_diagnostic="paired publication/cleanup pending; login/reboot persistence unconfirmed" if paired_commit else None,
+                manifest, "activating" if manifest.ordinary_migration is not None else "committed",
+                finalization_pending=private_commit,
+                committed_diagnostic="private publication/cleanup pending; login/reboot persistence unconfirmed" if private_commit else None,
             )
-            committed_durable = True
+            committed_durable = manifest.ordinary_migration is None
             diagnostics = []
             if capacity_reservation is not None:
                 try:
                     release_capacity_reservation(manifest, capacity_reservation)
                 except Exception as capacity_exc:
                     diagnostics.append(f"restore reservation cleanup failed: {capacity_exc}")
-            if paired_commit:
+            if private_commit:
                 try:
                     commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
                 except Exception as publish_exc:
+                    if manifest.ordinary_migration is not None:
+                        raise
                     diagnostics.append(f"candidate plist publish failed: {publish_exc}")
                 write_status(manifest, "committed", finalization_pending=bool(diagnostics), committed_diagnostic="; ".join(diagnostics) or None)
             return "committed"
         except Exception as activation_exc:
             failure = str(activation_exc)
             disrupted = disrupted or launchctl.disruption_started
+            if manifest.ordinary_migration is not None and disrupted:
+                return fail_migration_stopped(manifest, launchctl, failure)
             if committed_durable:
                 try:
                     write_status(manifest, "committed", committed_diagnostic=f"paired finalization interrupted: {failure}", finalization_pending=True)
@@ -1123,14 +1301,18 @@ def activate(manifest: Manifest) -> str:
 
 
 def quarantine_paired_plist(manifest: Manifest) -> Optional[Path]:
-    if manifest.paired_database_upgrade is None:
+    if not private_activation(manifest):
         return None
     target = Path(manifest.target_plist)
     if target.is_symlink():
         raise ActivationError("unresolved target plist must not be a symlink")
     if not target.exists():
         return None
-    transaction = Path(manifest.paired_database_upgrade.proof_path).parent
+    transaction = (
+        Path(manifest.ordinary_migration.controller_helper_path).parent
+        if manifest.ordinary_migration is not None
+        else Path(manifest.paired_database_upgrade.proof_path).parent
+    )
     fd, name = tempfile.mkstemp(prefix="unresolved-launchagent-", suffix=".plist.quarantined", dir=transaction)
     os.close(fd)
     destination = Path(name)
@@ -1337,6 +1519,90 @@ def recover_paired(manifest: Manifest) -> str:
             return "activation_failed_rollback_failed"
 
 
+def fail_migration_stopped(manifest: Manifest, launchctl: Launchctl, failure: str) -> str:
+    diagnostics = []
+    try:
+        launchctl.stop()
+        require_service_absent(launchctl)
+    except Exception as exc:
+        diagnostics.append(f"migration teardown unconfirmed: {exc}")
+    try:
+        quarantine_paired_plist(manifest)
+    except Exception as exc:
+        diagnostics.append(f"durable plist quarantine failed: {exc}")
+    write_status(manifest, "migration_failed_stopped", failure=failure, rollback_failure="; ".join(diagnostics) or None)
+    return "migration_failed_stopped"
+
+
+def resume_migration(manifest: Manifest) -> str:
+    with Path(manifest.lock_path).open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another deployment operation owns migration resume") from exc
+        if manifest.ordinary_migration is None or manifest.paired_database_upgrade is not None:
+            raise ActivationError("migration resume requires an ordinary migration transaction")
+        status = read_status(manifest)
+        if Path(manifest.active_path).read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"preparing", "prepared", "activating", "migration_failed_stopped", "migration_resumed"}:
+            raise ActivationError("migration resume must own a retained unresolved transaction")
+        if status.get("state") in {"preparing", "prepared"}:
+            pid = status.get("preparing_pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise ActivationError("preparing migration controller absence unproven")
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                raise ActivationError("preparing migration controller absence unproven") from exc
+            else:
+                raise ActivationError("preparing migration controller still alive")
+        launchctl = Launchctl(manifest)
+        prepared = []
+        try:
+            validate_manifest_identities(manifest)
+            validate_manifest_mode(manifest)
+            if status.get("recovery_mode") is not None or status.get("state") == "migration_resumed":
+                raise ActivationError("migration resume startup checkpoint exists; refuse startup replay")
+            require_service_absent(launchctl)
+            assert_database_exclusive(manifest)
+            validate_ordinary_receipt(manifest, restored=True)
+            target = Path(manifest.target_binary)
+            _regular_nosymlink(target, "installed runtime binary")
+            if sha256(target) not in {manifest.candidate_binary_sha256, manifest.rollback_binary_sha256}:
+                raise ActivationError("installed binary is not a captured transaction runtime")
+            published = Path(manifest.target_plist)
+            if published.exists() or published.is_symlink():
+                verify_staged(str(published), manifest.rollback_plist_sha256, "installed predecessor plist")
+                quarantine_paired_plist(manifest)
+            binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "captured predecessor binary")
+            private = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "private predecessor plist")
+            installation = prepare_atomic_install(binary, target, 0o755)
+            prepared.append(installation)
+            publication = prepare_plist_publication(private, published)
+            prepared.append(publication)
+            require_service_absent(launchctl)
+            assert_database_exclusive(manifest)
+            validate_ordinary_receipt(manifest, restored=True)
+            commit_atomic_install(installation, target)
+            verify_staged(str(target), manifest.rollback_binary_sha256, "installed predecessor binary")
+            write_status(manifest, "migration_failed_stopped", failure=status.get("failure"), recovery_mode="migration_resume_started")
+            launchctl.start(None, plist_path=str(private))
+            wait_for_identity(manifest, manifest.previous, health_url=manifest.previous_health_url, health_insecure_tls=manifest.previous_health_insecure_tls, health_json=manifest.previous_health_json)
+            require_loaded_plist(manifest, launchctl, private)
+            verify_staged(str(target), manifest.rollback_binary_sha256, "verified predecessor binary")
+            verify_staged(str(private), manifest.rollback_plist_sha256, "verified predecessor plist")
+            restore_deployed_sha(manifest)
+            commit_atomic_install(publication, published)
+            write_status(manifest, "migration_resumed", failure=status.get("failure"), recovery_mode="migration_resume_started")
+            return "migration_resumed"
+        except Exception as exc:
+            return fail_migration_stopped(manifest, launchctl, f"migration resume failed: {exc}")
+        finally:
+            for path in prepared:
+                path.unlink(missing_ok=True)
+
+
 def status_is_durable_terminal(manifest: Manifest) -> bool:
     try:
         status = read_status(manifest)
@@ -1355,13 +1621,17 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", nargs="?", choices=["activate", "recover-paired", "finalize-paired"])
+    parser.add_argument("command", nargs="?", choices=["activate", "recover-paired", "finalize-paired", "resume-migration"])
+    parser.add_argument("--supports-ordinary-migration", action="store_true")
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--probe-service-absence")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--helper-label")
     parser.add_argument("--uid", type=int)
     args = parser.parse_args()
+    if args.supports_ordinary_migration:
+        print("1")
+        return 0
     if args.protocol_version:
         print(HANDOFF_PROTOCOL_VERSION)
         return 0
@@ -1375,14 +1645,14 @@ def main() -> int:
         manifest = Manifest.load(args.manifest)
         if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
             raise ActivationError("helper identity does not match the immutable manifest")
-        state = finalize_paired(manifest) if args.command == "finalize-paired" else recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
+        state = resume_migration(manifest) if args.command == "resume-migration" else finalize_paired(manifest) if args.command == "finalize-paired" else recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
         if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
             fsync_dir(Path(manifest.status_path).parent)
             release_claim(manifest)
         print(state, flush=True)
-        return 0 if state == "committed" or (args.command == "recover-paired" and state == "activation_failed_rolled_back") else 1
+        return 0 if state == "committed" or (args.command == "recover-paired" and state == "activation_failed_rolled_back") or (args.command == "resume-migration" and state == "migration_resumed") else 1
     except ConcurrentDeploy as exc:
-        if manifest is not None and manifest.paired_database_upgrade is None:
+        if manifest is not None and not private_activation(manifest) and args.command != "resume-migration":
             try:
                 if args.command == "recover-paired":
                     record_recovery_error(manifest, str(exc))
@@ -1396,12 +1666,12 @@ def main() -> int:
     except Exception as exc:
         if manifest is not None and args.command == "recover-paired":
             record_recovery_error(manifest, exc)
-        if manifest is not None and args.command != "finalize-paired" and manifest.paired_database_upgrade is None and status_is_durable_terminal(manifest):
+        if manifest is not None and args.command not in {"finalize-paired", "resume-migration"} and (not private_activation(manifest) or (manifest.ordinary_migration is not None and read_status(manifest).get("state") == "precondition_failed")) and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        if args.command != "finalize-paired":
+        if args.command not in {"finalize-paired", "resume-migration"}:
             request_helper_bootout(args.uid, args.helper_label)
 
 

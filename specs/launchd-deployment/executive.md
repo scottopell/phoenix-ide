@@ -99,3 +99,7 @@ is published. Activation succeeded, so production rollback was not exercised.
 Disposable failure/restore fixtures and 143 deployment/restart tests passed on
 both hosts. Owner turn resumption remains separately verified; idle projection
 does not prove provider rejection was resolved.
+
+## Explicit modern migration policy
+
+The source opt-in ordinary migration policy is separate from RC1 and legacy prepared eligibility. `--migration-backup-receipt` requires stopped ownership, source-equivalent private backup/rehearsal, installed configuration and a selected-source capable helper. Candidate failure retains a stopped/fenced transaction, never runtime-only predecessor rollback. `resume-migration` verifies manual matched restoration before captured predecessor startup; checkpoint replay refuses. Tests cover mutation/failure without predecessor start, both receipt equivalence and wrong same-ledger data, controller routing/durability/fencing, and explicit resume. No production activation or large-private-database performance qualification is claimed.

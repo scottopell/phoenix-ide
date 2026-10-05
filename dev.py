@@ -9043,6 +9043,14 @@ class ProdDeployControllerOptions:
     backend: str | None = None
     prepared_artifact: Path | None = None
     paired_database_upgrade: bool = False
+    migration_backup_receipt: Path | None = None
+
+    def require_ordinary_migration(self) -> None:
+        if self.migration_backup_receipt is not None and (
+            sys.platform != "darwin" or self.backend not in (None, "launchd")
+            or self.enabled or self.prepared_artifact is not None or self.paired_database_upgrade
+        ):
+            raise SystemExit("--migration-backup-receipt requires ordinary macOS local HEAD/release deployment; excludes controller and paired/prepared sources")
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
         if release is None:
@@ -9717,6 +9725,16 @@ def _restart_transaction_status_path(transaction_id: str) -> Path:
     return LAUNCHD_RESTART_TRANSACTIONS_DIR / transaction_id / "status.json"
 
 
+def _ordinary_migration_owned(owner: str, status: dict) -> bool:
+    if status.get("transaction_id") == owner and status.get("ordinary_migration") is True:
+        return True
+    try:
+        manifest = json.loads((LAUNCHD_DEPLOY_DIR / "transactions" / owner / "manifest.json").read_text())
+        return isinstance(manifest, dict) and manifest.get("ordinary_migration") is not None
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def _status_is_terminal_for_owner(
     status_path: Path,
     owner: str,
@@ -9724,6 +9742,8 @@ def _status_is_terminal_for_owner(
 ) -> bool:
     try:
         status = json.loads(status_path.read_text())
+        if status_path == LAUNCHD_DEPLOY_STATUS_PATH and _ordinary_migration_owned(owner, status):
+            return status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed"}
         if (
             status.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
             and (status.get("state") == "activation_failed_rollback_failed"
@@ -9744,7 +9764,7 @@ def _transaction_has_paired_manifest(transaction: Path) -> bool:
         return True
     except (OSError, json.JSONDecodeError):
         return True
-    return not isinstance(payload, dict) or payload.get("paired_database_upgrade") is not None
+    return not isinstance(payload, dict) or payload.get("paired_database_upgrade") is not None or payload.get("ordinary_migration") is not None
 
 
 def _prune_launchd_deploy_transactions(transactions_dir: Path, current_transaction_id: str) -> None:
@@ -9812,6 +9832,15 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
         manifest = {}
     if not isinstance(manifest, dict):
         manifest = {}
+    if _ordinary_migration_owned(owner, status) and not (
+        status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed"}
+    ):
+        return (
+            f"ordinary migration {owner} retains deployment ownership. Do not clear its marker, redeploy, restart, or stop. "
+            "Preserve its private backup/rehearsal and predecessor artifacts. "
+            f"After confirming the old helper is absent, run ./dev.py prod resume-migration {owner}; "
+            "a resumed checkpoint requires explicit verified completion, not automatic claim removal."
+        )
     paired = manifest.get("paired_database_upgrade") is not None or manifest.get("source_kind") == "prepared_artifact" or status.get("source_kind") == "prepared_artifact"
     if paired and status.get("transaction_id") == owner and status.get("state") == "committed" and status.get("finalization_pending"):
         return (
@@ -10030,6 +10059,144 @@ def _helper_plist(
     }, fmt=plistlib.FMT_XML)
 
 
+def _migration_regular_path(value: object) -> Path:
+    if not isinstance(value, str):
+        raise ValueError("migration path must be a string")
+    path = Path(value)
+    if not path.is_absolute() or str(path.resolve(strict=True)) != value or path.is_symlink() or not path.is_file():
+        raise ValueError("migration path must be canonical and a regular non-symlink file")
+    if path.stat().st_nlink != 1:
+        raise ValueError("migration path must not be hardlinked")
+    return path
+
+
+def _read_migration_backup_receipt(receipt_path: Path, installed_env: dict[str, str]) -> dict:
+    fields = {
+        "database_path", "database_sha256", "backup_path", "backup_sha256",
+        "rehearsal_path", "rehearsal_sha256", "previous_binary_sha256", "previous_plist_sha256",
+    }
+    try:
+        receipt = json.loads(_migration_regular_path(str(receipt_path)).read_text())
+        if not isinstance(receipt, dict) or set(receipt) != fields | {"schema"} or type(receipt["schema"]) is not int or receipt["schema"] != 1:
+            raise ValueError("receipt must have exactly schema 1 fields")
+        result = {key: receipt[key] for key in fields}
+        for key in fields:
+            if key.endswith("_sha256") and (not isinstance(result[key], str) or re.fullmatch(r"[0-9a-f]{64}", result[key]) is None):
+                raise ValueError("receipt SHA-256 is invalid")
+        paths = [_migration_regular_path(result[key]) for key in ("database_path", "backup_path", "rehearsal_path")]
+        if len(set(paths)) != 3:
+            raise ValueError("receipt database paths must be distinct")
+        database = _migration_regular_path(str(installed_env.get("PHOENIX_DB_PATH", PROD_DB_PATH)))
+        if paths[0] != database:
+            raise ValueError("receipt database differs from installed configuration")
+        for key, path in zip(("database", "backup", "rehearsal"), paths):
+            if _file_sha256(path) != result[key + "_sha256"]:
+                raise ValueError("receipt database checksum mismatch")
+        if result["rehearsal_sha256"] != result["backup_sha256"]:
+            raise ValueError("receipt rehearsal must match backup bytes")
+        for key, path in (("previous_binary_sha256", LAUNCHD_INSTALL_DIR / "phoenix-ide"), ("previous_plist_sha256", LAUNCHD_PLIST_PATH)):
+            if _file_sha256(_migration_regular_path(str(path))) != result[key]:
+                raise ValueError("receipt predecessor checksum mismatch")
+        return result
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        raise SystemExit(f"invalid migration backup receipt: {exc}") from exc
+
+
+def _stage_ordinary_migration(receipt: dict, staging: Path, helper: Path) -> dict:
+    result = dict(receipt)
+    for kind in ("backup", "rehearsal"):
+        fd, name = tempfile.mkstemp(prefix=f"migration-{kind}-", suffix=".sqlite3", dir=staging)
+        path = Path(name)
+        with os.fdopen(fd, "wb") as target, Path(receipt[kind + "_path"]).open("rb") as source:
+            shutil.copyfileobj(source, target)
+            os.fchmod(target.fileno(), 0o600)
+            target.flush()
+            os.fsync(target.fileno())
+        if _file_sha256(path) != receipt[kind + "_sha256"]:
+            raise SystemExit("migration receipt changed during private staging")
+        result[kind + "_path"] = str(path)
+    result.update(controller_helper_path=str(helper), controller_helper_sha256=_file_sha256(helper))
+    return result
+
+
+def _abandon_incomplete_migration_preparation(transaction_id: str, staging: Path) -> None:
+    with _launchd_claim_lock():
+        status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+        if not isinstance(status, dict) or _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("state") != "preparing" or not status.get("ordinary_migration") or (staging / "manifest.json").exists():
+            raise SystemExit("incomplete migration preparation ownership is unproven")
+        pid = status.get("preparing_pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise SystemExit("preparing controller PID is unproven")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise SystemExit("preparing controller absence is unproven") from exc
+        else:
+            raise SystemExit("preparing controller is still alive")
+        helper = ROOT / "scripts" / "launchd_deploy_helper.py"
+        label = f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}"
+        probe = subprocess.run([sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+        if probe.returncode != 0:
+            raise SystemExit("preparation helper absence unconfirmed; claim retained")
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {**status, "state": "precondition_failed", "failure": "abandoned incomplete stopped migration preparation", "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+        _release_launchd_deploy_claim_unlocked(transaction_id)
+    print(f"Abandoned incomplete migration preparation {transaction_id}; no runtime/database action.")
+
+
+def cmd_prod_resume_migration(transaction_id: str) -> None:
+    """Dispatch offline recovery to the retained helper; never activate from the controller."""
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
+        raise SystemExit("migration resume requires macOS and a safe transaction ID")
+    staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    manifest_path = staging / "manifest.json"
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        _abandon_incomplete_migration_preparation(transaction_id, staging)
+        return
+    try:
+        payload = json.loads(_migration_regular_path(str(manifest_path)).read_text())
+        ordinary = payload["ordinary_migration"]
+        if not isinstance(ordinary, dict) or payload.get("paired_database_upgrade") is not None or payload.get("source_kind") not in {"local_head", "published_release"}:
+            raise ValueError("not an ordinary migration manifest")
+        if _deploy_claim_owner() != transaction_id or payload["transaction_id"] != transaction_id or payload["uid"] != os.getuid():
+            raise ValueError("migration resume claim/manifest mismatch")
+        helper = _migration_regular_path(ordinary["controller_helper_path"])
+        if helper.parent != staging or _file_sha256(helper) != ordinary["controller_helper_sha256"]:
+            raise ValueError("retained migration helper binding is invalid")
+        label = payload["helper_label"]
+        if label != f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}":
+            raise ValueError("retained migration helper label mismatch")
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+        raise SystemExit(f"migration resume refused: {exc}") from exc
+    status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    if status.get("transaction_id") != transaction_id:
+        raise SystemExit("migration resume durable status mismatch")
+    if status.get("state") in {"preparing", "prepared"}:
+        pid = status.get("preparing_pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise SystemExit("migration preparation controller absence unproven")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise SystemExit("migration preparation controller absence unproven") from exc
+        else:
+            raise SystemExit("migration preparation controller remains alive")
+    interpreter = str(Path(sys.executable).resolve())
+    probe = subprocess.run([interpreter, "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"], capture_output=True)
+    if probe.returncode != 0:
+        raise SystemExit("active Python interpreter cannot run SQLite migration resume")
+    absent = subprocess.run([interpreter, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+    if absent.returncode != 0:
+        raise SystemExit("previous migration helper absence is unconfirmed; claim retained")
+    result = subprocess.run([interpreter, str(helper), "resume-migration", "--manifest", str(manifest_path), "--helper-label", label, "--uid", str(os.getuid())])
+    if result.returncode != 0:
+        raise SystemExit("migration resume refused/failed; deployment ownership retained")
+    print(f"Migration resume helper completed: {transaction_id}; inspect prod status for retained ownership.")
+
+
 def cmd_prod_finalize_paired(transaction_id: str) -> None:
     if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
         raise SystemExit("paired finalization requires macOS and a safe transaction ID")
@@ -10174,7 +10341,7 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
 
 def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = None) -> tuple[dict[str, str], Path | None]:
     env: dict[str, str] = {}
-    if controller is not None and (controller.enabled or controller.prepared_artifact is not None):
+    if controller is not None and (controller.enabled or controller.prepared_artifact is not None or controller.migration_backup_receipt is not None):
         try:
             installed = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
             installed.pop("PHOENIX_VERSION", None)
@@ -10196,10 +10363,13 @@ def launchd_prod_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
+    controller.require_ordinary_migration()
     if controller.enabled and controller.prepared_artifact is None:
         release, _expected_full_commit = controller.require_exact_release(release)
-    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if controller.paired_database_upgrade and LAUNCHD_PLIST_PATH.is_file() else None
+    ordinary_policy = controller.migration_backup_receipt is not None
+    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if (controller.paired_database_upgrade or ordinary_policy) and LAUNCHD_PLIST_PATH.is_file() else None
     launchd_env, _env_file = _launchd_candidate_env(controller)
+    migration_receipt = _read_migration_backup_receipt(controller.migration_backup_receipt, launchd_env) if ordinary_policy else None
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
     transaction_id = controller.transaction_id or f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
@@ -10217,6 +10387,7 @@ def launchd_prod_deploy(
     selected_identity: RuntimeIdentity | None = None
     initial_status = {
         "transaction_id": transaction_id, "state": "preparing",
+        **({"ordinary_migration": True} if ordinary_policy else {}),
         "preparing_pid": os.getpid(), "source_kind": source_kind,
         "source_commit": source_commit, "release_commit": release_commit,
         "release_tag": release_tag, "expected_version": None, "expected_git_sha": None,
@@ -10243,11 +10414,13 @@ def launchd_prod_deploy(
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
         if installed_config_hash is not None and _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
             raise SystemExit("installed configuration changed before claim acquisition")
-        if controller.paired_database_upgrade and installed_config_hash is not None:
+        if (controller.paired_database_upgrade or ordinary_policy) and installed_config_hash is not None:
             launchd_env, _env_file = _launchd_candidate_env(controller)
             _preflight_prod_bind_auth(launchd_env, socket_activated=True)
             if _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
                 raise SystemExit("installed configuration changed during claimed snapshot read")
+        if ordinary_policy and _read_migration_backup_receipt(controller.migration_backup_receipt, launchd_env) != migration_receipt:
+            raise SystemExit("migration backup receipt changed before claim acquisition")
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
         _mkdir_durable(transactions_dir)
         _prune_launchd_deploy_transactions(transactions_dir, transaction_id)
@@ -10289,7 +10462,7 @@ def launchd_prod_deploy(
         env_file = _env_file
         if env_file:
             print(f"  Loaded env from {env_file}")
-        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT or ordinary_policy:
             path_str = env_overrides.get("PATH")
             if not path_str:
                 raise SystemExit("prepared-artifact deployment requires installed launchd PATH")
@@ -10298,7 +10471,7 @@ def launchd_prod_deploy(
             path_str, path_source = capture_login_shell_path()
         print_launchd_path_report(path_str, path_source)
         plist_content = generate_launchd_plist(selected_identity.version, extra_env=env_overrides, path_override=path_str)
-        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT or ordinary_policy:
             installed_config = dict(env_overrides)
             installed_config["PHOENIX_VERSION"] = selected_identity.version
             paired_plist = plistlib.loads(plist_content.encode())
@@ -10351,6 +10524,18 @@ def launchd_prod_deploy(
                 f"selected helper uses incompatible handoff protocol {protocol.stdout.strip()!r}; "
                 f"expected {LAUNCHD_HANDOFF_PROTOCOL_VERSION}"
             )
+        if ordinary_policy:
+            capability = subprocess.run([str(python_executable), str(helper), "--supports-ordinary-migration"], capture_output=True, text=True)
+            if capability.returncode != 0 or capability.stdout.strip() != "1":
+                raise SystemExit("selected candidate helper does not support ordinary migration policy")
+            absence = subprocess.run([str(python_executable), str(helper), "--probe-service-absence", LAUNCHD_LABEL, "--uid", str(os.getuid())], capture_output=True, text=True)
+            if absence.returncode != 0:
+                raise SystemExit("ordinary migration requires an existing stopped service; absence unconfirmed")
+            if installed_config_hash != _file_sha256(LAUNCHD_PLIST_PATH) or _read_migration_backup_receipt(controller.migration_backup_receipt, launchd_env) != migration_receipt:
+                raise SystemExit("installed migration receipt/configuration changed during preparation")
+            if _file_sha256(rollback_binary) != migration_receipt["previous_binary_sha256"] or _file_sha256(rollback_plist) != migration_receipt["previous_plist_sha256"]:
+                raise SystemExit("captured migration predecessor differs from receipt")
+            migration_receipt = _stage_ordinary_migration(migration_receipt, staging, helper)
         interpreter_check = subprocess.run(
             [str(python_executable), "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"],
             capture_output=True,
@@ -10409,6 +10594,7 @@ def launchd_prod_deploy(
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
             "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
             "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
+            **({"ordinary_migration": migration_receipt} if ordinary_policy else {}),
             "paired_database_upgrade": ({
                 "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
                 "backup_path": str(staging / "database-backup.sqlite3"),
@@ -10431,6 +10617,7 @@ def launchd_prod_deploy(
         _fsync_directory(staging)
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "prepared",
+            **({"ordinary_migration": True} if ordinary_policy else {}),
             "preparing_pid": os.getpid(), "source_kind": source_kind,
             "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
             "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
@@ -10446,13 +10633,14 @@ def launchd_prod_deploy(
         if result.returncode != 0:
             raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
     except BaseException as exc:
-        if controller is not None and controller.paired_database_upgrade and bootstrap_attempted:
+        if (controller.paired_database_upgrade or ordinary_policy) and bootstrap_attempted:
             raise
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         terminal_status_written = False
         try:
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
                 "transaction_id": transaction_id, "state": "precondition_failed",
+                **({"ordinary_migration": True} if ordinary_policy else {}),
                 "source_kind": source_kind,
                 "source_commit": source_commit,
                 "release_commit": release_commit,
@@ -10904,6 +11092,7 @@ def cmd_prod_deploy(
 ):
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
+    controller.require_ordinary_migration()
     supplied = (controller.prepared_artifact is not None, controller.paired_database_upgrade)
     if controller.expected_full_commit is not None and release is None and not any(supplied):
         raise SystemExit("--expected-full-commit requires all prepared paired options or an exact release controller")
@@ -10914,6 +11103,8 @@ def cmd_prod_deploy(
     if controller.prepared_artifact is not None and release:
         raise SystemExit("prepared artifact paired deployment excludes --release")
     env = controller.require_backend()
+    if controller.migration_backup_receipt is not None and env != "launchd":
+        raise SystemExit("--migration-backup-receipt requires macOS launchd")
     if controller.enabled and not release and controller.prepared_artifact is None:
         raise SystemExit("controller mode requires --release")
     if not release and controller.prepared_artifact is None:
@@ -10922,7 +11113,7 @@ def cmd_prod_deploy(
         print()
 
     if env == "launchd":
-        if controller.enabled or controller.prepared_artifact is not None:
+        if controller.enabled or controller.prepared_artifact is not None or controller.migration_backup_receipt is not None:
             launchd_prod_deploy(release, controller=controller)
         else:
             launchd_prod_deploy(release)
@@ -11272,6 +11463,9 @@ def main():
     deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
     deploy_parser.add_argument("--expected-full-commit", help="Exact full SHA for --prepared-artifact")
     deploy_parser.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
+    deploy_parser.add_argument("--migration-backup-receipt", type=Path, help="Offline schema-1 backup/rehearsal receipt for ordinary macOS local HEAD/release migration")
+    resume_parser = prod_sub.add_parser("resume-migration", help="Delegate retained offline migration recovery to its verified helper (no controller activation)")
+    resume_parser.add_argument("transaction_id")
     recover_parser = prod_sub.add_parser("recover-paired", help="Verify and restore a retained failed paired transaction")
     recover_parser.add_argument("transaction_id")
     finalize_parser = prod_sub.add_parser("finalize-paired", help="Finalize retained committed paired publication/cleanup without runtime or database changes")
@@ -11447,9 +11641,12 @@ def main():
                     transaction_id=args.transaction_id,
                     prepared_artifact=args.prepared_artifact,
                     paired_database_upgrade=args.paired_database_upgrade,
+                    migration_backup_receipt=args.migration_backup_receipt,
                     backend=args.controller_backend,
                 ),
             )
+        elif args.prod_command == "resume-migration":
+            cmd_prod_resume_migration(args.transaction_id)
         elif args.prod_command == "recover-paired":
             cmd_prod_recover_paired(args.transaction_id)
         elif args.prod_command == "finalize-paired":

@@ -113,3 +113,9 @@ tail -f ~/.phoenix-ide/prod-launchd-stderr.log        # Loader/pre-main failures
 - A stale ordinary `prepared` or `activating` status requires inspecting its activation log, matching status/claim, and proving its exact helper absent before any ordinary marker repair. Never apply ordinary marker repair to a paired transaction. See the repository `LAUNCHD.md` for the prepared-artifact paired lifecycle and supported proof boundaries.
 - `./dev.py check` failure applies only to local-HEAD deployment and aborts before staging. Published-release deployment deliberately skips repository checks and compilation.
 - Do not manually `launchctl load/unload` the production plist. Use the production commands and durable status evidence.
+
+## Ordinary modern migration option
+
+`prod deploy --migration-backup-receipt PATH` explicitly selects the stopped/fenced ordinary macOS policy. The service must be stopped, installed environment preserved, and a private stopped-state SQLite backup plus restoration rehearsal proven equivalent to source contents. Safely checkpoint/close SQLite before admission; never blindly drop WAL/SHM/journal data. Normal local HEAD/release source only; legacy paired eligibility does not widen.
+
+Failure leaves `migration_failed_stopped` with retained claim and no automatic predecessor start/DB restore. Manual offline matched restore precedes `prod resume-migration TXN`; the retained helper verifies restored bytes/content and captured runtime/configuration before startup. Do not clear retained migration markers or bypass deploy/restart/stop fencing. A resume-start checkpoint refuses replay. See repository `LAUNCHD.md` for receipt fields, capacity and proof boundaries; no host activation is authorized by this guide.

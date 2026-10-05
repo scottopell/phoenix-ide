@@ -632,9 +632,15 @@ rule RecordPairedFinalizationOutcome {
         -- Errors remain committed diagnostics; interruption retains pending and claim.
 }
 
+-- ordinary_modern_migration_selected(transaction) -> Boolean
+--   Explicit launchd ordinary stopped/fenced policy under launchd REQ-LDD-019;
+--   its states, receipt admission and manual-restoration resume are owned by
+--   launchd-deployment.allium, not runtime-artifact rollback rules here.
+
 rule RollBackFailedOrdinaryActivation {
     when: ActivationFailed(transaction, failure)
     requires: transaction.state = activating
+    requires: not ordinary_modern_migration_selected(transaction)
     requires: transaction.kind != PreparedArtifactDeployment
     requires: current_claim_matches(transaction)
     requires: exact_previous_restored(transaction)
@@ -717,6 +723,7 @@ rule RollBackFailedPreparedPairedActivation {
 rule PreserveRollbackFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
     requires: transaction.state = activating
+    requires: not ordinary_modern_migration_selected(transaction)
     requires: current_claim_matches(transaction)
     ensures: transaction.kind = PreparedArtifactDeployment implies transaction.state = activation_failed_rollback_failed
     ensures: transaction.kind != PreparedArtifactDeployment implies transaction.state = ordinary_activation_failed_rollback_failed

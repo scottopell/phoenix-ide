@@ -114,3 +114,7 @@ THE shared production deployment contract SHALL treat the macOS launchd prepared
 ### REQ-PD-020 — Narrow committed paired finalization
 
 The shared command surface SHALL expose `prod finalize-paired TXN` only for the launchd paired contract under `specs/launchd-deployment/requirements.md` REQ-LDD-018. This operation SHALL be publication/reservation-only and SHALL NOT reuse runtime activation or database rollback. Unknown ownership, helper absence, committed identity or captured configuration SHALL retain the fence and refuse.
+
+### REQ-PD-021 — Opt-in ordinary migration failure stays offline
+
+The shared deployment CLI SHALL expose the explicit macOS launchd ordinary migration policy in `specs/launchd-deployment/requirements.md` REQ-LDD-019 without changing ordinary runtime-only rollback or widening prepared legacy eligibility. A matching offline backup/rehearsal is a precondition, not automatic database recovery. Retained failed or interrupted ownership SHALL fence deploy/restart/stop and route the operator to manual matching restoration and `prod resume-migration TXN`, never marker removal or automatic predecessor startup.
