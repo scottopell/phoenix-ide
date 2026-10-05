@@ -443,6 +443,7 @@ class CompilerCacheTests(unittest.TestCase):
                 "KACHE_RUNTIME_DIR": "run/kache",
                 "KACHE_LOG_FILE": "logs/kache.log",
                 "SCCACHE_DIR": "cache/sccache",
+                "SCCACHE_CONF": "config/sccache.toml",
             },
             clear=True,
         ):
@@ -453,8 +454,10 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("/workspace/run/kache", os.environ["KACHE_RUNTIME_DIR"])
             self.assertEqual("/workspace/logs/kache.log", os.environ["KACHE_LOG_FILE"])
             self.assertEqual("cache/sccache", os.environ["SCCACHE_DIR"])
+            self.assertEqual("config/sccache.toml", os.environ["SCCACHE_CONF"])
             self.dev._normalize_cache_paths("sccache", self.dev.Path("/workspace"))
             self.assertEqual("/workspace/cache/sccache", os.environ["SCCACHE_DIR"])
+            self.assertEqual("/workspace/config/sccache.toml", os.environ["SCCACHE_CONF"])
 
     def test_absolute_cache_paths_are_preserved(self):
         with mock.patch.dict(

@@ -146,6 +146,30 @@ class DevWorkflowArtifactTests(unittest.TestCase):
 
         self.assertEqual("0", seen_environment["COREPACK_ENABLE_NETWORK"])
 
+    def test_doctor_uses_compiler_cache_sccache_validation(self):
+        with (
+            mock.patch.object(self.dev, "_doctor_version", return_value=(True, "ok")),
+            mock.patch.object(self.dev, "_find_chromium_binary", return_value=None),
+            mock.patch.object(
+                self.dev.shutil,
+                "which",
+                side_effect=lambda name, **_kwargs: "/usr/bin/sccache"
+                if name == "sccache"
+                else None,
+            ),
+            mock.patch.object(
+                self.dev,
+                "_usable_sccache",
+                return_value=(None, "unrecognized version output: exit code 0"),
+            ) as usable,
+        ):
+            results = self.dev.collect_doctor_results()
+
+        usable.assert_called_once_with("/usr/bin/sccache")
+        sccache = next(result for result in results if result.name == "sccache")
+        self.assertFalse(sccache.ok)
+        self.assertEqual("unrecognized version output: exit code 0", sccache.detail)
+
     def test_doctor_fails_only_for_missing_required_prerequisites(self):
         results = [
             self.dev.DoctorResult("cargo", False, "not found"),

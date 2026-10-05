@@ -3868,7 +3868,7 @@ def collect_doctor_results() -> list[DoctorResult]:
 
     sccache_binary = shutil.which("sccache")
     if sccache_binary:
-        version, error = _command_version(sccache_binary)
+        version, error = _usable_sccache(sccache_binary)
         results.append(DoctorResult(
             "sccache", version is not None, version or str(error), required=False,
         ))
@@ -4976,7 +4976,7 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
             "KACHE_LOG_FILE",
         )
         if backend == "kache"
-        else ("SCCACHE_DIR",)
+        else ("SCCACHE_DIR", "SCCACHE_CONF")
     )
     for name in names:
         value = os.environ.get(name)
