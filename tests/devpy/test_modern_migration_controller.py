@@ -3,12 +3,15 @@ import contextlib
 import importlib.util
 import json
 import os
+import shutil
+import sqlite3
 from pathlib import Path
 import plistlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -97,6 +100,7 @@ class MigrationControllerTests(unittest.TestCase):
                 "_prepare_release_candidate": {"return_value": prepared}, "_binary_identity": {"return_value": identity},
                 "_resolve_rollback_identity": {"return_value": (dev.RuntimeIdentity("1.0.0", "b" * 40), "http://localhost:8031/api/version", False, True)},
                 "_materialize_helper": {"side_effect": lambda commit, path, source: (events.append(("materialize", commit, source)), path.write_text("# immutable candidate helper\n"))},
+                "_materialize_source_file": {"side_effect": lambda commit, source, path, kind: path.write_bytes((ROOT / source).read_bytes())},
                 "generate_launchd_plist": {"return_value": plist.read_text()}, "capture_login_shell_path": {},
                 "print_launchd_path_report": {}, "_ensure_newsyslog_config": {}, "_report_launchd_handoff": {},
                 "_load_env_file": {"side_effect": AssertionError("ambient env must not be loaded")},
@@ -166,7 +170,7 @@ class MigrationControllerTests(unittest.TestCase):
             retained_helper.write_text("helper")
             Path(receipt["backup_path"]).chmod(0o644)
             with self.assertRaisesRegex(ValueError, "private"):
-                dev._stage_ordinary_migration(receipt, staging, retained_helper)
+                dev._stage_ordinary_migration(receipt, staging, retained_helper, source_commit="a" * 40, source_kind="published_release")
             self.assertFalse(list(staging.glob("migration-*.sqlite3")))
 
     def test_receipt_symlinks_and_hardlinks_rejected(self):
@@ -244,11 +248,138 @@ class MigrationControllerTests(unittest.TestCase):
                 self.assertFalse(any("bootstrap" in event[1] or "bootout" in event[1] for event in events if event[0] == "command"))
 
     def test_migration_fsync_failure_prevents_prepared_and_handoff(self):
-        with self.deployment(fail_sync=True) as (_, _, options, _, events, _):
+        with self.deployment(fail_sync=True) as (_, staging, options, _, events, _):
             with self.assertRaisesRegex(OSError, "fsync"):
                 dev.launchd_prod_deploy(controller=options)
             self.assertNotIn(("status", "prepared"), events)
             self.assertFalse(dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+            self.assertFalse(staging.exists())
+
+    def test_post_copy_preparation_failure_cleans_private_staging_before_release(self):
+        for fault in ("helper_plist", "manifest", "directory_fsync"):
+            with self.subTest(fault=fault), self.deployment() as (_, staging, options, receipt, _, _), contextlib.ExitStack() as stack:
+                if fault == "helper_plist":
+                    stack.enter_context(mock.patch.object(dev, "_helper_plist", side_effect=OSError("helper plist failure")))
+                elif fault == "manifest":
+                    original = dev._write_json_atomic
+                    def write(path, value, **kwargs):
+                        if path == staging / "manifest.json":
+                            raise OSError("manifest failure")
+                        return original(path, value, **kwargs)
+                    stack.enter_context(mock.patch.object(dev, "_write_json_atomic", side_effect=write))
+                else:
+                    original = dev._fsync_directory
+                    def sync(path):
+                        if path == staging:
+                            raise OSError("staging directory fsync failure")
+                        return original(path)
+                    stack.enter_context(mock.patch.object(dev, "_fsync_directory", side_effect=sync))
+                with self.assertRaises(OSError):
+                    dev.launchd_prod_deploy(controller=options)
+                self.assertFalse(staging.exists())
+                self.assertFalse(dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+                self.assertTrue(Path(receipt["backup_path"]).exists())
+                self.assertEqual(json.loads(dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text())["state"], "precondition_failed")
+
+    def test_cleanup_failure_retains_owner_and_supported_abandon_retries_cleanup(self):
+        with self.deployment() as (_, staging, options, receipt, events, _):
+            with mock.patch.object(dev, "_helper_plist", side_effect=OSError("preparation failure")), mock.patch.object(dev.shutil, "rmtree", side_effect=OSError("cleanup failure")):
+                with self.assertRaisesRegex(OSError, "cleanup failure"):
+                    dev.launchd_prod_deploy(controller=options)
+            self.assertEqual(dev._deploy_claim_owner(), "test-modern")
+            self.assertTrue(list(staging.glob("migration-*.sqlite3")))
+            status = json.loads(dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+            self.assertTrue(status["cleanup_pending"])
+            events.clear()
+            with mock.patch.object(dev.os, "kill", side_effect=ProcessLookupError()):
+                dev.cmd_prod_resume_migration("test-modern")
+            self.assertFalse(staging.exists())
+            self.assertFalse(dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+            self.assertTrue(Path(receipt["backup_path"]).exists())
+            self.assertFalse(any("bootstrap" in event[1] for event in events if event[0] == "command"))
+
+    def test_actual_112_lifecycle_cleanup_failure_manual_restore_and_terminal_retry(self):
+        from tests.devpy.test_modern_migration import helper, Backend, actual_migrations
+        with self.deployment(release=True) as (_, staging, options, receipt, _, _):
+            backend = Backend(SimpleNamespace(uid=os.getuid(), label=dev.LAUNCHD_LABEL))
+            backend.state = ("running", 123)
+            backend.stop()
+            self.assertEqual(backend.state, ("not_loaded", None))
+            database = Path(receipt["database_path"])
+            database.unlink()
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)")
+                connection.executemany("INSERT INTO _migrations VALUES (?, ?, '2026-10-05')", actual_migrations(112))
+                connection.execute("CREATE TABLE messages (id TEXT PRIMARY KEY, content TEXT NOT NULL)")
+                connection.execute("INSERT INTO messages VALUES ('original-message', 'must survive')")
+                self.assertEqual(connection.execute("SELECT count(*) FROM _migrations WHERE version=99").fetchone(), (0,))
+                connection.commit()
+                self.assertEqual(connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
+            Path(receipt["backup_path"]).unlink()
+            with sqlite3.connect(database) as source, sqlite3.connect(receipt["backup_path"]) as backup:
+                source.backup(backup)
+            shutil.copyfile(receipt["backup_path"], receipt["rehearsal_path"])
+            for kind in ("database", "backup", "rehearsal"):
+                path = Path(receipt[kind + "_path"])
+                path.chmod(0o600)
+                receipt[kind + "_sha256"] = dev._file_sha256(path)
+            options.migration_backup_receipt.write_text(json.dumps(receipt))
+            with mock.patch.object(dev, "_helper_plist", side_effect=OSError("post-copy failure")), mock.patch.object(dev.shutil, "rmtree", side_effect=OSError("cleanup interruption")):
+                with self.assertRaises(OSError):
+                    dev.launchd_prod_deploy("v2.0.0", controller=options)
+            self.assertTrue(json.loads(dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text())["cleanup_pending"])
+            with mock.patch.object(dev.os, "kill", side_effect=ProcessLookupError()):
+                dev.cmd_prod_resume_migration("test-modern")
+            self.assertFalse(staging.exists())
+            self.assertIsNone(dev._deploy_claim_owner())
+            with mock.patch.object(dev, "_materialize_helper", side_effect=lambda commit, path, source: shutil.copyfile(ROOT / "scripts/launchd_deploy_helper.py", path)):
+                dev.launchd_prod_deploy("v2.0.0", controller=options)
+            manifest_path = staging / "manifest.json"
+            manifest = helper.Manifest.load(manifest_path)
+            backend.manifest = manifest
+            backend.target = f"gui/{manifest.uid}/{manifest.label}"
+            registry = Path(manifest.ordinary_migration.migration_registry_path)
+            self.assertEqual(helper.ordinary_database_ledger(database, registry)[-1][:2], actual_migrations(112)[-1])
+            def candidate_mutation():
+                with sqlite3.connect(database) as connection:
+                    connection.execute("INSERT INTO _migrations VALUES (?, ?, '2026-10-05')", actual_migrations(113)[-1])
+                    connection.execute("CREATE TABLE candidate_changes (value TEXT)")
+            backend.on_start = candidate_mutation
+            argv = ["helper", "activate", "--manifest", str(manifest_path), "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+            with mock.patch.object(helper, "__file__", manifest.ordinary_migration.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), mock.patch.object(helper, "request_helper_bootout"), mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("candidate failed")) as health:
+                with mock.patch.object(sys, "argv", argv):
+                    self.assertEqual(helper.main(), 1)
+                self.assertEqual(helper.read_status(manifest)["state"], "migration_failed_stopped")
+                self.assertEqual(backend.state, ("not_loaded", None))
+                self.assertEqual(helper.ordinary_database_ledger(database, registry)[-1][0], 113)
+                shutil.copyfile(manifest.ordinary_migration.backup_path, database)
+                backend.on_start = None
+                health.side_effect = None
+                argv[1] = "resume-migration"
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(helper, "release_claim", side_effect=OSError("release interrupted")):
+                    self.assertEqual(helper.main(), 1)
+                status = Path(manifest.status_path).read_bytes()
+                self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_rolled_back")
+                self.assertEqual(helper.read_status(manifest)["recovery_mode"], "migration_resumed")
+                for consumer in (ROOT / "crates/phoenix-ide/src/api/release_updates.rs", ROOT / "ui/src/pages/ReleaseUpdatePanel.tsx"):
+                    self.assertIn("activation_failed_rolled_back", consumer.read_text())
+                with sqlite3.connect(database) as connection:
+                    self.assertEqual(connection.execute("SELECT * FROM messages").fetchall(), [("original-message", "must survive")])
+                    connection.execute("INSERT INTO messages VALUES ('later', 'accepted after resume')")
+                for path in (manifest.ordinary_migration.backup_path, manifest.ordinary_migration.rehearsal_path, manifest.ordinary_migration.migration_registry_path):
+                    Path(path).unlink()
+                later = database.read_bytes()
+                database.unlink()
+                events = list(backend.events)
+                with mock.patch.object(sys, "argv", argv):
+                    self.assertEqual(helper.main(), 0)
+                self.assertEqual(backend.events, events)
+                self.assertEqual(Path(manifest.status_path).read_bytes(), status)
+                self.assertFalse(Path(manifest.active_path).exists())
+                self.assertFalse(database.exists())
+                database.write_bytes(later)
+                with sqlite3.connect(database) as connection:
+                    self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone(), (2,))
 
     def test_bootstrap_attempt_failure_retains_claim_and_policy(self):
         with self.deployment(bootstrap=False) as (_, _, options, _, _, _):

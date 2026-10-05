@@ -522,7 +522,8 @@ rule RecordPairedFinalizationOutcome {
 
 -- modern_receipt_and_stopped_ownership_verified(transaction) -> Boolean
 --   Exact retained helper/capability, stopped service, exclusive sidecar-free
---   modern SQLite, integrity/complete ledger and logical schema/all-row equality.
+--   modern SQLite, integrity/actual selected-source migration membership and
+--   logical schema/all-row equality; registry gaps are not missing migrations.
 -- migration_predecessor_start_checkpoint_exists(transaction) -> Boolean
 --   Durable retained helper status records predecessor startup was attempted.
 -- manually_restored_database_and_predecessor_verified(transaction, service) -> Boolean
@@ -560,6 +561,24 @@ rule ResumeManuallyRestoredMigration {
         -- Failure before terminal success retains offline fence; an unresolved
         -- checkpoint refuses startup replay. Terminal success uses claim finalization.
         -- Deploy/restart/stop may not clear a retained migration claim.
+        -- Persist migration_resumed semantics using the predecessor-understood
+        -- activation_failed_rolled_back status plus migration_resumed recovery_mode.
+}
+
+rule AbandonFailedMigrationPreparation {
+    when: MigrationPreparationCleanupVerified(transaction)
+    requires: transaction.state = preparing
+    requires: transaction.ordinary_policy = modern_migration_stopped
+    requires: active_claim_retained(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: DurableStatusWritten(transaction)
+    ensures: not DeploymentOwnsActivationClaim(transaction)
+
+    @guidance
+        -- Before bootstrap, remove staged private copies and fsync their parent
+        -- before failure status/claim release. Cleanup failure retains preparing
+        -- ownership; explicit retry requires dead controller and absent helper,
+        -- including an already-written manifest. No runtime/database action.
 }
 
 -- resumed_predecessor_finalization_verified(transaction, service) -> Boolean

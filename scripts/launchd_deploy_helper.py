@@ -36,7 +36,6 @@ VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 
 TERMINAL_STATES = {
     "committed",
-    "migration_resumed",
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
@@ -74,6 +73,8 @@ class OrdinaryMigration:
     previous_plist_sha256: str
     controller_helper_path: str
     controller_helper_sha256: str
+    migration_registry_path: str
+    migration_registry_sha256: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -962,6 +963,7 @@ def validate_ordinary_paths(manifest: Manifest) -> None:
         manifest.rollback_binary or "", manifest.rollback_plist or "",
         manifest.target_binary, manifest.target_plist, manifest.status_path,
         manifest.deployed_sha_path, manifest.active_path, manifest.lock_path, manifest.claim_lock_path,
+        migration.migration_registry_path,
     )]
     for path in paths:
         if not path.is_absolute() or path.resolve(strict=False) != path or path.is_symlink():
@@ -983,7 +985,7 @@ def validate_ordinary_paths(manifest: Manifest) -> None:
         raise ActivationError("ordinary migration databases must not be hardlinked")
 
 
-def ordinary_database_ledger(path: Path) -> tuple:
+def ordinary_database_ledger(path: Path, registry: Path) -> tuple:
     import sqlite3
     for sidecar in (Path(str(path) + "-wal"), Path(str(path) + "-shm"), Path(str(path) + "-journal")):
         if sidecar.exists() or sidecar.is_symlink():
@@ -998,8 +1000,16 @@ def ordinary_database_ledger(path: Path) -> tuple:
         raise ActivationError("ordinary migration SQLite integrity/ledger check failed") from exc
     if not ledger or not isinstance(ledger[-1][0], int) or ledger[-1][0] < 70:
         raise ActivationError("ordinary migration requires a modern migration ledger at version >= 70")
-    if [row[0] for row in ledger] != list(range(1, ledger[-1][0] + 1)):
-        raise ActivationError("ordinary migration requires a complete contiguous modern ledger")
+    source = registry.read_text()
+    match = re.search(r"const MIGRATIONS: &\[Migration\] = &\[(.*?)\n\];", source, re.DOTALL)
+    if match is None:
+        raise ActivationError("selected-source migration registry is invalid")
+    migrations = [(int(version), name) for version, name in re.findall(r'Migration\s*\{\s*version:\s*(\d+),\s*name:\s*"([^"]+)"', match.group(1))]
+    if not migrations or len({version for version, _ in migrations}) != len(migrations):
+        raise ActivationError("selected-source migration registry is invalid")
+    expected = [(version, name) for version, name in migrations if version <= ledger[-1][0]]
+    if [(row[0], row[1]) for row in ledger] != expected or ledger[-1][0] not in {version for version, _ in migrations}:
+        raise ActivationError("ordinary migration ledger differs from selected-source migration membership")
     return ledger
 
 
@@ -1014,10 +1024,13 @@ def validate_ordinary_receipt(manifest: Manifest, *, restored: bool = False) -> 
     rehearsal = verify_staged(migration.rehearsal_path, migration.rehearsal_sha256, "migration rehearsal")
     if migration.rehearsal_sha256 != migration.backup_sha256:
         raise ActivationError("migration rehearsal bytes must equal the backup")
-    backup_ledger = ordinary_database_ledger(backup)
+    registry = verify_staged(migration.migration_registry_path, migration.migration_registry_sha256, "selected-source migration registry")
+    if registry.parent != Path(migration.controller_helper_path).parent:
+        raise ActivationError("migration registry must belong to retained helper transaction")
+    backup_ledger = ordinary_database_ledger(backup, registry)
     if any(path.exists() or path.is_symlink() for path in (*database_paths(manifest)[1:], database.parent / (database.name + "-journal"))):
         raise ActivationError("checkpoint the stopped source database before migration admission; sidecars remain")
-    if ordinary_database_ledger(database) != backup_ledger or ordinary_database_ledger(rehearsal) != backup_ledger:
+    if ordinary_database_ledger(database, registry) != backup_ledger or ordinary_database_ledger(rehearsal, registry) != backup_ledger:
         raise ActivationError("ordinary migration receipt ledger differs from backup")
     if ordinary_database_digest(database) != ordinary_database_digest(backup) or ordinary_database_digest(rehearsal) != ordinary_database_digest(backup):
         raise ActivationError("ordinary migration backup/rehearsal does not match stopped source contents")
@@ -1035,25 +1048,40 @@ def require_service_absent(launchctl: Launchctl) -> None:
         raise ActivationError("ordinary migration requires an exactly stopped service")
 
 
+def validate_ordinary_runtime(manifest: Manifest) -> None:
+    ordinary = manifest.ordinary_migration
+    if ordinary is None or manifest.paired_database_upgrade is not None:
+        raise ActivationError("ordinary migration and paired database mode are mutually exclusive")
+    if manifest.source_kind not in {"local_head", "published_release"}:
+        raise ActivationError("ordinary migration requires an ordinary local or release source")
+    if manifest.previous is None or not all((manifest.rollback_binary, manifest.rollback_plist, manifest.previous_health_url)) or manifest.previous_health_insecure_tls is None or manifest.previous_health_json is None:
+        raise ActivationError("ordinary migration requires a captured predecessor and endpoint")
+    if ordinary.previous_binary_sha256 != manifest.rollback_binary_sha256 or ordinary.previous_plist_sha256 != manifest.rollback_plist_sha256:
+        raise ActivationError("ordinary migration predecessor hashes differ from captured rollback inputs")
+    for value in (ordinary.previous_binary_sha256, ordinary.previous_plist_sha256, ordinary.controller_helper_sha256):
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ActivationError("ordinary migration requires exact SHA-256 bindings")
+    helper = verify_staged(ordinary.controller_helper_path, ordinary.controller_helper_sha256, "controller helper")
+    if helper != Path(__file__).resolve():
+        raise ActivationError("ordinary migration helper path is not the running retained helper")
+    transaction = _private_transaction_dir(helper.parent)
+    for value in (manifest.rollback_binary, manifest.rollback_plist, manifest.target_binary, manifest.target_plist, manifest.status_path, manifest.active_path, manifest.deployed_sha_path):
+        path = Path(value)
+        if not path.is_absolute() or path.resolve(strict=False) != path or path.is_symlink():
+            raise ActivationError("ordinary migration runtime paths must be canonical non-symlinks")
+    if any(Path(value).parent != transaction for value in (manifest.rollback_binary, manifest.rollback_plist)):
+        raise ActivationError("captured predecessor must belong to retained helper transaction")
+
+
 def validate_manifest_mode(manifest: Manifest) -> None:
     paired = manifest.paired_database_upgrade
     ordinary = manifest.ordinary_migration
     if ordinary is not None:
-        if paired is not None:
-            raise ActivationError("ordinary migration and paired database mode are mutually exclusive")
-        if manifest.source_kind not in {"local_head", "published_release"}:
-            raise ActivationError("ordinary migration requires an ordinary local or release source")
-        if manifest.previous is None or not all((manifest.rollback_binary, manifest.rollback_plist, manifest.previous_health_url)) or manifest.previous_health_insecure_tls is None or manifest.previous_health_json is None:
-            raise ActivationError("ordinary migration requires a captured predecessor and endpoint")
-        if ordinary.previous_binary_sha256 != manifest.rollback_binary_sha256 or ordinary.previous_plist_sha256 != manifest.rollback_plist_sha256:
-            raise ActivationError("ordinary migration predecessor hashes differ from captured rollback inputs")
-        for value in (ordinary.database_sha256, ordinary.backup_sha256, ordinary.rehearsal_sha256, ordinary.previous_binary_sha256, ordinary.previous_plist_sha256, ordinary.controller_helper_sha256):
+        validate_ordinary_runtime(manifest)
+        for value in (ordinary.database_sha256, ordinary.backup_sha256, ordinary.rehearsal_sha256, ordinary.migration_registry_sha256):
             if not re.fullmatch(r"[0-9a-f]{64}", value):
                 raise ActivationError("ordinary migration requires exact SHA-256 bindings")
         validate_ordinary_paths(manifest)
-        helper = verify_staged(ordinary.controller_helper_path, ordinary.controller_helper_sha256, "controller helper")
-        if helper != Path(__file__).resolve():
-            raise ActivationError("ordinary migration helper path is not the running retained helper")
         if any(_plist_database_path(Path(path)) != ordinary.database_path for path in (manifest.candidate_plist, manifest.rollback_plist)):
             raise ActivationError("ordinary migration database path differs between candidate, predecessor, and manifest")
     if manifest.source_kind == "prepared_artifact" and paired is None:
@@ -1543,7 +1571,7 @@ def resume_migration(manifest: Manifest) -> str:
         if manifest.ordinary_migration is None or manifest.paired_database_upgrade is not None:
             raise ActivationError("migration resume requires an ordinary migration transaction")
         status = read_status(manifest)
-        if Path(manifest.active_path).read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"preparing", "prepared", "activating", "migration_failed_stopped", "migration_resumed"}:
+        if Path(manifest.active_path).read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"preparing", "prepared", "activating", "migration_failed_stopped", "activation_failed_rolled_back"}:
             raise ActivationError("migration resume must own a retained unresolved transaction")
         if status.get("state") in {"preparing", "prepared"}:
             pid = status.get("preparing_pid")
@@ -1558,9 +1586,11 @@ def resume_migration(manifest: Manifest) -> str:
             else:
                 raise ActivationError("preparing migration controller still alive")
         launchctl = Launchctl(manifest)
-        if status.get("state") == "migration_resumed":
+        if status.get("state") == "activation_failed_rolled_back":
+            if status.get("recovery_mode") != "migration_resumed":
+                raise ActivationError("migration terminal resume evidence mismatch")
             validate_manifest_identities(manifest)
-            validate_manifest_mode(manifest)
+            validate_ordinary_runtime(manifest)
             verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "captured predecessor binary")
             verify_staged(manifest.target_binary, manifest.rollback_binary_sha256, "resumed predecessor binary")
             private = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "resumed private predecessor plist")
@@ -1617,7 +1647,7 @@ def resume_migration(manifest: Manifest) -> str:
             verify_staged(str(private), manifest.rollback_plist_sha256, "verified predecessor plist")
             restore_deployed_sha(manifest)
             commit_atomic_install(publication, published)
-            write_status(manifest, "migration_resumed", failure=status.get("failure"), recovery_mode="migration_resume_started")
+            write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"), recovery_mode="migration_resumed")
             return "migration_resumed"
         except Exception as exc:
             return fail_migration_stopped(manifest, launchctl, f"migration resume failed: {exc}")
@@ -1669,7 +1699,7 @@ def main() -> int:
         if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
             raise ActivationError("helper identity does not match the immutable manifest")
         state = resume_migration(manifest) if args.command == "resume-migration" else finalize_paired(manifest) if args.command == "finalize-paired" else recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
-        if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
+        if (state in TERMINAL_STATES or (args.command == "resume-migration" and state == "migration_resumed")) and status_is_durable_terminal(manifest):
             fsync_dir(Path(manifest.status_path).parent)
             release_claim(manifest)
         print(state, flush=True)

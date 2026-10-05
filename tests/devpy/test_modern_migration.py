@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -56,13 +57,19 @@ class Backend:
         return subprocess.CompletedProcess([], 0, f"path = {self.loaded}\n", "")
 
 
+def actual_migrations(version=113):
+    source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
+    registry = source.split("const MIGRATIONS: &[Migration] = &[", 1)[1].split("\n];", 1)[0]
+    return [(int(number), name) for number, name in re.findall(r'Migration\s*\{\s*version:\s*(\d+),\s*name:\s*"([^"]+)"', registry) if int(number) <= version]
+
+
 def fixture(root, version=112):
     transaction = root / "transaction"
     transaction.mkdir(mode=0o700)
     database = root / "modern.sqlite3"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-        connection.executemany("INSERT INTO _migrations VALUES (?, ?)", [(number, f'migration-{number}') for number in range(1, version + 1)])
+        connection.executemany("INSERT INTO _migrations VALUES (?, ?)", actual_migrations(version))
         connection.execute("CREATE TABLE preserved (value TEXT)")
         connection.execute("INSERT INTO preserved VALUES ('original')")
     backup = transaction / "backup.sqlite3"
@@ -71,6 +78,8 @@ def fixture(root, version=112):
     shutil.copy2(backup, rehearsal)
     retained_helper = transaction / "helper.py"
     shutil.copy2(Path(helper.__file__), retained_helper)
+    registry = transaction / "migration-registry.rs"
+    shutil.copy2(ROOT / "crates/phoenix-db/src/migrations.rs", registry)
     files = {}
     for name, value in {
         "candidate_binary": b"candidate binary",
@@ -105,6 +114,7 @@ def fixture(root, version=112):
             previous_binary_sha256=helper.sha256(files["rollback_binary"]),
             previous_plist_sha256=helper.sha256(files["rollback_plist"]),
             controller_helper_path=str(retained_helper), controller_helper_sha256=helper.sha256(retained_helper),
+            migration_registry_path=str(registry), migration_registry_sha256=helper.sha256(registry),
         ),
     )
     Path(manifest.active_path).write_text(manifest.transaction_id)
@@ -128,8 +138,20 @@ class ModernMigrationTests(unittest.TestCase):
     def test_sparse_modern_ledger_is_not_admitted(self):
         with sqlite3.connect(self.manifest.ordinary_migration.backup_path) as connection:
             connection.execute("DELETE FROM _migrations WHERE version = 45")
-        with self.assertRaisesRegex(helper.ActivationError, "complete contiguous"):
-            helper.ordinary_database_ledger(Path(self.manifest.ordinary_migration.backup_path))
+        with self.assertRaisesRegex(helper.ActivationError, "selected-source migration membership"):
+            helper.ordinary_database_ledger(Path(self.manifest.ordinary_migration.backup_path), Path(self.manifest.ordinary_migration.migration_registry_path))
+
+    def test_actual_registry_membership_rejects_invented_or_misnamed_migrations(self):
+        self.assertNotIn(99, {version for version, _ in actual_migrations(112)})
+        database = Path(self.manifest.ordinary_migration.database_path)
+        registry = Path(self.manifest.ordinary_migration.migration_registry_path)
+        for sql in ("INSERT INTO _migrations VALUES (99, 'invented')", "UPDATE _migrations SET name='wrong' WHERE version=112", "INSERT INTO _migrations VALUES (114, 'unknown')"):
+            original = database.read_bytes()
+            with sqlite3.connect(database) as connection:
+                connection.execute(sql)
+            with self.subTest(sql=sql), self.assertRaisesRegex(helper.ActivationError, "selected-source migration membership"):
+                helper.ordinary_database_ledger(database, registry)
+            database.write_bytes(original)
 
     def test_prepared_handoff_failure_can_explicitly_resume_matched_predecessor(self):
         self.assertEqual(helper.read_status(self.manifest)["state"], "prepared")
@@ -356,7 +378,7 @@ class ModernMigrationTests(unittest.TestCase):
         for version in (69, 70):
             with sqlite3.connect(migration.database_path) as connection:
                 connection.execute("DELETE FROM _migrations")
-                connection.executemany("INSERT INTO _migrations VALUES (?, ?)", [(number, f'migration-{number}') for number in range(1, version + 1)])
+                connection.executemany("INSERT INTO _migrations VALUES (?, ?)", actual_migrations(version))
             changed = dataclasses.replace(self.manifest, ordinary_migration=dataclasses.replace(migration, database_sha256=helper.sha256(Path(migration.database_path))))
             with self.subTest(version=version), self.assertRaisesRegex(helper.ActivationError, "modern migration ledger|ledger differs"):
                 helper.validate_ordinary_receipt(changed)
@@ -422,6 +444,10 @@ class ModernMigrationTests(unittest.TestCase):
         self.mutate()
         database = Path(self.manifest.ordinary_migration.database_path)
         before = database.read_bytes()
+        for value in (self.manifest.ordinary_migration.backup_path, self.manifest.ordinary_migration.rehearsal_path, self.manifest.ordinary_migration.migration_registry_path):
+            Path(value).unlink()
+        self.assertEqual(helper.read_status(self.manifest)["state"], "activation_failed_rolled_back")
+        self.assertEqual(helper.read_status(self.manifest)["recovery_mode"], "migration_resumed")
         status = Path(self.manifest.status_path).read_bytes()
         events = list(self.backend.events)
         argv = ["helper", "resume-migration", "--manifest", "unused", "--helper-label", self.manifest.helper_label, "--uid", str(self.manifest.uid)]

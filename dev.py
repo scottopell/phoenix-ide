@@ -10105,7 +10105,7 @@ def _read_migration_backup_receipt(receipt_path: Path, installed_env: dict[str, 
         raise SystemExit(f"invalid migration backup receipt: {exc}") from exc
 
 
-def _stage_ordinary_migration(receipt: dict, staging: Path, helper: Path) -> dict:
+def _stage_ordinary_migration(receipt: dict, staging: Path, helper: Path, *, source_commit: str, source_kind: str) -> dict:
     result = dict(receipt)
     for kind in ("backup", "rehearsal"):
         source_path = _migration_regular_path(receipt[kind + "_path"], private=True)
@@ -10119,14 +10119,27 @@ def _stage_ordinary_migration(receipt: dict, staging: Path, helper: Path) -> dic
         if _file_sha256(path) != receipt[kind + "_sha256"]:
             raise SystemExit("migration receipt changed during private staging")
         result[kind + "_path"] = str(path)
+    registry = staging / "migration-registry.rs"
+    _materialize_source_file(source_commit, "crates/phoenix-db/src/migrations.rs", registry, source_kind)
+    registry.chmod(0o600)
+    with registry.open("rb") as stream:
+        os.fsync(stream.fileno())
+    result.update(migration_registry_path=str(registry), migration_registry_sha256=_file_sha256(registry))
     result.update(controller_helper_path=str(helper), controller_helper_sha256=_file_sha256(helper))
     return result
+
+
+def _cleanup_ordinary_migration_preparation(staging: Path) -> None:
+    if staging.exists():
+        shutil.rmtree(staging)
+    if staging.parent.exists():
+        _fsync_directory(staging.parent)
 
 
 def _abandon_incomplete_migration_preparation(transaction_id: str, staging: Path) -> None:
     with _launchd_claim_lock():
         status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-        if not isinstance(status, dict) or _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("state") != "preparing" or not status.get("ordinary_migration") or (staging / "manifest.json").exists():
+        if not isinstance(status, dict) or _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("state") != "preparing" or not status.get("ordinary_migration") or ((staging / "manifest.json").exists() and not status.get("cleanup_pending")):
             raise SystemExit("incomplete migration preparation ownership is unproven")
         pid = status.get("preparing_pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
@@ -10144,7 +10157,8 @@ def _abandon_incomplete_migration_preparation(transaction_id: str, staging: Path
         probe = subprocess.run([sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
         if probe.returncode != 0:
             raise SystemExit("preparation helper absence unconfirmed; claim retained")
-        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {**status, "state": "precondition_failed", "failure": "abandoned incomplete stopped migration preparation", "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+        _cleanup_ordinary_migration_preparation(staging)
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {**status, "state": "precondition_failed", "cleanup_pending": False, "failure": "abandoned incomplete stopped migration preparation", "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
         _release_launchd_deploy_claim_unlocked(transaction_id)
     print(f"Abandoned incomplete migration preparation {transaction_id}; no runtime/database action.")
 
@@ -10155,6 +10169,10 @@ def cmd_prod_resume_migration(transaction_id: str) -> None:
         raise SystemExit("migration resume requires macOS and a safe transaction ID")
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
+    status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    if status.get("transaction_id") == transaction_id and status.get("cleanup_pending"):
+        _abandon_incomplete_migration_preparation(transaction_id, staging)
+        return
     if not manifest_path.exists() and not manifest_path.is_symlink():
         _abandon_incomplete_migration_preparation(transaction_id, staging)
         return
@@ -10539,7 +10557,7 @@ def launchd_prod_deploy(
                 raise SystemExit("installed migration receipt/configuration changed during preparation")
             if _file_sha256(rollback_binary) != migration_receipt["previous_binary_sha256"] or _file_sha256(rollback_plist) != migration_receipt["previous_plist_sha256"]:
                 raise SystemExit("captured migration predecessor differs from receipt")
-            migration_receipt = _stage_ordinary_migration(migration_receipt, staging, helper)
+            migration_receipt = _stage_ordinary_migration(migration_receipt, staging, helper, source_commit=source_commit, source_kind=source_kind)
         interpreter_check = subprocess.run(
             [str(python_executable), "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"],
             capture_output=True,
@@ -10639,6 +10657,15 @@ def launchd_prod_deploy(
     except BaseException as exc:
         if (controller.paired_database_upgrade or ordinary_policy) and bootstrap_attempted:
             raise
+        if ordinary_policy:
+            _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
+                "transaction_id": transaction_id, "state": "preparing",
+                "ordinary_migration": True, "preparing_pid": os.getpid(),
+                "cleanup_pending": True, "created_at": claimed_at,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "failure": "preparation failed; private staging cleanup pending",
+            })
+            _cleanup_ordinary_migration_preparation(staging)
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         terminal_status_written = False
         try:
