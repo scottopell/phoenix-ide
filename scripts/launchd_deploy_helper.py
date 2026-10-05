@@ -229,15 +229,13 @@ def write_status(
     rollback_failure: Optional[str] = None,
     committed_diagnostic: Optional[str] = None,
     finalization_pending: bool = False,
-    recovery_started: bool = False,
     recovery_mode: Optional[str] = None,
 ) -> None:
     try:
         prior = json.loads(Path(manifest.status_path).read_text())
     except (OSError, json.JSONDecodeError):
         prior = {}
-    if isinstance(prior, dict) and prior.get("transaction_id") == manifest.transaction_id and prior.get("recovery_started"):
-        recovery_started = True
+    if isinstance(prior, dict) and prior.get("transaction_id") == manifest.transaction_id and prior.get("recovery_mode") is not None:
         recovery_mode = recovery_mode or prior.get("recovery_mode")
     status = {
         "transaction_id": manifest.transaction_id,
@@ -254,7 +252,6 @@ def write_status(
         "rollback_failure": rollback_failure,
         "committed_diagnostic": committed_diagnostic,
         "finalization_pending": finalization_pending,
-        "recovery_started": recovery_started,
         "recovery_mode": recovery_mode,
     }
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
@@ -803,7 +800,7 @@ def restore(
             existing = json.loads(Path(manifest.status_path).read_text())
         except (OSError, json.JSONDecodeError):
             existing = {}
-        write_status(manifest, "activation_failed_rollback_failed", failure=existing.get("failure"), rollback_failure=existing.get("rollback_failure"), recovery_started=True, recovery_mode="snapshot_restored" if database_snapshot else "unchanged_predecessor")
+        write_status(manifest, "activation_failed_rollback_failed", failure=existing.get("failure"), rollback_failure=existing.get("rollback_failure"), recovery_mode="snapshot_restored" if database_snapshot else "unchanged_predecessor")
         old_pid = launchctl.inspect()[1]
         launchctl.start(old_pid, plist_path=str(rollback_plist))
     else:
@@ -1148,7 +1145,7 @@ def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = 
         prior = {}
     if prior.get("state") in {"committed", "preparing"}:
         return
-    if prior.get("recovery_started") and prior.get("state") == "activation_failed_rolled_back":
+    if prior.get("recovery_mode") is not None and prior.get("state") == "activation_failed_rolled_back":
         return
     previous = prior.get("rollback_failure")
     merged = f"{previous}; recovery attempt failed: {error}" if previous else error
@@ -1232,7 +1229,7 @@ def recover_paired(manifest: Manifest) -> str:
             raise ActivationError("paired recovery must own a retained unresolved transaction")
         launchctl = Launchctl(manifest)
         try:
-            if status.get("recovery_started"):
+            if status.get("recovery_mode") is not None:
                 verify_staged(manifest.target_binary, manifest.rollback_binary_sha256, "running predecessor binary")
                 private = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "private predecessor plist")
                 state, pid = launchctl.inspect()
