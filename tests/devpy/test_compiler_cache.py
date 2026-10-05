@@ -221,6 +221,8 @@ class CompilerCacheTests(unittest.TestCase):
             {"KACHE_LOG_FILE": "kache=trace", "KACHE_LOG_FILE_PATH": "/tmp/kache.log"},
             clear=True,
         ), mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
             self.dev.subprocess, "run", side_effect=run_daemon
         ) as run, mock.patch.object(
             self.dev, "_wait_for_kache_daemon", return_value=None
@@ -232,6 +234,26 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("kache=trace", daemon_env["KACHE_LOG_FILE"])
         self.assertEqual("/tmp/kache.log", daemon_env["KACHE_LOG_FILE_PATH"])
         wait.assert_called_once_with("/bin/kache", cargo_cwd=cargo_cwd)
+
+    def test_kache_daemon_rejects_running_process_with_unverifiable_environment(self):
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(True, None)
+        ), mock.patch.object(self.dev.subprocess, "run") as run:
+            error = self.dev._ensure_kache_daemon("/bin/kache")
+        self.assertIn("environment cannot be verified", error or "")
+        self.assertIn("kache daemon stop", error or "")
+        run.assert_not_called()
+
+    def test_kache_daemon_rejects_unknown_existing_state(self):
+        with mock.patch.object(
+            self.dev,
+            "_kache_daemon_is_running",
+            return_value=(False, "daemon readiness response had an invalid shape"),
+        ), mock.patch.object(self.dev.subprocess, "run") as run:
+            error = self.dev._ensure_kache_daemon("/bin/kache")
+        self.assertIn("cannot verify existing daemon environment", error or "")
+        self.assertIn("kache daemon stop", error or "")
+        run.assert_not_called()
 
     def test_kache_readiness_polls_until_running(self):
         starting = mock.Mock(
@@ -303,6 +325,8 @@ class CompilerCacheTests(unittest.TestCase):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with self.subTest("socket path and permissions"), mock.patch.dict(
             os.environ, {"KACHE_CACHE_DIR": "/very/long/worktree/cache"}, clear=True
+        ), mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
         ), mock.patch.object(
             self.dev.subprocess, "run", return_value=completed
         ) as run, mock.patch.object(
@@ -523,6 +547,7 @@ class CompilerCacheTests(unittest.TestCase):
                 "KACHE_CACHE_DIR": "cache/kache",
                 "KACHE_SOCKET_PATH": "run/kache.sock",
                 "KACHE_CONFIG": "config/kache.toml",
+                "KACHE_HOST_CONFIG": "config/host.toml",
                 "KACHE_RUNTIME_DIR": "run/kache",
                 "KACHE_LOG_FILE": "kache=trace",
                 "KACHE_LOG_FILE_PATH": "logs/kache.log",
@@ -536,6 +561,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("/workspace/cache/kache", os.environ["KACHE_CACHE_DIR"])
             self.assertEqual("/workspace/run/kache.sock", os.environ["KACHE_SOCKET_PATH"])
             self.assertEqual("/workspace/config/kache.toml", os.environ["KACHE_CONFIG"])
+            self.assertEqual("/workspace/config/host.toml", os.environ["KACHE_HOST_CONFIG"])
             self.assertEqual("/workspace/run/kache", os.environ["KACHE_RUNTIME_DIR"])
             self.assertEqual("kache=trace", os.environ["KACHE_LOG_FILE"])
             self.assertEqual("/workspace/logs/kache.log", os.environ["KACHE_LOG_FILE_PATH"])

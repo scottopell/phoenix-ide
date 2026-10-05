@@ -4947,6 +4947,31 @@ def _wait_for_kache_daemon(
     return last_error
 
 
+def _kache_daemon_is_running(binary: str, *, cargo_cwd: Path | None) -> tuple[bool, str | None]:
+    try:
+        result = subprocess.run(
+            [binary, "--json", "daemon"],
+            cwd=cargo_cwd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=os.environ,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, str(error)
+    if result.returncode != 0:
+        return False, None
+    try:
+        status = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        return False, str(error)
+    if not isinstance(status, dict) or not isinstance(status.get("daemon_running"), bool):
+        return False, "daemon readiness response had an invalid shape"
+    return status["daemon_running"], None
+
+
 def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str | None:
     cache_dir = os.environ.get("KACHE_CACHE_DIR")
     if os.name != "nt" and cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
@@ -4956,6 +4981,15 @@ def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str |
         except OSError as error:
             return str(error)
         os.environ["KACHE_SOCKET_PATH"] = str(socket_dir / f"{digest}.sock")
+
+    running, status_error = _kache_daemon_is_running(binary, cargo_cwd=cargo_cwd)
+    if status_error:
+        return f"cannot verify existing daemon environment: {status_error}; run 'kache daemon stop' and retry"
+    if running:
+        return (
+            "selected socket already has a running daemon whose environment cannot be verified; "
+            "run 'kache daemon stop' and retry"
+        )
 
     try:
         result = subprocess.run(
@@ -4985,6 +5019,7 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
             "KACHE_CACHE_DIR",
             "KACHE_SOCKET_PATH",
             "KACHE_CONFIG",
+            "KACHE_HOST_CONFIG",
             "KACHE_RUNTIME_DIR",
             "KACHE_LOG_FILE_PATH",
         )
