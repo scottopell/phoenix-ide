@@ -306,6 +306,12 @@ fn project_coordinator_write_to_app(error: ProjectCoordinatorProfileWriteDbError
             "project_coordinator_revision_conflict",
         ))),
         ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::RevisionExhausted,
+        ) => AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+            error.to_string(),
+            "project_coordinator_revision_exhausted",
+        ))),
+        ProjectCoordinatorProfileWriteDbError::Domain(
             ProjectCoordinatorProfileWriteError::NotOpen,
         ) => AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
             error.to_string(),
@@ -1353,6 +1359,21 @@ mod tests {
                 .unwrap();
         assert_eq!(snapshot["project_coordinator_revision"], "9007199254740993");
         assert!(snapshot["project_coordinator_profile"].is_null());
+        sqlx::query("UPDATE product_conversation_coordinator_profile_revisions SET revision = ?2 WHERE product_conversation_id = ?1")
+            .bind(id.as_str()).bind(i64::MAX).execute(state.db.pool()).await.unwrap();
+        let exhausted = create_router(state.clone()).oneshot(
+            Request::builder().method("PUT").uri(&uri).header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"type": "enable", "charter": "not saved", "expected_revision": i64::MAX.to_string()}).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(exhausted.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(exhausted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_type"], "project_coordinator_revision_exhausted");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("revision exhausted"));
     }
 
     #[tokio::test]

@@ -769,7 +769,8 @@ function ProjectCoordinatorSettings({
       onToggle={(event) => {
         const nextOpen = event.currentTarget.open;
         setOpen(nextOpen);
-        if (nextOpen && baseRevision < snapshotRevision) reset();
+        if (nextOpen && !(draftEdited && dirty)
+          && compareProjectCoordinatorRevision(baseRevision, snapshotRevision) < 0) reset();
       }}
     >
       <summary>Coordinator {profile ? '✓' : '+'}</summary>

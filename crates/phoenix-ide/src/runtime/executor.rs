@@ -10232,9 +10232,27 @@ fn estimate_tool_definitions_tokens(tools: &[ToolDefinition]) -> usize {
 fn estimate_provider_replay_tokens(
     provider_replay: Option<&phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
 ) -> usize {
+    use phoenix_core::domain::provider_replay::AnthropicPrivateBlock;
     provider_replay.map_or(0, |payload| {
-        serde_json::to_string(payload)
-            .map_or(usize::MAX, |serialized| estimate_text_tokens(&serialized))
+        payload
+            .response_sets
+            .iter()
+            .flat_map(|set| &set.private_blocks)
+            .map(|block| match block {
+                AnthropicPrivateBlock::Thinking {
+                    thinking,
+                    signature,
+                    ..
+                } => {
+                    estimate_text_tokens(thinking)
+                        + estimate_text_tokens(signature)
+                        + MESSAGE_OVERHEAD_TOKENS
+                }
+                AnthropicPrivateBlock::RedactedThinking { data, .. } => {
+                    estimate_text_tokens(data) + MESSAGE_OVERHEAD_TOKENS
+                }
+            })
+            .sum()
     })
 }
 
@@ -12935,6 +12953,27 @@ mod dispatch_context_budget_tests {
             estimate_provider_replay_tokens(Some(&replay)) >= estimate_text_tokens(&private_text)
         );
         assert_eq!(estimate_provider_replay_tokens(None), 0);
+        let mut public_heavy = replay.clone();
+        public_heavy.response_sets[0].public_content =
+            vec![ContentBlock::text("public content ".repeat(100_000))];
+        public_heavy.response_sets[0].owner_message_id = "owner metadata ".repeat(1_000);
+        public_heavy.response_sets[0].identity.response_id = "response metadata ".repeat(1_000);
+        assert_eq!(
+            estimate_provider_replay_tokens(Some(&public_heavy)),
+            estimate_provider_replay_tokens(Some(&replay))
+        );
+        public_heavy.response_sets[0].private_blocks.push(
+            AnthropicPrivateBlock::RedactedThinking {
+                index: ContentIndex(1),
+                data: "redacted ".repeat(1_000),
+            },
+        );
+        assert_eq!(
+            estimate_provider_replay_tokens(Some(&public_heavy)),
+            estimate_provider_replay_tokens(Some(&replay))
+                + estimate_text_tokens(&"redacted ".repeat(1_000))
+                + MESSAGE_OVERHEAD_TOKENS
+        );
         assert_eq!(estimate_tool_definitions_tokens(&[]), 0);
     }
 

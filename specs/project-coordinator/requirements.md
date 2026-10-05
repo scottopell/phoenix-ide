@@ -48,6 +48,15 @@ WHEN two human editing surfaces save from the same charter revision
 THE SYSTEM SHALL accept at most one save
 AND SHALL reject a stale save without overwriting the accepted charter
 
+THE SYSTEM SHALL use lossless monotonic revisions bounded by signed 64-bit integer storage
+AND SHALL NOT wrap, reset, or round a revision
+
+WHEN a save would exceed the revision range, including every increment required by that save
+THE SYSTEM SHALL reject the entire save with an explicit revision-exhaustion failure
+AND SHALL preserve the persisted profile, charter, and revision unchanged
+
+THE SYSTEM SHALL NOT guarantee unbounded editability or provide a profile import or repair API
+
 WHEN saving fails
 THE SYSTEM SHALL retain the unsaved editor contents and surface the failure
 

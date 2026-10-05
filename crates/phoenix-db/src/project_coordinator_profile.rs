@@ -298,6 +298,13 @@ impl Database {
             return Err(ProjectCoordinatorProfileWriteError::RevisionConflict.into());
         }
         let active_exists = active_profile_exists(&mut tx, product_conversation_id).await?;
+        expected_retained_revision
+            .checked_add(if charter.is_some() && active_exists {
+                2
+            } else {
+                1
+            })
+            .ok_or(ProjectCoordinatorProfileWriteError::RevisionExhausted)?;
 
         let new_revision;
         let outcome = if let Some(charter) = charter {
@@ -588,6 +595,111 @@ mod tests {
                 .expect("profile")
                 .charter(),
             "accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_profile_revision_rejects_atomically_and_preserves_stale_cas() {
+        for enabled in [false, true] {
+            let db = Database::open_in_memory().await.expect("database");
+            let id = ordinary(&db, "pc-exhausted").await;
+            if enabled {
+                db.write_project_coordinator_profile(&id, Some("preserved charter"), 0)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE product_conversation_coordinator_profile_revisions SET revision = ?2 WHERE product_conversation_id = ?1")
+                    .bind(id.as_str()).bind(i64::MAX).execute(&db.pool).await.unwrap();
+            } else {
+                sqlx::query("INSERT INTO product_conversation_coordinator_profile_revisions (product_conversation_id, revision, last_write_token) VALUES (?1, ?2, 'seed')")
+                    .bind(id.as_str()).bind(i64::MAX).execute(&db.pool).await.unwrap();
+            }
+            let before = db
+                .get_project_coordinator_profile_settings(&id)
+                .await
+                .unwrap();
+            for charter in [Some("replacement"), None] {
+                let error = db
+                    .write_project_coordinator_profile(&id, charter, i64::MAX)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    ProjectCoordinatorProfileWriteDbError::Domain(
+                        ProjectCoordinatorProfileWriteError::RevisionExhausted
+                    )
+                ));
+                assert_eq!(
+                    db.get_project_coordinator_profile_settings(&id)
+                        .await
+                        .unwrap(),
+                    before
+                );
+                let stale = db
+                    .write_project_coordinator_profile(&id, charter, i64::MAX - 1)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    stale,
+                    ProjectCoordinatorProfileWriteDbError::Domain(
+                        ProjectCoordinatorProfileWriteError::RevisionConflict
+                    )
+                ));
+            }
+            let (first, second) = tokio::join!(
+                db.write_project_coordinator_profile(&id, Some("first"), i64::MAX),
+                db.write_project_coordinator_profile(&id, Some("second"), i64::MAX),
+            );
+            for result in [first, second] {
+                assert!(matches!(
+                    result,
+                    Err(ProjectCoordinatorProfileWriteDbError::Domain(
+                        ProjectCoordinatorProfileWriteError::RevisionExhausted
+                    ))
+                ));
+            }
+            assert_eq!(
+                db.get_project_coordinator_profile_settings(&id)
+                    .await
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_checks_both_increments_before_deleting_profile() {
+        let db = Database::open_in_memory().await.unwrap();
+        let id = ordinary(&db, "pc-last-revision").await;
+        db.write_project_coordinator_profile(&id, Some("preserved"), 0)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE product_conversation_coordinator_profile_revisions SET revision = ?2 WHERE product_conversation_id = ?1")
+            .bind(id.as_str()).bind(i64::MAX - 1).execute(&db.pool).await.unwrap();
+        let before = db
+            .get_project_coordinator_profile_settings(&id)
+            .await
+            .unwrap();
+        let error = db
+            .write_project_coordinator_profile(&id, Some("replacement"), i64::MAX - 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectCoordinatorProfileWriteDbError::Domain(
+                ProjectCoordinatorProfileWriteError::RevisionExhausted
+            )
+        ));
+        assert_eq!(
+            db.get_project_coordinator_profile_settings(&id)
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            db.write_project_coordinator_profile(&id, None, i64::MAX - 1)
+                .await
+                .unwrap(),
+            ProjectCoordinatorProfileWriteOutcome::Disabled { revision: i64::MAX }
         );
     }
 

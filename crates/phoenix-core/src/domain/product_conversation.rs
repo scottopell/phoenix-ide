@@ -332,6 +332,7 @@ pub enum ProjectCoordinatorProfileWriteError {
     NotOrdinary,
     NotOpen,
     RevisionConflict,
+    RevisionExhausted,
 }
 
 impl fmt::Display for ProjectCoordinatorProfileWriteError {
@@ -346,6 +347,9 @@ impl fmt::Display for ProjectCoordinatorProfileWriteError {
                 f.write_str("project coordinator profile requires an Open ProductConversation")
             }
             Self::RevisionConflict => f.write_str("project coordinator profile revision conflict"),
+            Self::RevisionExhausted => f.write_str(
+                "project coordinator profile revision exhausted; saved profile is unchanged",
+            ),
         }
     }
 }

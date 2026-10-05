@@ -577,12 +577,38 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
     expect(screen.getByLabelText('Charter')).toHaveValue(savedProfile.charter);
 
+    expect(await screen.findByRole('alert')).toHaveTextContent('Profile changed elsewhere');
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    expect(screen.getByLabelText('Charter')).toHaveValue(savedProfile.charter);
+    expect(screen.getByRole('alert')).toHaveTextContent('Profile changed elsewhere');
+
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenLastCalledWith('pc-1', {
       type: 'enable',
       charter: savedProfile.charter,
       expected_revision: '1',
     }));
+  });
+
+  it('retains the draft and saved profile when revision exhaustion is visible', async () => {
+    const { api } = await import('../api');
+    const profile = { charter: 'Saved charter', updated_at_unix_micros: 1 };
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
+      project_coordinator_profile: profile, project_coordinator_revision: '9223372036854775807',
+    }));
+    vi.mocked(api.putProjectCoordinatorProfile).mockRejectedValue(new Error('project coordinator profile revision exhausted; saved profile is unchanged'));
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Unsaved replacement' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('revision exhausted');
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    expect(screen.getByLabelText('Charter')).toHaveValue('Unsaved replacement');
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    expect(screen.getByLabelText('Charter')).toHaveValue('Saved charter');
   });
 
   it('retains unsaved charter text and surfaces save failure', async () => {
