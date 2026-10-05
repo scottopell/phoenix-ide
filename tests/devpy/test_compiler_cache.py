@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import multiprocessing
 import os
 import platform
 import sys
@@ -275,6 +276,62 @@ class CompilerCacheTests(unittest.TestCase):
         ):
             self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
         self.assertEqual(["lock", "check", "start", "ready", "unlock"], events)
+
+    @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "requires fork")
+    def test_kache_daemon_serializes_cross_process_contenders(self):
+        context = multiprocessing.get_context("fork")
+        start = context.Event()
+        ready = context.Queue()
+        results = context.Queue()
+
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            socket = Path(temporary) / "kache.sock"
+            marker = Path(temporary) / "daemon-environment"
+
+            def contend(candidate):
+                dev = load_devpy()
+
+                def status(*_args, **_kwargs):
+                    return marker.exists(), None
+
+                def launch(*_args, **_kwargs):
+                    marker.write_text(candidate)
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "KACHE_SOCKET_PATH": str(socket),
+                        "KACHE_REMOTE_BUCKET": candidate,
+                    },
+                    clear=True,
+                ), mock.patch.object(
+                    dev, "_kache_daemon_is_running", side_effect=status
+                ), mock.patch.object(
+                    dev.subprocess, "run", side_effect=launch
+                ), mock.patch.object(dev, "_wait_for_kache_daemon", return_value=None):
+                    ready.put(candidate)
+                    start.wait()
+                    results.put((candidate, dev._ensure_kache_daemon("/bin/kache")))
+
+            contenders = [
+                context.Process(target=contend, args=(candidate,))
+                for candidate in ("bucket-a", "bucket-b")
+            ]
+            for contender in contenders:
+                contender.start()
+            self.assertEqual({ready.get(timeout=5), ready.get(timeout=5)}, {"bucket-a", "bucket-b"})
+            start.set()
+            outcomes = dict(results.get(timeout=5) for _ in contenders)
+            for contender in contenders:
+                contender.join(timeout=5)
+                self.assertEqual(0, contender.exitcode)
+
+            winner = marker.read_text()
+            loser = "bucket-b" if winner == "bucket-a" else "bucket-a"
+            self.assertIsNone(outcomes[winner])
+            self.assertIn("environment cannot be verified", outcomes[loser] or "")
+            self.assertTrue(socket.with_name(f"{socket.name}.lock").exists())
 
     def test_kache_daemon_rejects_running_process_with_unverifiable_environment(self):
         with mock.patch.dict(
