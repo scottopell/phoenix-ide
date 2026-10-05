@@ -1,0 +1,57 @@
+# Repair stale continuation opening settlement
+
+## Commission and admission
+
+One bounded successor SOURCE-REPAIR mission under Global's commission; not native or restart feature ownership. The user confirms API/scope inventory admission: unique scope `a7988772`, managed Explore, owned worktree `e87be297-daa2-43f9-82e4-f72b7fe2421c`, `gpt-6.1-sol/high/Standard`, and accepted roadmap #806 owner record `5993991748`.
+
+Checkout verified clean on `task-pending-e87be297` at `d6f94afaca8650fff75a638fd63c3e2c9eafc602`; cached `origin/main` matches. Explore network sandbox denied GitHub roadmap and remote readback. After approval, fetch/read back safe remote refs and verify the commissioned base without moving any checked-out main branch. Remain in the managed owned worktree.
+
+`taskmd new --slug stale-continuation-opening-settlement --priority p1` was attempted and denied by the Explore filesystem sandbox. This plain approval brief deliberately claims no numeric ID: another retained worktree already owns task 93006. Immediately after Work approval, allocate the actual task atomically with `taskmd new`, retain all existing IDs, and place this plan in that allocated task. Do not audit or modify the allocator.
+
+## Observed journey
+
+The user reports supported chat returns HTTP 409 `continuation_opening_pending` for two retained owners:
+
+- Native ProductConversation `00404b24-0927-43c1-952e-1be92e1f8c96`, latest/writable scope `6131f8f3-95d4-4b65-87c7-445574cef3c9`: idle, working false, 399 messages Oct 3–4; no outgoing successor, continuation operation, or automatic admission reported.
+- Restart ProductConversation `df61fb90-126d-45a1-b6a5-8289ebd21bc5`, latest/writable `4e42c7b1-f249-414d-9c07-fd2391462cad`; retained source scope `06d4d773-e812-4036-8f3e-fb3bd37046ef` also returns that 409.
+
+These are reported production observations, not independently inspected database facts. Deployed source reference is `39b6c59db18686bfa5396905d78c3d5a3f962f09`.
+
+## Verified findings and failure model
+
+- `SendChatApplicationService::send_with_admission_guard` rejects a non-reserved opening request when `Database::has_pending_continuation_opening` returns true.
+- That query checks an incoming `continuation_dispatch_intents` row for the successor without a `completed_continuation_handoffs` receipt for its predecessor. Idle state and absence of an outgoing operation do not disprove that incoming obligation.
+- Migration 100's `consume_continuation_dispatch_intent` message-insert trigger matches opening identity, successor, message kind, payload, and authority, inserts a handoff receipt, and consumes the intent. The receipt validates predecessor topology and referenced messages.
+- `insert_canonical_message_tx` writes the real prepared content. `canonical_message_id_for_turn` uses `successor:client-key`, a form the trigger explicitly recognizes. Do not assume an unhandled canonical-prefix mismatch.
+- `generated_context_authority_survives_dispatch_settlement` and `continuation_creation_persists_dispatch_intent_atomically` cover current-serializer settlement but do not alone establish legacy upgrade coverage.
+- `reconcile_legacy_half_committed_continuation_tx` decodes stored continuation content; inspect supported historical serialization and migration paths alongside durable opening acceptance.
+- Exact relevant source files (DB migrations, DB lib, direct-turn persistence, send-chat service, continuation service, core message schema) are unchanged between deployed 39b6c59 and commissioned d6f94afa.
+
+Hypothesis: an already accepted/persisted opening can remain classified pending across a supported legacy serialization/migration or interrupted settlement boundary. This is NOT proven for production or in a failing regression. Establish the precise cause before choosing a repair. Do not infer acceptance from idle state, transcript prose, or message count.
+
+## Interaction map
+
+Selected handoff and opening authority → atomic successor/intent reservation → send-chat reserved identity validation → durable direct-turn acceptance → canonical message materialization → atomic handoff receipt and intent consumption → ordinary chat admission.
+
+Inspect interruption/recovery edges, durable replay fast paths, and runtime startup's pending-opening steering fence. Recovery must preserve the original accepted identity and payload rather than resend an opening or invent new authority.
+
+## Bounded implementation and regression plan
+
+1. Verify Work admission/base and atomically allocate the task. Read `specs/bedrock/requirements.md` (REQ-BED-036/037 and recovery obligations), applicable Bedrock Allium, `specs/compatibility/requirements.md`, and related migration/recovery tests before editing.
+2. Obtain only necessary read-only evidence for the exact named scopes when supported: prefer bounded warnings/traces; if exact DB inspection is needed, verify the actual deployment/database target first and restrict output to identities, kinds, booleans, lengths, migration versions, and equality results. No secrets or full transcripts; do not guess a target or send coordinator-chain messages.
+3. Add a regression representing a supported historical persisted continuation/opening and its real migration/materialization path. Compare reserved client key, canonical ID, content kind/encoding, authority, predecessor link, pending intent, and completed receipt. Demonstrate the stale gate or falsify this hypothesis. Where feasible, run the same reproducer against both deployed and commissioned source using isolated test data only.
+4. Fix the smallest proven persistence/settlement/migration boundary. Preserve atomicity and exact accepted identity. If persisted supported rows need repair, provide a narrowly justified forward migration or existing supported recovery-path repair, not a manual production write or a new general compatibility subsystem. Update normative contract/ADR only if a guarantee must change; do not rewrite historical migrations as a substitute for upgrading existing databases.
+5. Tests must show matching accepted openings settle exactly once, intent is consumed, receipt references exact accepted message and authority, and a subsequent ordinary chat on the same writable scope passes this gate. Verify interruption/reopen recovery without duplicate opening, transcript mutation, or fabricated identity. Exercise manual user-authorized and generated-context openings where relevant.
+6. Negative tests: genuinely pending opening still blocks ordinary chat; wrong identity, scope, payload, content kind, or authority cannot settle or bypass the gate; close/history/work-scope authority fences remain intact. Include a service-level gate regression as well as DB/migration coverage.
+7. Run focused tests and `./dev.py check`, review exact HEAD adversarially for authority and migration correctness, then normal branch commit/PR/CI review. Report source/regression evidence separately from production remediation. Global owns final publication, merge, and deployment according to actual runtime instructions.
+
+## Acceptance and stop conditions
+
+- A deterministic failing regression or equally precise evidence identifies the cause before the fix; passing regression plus negative fences validates the minimal repair.
+- No claim that either retained production scope is repaired without authorized runtime evidence after Global's release/deployment.
+- Preserve both ProductConversations, all history, original source worktrees, task IDs, settings, and model configuration. All writes stay in this mission's managed worktree and isolated test data.
+- If the supported reproduction disproves the hypothesis or needs a broader continuation redesign/policy decision, checkpoint the evidence and request revised scope rather than bypassing gates.
+
+## Explicit non-goals
+
+No raw production DB lifecycle writes, opening replay, host restart/deploy, edits in either blocked owner's tree, native feature work, TestFlight upload, #788/design resumption, RC #844 work, broad continuation redesign, removal of authority gates, or config/model changes outside this mission's own admission. No duplicate owner or coordinator-chain messaging.
