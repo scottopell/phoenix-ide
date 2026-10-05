@@ -549,7 +549,8 @@ rule CheckpointAuthorizedPredecessorStartup {
 rule VerifyCheckpointedPredecessor {
     when: CheckpointRecoveryRequested(transaction, service)
     requires: transaction.kind = PreparedArtifactDeployment
-    requires: transaction.state in { activating, activation_failed_rollback_failed }
+    requires: transaction.state in { activating, activation_failed_rollback_failed, activation_failed_rolled_back }
+    requires: active_claim_retained(transaction)
     requires: transaction.recovery_mode != null
     requires: checkpointed_predecessor_running_verified(transaction)
     ensures: PairedRecoveryVerified(transaction, service, transaction.recovery_mode)
@@ -584,10 +585,13 @@ rule RollBackFailedPreparedPairedActivation {
     ensures: not DeployedShaWritten(transaction.source_commit)
 
     @guidance
-        -- After verified unchanged no-snapshot resume and durable terminal status,
-        -- release only temporary backup seed and DB-adjacent restore allocation.
-        -- Never remove a verified snapshot/proof. Cleanup failure is diagnostic
-        -- and does not tear down an already verified predecessor.
+        -- After verified unchanged no-snapshot resume, remove only the temporary
+        -- backup seed and DB-adjacent restore allocation and fsync their parents
+        -- before durable terminal status and claim release. Apply this sequence
+        -- to activation rollback, fresh recovery, and checkpoint finalization.
+        -- Never remove a verified snapshot/proof. Cleanup failure retains the
+        -- verified running predecessor, checkpoint, diagnostic and unresolved
+        -- claim for finalization-only retry without stop/start or snapshot replay.
 }
 
 rule PreserveRollbackFailure {
@@ -603,7 +607,7 @@ rule PreserveRollbackFailure {
 
 rule RecoverRetainedPairedTransaction {
     when: PairedRecoveryVerified(transaction, service, mode)
-    requires: transaction.state in { prepared, activating, activation_failed_rollback_failed }
+    requires: transaction.state in { prepared, activating, activation_failed_rollback_failed, activation_failed_rolled_back }
     requires: transaction.kind = PreparedArtifactDeployment
     requires: active_claim_retained(transaction)
     requires: paired_predecessor_start_order_is_valid(transaction)

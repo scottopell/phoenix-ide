@@ -40,6 +40,7 @@ const TERMINAL_STATUS_STATES: &[&str] = &[
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
+    "ordinary_activation_failed_rollback_failed",
     "rejected_concurrent",
 ];
 #[derive(Clone)]
@@ -479,14 +480,7 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
             .map(|timestamp| timestamp.to_rfc3339())
     });
-    let terminal = matches!(
-        state.as_str(),
-        "committed"
-            | "precondition_failed"
-            | "activation_failed_rolled_back"
-            | "activation_failed_rollback_failed"
-            | "rejected_concurrent"
-    );
+    let terminal = TERMINAL_STATUS_STATES.contains(&state.as_str());
     let status_is_stale = !terminal
         && updated_at
             .as_deref()
@@ -919,6 +913,60 @@ pub async fn approve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rollback_failures_hydrate_as_terminal_with_both_diagnostics() {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        app.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
+        let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for durable_state in [
+            "ordinary_activation_failed_rollback_failed",
+            "activation_failed_rollback_failed",
+        ] {
+            assert!(TERMINAL_STATUS_STATES.contains(&durable_state));
+            fs::write(
+                &path,
+                serde_json::json!({
+                    "transaction_id": "tx-rollback",
+                    "source_kind": "published_release",
+                    "state": durable_state,
+                    "source_commit": "a".repeat(40),
+                    "release_tag": "v1.2.3",
+                    "updated_at": "2020-01-01T00:00:00Z",
+                    "failure": "candidate unhealthy",
+                    "rollback_failure": "predecessor unhealthy",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ReleaseTransactionStatus::Present {
+                transaction_id,
+                state,
+                source_commit,
+                release_tag,
+                failure,
+                rollback_failure,
+                stale,
+                ..
+            } = read_status(&app, ReleaseUpdateBackend::BareLinux)
+            else {
+                panic!("rollback failure must remain visible after reconnect");
+            };
+            assert_eq!(transaction_id, "tx-rollback");
+            assert_eq!(state, durable_state);
+            assert_eq!(source_commit, Some("a".repeat(40)));
+            assert_eq!(release_tag.as_deref(), Some("v1.2.3"));
+            assert_eq!(failure.as_deref(), Some("candidate unhealthy"));
+            assert_eq!(rollback_failure.as_deref(), Some("predecessor unhealthy"));
+            assert!(
+                !stale,
+                "terminal failure must not be marked in-progress stale"
+            );
+        }
+    }
 
     #[test]
     fn cached_preview_preserves_discovery_sample_time() {

@@ -671,7 +671,8 @@ rule CheckpointAuthorizedPredecessorStartup {
 rule VerifyCheckpointedPredecessor {
     when: CheckpointRecoveryRequested(transaction)
     requires: transaction.kind = PreparedArtifactDeployment
-    requires: transaction.state in { activating, activation_failed_rollback_failed }
+    requires: transaction.state in { activating, activation_failed_rollback_failed, activation_failed_rolled_back }
+    requires: current_claim_matches(transaction)
     requires: transaction.recovery_mode != null
     requires: checkpointed_predecessor_running_verified(transaction)
     ensures: PairedRecoveryVerified(transaction, transaction.recovery_mode)
@@ -727,7 +728,7 @@ rule PreserveRollbackFailure {
 
 rule RecoverRetainedPairedTransaction {
     when: PairedRecoveryVerified(transaction, mode)
-    requires: transaction.state in { prepared, activating, activation_failed_rollback_failed }
+    requires: transaction.state in { prepared, activating, activation_failed_rollback_failed, activation_failed_rolled_back }
     requires: transaction.kind = PreparedArtifactDeployment
     requires: current_claim_matches(transaction)
     requires: supported_recovery_verified(transaction)
@@ -760,9 +761,9 @@ rule MatchingTerminalClaimReleased {
     requires: claim.transaction = transaction
     requires: claim.generation = transaction.claim_generation
     requires: durable_terminal_status_exists(transaction)
-    requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, activation_failed_rollback_failed }
-    requires: transaction.kind != PreparedArtifactDeployment
-        or transaction.state != activation_failed_rollback_failed
+    requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, ordinary_activation_failed_rollback_failed }
+    requires: transaction.state != ordinary_activation_failed_rollback_failed
+        or transaction.backend = launchd
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.state != activation_failed_rolled_back
         or supported_recovery_verified(transaction)

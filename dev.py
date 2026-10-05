@@ -8894,16 +8894,19 @@ def _launchd_stop_if_loaded():
         ["launchctl", "print", domain_target],
         capture_output=True, text=True,
     )
-    # launchctl print returns 0 even when service doesn't exist — check output
-    if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
-        return  # Not loaded, nothing to do
-    # Service is loaded — bootout stops and unloads it
-    subprocess.run(
-        ["launchctl", "bootout", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
-        capture_output=True,  # Suppress output; may warn if already stopping
-    )
-    # Brief wait for process to exit
-    time.sleep(1)
+    if result.returncode != 0:
+        helper_path = Path(__file__).resolve().parent / "scripts" / "launchd_deploy_helper.py"
+        absent = subprocess.run([sys.executable, str(helper_path), "--probe-service-absence", LAUNCHD_LABEL, "--uid", str(uid)], capture_output=True, text=True)
+        if absent.returncode == 0:
+            return
+        raise SystemExit("launchd target state is unknown; stop refused")
+    stopped = subprocess.run(["launchctl", "bootout", domain_target], capture_output=True, text=True)
+    if stopped.returncode != 0:
+        raise SystemExit(f"launchd service-target stop failed (exit {stopped.returncode})")
+    helper_path = Path(__file__).resolve().parent / "scripts" / "launchd_deploy_helper.py"
+    absent = subprocess.run([sys.executable, str(helper_path), "--probe-service-absence", LAUNCHD_LABEL, "--uid", str(uid)], capture_output=True, text=True)
+    if absent.returncode != 0:
+        raise SystemExit("launchd service-target teardown unconfirmed")
 
 
 def _file_sha256(path: Path) -> str:
@@ -8920,6 +8923,7 @@ class ProdSourceKind(enum.Enum):
     # A restart reuses the already-installed binary verbatim; the backend owns
     # whether installed configuration is preserved or refreshed.
     INSTALLED_RESTART = "installed_restart"
+    PREPARED_ARTIFACT = "prepared_artifact"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9037,6 +9041,8 @@ class ProdDeployControllerOptions:
     expected_asset_sha256: str | None = None
     transaction_id: str | None = None
     backend: str | None = None
+    prepared_artifact: Path | None = None
+    paired_database_upgrade: bool = False
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
         if release is None:
@@ -9593,6 +9599,67 @@ def _prepare_release_candidate(
     )
 
 
+def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> PreparedCandidate:
+    """Validate one protected prepare-main standalone artifact without resigning it."""
+    if sys.platform != "darwin":
+        raise SystemExit("--prepared-artifact is supported only on macOS launchd")
+    if re.fullmatch(r"[0-9a-f]{40}", expected_full_commit) is None:
+        raise SystemExit("--expected-full-commit must be a full 40-character lowercase git SHA")
+    if not directory.is_dir() or directory.is_symlink():
+        raise SystemExit("prepared artifact must be a real directory")
+    machine = platform.machine().lower()
+    target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}.get(machine)
+    if target is None:
+        raise SystemExit(f"unsupported macOS architecture {machine!r}")
+    receipt = directory / f"PREPARATION-RECEIPT-{target}.json"
+    if not receipt.is_file() or receipt.is_symlink():
+        raise SystemExit(f"prepared artifact is missing {receipt.name}")
+    try:
+        metadata = json.loads(receipt.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("prepared artifact receipt is unreadable") from exc
+    if metadata.get("operation") != "prepare-main" or metadata.get("target") != target:
+        raise SystemExit("prepared artifact receipt is not for prepare-main and this host architecture")
+    if metadata.get("commit") != expected_full_commit:
+        raise SystemExit("prepared artifact receipt commit does not match --expected-full-commit")
+    version = metadata.get("version")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}", version):
+        raise SystemExit("prepared artifact receipt has no valid full version")
+    checks = metadata.get("checks")
+    required = {"developer_id_signature": "verified", "hardened_runtime": "verified", "notarization": "accepted", "stapled_ticket": "validated", "gatekeeper": "accepted", "embedded_helper_bytes": "identical"}
+    if not isinstance(checks, dict) or any(checks.get(key) != value for key, value in required.items()):
+        raise SystemExit("prepared artifact receipt lacks accepted signing/notarization/Gatekeeper/helper checks")
+    submission_uuid = checks.get("notarization_submission_id")
+    if metadata.get("schema") != 1 or not isinstance(submission_uuid, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", submission_uuid):
+        raise SystemExit("prepared artifact receipt has no valid submission UUID")
+    digests = metadata.get("sha256")
+    if not isinstance(digests, dict):
+        raise SystemExit("prepared artifact receipt lacks standalone checksum")
+    expected_name = f"phoenix_ide-{target}-prepared-{expected_full_commit[:12]}"
+    digest = digests.get(expected_name)
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest.lower()) is None:
+        raise SystemExit(f"prepared artifact receipt lacks checksum for exact standalone {expected_name}")
+    binary = directory / expected_name
+    if not binary.is_file() or binary.is_symlink() or _file_sha256(binary) != digest.lower():
+        raise SystemExit("prepared standalone artifact checksum mismatch")
+    try:
+        subprocess.run(["codesign", "--verify", "--strict", str(binary)], check=True, capture_output=True, text=True)
+        verification = subprocess.run(["codesign", "--display", "--verbose=4", str(binary)], check=True, capture_output=True, text=True)
+        codesign_metadata = (verification.stdout or "") + (verification.stderr or "")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit("prepared standalone artifact failed strict codesign verification") from exc
+    if not re.search(r"Authority=Developer ID Application:", codesign_metadata):
+        raise SystemExit("prepared standalone artifact is not Developer ID Application signed")
+    if not re.search(r"^CodeDirectory .*flags=.*runtime", codesign_metadata, re.MULTILINE) or "Timestamp=" not in codesign_metadata:
+        raise SystemExit("prepared standalone artifact lacks hardened-runtime or timestamp codesign metadata")
+    binary.chmod(binary.stat().st_mode | 0o100)
+    identity = RuntimeIdentity.from_value(_binary_identity(binary))
+    if identity.version != version or identity.git_sha != expected_full_commit:
+        raise SystemExit("prepared standalone artifact identity does not match receipt and expected commit")
+    return PreparedCandidate(binary=binary, source_kind=ProdSourceKind.PREPARED_ARTIFACT, source_commit=expected_full_commit, identity=identity)
+
+
+
 def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
     binary = prod_build(target=target)
     source_commit = subprocess.run(
@@ -9615,7 +9682,7 @@ def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
 
 _DEPLOY_TERMINAL_STATES = {
     "committed", "precondition_failed", "activation_failed_rolled_back",
-    "activation_failed_rollback_failed", "rejected_concurrent",
+    "activation_failed_rollback_failed", "ordinary_activation_failed_rollback_failed", "rejected_concurrent",
 }
 _RESTART_TERMINAL_STATES = {
     "committed", "precondition_failed", "restart_failed", "rejected_concurrent",
@@ -9657,9 +9724,46 @@ def _status_is_terminal_for_owner(
 ) -> bool:
     try:
         status = json.loads(status_path.read_text())
+        if (
+            status.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
+            and (status.get("state") == "activation_failed_rollback_failed"
+                 or (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None))
+        ):
+            return False
         return status.get("transaction_id") == owner and status.get("state") in terminal_states
     except (OSError, json.JSONDecodeError):
         return False
+
+
+def _transaction_has_paired_manifest(transaction: Path) -> bool:
+    """Fail closed when deciding whether a transaction may be pruned."""
+    manifest = transaction / "manifest.json"
+    try:
+        payload = json.loads(manifest.read_text())
+    except FileNotFoundError:
+        return True
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not isinstance(payload, dict) or payload.get("paired_database_upgrade") is not None
+
+
+def _prune_launchd_deploy_transactions(transactions_dir: Path, current_transaction_id: str) -> None:
+    preserved = {current_transaction_id}
+    try:
+        old_transactions = sorted(
+            (
+                path
+                for path in transactions_dir.iterdir()
+                if path.is_dir() and path.name not in preserved
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    prunable = [path for path in old_transactions if not _transaction_has_paired_manifest(path)]
+    for old in prunable[5:]:
+        shutil.rmtree(old, ignore_errors=True)
 
 
 def _release_launchd_deploy_claim_unlocked(transaction_id: str) -> bool:
@@ -9693,11 +9797,57 @@ def _release_launchd_restart_claim(transaction_id: str) -> bool:
         return _release_launchd_restart_claim_unlocked(transaction_id)
 
 
-def _claim_launchd_deploy(transaction_id: str) -> None:
+def _paired_recovery_refusal(owner: str | None) -> str | None:
+    if owner is None:
+        return None
+    try:
+        status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        status = {}
+    if not isinstance(status, dict):
+        status = {}
+    try:
+        manifest = json.loads((LAUNCHD_DEPLOY_DIR / "transactions" / owner / "manifest.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        manifest = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
+    paired = manifest.get("paired_database_upgrade") is not None or manifest.get("source_kind") == "prepared_artifact" or status.get("source_kind") == "prepared_artifact"
+    if paired and status.get("transaction_id") == owner and status.get("state") == "committed" and status.get("finalization_pending"):
+        return (
+            f"paired commit {owner} has pending publication/cleanup; login/reboot persistence is unconfirmed. "
+            "Do not remove its active marker, redeploy, or invoke database rollback. "
+            f"After confirming the old helper is absent, run ./dev.py prod finalize-paired {owner}; "
+            "it verifies the running committed candidate and only retries publication/cleanup."
+        )
+    if paired and status.get("transaction_id") == owner and status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None:
+        return (
+            f"paired predecessor completion {owner} still owns its claim. "
+            "Do not clear the marker or redeploy. After confirming the old helper is absent, "
+            f"run ./dev.py prod recover-paired {owner}; it verifies the checkpointed running predecessor "
+            "and finalizes publication/status without snapshot replay."
+        )
+    resolved = status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed", "activation_failed_rolled_back"}
+    if paired and not resolved:
+        return (
+            f"paired recovery for {owner} is unverified. Do not remove its active marker or start any runtime. "
+            "Preserve the private snapshot/proof and matching predecessor binary/config. "
+            "Recovery must confirm stopped service and exclusive database ownership, verify the paired proof, "
+            "restore the matching database/runtime/config, and verify predecessor identity before releasing this claim. "
+            "Use prod recover-paired with the retained transaction; if its proof fails, keep the service stopped."
+        )
+    return None
+
+
+def _claim_launchd_deploy(transaction_id: str, *, initial_status: dict | None = None) -> None:
     LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     LAUNCHD_DEPLOY_DIR.chmod(0o700)
     with _launchd_claim_lock():
         owner = _deploy_claim_owner()
+        refusal = _paired_recovery_refusal(owner)
+        if refusal is not None:
+            raise ConcurrentLaunchdOperation(refusal)
+
         if owner and LAUNCHD_DEPLOY_STATUS_PATH.exists():
             if _status_is_terminal_for_owner(
                 LAUNCHD_DEPLOY_STATUS_PATH, owner, _DEPLOY_TERMINAL_STATES
@@ -9722,11 +9872,14 @@ def _claim_launchd_deploy(transaction_id: str) -> None:
                 f"another launchd deployment ({owner or 'unknown'}) is active or needs recovery. "
                 "Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
             )
+        if initial_status is not None:
+            _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
         fd = os.open(LAUNCHD_DEPLOY_ACTIVE_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as stream:
             stream.write(transaction_id + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        _fsync_directory(LAUNCHD_DEPLOY_ACTIVE_PATH.parent)
 
 
 def _claim_launchd_restart(transaction_id: str) -> None:
@@ -9736,6 +9889,9 @@ def _claim_launchd_restart(transaction_id: str) -> None:
         LAUNCHD_RESTART_DIR.chmod(0o700)
         with _launchd_claim_lock():
             deploy_owner = _deploy_claim_owner()
+            refusal = _paired_recovery_refusal(deploy_owner)
+            if refusal is not None:
+                raise ConcurrentLaunchdOperation(refusal)
             if deploy_owner and _status_is_terminal_for_owner(
                 LAUNCHD_DEPLOY_STATUS_PATH, deploy_owner, _DEPLOY_TERMINAL_STATES
             ):
@@ -9874,6 +10030,118 @@ def _helper_plist(
     }, fmt=plistlib.FMT_XML)
 
 
+def cmd_prod_finalize_paired(transaction_id: str) -> None:
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
+        raise SystemExit("paired finalization requires macOS and a safe transaction ID")
+    staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    manifest_path = staging / "manifest.json"
+    payload = json.loads(manifest_path.read_text())
+    status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    owner = _deploy_claim_owner()
+    if status.get("transaction_id") != transaction_id or status.get("state") != "committed" or payload.get("paired_database_upgrade") is None:
+        raise SystemExit("finalization requires the retained committed paired transaction")
+    if owner != transaction_id and (owner is not None or status.get("finalization_pending")):
+        raise SystemExit("paired finalization claim mismatch")
+    helper = Path(payload["paired_database_upgrade"]["controller_helper_path"])
+    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != payload["paired_database_upgrade"].get("controller_helper_sha256"):
+        raise SystemExit("retained helper checksum mismatch")
+    interpreter = subprocess.run([sys.executable, "-c", "import fcntl, plistlib, ssl, urllib.request"], capture_output=True, text=True)
+    if interpreter.returncode != 0:
+        raise SystemExit("current interpreter cannot run retained paired finalization helper")
+    label = payload["helper_label"]
+    absence = subprocess.run([sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+    if absence.returncode != 0:
+        raise SystemExit("previous activation helper absence is unconfirmed")
+    result = subprocess.run([sys.executable, str(helper), "finalize-paired", "--manifest", str(manifest_path), "--helper-label", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"paired finalization refused/failed; claim retained: {result.stderr.strip()}")
+    print(f"Paired finalization complete: {transaction_id}; no runtime/database action.")
+
+
+def cmd_prod_recover_paired(transaction_id: str) -> None:
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
+        raise SystemExit("paired recovery requires macOS and a safe transaction ID")
+    staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    manifest_path = staging / "manifest.json"
+    try:
+        recovery_status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        recovery_status = {}
+    if not isinstance(recovery_status, dict):
+        recovery_status = {}
+    if recovery_status.get("transaction_id") == transaction_id and recovery_status.get("state") == "committed":
+        raise SystemExit("committed paired transactions cannot enter database rollback; inspect pending publication/cleanup guidance in prod status")
+    if not manifest_path.exists() or recovery_status.get("state") in {"preparing", "prepared"}:
+        with _launchd_claim_lock():
+            status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+            if _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("source_kind") != "prepared_artifact" or status.get("state") not in {"preparing", "prepared"}:
+                raise SystemExit("pre-handoff recovery must own an interrupted paired preparation")
+            owner_pid = status.get("preparing_pid")
+            if not isinstance(owner_pid, int) or owner_pid <= 0:
+                raise SystemExit("interrupted preparation process identity is unavailable")
+            try:
+                os.kill(owner_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise SystemExit("preparation process is still alive; ownership cannot be released")
+            label = f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}"
+            probe_helper = Path(__file__).resolve().parent / "scripts" / "launchd_deploy_helper.py"
+            result = subprocess.run([sys.executable, str(probe_helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+            if result.returncode != 0:
+                raise SystemExit("pre-manifest helper absence is unconfirmed")
+            if manifest_path.exists():
+                abandoned = json.loads(manifest_path.read_text())
+                paired = abandoned.get("paired_database_upgrade")
+                if paired is not None:
+                    proof = Path(paired["proof_path"])
+                    backup = Path(paired["backup_path"])
+                    database = Path(paired["database_path"])
+                    reserve = database.parent / f".{database.name}.restore-{transaction_id}"
+                    if backup.parent != staging or proof.parent != staging or proof.exists() or proof.is_symlink():
+                        raise SystemExit("abandonment allocation context is ambiguous")
+                    for allocation in (backup, reserve):
+                        if allocation.is_symlink():
+                            raise SystemExit("abandonment allocation is symlink")
+                        allocation.unlink(missing_ok=True)
+                        directory = os.open(allocation.parent, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
+            status.update(
+                state="precondition_failed",
+                updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                failure="interrupted preparation ended before activation handoff",
+            )
+            _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, status)
+            _release_launchd_deploy_claim_unlocked(transaction_id)
+        print("Interrupted pre-handoff paired preparation verified; runtime/database untouched and ownership released.")
+        return
+    payload = json.loads(manifest_path.read_text())
+    paired = payload.get("paired_database_upgrade")
+    if not isinstance(paired, dict) or _paired_recovery_refusal(transaction_id) is None or _deploy_claim_owner() != transaction_id:
+        raise SystemExit("no matching failed paired transaction owns recovery")
+    helper = Path(paired["controller_helper_path"])
+    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != paired["controller_helper_sha256"]:
+        raise SystemExit("retained paired controller helper binding is invalid")
+    label = payload["helper_label"]
+    interpreter = Path(sys.executable).resolve()
+    probe = subprocess.run([str(interpreter), "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"], capture_output=True)
+    if probe.returncode != 0:
+        raise SystemExit("active Python interpreter cannot run paired SQLite recovery")
+    observed = subprocess.run([str(interpreter), str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+    if observed.returncode != 0:
+        raise SystemExit("paired helper absence is unconfirmed; inspect it before recovery")
+    plist = plistlib.loads(_helper_plist(label, helper, manifest_path, staging / "recovery.log", Path(sys.executable)))
+    plist["ProgramArguments"][2] = "recover-paired"
+    helper_plist = staging / "recovery-helper.plist"
+    helper_plist.write_bytes(plistlib.dumps(plist))
+    helper_plist.chmod(0o600)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)], check=True)
+    print(f"Verified paired recovery handed to retained controller for {transaction_id}; inspect prod status. Claim remains until matching restore and predecessor verification succeed.")
+
+
 def _restart_helper_plist(
     label: str,
     helper: Path,
@@ -9906,7 +10174,7 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
 
 def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = None) -> tuple[dict[str, str], Path | None]:
     env: dict[str, str] = {}
-    if controller is not None and controller.enabled:
+    if controller is not None and (controller.enabled or controller.prepared_artifact is not None):
         try:
             installed = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
             installed.pop("PHOENIX_VERSION", None)
@@ -9928,21 +10196,35 @@ def launchd_prod_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
-    if controller.enabled:
+    if controller.enabled and controller.prepared_artifact is None:
         release, _expected_full_commit = controller.require_exact_release(release)
+    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if controller.paired_database_upgrade and LAUNCHD_PLIST_PATH.is_file() else None
     launchd_env, _env_file = _launchd_candidate_env(controller)
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
     transaction_id = controller.transaction_id or f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
-    source_kind = "published_release" if release else "local_head"
+    if staging.exists() or staging.is_symlink():
+        raise FileExistsError("deployment transaction already exists; select a new transaction ID")
+    source_kind = (
+        "prepared_artifact" if controller.prepared_artifact is not None
+        else "published_release" if release else "local_head"
+    )
     source_commit = None
     release_commit = None
     release_tag = release
     selected_identity: RuntimeIdentity | None = None
+    initial_status = {
+        "transaction_id": transaction_id, "state": "preparing",
+        "preparing_pid": os.getpid(), "source_kind": source_kind,
+        "source_commit": source_commit, "release_commit": release_commit,
+        "release_tag": release_tag, "expected_version": None, "expected_git_sha": None,
+        "created_at": claimed_at, "updated_at": claimed_at,
+        "failure": None, "rollback_failure": None,
+    }
     try:
-        _claim_launchd_deploy(transaction_id)
+        _claim_launchd_deploy(transaction_id, initial_status=initial_status)
     except ActiveLaunchdRestart as exc:
         rejected_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
@@ -9956,33 +10238,32 @@ def launchd_prod_deploy(
             "failure": str(exc), "rollback_failure": None,
         })
         raise
+    bootstrap_attempted = False
     try:
-        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "preparing",
-            "source_kind": source_kind,
-            "source_commit": source_commit,
-            "release_commit": release_commit,
-            "release_tag": release_tag,
-            "expected_version": None, "expected_git_sha": None,
-            "created_at": claimed_at, "updated_at": claimed_at,
-            "failure": None, "rollback_failure": None,
-        })
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
+        if installed_config_hash is not None and _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
+            raise SystemExit("installed configuration changed before claim acquisition")
+        if controller.paired_database_upgrade and installed_config_hash is not None:
+            launchd_env, _env_file = _launchd_candidate_env(controller)
+            _preflight_prod_bind_auth(launchd_env, socket_activated=True)
+            if _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
+                raise SystemExit("installed configuration changed during claimed snapshot read")
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
-        transactions_dir.mkdir(parents=True, exist_ok=True)
-        old_transactions = sorted(
-            (path for path in transactions_dir.iterdir() if path.is_dir()),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for old in old_transactions[5:]:
-            shutil.rmtree(old, ignore_errors=True)
-        staging.mkdir(parents=True)
+        _mkdir_durable(transactions_dir)
+        _prune_launchd_deploy_transactions(transactions_dir, transaction_id)
+        staging.mkdir(mode=0o700)
+        _fsync_directory(staging.parent)
         staging.chmod(0o700)
-        prepared = (
-            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
-            if release
-            else _prepare_local_candidate(target=None)
-        )
+        if controller.prepared_artifact is not None:
+            if release or not controller.paired_database_upgrade or controller.expected_full_commit is None:
+                raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together and exclude --release")
+            prepared = _prepare_prepared_artifact(controller.prepared_artifact, controller.expected_full_commit)
+        else:
+            prepared = (
+                _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
+                if release
+                else _prepare_local_candidate(target=None)
+            )
         binary = prepared.binary
         selected_identity = prepared.identity
         release_tag = prepared.release_tag
@@ -9994,10 +10275,11 @@ def launchd_prod_deploy(
         if binary != candidate_binary:
             shutil.copy2(binary, candidate_binary)
         candidate_binary.chmod(0o755)
-        subprocess.run(
-            ["codesign", "--force", "--sign", "-", "--identifier", LAUNCHD_LABEL, str(candidate_binary)],
-            check=True,
-        )
+        if prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT:
+            subprocess.run(
+                ["codesign", "--force", "--sign", "-", "--identifier", LAUNCHD_LABEL, str(candidate_binary)],
+                check=True,
+            )
         subprocess.run(["codesign", "--verify", "--strict", str(candidate_binary)], check=True)
         observed_identity = RuntimeIdentity.from_value(_binary_identity(candidate_binary))
         if observed_identity != selected_identity:
@@ -10007,9 +10289,21 @@ def launchd_prod_deploy(
         env_file = _env_file
         if env_file:
             print(f"  Loaded env from {env_file}")
-        path_str, path_source = capture_login_shell_path()
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+            path_str = env_overrides.get("PATH")
+            if not path_str:
+                raise SystemExit("prepared-artifact deployment requires installed launchd PATH")
+            path_source = "installed launchd plist"
+        else:
+            path_str, path_source = capture_login_shell_path()
         print_launchd_path_report(path_str, path_source)
         plist_content = generate_launchd_plist(selected_identity.version, extra_env=env_overrides, path_override=path_str)
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+            installed_config = dict(env_overrides)
+            installed_config["PHOENIX_VERSION"] = selected_identity.version
+            paired_plist = plistlib.loads(plist_content.encode())
+            paired_plist["EnvironmentVariables"] = installed_config
+            plist_content = plistlib.dumps(paired_plist).decode()
         candidate_plist = staging / "candidate.plist"
         candidate_plist.write_text(plist_content)
         candidate_plist.chmod(0o600)
@@ -10023,6 +10317,8 @@ def launchd_prod_deploy(
         if target_binary.exists():
             shutil.copy2(target_binary, rollback_binary)
             shutil.copy2(LAUNCHD_PLIST_PATH, rollback_plist)
+            if installed_config_hash is not None and _file_sha256(rollback_plist) != installed_config_hash:
+                raise SystemExit("captured predecessor configuration differs from claimed environment snapshot")
             rollback_plist.chmod(0o600)
         previous_env = _launchd_env_from_plist(rollback_plist) if rollback_plist.exists() else {}
         previous_identity = None
@@ -10037,7 +10333,14 @@ def launchd_prod_deploy(
             ) = _resolve_rollback_identity(rollback_binary, previous_env)
 
         helper = staging / "activate.py"
-        _materialize_helper(source_commit, helper, source_kind)
+        controller_source_commit = None
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+            controller_source_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+            if re.fullmatch(r"[0-9a-f]{40}", controller_source_commit) is None:
+                raise SystemExit("controller source commit is not a full lowercase git SHA")
+            if subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip():
+                raise SystemExit("prepared-artifact deployment requires a clean controller checkout")
+        _materialize_helper(controller_source_commit or source_commit, helper, "local_head" if controller_source_commit else source_kind)
         python_executable = Path(sys.executable).resolve()
         protocol = subprocess.run(
             [str(python_executable), str(helper), "--protocol-version"],
@@ -10049,7 +10352,7 @@ def launchd_prod_deploy(
                 f"expected {LAUNCHD_HANDOFF_PROTOCOL_VERSION}"
             )
         interpreter_check = subprocess.run(
-            [str(python_executable), "-c", "import fcntl, plistlib, ssl, urllib.request"],
+            [str(python_executable), "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"],
             capture_output=True,
         )
         if interpreter_check.returncode != 0:
@@ -10106,18 +10409,36 @@ def launchd_prod_deploy(
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
             "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
             "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
+            "paired_database_upgrade": ({
+                "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
+                "backup_path": str(staging / "database-backup.sqlite3"),
+                "proof_path": str(staging / "database-backup-proof.json"),
+                "controller_source_commit": controller_source_commit,
+                "controller_helper_sha256": _file_sha256(helper) if controller_source_commit else None,
+                "controller_helper_path": str(helper) if controller_source_commit else None,
+            } if controller.paired_database_upgrade else None),
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_json_atomic(staging / "manifest.json", manifest)
         (staging / "manifest.json").chmod(0o400)
+        retained_artifacts = [
+            candidate_binary, candidate_plist, helper, helper_plist, staging / "manifest.json",
+        ]
+        retained_artifacts.extend(path for path in (rollback_binary, rollback_plist) if path.exists())
+        for artifact in retained_artifacts:
+            with artifact.open("rb") as stream:
+                os.fsync(stream.fileno())
+        _fsync_directory(staging)
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "prepared", "source_kind": source_kind,
+            "transaction_id": transaction_id, "state": "prepared",
+            "preparing_pid": os.getpid(), "source_kind": source_kind,
             "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
             "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
             "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
             "failure": None, "rollback_failure": None,
         })
         _ensure_newsyslog_config()
+        bootstrap_attempted = True
         result = subprocess.run(
             ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)],
             capture_output=True, text=True,
@@ -10125,7 +10446,10 @@ def launchd_prod_deploy(
         if result.returncode != 0:
             raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
     except BaseException as exc:
+        if controller is not None and controller.paired_database_upgrade and bootstrap_attempted:
+            raise
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        terminal_status_written = False
         try:
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
                 "transaction_id": transaction_id, "state": "precondition_failed",
@@ -10139,8 +10463,10 @@ def launchd_prod_deploy(
                 "failure": f"{type(exc).__name__}: preparation failed before handoff",
                 "rollback_failure": None,
             })
+            terminal_status_written = True
         finally:
-            _release_launchd_deploy_claim(transaction_id)
+            if terminal_status_written:
+                _release_launchd_deploy_claim(transaction_id)
         raise
     _report_launchd_handoff(transaction_id, selected_identity)
 
@@ -10461,6 +10787,11 @@ def _print_launchd_restart_status() -> None:
 
 
 def _print_launchd_deploy_status() -> None:
+    owner = _deploy_claim_owner()
+    if owner is not None:
+        refusal = _paired_recovery_refusal(owner)
+        if refusal is not None:
+            print(f"    RECOVERY: {refusal}")
     if not LAUNCHD_DEPLOY_STATUS_PATH.exists():
         return
     try:
@@ -10478,6 +10809,11 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Failure: {deploy['failure']}")
         if deploy.get("rollback_failure"):
             print(f"    Rollback failure: {deploy['rollback_failure']}")
+        if deploy.get("committed_diagnostic"):
+            print(f"    Committed warning: {deploy['committed_diagnostic']}")
+        refusal = _paired_recovery_refusal(owner or deploy.get("transaction_id"))
+        if owner is None and refusal is not None:
+            print(f"    RECOVERY: {refusal}")
         if deploy.get("state") in {"preparing", "prepared", "activating"}:
             age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(deploy["updated_at"])
             stale_after = (
@@ -10486,7 +10822,10 @@ def _print_launchd_deploy_status() -> None:
                 + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
             )
             if age.total_seconds() > stale_after:
-                print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
+                if refusal is not None:
+                    print("    STALE: paired recovery remains unresolved; follow RECOVERY above")
+                else:
+                    print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
     except Exception as exc:
         print(f"  Last deploy: unreadable status ({type(exc).__name__})")
 
@@ -10565,16 +10904,25 @@ def cmd_prod_deploy(
 ):
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
+    supplied = (controller.prepared_artifact is not None, controller.paired_database_upgrade)
+    if controller.expected_full_commit is not None and release is None and not any(supplied):
+        raise SystemExit("--expected-full-commit requires all prepared paired options or an exact release controller")
+    if any(supplied) and (not all(supplied) or controller.expected_full_commit is None):
+        raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together")
+    if controller.prepared_artifact is not None and (sys.platform != "darwin" or controller.backend not in (None, "launchd")):
+        raise SystemExit("prepared artifact paired deployment is supported only by macOS launchd")
+    if controller.prepared_artifact is not None and release:
+        raise SystemExit("prepared artifact paired deployment excludes --release")
     env = controller.require_backend()
-    if controller.enabled and not release:
+    if controller.enabled and not release and controller.prepared_artifact is None:
         raise SystemExit("controller mode requires --release")
-    if not release:
+    if not release and controller.prepared_artifact is None:
         print("Running pre-deploy checks...\n")
         cmd_check(gate=False, pretty=pretty)
         print()
 
     if env == "launchd":
-        if controller.enabled:
+        if controller.enabled or controller.prepared_artifact is not None:
             launchd_prod_deploy(release, controller=controller)
         else:
             launchd_prod_deploy(release)
@@ -10616,6 +10964,9 @@ def cmd_prod_status():
 
 def cmd_prod_stop():
     """Stop production service (auto-detects environment)."""
+    refusal = _paired_recovery_refusal(_deploy_claim_owner())
+    if refusal is not None:
+        raise SystemExit(refusal)
     env = detect_prod_env()
 
     if env == "launchd":
@@ -10918,6 +11269,13 @@ def main():
     deploy_parser.add_argument("--controller-expected-asset-name", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-asset-sha256", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
+    deploy_parser.add_argument("--expected-full-commit", help="Exact full SHA for --prepared-artifact")
+    deploy_parser.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
+    recover_parser = prod_sub.add_parser("recover-paired", help="Verify and restore a retained failed paired transaction")
+    recover_parser.add_argument("transaction_id")
+    finalize_parser = prod_sub.add_parser("finalize-paired", help="Finalize retained committed paired publication/cleanup without runtime or database changes")
+    finalize_parser.add_argument("transaction_id")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(
@@ -11083,13 +11441,19 @@ def main():
                 controller=ProdDeployControllerOptions(
                     enabled=args.controller_mode,
                     exact_release_tag=args.controller_release_tag,
-                    expected_full_commit=args.controller_expected_full_commit,
+                    expected_full_commit=args.expected_full_commit or args.controller_expected_full_commit,
                     expected_asset_name=args.controller_expected_asset_name,
                     expected_asset_sha256=args.controller_expected_asset_sha256,
                     transaction_id=args.transaction_id,
+                    prepared_artifact=args.prepared_artifact,
+                    paired_database_upgrade=args.paired_database_upgrade,
                     backend=args.controller_backend,
                 ),
             )
+        elif args.prod_command == "recover-paired":
+            cmd_prod_recover_paired(args.transaction_id)
+        elif args.prod_command == "finalize-paired":
+            cmd_prod_finalize_paired(args.transaction_id)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":

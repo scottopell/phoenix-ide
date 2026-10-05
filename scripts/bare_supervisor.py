@@ -688,11 +688,11 @@ class Supervisor:
                     self.transaction_status(
                         manifest,
                         manifest_hash,
-                        "activation_failed_rollback_failed",
+                        "ordinary_activation_failed_rollback_failed",
                         failure,
                         str(rollback_error),
                     )
-                    return "activation_failed_rollback_failed"
+                    return "ordinary_activation_failed_rollback_failed"
             finally:
                 for path in reserved:
                     path.unlink(missing_ok=True)
@@ -762,6 +762,11 @@ class Supervisor:
                 self.restart_installed(identity, health_url, manifest.health_timeout_secs)
                 self.layout.active_file.unlink(missing_ok=True)
                 return
+            if state in {
+                "activation_failed_rollback_failed",
+                "ordinary_activation_failed_rollback_failed",
+            }:
+                return
             if state != "activating":
                 raise SupervisorError(f"active claim has unrecoverable durable state {state!r}")
             if phase in {"candidate_installed", "candidate_started"}:
@@ -806,7 +811,7 @@ class Supervisor:
                     self.transaction_status(
                         manifest,
                         manifest_hash,
-                        "activation_failed_rollback_failed",
+                        "ordinary_activation_failed_rollback_failed",
                         str(status.get("failure") or "supervisor interrupted during activation"),
                         str(reconciliation_error),
                     )
