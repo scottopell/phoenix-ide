@@ -209,6 +209,34 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("/opt/local/kache", os.environ["RUSTC_WRAPPER"])
             ensure.assert_called_once_with("/opt/local/kache", cargo_cwd=None)
 
+    def test_minimal_kache_configuration_gets_generated_socket(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev, "_private_kache_socket_dir", return_value=Path("/tmp/private-kache")
+        ), mock.patch.object(
+            self.dev, "_kache_socket_lock", return_value=contextlib.nullcontext()
+        ), mock.patch.object(
+            self.dev, "_start_kache_daemon_locked", return_value=None
+        ):
+            self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
+            self.assertRegex(
+                os.environ["KACHE_SOCKET_PATH"],
+                r"^/tmp/private-kache/[0-9a-f]{16}\.sock$",
+            )
+
+    def test_config_override_gets_generated_socket(self):
+        with mock.patch.dict(
+            os.environ, {"KACHE_CONFIG": "/tmp/config.toml"}, clear=True
+        ), mock.patch.object(
+            self.dev, "_private_kache_socket_dir", return_value=Path("/tmp/private-kache")
+        ), mock.patch.object(
+            self.dev, "_kache_socket_lock", return_value=contextlib.nullcontext()
+        ), mock.patch.object(
+            self.dev, "_start_kache_daemon_locked", return_value=None
+        ):
+            self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
+            self.assertIn("KACHE_SOCKET_PATH", os.environ)
+            self.assertEqual("/tmp/config.toml", os.environ["KACHE_CONFIG"])
+
     def test_kache_daemon_uses_cargo_working_directory(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         cargo_cwd = self.dev.Path("/detached/build")
@@ -240,6 +268,43 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("kache=trace", daemon_env["KACHE_LOG_FILE"])
         self.assertEqual("/tmp/kache.log", daemon_env["KACHE_LOG_FILE_PATH"])
         wait.assert_called_once_with("/bin/kache", cargo_cwd=cargo_cwd)
+
+    def test_kache_lock_setup_failure_is_actionable(self):
+        with mock.patch.dict(
+            os.environ, {"KACHE_SOCKET_PATH": "/unwritable/kache.sock"}, clear=True
+        ), mock.patch.object(
+            self.dev, "_kache_socket_lock", side_effect=OSError("permission denied")
+        ):
+            error = self.dev._ensure_kache_daemon("/bin/kache")
+        self.assertEqual("cannot lock Kache socket setup: permission denied", error)
+
+    def test_kache_lock_creation_failure_propagates(self):
+        with mock.patch.object(
+            self.dev.Path, "mkdir", side_effect=OSError("read-only filesystem")
+        ):
+            with self.assertRaisesRegex(OSError, "read-only filesystem"):
+                with self.dev._kache_socket_lock(Path("/tmp/kache.sock")):
+                    self.fail("lock body must not run")
+
+    def test_kache_lock_acquisition_failure_closes_descriptor(self):
+        with mock.patch.object(self.dev.os, "open", return_value=42), mock.patch.object(
+            self.dev.fcntl, "flock", side_effect=OSError("lock unavailable")
+        ), mock.patch.object(self.dev.os, "close") as close:
+            with self.assertRaisesRegex(OSError, "lock unavailable"):
+                with self.dev._kache_socket_lock(Path("/tmp/kache.sock")):
+                    self.fail("lock body must not run")
+        close.assert_called_once_with(42)
+
+    def test_kache_daemon_start_replaces_undecodable_output(self):
+        completed = mock.Mock(returncode=1, stdout="\ufffd", stderr="")
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "run", return_value=completed
+        ) as run:
+            error = self.dev._start_kache_daemon_locked("/bin/kache", cargo_cwd=None)
+        self.assertEqual("\ufffd", error)
+        self.assertEqual("replace", run.call_args.kwargs["errors"])
 
     def test_kache_daemon_holds_socket_lock_across_check_start_and_readiness(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")

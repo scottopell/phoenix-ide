@@ -4977,18 +4977,51 @@ def _kache_socket_lock(socket_path: Path):
     lock_path = socket_path.with_name(f"{socket_path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        acquired = True
         yield
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+        try:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _start_kache_daemon_locked(binary: str, *, cargo_cwd: Path | None) -> str | None:
+    running, status_error = _kache_daemon_is_running(binary, cargo_cwd=cargo_cwd)
+    if status_error:
+        return f"cannot verify existing daemon environment: {status_error}; run 'kache daemon stop' and retry"
+    if running:
+        return (
+            "selected socket already has a running daemon whose environment cannot be verified; "
+            "run 'kache daemon stop' and retry"
+        )
+
+    try:
+        result = subprocess.run(
+            [binary, "daemon", "start"],
+            cwd=cargo_cwd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=os.environ,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return str(error)
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
+    return _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
 
 
 def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str | None:
-    cache_dir = os.environ.get("KACHE_CACHE_DIR")
-    if os.name != "nt" and cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
-        digest = hashlib.sha256(str(Path(cache_dir).expanduser().resolve()).encode()).hexdigest()[:16]
+    if os.name != "nt" and "KACHE_SOCKET_PATH" not in os.environ:
+        socket_identity = os.environ.get("KACHE_CACHE_DIR") or str(Path(cargo_cwd or ROOT).resolve())
+        digest = hashlib.sha256(socket_identity.encode()).hexdigest()[:16]
         try:
             socket_dir = _private_kache_socket_dir()
         except OSError as error:
@@ -4999,31 +5032,11 @@ def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str |
     if not socket:
         return "KACHE_SOCKET_PATH is required to serialize daemon startup"
 
-    with _kache_socket_lock(Path(socket)):
-        running, status_error = _kache_daemon_is_running(binary, cargo_cwd=cargo_cwd)
-        if status_error:
-            return f"cannot verify existing daemon environment: {status_error}; run 'kache daemon stop' and retry"
-        if running:
-            return (
-                "selected socket already has a running daemon whose environment cannot be verified; "
-                "run 'kache daemon stop' and retry"
-            )
-
-        try:
-            result = subprocess.run(
-                [binary, "daemon", "start"],
-                cwd=cargo_cwd,
-                capture_output=True,
-                text=True,
-                env=os.environ,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            return str(error)
-        if result.returncode != 0:
-            return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
-        return _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
+    try:
+        with _kache_socket_lock(Path(socket)):
+            return _start_kache_daemon_locked(binary, cargo_cwd=cargo_cwd)
+    except OSError as error:
+        return f"cannot lock Kache socket setup: {error}"
 
 
 def _absolute_executable(binary: str | None) -> str | None:
