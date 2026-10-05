@@ -4903,51 +4903,15 @@ def _private_kache_socket_dir() -> Path:
     return directory
 
 
-def _wait_for_kache_daemon(
-    binary: str, *, cargo_cwd: Path | None = None, timeout: float = 2.0
-) -> str | None:
-    deadline = time.monotonic() + timeout
-    last_error = "daemon did not report readiness"
-    while time.monotonic() < deadline:
-        try:
-            result = subprocess.run(
-                [binary, "--json", "daemon"],
-                cwd=cargo_cwd,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                env=os.environ,
-                timeout=2,
-                check=False,
-            )
-            if result.returncode == 0:
-                status = json.loads(result.stdout)
-                if not isinstance(status, dict):
-                    last_error = "daemon readiness response was not an object"
-                    continue
-                if status.get("daemon_running") is not True:
-                    last_error = "daemon did not report running"
-                    continue
-                expected = os.environ.get("KACHE_SOCKET_PATH")
-                actual = status.get("socket")
-                if actual is not None and not isinstance(actual, str):
-                    last_error = "daemon readiness socket was not a string"
-                    continue
-                if expected and actual and Path(actual).resolve() != Path(expected).resolve():
-                    return f"daemon reported unexpected socket {actual}; expected {expected}"
-                if expected and not actual:
-                    last_error = "daemon readiness omitted configured socket"
-                else:
-                    return None
-            else:
-                last_error = (result.stderr or result.stdout).strip() or f"status exit {result.returncode}"
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
-            last_error = str(error)
-        time.sleep(0.05)
-    return last_error
+class KacheDaemonStatus(enum.Enum):
+    ABSENT = "absent"
+    RUNNING = "running"
+    ERROR = "error"
 
 
-def _kache_daemon_is_running(binary: str, *, cargo_cwd: Path | None) -> tuple[bool, str | None]:
+def _read_kache_daemon_status(
+    binary: str, *, cargo_cwd: Path | None
+) -> tuple[KacheDaemonStatus, str | None, str | None]:
     try:
         result = subprocess.run(
             [binary, "--json", "daemon"],
@@ -4960,16 +4924,51 @@ def _kache_daemon_is_running(binary: str, *, cargo_cwd: Path | None) -> tuple[bo
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        return False, str(error)
+        return KacheDaemonStatus.ERROR, None, str(error)
     if result.returncode != 0:
-        return False, None
+        detail = (result.stderr or result.stdout).strip() or f"status exit {result.returncode}"
+        return KacheDaemonStatus.ERROR, None, detail
     try:
         status = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        return False, str(error)
+        return KacheDaemonStatus.ERROR, None, str(error)
     if not isinstance(status, dict) or not isinstance(status.get("daemon_running"), bool):
-        return False, "daemon readiness response had an invalid shape"
-    return status["daemon_running"], None
+        return KacheDaemonStatus.ERROR, None, "daemon readiness response had an invalid shape"
+    socket = status.get("socket")
+    if socket is not None and not isinstance(socket, str):
+        return KacheDaemonStatus.ERROR, None, "daemon readiness socket was not a string"
+    state = KacheDaemonStatus.RUNNING if status["daemon_running"] else KacheDaemonStatus.ABSENT
+    return state, socket, None
+
+
+def _wait_for_kache_daemon(
+    binary: str, *, cargo_cwd: Path | None = None, timeout: float = 2.0
+) -> str | None:
+    deadline = time.monotonic() + timeout
+    last_error = "daemon did not report readiness"
+    while time.monotonic() < deadline:
+        status, actual, status_error = _read_kache_daemon_status(binary, cargo_cwd=cargo_cwd)
+        if status is KacheDaemonStatus.RUNNING:
+            expected = os.environ.get("KACHE_SOCKET_PATH")
+            if expected and actual and Path(actual).resolve() != Path(expected).resolve():
+                return f"daemon reported unexpected socket {actual}; expected {expected}"
+            if expected and not actual:
+                last_error = "daemon readiness omitted configured socket"
+            else:
+                return None
+        elif status is KacheDaemonStatus.ABSENT:
+            last_error = "daemon did not report running"
+        else:
+            last_error = status_error or "daemon readiness failed"
+        time.sleep(0.05)
+    return last_error
+
+
+def _kache_daemon_is_running(binary: str, *, cargo_cwd: Path | None) -> tuple[bool, str | None]:
+    status, _socket, error = _read_kache_daemon_status(binary, cargo_cwd=cargo_cwd)
+    if status is KacheDaemonStatus.ERROR:
+        return False, error
+    return status is KacheDaemonStatus.RUNNING, None
 
 
 @contextlib.contextmanager
@@ -5043,8 +5042,36 @@ def _absolute_executable(binary: str | None) -> str | None:
     return str(Path(binary).resolve()) if binary else None
 
 
+def _pin_kache_config(cwd: Path) -> None:
+    if "KACHE_CONFIG" in os.environ:
+        return
+    directory = cwd
+    while True:
+        candidate = directory / ".kache.toml"
+        if candidate.is_file():
+            os.environ["KACHE_CONFIG"] = str(candidate)
+            return
+        if directory.parent == directory:
+            return
+        directory = directory.parent
+
+
+def _normalize_path_list(name: str, base: Path) -> None:
+    value = os.environ.get(name)
+    if not value:
+        return
+    os.environ[name] = os.pathsep.join(
+        str(path if path.is_absolute() else base / path)
+        for entry in value.split(os.pathsep)
+        if entry
+        for path in (Path(entry).expanduser(),)
+    )
+
+
 def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
     base = (base or Path.cwd()).resolve()
+    if backend == "kache":
+        _pin_kache_config(base)
     names = (
         (
             "KACHE_CACHE_DIR",
@@ -5060,6 +5087,7 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
             "SCCACHE_CONF",
             "SCCACHE_ERROR_LOG",
             "SCCACHE_GCS_KEY_PATH",
+            "SCCACHE_STARTUP_NOTIFY",
         )
     )
     for name in names:
@@ -5067,6 +5095,13 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
         if value:
             path = Path(value).expanduser()
             os.environ[name] = str(path if path.is_absolute() else base / path)
+    if backend == "sccache":
+        _normalize_path_list("SCCACHE_EXTRAFILES", base)
+        uds = os.environ.get("SCCACHE_SERVER_UDS")
+        if uds and not uds.startswith("\\x00"):
+            uds_path = Path(uds).expanduser()
+            if not uds_path.is_absolute():
+                os.environ["SCCACHE_SERVER_UDS"] = str(base / uds_path)
 
 
 def _environment_flag(name: str) -> bool:

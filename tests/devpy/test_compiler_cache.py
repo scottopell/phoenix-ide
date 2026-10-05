@@ -438,6 +438,39 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(self.dev.time, "sleep"):
             self.assertIsNone(self.dev._wait_for_kache_daemon("/bin/kache", timeout=1))
 
+    def test_kache_readiness_sleeps_after_every_retryable_status(self):
+        malformed = mock.Mock(returncode=0, stdout="not-json", stderr="")
+        absent = mock.Mock(
+            returncode=0,
+            stdout='{"daemon_running":false,"socket":"/tmp/kache.sock"}',
+            stderr="",
+        )
+        running = mock.Mock(
+            returncode=0,
+            stdout='{"daemon_running":true,"socket":"/tmp/kache.sock"}',
+            stderr="",
+        )
+        clock = iter((0.0, 0.0, 0.1, 0.2))
+        with mock.patch.dict(
+            os.environ, {"KACHE_SOCKET_PATH": "/tmp/kache.sock"}, clear=True
+        ), mock.patch.object(
+            self.dev.subprocess, "run", side_effect=(malformed, absent, running)
+        ), mock.patch.object(
+            self.dev.time, "monotonic", side_effect=lambda: next(clock)
+        ), mock.patch.object(self.dev.time, "sleep") as sleep:
+            self.assertIsNone(self.dev._wait_for_kache_daemon("/bin/kache", timeout=1))
+        self.assertEqual([mock.call(0.05), mock.call(0.05)], sleep.call_args_list)
+
+    def test_kache_status_nonzero_is_error_not_absence(self):
+        status = mock.Mock(returncode=2, stdout="", stderr="socket permission denied")
+        with mock.patch.object(self.dev.subprocess, "run", return_value=status):
+            state, socket, error = self.dev._read_kache_daemon_status(
+                "/bin/kache", cargo_cwd=None
+            )
+        self.assertIs(state, self.dev.KacheDaemonStatus.ERROR)
+        self.assertIsNone(socket)
+        self.assertEqual("socket permission denied", error)
+
     def test_kache_readiness_replaces_undecodable_output(self):
         status = mock.Mock(returncode=0, stdout="\ufffd", stderr="")
         clock = iter((0.0, 0.0, 1.0))
@@ -459,7 +492,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev.time, "sleep"
         ):
             error = self.dev._wait_for_kache_daemon("/bin/kache", timeout=0.5)
-        self.assertEqual("daemon readiness response was not an object", error)
+        self.assertEqual("daemon readiness response had an invalid shape", error)
 
     def test_kache_readiness_rejects_non_string_socket(self):
         status = mock.Mock(
@@ -791,6 +824,41 @@ class CompilerCacheTests(unittest.TestCase):
                 "/workspace/credentials/gcs.json",
                 os.environ["SCCACHE_GCS_KEY_PATH"],
             )
+
+    def test_kache_implicit_config_is_pinned_from_invoking_tree(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested = root / "nested" / "worktree"
+            nested.mkdir(parents=True)
+            config = root / ".kache.toml"
+            config.write_text("[cache]\n")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.dev._normalize_cache_paths("kache", nested)
+                self.assertEqual(str(config.resolve()), os.environ["KACHE_CONFIG"])
+
+    def test_sccache_cwd_paths_and_abstract_uds(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SCCACHE_STARTUP_NOTIFY": "run/notify.sock",
+                "SCCACHE_EXTRAFILES": f"one.h{os.pathsep}nested/two.h",
+                "SCCACHE_SERVER_UDS": "run/sccache.sock",
+            },
+            clear=True,
+        ):
+            self.dev._normalize_cache_paths("sccache", Path("/workspace"))
+            self.assertEqual("/workspace/run/notify.sock", os.environ["SCCACHE_STARTUP_NOTIFY"])
+            self.assertEqual(
+                f"/workspace/one.h{os.pathsep}/workspace/nested/two.h",
+                os.environ["SCCACHE_EXTRAFILES"],
+            )
+            self.assertEqual("/workspace/run/sccache.sock", os.environ["SCCACHE_SERVER_UDS"])
+
+        with mock.patch.dict(
+            os.environ, {"SCCACHE_SERVER_UDS": r"\x00sccache.sock"}, clear=True
+        ):
+            self.dev._normalize_cache_paths("sccache", Path("/workspace"))
+            self.assertEqual(r"\x00sccache.sock", os.environ["SCCACHE_SERVER_UDS"])
 
     def test_absolute_cache_paths_are_preserved(self):
         with mock.patch.dict(
