@@ -641,6 +641,34 @@ class ActivationTests(unittest.TestCase):
                     release.assert_not_called()
                     self.assertTrue(Path(manifest.active_path).exists())
 
+    def test_checkpoint_retry_verification_failure_is_durable_and_never_replays_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("candidate failed"))
+            _state, manifest, _database, _binary, _plist, *_rest, events, launchctl = result
+            copied_helper = manifest.paired_database_upgrade.controller_helper_path
+            self.assertEqual(json.loads(Path(manifest.status_path).read_text())["state"], "activation_failed_rolled_back")
+            before_events = list(events)
+            with mock.patch.object(helper, "__file__", str(copied_helper)), mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("checkpoint health verification failed")), mock.patch.object(helper, "restore_database") as replay:
+                self.assertEqual(helper.recover_paired(manifest), "activation_failed_rollback_failed")
+                replay.assert_not_called()
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual(status["state"], "activation_failed_rollback_failed")
+            self.assertEqual(status["failure"], "candidate failed")
+            self.assertIn("checkpoint health verification failed", status["rollback_failure"])
+            self.assertEqual(status["recovery_mode"], "snapshot_restored")
+            self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
+            self.assertEqual(events, before_events + ["stop"])
+            self.assertFalse(launchctl.loaded)
+            self.assertFalse(helper.status_is_durable_terminal(manifest))
+            with mock.patch.object(helper, "__file__", str(copied_helper)), mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "restore_database") as replay:
+                self.assertEqual(helper.recover_paired(manifest), "activation_failed_rollback_failed")
+                replay.assert_not_called()
+            retried = json.loads(Path(manifest.status_path).read_text())
+            self.assertIn("checkpoint health verification failed", retried["rollback_failure"])
+            self.assertIn("post-restore checkpoint has no running predecessor; refuse snapshot replay", retried["rollback_failure"])
+            self.assertEqual(retried["recovery_mode"], "snapshot_restored")
+            self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
+
     def test_checkpoint_recovery_lock_loser_cannot_release_retained_claim(self):
         with tempfile.TemporaryDirectory() as td:
             manifest, *_ = self._full_paired_fixture(Path(td))

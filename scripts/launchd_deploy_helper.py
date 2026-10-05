@@ -1190,8 +1190,6 @@ def record_recovery_error(manifest: Manifest, error: str | Exception, *, quarant
         return
     if prior.get("state") in {"committed", "preparing"}:
         return
-    if prior.get("recovery_mode") is not None and prior.get("state") == "activation_failed_rolled_back" and not verified_finalization_failed:
-        return
     previous = prior.get("rollback_failure")
     merged = f"{previous}; recovery attempt failed: {error}" if previous else error
     try:
