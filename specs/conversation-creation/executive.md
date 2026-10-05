@@ -8,10 +8,13 @@ Conversation creation accepts one durable job per request before filesystem, Git
 
 The branch includes the shell-first API and UI flow, but production persistence and worker orchestration still use earlier staged and phase-update behavior rather than the full simplified request-bound publication contract. The durable protocol vocabulary, pure transition function, `CreationClaim`/`CompleteCreation` state-machine hooks, and deterministic operation-sequence tests are present (`crates/phoenix-state-machine/src/creation_protocol.rs`, `transition.rs`). Ordinary web creation enters through a directory-first typed ProductConversation request and provisions Git-backed conversations in detached-default worktrees without Project, mode, or branch inputs. Publication records the allocated worktree on `WorkScope` and retains the repository root and exact checkout OID as creation-job staging facts; it does not mint hidden `GitRepository` identity, attach `WorkScope.repository`, or write repository locator observations. Under ADR-035 and REQ-GITREP-009, legacy `Project` remains the sole live repository authority. Hidden `GitRepository` identity and attachment, request-id job identity, immutable starting-pin persistence, atomic publication, and durable typed unresolved default-branch evidence remain normative targets rather than shipped authority.
 
+Ordinary creation with omitted model uses the registry product default independently of workspace mode; explicit model/effort/speed selections remain unchanged (REQ-CCR-011). Cheap auxiliary work retains its separate selector.
+
 ## Verification Coverage
 
 | Requirement | Status | Verification |
 | --- | --- | --- |
+| REQ-CCR-011 Ordinary Creation Model Default | Implemented | Registry preference and creation model-resolution tests; browser remembered-selection regression |
 | REQ-CCR-001 Durable Acceptance | Partial | Existing shell/job transaction exists, but request-id replay and no-partial-publication cutover remain incomplete |
 | REQ-CCR-002 Exclusive Authority | Modelled | Pure claim/generation transition and stale-result tests; request-id-as-job-identity not fully implemented |
 | REQ-CCR-003 Crash Reconciliation | Modelled | Expired-claim takeover emits reconciliation rather than blind replay; explicit cleanup ambiguity remains unimplemented |

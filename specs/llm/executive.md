@@ -16,7 +16,7 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 |-------------|--------|-------|
 | **REQ-LLM-001:** Provider Abstraction | ✅ Complete | LlmService trait with async complete() |
 | **REQ-LLM-002:** Backend-Compatible Endpoint Support | ✅ Complete | Exact base URL overrides, no hidden suffix append |
-| **REQ-LLM-003:** Model Registry | ✅ Complete | Available-only catalog including direct Claude Sonnet 5.5 and exact GPT-6.1 Sol, GPT-6 Astra/Sol/Luna, and GPT-5.6 Sol/Luna/Terra OpenAI built-ins, discovery bounded by configured specs, exact custom-route precedence, and fail-closed legacy pin mappings |
+| **REQ-LLM-003:** Model Registry | ✅ Complete | Product default prefers registered GPT-6.1 Sol unless an available explicit DEFAULT_MODEL overrides it. Available-only catalog including direct Claude Sonnet 5.5 and exact GPT-6.1 Sol, GPT-6 Astra/Sol/Luna, and GPT-5.6 Sol/Luna/Terra OpenAI built-ins, discovery bounded by configured specs, exact custom-route precedence, and fail-closed legacy pin mappings |
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Opportunistic backend-scoped `/v1/models` discovery, falls back to configured models |
 | **REQ-LLM-003b:** Typed Model Effort Capability Registry | ✅ Complete | Constructor-validated known-native, unknown, unsupported, and supported-level capability states |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
