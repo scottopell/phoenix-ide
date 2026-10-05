@@ -657,6 +657,44 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("cargo", calls[1][0])
         self.assertIsNotNone(calls[1][1])
 
+    def test_local_prod_deploy_reuses_one_compiler_cache_setup(self):
+        setup = (
+            "kache",
+            {
+                "RUSTC_WRAPPER": "/bin/kache",
+                "KACHE_SOCKET_PATH": "/tmp/kache.sock",
+            },
+        )
+        controller = mock.Mock()
+        controller.require_backend.return_value = "launchd"
+        controller.enabled = False
+        with mock.patch.object(
+            self.dev, "_compiler_cache_subprocess_env", return_value=setup
+        ) as configure, mock.patch.object(self.dev, "cmd_check") as check, mock.patch.object(
+            self.dev, "launchd_prod_deploy"
+        ) as deploy:
+            self.dev.cmd_prod_deploy(controller=controller)
+
+        configure.assert_called_once_with(cargo_cwd=self.dev.ROOT)
+        self.assertIs(setup, check.call_args.kwargs["compiler_cache_setup"])
+        self.assertIs(setup, deploy.call_args.kwargs["compiler_cache_setup"])
+
+    def test_independent_prod_deploys_configure_independently(self):
+        controller = mock.Mock()
+        controller.require_backend.return_value = "launchd"
+        controller.enabled = False
+        with mock.patch.object(
+            self.dev,
+            "_compiler_cache_subprocess_env",
+            side_effect=[("kache", {"run": "one"}), SystemExit("existing daemon")],
+        ) as configure, mock.patch.object(self.dev, "cmd_check"), mock.patch.object(
+            self.dev, "launchd_prod_deploy"
+        ):
+            self.dev.cmd_prod_deploy(controller=controller)
+            with self.assertRaisesRegex(SystemExit, "existing daemon"):
+                self.dev.cmd_prod_deploy(controller=controller)
+        self.assertEqual(2, configure.call_count)
+
     def test_subprocess_environment_reports_actual_backend_without_leaking(self):
         def configure(_requested, **_options):
             os.environ["RUSTC_WRAPPER"] = "/bin/sccache"
@@ -721,6 +759,7 @@ class CompilerCacheTests(unittest.TestCase):
                 "SCCACHE_DIR": "cache/sccache",
                 "SCCACHE_CONF": "config/sccache.toml",
                 "SCCACHE_ERROR_LOG": "logs/sccache.log",
+                "SCCACHE_GCS_KEY_PATH": "credentials/gcs.json",
             },
             clear=True,
         ):
@@ -735,10 +774,15 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("cache/sccache", os.environ["SCCACHE_DIR"])
             self.assertEqual("config/sccache.toml", os.environ["SCCACHE_CONF"])
             self.assertEqual("logs/sccache.log", os.environ["SCCACHE_ERROR_LOG"])
+            self.assertEqual("credentials/gcs.json", os.environ["SCCACHE_GCS_KEY_PATH"])
             self.dev._normalize_cache_paths("sccache", self.dev.Path("/workspace"))
             self.assertEqual("/workspace/cache/sccache", os.environ["SCCACHE_DIR"])
             self.assertEqual("/workspace/config/sccache.toml", os.environ["SCCACHE_CONF"])
             self.assertEqual("/workspace/logs/sccache.log", os.environ["SCCACHE_ERROR_LOG"])
+            self.assertEqual(
+                "/workspace/credentials/gcs.json",
+                os.environ["SCCACHE_GCS_KEY_PATH"],
+            )
 
     def test_absolute_cache_paths_are_preserved(self):
         with mock.patch.dict(

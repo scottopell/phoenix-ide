@@ -5055,7 +5055,12 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
             "KACHE_LOG_FILE_PATH",
         )
         if backend == "kache"
-        else ("SCCACHE_DIR", "SCCACHE_CONF", "SCCACHE_ERROR_LOG")
+        else (
+            "SCCACHE_DIR",
+            "SCCACHE_CONF",
+            "SCCACHE_ERROR_LOG",
+            "SCCACHE_GCS_KEY_PATH",
+        )
     )
     for name in names:
         value = os.environ.get(name)
@@ -5360,6 +5365,7 @@ def cmd_check(
     pretty: bool = False,
     compiler_cache: str | None = None,
     profile_work: bool = False,
+    compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
 ):
     """Run lint, format checks, tests, and task validation within one worker budget.
 
@@ -6147,8 +6153,10 @@ def cmd_check(
     selected_compiler_cache = None
     compiler_cache_env = None
     if cargo_active:
-        selected_compiler_cache, configured_env = _compiler_cache_subprocess_env(
-            compiler_cache, cargo_cwd=ROOT
+        selected_compiler_cache, configured_env = (
+            compiler_cache_setup
+            if compiler_cache_setup is not None
+            else _compiler_cache_subprocess_env(compiler_cache, cargo_cwd=ROOT)
         )
         compiler_cache_env = _compiler_cache_overrides(
             selected_compiler_cache, configured_env
@@ -7767,7 +7775,12 @@ def _production_cargo_feature_args() -> list[str]:
     return ["--features", "phoenix_ide/datadog-tracing"]
 
 
-def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-musl") -> Path:
+def prod_build(
+    strip: bool = True,
+    target: str | None = "x86_64-unknown-linux-musl",
+    *,
+    compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
+) -> Path:
     """Build the production binary from the invoking checkout's exact HEAD."""
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
@@ -7827,7 +7840,11 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
         raise SystemExit(f"production build worktree is dirty before Rust compilation:\n{build_tree_status}")
     
     # Build Rust
-    _, build_env = _compiler_cache_subprocess_env(cargo_cwd=PROD_BUILD_WORKTREE)
+    _, build_env = (
+        compiler_cache_setup
+        if compiler_cache_setup is not None
+        else _compiler_cache_subprocess_env(cargo_cwd=PROD_BUILD_WORKTREE)
+    )
     needs_cross = target and sys.platform != "linux"
     if needs_cross:
         raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")
@@ -8144,6 +8161,7 @@ def native_prod_deploy(
     release: str | None = None,
     *,
     controller: "ProdDeployControllerOptions | None" = None,
+    compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
 ):
     """Prepare and hand systemd activation to an independent root transient unit."""
     import tempfile
@@ -8167,7 +8185,14 @@ def native_prod_deploy(
         prepared = (
             _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
             if release
-            else _prepare_local_candidate(target=_linux_musl_target())
+            else _prepare_local_candidate(
+                target=_linux_musl_target(),
+                **(
+                    {"compiler_cache_setup": compiler_cache_setup}
+                    if compiler_cache_setup is not None
+                    else {}
+                ),
+            )
         )
         candidate_binary = staging / "candidate-binary"
         if prepared.binary != candidate_binary:
@@ -8769,6 +8794,7 @@ def prod_daemon_deploy(
     release: str | None = None,
     *,
     controller: "ProdDeployControllerOptions | None" = None,
+    compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
 ):
     """Deploy through the persistent same-user supervisor on Linux without systemd."""
     import tempfile
@@ -8789,7 +8815,10 @@ def prod_daemon_deploy(
         staging = Path(td)
         prepared = (
             _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
-            if release else _prepare_local_candidate(target=_linux_musl_target())
+            if release else _prepare_local_candidate(
+                target=_linux_musl_target(),
+                compiler_cache_setup=compiler_cache_setup,
+            )
         )
         supervisor_source = staging / "bare-supervisor.py"
         _materialize_source_file(
@@ -9898,8 +9927,19 @@ def _prepare_release_candidate(
     )
 
 
-def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
-    binary = prod_build(target=target)
+def _prepare_local_candidate(
+    *,
+    target: str | None,
+    compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
+) -> PreparedCandidate:
+    binary = prod_build(
+        target=target,
+        **(
+            {"compiler_cache_setup": compiler_cache_setup}
+            if compiler_cache_setup is not None
+            else {}
+        ),
+    )
     source_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
     ).stdout.strip()
@@ -10228,6 +10268,7 @@ def launchd_prod_deploy(
     release: str | None = None,
     *,
     controller: "ProdDeployControllerOptions | None" = None,
+    compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
 ):
     """Prepare a candidate, then hand transactional activation to launchd."""
     import uuid
@@ -10286,7 +10327,14 @@ def launchd_prod_deploy(
         prepared = (
             _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
             if release
-            else _prepare_local_candidate(target=None)
+            else _prepare_local_candidate(
+                target=None,
+                **(
+                    {"compiler_cache_setup": compiler_cache_setup}
+                    if compiler_cache_setup is not None
+                    else {}
+                ),
+            )
         )
         binary = prepared.binary
         selected_identity = prepared.identity
@@ -10873,31 +10921,56 @@ def cmd_prod_deploy(
     env = controller.require_backend()
     if controller.enabled and not release:
         raise SystemExit("controller mode requires --release")
+    compiler_cache_setup = None
     if not release:
+        compiler_cache_setup = _compiler_cache_subprocess_env(cargo_cwd=ROOT)
         print("Running pre-deploy checks...\n")
-        cmd_check(gate=False, pretty=pretty)
+        cmd_check(
+            gate=False,
+            pretty=pretty,
+            compiler_cache_setup=compiler_cache_setup,
+        )
         print()
 
     if env == "launchd":
         if controller.enabled:
             launchd_prod_deploy(release, controller=controller)
         else:
-            launchd_prod_deploy(release)
+            launchd_prod_deploy(
+                release,
+                **(
+                    {"compiler_cache_setup": compiler_cache_setup}
+                    if compiler_cache_setup is not None
+                    else {}
+                ),
+            )
 
     elif env == "native":
         if controller.enabled:
             native_prod_deploy(release, controller=controller)
         else:
-            native_prod_deploy(release)
+            native_prod_deploy(
+                release,
+                **(
+                    {"compiler_cache_setup": compiler_cache_setup}
+                    if compiler_cache_setup is not None
+                    else {}
+                ),
+            )
 
     elif env == "daemon":
         print("Detected: Bare Linux (persistent supervisor mode)")
         print("    Deploying through the same-user Phoenix supervisor")
         print()
-        if controller.enabled:
-            prod_daemon_deploy(release, controller=controller)
-        else:
-            prod_daemon_deploy(release)
+        prod_daemon_deploy(
+            release,
+            **({"controller": controller} if controller.enabled else {}),
+            **(
+                {"compiler_cache_setup": compiler_cache_setup}
+                if compiler_cache_setup is not None
+                else {}
+            ),
+        )
 
     else:
         print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
