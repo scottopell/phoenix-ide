@@ -10,10 +10,26 @@ Automated rollback restores the previous runtime artifacts, configuration, envir
 
 Live production deployment remains an explicitly gated operator action; automated integration validation uses disposable resources.
 
+## Paired controller implementation gap
+
+The accepted prepared-artifact paired contract (REQ-PD-018 / REQ-PD-019 / REQ-PD-020) and Allium model are
+normative, but not implemented on `main`. PR #836 owns receipt admission,
+private SQLite paired recovery, private verified plist publication,
+preparation/activation claims, and pending post-commit/status guidance.
+This prerequisite PR changes documentation/specifications only and does not
+ship a controller or prove live qualification. Ordinary deployment/restart
+behavior remains separate. Current controller qualification is tracked in
+[PR #836](https://github.com/scottopell/phoenix-ide/pull/836).
+
+| Paired requirement | Main implementation / verification gap |
+| --- | --- |
+| REQ-PD-018 / REQ-PD-019 / REQ-PD-020 | Not implemented on main; controller and regression closure owned by #836 |
+
 ## Requirement coverage
 
 | Requirement | Current implementation / verification |
 | --- | --- |
+| REQ-PD-020 | Not implemented on main; finalization-only command/fault/replay qualification owned by #836 |
 | REQ-PD-001 | `detect_prod_env`; backend status naming requires normalization |
 | REQ-PD-002 | typed local/release candidate preparation requires the complete 40-character embedded SHA to equal the selected full source commit across launchd, systemd, and bare Linux |
 | REQ-PD-003 | all three backends have complete local/release preparation paths and focused tests |

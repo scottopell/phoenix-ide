@@ -51,9 +51,13 @@ AND SHALL require each migration's owning feature requirements to define whether
 
 THE SYSTEM SHALL NOT provide a general automatic database rollback subsystem
 
-WHEN an operator rolls Phoenix back to an older binary version
+WHEN an operator rolls Phoenix back to an older binary version after candidate database mutation
 THE SYSTEM SHALL require Phoenix to be stopped
 AND SHALL require the database backup paired with that binary version to be restored before the binary starts
+
+WHEN the feature-scoped paired launchd transaction fails before candidate mutation and no snapshot proof exists,
+THE SYSTEM MAY resume only the verified unchanged predecessor under `specs/launchd-deployment/requirements.md` REQ-LDD-017 exclusive legacy database and captured binary/configuration proof
+AND SHALL NOT describe this as a database downgrade or snapshot restoration.
 
 WHEN an automated deployment restores a previous binary without restoring its matching previous database
 THE SYSTEM SHALL describe the outcome as runtime-artifact rollback
@@ -62,6 +66,11 @@ AND SHALL NOT guarantee that the restored binary can use a database changed by t
 WHEN a feature requires additional automated recovery of matching runtime and database state
 THE SYSTEM SHALL require that feature's normative requirements to define the recovery boundary and guarantees
 AND SHALL implement only the feature-scoped recovery mechanism required by that contract
+
+WHEN the supported macOS launchd ProductConversation upgrade is selected explicitly,
+THE SYSTEM MAY provide an automated paired SQLite snapshot and rollback only within `specs/launchd-deployment/requirements.md` REQ-LDD-017 and `specs/production-deployment/requirements.md` REQ-PD-018
+AND SHALL preserve the project-wide prohibition on a generic automatic database rollback subsystem
+AND SHALL fail closed when exclusive ownership, snapshot integrity, or restoration proof is unavailable.
 
 **Rationale:** Manual offline paired restore supports version rollback without a generic snapshot-management subsystem. Any additional automation would impose recovery and verification complexity and must be justified by the feature that needs it.
 
