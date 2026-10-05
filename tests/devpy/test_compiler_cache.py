@@ -441,6 +441,7 @@ class CompilerCacheTests(unittest.TestCase):
                 "KACHE_SOCKET_PATH": "run/kache.sock",
                 "KACHE_CONFIG": "config/kache.toml",
                 "KACHE_RUNTIME_DIR": "run/kache",
+                "KACHE_LOG_FILE": "logs/kache.log",
                 "SCCACHE_DIR": "cache/sccache",
             },
             clear=True,
@@ -450,6 +451,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("/workspace/run/kache.sock", os.environ["KACHE_SOCKET_PATH"])
             self.assertEqual("/workspace/config/kache.toml", os.environ["KACHE_CONFIG"])
             self.assertEqual("/workspace/run/kache", os.environ["KACHE_RUNTIME_DIR"])
+            self.assertEqual("/workspace/logs/kache.log", os.environ["KACHE_LOG_FILE"])
             self.assertEqual("cache/sccache", os.environ["SCCACHE_DIR"])
             self.dev._normalize_cache_paths("sccache", self.dev.Path("/workspace"))
             self.assertEqual("/workspace/cache/sccache", os.environ["SCCACHE_DIR"])

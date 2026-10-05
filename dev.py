@@ -4973,6 +4973,7 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
             "KACHE_SOCKET_PATH",
             "KACHE_CONFIG",
             "KACHE_RUNTIME_DIR",
+            "KACHE_LOG_FILE",
         )
         if backend == "kache"
         else ("SCCACHE_DIR",)
