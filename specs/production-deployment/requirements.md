@@ -54,6 +54,8 @@ A deployment shall commit only after observing a new backend-owned runtime proce
 
 ### REQ-PD-010 — Verified rollback
 
+For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. The unconditional artifact-rollback attempt below applies to ordinary sources.
+
 If activation fails after disruption, the activation owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment snapshot, and service state, verify the captured previous runtime identity at its previous endpoint, restore the previous deployed SHA, and durably distinguish successful runtime-artifact rollback from rollback failure.
 
 Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit a 12-character identity for a candidate, controller, release asset, newly installed runtime, or general downgrade path, and shall not establish cross-version deployment compatibility.

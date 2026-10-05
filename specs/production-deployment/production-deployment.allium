@@ -18,7 +18,7 @@ enum BackendKind { launchd | systemd | bare_linux }
 enum TransactionState {
     preparing | prepared | handed_off | activating | committed
     | precondition_failed | activation_failed_rolled_back
-    | activation_failed_rollback_failed | rejected_concurrent
+    | activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed | rejected_concurrent
 }
 
 value RuntimeIdentity {
@@ -96,10 +96,11 @@ entity DeployTransaction {
         activating -> committed
         activating -> activation_failed_rolled_back
         activating -> activation_failed_rollback_failed
+        activating -> ordinary_activation_failed_rollback_failed
         activation_failed_rollback_failed -> activation_failed_rolled_back
         activation_failed_rollback_failed -> activation_failed_rollback_failed
         terminal: committed, precondition_failed,
-                  activation_failed_rolled_back, rejected_concurrent
+                  activation_failed_rolled_back, ordinary_activation_failed_rollback_failed, rejected_concurrent
     }
 }
 
@@ -638,6 +639,8 @@ rule CheckpointAuthorizedPredecessorStartup {
     requires: transaction.state in { activating, activation_failed_rollback_failed }
     requires: transaction.recovery_mode = null
     requires: predecessor_start_authorized(transaction)
+    requires: mode = snapshot_restored implies paired_snapshot_restored(transaction)
+    requires: mode = unchanged_predecessor implies paired_unchanged_predecessor_verified(transaction)
     ensures: transaction.recovery_mode = mode
     ensures: DurableStatusWritten(transaction)
 
@@ -694,7 +697,8 @@ rule PreserveRollbackFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
     requires: transaction.state = activating
     requires: current_claim_matches(transaction)
-    ensures: transaction.state = activation_failed_rollback_failed
+    ensures: transaction.kind = PreparedArtifactDeployment implies transaction.state = activation_failed_rollback_failed
+    ensures: transaction.kind != PreparedArtifactDeployment implies transaction.state = ordinary_activation_failed_rollback_failed
     ensures: transaction.failure = failure
     ensures: transaction.rollback_failure = rollback_failure
     ensures: DurableStatusWritten(transaction)
@@ -708,6 +712,8 @@ rule RecoverRetainedPairedTransaction {
     requires: current_claim_matches(transaction)
     requires: supported_recovery_verified(transaction)
     ensures: transaction.state = activation_failed_rolled_back
+    requires: mode = snapshot_restored implies paired_snapshot_restored(transaction)
+    requires: mode = unchanged_predecessor implies paired_unchanged_predecessor_verified(transaction)
     ensures: transaction.recovery_mode = mode
     ensures: mode = snapshot_restored implies DatabaseRollbackCompleted(transaction)
     ensures: mode = unchanged_predecessor implies not DatabaseRollbackClaimed(transaction)
