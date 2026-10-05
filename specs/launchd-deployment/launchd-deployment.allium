@@ -28,7 +28,6 @@ value PreparedArtifactProof {
     controller_helper_hash: String
     shared_database_path: String
     migration_ledger_version: Integer
-    product_conversation_upgrade: Boolean
 }
 
 entity PreparedArtifactLifecycleObservation {
@@ -573,12 +572,13 @@ rule RollBackFailedPreparedPairedActivation {
     requires: supported_recovery_verified(transaction)
     requires: predecessor_publication_durable(transaction)
     requires: exact_previous_restored(transaction, service)
+    requires: transaction.recovery_mode != null
     ensures: transaction.state = activation_failed_rolled_back
     ensures: transaction.failure = failure
     ensures: DurableStatusWritten(transaction)
     ensures: RuntimeArtifactRollbackRecorded(transaction)
-    ensures: paired_snapshot_restored(transaction) implies transaction.recovery_mode = snapshot_restored
-    ensures: paired_unchanged_predecessor_verified(transaction) implies transaction.recovery_mode = unchanged_predecessor
+    requires: paired_snapshot_restored(transaction) implies transaction.recovery_mode = snapshot_restored
+    requires: paired_unchanged_predecessor_verified(transaction) implies transaction.recovery_mode = unchanged_predecessor
     ensures: paired_snapshot_restored(transaction) implies DatabaseRollbackCompleted(transaction)
     ensures: paired_unchanged_predecessor_verified(transaction) implies not DatabaseRollbackClaimed(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
