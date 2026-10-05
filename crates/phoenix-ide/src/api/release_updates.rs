@@ -278,7 +278,7 @@ impl ReleaseVersion {
                 if rc == 0 {
                     return None;
                 }
-                (core, ReleaseStage::Rc(rc as u8))
+                (core, ReleaseStage::Rc(u8::try_from(rc).ok()?))
             }
             None => (version, ReleaseStage::Stable),
         };
