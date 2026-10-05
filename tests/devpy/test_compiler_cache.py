@@ -667,29 +667,41 @@ class CompilerCacheTests(unittest.TestCase):
         )
         controller = self.dev.ProdDeployControllerOptions(backend="launchd")
         with mock.patch.object(
+            self.dev, "detect_prod_env", return_value="launchd"
+        ), mock.patch.object(
             self.dev, "_compiler_cache_subprocess_env", return_value=setup
         ) as configure, mock.patch.object(self.dev, "cmd_check") as check, mock.patch.object(
             self.dev, "launchd_prod_deploy"
-        ) as deploy:
+        ) as deploy, mock.patch.object(self.dev, "native_prod_deploy") as native, mock.patch.object(
+            self.dev, "prod_daemon_deploy"
+        ) as daemon:
             self.dev.cmd_prod_deploy(controller=controller)
 
         configure.assert_called_once_with(cargo_cwd=self.dev.ROOT)
         self.assertIs(setup, check.call_args.kwargs["compiler_cache_setup"])
         self.assertIs(setup, deploy.call_args.kwargs["compiler_cache_setup"])
+        native.assert_not_called()
+        daemon.assert_not_called()
 
     def test_independent_prod_deploys_configure_independently(self):
         controller = self.dev.ProdDeployControllerOptions(backend="launchd")
         with mock.patch.object(
+            self.dev, "detect_prod_env", return_value="launchd"
+        ), mock.patch.object(
             self.dev,
             "_compiler_cache_subprocess_env",
             side_effect=[("kache", {"run": "one"}), SystemExit("existing daemon")],
         ) as configure, mock.patch.object(self.dev, "cmd_check"), mock.patch.object(
             self.dev, "launchd_prod_deploy"
-        ):
+        ), mock.patch.object(self.dev, "native_prod_deploy") as native, mock.patch.object(
+            self.dev, "prod_daemon_deploy"
+        ) as daemon:
             self.dev.cmd_prod_deploy(controller=controller)
             with self.assertRaisesRegex(SystemExit, "existing daemon"):
                 self.dev.cmd_prod_deploy(controller=controller)
         self.assertEqual(2, configure.call_count)
+        native.assert_not_called()
+        daemon.assert_not_called()
 
     def test_subprocess_environment_reports_actual_backend_without_leaking(self):
         def configure(_requested, **_options):
