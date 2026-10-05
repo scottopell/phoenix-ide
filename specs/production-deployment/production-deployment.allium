@@ -33,15 +33,14 @@ value RuntimeEndpoint {
 value PreparedArtifactProof {
     controller_source_commit: String
     controller_helper_hash: String
-    candidate_database_path: String
-    predecessor_database_path: String
+    shared_database_path: String
     migration_ledger_version: Integer
     product_conversation_upgrade: Boolean
 }
 
 entity PreparedArtifactLifecycleObservation {
     kind: PreparedArtifactAwaitingPreparation | PreparedArtifactPreflight | PreparedArtifactOfflineOwned
-        | PreparedArtifactSnapshotVerified | PreparedArtifactRollbackVerified
+        | PreparedArtifactSnapshotVerified
 }
 
 variant PreparedArtifactAwaitingPreparation : PreparedArtifactLifecycleObservation {}
@@ -61,12 +60,6 @@ variant PreparedArtifactSnapshotVerified : PreparedArtifactLifecycleObservation 
     snapshot_integrity_proof: String
 }
 
-variant PreparedArtifactRollbackVerified : PreparedArtifactLifecycleObservation {
-    prepared_artifact_proof: PreparedArtifactProof
-    offline_ownership_proof: String
-    snapshot_integrity_proof: String
-    rollback_proof: String
-}
 
 enum FinalizationOutcome { not_committed | pending | complete | diagnostic_complete }
 
@@ -166,13 +159,16 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   not receipt-derived. This does not assert database lifecycle observations.
 -- paired_database_preflight_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, the immutable proof has
---   legacy-schema eligibility, a configured candidate/predecessor database path
---   pair, migration ledger version at most 69, and ProductConversation upgrade
+--   Candidate and captured predecessor configure the same canonical path; the
+--   single shared_database_path is that value. The proof includes
+--   legacy-schema eligibility, one canonical database path shared by installed
+--   predecessor and candidate, ledger at most 69, and ProductConversation upgrade
 --   mode. It does not assert quiesce, offline ownership, or a snapshot.
 -- paired_database_proof_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, after quiesce the lifecycle
---   observation proves exclusive offline ownership, verified SQLite snapshot
---   integrity, and rollback proof for the configured path pair.
+--   observation is PreparedArtifactSnapshotVerified: exclusive offline ownership
+--   and verified SQLite snapshot integrity bound to the immutable controller,
+--   predecessor and shared path. No future rollback result is required.
 -- controller_identity_is_independently_bound(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, the controller helper hash
 --   is bound to the recorded clean controller source and protocol. The controller
@@ -311,6 +307,14 @@ variant BareLinuxHandoff : DeploymentHandoff {
 -- DurablePreparingStatusWritten(transaction)
 --   Matching preparation identity/PID is durable before ownership publication.
 
+-- paired_precommit_autoload_safe(transaction) -> Boolean
+--   While preparing, only captured predecessor may be auto-loaded. After helper
+--   teardown/quarantine and before candidate commit, no candidate auto-loaded
+--   plist exists; verified candidate bootstrap remains private.
+-- paired_finalization_diagnostic_is_durable(transaction) -> Boolean
+--   A pending/diagnostic finalization records publication/cleanup uncertainty
+--   without asserting successful publication or authorizing DB rollback.
+
 rule AcquirePreparationClaim {
     when: DeploymentRequested(transaction)
     requires: transaction.state = preparing
@@ -338,6 +342,7 @@ rule PrepareCandidate {
         or transaction.paired_lifecycle_observation.kind = PreparedArtifactPreflight
     requires: controller_identity_is_independently_bound(transaction)
     requires: previous_rollback_identity_is_valid(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment or transaction.previous != null
     requires: selected_supervisor_artifact_matches_running(transaction)
     ensures: transaction.state = prepared
     ensures: preparation_complete(transaction)
@@ -423,6 +428,7 @@ rule ObservePreparedPreflight {
     when: PairedPreflightVerified(transaction, proof)
     requires: transaction.kind = PreparedArtifactDeployment
     requires: transaction.state = preparing
+    requires: transaction.paired_lifecycle_observation.kind = PreparedArtifactAwaitingPreparation
     ensures: transaction.paired_lifecycle_observation = PreparedArtifactPreflight.created(
         prepared_artifact_proof: proof
     )
@@ -674,9 +680,33 @@ invariant OrdinaryRollbackIsRuntimeOnly {
             and not DatabaseRollbackClaimed(transaction)
 }
 
+invariant PairedPrecommitAutoloadSafety {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state in { preparing, prepared, activating } implies
+            paired_precommit_autoload_safe(transaction)
+}
+
+invariant PairedFinalizationUncertaintyIsExplicit {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state = committed
+        and transaction.finalization in { pending, diagnostic_complete } implies
+            paired_finalization_diagnostic_is_durable(transaction)
+}
+
+invariant PairedPredecessorIsRequired {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state not in { preparing, rejected_concurrent, precondition_failed } implies
+            transaction.previous != null
+}
+
 invariant PairedPublicationRequiresVerification {
     for transaction in DeployTransactions:
-        transaction.kind = PreparedArtifactDeployment implies
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state = committed
+        and transaction.finalization = complete implies
             paired_publication_is_verified(transaction)
 }
 
