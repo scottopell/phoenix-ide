@@ -1,5 +1,7 @@
 import importlib.util
 import os
+import platform
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -186,6 +188,10 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("sccache", self.dev._configure_compiler_cache("sccache"))
         probe.assert_not_called()
 
+    @unittest.skipUnless(
+        sys.platform == "darwin" and platform.machine().lower() == "arm64",
+        "Kache v0.26.0 is qualified only on macOS arm64",
+    )
     def test_local_kache_binary_is_supported(self):
         with mock.patch.dict(
             os.environ, {"PHOENIX_KACHE_BIN": "/opt/local/kache"}, clear=True
@@ -379,6 +385,8 @@ class CompilerCacheTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             self.dev.shutil, "which", side_effect=lambda name: "/bin/kache" if name == "kache" else None
         ), mock.patch.object(
+            self.dev, "_kache_host_error", return_value=None
+        ), mock.patch.object(
             self.dev, "_kache_version", return_value=("0.26.0", None)
         ), mock.patch.object(self.dev, "_ensure_kache_daemon", return_value="socket failed"):
             with self.assertRaisesRegex(SystemExit, "kache daemon failed to start: socket failed"):
@@ -409,6 +417,8 @@ class CompilerCacheTests(unittest.TestCase):
     def test_explicit_kache_rejects_unsupported_release(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             self.dev.shutil, "which", side_effect=lambda name: "/bin/kache" if name == "kache" else None
+        ), mock.patch.object(
+            self.dev, "_kache_host_error", return_value=None
         ), mock.patch.object(
             self.dev, "_kache_version", return_value=(None, "unsupported kache 0.25.0")
         ):
