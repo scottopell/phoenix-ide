@@ -3512,25 +3512,34 @@ fn exact_worktree_administrative_dir(
     Ok(git_dir)
 }
 
-/// Best-effort, synchronous stop of every Git fsmonitor daemon bound to the
+/// Best-effort, bounded stop of every Git fsmonitor daemon bound to the
 /// worktree at `path` or to any initialized submodule beneath it. A worktree
-/// with no running daemon is the common case and is not an error. Ordering
-/// relative to quarantine: see ADR-080 and work-lifecycle.allium.
+/// with no running daemon is the common case and is not an error. On deadline
+/// the stop is abandoned; a daemon still holding the tree is then reported by
+/// the descriptor scan as typed residual state. Ordering relative to
+/// quarantine: see ADR-080 and work-lifecycle.allium.
 fn stop_bound_fsmonitor_daemons_best_effort(path: &Path) {
-    let _ = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")])
-        .args([
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let _ = run_bounded_git_command_until(
+        path,
+        &[
             "submodule",
             "foreach",
             "--quiet",
             "--recursive",
             "git fsmonitor--daemon stop >/dev/null 2>&1 || true",
-        ])
-        .current_dir(path)
-        .output();
-    let _ = phoenix_core::git::command()
-        .args(["fsmonitor--daemon", "stop"])
-        .current_dir(path)
-        .output();
+        ],
+        None,
+        deadline,
+        "submodule fsmonitor shutdown",
+    );
+    let _ = run_bounded_git_command_until(
+        path,
+        &["fsmonitor--daemon", "stop"],
+        None,
+        deadline,
+        "worktree fsmonitor shutdown",
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

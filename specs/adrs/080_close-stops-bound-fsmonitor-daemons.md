@@ -29,6 +29,7 @@ Choose option 4. The false positive comes from a specific benign process being a
 - **Positive:** Phoenix never changes the user's fsmonitor configuration or index state.
 - **Positive:** The descriptor scan keeps its full strictness; no process allow-list.
 - **Negative:** Retirement makes two more best-effort Git invocations per attempt.
+- **Negative:** A wedged daemon makes Close wait up to the stop deadline before the scan reports typed repair state.
 - **Negative:** The user's fsmonitor daemon for a retired worktree is stopped. That worktree is being deleted, so this has no lasting effect.
 - **Neutral:** A daemon the user restarts between the stop and the scan is still reported as an external writer, which is correct: something other than Phoenix touched the tree.
 
