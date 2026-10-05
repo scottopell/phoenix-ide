@@ -429,7 +429,7 @@ class ActivationTests(unittest.TestCase):
                 reserved.write_bytes(b"temporary")
                 before = database.read_bytes()
                 backend = mock.Mock()
-                backend.inspect.return_value = ("running", 101)
+                backend.inspect.return_value = ("active", 101)
                 absent = subprocess.CompletedProcess([], 113, "", f'Could not find service "{manifest.helper_label}" in domain gui/{manifest.uid}')
                 with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("mismatch") if fail == "identity" else None), mock.patch.object(helper.subprocess, "run", return_value=absent), mock.patch.object(helper, "restore_database") as restore_db:
                     if fail == "publish":
@@ -837,6 +837,18 @@ class ActivationTests(unittest.TestCase):
                 before = Path(manifest.status_path).read_bytes()
                 helper.record_recovery_error(manifest, "rejected state")
                 self.assertEqual(Path(manifest.status_path).read_bytes(), before)
+
+    def test_absence_probe_loads_without_sqlite_module(self):
+        import builtins
+        original = builtins.__import__
+        def without_sqlite(name, *args, **kwargs):
+            if name == "sqlite3":
+                raise ImportError("optional sqlite unavailable")
+            return original(name, *args, **kwargs)
+        with mock.patch.object(builtins, "__import__", side_effect=without_sqlite):
+            probe = load(ROOT / "scripts" / "launchd_deploy_helper.py", "sqlite_free_absence_probe")
+            with mock.patch.object(probe.sys, "argv", ["helper", "--probe-service-absence", "dev.test", "--uid", "501"]), mock.patch.object(probe.subprocess, "run", return_value=subprocess.CompletedProcess([], 113, "", 'Could not find service "dev.test" in domain gui/501')):
+                self.assertEqual(probe.main(), 0)
 
     def test_absence_probe_requires_nonzero_print_and_exact_target_diagnostic(self):
         label, uid = "dev.phoenix.activation.test", 501
@@ -1551,7 +1563,7 @@ class PreparationTests(unittest.TestCase):
             staging = root / "transactions" / "preparing"
             staging.mkdir(parents=True)
             manifest = staging / "manifest.json"
-            manifest.write_text(json.dumps({"paired_database_upgrade": {}}))
+            manifest.write_text(json.dumps({"paired_database_upgrade": {"backup_path": str(staging / "backup.sqlite3"), "proof_path": str(staging / "proof.json"), "database_path": str(root / "prod.db")}}))
             active, status = root / "active", root / "status.json"
             active.write_text("preparing\n")
             status.write_text(json.dumps({"transaction_id": "preparing", "source_kind": "prepared_artifact", "state": "preparing", "preparing_pid": 123}))
@@ -1561,23 +1573,29 @@ class PreparationTests(unittest.TestCase):
             self.assertNotIn("bootstrap", run.call_args.args[0])
             self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
             self.assertFalse(active.exists())
-            self.assertEqual(json.loads(manifest.read_text()), {"paired_database_upgrade": {}})
+            self.assertIn("backup_path", json.loads(manifest.read_text())["paired_database_upgrade"])
 
     def test_prepared_handoff_absent_abandons_without_runtime_mutation(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             staging = root / "transactions" / "prepared"
             staging.mkdir(parents=True)
-            (staging / "manifest.json").write_text(json.dumps({"paired_database_upgrade": {}}))
+            (staging / "manifest.json").write_text(json.dumps({"paired_database_upgrade": {"backup_path": str(staging / "backup.sqlite3"), "proof_path": str(staging / "proof.json"), "database_path": str(root / "prod.db")}}))
             active, status = root / "active", root / "status.json"
             active.write_text("prepared\n")
             status.write_text(json.dumps({"transaction_id": "prepared", "source_kind": "prepared_artifact", "state": "prepared", "preparing_pid": 123}))
+            backup = staging / "backup.sqlite3"
+            reserve = root / ".prod.db.restore-prepared"
+            backup.write_bytes(b"allocated seed")
+            reserve.write_bytes(b"allocated restore")
             with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
                 self.dev.cmd_prod_recover_paired("prepared")
             self.assertEqual(run.call_count, 1)
             self.assertIn("--probe-service-absence", run.call_args.args[0])
             self.assertFalse(active.exists())
             self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
+            self.assertFalse(backup.exists())
+            self.assertFalse(reserve.exists())
 
     def test_status_recovers_paired_guidance_from_claim_without_readable_status(self):
         for contents in (None, "{", "[]", "null"):

@@ -201,7 +201,8 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   this does not claim an operating-system failure made teardown complete.
 -- recovery_verification_unconfirmed(transaction) -> Boolean
 --   Durable status reports that recovery or teardown could not be confirmed,
---   including when predecessor health failed after an attempted start.
+--   when predecessor identity/start proof failed; a verified running predecessor
+--   with publication-only failure is preserved behind its retained claim.
 -- paired_transaction_retained(transaction) -> Boolean
 --   The private paired transaction directory, verified snapshot, proof files,
 --   and durable recovery status remain available for supported recovery.
@@ -299,6 +300,8 @@ variant BareLinuxHandoff : DeploymentHandoff {
 -- PreparedAbandonmentVerified(transaction)
 --   Operator requested recovery and pre_manifest_abandonment_verified holds.
 
+-- snapshot_proof_durable(transaction) -> Boolean
+--   Matching context-bound snapshot proof is persisted and verified before bootstrap.
 -- CandidatePreparationCompleted(transaction)
 --   Fallible staging completed under the already acquired preparation claim.
 -- PairedPreflightVerified(transaction, proof)
@@ -464,6 +467,7 @@ rule ObserveSnapshotProof {
         offline_ownership_proof: transaction.paired_lifecycle_observation.offline_ownership_proof,
         snapshot_integrity_proof: snapshot
     )
+    ensures: PairedSnapshotProofPersisted(transaction)
 }
 
 rule ReserveHelperCapacity {
@@ -471,6 +475,7 @@ rule ReserveHelperCapacity {
     requires: transaction.state = handed_off
     requires: current_claim_matches(transaction)
     ensures: helper_capacity_reserved(transaction)
+    ensures: HelperCapacityReserved(transaction)
 }
 
 rule HelperCapacityFailureBeforeStop {
@@ -482,16 +487,22 @@ rule HelperCapacityFailureBeforeStop {
     ensures: DurableStatusWritten(transaction)
 }
 
+-- admitted_handoff_is_valid(transaction) -> Boolean
+--   Stored immutable handoff is valid for backend and independent owner;
+--   capacity observation is earned only by that admitted transaction/owner.
+
 rule IndependentOwnerBeginsActivation {
-    when: ActivationOwnerAccepted(transaction, handoff)
+    when: HelperCapacityReserved(transaction)
     requires: helper_capacity_reserved(transaction)
     requires: transaction.state = handed_off
     requires: current_claim_matches(transaction)
-    requires: handoff_valid_for_backend(transaction, handoff)
-    requires: backend_owner_independent(transaction, handoff)
+    requires: admitted_handoff_is_valid(transaction)
     requires: preparation_complete(transaction)
     ensures: transaction.state = activating
 }
+
+-- PairedSnapshotProofPersisted(transaction)
+--   The verified context-bound snapshot proof was atomically written and fsynced.
 
 rule CandidateStartupPrepared {
     when: CandidateStartupReady(transaction)
@@ -500,6 +511,7 @@ rule CandidateStartupPrepared {
     requires: candidate_startup_proof_is_valid(transaction)
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.paired_lifecycle_observation.kind = PreparedArtifactSnapshotVerified
+    requires: transaction.kind != PreparedArtifactDeployment or snapshot_proof_durable(transaction)
     ensures: atomic_install_complete(transaction)
 }
 
@@ -810,6 +822,17 @@ invariant OrdinaryRollbackIsRuntimeOnly {
             RuntimeArtifactRollbackRecorded(transaction)
             and not DatabaseRollbackClaimed(transaction)
 }
+
+invariant PairedUnresolvedFailureAutoloadFence {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state = activation_failed_rollback_failed implies
+            paired_unresolved_autoload_quarantined(transaction)
+}
+
+-- paired_unresolved_autoload_quarantined(transaction) -> Boolean
+--   Unresolved target plist remains outside LaunchAgents; quarantine failures
+--   are explicit diagnostics and retain claim, never a successful fence assertion.
 
 invariant PairedPrecommitAutoloadSafety {
     for transaction in DeployTransactions:

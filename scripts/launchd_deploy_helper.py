@@ -24,7 +24,6 @@ import tempfile
 import time
 import urllib.request
 import urllib.parse
-import sqlite3
 import stat
 from pathlib import Path
 from typing import Callable, Optional
@@ -374,6 +373,7 @@ def assert_database_exclusive(manifest: Manifest) -> None:
 
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
+    import sqlite3
     if not path.is_absolute() or path.is_symlink():
         raise ActivationError("SQLite path must be an absolute non-symlink file")
     uri = "file:" + urllib.parse.quote(str(path), safe="/") + "?mode=ro"
@@ -384,6 +384,7 @@ def _readonly_connection(path: Path) -> sqlite3.Connection:
 
 
 def validate_database(path: Path) -> None:
+    import sqlite3
     from contextlib import closing
     try:
         with closing(_readonly_connection(path)) as connection:
@@ -395,6 +396,7 @@ def validate_database(path: Path) -> None:
 
 
 def validate_legacy_database(path: Path) -> None:
+    import sqlite3
     """Read-only gate for the one supported 69 -> ProductConversation upgrade."""
     from contextlib import closing
     try:
@@ -424,6 +426,7 @@ def _plist_database_path(path: Path) -> Optional[str]:
 
 
 def _source_capacity_bytes(database: Path) -> int:
+    import sqlite3
     """Reserve the live DB, WAL, and a page-sized margin before stopping it."""
     try:
         database_size = database.stat().st_size
@@ -437,6 +440,7 @@ def _source_capacity_bytes(database: Path) -> int:
 
 
 def _allocate_private_sqlite(path: Path, size: int) -> None:
+    import sqlite3
     if path.exists() or path.is_symlink():
         raise ActivationError("database capacity reservation already exists")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -501,6 +505,7 @@ def _reservation_still_sufficient(manifest: Manifest, reservation: DatabaseCapac
 
 
 def create_database_backup(manifest: Manifest, reservation: Optional[DatabaseCapacityReservation] = None) -> None:
+    import sqlite3
     """Take a SQLite backup API snapshot into the held destination."""
     if manifest.paired_database_upgrade is None:
         return
@@ -1202,7 +1207,7 @@ def finalize_paired(manifest: Manifest) -> str:
         private = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "committed private plist")
         launchctl = Launchctl(manifest)
         state, pid = launchctl.inspect()
-        if state != "running" or pid is None:
+        if state not in {"running", "active"} or pid is None:
             raise ActivationError("committed candidate is not running")
         require_loaded_plist(manifest, launchctl, private)
         wait_for_identity(manifest, manifest.expected)
@@ -1252,7 +1257,7 @@ def recover_paired(manifest: Manifest) -> str:
                 verify_staged(manifest.target_binary, manifest.rollback_binary_sha256, "running predecessor binary")
                 private = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "private predecessor plist")
                 state, pid = launchctl.inspect()
-                if state != "running" or pid is None:
+                if state not in {"running", "active"} or pid is None:
                     raise ActivationError("post-restore checkpoint has no running predecessor; refuse snapshot replay")
                 require_loaded_plist(manifest, launchctl, private)
                 wait_for_identity(manifest, manifest.previous, health_url=manifest.previous_health_url, health_insecure_tls=manifest.previous_health_insecure_tls, health_json=manifest.previous_health_json)

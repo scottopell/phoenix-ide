@@ -10081,6 +10081,25 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
             result = subprocess.run([sys.executable, str(probe_helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
             if result.returncode != 0:
                 raise SystemExit("pre-manifest helper absence is unconfirmed")
+            if manifest_path.exists():
+                abandoned = json.loads(manifest_path.read_text())
+                paired = abandoned.get("paired_database_upgrade")
+                if paired is not None:
+                    proof = Path(paired["proof_path"])
+                    backup = Path(paired["backup_path"])
+                    database = Path(paired["database_path"])
+                    reserve = database.parent / f".{database.name}.restore-{transaction_id}"
+                    if backup.parent != staging or proof.parent != staging or proof.exists() or proof.is_symlink():
+                        raise SystemExit("abandonment allocation context is ambiguous")
+                    for allocation in (backup, reserve):
+                        if allocation.is_symlink():
+                            raise SystemExit("abandonment allocation is symlink")
+                        allocation.unlink(missing_ok=True)
+                        directory = os.open(allocation.parent, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
             status.update(
                 state="precondition_failed",
                 updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -10170,6 +10189,7 @@ def launchd_prod_deploy(
     controller = controller or ProdDeployControllerOptions()
     if controller.enabled and controller.prepared_artifact is None:
         release, _expected_full_commit = controller.require_exact_release(release)
+    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if controller.paired_database_upgrade else None
     launchd_env, _env_file = _launchd_candidate_env(controller)
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
@@ -10210,6 +10230,13 @@ def launchd_prod_deploy(
     bootstrap_attempted = False
     try:
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
+        if installed_config_hash is not None and _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
+            raise SystemExit("installed configuration changed before claim acquisition")
+        if controller.paired_database_upgrade:
+            launchd_env, _env_file = _launchd_candidate_env(controller)
+            _preflight_prod_bind_auth(launchd_env, socket_activated=True)
+            if _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
+                raise SystemExit("installed configuration changed during claimed snapshot read")
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
         transactions_dir.mkdir(parents=True, exist_ok=True)
         _prune_launchd_deploy_transactions(transactions_dir, transaction_id)
@@ -10278,6 +10305,8 @@ def launchd_prod_deploy(
         if target_binary.exists():
             shutil.copy2(target_binary, rollback_binary)
             shutil.copy2(LAUNCHD_PLIST_PATH, rollback_plist)
+            if installed_config_hash is not None and _file_sha256(rollback_plist) != installed_config_hash:
+                raise SystemExit("captured predecessor configuration differs from claimed environment snapshot")
             rollback_plist.chmod(0o600)
         previous_env = _launchd_env_from_plist(rollback_plist) if rollback_plist.exists() else {}
         previous_identity = None
