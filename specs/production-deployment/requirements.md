@@ -2,7 +2,7 @@
 
 ## Scope
 
-Safe replacement and operation of native Phoenix production runtimes on macOS launchd, Linux systemd, and Linux hosts without systemd. The deployment source is either exact checked local `HEAD` or an immutable published release. This specification owns shared cross-platform guarantees and the release assets required to satisfy them. `specs/launchd-deployment/requirements.md` cumulatively refines launchd-specific mechanics; it does not redefine the shared guarantees.
+Safe replacement and operation of native Phoenix production runtimes on macOS launchd, Linux systemd, and Linux hosts without systemd. The deployment source is exact checked local `HEAD`, an immutable published release, or the explicit launchd-only prepared-artifact paired source under REQ-PD-018. This specification owns shared cross-platform guarantees and the release assets required to satisfy them. `specs/launchd-deployment/requirements.md` cumulatively refines launchd-specific mechanics; it does not redefine the shared guarantees.
 
 ## Requirements
 
@@ -13,6 +13,8 @@ When an operator invokes a production command, the system shall select launchd o
 ### REQ-PD-002 — Explicit candidate sources
 
 The local deployment command shall run required checks, build exact local `HEAD`, require the candidate to embed that complete 40-character lowercase commit SHA, and stage the resulting binary. The release deployment command shall resolve `latest` at most once or use the requested tag, bind the tag to one immutable commit, select the host target asset, verify the published checksum, and require the candidate's complete 40-character lowercase embedded SHA to equal the selected commit exactly; it shall not run repository checks, install dependencies, mutate the worktree, or compile.
+
+The prepared-artifact source SHALL be admitted only on macOS launchd under REQ-PD-018, using exact protected prepared bytes and an independently verified clean controller without rebuilding or ad-hoc resigning.
 
 WHEN `latest` is requested,
 THE release deployment command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
