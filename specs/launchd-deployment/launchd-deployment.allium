@@ -269,6 +269,10 @@ external entity TargetService {
 -- PreparedAbandonmentVerified(transaction)
 --   Operator requested recovery and pre_manifest_abandonment_verified holds.
 
+-- snapshot_proof_durable(transaction) -> Boolean
+--   Matching context-bound snapshot proof is persisted and verified before bootstrap.
+-- DeploymentOwnsActivationClaim(transaction) -> Boolean
+--   This exact transaction owns the shared deploy/restart operation mutex.
 -- CandidatePreparationCompleted(transaction)
 --   Fallible staging completed under the already acquired preparation claim.
 -- PairedPreflightVerified(transaction, proof)
@@ -369,6 +373,7 @@ rule ObserveSnapshotProof {
         offline_ownership_proof: transaction.paired_lifecycle_observation.offline_ownership_proof,
         snapshot_integrity_proof: snapshot
     )
+    ensures: PairedSnapshotProofPersisted(transaction)
 }
 
 rule ReserveHelperCapacity {
@@ -376,10 +381,11 @@ rule ReserveHelperCapacity {
     requires: transaction.state = prepared
     requires: helper_is_launchd_owned(transaction)
     ensures: helper_capacity_reserved(transaction)
+    ensures: HelperCapacityReserved(transaction)
 }
 
 rule ActivateCandidate {
-    when: ActivationHelperStarted(transaction)
+    when: HelperCapacityReserved(transaction)
     requires: transaction.state = prepared
     requires: helper_capacity_reserved(transaction)
     requires: helper_is_launchd_owned(transaction)
@@ -403,12 +409,16 @@ rule HelperCapacityFailureBeforeStop {
     ensures: DurableStatusWritten(transaction)
 }
 
+-- PairedSnapshotProofPersisted(transaction)
+--   The verified context-bound snapshot proof was atomically written and fsynced.
+
 rule CandidateStartupPrepared {
     when: CandidateStartupReady(transaction)
     requires: transaction.state = activating
     requires: candidate_startup_proof_is_valid(transaction)
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.paired_lifecycle_observation.kind = PreparedArtifactSnapshotVerified
+    requires: transaction.kind != PreparedArtifactDeployment or snapshot_proof_durable(transaction)
     ensures: atomic_candidate_install(transaction)
 
     @guidance
@@ -664,6 +674,13 @@ rule ReleaseMatchingTerminalClaim {
     ensures: not DeploymentOwnsActivationClaim(transaction)
 }
 
+rule ShowUnresolvedPairedStatus {
+    when: DeploymentStatusRequested(transaction)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = activation_failed_rollback_failed
+    ensures: PairedRecoveryGuidanceShown(transaction)
+}
+
 rule ReportStaleTransaction {
     when: DeploymentStatusRequested(transaction)
     requires: transaction.state in { preparing, prepared, activating }
@@ -761,6 +778,17 @@ invariant FailedPreparedRecoveryRetainsManualRecovery {
             and active_claim_retained(transaction)
 }
 
+invariant PairedUnresolvedFailureAutoloadFence {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state = activation_failed_rollback_failed implies
+            paired_unresolved_autoload_quarantined(transaction)
+}
+
+-- paired_unresolved_autoload_quarantined(transaction) -> Boolean
+--   Unresolved target plist remains outside LaunchAgents; quarantine failures
+--   are explicit diagnostics and retain claim, never a successful fence assertion.
+
 invariant PairedPrecommitAutoloadSafety {
     for transaction in DeployTransactions:
         transaction.kind = PreparedArtifactDeployment
@@ -809,7 +837,7 @@ invariant CommittedRestartPreservesInstalledState {
 
 invariant ProductionOperationsAreMutuallyExclusive {
     for restart in RestartTransactions:
-        RestartOwnsActivationClaim(restart) implies not DeploymentOwnsActivationClaim()
+        RestartOwnsActivationClaim(restart) implies not DeployTransactions.any(t => DeploymentOwnsActivationClaim(t))
 }
 
 invariant RestartClaimsAreMutuallyExclusive {
