@@ -53,6 +53,16 @@ describe('AutomaticContinuationControl', () => {
     vi.useRealTimers();
   });
 
+  it('reports unknown status and attention when the initial load fails', async () => {
+    apiMock.getCoordinatorAutomaticContinuation.mockRejectedValueOnce(new Error('offline'));
+    const onStatusChange = vi.fn();
+
+    render(<AutomaticContinuationControl scope={{ kind: 'coordinator' }} onStatusChange={onStatusChange} />);
+
+    expect(await screen.findByText('offline')).toBeInTheDocument();
+    await waitFor(() => expect(onStatusChange).toHaveBeenLastCalledWith('…', true));
+  });
+
   it('defaults an ordinary ProductConversation OFF from GET and immediately PUTs the checked value', async () => {
     render(<AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc/1' }} />);
 

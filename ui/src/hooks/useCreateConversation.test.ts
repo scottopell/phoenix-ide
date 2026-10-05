@@ -53,6 +53,26 @@ describe('reconcileSubscribedModelSelection', () => {
     expect(next).toEqual({ selectedModel: 'gpt-5', selectedEffort: null });
   });
 
+  it('uses the server default only when no valid remembered selection exists', () => {
+    const data = {
+      default: 'gpt-6.1-sol',
+      llm_configured: true,
+      credential_status: 'valid' as const,
+      models: ['gpt-6.1-sol', 'gpt-6-astra'].map(id => ({
+        id, provider: 'openai', recommended: true, description: '', context_window: 272_000,
+        effort_capabilities: {
+          support: 'supported' as const,
+          levels: ['medium' as const, 'high' as const],
+          native_default: { known: 'medium' as const },
+        },
+      })),
+    };
+    expect(reconcileSubscribedModelSelection(data, null, null))
+      .toEqual({ selectedModel: 'gpt-6.1-sol', selectedEffort: null });
+    expect(reconcileSubscribedModelSelection(data, 'gpt-6-astra', 'high'))
+      .toEqual({ selectedModel: 'gpt-6-astra', selectedEffort: 'high' });
+  });
+
   it('clears any pending product create request id when a new intent begins', () => {
     localStorage.setItem(
       'phoenix-pending-product-create-request',

@@ -60,6 +60,7 @@ import { beginNewProductConversationIntent } from '../hooks/useCreateConversatio
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
+import type { StateBarConversationExtension } from '../components/StateBar';
 import {
   OPEN_MESSAGE_VIEWER_EVENT,
   type OpenMessageViewerEventDetail,
@@ -175,6 +176,7 @@ async function resolveConversationRoute(routeSegment: string) {
 interface ConversationPageProps {
   routePrefix?: '/c' | '/global';
   composerQuickAction?: ComposerQuickAction | undefined;
+  stateBarExtension?: StateBarConversationExtension | undefined;
 }
 
 export interface EmbeddedConversationProjection {
@@ -213,10 +215,10 @@ interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedC
   showTranscript?: boolean;
 }
 
-export function ConversationPage({ routePrefix = '/c', composerQuickAction }: ConversationPageProps) {
+export function ConversationPage({ routePrefix = '/c', composerQuickAction, stateBarExtension }: ConversationPageProps) {
   const { slug } = useParams<{ slug: string }>();
   return slug
-    ? <EmbeddedConversationPage slug={slug} routePrefix={routePrefix} composerQuickAction={composerQuickAction} />
+    ? <EmbeddedConversationPage slug={slug} routePrefix={routePrefix} composerQuickAction={composerQuickAction} stateBarExtension={stateBarExtension} />
     : null;
 }
 
@@ -224,6 +226,7 @@ export function EmbeddedConversationPage({
   slug,
   routePrefix = '/c',
   composerQuickAction,
+  stateBarExtension,
   showTranscript = true,
   embeddedShell = false,
   suppressCanonicalization = false,
@@ -261,6 +264,7 @@ export function EmbeddedConversationPage({
         slug={slug}
         routePrefix={routePrefix}
         composerQuickAction={composerQuickAction}
+        stateBarExtension={stateBarExtension}
         showTranscript={showTranscript}
         embeddedShell={embeddedShell}
         mutationEnabled={mutationEnabled}
@@ -296,6 +300,7 @@ function ConversationPageContent({
   routePrefix,
   composerQuickAction,
   showTranscript,
+  stateBarExtension,
   embeddedShell,
   mutationEnabled,
   aggregateLifecycleOpen,
@@ -308,6 +313,7 @@ function ConversationPageContent({
   slug: string;
   routePrefix: '/c' | '/global';
   composerQuickAction?: ComposerQuickAction | undefined;
+  stateBarExtension?: StateBarConversationExtension | undefined;
   showTranscript: boolean;
   embeddedShell: boolean;
   mutationEnabled: boolean;
@@ -2100,20 +2106,6 @@ function ConversationPageContent({
         </div>
       );
     }
-    if (inspectViewerOpen && inspectSlot) {
-      return (
-        <div id="app">
-          <Suspense fallback={null}>
-            <ProcessInspectorPanel
-              handleId={inspectSlot.handleId}
-              conversationId={conversationId}
-              onClose={handleCloseInspector}
-              inline
-            />
-          </Suspense>
-        </div>
-      );
-    }
     if (messageViewerOpen && messageSlot) {
       return (
         <div id="app">
@@ -2632,6 +2624,7 @@ function ConversationPageContent({
           buttonRef: terminalLauncherRef,
         } : undefined}
         workActionsAvailable={!isArchived}
+        conversationExtension={stateBarExtension}
         prStatusHandle={prStatusHandle}
       />
       </RenderProfiler>
