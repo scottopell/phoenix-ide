@@ -63,7 +63,7 @@ variant PreparedArtifactSnapshotVerified : PreparedArtifactLifecycleObservation 
 
 enum PairedRecoveryMode { snapshot_restored | unchanged_predecessor }
 
-enum FinalizationOutcome { not_committed | pending | complete | diagnostic_complete }
+enum FinalizationOutcome { not_committed | pending | complete }
 
 entity DeployTransaction {
     id: String
@@ -221,10 +221,11 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   transaction. Protocol equality and on-disk file equality alone do not
 --   satisfy this predicate.
 -- preparation_complete(transaction) -> Boolean
---   Candidate, backend configuration, one environment snapshot, rollback
+--   Candidate, backend configuration, one source-specific environment snapshot, rollback
 --   inputs, identities, endpoints, destination reservations, hashes,
 --   activation program, immutable handoff, and initial status are valid and
---   host-resident before disruption.
+--   host-resident before disruption. Ordinary helper comes from selected source;
+--   paired helper comes from the separately verified clean controller commit.
 -- claim_available(transaction) -> Boolean
 --   No active or unresolved transaction owns the host deployment claim.
 -- current_claim_matches(transaction) -> Boolean
@@ -275,7 +276,8 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   durable transaction exists.
 -- installed_environment_is_snapshot(transaction) -> Boolean
 --   The installed environment is the single snapshot used by preflight and
---   endpoint selection, not a competing override layer.
+--   endpoint selection, not a competing override layer. Prepared source uses
+--   captured installed plist/PATH; ordinary sources use the source env snapshot.
 
 -- paired_snapshot_restored(transaction) -> Boolean
 --   A context-bound snapshot was restored and integrity-checked offline.
@@ -315,7 +317,7 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   teardown/quarantine and before candidate commit, no candidate auto-loaded
 --   plist exists; verified candidate bootstrap remains private.
 -- paired_finalization_diagnostic_is_durable(transaction) -> Boolean
---   A pending/diagnostic finalization records publication/cleanup uncertainty
+--   A pending finalization records publication/cleanup uncertainty
 --   without asserting successful publication or authorizing DB rollback.
 
 rule AcquirePreparationClaim {
@@ -498,6 +500,24 @@ rule CandidateStartupPrepared {
     ensures: atomic_install_complete(transaction)
 }
 
+rule VerifyOrdinaryAbandonedPreparation {
+    when: OperatorVerifiedOrdinaryPreparationAbandoned(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment
+    requires: transaction.state = preparing
+    requires: ordinary_preparation_abandonment_verified(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Existing operator/manual stale-claim disposition only: confirm recorded
+        -- preparer dead, exact claim and no admitted helper; no automated DB recovery
+        -- or new ordinary recovery command. Terminal matching release follows.
+}
+
+-- ordinary_preparation_abandonment_verified(transaction) -> Boolean
+--   Operator verified matching ordinary preparation claim, dead preparer, no
+--   activation handoff/helper, and unchanged runtime; unknown remains fenced.
+
 rule AbandonInterruptedPreparation {
     when: PreparedAbandonmentVerified(transaction)
     requires: transaction.state = preparing
@@ -556,17 +576,45 @@ rule ResumeCommittedPairedFinalization {
 -- PairedFinalizationAttemptsResumed(transaction)
 --   Publication/cleanup attempts resumed without any runtime/database mutation.
 
+rule PreserveFailedPairedFinalization {
+    when: PairedFinalizationFailed(transaction, diagnostic)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = committed
+    requires: transaction.finalization = pending
+    ensures: transaction.finalization = pending
+    ensures: CommittedFinalizationDiagnosticWritten(transaction, diagnostic)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule VerifyCompletedPairedFinalization {
+    when: PairedFinalizationRequested(transaction)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = committed
+    requires: transaction.finalization = complete
+    requires: completed_finalization_context_is_valid(transaction)
+    ensures: transaction.finalization = complete
+    ensures: IdempotentFinalizationConfirmed(transaction)
+
+    @guidance
+        -- Verify same retained candidate/binary/private configuration and published
+        -- inode with absent prior helper, no competing claim. No mutation on rerun.
+}
+
+-- completed_finalization_context_is_valid(transaction) -> Boolean
+--   Exact candidate/configuration and completed published inode, helper absent,
+--   no competing claim; does not require an already released active claim.
+
 rule RecordPairedFinalizationOutcome {
     when: PairedFinalizationFinished(transaction, outcome)
     requires: transaction.kind = PreparedArtifactDeployment
     requires: transaction.state = committed
     requires: transaction.finalization = pending
-    requires: outcome in { complete, diagnostic_complete }
+    requires: outcome = complete
     ensures: transaction.finalization = outcome
     ensures: DurableStatusWritten(transaction)
 
     @guidance
-        -- Clear pending only after both publication and cleanup attempts finish.
+        -- Clear pending only after both publication and cleanup succeed durably.
         -- Errors remain committed diagnostics; interruption retains pending and claim.
 }
 
@@ -584,6 +632,39 @@ rule RollBackFailedOrdinaryActivation {
     ensures: not DeployedShaWritten(transaction.source_commit)
 }
 
+rule CheckpointAuthorizedPredecessorStartup {
+    when: PredecessorRecoveryPrepared(transaction, mode)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state in { activating, activation_failed_rollback_failed }
+    requires: transaction.recovery_mode = null
+    requires: predecessor_start_authorized(transaction)
+    ensures: transaction.recovery_mode = mode
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Persist typed snapshot-restored or unchanged-predecessor checkpoint
+        -- BEFORE bootstrap. Once set, any retry must not restore snapshot again.
+        -- Private predecessor startup is authorized only after durable checkpoint.
+}
+
+rule VerifyCheckpointedPredecessor {
+    when: CheckpointRecoveryRequested(transaction)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state in { activating, activation_failed_rollback_failed }
+    requires: transaction.recovery_mode != null
+    requires: checkpointed_predecessor_running_verified(transaction)
+    ensures: PairedRecoveryVerified(transaction, transaction.recovery_mode)
+
+    @guidance
+        -- Verify running predecessor/private loaded configuration and identity,
+        -- finalize publication/status only. Never stop or replay database snapshot.
+        -- Unknown/stopped predecessor remains fenced for operator investigation.
+}
+
+-- checkpointed_predecessor_running_verified(transaction) -> Boolean
+--   Exact captured predecessor binary/private loaded plist and runtime identity
+--   are verified after the durable startup checkpoint without database replay.
+
 rule RollBackFailedPreparedPairedActivation {
     when: ActivationFailed(transaction, failure)
     requires: transaction.state = activating
@@ -591,6 +672,7 @@ rule RollBackFailedPreparedPairedActivation {
     requires: current_claim_matches(transaction)
     requires: paired_recovery_succeeded(transaction)
     requires: paired_predecessor_start_order_is_valid(transaction)
+    requires: supported_recovery_verified(transaction)
     ensures: transaction.state = activation_failed_rolled_back
     ensures: transaction.failure = failure
     ensures: DurableStatusWritten(transaction)
@@ -658,7 +740,7 @@ rule MatchingTerminalClaimReleased {
         or supported_recovery_verified(transaction)
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.state != committed
-        or transaction.finalization in { complete, diagnostic_complete }
+        or transaction.finalization = complete
     ensures: claim.active = false
 }
 
@@ -672,7 +754,7 @@ rule StaleClaimReleaseRejected {
 
 rule InterruptedTransactionRemainsActionable {
     when: DeploymentStatusRequested(transaction)
-    requires: transaction.state in { prepared, handed_off, activating }
+    requires: transaction.state in { preparing, prepared, handed_off, activating }
     requires: now() - transaction.updated_at > config.stale_after
     ensures: RecoveryGuidanceShown(transaction)
     ensures: not transaction.state = committed
@@ -724,7 +806,7 @@ invariant PairedFinalizationUncertaintyIsExplicit {
     for transaction in DeployTransactions:
         transaction.kind = PreparedArtifactDeployment
         and transaction.state = committed
-        and transaction.finalization in { pending, diagnostic_complete } implies
+        and transaction.finalization = pending implies
             paired_finalization_diagnostic_is_durable(transaction)
 }
 

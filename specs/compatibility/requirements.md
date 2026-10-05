@@ -51,9 +51,13 @@ AND SHALL require each migration's owning feature requirements to define whether
 
 THE SYSTEM SHALL NOT provide a general automatic database rollback subsystem
 
-WHEN an operator rolls Phoenix back to an older binary version
+WHEN an operator rolls Phoenix back to an older binary version after candidate database mutation
 THE SYSTEM SHALL require Phoenix to be stopped
 AND SHALL require the database backup paired with that binary version to be restored before the binary starts
+
+WHEN the feature-scoped paired launchd transaction fails before candidate mutation and no snapshot proof exists,
+THE SYSTEM MAY resume only the verified unchanged predecessor under `specs/launchd-deployment/requirements.md` REQ-LDD-017 exclusive legacy database and captured binary/configuration proof
+AND SHALL NOT describe this as a database downgrade or snapshot restoration.
 
 WHEN an automated deployment restores a previous binary without restoring its matching previous database
 THE SYSTEM SHALL describe the outcome as runtime-artifact rollback

@@ -20,7 +20,7 @@ While an activation or unresolved transaction owns the host deployment claim, th
 
 ### REQ-LDD-004 — Immutable, secret-safe handoff
 
-The activation helper shall be sourced from the selected immutable commit and consume only stable host-resident files and a manifest containing source identity, candidate and previous runtime identities and endpoints, artifact hashes, target paths, and rollback paths; the manifest and durable diagnostics shall not contain plist environment values.
+For ordinary sources, the activation helper shall be sourced from the selected immutable commit. For prepared-artifact paired sources, it shall be sourced from the separately recorded verified clean controller commit, which may differ from the candidate commit. The helper shall consume only stable host-resident files and a manifest containing source identity, candidate and previous runtime identities and endpoints, artifact hashes, target paths, and rollback paths; the manifest and durable diagnostics shall not contain plist environment values.
 
 ### REQ-LDD-005 — Atomic artifact replacement
 
@@ -99,6 +99,8 @@ After backend-managed quiesce confirms the predecessor stopped, THE helper SHALL
 
 IF candidate activation or health verification fails, THE helper SHALL stop the candidate first, re-prove exclusive offline ownership, restore and integrity-check the matching snapshot while removing stale WAL/SHM only under that proof, atomically restore the predecessor binary/plist, and start the predecessor only after database restoration. If any proof fails it SHALL leave the service stopped, persist actionable recovery status, and retain the active claim. Existing runtime-only rollback remains unchanged. Before a snapshot proof exists, a failure MAY resume the predecessor only after confirmed teardown, exclusive offline ownership, legacy ledger/table eligibility, and captured binary/configuration checksum equality prove that candidate mutation has not occurred. This path SHALL NOT claim database restoration. An interrupted pre-handoff preparation, whether or not its immutable manifest has already been persisted, SHALL release only its matching claim after durable terminal status, a dead recorded preparation PID, and confirmed target helper absence; live, reused, missing, or unproven process identity SHALL retain ownership. Successful commit SHALL remove only the temporary database-adjacent restore reservation and fsync its parent, retaining the audit snapshot/proof.
 
+Before a recovered predecessor can serve requests, THE paired helper SHALL persist a post-restore startup checkpoint and typed snapshot-restored versus unchanged-predecessor outcome. Any retry after that checkpoint SHALL verify/finalize the running predecessor without restoring the snapshot again; absent or unverified predecessor state SHALL fail closed rather than discard subsequently accepted writes.
+
 ### REQ-LDD-018 — Committed paired finalization without runtime or database mutation
 
 WHEN the operator invokes `prod finalize-paired TXN` for interrupted committed paired finalization,
@@ -107,5 +109,3 @@ THE SYSTEM SHALL use only the retained byte-bound helper and immutable transacti
 THE SYSTEM SHALL retry only atomic publication of that captured candidate plist and removal/fsync of the transaction-owned temporary restore reservation, retain authoritative audit backup/proof, and persist pending status/claim through interruption or error. It SHALL clear pending and release only the owned claim after durable completion. An already completed rerun SHALL verify that same candidate/configuration and produce an idempotent result without applying ambient configuration.
 
 THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an older runtime, or generalize this operation into downgrade or cross-version recovery. Unknown, stale, mismatched, or absent evidence SHALL refuse without releasing ownership.
-
-Before a recovered predecessor can serve requests, THE paired helper SHALL persist a post-restore startup checkpoint and typed snapshot-restored versus unchanged-predecessor outcome. Any retry after that checkpoint SHALL verify/finalize the running predecessor without restoring the snapshot again; absent or unverified predecessor state SHALL fail closed rather than discard subsequently accepted writes.

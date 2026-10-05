@@ -23,12 +23,13 @@ behavior remains separate. Current controller qualification is tracked in
 
 | Paired requirement | Main implementation / verification gap |
 | --- | --- |
-| REQ-LDD-017 | Not implemented on main; controller and regression closure owned by #836 |
+| REQ-LDD-017 / REQ-LDD-018 | Not implemented on main; controller and regression closure owned by #836 |
 
 ## Requirement coverage
 
 | Requirement | Implementation / verification |
 | --- | --- |
+| REQ-LDD-018 | Not implemented on main; finalization-only command/fault/replay qualification owned by #836 |
 | REQ-LDD-001 | `_helper_plist`, `launchd_prod_deploy`; disposable integration harness |
 | REQ-LDD-002 | `launchd_prod_deploy`, `_binary_identity`; preparation tests |
 | REQ-LDD-003 | `_claim_launchd_deploy`, helper `flock`; concurrent-deploy tests |
