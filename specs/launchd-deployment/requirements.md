@@ -103,6 +103,8 @@ IF candidate activation or health verification fails, THE helper SHALL stop the 
 
 Before a recovered predecessor can serve requests, THE paired helper SHALL persist a post-restore startup checkpoint and typed snapshot-restored versus unchanged-predecessor outcome. Any retry after that checkpoint SHALL verify/finalize the running predecessor without restoring the snapshot again; absent or unverified predecessor state SHALL fail closed rather than discard subsequently accepted writes.
 
+A failure limited to plist publication or deployed-identity durability after predecessor identity verification SHALL retain the verified running predecessor and unresolved claim for finalization-only retry. This SHALL NOT authorize leaving any unverified candidate/predecessor running; unknown identity/database/start proof SHALL still attempt teardown. Prepared/helper-handoff interruption with dead recorded preparer and confirmed helper absence SHALL terminalize without runtime disruption; manifest presence SHALL NOT authorize rollback.
+
 ### REQ-LDD-018 — Committed paired finalization without runtime or database mutation
 
 WHEN the operator invokes `prod finalize-paired TXN` for interrupted committed paired finalization,

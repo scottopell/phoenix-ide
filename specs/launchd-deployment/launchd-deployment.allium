@@ -195,7 +195,7 @@ external entity TargetService {
 --   is bound to the recorded clean controller source and protocol. The controller
 --   and candidate commits may be equal when that independently bound helper is
 --   valid.
--- PairedRecoveryVerified(transaction, service)
+-- PairedRecoveryVerified(transaction, service, mode)
 --   Separately requested retained-helper recovery verified matched database,
 --   runtime/configuration and predecessor identity before releasing ownership.
 -- CandidateStartupReady(transaction)
@@ -263,7 +263,8 @@ external entity TargetService {
 --   True for ordinary sources.
 -- pre_manifest_abandonment_verified(transaction) -> Boolean
 --   Matching preparing status preceded owned claim publication, manifest
---   is absent or exists before handoff; recorded preparation PID is dead and
+--   is absent or exists; preparation PID is dead and no helper was admitted,
+--   or a prepared/helper-handoff attempt ended with confirmed helper absence and
 --   helper absence is confirmed. Manifest presence does not imply handoff.
 -- PreparedAbandonmentVerified(transaction)
 --   Operator requested recovery and pre_manifest_abandonment_verified holds.
@@ -279,7 +280,8 @@ external entity TargetService {
 -- HelperCapacityFailed(transaction, failure)
 --   Initial physical allocation failed after handoff but before target stop.
 -- PairedFinalizationFinished(transaction, outcome)
---   Publication and cleanup attempts finished with success or durable diagnostics.
+--   Both publication and cleanup succeeded durably; failures use separate
+--   PairedFinalizationFailed and retain pending.
 -- DurablePreparingStatusWritten(transaction)
 --   Matching preparation identity/PID is durable before ownership publication.
 
@@ -513,6 +515,11 @@ rule RollBackFailedOrdinaryActivation {
     ensures: not DeployedShaWritten(transaction.source_commit)
 }
 
+-- predecessor_publication_durable(transaction) -> Boolean
+--   Captured predecessor plist publication and deployed identity writes are
+--   durable after verified startup; failure retains running verified predecessor
+--   and retryable claim without teardown or database replay.
+
 rule CheckpointAuthorizedPredecessorStartup {
     when: PredecessorRecoveryPrepared(transaction, mode)
     requires: transaction.kind = PreparedArtifactDeployment
@@ -531,12 +538,12 @@ rule CheckpointAuthorizedPredecessorStartup {
 }
 
 rule VerifyCheckpointedPredecessor {
-    when: CheckpointRecoveryRequested(transaction)
+    when: CheckpointRecoveryRequested(transaction, service)
     requires: transaction.kind = PreparedArtifactDeployment
     requires: transaction.state in { activating, activation_failed_rollback_failed }
     requires: transaction.recovery_mode != null
     requires: checkpointed_predecessor_running_verified(transaction)
-    ensures: PairedRecoveryVerified(transaction, transaction.recovery_mode)
+    ensures: PairedRecoveryVerified(transaction, service, transaction.recovery_mode)
 
     @guidance
         -- Verify running predecessor/private loaded configuration and identity,
@@ -554,6 +561,7 @@ rule RollBackFailedPreparedPairedActivation {
     requires: transaction.kind = PreparedArtifactDeployment
     requires: paired_predecessor_start_order_is_valid(transaction)
     requires: supported_recovery_verified(transaction)
+    requires: predecessor_publication_durable(transaction)
     requires: exact_previous_restored(transaction, service)
     ensures: transaction.state = activation_failed_rolled_back
     ensures: transaction.failure = failure
@@ -591,9 +599,11 @@ rule RecoverRetainedPairedTransaction {
     requires: paired_predecessor_start_order_is_valid(transaction)
     requires: exact_previous_restored(transaction, service)
     requires: supported_recovery_verified(transaction)
+    requires: predecessor_publication_durable(transaction)
     ensures: transaction.state = activation_failed_rolled_back
     requires: mode = snapshot_restored implies paired_snapshot_restored(transaction)
     requires: mode = unchanged_predecessor implies paired_unchanged_predecessor_verified(transaction)
+    requires: mode = transaction.recovery_mode
     ensures: transaction.recovery_mode = mode
     ensures: mode = snapshot_restored implies DatabaseRollbackCompleted(transaction)
     ensures: mode = unchanged_predecessor implies not DatabaseRollbackClaimed(transaction)
@@ -631,7 +641,7 @@ rule VerifyOrdinaryAbandonedPreparation {
 
 rule AbandonInterruptedPreparation {
     when: PreparedAbandonmentVerified(transaction)
-    requires: transaction.state = preparing
+    requires: transaction.state in { preparing, prepared }
     requires: transaction.kind = PreparedArtifactDeployment
     requires: pre_manifest_abandonment_verified(transaction)
     ensures: transaction.state = precondition_failed
@@ -644,7 +654,7 @@ rule AbandonInterruptedPreparation {
 
 rule ReleaseMatchingTerminalClaim {
     when: TerminalStatusPersisted(transaction)
-    requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, ordinary_activation_failed_rollback_failed }
+    requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, ordinary_activation_failed_rollback_failed, rejected_concurrent }
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.state != committed
         or transaction.finalization = complete
