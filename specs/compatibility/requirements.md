@@ -107,7 +107,6 @@ THE SYSTEM SHALL format that integer as a human-readable date and time only at a
 
 **Rationale:** SQLite has no native date-time storage class. New or structurally changed columns use one integer representation without forcing a project-wide migration of unchanged historical timestamp storage. The integer preserves ordering and precision without embedding a duplicate date parser or formatter contract in the schema.
 
-
 ---
 
 ### REQ-COMP-006 — Legacy Direct Authority Repair Is Forward-Only
@@ -127,3 +126,35 @@ THE SYSTEM SHALL reconstruct its original locator-absent encoding and verify its
 THE SYSTEM SHALL retain the accepted payload, origin, and fingerprint without rewriting them or substituting a later invocation locator.
 
 THE SYSTEM SHALL reject any payload whose fingerprint matches neither its current encoding nor the specifically supported historical encoding.
+
+---
+
+### REQ-COMP-008 — Qualified Compiler-Cache Compatibility
+
+WHEN Phoenix automatically selects a compiler cache
+THE SYSTEM SHALL select an sccache executable that passes its version probe or no compiler cache
+AND SHALL report the fallback reason and backend actually selected
+AND SHALL NOT automatically select Kache v0.26.0
+
+WHEN an operator explicitly selects Kache
+THE SYSTEM SHALL require a macOS arm64 host
+AND SHALL require the executable to report exactly version `0.26.0`
+AND SHALL require its local daemon to report readiness on the configured socket
+AND SHALL report that debug-symbol fidelity remains unqualified
+
+WHEN an operator explicitly selects Kache or sccache
+THE SYSTEM SHALL fail actionably if that backend is unusable
+AND SHALL NOT silently substitute another backend
+
+WHEN a caller supplies `RUSTC_WRAPPER`
+OR explicitly selects no compiler cache
+THE SYSTEM SHALL preserve that choice
+AND SHALL report it
+
+THE SYSTEM SHALL scope automatically generated compiler-cache environment variables to direct Cargo subprocesses and explicitly identified wrappers that own Cargo builds
+AND SHALL NOT propagate them into the Phoenix server or agent-executed commands
+
+THE SYSTEM SHALL guarantee this contract only for selection and local subprocess setup
+AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or restored-archive source-level debug fidelity
+
+**Rationale:** Compiler caching is an optional development optimization. Exact qualification, explicit opt-in for unqualified fidelity, and subprocess scoping prevent an accelerator from becoming an implicit correctness or compatibility promise.

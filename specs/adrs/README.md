@@ -91,6 +91,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [075](075_gpt-61-sol-is-the-ordinary-product-default.md) | GPT-6.1 Sol is the ordinary product default | Accepted | REQ-LLM-003, REQ-CCR-011, REQ-AG-005/010/011 |
 | [076](076_prepared-artifact-paired-launchd-upgrade-fails-closed.md) | Prepared artifacts pair a clean controller with private SQLite proof and fail-closed rollback | Accepted | REQ-LDD-017, REQ-PD-018, REQ-COMP-003, REQ-DESKTOP-REL-010 |
 | [077](077_committed-paired-finalization-is-publication-only.md) | Committed paired finalization is publication-only; recovered startup checkpoints forbid snapshot replay | Accepted | REQ-LDD-017, REQ-LDD-018, REQ-PD-018, REQ-PD-020, REQ-COMP-003 |
+| [078](078_kache-first-automatic-compiler-cache.md) | Automatic compiler caching prefers released Kache | Superseded by ADR-079 | development methodology; REQ-COMP-001 |
+| [079](079_kache-explicit-pending-debug-fidelity.md) | Kache remains explicit pending restored debug fidelity | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
 
 ## For agents: which decisions bind your task
 
@@ -100,6 +102,7 @@ Consult the relevant ADRs before starting work of each kind.
 | --- | --- |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
+| Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
