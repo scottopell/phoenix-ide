@@ -66,9 +66,13 @@ class CompilerCacheTests(unittest.TestCase):
             "requires explicit opt-in because macOS restored-archive debug-symbol fidelity is unqualified"
         )
 
-    def test_explicit_kache_remains_opt_in(self):
-        selected, env = self.configure("kache", installed={"kache", "sccache"})
+    def test_explicit_kache_remains_opt_in_with_fidelity_warning(self):
+        with mock.patch("builtins.print") as output:
+            selected, env = self.configure("kache", installed={"kache", "sccache"})
         self.assertEqual("kache", selected)
+        output.assert_any_call(
+            "  ⚠ kache restored-archive source-level debug fidelity is unqualified on macOS"
+        )
         self.assertEqual(
             str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
         )
@@ -436,6 +440,7 @@ class CompilerCacheTests(unittest.TestCase):
                 "KACHE_CACHE_DIR": "cache/kache",
                 "KACHE_SOCKET_PATH": "run/kache.sock",
                 "KACHE_CONFIG": "config/kache.toml",
+                "KACHE_RUNTIME_DIR": "run/kache",
                 "SCCACHE_DIR": "cache/sccache",
             },
             clear=True,
@@ -444,6 +449,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("/workspace/cache/kache", os.environ["KACHE_CACHE_DIR"])
             self.assertEqual("/workspace/run/kache.sock", os.environ["KACHE_SOCKET_PATH"])
             self.assertEqual("/workspace/config/kache.toml", os.environ["KACHE_CONFIG"])
+            self.assertEqual("/workspace/run/kache", os.environ["KACHE_RUNTIME_DIR"])
             self.assertEqual("cache/sccache", os.environ["SCCACHE_DIR"])
             self.dev._normalize_cache_paths("sccache", self.dev.Path("/workspace"))
             self.assertEqual("/workspace/cache/sccache", os.environ["SCCACHE_DIR"])

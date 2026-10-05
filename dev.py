@@ -4968,7 +4968,12 @@ def _absolute_executable(binary: str | None) -> str | None:
 def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
     base = (base or Path.cwd()).resolve()
     names = (
-        ("KACHE_CACHE_DIR", "KACHE_SOCKET_PATH", "KACHE_CONFIG")
+        (
+            "KACHE_CACHE_DIR",
+            "KACHE_SOCKET_PATH",
+            "KACHE_CONFIG",
+            "KACHE_RUNTIME_DIR",
+        )
         if backend == "kache"
         else ("SCCACHE_DIR",)
     )
@@ -5095,6 +5100,9 @@ def _configure_compiler_cache(
             print(f"  ⚠ kache unavailable; continuing without compiler cache: {detail}")
             print("  Compiler cache: none")
             return "none"
+        print(
+            "  ⚠ kache restored-archive source-level debug fidelity is unqualified on macOS"
+        )
         print(f"  Compiler cache: kache {kache_version}")
     else:
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")
