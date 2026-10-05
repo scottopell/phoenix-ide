@@ -10,7 +10,7 @@ At selection time, authoritative remote history showed latest stable `v0.12.0`, 
 
 ## Gates and acceptance
 
-- PR #836 controller/ADR-075 must qualify and land through Global; no bump/tag before that declared source gate.
+- PR #836 controller/ADR-076 and ADR-077 must qualify and land through Global; no bump/tag before that declared source gate.
 - Open the version bump using the supported helper from exact fresh main; qualify its exact source and hand to Global for merge.
 - Observe the release workflow's actual immutable tag/build source and both macOS signing/notarization receipts, Linux payloads, private draft checks, and public verifier.
 - Require the exact nine-name release set (eight payloads plus SHA256SUMS), matching downloaded/GitHub digests, `prerelease=true`, and `isLatest=false`.
