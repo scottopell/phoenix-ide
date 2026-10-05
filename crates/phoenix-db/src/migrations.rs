@@ -11780,8 +11780,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(3).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(4).copied().collect::<Vec<_>>(),
             vec![
+                (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
                 (111, "coordinator_conversation_watches"),
                 (110, "trusted_input_origin"),
