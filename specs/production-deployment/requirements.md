@@ -54,7 +54,7 @@ If activation fails after disruption, the activation owner shall stop the candid
 
 Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit a 12-character identity for a candidate, controller, release asset, newly installed runtime, or general downgrade path, and shall not establish cross-version deployment compatibility.
 
-Automated rollback shall restore runtime artifacts only. It shall not restore a database or guarantee that the restored binary can use a database changed by the failed candidate; database rollback remains governed by `specs/compatibility/requirements.md`.
+Ordinary deployment rollback shall restore runtime artifacts only and shall not guarantee that the predecessor can use a database changed by the candidate. The explicit prepared-artifact ProductConversation upgrade shall restore its verified predecessor database, binary, and configuration before restarting the predecessor; its boundary is defined by REQ-PD-018 and `specs/launchd-deployment/requirements.md`.
 
 ### REQ-PD-011 — Truthful durable status and recovery
 
@@ -90,3 +90,15 @@ Integration harnesses shall use randomized virtual machines or containers, units
 ### REQ-PD-017 — Supported published Linux assets
 
 Published releases shall provide checksummed `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` binaries in addition to supported macOS assets, and release candidate selection shall reject an asset whose target, checksum, version, or embedded commit does not match the selected release.
+
+### REQ-PD-018 — Prepared-artifact paired launchd boundary
+
+WHEN the explicit prepared-artifact ProductConversation upgrade is selected
+THE SYSTEM SHALL bind the protected candidate provenance to a clean controller helper and private transaction proof
+AND SHALL fail closed when database ownership, legacy ledger/table shape, snapshot integrity, configuration identity, or rollback proof cannot be established
+
+THE SYSTEM SHALL NOT generalize this feature-scoped pair into automatic database rollback for other deployment sources or backends.
+
+### REQ-PD-019 — Feature-scoped prepared paired upgrade
+
+THE shared production deployment contract SHALL treat the macOS launchd prepared-artifact/ProductConversation database upgrade as an explicit feature-scoped guarantee, not as a general snapshot or downgrade facility. Other backends and ordinary runtime-only deployment retain their existing database behavior.

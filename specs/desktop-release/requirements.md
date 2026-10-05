@@ -115,6 +115,8 @@ THE SYSTEM SHALL preserve the historical tagged build identity while using the p
 WHEN an authorized operator requests desktop artifact preparation from `main`,
 THE SYSTEM SHALL bind preparation to the exact current `main` commit and source version, run both supported macOS architectures through the same protected Developer ID signing, notarization, stapling, Gatekeeper, embedded-helper, and checksum verification path used for release artifacts, and retain the resulting artifacts and sanitized verification receipts as GitHub Actions artifacts that are not attached to or published as a GitHub Release.
 
+The preparation producer and paired launchd consumer under `specs/launchd-deployment/requirements.md` REQ-LDD-017 SHALL share receipt schema `1`: operation `prepare-main`, exact full source commit and version, host target, exact standalone basename and SHA-256, and checks for Developer ID signature, hardened runtime, accepted notarization with submission UUID, validated stapled ticket, accepted Gatekeeper, and identical embedded helper bytes. Local receipt validation SHALL NOT authenticate workflow origin; the operator SHALL establish the protected run/source association independently.
+
 WHILE executing preparation,
 THE SYSTEM SHALL NOT create or move a tag, create or mutate a GitHub release, run release publication, deploy, or install the prepared artifacts.
 

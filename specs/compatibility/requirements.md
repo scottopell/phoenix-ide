@@ -63,6 +63,11 @@ WHEN a feature requires additional automated recovery of matching runtime and da
 THE SYSTEM SHALL require that feature's normative requirements to define the recovery boundary and guarantees
 AND SHALL implement only the feature-scoped recovery mechanism required by that contract
 
+WHEN the supported macOS launchd ProductConversation upgrade is selected explicitly,
+THE SYSTEM MAY provide an automated paired SQLite snapshot and rollback only within `specs/launchd-deployment/requirements.md` REQ-LDD-017 and `specs/production-deployment/requirements.md` REQ-PD-018
+AND SHALL preserve the project-wide prohibition on a generic automatic database rollback subsystem
+AND SHALL fail closed when exclusive ownership, snapshot integrity, or restoration proof is unavailable.
+
 **Rationale:** Manual offline paired restore supports version rollback without a generic snapshot-management subsystem. Any additional automation would impose recovery and verification complexity and must be justified by the feature that needs it.
 
 ---
