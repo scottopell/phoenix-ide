@@ -38,7 +38,7 @@ The activation owner shall consume only immutable host-resident transaction inpu
 
 ### REQ-PD-006 — Single fenced activation writer
 
-While an activation or unresolved transaction owns the host deployment claim, the system shall reject another deployment without changing production state. Claim acquisition and release shall be serialized, and an owner shall release a claim only when its matching terminal status is durable; an older owner shall not clear a newer claim.
+While an activation or unresolved transaction owns the host deployment claim, the system shall reject another deployment without changing production state. Claim acquisition and release shall be serialized, and an owner shall release a claim only when its matching terminal status is durable; an older owner shall not clear a newer claim. Systemd status SHALL project retained ownership through its established privileged status-file read, without requiring a separate privileged active-marker read. Claim-release failure SHALL preserve the verified terminal outcome and retain ownership. A crash after durable unlink but before status projection SHALL permit matching terminal release-only reconciliation under the claim lock, including parent fsync and durable claim-free projection, without activation replay; a competing owner or superseding status SHALL refuse.
 
 ### REQ-PD-007 — Validated privilege boundary
 

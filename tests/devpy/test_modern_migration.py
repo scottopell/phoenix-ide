@@ -627,6 +627,74 @@ class ModernMigrationTests(unittest.TestCase):
                 if boundary == "publication_error":
                     self.emit_projection(helper.read_status(manifest), retained=False)
 
+    def test_claim_free_terminal_retry_reserves_ownership_before_verification(self):
+        import threading
+        for outcome in ("committed", "migration_resumed"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as td:
+                manifest, backend = fixture(Path(td).resolve())
+                with mock.patch.object(helper, "__file__", manifest.ordinary_migration.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend):
+                    if outcome == "committed":
+                        self.assertEqual(helper.activate(manifest), "committed")
+                    else:
+                        helper.write_status(manifest, "migration_failed_stopped", failure="original candidate failure")
+                        self.assertEqual(helper.resume_migration(manifest), "migration_resumed")
+                    helper.release_claim(manifest)
+                    verified = threading.Event()
+                    allow = threading.Event()
+                    errors = []
+                    def paused(*args, **kwargs):
+                        verified.set()
+                        if not allow.wait(5):
+                            raise AssertionError("test did not release verifier")
+                    def resume():
+                        try:
+                            helper.resume_migration(manifest)
+                        except BaseException as error:
+                            errors.append(error)
+                    with mock.patch.object(helper, "wait_for_identity", side_effect=paused):
+                        worker = threading.Thread(target=resume)
+                        worker.start()
+                        self.assertTrue(verified.wait(5))
+                        with Path(manifest.claim_lock_path).open("a+") as lock:
+                            helper.fcntl.flock(lock, helper.fcntl.LOCK_EX)
+                            self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
+                            if outcome == "committed":
+                                self.assertTrue(helper.read_status(manifest)["finalization_pending"])
+                        from tests.devpy.test_modern_migration_controller import dev
+                        with ExitStack() as controller_paths:
+                            for name, value in {
+                                "LAUNCHD_DEPLOY_DIR": Path(manifest.active_path).parent,
+                                "LAUNCHD_DEPLOY_ACTIVE_PATH": Path(manifest.active_path),
+                                "LAUNCHD_DEPLOY_STATUS_PATH": Path(manifest.status_path),
+                                "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH": Path(manifest.claim_lock_path),
+                                "LAUNCHD_RESTART_DIR": Path(manifest.active_path).parent / "restart",
+                                "LAUNCHD_RESTART_ACTIVE_PATH": Path(manifest.active_path).parent / "restart-active",
+                            }.items():
+                                controller_paths.enter_context(mock.patch.object(dev, name, value))
+                            with self.assertRaises(dev.ConcurrentLaunchdOperation):
+                                dev._claim_launchd_deploy("next-owner")
+                            with self.assertRaises(dev.ConcurrentLaunchdOperation):
+                                dev._claim_launchd_restart("next-restart")
+                            self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
+                        allow.set()
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertTrue(helper.release_claim(manifest))
+                    Path(manifest.active_path).write_text("next-owner")
+                    before = Path(manifest.status_path).read_bytes()
+                    with self.assertRaises(helper.ActivationError):
+                        helper.resume_migration(manifest)
+                    self.assertEqual(Path(manifest.active_path).read_text(), "next-owner")
+                    self.assertEqual(Path(manifest.status_path).read_bytes(), before)
+                    Path(manifest.active_path).unlink()
+                    Path(manifest.status_path).write_text(json.dumps({"transaction_id": "superseding", "state": "committed"}))
+                    superseding = Path(manifest.status_path).read_bytes()
+                    with self.assertRaises(helper.ActivationError):
+                        helper.resume_migration(manifest)
+                    self.assertFalse(Path(manifest.active_path).exists())
+                    self.assertEqual(Path(manifest.status_path).read_bytes(), superseding)
+
     def test_activation_success_publishes_only_after_exact_identity_and_no_db_writes(self):
         before = Path(self.manifest.ordinary_migration.database_path).read_bytes()
         self.health.side_effect = lambda *_: self.assertFalse(Path(self.manifest.target_plist).exists())

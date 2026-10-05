@@ -473,6 +473,10 @@ rule FinalizeCommittedOrdinaryMigration {
         -- publish verified private plist and settle status/owned claim. Never stop,
         -- start, inspect/restore database or captured predecessor. Unknown/stopped
         -- evidence retains commit/fence; accepted candidate writes are authoritative.
+        -- Under operation then shared claim lock, recheck global status and reserve
+        -- absent terminal ownership before verification. Persist pending during
+        -- committed retry reservation so controller admission cannot reap it.
+        -- A competing owner or superseding status refuses without mutation.
 }
 
 rule ResumeCommittedPairedFinalization {
@@ -600,7 +604,11 @@ rule AbandonFailedMigrationPreparation {
         -- Before bootstrap, remove staged private copies and fsync their parent
         -- before failure status/claim release. Cleanup failure retains preparing
         -- ownership; explicit retry requires dead controller and absent helper,
-        -- including an already-written manifest. No runtime/database action.
+        -- including an already-written manifest. Preparing always routes to
+        -- controller cleanup-only, never predecessor recovery/bootstrap. Persist
+        -- terminal abandonment evidence before durable claim unlink; failed parent
+        -- fsync re-establishes ownership for cleanup/release-only retry.
+        -- No runtime/database action.
 }
 
 -- resumed_predecessor_finalization_verified(transaction, service) -> Boolean
@@ -623,8 +631,9 @@ rule FinalizeResumedMigrationClaim {
         -- Claim removal fsyncs its parent after unlink. If that fsync fails,
         -- re-establish matching claim for verification-only retry. CLI guidance
         -- requires actual active ownership, never merely the last transaction ID.
-        -- An already-absent removal can be parent-fsynced after the same terminal
-        -- verification; a competing owner refuses finalization.
+        -- Under operation then shared claim lock, atomically recheck global terminal
+        -- status and reserve absent ownership before verification or mutation.
+        -- A competing owner or superseding global status refuses without mutation.
         -- Preserve manual-restoration explanation in the predecessor's existing
         -- failure diagnostic; current API also threads recovery_mode to the UI.
         -- Current API derives retained ownership from actual active claim; UI

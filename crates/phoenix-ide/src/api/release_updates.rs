@@ -451,39 +451,68 @@ fn marker_identity(marker: &Path) -> Option<(String, String)> {
     Some((lines.next()?.to_string(), lines.next()?.to_string()))
 }
 
-fn retained_deploy_ownership(state: &AppState, backend: ReleaseUpdateBackend) -> bool {
-    let Some(path) = status_path(state, backend)
-        .and_then(|path| path.parent().map(|parent| parent.join("active")))
-    else {
-        return true;
+fn systemd_status_command(path: &Path) -> Command {
+    let mut command = Command::new("sudo");
+    command.args(["-n", "cat"]).arg(path);
+    command
+}
+
+fn systemd_ownership_value(value: &serde_json::Value) -> Option<bool> {
+    let Some(object) = value.as_object() else {
+        return Some(true);
     };
-    if matches!(backend, ReleaseUpdateBackend::Systemd) {
-        return match Command::new("sudo").args(["-n", "cat"]).arg(&path).output() {
-            Ok(output) if output.status.success() => true,
-            Ok(output)
-                if String::from_utf8_lossy(&output.stderr)
-                    .contains("No such file or directory") =>
-            {
-                false
-            }
-            _ => true,
+    match object.get("retained_ownership") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(retained)) => Some(*retained),
+        Some(_) => Some(true),
+    }
+}
+
+fn systemd_status_ownership(output: &std::process::Output) -> Option<bool> {
+    if !output.status.success() {
+        return if String::from_utf8_lossy(&output.stderr).contains("No such file or directory") {
+            None
+        } else {
+            Some(true)
         };
     }
-    match fs::read_to_string(path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => true,
+    match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        Ok(value) => systemd_ownership_value(&value),
+        Err(_) => Some(true),
+    }
+}
+
+fn retained_deploy_ownership(state: &AppState, backend: ReleaseUpdateBackend) -> Option<bool> {
+    let Some(status) = status_path(state, backend) else {
+        return Some(true);
+    };
+    if matches!(backend, ReleaseUpdateBackend::Systemd) {
+        return match systemd_status_command(&status).output() {
+            Ok(output) => systemd_status_ownership(&output),
+            Err(_) => Some(true),
+        };
+    }
+    let Some(parent) = status.parent() else {
+        return Some(true);
+    };
+    match fs::read_to_string(parent.join("active")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Ok(_) | Err(_) => Some(true),
     }
 }
 
 #[allow(clippy::too_many_lines)]
 fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransactionStatus {
-    let retained_ownership = retained_deploy_ownership(state, backend);
+    let native_ownership = if matches!(backend, ReleaseUpdateBackend::Systemd) {
+        None
+    } else {
+        retained_deploy_ownership(state, backend)
+    };
     let Some(path) = status_path(state, backend) else {
         return ReleaseTransactionStatus::None;
     };
     let text = if matches!(backend, ReleaseUpdateBackend::Systemd) {
-        match Command::new("sudo").args(["-n", "cat"]).arg(&path).output() {
+        match systemd_status_command(&path).output() {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).into_owned()
             }
@@ -563,9 +592,14 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
     let finalization_pending = value
         .get("finalization_pending")
         .and_then(serde_json::Value::as_bool);
+    let retained_ownership = if matches!(backend, ReleaseUpdateBackend::Systemd) {
+        systemd_ownership_value(&value)
+    } else {
+        native_ownership
+    };
     let terminal = TERMINAL_STATUS_STATES.contains(&state.as_str())
         && finalization_pending != Some(true)
-        && !retained_ownership;
+        && retained_ownership != Some(true);
     let status_is_stale = !terminal
         && updated_at
             .as_deref()
@@ -592,7 +626,7 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
         recovery_mode: string("recovery_mode"),
         finalization_pending,
         committed_diagnostic: string("committed_diagnostic"),
-        retained_ownership: Some(retained_ownership),
+        retained_ownership,
         stale: status_is_stale,
     }
 }
@@ -834,7 +868,7 @@ pub async fn approve(
     else {
         unreachable!()
     };
-    if retained_deploy_ownership(&state, selected_backend) {
+    if retained_deploy_ownership(&state, selected_backend) == Some(true) {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
             "error": "deployment ownership is retained; inspect prod status and complete matching recovery before another approval"
         }))).into_response();
@@ -1172,10 +1206,46 @@ mod tests {
                 assert_eq!(wire["retained_ownership"], retained);
                 assert_eq!(
                     retained_deploy_ownership(&app, ReleaseUpdateBackend::BareLinux),
-                    retained
+                    Some(retained)
                 );
             }
         }
+    }
+
+    #[test]
+    fn systemd_ownership_uses_existing_status_command_and_legacy_omission() {
+        let path = Path::new("/var/lib/phoenix-ide/deploy/status.json");
+        let command = systemd_status_command(path);
+        assert_eq!(command.get_program(), "sudo");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-n", "cat", path.to_str().unwrap()]
+        );
+        for (body, expected) in [
+            (r#"{"state":"committed"}"#, None),
+            (r#"{"retained_ownership":false}"#, Some(false)),
+            (r#"{"retained_ownership":true}"#, Some(true)),
+            ("invalid", Some(true)),
+            ("[]", Some(true)),
+            (r#"{"retained_ownership":"invalid"}"#, Some(true)),
+            (r#"{"retained_ownership":null}"#, None),
+        ] {
+            let output = Command::new("sh")
+                .args(["-c", "printf '%s' \"$1\"", "fixture", body])
+                .output()
+                .unwrap();
+            assert_eq!(systemd_status_ownership(&output), expected);
+        }
+        let denied = Command::new("sh")
+            .args(["-c", "echo 'sudo denied' >&2; exit 1"])
+            .output()
+            .unwrap();
+        assert_eq!(systemd_status_ownership(&denied), Some(true));
+        let absent = Command::new("sh")
+            .args(["-c", "echo 'No such file or directory' >&2; exit 1"])
+            .output()
+            .unwrap();
+        assert_eq!(systemd_status_ownership(&absent), None);
     }
 
     #[test]

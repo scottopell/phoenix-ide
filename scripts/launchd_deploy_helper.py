@@ -1610,6 +1610,24 @@ def finalize_committed_migration(manifest: Manifest, launchctl: Launchctl, statu
     return "committed"
 
 
+def reserve_migration_resume(manifest: Manifest) -> dict:
+    with Path(manifest.claim_lock_path).open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        status = read_status(manifest)
+        try:
+            owner = Path(manifest.active_path).read_text().strip()
+        except FileNotFoundError:
+            owner = None
+        terminal = (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") == "migration_resumed") or (status.get("state") == "committed" and not status.get("finalization_pending"))
+        if status.get("transaction_id") != manifest.transaction_id or (owner != manifest.transaction_id and not (owner is None and terminal)):
+            raise ActivationError("migration resume must own a retained unresolved transaction")
+        if owner is None:
+            atomic_write(Path(manifest.active_path), (manifest.transaction_id + "\n").encode())
+        if status.get("state") == "committed":
+            write_status(manifest, "committed", failure=status.get("failure"), committed_diagnostic="publication/claim finalization reserved", finalization_pending=True)
+        return status
+
+
 def resume_migration(manifest: Manifest) -> str:
     with Path(manifest.lock_path).open("a+") as lock:
         try:
@@ -1618,15 +1636,12 @@ def resume_migration(manifest: Manifest) -> str:
             raise ConcurrentDeploy("another deployment operation owns migration resume") from exc
         if manifest.ordinary_migration is None or manifest.paired_database_upgrade is not None:
             raise ActivationError("migration resume requires an ordinary migration transaction")
-        status = read_status(manifest)
-        try:
-            owner = Path(manifest.active_path).read_text().strip()
-        except FileNotFoundError:
-            owner = None
-        terminal_resume = (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") == "migration_resumed") or (status.get("state") == "committed" and not status.get("finalization_pending"))
-        if (owner != manifest.transaction_id and not (owner is None and terminal_resume)) or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"preparing", "prepared", "activating", "migration_failed_stopped", "activation_failed_rolled_back", "committed"}:
-            raise ActivationError("migration resume must own a retained unresolved transaction")
-        if status.get("state") in {"preparing", "prepared"}:
+        status = reserve_migration_resume(manifest)
+        if status.get("state") == "preparing":
+            raise ActivationError("pre-bootstrap preparing migration requires controller cleanup-only abandonment")
+        if status.get("state") not in {"prepared", "activating", "migration_failed_stopped", "activation_failed_rolled_back", "committed"}:
+            raise ActivationError("migration resume state does not authorize runtime recovery")
+        if status.get("state") == "prepared":
             pid = status.get("preparing_pid")
             if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
                 raise ActivationError("preparing migration controller absence unproven")

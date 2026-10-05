@@ -109,7 +109,7 @@ class MigrationControllerTests(unittest.TestCase):
             }
             mocks = {name: stack.enter_context(mock.patch.object(dev, name, **options)) for name, options in patches.items()}
             stack.enter_context(mock.patch.object(dev.os, "fsync", side_effect=fsync))
-            stack.enter_context(mock.patch.object(dev.subprocess, "run", side_effect=run))
+            mocks["subprocess.run"] = stack.enter_context(mock.patch.object(dev.subprocess, "run", side_effect=run))
             controller = dev.ProdDeployControllerOptions(transaction_id="test-modern", migration_backup_receipt=receipt_path)
             yield root, staging, controller, receipt, events, mocks
 
@@ -130,6 +130,63 @@ class MigrationControllerTests(unittest.TestCase):
                         self.assertFalse(dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
                         self.assertEqual(json.loads(dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text())["state"], "precondition_failed")
                     self.assertTrue(all("--probe-service-absence" in call.args[0] for call in backend.call_args_list))
+
+    def test_manifest_written_preparing_crash_uses_cleanup_only_and_durable_abandon_retry(self):
+        class Crash(BaseException):
+            pass
+        for boundary in ("manifest_written", "staging_synced", "prepared_status"):
+            with self.subTest(boundary=boundary), self.deployment() as (_, staging, options, receipt, _, mocks), contextlib.ExitStack() as stack:
+                original_write = dev._write_json_atomic
+                original_sync = dev._fsync_directory
+                def crash():
+                    self.assertTrue((staging / "manifest.json").is_file())
+                    self.assertEqual(json.loads(dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text())["state"], "preparing")
+                    raise Crash()
+                def crash_write(path, value, **kwargs):
+                    if value.get("cleanup_pending"):
+                        raise Crash()
+                    if boundary == "prepared_status" and value.get("state") == "prepared":
+                        crash()
+                    result = original_write(path, value, **kwargs)
+                    if boundary == "manifest_written" and path == staging / "manifest.json":
+                        crash()
+                    return result
+                def crash_sync(path):
+                    result = original_sync(path)
+                    if boundary == "staging_synced" and path == staging and (staging / "manifest.json").exists():
+                        crash()
+                    return result
+                stack.enter_context(mock.patch.object(dev, "_write_json_atomic", side_effect=crash_write))
+                stack.enter_context(mock.patch.object(dev, "_fsync_directory", side_effect=crash_sync))
+                with self.assertRaises(Crash):
+                    dev.launchd_prod_deploy(controller=options)
+                self.assertTrue((staging / "manifest.json").is_file())
+                self.assertEqual(json.loads(dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text())["state"], "preparing")
+                stack.close()
+                mocks["subprocess.run"].side_effect = None
+                mocks["subprocess.run"].return_value = subprocess.CompletedProcess([], 0, "", "")
+                mocks["subprocess.run"].reset_mock()
+                old_db = Path(receipt["database_path"]).read_bytes()
+                sync = dev._fsync_directory
+                failed = False
+                def fail_after_unlink(path):
+                    nonlocal failed
+                    if path == dev.LAUNCHD_DEPLOY_ACTIVE_PATH.parent and not dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists() and not failed:
+                        failed = True
+                        raise OSError("controller claim unlink sync failed")
+                    return sync(path)
+                with mock.patch.object(dev.os, "kill", side_effect=ProcessLookupError()), mock.patch.object(dev, "_fsync_directory", side_effect=fail_after_unlink):
+                    with self.assertRaises(OSError):
+                        dev.cmd_prod_resume_migration("test-modern")
+                self.assertTrue(dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+                self.assertFalse(staging.exists())
+                self.assertTrue(json.loads(dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text())["abandoned_preparation"])
+                with mock.patch.object(dev.os, "kill", side_effect=ProcessLookupError()):
+                    dev.cmd_prod_resume_migration("test-modern")
+                self.assertFalse(dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+                self.assertEqual(Path(receipt["database_path"]).read_bytes(), old_db)
+                self.assertTrue(Path(receipt["backup_path"]).exists())
+                self.assertTrue(all("--probe-service-absence" in call.args[0] for call in mocks["subprocess.run"].call_args_list))
 
     def test_receipt_exact_shape_hashes_and_source_bindings(self):
         with self.deployment() as (root, _, options, receipt, _, _):

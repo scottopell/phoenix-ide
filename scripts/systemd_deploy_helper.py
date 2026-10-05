@@ -479,6 +479,7 @@ def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = Non
         "updated_at": utc_now(),
         "failure": failure,
         "rollback_failure": rollback_failure,
+        "retained_ownership": True,
     }
     lock_path = Path(manifest.claim_lock_path)
     with lock_path.open("a+") as lock:
@@ -506,23 +507,50 @@ def write_policy_status(
         "updated_at": utc_now(),
         "failure": failure,
         "rollback_failure": None,
+        "retained_ownership": True,
     }
     with policy.claim_lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         atomic_write(policy.status_path, (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
 
-def release_policy_claim(transaction_id: str, policy: ValidationPolicy) -> bool:
-    with policy.claim_lock_path.open("a+") as lock:
+def mark_claim_released(status_path: Path, transaction_id: str, *, retained: bool = False) -> None:
+    status = json.loads(status_path.read_text())
+    if status.get("transaction_id") != transaction_id:
+        raise ActivationError("released claim differs from status owner")
+    status["retained_ownership"] = retained
+    atomic_write(status_path, (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
+
+
+def release_terminal_claim(transaction_id: str, claim: Path, status_path: Path, lock_path: Path) -> bool:
+    with lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            if policy.active_path.read_text().strip() != transaction_id:
-                return False
-            policy.active_path.unlink()
-            fsync_dir(policy.active_path.parent)
-            return True
+            owner = claim.read_text().strip()
         except FileNotFoundError:
+            owner = None
+        if owner not in {None, transaction_id}:
             return False
+        try:
+            status = json.loads(status_path.read_text())
+        except (OSError, ValueError):
+            return False
+        if status.get("transaction_id") != transaction_id or status.get("state") not in CLAIM_RELEASABLE_STATES:
+            return False
+        if owner is not None:
+            claim.unlink()
+        try:
+            fsync_dir(claim.parent)
+            mark_claim_released(status_path, transaction_id)
+        except (OSError, ValueError, ActivationError):
+            atomic_write(claim, (transaction_id + "\n").encode())
+            mark_claim_released(status_path, transaction_id, retained=True)
+            raise
+        return True
+
+
+def release_policy_claim(transaction_id: str, policy: ValidationPolicy) -> bool:
+    return release_terminal_claim(transaction_id, policy.active_path, policy.status_path, policy.claim_lock_path)
 
 
 def status_is_durable_terminal(manifest: Manifest) -> bool:
@@ -534,26 +562,7 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
 
 
 def release_claim(manifest: Manifest) -> bool:
-    claim = Path(manifest.active_path)
-    lock_path = Path(manifest.claim_lock_path)
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            if claim.read_text().strip() != manifest.transaction_id:
-                return False
-            try:
-                status = json.loads(Path(manifest.status_path).read_text())
-            except (OSError, json.JSONDecodeError):
-                return False
-            if status.get("state") not in CLAIM_RELEASABLE_STATES:
-                return False
-            if not status_is_durable_terminal(manifest):
-                return False
-            claim.unlink()
-            fsync_dir(claim.parent)
-            return True
-        except FileNotFoundError:
-            return False
+    return release_terminal_claim(manifest.transaction_id, Path(manifest.active_path), Path(manifest.status_path), Path(manifest.claim_lock_path))
 
 
 class Systemctl:
@@ -1099,7 +1108,8 @@ def main() -> int:
         try:
             manifest = Manifest.load(args.manifest)
             validate_manifest(args.manifest, manifest, ValidationPolicy.production())
-            write_status(manifest, "precondition_failed", failure="transient activation unit did not start")
+            if not status_is_durable_terminal(manifest):
+                write_status(manifest, "precondition_failed", failure="transient activation unit did not start")
             if not release_claim(manifest):
                 raise ActivationError("failed to release abandoned activation claim")
             return 0
@@ -1109,20 +1119,32 @@ def main() -> int:
     if args.action != "activate" or args.manifest is None:
         parser.error("activation requires activate --manifest PATH")
     manifest = None
+    validated = False
     policy = ValidationPolicy.production()
     try:
         manifest = Manifest.load(args.manifest)
         validate_manifest(args.manifest, manifest, policy)
+        validated = True
         state = activate(manifest)
         if state in CLAIM_RELEASABLE_STATES and status_is_durable_terminal(manifest):
-            release_claim(manifest)
+            try:
+                if not release_claim(manifest):
+                    raise ActivationError("terminal activation claim release remains unresolved")
+            except Exception as exc:
+                print(f"systemd {state}; claim finalization failed: {exc}", file=sys.stderr)
+                return 1
         print(state, flush=True)
         return 0 if state == "committed" else 1
     except ConcurrentDeploy as exc:
         print(f"systemd activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        if manifest is not None:
+        if validated and manifest is not None and status_is_durable_terminal(manifest):
+            try:
+                release_claim(manifest)
+            except Exception as release_error:
+                print(f"systemd terminal claim finalization failed: {release_error}", file=sys.stderr)
+        elif manifest is not None:
             try:
                 staged_transaction_id = args.manifest.parent.name
                 expected_manifest_path = policy.transaction_root / staged_transaction_id / "manifest.json"
@@ -1131,8 +1153,7 @@ def main() -> int:
                 write_policy_status(manifest, policy, "precondition_failed", failure=str(exc))
                 release_policy_claim(manifest.transaction_id, policy)
             except Exception:
-                if status_is_durable_terminal(manifest):
-                    release_claim(manifest)
+                pass
         print(f"systemd activation helper failed: {exc}", file=sys.stderr)
         return 1
 

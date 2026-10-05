@@ -10187,9 +10187,19 @@ def _release_launchd_deploy_claim_unlocked(transaction_id: str) -> bool:
         return False
     try:
         LAUNCHD_DEPLOY_ACTIVE_PATH.unlink()
-        return True
     except FileNotFoundError:
         return False
+    try:
+        _fsync_directory(LAUNCHD_DEPLOY_ACTIVE_PATH.parent)
+    except OSError:
+        with LAUNCHD_DEPLOY_ACTIVE_PATH.open("w") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(transaction_id + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_directory(LAUNCHD_DEPLOY_ACTIVE_PATH.parent)
+        raise
+    return True
 
 
 def _release_launchd_deploy_claim(transaction_id: str) -> bool:
@@ -10540,7 +10550,7 @@ def _cleanup_ordinary_migration_preparation(staging: Path) -> None:
 def _abandon_incomplete_migration_preparation(transaction_id: str, staging: Path) -> None:
     with _launchd_claim_lock():
         status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-        if not isinstance(status, dict) or _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("state") != "preparing" or not status.get("ordinary_migration") or ((staging / "manifest.json").exists() and not status.get("cleanup_pending")):
+        if not isinstance(status, dict) or _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("state") not in {"preparing", "precondition_failed"} or not status.get("ordinary_migration") or (status.get("state") == "precondition_failed" and not status.get("abandoned_preparation")):
             raise SystemExit("incomplete migration preparation ownership is unproven")
         pid = status.get("preparing_pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
@@ -10559,7 +10569,7 @@ def _abandon_incomplete_migration_preparation(transaction_id: str, staging: Path
         if probe.returncode != 0:
             raise SystemExit("preparation helper absence unconfirmed; claim retained")
         _cleanup_ordinary_migration_preparation(staging)
-        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {**status, "state": "precondition_failed", "cleanup_pending": False, "failure": "abandoned incomplete stopped migration preparation", "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {**status, "state": "precondition_failed", "cleanup_pending": False, "abandoned_preparation": True, "failure": "abandoned incomplete stopped migration preparation", "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
         _release_launchd_deploy_claim_unlocked(transaction_id)
     print(f"Abandoned incomplete migration preparation {transaction_id}; no runtime/database action.")
 
@@ -10571,7 +10581,7 @@ def cmd_prod_resume_migration(transaction_id: str) -> None:
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
     status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-    if status.get("transaction_id") == transaction_id and status.get("cleanup_pending"):
+    if status.get("transaction_id") == transaction_id and (status.get("state") == "preparing" or status.get("cleanup_pending") or status.get("abandoned_preparation")):
         _abandon_incomplete_migration_preparation(transaction_id, staging)
         return
     if not manifest_path.exists() and not manifest_path.is_symlink():
