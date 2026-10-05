@@ -30,7 +30,7 @@ function authorityText(authority: ReleaseUpdateAuthority): string | null {
 }
 
 function transactionIsTerminal(transaction: Extract<ReleaseTransactionStatus, { kind: 'present' }>): boolean {
-  return TERMINAL_STATES.has(transaction.state) && transaction.finalization_pending !== true;
+  return TERMINAL_STATES.has(transaction.state) && transaction.finalization_pending !== true && transaction.retained_ownership !== true;
 }
 
 function stateText(state: string, recoveryMode?: string | null): string {
@@ -53,7 +53,7 @@ function stateText(state: string, recoveryMode?: string | null): string {
 
 function statusTone(transaction: ReleaseTransactionStatus): string {
   if (transaction.kind !== 'present') return 'muted';
-  if (transaction.finalization_pending === true) return 'warning';
+  if (transaction.finalization_pending === true || transaction.retained_ownership === true) return 'warning';
   if (transaction.state === 'committed') return 'success';
   if (transaction.state === 'activation_failed_rolled_back') return 'warning';
   if (TERMINAL_STATES.has(transaction.state)) return 'danger';
@@ -70,7 +70,7 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
   return (
     <div className={`release-update__status release-update__status--${statusTone(transaction)}`}>
       <div className="release-update__status-head">
-        <strong>{transactionIsTerminal(transaction) ? '●' : '…'} {transaction.finalization_pending === true ? 'Verified candidate — publication finalization required; activation acceptance pending' : stateText(transaction.state, transaction.recovery_mode)}</strong>
+        <strong>{transactionIsTerminal(transaction) ? '●' : '…'} {transaction.finalization_pending === true ? 'Verified candidate — publication finalization required; activation acceptance pending' : transaction.retained_ownership === true && TERMINAL_STATES.has(transaction.state) ? 'Deployment ownership retained; recovery finalization required' : stateText(transaction.state, transaction.recovery_mode)}</strong>
         <code>{transaction.transaction_id}</code>
       </div>
       {(transaction.expected_version || transaction.expected_git_sha) && (
@@ -80,6 +80,7 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
       {transaction.release_tag && <div>Approved release: <strong>{transaction.release_tag}</strong></div>}
       {transaction.updated_at && <div>Updated: {new Date(transaction.updated_at).toLocaleString()}</div>}
       {transaction.finalization_pending === true && <div className="release-update__recovery">Publication is not finalized. Inspect <code>./dev.py prod status</code> and use the matching transaction’s publication-only recovery; do not restore an older database backup.</div>}
+      {transaction.retained_ownership === true && <div className="release-update__recovery">The deployment claim remains fenced. Inspect <code>./dev.py prod status</code> and complete the matching transaction’s recovery before another approval.</div>}
       {transaction.committed_diagnostic && <div>{transaction.committed_diagnostic}</div>}
       {transaction.failure && <div>Failure: {transaction.failure}</div>}
       {transaction.rollback_failure && <div>Rollback failure: {transaction.rollback_failure}</div>}

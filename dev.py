@@ -10145,7 +10145,22 @@ def _transaction_has_paired_manifest(transaction: Path) -> bool:
         return True
     except (OSError, json.JSONDecodeError):
         return True
-    return not isinstance(payload, dict) or payload.get("paired_database_upgrade") is not None or payload.get("ordinary_migration") is not None
+    if not isinstance(payload, dict) or payload.get("paired_database_upgrade") is not None:
+        return True
+    if payload.get("ordinary_migration") is None:
+        return False
+    owner = _deploy_claim_owner()
+    if owner == transaction.name or (owner is None and LAUNCHD_DEPLOY_ACTIVE_PATH.exists()):
+        return True
+    try:
+        completion = json.loads((transaction / "completed.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not (isinstance(completion, dict)
+        and completion.get("transaction_id") == transaction.name
+        and completion.get("state") in {"committed", "activation_failed_rolled_back", "precondition_failed"}
+        and completion.get("finalization_pending") is False
+        and completion.get("claim_released") is True)
 
 
 def _prune_launchd_deploy_transactions(transactions_dir: Path, current_transaction_id: str) -> None:

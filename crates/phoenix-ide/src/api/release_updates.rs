@@ -128,6 +128,8 @@ pub enum ReleaseTransactionStatus {
         finalization_pending: Option<bool>,
         #[ts(optional = nullable)]
         committed_diagnostic: Option<String>,
+        #[ts(optional = nullable)]
+        retained_ownership: Option<bool>,
         stale: bool,
     },
     Unreadable {
@@ -449,8 +451,34 @@ fn marker_identity(marker: &Path) -> Option<(String, String)> {
     Some((lines.next()?.to_string(), lines.next()?.to_string()))
 }
 
+fn retained_deploy_ownership(state: &AppState, backend: ReleaseUpdateBackend) -> bool {
+    let Some(path) = status_path(state, backend)
+        .and_then(|path| path.parent().map(|parent| parent.join("active")))
+    else {
+        return true;
+    };
+    if matches!(backend, ReleaseUpdateBackend::Systemd) {
+        return match Command::new("sudo").args(["-n", "cat"]).arg(&path).output() {
+            Ok(output) if output.status.success() => true,
+            Ok(output)
+                if String::from_utf8_lossy(&output.stderr)
+                    .contains("No such file or directory") =>
+            {
+                false
+            }
+            _ => true,
+        };
+    }
+    match fs::read_to_string(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransactionStatus {
+    let retained_ownership = retained_deploy_ownership(state, backend);
     let Some(path) = status_path(state, backend) else {
         return ReleaseTransactionStatus::None;
     };
@@ -535,8 +563,9 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
     let finalization_pending = value
         .get("finalization_pending")
         .and_then(serde_json::Value::as_bool);
-    let terminal =
-        TERMINAL_STATUS_STATES.contains(&state.as_str()) && finalization_pending != Some(true);
+    let terminal = TERMINAL_STATUS_STATES.contains(&state.as_str())
+        && finalization_pending != Some(true)
+        && !retained_ownership;
     let status_is_stale = !terminal
         && updated_at
             .as_deref()
@@ -563,6 +592,7 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
         recovery_mode: string("recovery_mode"),
         finalization_pending,
         committed_diagnostic: string("committed_diagnostic"),
+        retained_ownership: Some(retained_ownership),
         stale: status_is_stale,
     }
 }
@@ -804,6 +834,11 @@ pub async fn approve(
     else {
         unreachable!()
     };
+    if retained_deploy_ownership(&state, selected_backend) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "deployment ownership is retained; inspect prod status and complete matching recovery before another approval"
+        }))).into_response();
+    }
     let transaction_id = Uuid::new_v4().simple().to_string();
     let root = match updater_dir(&state) {
         Ok(root) => root,
@@ -1061,8 +1096,14 @@ mod tests {
         );
         let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let active = path.parent().unwrap().join("active");
         for status in statuses {
             fs::write(&path, status.to_string()).unwrap();
+            if status["retained_ownership"] == true {
+                fs::write(&active, status["transaction_id"].as_str().unwrap()).unwrap();
+            } else {
+                let _ = fs::remove_file(&active);
+            }
             let wire =
                 serde_json::to_value(read_status(&app, ReleaseUpdateBackend::BareLinux)).unwrap();
             assert_eq!(wire["state"], status["state"]);
@@ -1088,6 +1129,7 @@ mod tests {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null)
             );
+            assert_eq!(wire["retained_ownership"], status["retained_ownership"]);
             if status["recovery_mode"] == "migration_resumed" {
                 assert_eq!(wire["stale"], false);
                 assert!(wire["failure"]
@@ -1100,6 +1142,38 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("No automatic database restore"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_terminal_status_projects_actual_retained_claim() {
+        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        app.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(root.path()));
+        let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let active = path.parent().unwrap().join("active");
+        for terminal in TERMINAL_STATUS_STATES {
+            fs::write(
+                &path,
+                serde_json::json!({"transaction_id":"terminal", "state":terminal, "source_kind":"published_release"}).to_string(),
+            )
+            .unwrap();
+            for retained in [true, false] {
+                if retained {
+                    fs::write(&active, "terminal").unwrap();
+                } else {
+                    let _ = fs::remove_file(&active);
+                }
+                let wire = serde_json::to_value(read_status(&app, ReleaseUpdateBackend::BareLinux))
+                    .unwrap();
+                assert_eq!(wire["retained_ownership"], retained);
+                assert_eq!(
+                    retained_deploy_ownership(&app, ReleaseUpdateBackend::BareLinux),
+                    retained
+                );
             }
         }
     }

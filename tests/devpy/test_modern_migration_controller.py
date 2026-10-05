@@ -396,6 +396,7 @@ class MigrationControllerTests(unittest.TestCase):
                 self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
                 self.assertEqual(Path(manifest.status_path).read_bytes(), status)
                 self.assertEqual(backend.events, events)
+                retained_projection = {**helper.read_status(manifest), "retained_ownership": True}
                 print_output = io.StringIO()
                 with contextlib.redirect_stdout(print_output):
                     dev._print_launchd_deploy_status()
@@ -425,11 +426,12 @@ class MigrationControllerTests(unittest.TestCase):
                     if not destination.is_relative_to(ROOT):
                         raise AssertionError("projection fixture must stay in test worktree")
                     prior = json.loads(destination.read_text()) if destination.exists() else []
-                    destination.write_text(json.dumps([*prior, failed_projection, helper.read_status(manifest)]))
+                    destination.write_text(json.dumps([*prior, {**failed_projection, "retained_ownership": True}, retained_projection, {**helper.read_status(manifest), "retained_ownership": False}]))
                 self.assertEqual(backend.events, events)
                 self.assertEqual(Path(manifest.status_path).read_bytes(), status)
                 self.assertFalse(Path(manifest.active_path).exists())
                 self.assertFalse(database.exists())
+                self.assertFalse(dev._transaction_has_paired_manifest(staging))
                 database.write_bytes(later)
                 with sqlite3.connect(database) as connection:
                     self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone(), (2,))
@@ -570,6 +572,28 @@ class MigrationControllerTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 dev._claim_launchd_deploy("next")
             self.assertEqual(dev._deploy_claim_owner(), "test-modern")
+
+    def test_completed_ordinary_transactions_share_bounded_retention_without_touching_external_backup(self):
+        with self.deployment() as (_, staging, _, receipt, _, _):
+            transactions = staging.parent
+            for index in range(8):
+                transaction = transactions / f"done-{index}"
+                transaction.mkdir(parents=True)
+                (transaction / "manifest.json").write_text(json.dumps({"ordinary_migration": {"backup_path": receipt["backup_path"]}}))
+                (transaction / "completed.json").write_text(json.dumps({"transaction_id": transaction.name, "state": "committed" if index % 2 else "activation_failed_rolled_back", "finalization_pending": False, "claim_released": True}))
+                (transaction / "private-copy.sqlite3").write_bytes(b"private retained copy")
+                os.utime(transaction, (100 + index, 100 + index))
+            for name in ("active", "failed", "unknown"):
+                transaction = transactions / name
+                transaction.mkdir()
+                (transaction / "manifest.json").write_text(json.dumps({"ordinary_migration": {}}))
+                if name != "unknown":
+                    (transaction / "completed.json").write_text(json.dumps({"transaction_id": name, "state": "migration_failed_stopped" if name == "failed" else "committed", "finalization_pending": False, "claim_released": True}))
+            dev.LAUNCHD_DEPLOY_ACTIVE_PATH.parent.mkdir(exist_ok=True)
+            dev.LAUNCHD_DEPLOY_ACTIVE_PATH.write_text("active")
+            dev._prune_launchd_deploy_transactions(transactions, "current")
+            self.assertEqual(sorted(path.name for path in transactions.iterdir()), ["active", "done-3", "done-4", "done-5", "done-6", "done-7", "failed", "unknown"])
+            self.assertTrue(Path(receipt["backup_path"]).exists())
 
     def test_cli_options_and_resume_dispatch(self):
         patches = [mock.patch.object(dev, name) for name in ("_bootstrap_dev_tracing", "_start_dev_command_tracing")]

@@ -627,6 +627,11 @@ rule FinalizeResumedMigrationClaim {
         -- verification; a competing owner refuses finalization.
         -- Preserve manual-restoration explanation in the predecessor's existing
         -- failure diagnostic; current API also threads recovery_mode to the UI.
+        -- Current API derives retained ownership from actual active claim; UI
+        -- polling/approval remain fenced until release even for terminal status.
+        -- After durable claim removal, transaction-local completion evidence makes
+        -- private copies eligible for existing bounded pruning. Protect active,
+        -- failed/pending/unknown transactions and external operator originals.
 }
 
 rule RollBackFailedOrdinaryActivation {

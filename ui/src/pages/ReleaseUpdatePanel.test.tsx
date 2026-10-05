@@ -566,10 +566,11 @@ describe('ReleaseUpdatePanel', () => {
       rollback_failure: null, recovery_mode: typeof status['recovery_mode'] === 'string' ? status['recovery_mode'] : null,
       finalization_pending: typeof status['finalization_pending'] === 'boolean' ? status['finalization_pending'] : null,
       committed_diagnostic: typeof status['committed_diagnostic'] === 'string' ? status['committed_diagnostic'] : null,
+      retained_ownership: typeof status['retained_ownership'] === 'boolean' ? status['retained_ownership'] : null,
       stale: false,
     });
-    const [pending, completed, failed, resumed] = statuses;
-    if (!pending || !completed || !failed || !resumed) throw new Error('Lifecycle must emit pending/finalized and failed/resumed statuses');
+    const [pending, committedRetained, completed, failed, resumedRetained, resumed] = statuses;
+    if (!pending || !committedRetained || !completed || !failed || !resumedRetained || !resumed) throw new Error('Lifecycle must emit pending/claim-retained/finalized and failed/claim-retained/resumed statuses');
     let transaction = project(pending);
     vi.mocked(fetch).mockImplementation((input) => json(String(input).includes('/transaction') ? transaction : { ...snapshot, transaction }));
     const view = render(<ReleaseUpdatePanel />);
@@ -583,6 +584,10 @@ describe('ReleaseUpdatePanel', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(2200); });
     expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(pendingFetches);
     expect(screen.queryByText(/transaction status is stale/i)).not.toBeInTheDocument();
+    transaction = project(committedRetained);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
+    expect(await screen.findByText(/deployment ownership retained; recovery finalization required/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Update committed/i)).not.toBeInTheDocument();
     transaction = project(completed);
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
     expect(await screen.findByText(/Update committed/i)).toBeInTheDocument();
@@ -591,6 +596,13 @@ describe('ReleaseUpdatePanel', () => {
     transaction = project(failed);
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
     await screen.findByText(/migration failed stopped/i);
+    transaction = project(resumedRetained);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
+    expect(await screen.findByText(/deployment ownership retained; recovery finalization required/i)).toBeInTheDocument();
+    expect(screen.queryByText(/publication finalization required/i)).not.toBeInTheDocument();
+    const retainedFetches = vi.mocked(fetch).mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2200); });
+    expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(retainedFetches);
     transaction = project(resumed);
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
     expect(await screen.findByText('● Activation failed; manual matched database restoration verified; captured predecessor resumed')).toBeInTheDocument();
@@ -604,6 +616,21 @@ describe('ReleaseUpdatePanel', () => {
     expect(await screen.findByText(/predecessor runtime verified — inspect recovery details for database outcome/i)).toBeInTheDocument();
     expect(screen.getByText(/Manual offline matched database restoration verified/i)).toBeInTheDocument();
     expect(screen.queryByText(/database not restored/i)).not.toBeInTheDocument();
+  });
+
+  it.each(['committed', 'precondition_failed', 'activation_failed_rolled_back', 'activation_failed_rollback_failed', 'ordinary_activation_failed_rollback_failed', 'rejected_concurrent'])('keeps %s fenced and polling for actual ownership, then permits terminal interpretation after release', async (state) => {
+    let retained = true;
+    const transaction = () => ({ kind: 'present', transaction_id: 'owned-terminal', state, retained_ownership: retained, finalization_pending: false, failure: null, rollback_failure: null, stale: false });
+    vi.mocked(fetch).mockImplementation((input) => json(String(input).includes('/transaction') ? transaction() : { ...snapshot, transaction: transaction() }));
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText(/deployment ownership retained; recovery finalization required/i);
+    expect(screen.queryByRole('button', { name: /Review and install/i })).not.toBeInTheDocument();
+    const calls = vi.mocked(fetch).mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2200); });
+    expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(calls);
+    retained = false;
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
+    expect(screen.queryByText(/deployment ownership retained/i)).not.toBeInTheDocument();
   });
 
   it.each([

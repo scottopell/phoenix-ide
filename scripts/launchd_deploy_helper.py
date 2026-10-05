@@ -936,18 +936,28 @@ def release_claim(manifest: Manifest) -> bool:
         try:
             owner = claim.read_text().strip()
         except FileNotFoundError:
-            if manifest.ordinary_migration is not None and status_is_durable_terminal(manifest):
-                fsync_dir(claim.parent)
-                return True
+            if manifest.ordinary_migration is None or not status_is_durable_terminal(manifest):
+                return False
+            owner = None
+        if owner is not None and owner != manifest.transaction_id:
             return False
-        if owner != manifest.transaction_id:
-            return False
-        claim.unlink()
+        if owner is not None:
+            claim.unlink()
         try:
             fsync_dir(claim.parent)
         except OSError:
             atomic_write(claim, (manifest.transaction_id + "\n").encode())
             raise
+        if manifest.ordinary_migration is not None:
+            try:
+                status = read_status(manifest)
+                atomic_write(Path(manifest.ordinary_migration.controller_helper_path).parent / "completed.json", json.dumps({
+                    "transaction_id": manifest.transaction_id, "state": status["state"],
+                    "finalization_pending": False, "claim_released": True,
+                }).encode())
+            except OSError:
+                atomic_write(claim, (manifest.transaction_id + "\n").encode())
+                raise
         return True
 
 

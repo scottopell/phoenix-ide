@@ -521,13 +521,13 @@ class ModernMigrationTests(unittest.TestCase):
         self.assertFalse(Path(self.manifest.active_path).exists())
         self.assertEqual(events, self.backend.events)
 
-    def emit_projection(self, status):
+    def emit_projection(self, status, *, retained=True):
         if output := os.environ.get("PHOENIX_MIGRATION_TEST_PROJECTIONS"):
             path = Path(output).resolve()
             if not path.is_relative_to(ROOT):
                 raise AssertionError("projection fixture must stay in worktree")
             statuses = json.loads(path.read_text()) if path.exists() else []
-            path.write_text(json.dumps([*statuses, status]))
+            path.write_text(json.dumps([*statuses, {**status, "retained_ownership": retained}]))
 
     def test_candidate_publication_crash_checkpoint_preserves_accepted_writes(self):
         class PowerLoss(BaseException):
@@ -601,9 +601,31 @@ class ModernMigrationTests(unittest.TestCase):
                 self.assertTrue(Path(manifest.target_plist).samefile(manifest.candidate_plist))
                 self.assertTrue(helper.status_is_durable_terminal(manifest))
                 if boundary == "publication_error":
+                    real_sync = helper.fsync_dir
+                    interrupted = False
+                    def sync(path):
+                        nonlocal interrupted
+                        if path == Path(manifest.active_path).parent and not Path(manifest.active_path).exists() and not interrupted:
+                            interrupted = True
+                            raise OSError("committed claim sync interrupted")
+                        return real_sync(path)
+                    with mock.patch.object(helper, "fsync_dir", side_effect=sync), self.assertRaises(OSError):
+                        helper.release_claim(manifest)
+                    self.assertTrue(Path(manifest.active_path).exists())
                     self.emit_projection(helper.read_status(manifest))
+                if boundary == "publication_error":
+                    real_atomic = helper.atomic_write
+                    def fail_completion(path, data, mode=0o600):
+                        if path.name == "completed.json":
+                            raise OSError("completion receipt failure")
+                        return real_atomic(path, data, mode)
+                    with mock.patch.object(helper, "atomic_write", side_effect=fail_completion), self.assertRaises(OSError):
+                        helper.release_claim(manifest)
+                    self.assertTrue(Path(manifest.active_path).exists())
                 self.assertTrue(helper.release_claim(manifest))
                 self.assertFalse(Path(manifest.active_path).exists())
+                if boundary == "publication_error":
+                    self.emit_projection(helper.read_status(manifest), retained=False)
 
     def test_activation_success_publishes_only_after_exact_identity_and_no_db_writes(self):
         before = Path(self.manifest.ordinary_migration.database_path).read_bytes()

@@ -73,6 +73,8 @@ The status API shall preserve the optional backend `recovery_mode`. When termina
 
 The status API shall preserve optional `finalization_pending` and `committed_diagnostic`. A verified candidate with pending publication shall remain warning/non-accepted, display its diagnostic and publication-only recovery guidance, continue polling, and prohibit another approval. It shall not use the normal committed-success badge or installed-release reconciliation until finalization completes. Missing fields from a predecessor API retain its established terminal interpretation; the surface shall not invent unreported pending work.
 
+The current status API shall derive optional `retained_ownership` from the actual active deployment claim, conservatively retaining ownership on unreadable claim evidence. For every terminal outcome, retained ownership shall keep the current panel fenced, polling and approval-disabled with matching recovery guidance until release; it shall not imply candidate publication is pending when only manual-resume claim cleanup remains. Release approval shall refuse actual retained ownership independently of the displayed terminal state. An older API omitting this field retains its established interpretation; it does not gain new embedded UI behavior.
+
 ### REQ-RU-009 — Terminal and replay-safe audit trail
 
 The system shall preserve enough durable release-update identity to explain which preview was approved, which published tag and full commit were attempted, and which backend terminal outcome was observed after reconnect.
