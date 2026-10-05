@@ -4972,6 +4972,19 @@ def _kache_daemon_is_running(binary: str, *, cargo_cwd: Path | None) -> tuple[bo
     return status["daemon_running"], None
 
 
+@contextlib.contextmanager
+def _kache_socket_lock(socket_path: Path):
+    lock_path = socket_path.with_name(f"{socket_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str | None:
     cache_dir = os.environ.get("KACHE_CACHE_DIR")
     if os.name != "nt" and cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
@@ -4982,30 +4995,35 @@ def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str |
             return str(error)
         os.environ["KACHE_SOCKET_PATH"] = str(socket_dir / f"{digest}.sock")
 
-    running, status_error = _kache_daemon_is_running(binary, cargo_cwd=cargo_cwd)
-    if status_error:
-        return f"cannot verify existing daemon environment: {status_error}; run 'kache daemon stop' and retry"
-    if running:
-        return (
-            "selected socket already has a running daemon whose environment cannot be verified; "
-            "run 'kache daemon stop' and retry"
-        )
+    socket = os.environ.get("KACHE_SOCKET_PATH")
+    if not socket:
+        return "KACHE_SOCKET_PATH is required to serialize daemon startup"
 
-    try:
-        result = subprocess.run(
-            [binary, "daemon", "start"],
-            cwd=cargo_cwd,
-            capture_output=True,
-            text=True,
-            env=os.environ,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return str(error)
-    if result.returncode != 0:
-        return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
-    return _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
+    with _kache_socket_lock(Path(socket)):
+        running, status_error = _kache_daemon_is_running(binary, cargo_cwd=cargo_cwd)
+        if status_error:
+            return f"cannot verify existing daemon environment: {status_error}; run 'kache daemon stop' and retry"
+        if running:
+            return (
+                "selected socket already has a running daemon whose environment cannot be verified; "
+                "run 'kache daemon stop' and retry"
+            )
+
+        try:
+            result = subprocess.run(
+                [binary, "daemon", "start"],
+                cwd=cargo_cwd,
+                capture_output=True,
+                text=True,
+                env=os.environ,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return str(error)
+        if result.returncode != 0:
+            return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
+        return _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
 
 
 def _absolute_executable(binary: str | None) -> str | None:

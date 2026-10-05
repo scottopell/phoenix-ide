@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 import os
 import platform
@@ -218,7 +219,11 @@ class CompilerCacheTests(unittest.TestCase):
 
         with mock.patch.dict(
             os.environ,
-            {"KACHE_LOG_FILE": "kache=trace", "KACHE_LOG_FILE_PATH": "/tmp/kache.log"},
+            {
+                "KACHE_LOG_FILE": "kache=trace",
+                "KACHE_LOG_FILE_PATH": "/tmp/kache.log",
+                "KACHE_SOCKET_PATH": "/tmp/kache.sock",
+            },
             clear=True,
         ), mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
@@ -235,8 +240,46 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("/tmp/kache.log", daemon_env["KACHE_LOG_FILE_PATH"])
         wait.assert_called_once_with("/bin/kache", cargo_cwd=cargo_cwd)
 
+    def test_kache_daemon_holds_socket_lock_across_check_start_and_readiness(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        events = []
+
+        @contextlib.contextmanager
+        def lock(_socket):
+            events.append("lock")
+            yield
+            events.append("unlock")
+
+        def status(*_args, **_kwargs):
+            events.append("check")
+            return False, None
+
+        def start(*_args, **_kwargs):
+            events.append("start")
+            return completed
+
+        def ready(*_args, **_kwargs):
+            events.append("ready")
+            return None
+
+        with mock.patch.dict(
+            os.environ, {"KACHE_SOCKET_PATH": "/tmp/kache.sock"}, clear=True
+        ), mock.patch.object(
+            self.dev, "_kache_socket_lock", side_effect=lock
+        ), mock.patch.object(
+            self.dev, "_kache_daemon_is_running", side_effect=status
+        ), mock.patch.object(
+            self.dev.subprocess, "run", side_effect=start
+        ), mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", side_effect=ready
+        ):
+            self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
+        self.assertEqual(["lock", "check", "start", "ready", "unlock"], events)
+
     def test_kache_daemon_rejects_running_process_with_unverifiable_environment(self):
-        with mock.patch.object(
+        with mock.patch.dict(
+            os.environ, {"KACHE_SOCKET_PATH": "/tmp/kache.sock"}, clear=True
+        ), mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(True, None)
         ), mock.patch.object(self.dev.subprocess, "run") as run:
             error = self.dev._ensure_kache_daemon("/bin/kache")
@@ -245,7 +288,9 @@ class CompilerCacheTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_kache_daemon_rejects_unknown_existing_state(self):
-        with mock.patch.object(
+        with mock.patch.dict(
+            os.environ, {"KACHE_SOCKET_PATH": "/tmp/kache.sock"}, clear=True
+        ), mock.patch.object(
             self.dev,
             "_kache_daemon_is_running",
             return_value=(False, "daemon readiness response had an invalid shape"),
