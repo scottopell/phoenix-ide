@@ -863,6 +863,19 @@ def write_verified_predecessor_status(manifest: Manifest, **diagnostics) -> None
         raise
 
 
+def finalize_verified_predecessor(manifest: Manifest, failure: str | None) -> None:
+    if manifest.paired_database_upgrade is not None:
+        try:
+            checkpoint = json.loads(Path(manifest.status_path).read_text())
+            if not isinstance(checkpoint, dict) or checkpoint.get("transaction_id") != manifest.transaction_id or checkpoint.get("recovery_mode") not in {"unchanged_predecessor", "snapshot_restored"}:
+                raise ActivationError("verified predecessor recovery checkpoint is unavailable")
+            if checkpoint["recovery_mode"] == "unchanged_predecessor":
+                release_unsnapshotted_capacity(manifest)
+        except Exception as exc:
+            raise VerifiedPredecessorFinalizationError(f"verified predecessor capacity finalization failed: {exc}") from exc
+    write_verified_predecessor_status(manifest, failure=failure)
+
+
 def release_claim(manifest: Manifest) -> bool:
     claim = Path(manifest.active_path)
     claim_lock = Path(manifest.claim_lock_path)
@@ -1076,12 +1089,7 @@ def activate(manifest: Manifest) -> str:
                     candidate_binary_mutated=candidate_binary_mutated,
                     rollback_plist=quarantined_previous_plist,
                 )
-                write_verified_predecessor_status(manifest, failure=failure)
-                if manifest.paired_database_upgrade is not None and not database_snapshot:
-                    try:
-                        release_unsnapshotted_capacity(manifest)
-                    except Exception as cleanup_exc:
-                        write_verified_predecessor_status(manifest, failure=failure, rollback_failure=f"verified unchanged resume; capacity cleanup failed: {cleanup_exc}")
+                finalize_verified_predecessor(manifest, failure)
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:
                 rollback_failure = str(rollback_exc)
@@ -1291,7 +1299,7 @@ def recover_paired(manifest: Manifest) -> str:
                     commit_atomic_install(publication, Path(manifest.target_plist))
                 except Exception as exc:
                     raise VerifiedPredecessorFinalizationError(str(exc)) from exc
-                write_verified_predecessor_status(manifest, failure=status.get("failure"))
+                finalize_verified_predecessor(manifest, status.get("failure"))
                 return "activation_failed_rolled_back"
             paired = manifest.paired_database_upgrade
             snapshot_exists = Path(paired.proof_path).exists() or Path(paired.proof_path).is_symlink()
@@ -1313,12 +1321,7 @@ def recover_paired(manifest: Manifest) -> str:
                 )
             else:
                 restore(manifest, launchctl, None)
-            write_verified_predecessor_status(manifest, failure=status.get("failure"))
-            if not snapshot_exists:
-                try:
-                    release_unsnapshotted_capacity(manifest)
-                except Exception as cleanup_exc:
-                    write_verified_predecessor_status(manifest, failure=status.get("failure"), rollback_failure=f"verified unchanged resume; capacity cleanup failed: {cleanup_exc}")
+            finalize_verified_predecessor(manifest, status.get("failure"))
             return "activation_failed_rolled_back"
         except Exception as exc:
             failure = str(exc)

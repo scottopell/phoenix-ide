@@ -373,6 +373,8 @@ class ActivationTests(unittest.TestCase):
                 restore_db.assert_not_called()
                 backend.start.assert_not_called()
                 backend.stop.assert_not_called()
+            self.assertTrue(Path(manifest.paired_database_upgrade.backup_path).exists())
+            self.assertTrue(Path(manifest.paired_database_upgrade.proof_path).exists())
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute("SELECT value FROM post_recovery_write").fetchone()[0], "keep")
 
@@ -640,6 +642,139 @@ class ActivationTests(unittest.TestCase):
                         self.assertEqual(helper.main(), 1)
                     release.assert_not_called()
                     self.assertTrue(Path(manifest.active_path).exists())
+
+    def test_unchanged_predecessor_finalization_retries_both_capacity_allocations(self):
+        import sqlite3
+
+        for entry in ("activation", "fresh_recovery", "checkpoint_retry"):
+            for failing_allocation in ("backup", "restore"):
+                with self.subTest(entry=entry, allocation=failing_allocation), tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    manifest, database, _binary, _plist, copied_helper = self._full_paired_fixture(root)
+                    Path(manifest.active_path).write_text(manifest.transaction_id)
+                    helper.write_status(manifest, "activating", failure="snapshot failed")
+                    reserved = helper.reserve_database_capacity(manifest)
+                    failing_path = reserved.backup_path if failing_allocation == "backup" else reserved.restore_path
+                    backend = FakeLaunchctl(manifest)
+                    if entry == "activation":
+                        reserved.backup_path.unlink()
+                        reserved.restore_path.unlink()
+                    else:
+                        backend.inspect = mock.Mock(return_value=("running", 101) if entry == "checkpoint_retry" else ("not_loaded", None))
+                    if entry == "checkpoint_retry":
+                        helper.write_status(manifest, "activation_failed_rolled_back", failure="snapshot failed", recovery_mode="unchanged_predecessor")
+                    original_unlink = Path.unlink
+
+                    def fail_allocation(path, *args, **kwargs):
+                        if path == failing_path:
+                            raise OSError("capacity unlink failed")
+                        return original_unlink(path, *args, **kwargs)
+
+                    with mock.patch.object(helper, "__file__", str(copied_helper)), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), mock.patch.object(helper, "restore_database") as replay:
+                        if entry == "activation":
+                            with mock.patch.object(helper, "_reservation_still_sufficient", side_effect=helper.ActivationError("capacity grew")), mock.patch.object(backend, "inspect", side_effect=lambda: ("not_loaded", None) if backend.events and backend.events[-1] == "stop" else ("running", 101)), mock.patch.object(Path, "unlink", fail_allocation):
+                                state = helper.activate(manifest)
+                        else:
+                            with mock.patch.object(Path, "unlink", fail_allocation):
+                                state = helper.recover_paired(manifest)
+                        self.assertEqual(state, "activation_failed_rollback_failed")
+                        failed = json.loads(Path(manifest.status_path).read_text())
+                        self.assertEqual(failed["recovery_mode"], "unchanged_predecessor", failed)
+                        self.assertIn("capacity finalization failed", failed["rollback_failure"])
+                        self.assertTrue(failing_path.exists())
+                        self.assertTrue(Path(manifest.active_path).exists())
+                        self.assertFalse(helper.status_is_durable_terminal(manifest))
+                        with sqlite3.connect(database) as conn:
+                            conn.execute("UPDATE users SET name = 'after-unchanged-resume'")
+                        backend.inspect = mock.Mock(return_value=("running", 101))
+                        backend.events.clear()
+                        argv = ["helper", "recover-paired", "--manifest", str(root / "manifest.json"), "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+                        with mock.patch.object(sys, "argv", argv), mock.patch.object(helper.Manifest, "load", return_value=manifest), mock.patch.object(helper, "request_helper_bootout"):
+                            self.assertEqual(helper.main(), 0)
+                        replay.assert_not_called()
+                        self.assertEqual(backend.events, [])
+                    self.assertFalse(reserved.backup_path.exists())
+                    self.assertFalse(reserved.restore_path.exists())
+                    self.assertFalse(Path(manifest.active_path).exists())
+                    self.assertEqual(json.loads(Path(manifest.status_path).read_text())["state"], "activation_failed_rolled_back")
+                    with sqlite3.connect(database) as conn:
+                        self.assertEqual(conn.execute("SELECT name FROM users WHERE id = 1").fetchone(), ("after-unchanged-resume",))
+
+    def test_unreadable_finalizer_checkpoint_retains_capacity_and_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest, _database, _binary, _plist, copied_helper = self._full_paired_fixture(Path(td))
+            Path(manifest.active_path).write_text(manifest.transaction_id)
+            helper.write_status(manifest, "activation_failed_rolled_back", recovery_mode="unchanged_predecessor")
+            reserved = helper.reserve_database_capacity(manifest)
+            backend = FakeLaunchctl(manifest)
+            original_finalize = helper.finalize_verified_predecessor
+            original_read = Path.read_text
+
+            def fail_finalizer_read(current, failure):
+                failed = False
+
+                def read(path, *args, **kwargs):
+                    nonlocal failed
+                    if path == Path(current.status_path) and not failed:
+                        failed = True
+                        raise OSError("checkpoint read unavailable")
+                    return original_read(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "read_text", read):
+                    original_finalize(current, failure)
+
+            argv = ["helper", "recover-paired", "--manifest", str(Path(td) / "manifest.json"), "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+            with mock.patch.object(helper, "__file__", str(copied_helper)), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "restore_database") as replay, mock.patch.object(sys, "argv", argv), mock.patch.object(helper.Manifest, "load", return_value=manifest), mock.patch.object(helper, "request_helper_bootout"):
+                with mock.patch.object(helper, "finalize_verified_predecessor", side_effect=fail_finalizer_read):
+                    self.assertEqual(helper.main(), 1)
+                self.assertTrue(reserved.backup_path.exists())
+                self.assertTrue(reserved.restore_path.exists())
+                self.assertTrue(Path(manifest.active_path).exists())
+                status = json.loads(Path(manifest.status_path).read_text())
+                self.assertEqual(status["state"], "activation_failed_rollback_failed")
+                self.assertEqual(status["recovery_mode"], "unchanged_predecessor")
+                self.assertIn("checkpoint read unavailable", status["rollback_failure"])
+                self.assertEqual(backend.events, [])
+                self.assertEqual(helper.main(), 0)
+                replay.assert_not_called()
+                self.assertEqual(backend.events, [])
+            self.assertFalse(reserved.backup_path.exists())
+            self.assertFalse(reserved.restore_path.exists())
+            self.assertFalse(Path(manifest.active_path).exists())
+
+    def test_unchanged_cleanup_interruption_and_directory_fsync_are_retryable(self):
+        for interruption in (SystemExit("cleanup interrupted"), OSError("cleanup directory fsync failed")):
+            with self.subTest(interruption=type(interruption).__name__), tempfile.TemporaryDirectory() as td:
+                manifest, _database, _binary, _plist, copied_helper = self._full_paired_fixture(Path(td))
+                Path(manifest.active_path).write_text(manifest.transaction_id)
+                helper.write_status(manifest, "activation_failed_rolled_back", recovery_mode="unchanged_predecessor")
+                reserved = helper.reserve_database_capacity(manifest)
+                backend = FakeLaunchctl(manifest)
+                original_sync = helper.fsync_dir
+                failed = False
+
+                def fail_cleanup_barrier(path):
+                    nonlocal failed
+                    if not failed and not reserved.backup_path.exists():
+                        failed = True
+                        raise interruption
+                    original_sync(path)
+
+                with mock.patch.object(helper, "__file__", str(copied_helper)), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "restore_database") as replay:
+                    with mock.patch.object(helper, "fsync_dir", side_effect=fail_cleanup_barrier):
+                        if isinstance(interruption, SystemExit):
+                            with self.assertRaises(SystemExit):
+                                helper.recover_paired(manifest)
+                        else:
+                            self.assertEqual(helper.recover_paired(manifest), "activation_failed_rollback_failed")
+                    self.assertTrue(Path(manifest.active_path).exists())
+                    self.assertTrue(reserved.restore_path.exists())
+                    backend.events.clear()
+                    self.assertEqual(helper.recover_paired(manifest), "activation_failed_rolled_back")
+                    self.assertEqual(backend.events, [])
+                    replay.assert_not_called()
+                self.assertFalse(reserved.backup_path.exists())
+                self.assertFalse(reserved.restore_path.exists())
 
     def test_checkpoint_retry_verification_failure_is_durable_and_never_replays_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
