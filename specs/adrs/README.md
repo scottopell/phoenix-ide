@@ -88,6 +88,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 
 | [073](073_preserve-prelocator-prepared-turn-fingerprints.md) | Preserve prelocator prepared-turn fingerprints | Accepted | REQ-COMP-007 |
 | [074](074_active-direct-turn-is-the-restart-baton.md) | Active direct turn is the restart baton | Accepted | REQ-BED-007, REQ-DWF-CHAT-014, REQ-DWF-CHAT-016 |
+| [075](075_gpt-61-sol-is-the-ordinary-product-default.md) | GPT-6.1 Sol is the ordinary product default | Accepted | REQ-LLM-003, REQ-CCR-011, REQ-AG-005/010/011 |
 
 ## For agents: which decisions bind your task
 
