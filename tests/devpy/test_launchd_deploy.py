@@ -1,6 +1,8 @@
 import datetime
 import fcntl
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import plistlib
@@ -331,6 +333,28 @@ class ActivationTests(unittest.TestCase):
                 expected_binary = old_binary if phase == "candidate_install" else b"new binary"
                 self.assertEqual(expected_binary, target_binary.read_bytes())
                 self.assertEqual("activating", json.loads(Path(manifest.status_path).read_text())["state"])
+
+    def test_postcommit_interruption_keeps_pending_diagnostic_and_claim(self):
+        for phase in ("cleanup", "publication"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                original_commit = helper.commit_atomic_install
+
+                def crash_publication(prepared, target):
+                    if Path(target).name == "live.plist":
+                        raise SystemExit("postcommit crash")
+                    return original_commit(prepared, target)
+
+                patch = mock.patch.object(helper, "release_capacity_reservation", side_effect=SystemExit("postcommit crash")) if phase == "cleanup" else mock.patch.object(helper, "commit_atomic_install", side_effect=crash_publication)
+                with patch, self.assertRaises(SystemExit):
+                    self._activate_full_paired(root)
+                status = json.loads((root / "status.json").read_text())
+                self.assertEqual(status["state"], "committed")
+                self.assertTrue(status["finalization_pending"])
+                self.assertFalse(helper.status_is_durable_terminal(type("StatusOwner", (), {"transaction_id": status["transaction_id"], "status_path": str(root / "status.json"), "paired_database_upgrade": object()})()))
+                self.assertIn("pending", status["committed_diagnostic"])
+                self.assertFalse((root / "live.plist").exists())
+                self.assertTrue((root / "active").exists())
 
     def test_private_bootstrap_publication_preserves_strict_restart_configuration(self):
         from types import SimpleNamespace
@@ -1357,6 +1381,36 @@ class PreparationTests(unittest.TestCase):
                 self.dev.cmd_prod_recover_paired("early")
             self.assertFalse(active.exists())
             self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
+
+    def test_status_recovers_paired_guidance_from_claim_without_readable_status(self):
+        for contents in (None, "{", "[]", "null"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                staging = root / "transactions" / "lost"
+                staging.mkdir(parents=True)
+                (staging / "manifest.json").write_text(json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {}}))
+                active, status = root / "active", root / "status.json"
+                active.write_text("lost\n")
+                if contents is not None:
+                    status.write_text(contents)
+                output = io.StringIO()
+                with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), contextlib.redirect_stdout(output):
+                    self.dev._print_launchd_deploy_status()
+                self.assertIn("prod recover-paired", output.getvalue())
+                self.assertIn("Do not remove", output.getvalue())
+                self.assertTrue(active.exists())
+
+    def test_pending_paired_commit_blocks_admission_without_authorizing_rollback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            status.write_text(json.dumps({"transaction_id": "pending", "source_kind": "prepared_artifact", "state": "committed", "finalization_pending": True}))
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status):
+                guidance = self.dev._paired_recovery_refusal("pending")
+            self.assertIn("pending publication/cleanup", guidance)
+            self.assertIn("Do not remove", guidance)
+            self.assertIn("or invoke database rollback", guidance)
+            self.assertNotIn("prod recover-paired", guidance)
 
     def test_initial_status_is_durable_before_owned_claim_publication(self):
         with tempfile.TemporaryDirectory() as td:

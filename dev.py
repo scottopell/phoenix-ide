@@ -9800,11 +9800,21 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
         status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
     except (OSError, json.JSONDecodeError):
         status = {}
+    if not isinstance(status, dict):
+        status = {}
     try:
         manifest = json.loads((LAUNCHD_DEPLOY_DIR / "transactions" / owner / "manifest.json").read_text())
     except (OSError, json.JSONDecodeError):
         manifest = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
     paired = manifest.get("paired_database_upgrade") is not None or manifest.get("source_kind") == "prepared_artifact" or status.get("source_kind") == "prepared_artifact"
+    if paired and status.get("transaction_id") == owner and status.get("state") == "committed" and status.get("finalization_pending"):
+        return (
+            f"paired commit {owner} has pending publication/cleanup; login/reboot persistence is unconfirmed. "
+            "Do not remove its active marker, redeploy, or invoke database rollback. "
+            "Inspect the retained helper and committed warning before any operator action."
+        )
     resolved = status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed", "activation_failed_rolled_back"}
     if paired and not resolved:
         return (
@@ -10680,6 +10690,11 @@ def _print_launchd_restart_status() -> None:
 
 
 def _print_launchd_deploy_status() -> None:
+    owner = _deploy_claim_owner()
+    if owner is not None:
+        refusal = _paired_recovery_refusal(owner)
+        if refusal is not None:
+            print(f"    RECOVERY: {refusal}")
     if not LAUNCHD_DEPLOY_STATUS_PATH.exists():
         return
     try:
@@ -10699,8 +10714,8 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Rollback failure: {deploy['rollback_failure']}")
         if deploy.get("committed_diagnostic"):
             print(f"    Committed warning: {deploy['committed_diagnostic']}")
-        refusal = _paired_recovery_refusal(deploy.get("transaction_id"))
-        if refusal is not None:
+        refusal = _paired_recovery_refusal(owner or deploy.get("transaction_id"))
+        if owner is None and refusal is not None:
             print(f"    RECOVERY: {refusal}")
         if deploy.get("state") in {"preparing", "prepared", "activating"}:
             age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(deploy["updated_at"])

@@ -27,7 +27,7 @@ The prepared-artifact paired path is deliberately narrower than ordinary release
 | Stopped, before snapshot proof | Target service absent; predecessor plist quarantined; binary unchanged | Exclusive legacy DB plus captured binary/config hashes allow private predecessor resume; no DB restoration claimed; release unproven temporary allocations after verified terminal resume. Unknown ownership or modern DB stays stopped/fenced |
 | Snapshot verified, candidate installed/started | Matching snapshot/proof retained; candidate bootstraps private plist; no auto-loaded target plist | Install/start/health interruption retains claim and audit proof; login cannot discover an unverified candidate plist |
 | Failed candidate, paired restore | Service-target teardown; exclusive offline snapshot restore before predecessor binary/start | Private predecessor bootstrap; publish matching plist only after predecessor identity/deployed SHA; failed proof attempts teardown and retains claim/quarantine |
-| Exact candidate durably committed | Candidate identity and deployed SHA verified; commit durable before plist publication | Release only restore reservation, retaining backup/proof; publish prepared candidate plist last preserving the private bootstrap inode for strict restart verification. Cleanup/publication error is a displayed committed warning, never rollback; missing publication does not prove reboot persistence |
+| Exact candidate durably committed | Candidate identity and deployed SHA verified; commit durable before plist publication | Persist pending publication/cleanup warning and retain claim through both attempts. Release only restore reservation, retaining backup/proof; publish prepared candidate plist last preserving the private bootstrap inode for strict restart verification. Cleanup/publication error is a displayed committed warning, never rollback; missing publication does not prove reboot persistence |
 | Terminal failed paired status | Recovery claim unresolved | `prod status` always presents `prod recover-paired` guidance, never generic marker removal |
 
 Focused regression coverage includes real launchctl command shapes, both exact
@@ -37,6 +37,16 @@ resume, unsafe no-snapshot refusal, preparation ownership, SQLite interpreter
 probes, and reservation-only cleanup. These controller refinements are local/CI
 qualification; the devmbp deployment receipt below used an earlier controller
 and is not live verification of these refinements.
+
+## Main implementation gap
+
+The accepted paired contract (REQ-LDD-017) and behavioral model are normative,
+but their controller implementation is not yet shipped on `main`. PR #836 owns
+prepared receipt admission, private paired SQLite recovery, claim/status behavior,
+and regression qualification. The documentation prerequisite PR #842 changes no
+runtime. Until #836 lands, main does not implement these paired guarantees;
+ordinary deployment/restart behavior is separate. Local/source evidence below
+must not be read as main coverage or live verification of every refinement.
 
 ## Requirement coverage
 

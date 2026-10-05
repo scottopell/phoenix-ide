@@ -131,6 +131,10 @@ and predecessor identity. Successful commit removes only the database-adjacent
 restore reservation; private audit backup/proof survive. Verified no-snapshot
 resume removes only the unproven backup seed and temporary restore reservation. A post-commit publication
 or cleanup error is displayed as a committed warning, never an automatic rollback.
+Durable commit records a pending warning before these attempts; interruption
+retains the claim and warns that publication/cleanup is incomplete. Do not
+invoke database rollback or clear that committed claim merely because its helper
+is absent.
 A missing published plist means login/reboot persistence is not established even
 though the verified candidate is running; do not infer recovery from claim release.
 

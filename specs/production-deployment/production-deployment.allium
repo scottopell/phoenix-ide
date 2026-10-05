@@ -15,7 +15,6 @@ config {
 }
 
 enum BackendKind { launchd | systemd | bare_linux }
-enum SourceKind { local_head | published_release | prepared_artifact }
 enum TransactionState {
     preparing | prepared | handed_off | activating | committed
     | precondition_failed | activation_failed_rolled_back
@@ -40,24 +39,46 @@ value PreparedArtifactProof {
     product_conversation_upgrade: Boolean
 }
 
-value PreparedArtifactLifecycleObservation {
-    offline_ownership_proof: String?
-    snapshot_integrity_proof: String?
-    rollback_proof: String?
+entity PreparedArtifactLifecycleObservation {
+    kind: PreparedArtifactAwaitingPreparation | PreparedArtifactPreflight | PreparedArtifactOfflineOwned
+        | PreparedArtifactSnapshotVerified | PreparedArtifactRollbackVerified
 }
+
+variant PreparedArtifactAwaitingPreparation : PreparedArtifactLifecycleObservation {}
+
+variant PreparedArtifactPreflight : PreparedArtifactLifecycleObservation {
+    prepared_artifact_proof: PreparedArtifactProof
+}
+
+variant PreparedArtifactOfflineOwned : PreparedArtifactLifecycleObservation {
+    prepared_artifact_proof: PreparedArtifactProof
+    offline_ownership_proof: String
+}
+
+variant PreparedArtifactSnapshotVerified : PreparedArtifactLifecycleObservation {
+    prepared_artifact_proof: PreparedArtifactProof
+    offline_ownership_proof: String
+    snapshot_integrity_proof: String
+}
+
+variant PreparedArtifactRollbackVerified : PreparedArtifactLifecycleObservation {
+    prepared_artifact_proof: PreparedArtifactProof
+    offline_ownership_proof: String
+    snapshot_integrity_proof: String
+    rollback_proof: String
+}
+
+enum FinalizationOutcome { not_committed | pending | complete | diagnostic_complete }
 
 entity DeployTransaction {
     id: String
     backend: BackendKind
-    source_kind: SourceKind
+    kind: LocalHeadDeployment | PublishedReleaseDeployment | PreparedArtifactDeployment
     source_commit: String
-    release_tag: String?
     expected: RuntimeIdentity
     previous: RuntimeIdentity?
     expected_endpoint: RuntimeEndpoint
     previous_endpoint: RuntimeEndpoint?
-    prepared_artifact_proof: PreparedArtifactProof?
-    paired_lifecycle_observation: PreparedArtifactLifecycleObservation?
     state: TransactionState
     claim_generation: Integer
     created_at: Timestamp
@@ -73,6 +94,7 @@ entity DeployTransaction {
         prepared -> precondition_failed
         prepared -> activation_failed_rolled_back
         prepared -> activation_failed_rollback_failed
+        handed_off -> precondition_failed
         handed_off -> activating
         handed_off -> activation_failed_rolled_back
         handed_off -> activation_failed_rollback_failed
@@ -85,6 +107,18 @@ entity DeployTransaction {
                   activation_failed_rolled_back, rejected_concurrent
     }
 }
+
+variant LocalHeadDeployment : DeployTransaction {}
+
+variant PublishedReleaseDeployment : DeployTransaction {
+    release_tag: String
+}
+
+variant PreparedArtifactDeployment : DeployTransaction {
+    paired_lifecycle_observation: PreparedArtifactLifecycleObservation
+    finalization: FinalizationOutcome
+}
+
 
 entity DeploymentClaim {
     transaction: DeployTransaction
@@ -126,9 +160,10 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   match establishes candidate identity.
 -- prepared_artifact_source_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, the protected standalone
---   artifact and full identity are valid, and a trusted protected prepare-main
---   receipt independently binds the controller helper and protocol. This is
---   source-only evidence and does not assert database lifecycle observations.
+--   artifact identity and receipt contents are valid. The operator establishes
+--   protected run/source association independently of local JSON validation;
+--   clean controller source/helper hash and protocol are independent evidence,
+--   not receipt-derived. This does not assert database lifecycle observations.
 -- paired_database_preflight_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, the immutable proof has
 --   legacy-schema eligibility, a configured candidate/predecessor database path
@@ -211,8 +246,9 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   The typed handoff variant corresponds to transaction.backend and all
 --   host-resident inputs match their declared hashes and allowed locations.
 -- atomic_install_complete(transaction) -> Boolean
---   Fsynced destination-filesystem copies replaced all candidate targets by
---   atomic rename without first unlinking a live path.
+--   Fsynced destination-filesystem artifacts replace the candidate binary by
+--   rename. Ordinary plist publication is complete; paired bootstrap remains
+--   private with its atomic publication link prepared until durable commit.
 -- exact_candidate_running(transaction) -> Boolean
 --   A new backend-owned process serves the exact expected version and complete
 --   40-character git SHA, expected.git_sha equals source_commit, and bare Linux
@@ -259,21 +295,48 @@ variant BareLinuxHandoff : DeploymentHandoff {
 -- PreparedAbandonmentVerified(transaction)
 --   Operator requested recovery and pre_manifest_abandonment_verified holds.
 
-rule PrepareCandidate {
+-- CandidatePreparationCompleted(transaction)
+--   Fallible staging completed under the already acquired preparation claim.
+-- PairedPreflightVerified(transaction, proof)
+--   Legacy path/schema and independent source/controller preflight was verified.
+-- PairedOfflineOwnershipVerified(transaction, proof, ownership)
+--   Service teardown and bounded exclusive offline ownership were verified.
+-- PairedSnapshotVerified(transaction, proof, ownership, snapshot)
+--   Context-bound SQLite snapshot integrity was verified after offline ownership.
+-- HelperCapacityFailed(transaction, failure)
+--   Initial physical allocation failed after handoff but before target stop.
+-- PairedFinalizationFinished(transaction, outcome)
+--   Publication and cleanup attempts finished with success or durable diagnostics.
+-- DurablePreparingStatusWritten(transaction)
+--   Matching preparation identity/PID is durable before ownership publication.
+
+rule AcquirePreparationClaim {
     when: DeploymentRequested(transaction)
     requires: transaction.state = preparing
     requires: claim_available(transaction)
-    requires: selected_source_is_valid(transaction)
-    requires: prepared_artifact_source_is_valid(transaction)
-    requires: paired_database_preflight_is_valid(transaction)
-    requires: controller_identity_is_independently_bound(transaction)
-    requires: previous_rollback_identity_is_valid(transaction)
-    requires: selected_supervisor_artifact_matches_running(transaction)
+    ensures: DurablePreparingStatusWritten(transaction)
     ensures: DeploymentClaim.created(
         transaction: transaction,
         generation: transaction.claim_generation,
         active: true
     )
+
+    @guidance
+        -- Persist preparation owner PID/status before publishing the claim.
+}
+
+rule PrepareCandidate {
+    when: CandidatePreparationCompleted(transaction)
+    requires: transaction.state = preparing
+    requires: current_claim_matches(transaction)
+    requires: selected_source_is_valid(transaction)
+    requires: prepared_artifact_source_is_valid(transaction)
+    requires: paired_database_preflight_is_valid(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment
+        or transaction.paired_lifecycle_observation.kind = PreparedArtifactPreflight
+    requires: controller_identity_is_independently_bound(transaction)
+    requires: previous_rollback_identity_is_valid(transaction)
+    requires: selected_supervisor_artifact_matches_running(transaction)
     ensures: transaction.state = prepared
     ensures: preparation_complete(transaction)
     ensures: installed_environment_is_snapshot(transaction)
@@ -354,11 +417,50 @@ rule BareLinuxActivationHandedOff {
     ensures: transaction.state = handed_off
 }
 
+rule ObservePreparedPreflight {
+    when: PairedPreflightVerified(transaction, proof)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = preparing
+    ensures: transaction.paired_lifecycle_observation = PreparedArtifactPreflight.created(
+        prepared_artifact_proof: proof
+    )
+}
+
+rule ObserveOfflineOwnership {
+    when: PairedOfflineOwnershipVerified(transaction, proof, ownership)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = activating
+    requires: transaction.paired_lifecycle_observation.kind = PreparedArtifactPreflight
+    ensures: transaction.paired_lifecycle_observation = PreparedArtifactOfflineOwned.created(
+        prepared_artifact_proof: proof, offline_ownership_proof: ownership
+    )
+}
+
+rule ObserveSnapshotProof {
+    when: PairedSnapshotVerified(transaction, proof, ownership, snapshot)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = activating
+    requires: transaction.paired_lifecycle_observation.kind = PreparedArtifactOfflineOwned
+    ensures: transaction.paired_lifecycle_observation = PreparedArtifactSnapshotVerified.created(
+        prepared_artifact_proof: proof, offline_ownership_proof: ownership,
+        snapshot_integrity_proof: snapshot
+    )
+}
+
 rule ReserveHelperCapacity {
     when: HelperCapacityVerified(transaction)
     requires: transaction.state = handed_off
     requires: current_claim_matches(transaction)
     ensures: helper_capacity_reserved(transaction)
+}
+
+rule HelperCapacityFailureBeforeStop {
+    when: HelperCapacityFailed(transaction, failure)
+    requires: transaction.state = handed_off
+    ensures: transaction.state = precondition_failed
+    ensures: transaction.failure = failure
+    ensures: ProductionStateUnchanged(transaction)
+    ensures: DurableStatusWritten(transaction)
 }
 
 rule IndependentOwnerBeginsActivation {
@@ -377,13 +479,15 @@ rule CandidateStartupPrepared {
     requires: transaction.state = activating
     requires: current_claim_matches(transaction)
     requires: candidate_startup_proof_is_valid(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment
+        or transaction.paired_lifecycle_observation.kind = PreparedArtifactSnapshotVerified
     ensures: atomic_install_complete(transaction)
 }
 
 rule AbandonInterruptedPreparation {
     when: PreparedAbandonmentVerified(transaction)
     requires: transaction.state = preparing
-    requires: transaction.source_kind = prepared_artifact
+    requires: transaction.kind = PreparedArtifactDeployment
     requires: pre_manifest_abandonment_verified(transaction)
     ensures: transaction.state = precondition_failed
     ensures: DurableStatusWritten(transaction)
@@ -399,11 +503,14 @@ rule CommitVerifiedCandidate {
     requires: current_claim_matches(transaction)
     requires: exact_candidate_running(transaction)
     requires: candidate_startup_proof_is_valid(transaction)
+    requires: atomic_install_complete(transaction)
     ensures: transaction.state = committed
+    ensures: transaction.kind = PreparedArtifactDeployment implies transaction.finalization = pending
     ensures: DeployedShaWritten(transaction.source_commit)
     ensures: DurableStatusWritten(transaction)
 
     @guidance
+        -- Persist pending publication/cleanup diagnostic with durable commit.
         -- For paired launchd, after durable commit release only the temporary
         -- restore reservation and fsync its parent; retain audit snapshot/proof.
         -- Publish the prepared candidate plist last. Publication/cleanup errors
@@ -411,10 +518,24 @@ rule CommitVerifiedCandidate {
         -- establish login/reboot persistence when publication is unconfirmed.
 }
 
+rule RecordPairedFinalizationOutcome {
+    when: PairedFinalizationFinished(transaction, outcome)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = committed
+    requires: transaction.finalization = pending
+    requires: outcome in { complete, diagnostic_complete }
+    ensures: transaction.finalization = outcome
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Clear pending only after both publication and cleanup attempts finish.
+        -- Errors remain committed diagnostics; interruption retains pending and claim.
+}
+
 rule RollBackFailedOrdinaryActivation {
     when: ActivationFailed(transaction, failure)
     requires: transaction.state = activating
-    requires: transaction.source_kind != prepared_artifact
+    requires: transaction.kind != PreparedArtifactDeployment
     requires: current_claim_matches(transaction)
     requires: exact_previous_restored(transaction)
     ensures: transaction.state = activation_failed_rolled_back
@@ -428,7 +549,7 @@ rule RollBackFailedOrdinaryActivation {
 rule RollBackFailedPreparedPairedActivation {
     when: ActivationFailed(transaction, failure)
     requires: transaction.state = activating
-    requires: transaction.source_kind = prepared_artifact
+    requires: transaction.kind = PreparedArtifactDeployment
     requires: current_claim_matches(transaction)
     requires: paired_recovery_succeeded(transaction)
     requires: paired_predecessor_start_order_is_valid(transaction)
@@ -461,7 +582,7 @@ rule PreserveRollbackFailure {
 rule RecoverRetainedPairedTransaction {
     when: PairedRecoveryVerified(transaction)
     requires: transaction.state in { prepared, activating, activation_failed_rollback_failed }
-    requires: transaction.source_kind = prepared_artifact
+    requires: transaction.kind = PreparedArtifactDeployment
     requires: current_claim_matches(transaction)
     requires: supported_recovery_verified(transaction)
     ensures: transaction.state = activation_failed_rolled_back
@@ -471,7 +592,7 @@ rule RecoverRetainedPairedTransaction {
 rule PreservePreparedRecoveryFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
     requires: transaction.state in { prepared, activating, activation_failed_rollback_failed }
-    requires: transaction.source_kind = prepared_artifact
+    requires: transaction.kind = PreparedArtifactDeployment
     requires: current_claim_matches(transaction)
     ensures: transaction.state = activation_failed_rollback_failed
     ensures: candidate_teardown_attempted(transaction)
@@ -487,11 +608,14 @@ rule MatchingTerminalClaimReleased {
     requires: claim.generation = transaction.claim_generation
     requires: durable_terminal_status_exists(transaction)
     requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, activation_failed_rollback_failed }
-    requires: transaction.source_kind != prepared_artifact
+    requires: transaction.kind != PreparedArtifactDeployment
         or transaction.state != activation_failed_rollback_failed
-    requires: transaction.source_kind != prepared_artifact
+    requires: transaction.kind != PreparedArtifactDeployment
         or transaction.state != activation_failed_rolled_back
         or supported_recovery_verified(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment
+        or transaction.state != committed
+        or transaction.finalization in { complete, diagnostic_complete }
     ensures: claim.active = false
 }
 
@@ -540,7 +664,7 @@ invariant LegacyIdentityIsRollbackOnly {
 
 invariant OrdinaryRollbackIsRuntimeOnly {
     for transaction in DeployTransactions:
-        transaction.source_kind != prepared_artifact
+        transaction.kind != PreparedArtifactDeployment
         and transaction.state = activation_failed_rolled_back implies
             RuntimeArtifactRollbackRecorded(transaction)
             and not DatabaseRollbackClaimed(transaction)
@@ -548,13 +672,14 @@ invariant OrdinaryRollbackIsRuntimeOnly {
 
 invariant PairedPublicationRequiresVerification {
     for transaction in DeployTransactions:
-        transaction.source_kind = prepared_artifact implies
+        transaction.kind = PreparedArtifactDeployment implies
             paired_publication_is_verified(transaction)
 }
 
 invariant PreparedArtifactIsLaunchdScoped {
     for transaction in DeployTransactions:
-        transaction.source_kind = prepared_artifact implies
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state not in { preparing, rejected_concurrent, precondition_failed } implies
             transaction.backend = launchd
             and prepared_artifact_source_is_valid(transaction)
             and paired_database_preflight_is_valid(transaction)
@@ -563,7 +688,7 @@ invariant PreparedArtifactIsLaunchdScoped {
 
 invariant FailedPreparedRecoveryRetainsManualRecovery {
     for transaction in DeployTransactions:
-        transaction.source_kind = prepared_artifact
+        transaction.kind = PreparedArtifactDeployment
         and transaction.state = activation_failed_rollback_failed implies
             candidate_teardown_attempted(transaction)
             and paired_transaction_retained(transaction)

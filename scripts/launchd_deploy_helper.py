@@ -239,6 +239,7 @@ def write_status(
     failure: Optional[str] = None,
     rollback_failure: Optional[str] = None,
     committed_diagnostic: Optional[str] = None,
+    finalization_pending: bool = False,
 ) -> None:
     status = {
         "transaction_id": manifest.transaction_id,
@@ -254,6 +255,7 @@ def write_status(
         "failure": failure,
         "rollback_failure": rollback_failure,
         "committed_diagnostic": committed_diagnostic,
+        "finalization_pending": finalization_pending,
     }
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
@@ -1000,25 +1002,31 @@ def activate(manifest: Manifest) -> str:
                 launchctl.start(old_pid, plist_path=manifest.candidate_plist)
             wait_for_identity(manifest, manifest.expected)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
-            write_status(manifest, "committed")
+            paired_commit = manifest.paired_database_upgrade is not None
+            write_status(
+                manifest, "committed", finalization_pending=paired_commit,
+                committed_diagnostic="paired publication/cleanup pending; login/reboot persistence unconfirmed" if paired_commit else None,
+            )
             committed_durable = True
+            diagnostics = []
             if capacity_reservation is not None:
                 try:
                     release_capacity_reservation(manifest, capacity_reservation)
                 except Exception as capacity_exc:
-                    write_status(manifest, "committed", committed_diagnostic=str(capacity_exc))
-            if manifest.paired_database_upgrade is not None:
+                    diagnostics.append(f"restore reservation cleanup failed: {capacity_exc}")
+            if paired_commit:
                 try:
                     commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
                 except Exception as publish_exc:
-                    write_status(manifest, "committed", committed_diagnostic=f"candidate plist publish failed: {publish_exc}")
+                    diagnostics.append(f"candidate plist publish failed: {publish_exc}")
+                write_status(manifest, "committed", committed_diagnostic="; ".join(diagnostics) or None)
             return "committed"
         except Exception as activation_exc:
             failure = str(activation_exc)
             disrupted = disrupted or launchctl.disruption_started
             if committed_durable:
                 try:
-                    write_status(manifest, "committed", committed_diagnostic=failure)
+                    write_status(manifest, "committed", committed_diagnostic=f"paired finalization interrupted: {failure}", finalization_pending=True)
                 except Exception:
                     pass
                 return "committed"
@@ -1203,6 +1211,7 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
         return (
             status.get("transaction_id") == manifest.transaction_id
             and status.get("state") in TERMINAL_STATES
+            and not status.get("finalization_pending", False)
             and not (
                 manifest.paired_database_upgrade is not None
                 and status.get("state") == "activation_failed_rollback_failed"
