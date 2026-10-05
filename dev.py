@@ -8894,16 +8894,19 @@ def _launchd_stop_if_loaded():
         ["launchctl", "print", domain_target],
         capture_output=True, text=True,
     )
-    # launchctl print returns 0 even when service doesn't exist — check output
-    if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
-        return  # Not loaded, nothing to do
-    # Service is loaded — bootout stops and unloads it
-    subprocess.run(
-        ["launchctl", "bootout", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
-        capture_output=True,  # Suppress output; may warn if already stopping
-    )
-    # Brief wait for process to exit
-    time.sleep(1)
+    if result.returncode != 0:
+        helper_path = Path(__file__).resolve().parent / "scripts" / "launchd_deploy_helper.py"
+        absent = subprocess.run([sys.executable, str(helper_path), "--probe-service-absence", LAUNCHD_LABEL, "--uid", str(uid)], capture_output=True, text=True)
+        if absent.returncode == 0:
+            return
+        raise SystemExit("launchd target state is unknown; stop refused")
+    stopped = subprocess.run(["launchctl", "bootout", domain_target], capture_output=True, text=True)
+    if stopped.returncode != 0:
+        raise SystemExit(f"launchd service-target stop failed (exit {stopped.returncode})")
+    helper_path = Path(__file__).resolve().parent / "scripts" / "launchd_deploy_helper.py"
+    absent = subprocess.run([sys.executable, str(helper_path), "--probe-service-absence", LAUNCHD_LABEL, "--uid", str(uid)], capture_output=True, text=True)
+    if absent.returncode != 0:
+        raise SystemExit("launchd service-target teardown unconfirmed")
 
 
 def _file_sha256(path: Path) -> str:
@@ -9813,7 +9816,8 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
         return (
             f"paired commit {owner} has pending publication/cleanup; login/reboot persistence is unconfirmed. "
             "Do not remove its active marker, redeploy, or invoke database rollback. "
-            "Inspect the retained helper and committed warning before any operator action."
+            f"After confirming the old helper is absent, run ./dev.py prod finalize-paired {owner}; "
+            "it verifies the running committed candidate and only retries publication/cleanup."
         )
     resolved = status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed", "activation_failed_rolled_back"}
     if paired and not resolved:
@@ -10017,6 +10021,31 @@ def _helper_plist(
     }, fmt=plistlib.FMT_XML)
 
 
+def cmd_prod_finalize_paired(transaction_id: str) -> None:
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
+        raise SystemExit("paired finalization requires macOS and a safe transaction ID")
+    staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    manifest_path = staging / "manifest.json"
+    payload = json.loads(manifest_path.read_text())
+    status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    owner = _deploy_claim_owner()
+    if status.get("transaction_id") != transaction_id or status.get("state") != "committed" or payload.get("paired_database_upgrade") is None:
+        raise SystemExit("finalization requires the retained committed paired transaction")
+    if owner != transaction_id and (owner is not None or status.get("finalization_pending")):
+        raise SystemExit("paired finalization claim mismatch")
+    helper = Path(payload["paired_database_upgrade"]["controller_helper_path"])
+    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != payload["paired_database_upgrade"].get("controller_helper_sha256"):
+        raise SystemExit("retained helper checksum mismatch")
+    label = payload["helper_label"]
+    absence = subprocess.run([sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+    if absence.returncode != 0:
+        raise SystemExit("previous activation helper absence is unconfirmed")
+    result = subprocess.run([sys.executable, str(helper), "finalize-paired", "--manifest", str(manifest_path), "--helper-label", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"paired finalization refused/failed; claim retained: {result.stderr.strip()}")
+    print(f"Paired finalization complete: {transaction_id}; no runtime/database action.")
+
+
 def cmd_prod_recover_paired(transaction_id: str) -> None:
     if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
         raise SystemExit("paired recovery requires macOS and a safe transaction ID")
@@ -10175,6 +10204,7 @@ def launchd_prod_deploy(
             "failure": str(exc), "rollback_failure": None,
         })
         raise
+    bootstrap_attempted = False
     try:
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
@@ -10355,6 +10385,7 @@ def launchd_prod_deploy(
             "failure": None, "rollback_failure": None,
         })
         _ensure_newsyslog_config()
+        bootstrap_attempted = True
         result = subprocess.run(
             ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)],
             capture_output=True, text=True,
@@ -10362,6 +10393,8 @@ def launchd_prod_deploy(
         if result.returncode != 0:
             raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
     except BaseException as exc:
+        if controller is not None and controller.paired_database_upgrade and bootstrap_attempted:
+            raise
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
@@ -11182,6 +11215,8 @@ def main():
     deploy_parser.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
     recover_parser = prod_sub.add_parser("recover-paired", help="Verify and restore a retained failed paired transaction")
     recover_parser.add_argument("transaction_id")
+    finalize_parser = prod_sub.add_parser("finalize-paired", help="Finalize retained committed paired publication/cleanup without runtime or database changes")
+    finalize_parser.add_argument("transaction_id")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(
@@ -11358,6 +11393,8 @@ def main():
             )
         elif args.prod_command == "recover-paired":
             cmd_prod_recover_paired(args.transaction_id)
+        elif args.prod_command == "finalize-paired":
+            cmd_prod_finalize_paired(args.transaction_id)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":

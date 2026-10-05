@@ -356,6 +356,79 @@ class ActivationTests(unittest.TestCase):
                 self.assertFalse((root / "live.plist").exists())
                 self.assertTrue((root / "active").exists())
 
+    def test_recovery_checkpoint_preserves_new_database_writes_on_retry(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            _state, manifest, database, _binary, _plist, *_ = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("candidate failed"))
+            with sqlite3.connect(database) as conn:
+                conn.execute("CREATE TABLE post_recovery_write(value TEXT)")
+                conn.execute("INSERT INTO post_recovery_write VALUES ('keep')")
+            status = json.loads(Path(manifest.status_path).read_text())
+            status["state"] = "activation_failed_rollback_failed"
+            Path(manifest.status_path).write_text(json.dumps(status))
+            backend = mock.Mock()
+            backend.inspect.return_value = ("running", 123)
+            with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "restore_database") as restore_db:
+                self.assertEqual(helper.recover_paired(manifest), "activation_failed_rolled_back")
+                restore_db.assert_not_called()
+                backend.start.assert_not_called()
+                backend.stop.assert_not_called()
+            with sqlite3.connect(database) as conn:
+                self.assertEqual(conn.execute("SELECT value FROM post_recovery_write").fetchone()[0], "keep")
+
+    def test_loaded_plist_finalization_proof_rejects_lookalike_inode(self):
+        with tempfile.TemporaryDirectory() as td:
+            _state, manifest, _database, _binary, plist, *_ = self._activate_full_paired(Path(td))
+            backend = helper.Launchctl(manifest)
+            same_contents = Path(td) / "lookalike.plist"
+            shutil.copy2(plist, same_contents)
+            for loaded, valid in ((manifest.candidate_plist, True), (str(same_contents), False)):
+                with mock.patch.object(backend, "run", return_value=subprocess.CompletedProcess([], 0, f"path = {loaded}\n", "")):
+                    if valid:
+                        helper.require_loaded_plist(manifest, backend, Path(manifest.candidate_plist))
+                    else:
+                        with self.assertRaises(helper.ActivationError):
+                            helper.require_loaded_plist(manifest, backend, Path(manifest.candidate_plist))
+
+    def test_finalization_retry_only_publishes_and_cleans_owned_capacity(self):
+        for fail in (None, "publish", "cleanup", "claim", "identity"):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as td:
+                state, manifest, database, binary, plist, *_ = self._activate_full_paired(Path(td))
+                helper.write_status(manifest, "committed", finalization_pending=True)
+                Path(manifest.active_path).write_text("other" if fail == "claim" else manifest.transaction_id)
+                plist.unlink()
+                reserved = helper._restore_capacity_path(manifest, database)
+                reserved.write_bytes(b"temporary")
+                before = database.read_bytes()
+                backend = mock.Mock()
+                backend.inspect.return_value = ("running", 101)
+                absent = subprocess.CompletedProcess([], 113, "", f'Could not find service "{manifest.helper_label}" in domain gui/{manifest.uid}')
+                with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("mismatch") if fail == "identity" else None), mock.patch.object(helper.subprocess, "run", return_value=absent), mock.patch.object(helper, "restore_database") as restore_db:
+                    if fail == "publish":
+                        with mock.patch.object(helper, "commit_atomic_install", side_effect=OSError("publish failed")), self.assertRaises(OSError):
+                            helper.finalize_paired(manifest)
+                        self.assertEqual(helper.finalize_paired(manifest), "committed")
+                    elif fail == "cleanup":
+                        with mock.patch.object(helper, "fsync_dir", side_effect=OSError("cleanup failed")), self.assertRaises(OSError):
+                            helper.finalize_paired(manifest)
+                        self.assertEqual(helper.finalize_paired(manifest), "committed")
+                    elif fail in ("claim", "identity"):
+                        with self.assertRaises(helper.ActivationError):
+                            helper.finalize_paired(manifest)
+                    else:
+                        self.assertEqual(helper.finalize_paired(manifest), "committed")
+                        self.assertEqual(helper.finalize_paired(manifest), "committed")
+                        self.assertTrue(Path(manifest.candidate_plist).samefile(plist))
+                        self.assertFalse(reserved.exists())
+                        self.assertFalse(Path(manifest.active_path).exists())
+                    restore_db.assert_not_called()
+                    backend.start.assert_not_called()
+                    backend.stop.assert_not_called()
+                self.assertEqual(database.read_bytes(), before)
+                if fail in ("claim", "identity"):
+                    self.assertTrue(Path(manifest.active_path).exists())
+                    self.assertTrue(json.loads(Path(manifest.status_path).read_text())["finalization_pending"])
+
     def test_private_bootstrap_publication_preserves_strict_restart_configuration(self):
         from types import SimpleNamespace
         restart = load(ROOT / "scripts" / "launchd_restart_helper.py", "paired_restart_seam_test")
@@ -426,7 +499,7 @@ class ActivationTests(unittest.TestCase):
                 status = json.loads(Path(manifest.status_path).read_text())
                 self.assertNotIn("recovery teardown failed", status["rollback_failure"])
 
-    def test_explicit_recovery_restores_verified_pair_before_releasing_claim(self):
+    def test_checkpointed_recovery_refuses_snapshot_replay_without_running_predecessor(self):
         with tempfile.TemporaryDirectory() as td:
             result = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("candidate failed"), predecessor_health_failure=helper.ActivationError("recovery failed"))
             _state, manifest, database, *_rest, launchctl = result
@@ -434,13 +507,13 @@ class ActivationTests(unittest.TestCase):
             status["state"] = "activating"
             Path(manifest.status_path).write_text(json.dumps(status))
             with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "restore_deployed_sha"), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
-                self.assertEqual(helper.recover_paired(manifest), "activation_failed_rolled_back")
-                self.assertTrue(helper.status_is_durable_terminal(manifest))
-                helper.release_claim(manifest)
-            self.assertFalse(Path(manifest.active_path).exists())
+                with mock.patch.object(helper, "restore_database") as restore_db:
+                    self.assertEqual(helper.recover_paired(manifest), "activation_failed_rollback_failed")
+                    restore_db.assert_not_called()
+                self.assertFalse(helper.status_is_durable_terminal(manifest))
+            self.assertTrue(Path(manifest.active_path).exists())
             import sqlite3
-            self.assertTrue(Path(manifest.target_plist).exists())
-            self.assertEqual(helper.sha256(Path(manifest.target_plist)), manifest.rollback_plist_sha256)
+            self.assertFalse(Path(manifest.target_plist).exists())
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute("SELECT MAX(version) FROM _migrations").fetchone()[0], 69)
 
@@ -1391,6 +1464,23 @@ class PreparationTests(unittest.TestCase):
             self.assertFalse(active.exists())
             self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
 
+    def test_finalization_controller_uses_retained_helper_without_bootstrap(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staging = root / "transactions" / "pending"
+            staging.mkdir(parents=True)
+            script = staging / "launchd_deploy_helper.py"
+            script.write_bytes(b"retained helper")
+            (staging / "manifest.json").write_text(json.dumps({"transaction_id": "pending", "helper_label": "dev.activation.pending", "paired_database_upgrade": {"controller_helper_sha256": self.dev._file_sha256(script), "controller_helper_path": str(script)}}))
+            active, status = root / "active", root / "status.json"
+            active.write_text("pending\n")
+            status.write_text(json.dumps({"transaction_id": "pending", "state": "committed", "finalization_pending": True}))
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                self.dev.cmd_prod_finalize_paired("pending")
+            self.assertEqual(run.call_count, 2)
+            self.assertIn("finalize-paired", run.call_args.args[0])
+            self.assertFalse(any("bootstrap" in call.args[0] for call in run.call_args_list))
+
     def test_committed_recovery_refusal_never_bootstraps_or_rewrites_status(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1872,6 +1962,15 @@ class PreparationTests(unittest.TestCase):
                 self.dev.launchd_prod_deploy()
             self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
 
+    def test_prod_stop_uses_service_target_and_requires_absence(self):
+        success = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(self.dev.subprocess, "run", side_effect=[success, success, success]) as run:
+            self.dev._launchd_stop_if_loaded()
+        self.assertEqual(run.call_args_list[1].args[0], ["launchctl", "bootout", f"gui/{os.getuid()}/{self.dev.LAUNCHD_LABEL}"])
+        self.assertIn("--probe-service-absence", run.call_args_list[2].args[0])
+        with mock.patch.object(self.dev.subprocess, "run", side_effect=[success, subprocess.CompletedProcess([], 5, "", "")]), self.assertRaisesRegex(SystemExit, "stop failed"):
+            self.dev._launchd_stop_if_loaded()
+
     def test_activation_sqlite_interpreter_probe_failure_prevents_bootstrap(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1893,6 +1992,36 @@ class PreparationTests(unittest.TestCase):
                     self.dev.launchd_prod_deploy()
             self.assertFalse(any("bootstrap" in c.args[0] for c in calls.call_args_list))
             self.assertFalse((root / "deploy" / "active").exists())
+
+    def test_paired_bootstrap_interruption_retains_prepared_claim_without_overwrite(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staging = root / "deploy" / "transactions" / "interrupted"
+            candidate = root / "candidate"
+            candidate.write_bytes(b"candidate")
+            installed = root / "installed"
+            installed.mkdir()
+            (installed / "phoenix-ide").write_bytes(b"previous")
+            target_plist = root / "installed.plist"
+            target_plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"PATH": "/test", "PHOENIX_PASSWORD": "test-only"}}))
+            identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
+            previous = self.dev.RuntimeIdentity("1.0.0", "b" * 40)
+            prepared = self.dev.PreparedCandidate(binary=candidate, source_kind=self.dev.ProdSourceKind.PREPARED_ARTIFACT, source_commit=identity.git_sha, identity=identity)
+            controller = self.dev.ProdDeployControllerOptions(transaction_id="interrupted", prepared_artifact=root, expected_full_commit=identity.git_sha, paired_database_upgrade=True)
+            def run(command, **_kwargs):
+                if "rev-parse" in command:
+                    return subprocess.CompletedProcess(command, 0, "d" * 40, "")
+                if "bootstrap" in command:
+                    raise KeyboardInterrupt("accepted handoff response interrupted")
+                if "--protocol-version" in command:
+                    return subprocess.CompletedProcess(command, 0, str(self.dev.LAUNCHD_HANDOFF_PROTOCOL_VERSION) + "\n", "")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "deploy" / "active"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", root / "deploy" / "status.json"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", installed), mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", target_plist), mock.patch.object(self.dev, "_restart_claim_owner", return_value=None), mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({"PATH": "/test", "PHOENIX_PASSWORD": "test-only"}, None)), mock.patch.object(self.dev, "_prepare_prepared_artifact", return_value=prepared), mock.patch.object(self.dev, "_binary_identity", side_effect=lambda path: previous if Path(path).name == "rollback.bin" else identity), mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda *_args: None), mock.patch.object(self.dev, "_file_sha256", return_value="c" * 64), mock.patch.object(self.dev, "generate_launchd_plist", return_value=target_plist.read_bytes().decode()), mock.patch.object(self.dev, "_ensure_newsyslog_config"), mock.patch.object(self.dev.subprocess, "run", side_effect=run):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.dev.launchd_prod_deploy(controller=controller)
+            self.assertEqual((root / "deploy" / "active").read_text().strip(), "interrupted")
+            self.assertEqual(json.loads((root / "deploy" / "status.json").read_text())["state"], "prepared")
 
     def test_precondition_failure_records_typed_candidate_identity(self):
         with tempfile.TemporaryDirectory() as td:

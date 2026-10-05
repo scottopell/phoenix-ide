@@ -104,3 +104,7 @@ THE SYSTEM SHALL NOT generalize this feature-scoped pair into automatic database
 ### REQ-PD-019 — Feature-scoped prepared paired upgrade
 
 THE shared production deployment contract SHALL treat the macOS launchd prepared-artifact/ProductConversation database upgrade as an explicit feature-scoped guarantee, not as a general snapshot or downgrade facility. Other backends and ordinary runtime-only deployment retain their existing database behavior.
+
+### REQ-PD-020 — Narrow committed paired finalization
+
+The shared command surface SHALL expose `prod finalize-paired TXN` only for the launchd paired contract under `specs/launchd-deployment/requirements.md` REQ-LDD-018. This operation SHALL be publication/reservation-only and SHALL NOT reuse runtime activation or database rollback. Unknown ownership, helper absence, committed identity or captured configuration SHALL retain the fence and refuse.

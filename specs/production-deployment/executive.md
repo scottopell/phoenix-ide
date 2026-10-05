@@ -20,13 +20,17 @@ not a later live deployment on devmbp.
 
 ## Main implementation gap
 
-The accepted paired contract (REQ-PD-018 and REQ-PD-019) and behavioral model are normative,
+The accepted paired contract (REQ-PD-018, REQ-PD-019 and REQ-PD-020) and behavioral model are normative,
 but their controller implementation is not yet shipped on `main`. PR #836 owns
 prepared receipt admission, private paired SQLite recovery, claim/status behavior,
 and regression qualification. The documentation prerequisite PR #842 changes no
 runtime. Until #836 lands, main does not implement these paired guarantees;
 ordinary deployment/restart behavior is separate. Local/source evidence below
 must not be read as main coverage or live verification of every refinement.
+
+The committed finalization-only resumer is commissioned by Global as delegated
+engineering scope, not a new quoted user release/deployment authorization.
+It is qualified locally/CI only; no healthy production finalization was executed.
 
 ## Requirement coverage
 

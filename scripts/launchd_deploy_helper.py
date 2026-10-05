@@ -62,17 +62,6 @@ class PairedDatabaseUpgrade:
 
 
 @dataclasses.dataclass(frozen=True)
-class PairedDatabaseUpgrade:
-    """The sole structural representation of the feature-scoped DB snapshot."""
-    database_path: str
-    backup_path: str
-    proof_path: str
-    controller_source_commit: str
-    controller_helper_sha256: str
-    controller_helper_path: str
-
-
-@dataclasses.dataclass(frozen=True)
 class DatabaseCapacityReservation:
     backup_path: Path
     restore_path: Path
@@ -240,7 +229,16 @@ def write_status(
     rollback_failure: Optional[str] = None,
     committed_diagnostic: Optional[str] = None,
     finalization_pending: bool = False,
+    recovery_started: bool = False,
+    recovery_mode: Optional[str] = None,
 ) -> None:
+    try:
+        prior = json.loads(Path(manifest.status_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        prior = {}
+    if isinstance(prior, dict) and prior.get("transaction_id") == manifest.transaction_id and prior.get("recovery_started"):
+        recovery_started = True
+        recovery_mode = recovery_mode or prior.get("recovery_mode")
     status = {
         "transaction_id": manifest.transaction_id,
         "state": state,
@@ -256,6 +254,8 @@ def write_status(
         "rollback_failure": rollback_failure,
         "committed_diagnostic": committed_diagnostic,
         "finalization_pending": finalization_pending,
+        "recovery_started": recovery_started,
+        "recovery_mode": recovery_mode,
     }
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
@@ -799,6 +799,11 @@ def restore(
             prepared_rollback[1] if prepared_rollback is not None
             else prepare_plist_publication(rollback_plist, Path(manifest.target_plist))
         )
+        try:
+            existing = json.loads(Path(manifest.status_path).read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        write_status(manifest, "activation_failed_rollback_failed", failure=existing.get("failure"), rollback_failure=existing.get("rollback_failure"), recovery_started=True, recovery_mode="snapshot_restored" if database_snapshot else "unchanged_predecessor")
         old_pid = launchctl.inspect()[1]
         launchctl.start(old_pid, plist_path=str(rollback_plist))
     else:
@@ -1143,9 +1148,69 @@ def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = 
         prior = {}
     if prior.get("state") in {"committed", "preparing"}:
         return
+    if prior.get("recovery_started") and prior.get("state") == "activation_failed_rolled_back":
+        return
     previous = prior.get("rollback_failure")
     merged = f"{previous}; recovery attempt failed: {error}" if previous else error
     write_status(manifest, "activation_failed_rollback_failed", failure=prior.get("failure"), rollback_failure=merged)
+
+
+def require_loaded_plist(manifest: Manifest, launchctl: Launchctl, private: Path) -> None:
+    result = launchctl.run(["launchctl", "print", launchctl.target], capture_output=True, text=True)
+    match = re.search(r"^\s*path = (.+)$", result.stdout, re.MULTILINE)
+    if result.returncode != 0 or match is None or not Path(match.group(1).strip()).samefile(private):
+        raise ActivationError("loaded configuration does not match retained private plist")
+
+
+def finalize_paired(manifest: Manifest) -> str:
+    with Path(manifest.lock_path).open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another deployment owns finalization") from exc
+        validate_manifest_identities(manifest)
+        validate_manifest_mode(manifest)
+        if manifest.paired_database_upgrade is None:
+            raise ActivationError("finalization requires paired transaction")
+        old_helper = subprocess.run(["launchctl", "print", f"gui/{manifest.uid}/{manifest.helper_label}"], capture_output=True, text=True)
+        if old_helper.returncode == 0 or not service_absence_confirmed(old_helper.stdout + "\n" + old_helper.stderr, manifest.helper_label, manifest.uid):
+            raise ActivationError("activation helper absence unconfirmed")
+        status = json.loads(Path(manifest.status_path).read_text())
+        if status.get("transaction_id") != manifest.transaction_id or status.get("state") != "committed":
+            raise ActivationError("finalization requires matching committed status")
+        claim = Path(manifest.active_path)
+        owner = claim.read_text().strip() if claim.exists() else None
+        if owner != manifest.transaction_id and (owner is not None or status.get("finalization_pending")):
+            raise ActivationError("finalization claim mismatch")
+        if sha256(Path(__file__)) != manifest.paired_database_upgrade.controller_helper_sha256:
+            raise ActivationError("retained helper checksum mismatch")
+        verify_staged(manifest.target_binary, manifest.candidate_binary_sha256, "committed candidate binary")
+        private = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "committed private plist")
+        launchctl = Launchctl(manifest)
+        state, pid = launchctl.inspect()
+        if state != "running" or pid is None:
+            raise ActivationError("committed candidate is not running")
+        require_loaded_plist(manifest, launchctl, private)
+        wait_for_identity(manifest, manifest.expected)
+        if owner is None and not status.get("finalization_pending"):
+            if not Path(manifest.target_plist).samefile(private):
+                raise ActivationError("completed publication identity mismatch")
+            return "committed"
+        write_status(manifest, "committed", finalization_pending=True, committed_diagnostic="paired finalization retry pending")
+        try:
+            reservation = _restore_capacity_path(manifest, Path(manifest.paired_database_upgrade.database_path))
+            if reservation.is_symlink():
+                raise ActivationError("restore reservation is symlink")
+            reservation.unlink(missing_ok=True)
+            fsync_dir(reservation.parent)
+            publication = prepare_plist_publication(private, Path(manifest.target_plist))
+            commit_atomic_install(publication, Path(manifest.target_plist))
+            write_status(manifest, "committed")
+        except Exception as exc:
+            write_status(manifest, "committed", finalization_pending=True, committed_diagnostic=f"finalization failed: {exc}")
+            raise
+        release_claim(manifest)
+        return "committed"
 
 
 def recover_paired(manifest: Manifest) -> str:
@@ -1167,6 +1232,19 @@ def recover_paired(manifest: Manifest) -> str:
             raise ActivationError("paired recovery must own a retained unresolved transaction")
         launchctl = Launchctl(manifest)
         try:
+            if status.get("recovery_started"):
+                verify_staged(manifest.target_binary, manifest.rollback_binary_sha256, "running predecessor binary")
+                private = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "private predecessor plist")
+                state, pid = launchctl.inspect()
+                if state != "running" or pid is None:
+                    raise ActivationError("post-restore checkpoint has no running predecessor; refuse snapshot replay")
+                require_loaded_plist(manifest, launchctl, private)
+                wait_for_identity(manifest, manifest.previous, health_url=manifest.previous_health_url, health_insecure_tls=manifest.previous_health_insecure_tls, health_json=manifest.previous_health_json)
+                restore_deployed_sha(manifest)
+                publication = prepare_plist_publication(private, Path(manifest.target_plist))
+                commit_atomic_install(publication, Path(manifest.target_plist))
+                write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"))
+                return "activation_failed_rolled_back"
             paired = manifest.paired_database_upgrade
             snapshot_exists = Path(paired.proof_path).exists() or Path(paired.proof_path).is_symlink()
             if not snapshot_exists:
@@ -1225,7 +1303,7 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", nargs="?", choices=["activate", "recover-paired"])
+    parser.add_argument("command", nargs="?", choices=["activate", "recover-paired", "finalize-paired"])
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--probe-service-absence")
     parser.add_argument("--manifest", type=Path)
@@ -1245,7 +1323,7 @@ def main() -> int:
         manifest = Manifest.load(args.manifest)
         if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
             raise ActivationError("helper identity does not match the immutable manifest")
-        state = recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
+        state = finalize_paired(manifest) if args.command == "finalize-paired" else recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
         if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(state, flush=True)
@@ -1255,22 +1333,23 @@ def main() -> int:
             try:
                 if args.command == "recover-paired":
                     record_recovery_error(manifest, str(exc))
-                else:
+                elif args.command != "finalize-paired":
                     write_status(manifest, "rejected_concurrent", failure=str(exc))
             finally:
-                if status_is_durable_terminal(manifest):
+                if args.command != "finalize-paired" and status_is_durable_terminal(manifest):
                     release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
         if manifest is not None and args.command == "recover-paired":
             record_recovery_error(manifest, str(exc))
-        if manifest is not None and status_is_durable_terminal(manifest):
+        if manifest is not None and args.command != "finalize-paired" and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        request_helper_bootout(args.uid, args.helper_label)
+        if args.command != "finalize-paired":
+            request_helper_bootout(args.uid, args.helper_label)
 
 
 if __name__ == "__main__":

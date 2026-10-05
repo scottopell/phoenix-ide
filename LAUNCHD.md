@@ -145,3 +145,19 @@ not auto-start an unverified job. Verified paired recovery reinstalls the matchi
 predecessor plist after database restoration. Quarantine or teardown failure is
 reported explicitly; an active claim alone is not proof the operating system
 cannot run a job.
+
+### Interrupted committed paired finalization
+
+Run `./dev.py prod finalize-paired TRANSACTION_ID` only for the displayed retained
+committed transaction. The synchronous retained helper proves old-helper absence,
+exclusive ownership and the exact running candidate/configuration, then retries
+only private-plist publication and temporary restore-reservation cleanup. It never
+stops/bootstraps the runtime or reads/writes the database. Success prints
+`Paired finalization complete: …; no runtime/database action.`; interrupted/error
+attempts retain pending status and claim. A completed rerun verifies the same
+candidate and published inode rather than applying current repository settings.
+
+Recovery records a durable startup checkpoint before predecessor startup. After
+that point, a retry verifies/finalizes the running predecessor without replaying
+the original snapshot; unknown or stopped predecessor remains fenced for explicit
+operator investigation. This avoids deleting writes accepted after earlier recovery.

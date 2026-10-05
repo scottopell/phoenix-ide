@@ -61,6 +61,8 @@ variant PreparedArtifactSnapshotVerified : PreparedArtifactLifecycleObservation 
 }
 
 
+enum PairedRecoveryMode { snapshot_restored | unchanged_predecessor }
+
 enum FinalizationOutcome { not_committed | pending | complete | diagnostic_complete }
 
 entity DeployTransaction {
@@ -110,6 +112,7 @@ variant PublishedReleaseDeployment : DeployTransaction {
 variant PreparedArtifactDeployment : DeployTransaction {
     paired_lifecycle_observation: PreparedArtifactLifecycleObservation
     finalization: FinalizationOutcome
+    recovery_mode: PairedRecoveryMode?
 }
 
 
@@ -320,6 +323,7 @@ rule AcquirePreparationClaim {
     requires: transaction.state = preparing
     requires: claim_available(transaction)
     requires: selected_supervisor_artifact_matches_running(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment or transaction.backend = launchd
     ensures: DurablePreparingStatusWritten(transaction)
     ensures: DeploymentClaim.created(
         transaction: transaction,
@@ -528,6 +532,30 @@ rule CommitVerifiedCandidate {
         -- establish login/reboot persistence when publication is unconfirmed.
 }
 
+rule ResumeCommittedPairedFinalization {
+    when: PairedFinalizationRequested(transaction)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = committed
+    requires: transaction.finalization = pending
+    requires: committed_finalization_context_is_valid(transaction)
+    ensures: PairedFinalizationAttemptsResumed(transaction)
+
+    @guidance
+        -- Explicit finalize-paired verifies retained byte-bound helper, matching
+        -- claim, helper absence, running exact candidate/binary/private loaded
+        -- configuration and mutual exclusion. Retry only plist publication and
+        -- temporary restore reservation cleanup; no stop/bootstrap/restart/DB IO.
+        -- Pending survives interruption; durable completion releases owned claim.
+}
+
+-- committed_finalization_context_is_valid(transaction) -> Boolean
+--   Exact retained transaction/helper/claim, absent prior helper, matching running
+--   committed binary/config/identity and exclusive operation lock; unknown rejects.
+-- PairedFinalizationRequested(transaction)
+--   Operator invoked prod finalize-paired for a retained committed transaction.
+-- PairedFinalizationAttemptsResumed(transaction)
+--   Publication/cleanup attempts resumed without any runtime/database mutation.
+
 rule RecordPairedFinalizationOutcome {
     when: PairedFinalizationFinished(transaction, outcome)
     requires: transaction.kind = PreparedArtifactDeployment
@@ -567,6 +595,8 @@ rule RollBackFailedPreparedPairedActivation {
     ensures: transaction.failure = failure
     ensures: DurableStatusWritten(transaction)
     ensures: RuntimeArtifactRollbackRecorded(transaction)
+    ensures: paired_snapshot_restored(transaction) implies transaction.recovery_mode = snapshot_restored
+    ensures: paired_unchanged_predecessor_verified(transaction) implies transaction.recovery_mode = unchanged_predecessor
     ensures: paired_snapshot_restored(transaction) implies DatabaseRollbackCompleted(transaction)
     ensures: paired_unchanged_predecessor_verified(transaction) implies not DatabaseRollbackClaimed(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
@@ -590,12 +620,15 @@ rule PreserveRollbackFailure {
 }
 
 rule RecoverRetainedPairedTransaction {
-    when: PairedRecoveryVerified(transaction)
+    when: PairedRecoveryVerified(transaction, mode)
     requires: transaction.state in { prepared, activating, activation_failed_rollback_failed }
     requires: transaction.kind = PreparedArtifactDeployment
     requires: current_claim_matches(transaction)
     requires: supported_recovery_verified(transaction)
     ensures: transaction.state = activation_failed_rolled_back
+    ensures: transaction.recovery_mode = mode
+    ensures: mode = snapshot_restored implies DatabaseRollbackCompleted(transaction)
+    ensures: mode = unchanged_predecessor implies not DatabaseRollbackClaimed(transaction)
     ensures: DurableStatusWritten(transaction)
 }
 
