@@ -4915,6 +4915,7 @@ def _wait_for_kache_daemon(
                 cwd=cargo_cwd,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 env=os.environ,
                 timeout=2,
                 check=False,

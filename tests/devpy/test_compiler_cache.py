@@ -249,6 +249,18 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(self.dev.time, "sleep"):
             self.assertIsNone(self.dev._wait_for_kache_daemon("/bin/kache", timeout=1))
 
+    def test_kache_readiness_replaces_undecodable_output(self):
+        status = mock.Mock(returncode=0, stdout="\ufffd", stderr="")
+        clock = iter((0.0, 0.0, 1.0))
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.subprocess, "run", return_value=status
+        ) as run, mock.patch.object(
+            self.dev.time, "monotonic", side_effect=lambda: next(clock)
+        ), mock.patch.object(self.dev.time, "sleep"):
+            error = self.dev._wait_for_kache_daemon("/bin/kache", timeout=0.5)
+        self.assertIn("Expecting value", error or "")
+        self.assertEqual("replace", run.call_args.kwargs["errors"])
+
     def test_kache_readiness_rejects_non_object_status(self):
         status = mock.Mock(returncode=0, stdout="null", stderr="")
         clock = iter((0.0, 0.0, 1.0))
