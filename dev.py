@@ -4976,7 +4976,7 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
             "KACHE_LOG_FILE",
         )
         if backend == "kache"
-        else ("SCCACHE_DIR", "SCCACHE_CONF")
+        else ("SCCACHE_DIR", "SCCACHE_CONF", "SCCACHE_ERROR_LOG")
     )
     for name in names:
         value = os.environ.get(name)
