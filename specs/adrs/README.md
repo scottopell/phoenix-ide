@@ -83,11 +83,10 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [069](069_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
 | [070](070_trusted-input-provenance-and-global-watches.md) | Trusted input provenance and explicit Global conversation watches | Accepted | REQ-GR-007, REQ-GR-014, REQ-GR-015 |
 | [071](071_historical-input-retries-retain-unknown-provenance.md) | Historical input retries retain unknown provenance | Accepted | REQ-GR-014, REQ-DWF-039, REQ-COMP-001 |
-
 | [072](072_source-input-links-pin-originating-tool-invocations.md) | Source input links pin originating tool invocations | Accepted | REQ-GR-014, REQ-COMP-001 |
-
 | [073](073_preserve-prelocator-prepared-turn-fingerprints.md) | Preserve prelocator prepared-turn fingerprints | Accepted | REQ-COMP-007 |
 | [074](074_active-direct-turn-is-the-restart-baton.md) | Active direct turn is the restart baton | Accepted | REQ-BED-007, REQ-DWF-CHAT-014, REQ-DWF-CHAT-016 |
+| [075](075_project-coordinator-is-an-ordinary-productconversation-profile.md) | Project Coordinator is an ordinary ProductConversation profile | Accepted | REQ-PCO-001 through REQ-PCO-007; `ProductConversation`, continuation compaction, provider prompt composition |
 
 ## For agents: which decisions bind your task
 
