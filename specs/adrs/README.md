@@ -88,7 +88,6 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 
 | [073](073_preserve-prelocator-prepared-turn-fingerprints.md) | Preserve prelocator prepared-turn fingerprints | Accepted | REQ-COMP-007 |
 | [074](074_active-direct-turn-is-the-restart-baton.md) | Active direct turn is the restart baton | Accepted | REQ-BED-007, REQ-DWF-CHAT-014, REQ-DWF-CHAT-016 |
-
 | [075](075_prepared-artifact-paired-launchd-upgrade-fails-closed.md) | Prepared artifacts pair a clean controller with private SQLite proof and fail-closed rollback | Accepted | REQ-LDD-017, REQ-PD-018, REQ-COMP-007 |
 
 ## For agents: which decisions bind your task
