@@ -5097,6 +5097,7 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
             os.environ[name] = str(path if path.is_absolute() else base / path)
     if backend == "sccache":
         _normalize_path_list("SCCACHE_EXTRAFILES", base)
+        _normalize_path_list("SCCACHE_BASEDIRS", base)
         uds = os.environ.get("SCCACHE_SERVER_UDS")
         if uds and not uds.startswith("\\x00"):
             uds_path = Path(uds).expanduser()

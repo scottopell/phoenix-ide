@@ -842,6 +842,7 @@ class CompilerCacheTests(unittest.TestCase):
             {
                 "SCCACHE_STARTUP_NOTIFY": "run/notify.sock",
                 "SCCACHE_EXTRAFILES": f"one.h{os.pathsep}nested/two.h",
+                "SCCACHE_BASEDIRS": f".{os.pathsep}nested/source",
                 "SCCACHE_SERVER_UDS": "run/sccache.sock",
             },
             clear=True,
@@ -851,6 +852,10 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual(
                 f"/workspace/one.h{os.pathsep}/workspace/nested/two.h",
                 os.environ["SCCACHE_EXTRAFILES"],
+            )
+            self.assertEqual(
+                f"/workspace{os.pathsep}/workspace/nested/source",
+                os.environ["SCCACHE_BASEDIRS"],
             )
             self.assertEqual("/workspace/run/sccache.sock", os.environ["SCCACHE_SERVER_UDS"])
 
