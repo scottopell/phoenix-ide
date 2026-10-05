@@ -9879,6 +9879,7 @@ def _claim_launchd_deploy(transaction_id: str, *, initial_status: dict | None = 
             stream.write(transaction_id + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        _fsync_directory(LAUNCHD_DEPLOY_ACTIVE_PATH.parent)
 
 
 def _claim_launchd_restart(transaction_id: str) -> None:
@@ -10044,7 +10045,7 @@ def cmd_prod_finalize_paired(transaction_id: str) -> None:
     helper = Path(payload["paired_database_upgrade"]["controller_helper_path"])
     if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != payload["paired_database_upgrade"].get("controller_helper_sha256"):
         raise SystemExit("retained helper checksum mismatch")
-    interpreter = subprocess.run([sys.executable, "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"], capture_output=True, text=True)
+    interpreter = subprocess.run([sys.executable, "-c", "import fcntl, plistlib, ssl, urllib.request"], capture_output=True, text=True)
     if interpreter.returncode != 0:
         raise SystemExit("current interpreter cannot run retained paired finalization helper")
     label = payload["helper_label"]

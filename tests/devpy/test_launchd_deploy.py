@@ -1868,10 +1868,24 @@ class PreparationTests(unittest.TestCase):
             active, status = root / "active", root / "status.json"
             active.write_text("pending\n")
             status.write_text(json.dumps({"transaction_id": "pending", "state": "committed", "finalization_pending": True}))
-            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            import builtins
+            original_import = builtins.__import__
+
+            def sqlite_unavailable(name, *args, **kwargs):
+                if name == "sqlite3":
+                    raise ModuleNotFoundError("optional sqlite3 unavailable")
+                return original_import(name, *args, **kwargs)
+
+            def execute_probe(command, **_kwargs):
+                if "-c" in command:
+                    with mock.patch.object(builtins, "__import__", side_effect=sqlite_unavailable):
+                        exec(command[-1], {})
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev.subprocess, "run", side_effect=execute_probe) as run:
                 self.dev.cmd_prod_finalize_paired("pending")
             self.assertEqual(run.call_count, 3)
-            self.assertIn("sqlite3", run.call_args_list[0].args[0][-1])
+            self.assertNotIn("sqlite3", run.call_args_list[0].args[0][-1])
             self.assertIn("finalize-paired", run.call_args.args[0])
             self.assertFalse(any("bootstrap" in call.args[0] for call in run.call_args_list))
 
@@ -1978,6 +1992,53 @@ class PreparationTests(unittest.TestCase):
             with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev, "_restart_claim_owner", return_value=None), mock.patch.object(self.dev.os, "open", side_effect=open_after_status):
                 self.dev._claim_launchd_deploy("early", initial_status=initial)
             self.assertEqual(active.read_text(), "early\n")
+
+    def test_claim_parent_fsync_follows_status_and_marker_file_fsync(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active, status = root / "active", root / "status.json"
+            initial = {"transaction_id": "early", "state": "preparing", "source_kind": "prepared_artifact", "preparing_pid": os.getpid()}
+            original_fsync = os.fsync
+            events = []
+
+            def file_sync(fd):
+                if active.exists() and os.fstat(fd).st_ino == active.stat().st_ino:
+                    events.append("marker-file")
+                original_fsync(fd)
+
+            def directory_sync(path):
+                self.assertEqual(json.loads(status.read_text()), initial)
+                if not active.exists():
+                    return
+                self.assertEqual(active.read_text().strip(), "early")
+                self.assertEqual(events, ["marker-file"])
+                self.assertEqual(path, root)
+                events.append("marker-parent")
+
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev, "_restart_claim_owner", return_value=None), mock.patch.object(self.dev.os, "fsync", side_effect=file_sync), mock.patch.object(self.dev, "_fsync_directory", side_effect=directory_sync):
+                self.dev._claim_launchd_deploy("early", initial_status=initial)
+            self.assertEqual(events, ["marker-file", "marker-parent"])
+
+    def test_claim_parent_fsync_failure_never_prepares_or_hands_off(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active, status = root / "active", root / "status.json"
+            original_sync = self.dev._fsync_directory
+
+            def fail_marker_parent(path):
+                if active.exists():
+                    raise OSError("claim directory fsync failed")
+                original_sync(path)
+
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev, "_restart_claim_owner", return_value=None), mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), mock.patch.object(self.dev, "_preflight_prod_bind_auth"), mock.patch.object(self.dev, "_fsync_directory", side_effect=fail_marker_parent), mock.patch.object(self.dev, "_prepare_prepared_artifact") as prepare, mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release, mock.patch.object(self.dev.subprocess, "run") as backend:
+                controller = self.dev.ProdDeployControllerOptions(transaction_id="early", prepared_artifact=root, paired_database_upgrade=True, expected_full_commit="a" * 40)
+                with self.assertRaisesRegex(OSError, "claim directory fsync failed"):
+                    self.dev.launchd_prod_deploy(controller=controller)
+                prepare.assert_not_called()
+                release.assert_not_called()
+                backend.assert_not_called()
+            self.assertEqual(active.read_text().strip(), "early")
+            self.assertEqual(json.loads(status.read_text())["state"], "preparing")
 
     def test_pre_manifest_recovery_refuses_unknown_helper_or_missing_pid(self):
         for missing_pid in (False, True):
