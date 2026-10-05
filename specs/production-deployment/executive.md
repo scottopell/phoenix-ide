@@ -12,7 +12,7 @@ Live production deployment remains an explicitly gated operator action; automate
 
 ## Paired controller implementation gap
 
-The accepted prepared-artifact paired contract (REQ-PD-018 / REQ-PD-019) and Allium model are
+The accepted prepared-artifact paired contract (REQ-PD-018 / REQ-PD-019 / REQ-PD-020) and Allium model are
 normative, but not implemented on `main`. PR #836 owns receipt admission,
 private SQLite paired recovery, private verified plist publication,
 preparation/activation claims, and pending post-commit/status guidance.

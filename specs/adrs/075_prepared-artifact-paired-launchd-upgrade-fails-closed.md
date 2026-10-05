@@ -26,6 +26,24 @@ The feature has no generic database rollback semantics and does not permit clean
 - Resigning the protected binary would invalidate the controller's artifact provenance.
 - Treating a missing `lsof`, malformed ledger, or missing proof as safe would make recovery depend on an unverified runtime.
 
+## Committed-finalization amendment — 2026-10-05
+
+Global commissioned a bounded finalization-only resumer as delegated engineering
+scope for safe deployment/RC delivery; this is not a fabricated detailed user
+approval and does not authorize a live production operation. The alternative was
+manual-only blocked finalization after a committed interruption. The decision is
+`prod finalize-paired TXN`: verify retained byte-bound transaction/helper, matching
+claim, absent activation helper, mutual exclusion, and exact running committed
+candidate/binary/private loaded configuration; retry only captured plist publication
+and temporary restore-reservation cleanup. No runtime stop/bootstrap/restart,
+database access, old-version restore, ambient configuration, or generalized replay.
+Pending survives interruption; verified completion releases owned claim and a
+completed rerun is idempotent. REQ-LDD-018 / REQ-PD-020 own this narrow boundary.
+
+Recovered predecessor startup also records a durable checkpoint and typed outcome;
+a retry verifies/finalizes a running predecessor without replaying an old snapshot
+and discarding later writes. Unknown/stopped post-checkpoint state remains fenced.
+
 ## References
 
 - `specs/desktop-release/requirements.md` REQ-DESKTOP-REL-010 owns the protected preparation receipt consumed under REQ-LDD-017.
