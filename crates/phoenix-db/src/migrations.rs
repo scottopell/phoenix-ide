@@ -16729,7 +16729,8 @@ mod tests {
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
                     (103, 'temporarily_skip_automatic_continuation_resume_phase'),
                     (108, 'temporarily_skip_authority_timestamp_storage_class'),
-                    (111, 'temporarily_skip_coordinator_watches')",
+                    (111, 'temporarily_skip_coordinator_watches'),
+                    (113, 'temporarily_skip_historical_continuation_settlement')",
         )
         .execute(&pool)
         .await
@@ -17627,7 +17628,8 @@ mod tests {
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
                     (103, 'temporarily_skip_automatic_continuation_resume_phase'),
                     (108, 'temporarily_skip_authority_timestamp_storage_class'),
-                    (111, 'temporarily_skip_coordinator_watches')",
+                    (111, 'temporarily_skip_coordinator_watches'),
+                    (113, 'temporarily_skip_historical_continuation_settlement')",
         )
         .execute(pool)
         .await
