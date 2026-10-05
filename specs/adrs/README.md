@@ -93,6 +93,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [077](077_committed-paired-finalization-is-publication-only.md) | Committed paired finalization is publication-only; recovered startup checkpoints forbid snapshot replay | Accepted | REQ-LDD-017, REQ-LDD-018, REQ-PD-018, REQ-PD-020, REQ-COMP-003 |
 | [078](078_kache-first-automatic-compiler-cache.md) | Automatic compiler caching prefers released Kache | Superseded by ADR-079 | development methodology; REQ-COMP-001 |
 | [079](079_kache-explicit-pending-debug-fidelity.md) | Kache remains explicit pending restored debug fidelity | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [080](080_close-stops-bound-fsmonitor-daemons.md) | Close stops bound fsmonitor daemons instead of reconfiguring Git | Accepted | REQ-WL-002b; Close retirement quarantine and descriptor scan |
 
 ## For agents: which decisions bind your task
 
