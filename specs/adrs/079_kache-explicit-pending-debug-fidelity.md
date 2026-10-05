@@ -1,13 +1,13 @@
-# ADR-077: Kache remains explicit pending restored debug fidelity
+# ADR-079: Kache remains explicit pending restored debug fidelity
 
 - **Status:** Accepted
 - **Date:** 2026-10-04
-- **Supersedes:** ADR-076
+- **Supersedes:** ADR-078
 - **Affects:** development methodology; REQ-COMP-001, REQ-COMP-008
 
 ## Context
 
-ADR-076 adopted released Kache 0.26.0 as the automatic compiler cache after measurements showed faster cross-worktree restoration and lower estimated APFS physical growth than sccache for a representative Phoenix check workload.
+ADR-078 adopted released Kache 0.26.0 as the automatic compiler cache after measurements showed faster cross-worktree restoration and lower estimated APFS physical growth than sccache for a representative Phoenix check workload.
 
 Qualification then exercised an actual native macOS production build. Restored dependency archives compiled successfully, Kache reported no cache errors, and the binary and `.dSYM` UUIDs matched. `dsymutil` nevertheless emitted unresolved-object warnings for restored archives. Those observations do not prove source-level symbol and breakpoint fidelity, and development binaries need that fidelity as much as production binaries.
 
@@ -35,7 +35,7 @@ Automatic Kache adoption requires new evidence that a representative restored ma
 
 ## References
 
-- ADR-076
+- ADR-078
 - `dev.py::_configure_compiler_cache`
 - `docs/development/compiler-cache.md`
 - Kache v0.26.0

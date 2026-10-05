@@ -1,6 +1,6 @@
-# ADR-076: Automatic compiler caching prefers released Kache
+# ADR-078: Automatic compiler caching prefers released Kache
 
-- **Status:** Superseded by ADR-077
+- **Status:** Superseded by ADR-079
 - **Date:** 2026-09-20
 - **Affects:** development methodology; REQ-COMP-001
 
