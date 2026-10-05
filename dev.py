@@ -4973,7 +4973,7 @@ def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
             "KACHE_SOCKET_PATH",
             "KACHE_CONFIG",
             "KACHE_RUNTIME_DIR",
-            "KACHE_LOG_FILE",
+            "KACHE_LOG_FILE_PATH",
         )
         if backend == "kache"
         else ("SCCACHE_DIR", "SCCACHE_CONF", "SCCACHE_ERROR_LOG")
@@ -5029,7 +5029,7 @@ def _configure_compiler_cache(
     kache_error = (
         None
         if wants_kache
-        else "requires explicit opt-in because macOS restored-archive debug-symbol fidelity is unqualified"
+        else "requires explicit opt-in because restored-archive debug-symbol fidelity is unqualified"
     )
     if wants_kache and _environment_flag("KACHE_DISABLED"):
         kache_error = "KACHE_DISABLED is set"
@@ -5102,7 +5102,7 @@ def _configure_compiler_cache(
             print("  Compiler cache: none")
             return "none"
         print(
-            "  ⚠ kache restored-archive source-level debug fidelity is unqualified on macOS"
+            "  ⚠ kache restored-archive source-level debug fidelity is unqualified"
         )
         print(f"  Compiler cache: kache {kache_version}")
     else:

@@ -63,19 +63,24 @@ class CompilerCacheTests(unittest.TestCase):
         )
         output.assert_any_call(
             "  ⚠ kache unavailable; using sccache: "
-            "requires explicit opt-in because macOS restored-archive debug-symbol fidelity is unqualified"
+            "requires explicit opt-in because restored-archive debug-symbol fidelity is unqualified"
         )
 
     def test_explicit_kache_remains_opt_in_with_fidelity_warning(self):
         with mock.patch("builtins.print") as output:
-            selected, env = self.configure("kache", installed={"kache", "sccache"})
+            selected, env = self.configure(
+                "kache",
+                env={"KACHE_LOG_FILE": "kache=trace"},
+                installed={"kache", "sccache"},
+            )
         self.assertEqual("kache", selected)
         output.assert_any_call(
-            "  ⚠ kache restored-archive source-level debug fidelity is unqualified on macOS"
+            "  ⚠ kache restored-archive source-level debug fidelity is unqualified"
         )
         self.assertEqual(
             str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
         )
+        self.assertEqual("kache=trace", env["KACHE_LOG_FILE"])
 
     def test_auto_reports_none_when_no_backend_is_installed(self):
         with mock.patch("builtins.print") as output:
@@ -173,8 +178,18 @@ class CompilerCacheTests(unittest.TestCase):
     def test_kache_daemon_uses_cargo_working_directory(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         cargo_cwd = self.dev.Path("/detached/build")
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            self.dev.subprocess, "run", return_value=completed
+        daemon_env = {}
+
+        def run_daemon(*_args, **kwargs):
+            daemon_env.update(kwargs["env"])
+            return completed
+
+        with mock.patch.dict(
+            os.environ,
+            {"KACHE_LOG_FILE": "kache=trace", "KACHE_LOG_FILE_PATH": "/tmp/kache.log"},
+            clear=True,
+        ), mock.patch.object(
+            self.dev.subprocess, "run", side_effect=run_daemon
         ) as run, mock.patch.object(
             self.dev, "_wait_for_kache_daemon", return_value=None
         ) as wait:
@@ -182,6 +197,8 @@ class CompilerCacheTests(unittest.TestCase):
                 self.dev._ensure_kache_daemon("/bin/kache", cargo_cwd=cargo_cwd)
             )
         self.assertEqual(cargo_cwd, run.call_args.kwargs["cwd"])
+        self.assertEqual("kache=trace", daemon_env["KACHE_LOG_FILE"])
+        self.assertEqual("/tmp/kache.log", daemon_env["KACHE_LOG_FILE_PATH"])
         wait.assert_called_once_with("/bin/kache", cargo_cwd=cargo_cwd)
 
     def test_kache_readiness_polls_until_running(self):
@@ -236,7 +253,7 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("sccache", selected)
         output.assert_any_call(
             "  ⚠ kache unavailable; using sccache: "
-            "requires explicit opt-in because macOS restored-archive debug-symbol fidelity is unqualified"
+            "requires explicit opt-in because restored-archive debug-symbol fidelity is unqualified"
         )
 
     def test_explicit_kache_reports_invalid_configured_binary(self):
@@ -441,7 +458,8 @@ class CompilerCacheTests(unittest.TestCase):
                 "KACHE_SOCKET_PATH": "run/kache.sock",
                 "KACHE_CONFIG": "config/kache.toml",
                 "KACHE_RUNTIME_DIR": "run/kache",
-                "KACHE_LOG_FILE": "logs/kache.log",
+                "KACHE_LOG_FILE": "kache=trace",
+                "KACHE_LOG_FILE_PATH": "logs/kache.log",
                 "SCCACHE_DIR": "cache/sccache",
                 "SCCACHE_CONF": "config/sccache.toml",
                 "SCCACHE_ERROR_LOG": "logs/sccache.log",
@@ -453,7 +471,8 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("/workspace/run/kache.sock", os.environ["KACHE_SOCKET_PATH"])
             self.assertEqual("/workspace/config/kache.toml", os.environ["KACHE_CONFIG"])
             self.assertEqual("/workspace/run/kache", os.environ["KACHE_RUNTIME_DIR"])
-            self.assertEqual("/workspace/logs/kache.log", os.environ["KACHE_LOG_FILE"])
+            self.assertEqual("kache=trace", os.environ["KACHE_LOG_FILE"])
+            self.assertEqual("/workspace/logs/kache.log", os.environ["KACHE_LOG_FILE_PATH"])
             self.assertEqual("cache/sccache", os.environ["SCCACHE_DIR"])
             self.assertEqual("config/sccache.toml", os.environ["SCCACHE_CONF"])
             self.assertEqual("logs/sccache.log", os.environ["SCCACHE_ERROR_LOG"])
