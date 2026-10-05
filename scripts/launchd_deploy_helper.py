@@ -39,6 +39,7 @@ TERMINAL_STATES = {
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
+    "ordinary_activation_failed_rollback_failed",
     "rejected_concurrent",
 }
 
@@ -853,6 +854,15 @@ def restore(
         raise
 
 
+def write_verified_predecessor_status(manifest: Manifest, **diagnostics) -> None:
+    try:
+        write_status(manifest, "activation_failed_rolled_back", **diagnostics)
+    except Exception as exc:
+        if manifest.paired_database_upgrade is not None:
+            raise VerifiedPredecessorFinalizationError(str(exc)) from exc
+        raise
+
+
 def release_claim(manifest: Manifest) -> bool:
     claim = Path(manifest.active_path)
     claim_lock = Path(manifest.claim_lock_path)
@@ -1066,12 +1076,12 @@ def activate(manifest: Manifest) -> str:
                     candidate_binary_mutated=candidate_binary_mutated,
                     rollback_plist=quarantined_previous_plist,
                 )
-                write_status(manifest, "activation_failed_rolled_back", failure=failure)
+                write_verified_predecessor_status(manifest, failure=failure)
                 if manifest.paired_database_upgrade is not None and not database_snapshot:
                     try:
                         release_unsnapshotted_capacity(manifest)
                     except Exception as cleanup_exc:
-                        write_status(manifest, "activation_failed_rolled_back", failure=failure, rollback_failure=f"verified unchanged resume; capacity cleanup failed: {cleanup_exc}")
+                        write_verified_predecessor_status(manifest, failure=failure, rollback_failure=f"verified unchanged resume; capacity cleanup failed: {cleanup_exc}")
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:
                 rollback_failure = str(rollback_exc)
@@ -1088,8 +1098,17 @@ def activate(manifest: Manifest) -> str:
                         quarantine_paired_plist(manifest)
                     except Exception as quarantine:
                         rollback_failure += f"; durable plist quarantine failed: {quarantine}"
-                write_status(manifest, "activation_failed_rollback_failed", failure=failure, rollback_failure=rollback_failure)
-                return "activation_failed_rollback_failed"
+                failed_state = (
+                    "activation_failed_rollback_failed" if manifest.paired_database_upgrade is not None
+                    else "ordinary_activation_failed_rollback_failed"
+                )
+                try:
+                    write_status(manifest, failed_state, failure=failure, rollback_failure=rollback_failure)
+                except Exception as exc:
+                    if isinstance(rollback_exc, VerifiedPredecessorFinalizationError):
+                        raise VerifiedPredecessorFinalizationError(str(exc)) from exc
+                    raise
+                return failed_state
         finally:
             for prepared in prepared_installs:
                 prepared.unlink(missing_ok=True)
@@ -1153,7 +1172,9 @@ def release_unsnapshotted_capacity(manifest: Manifest) -> None:
         fsync_dir(path.parent)
 
 
-def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = False) -> None:
+def record_recovery_error(manifest: Manifest, error: str | Exception, *, quarantine: bool = False) -> None:
+    verified_finalization_failed = isinstance(error, VerifiedPredecessorFinalizationError)
+    error = str(error)
     if quarantine:
         try:
             quarantine_paired_plist(manifest)
@@ -1169,11 +1190,16 @@ def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = 
         return
     if prior.get("state") in {"committed", "preparing"}:
         return
-    if prior.get("recovery_mode") is not None and prior.get("state") == "activation_failed_rolled_back":
+    if prior.get("recovery_mode") is not None and prior.get("state") == "activation_failed_rolled_back" and not verified_finalization_failed:
         return
     previous = prior.get("rollback_failure")
     merged = f"{previous}; recovery attempt failed: {error}" if previous else error
-    write_status(manifest, "activation_failed_rollback_failed", failure=prior.get("failure"), rollback_failure=merged)
+    try:
+        write_status(manifest, "activation_failed_rollback_failed", failure=prior.get("failure"), rollback_failure=merged)
+    except Exception as exc:
+        if verified_finalization_failed:
+            raise VerifiedPredecessorFinalizationError(str(exc)) from exc
+        raise
 
 
 def require_loaded_plist(manifest: Manifest, launchctl: Launchctl, private: Path) -> None:
@@ -1249,7 +1275,7 @@ def recover_paired(manifest: Manifest) -> str:
             status = read_status(manifest)
         except (OSError, json.JSONDecodeError):
             status = {}
-        if claim.read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"activating", "activation_failed_rollback_failed"}:
+        if claim.read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or (status.get("state") not in {"activating", "activation_failed_rollback_failed"} and not (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None)):
             raise ActivationError("paired recovery must own a retained unresolved transaction")
         launchctl = Launchctl(manifest)
         try:
@@ -1267,7 +1293,7 @@ def recover_paired(manifest: Manifest) -> str:
                     commit_atomic_install(publication, Path(manifest.target_plist))
                 except Exception as exc:
                     raise VerifiedPredecessorFinalizationError(str(exc)) from exc
-                write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"))
+                write_verified_predecessor_status(manifest, failure=status.get("failure"))
                 return "activation_failed_rolled_back"
             paired = manifest.paired_database_upgrade
             snapshot_exists = Path(paired.proof_path).exists() or Path(paired.proof_path).is_symlink()
@@ -1289,12 +1315,12 @@ def recover_paired(manifest: Manifest) -> str:
                 )
             else:
                 restore(manifest, launchctl, None)
-            write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"))
+            write_verified_predecessor_status(manifest, failure=status.get("failure"))
             if not snapshot_exists:
                 try:
                     release_unsnapshotted_capacity(manifest)
                 except Exception as cleanup_exc:
-                    write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"), rollback_failure=f"verified unchanged resume; capacity cleanup failed: {cleanup_exc}")
+                    write_verified_predecessor_status(manifest, failure=status.get("failure"), rollback_failure=f"verified unchanged resume; capacity cleanup failed: {cleanup_exc}")
             return "activation_failed_rolled_back"
         except Exception as exc:
             failure = str(exc)
@@ -1306,7 +1332,7 @@ def recover_paired(manifest: Manifest) -> str:
                         raise ActivationError("paired recovery teardown is unconfirmed")
                 except Exception as teardown:
                     failure += f"; recovery teardown failed: {teardown}"
-            record_recovery_error(manifest, failure, quarantine=True)
+            record_recovery_error(manifest, exc if isinstance(exc, VerifiedPredecessorFinalizationError) else failure, quarantine=True)
             return "activation_failed_rollback_failed"
 
 
@@ -1350,11 +1376,12 @@ def main() -> int:
             raise ActivationError("helper identity does not match the immutable manifest")
         state = finalize_paired(manifest) if args.command == "finalize-paired" else recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
         if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
+            fsync_dir(Path(manifest.status_path).parent)
             release_claim(manifest)
         print(state, flush=True)
         return 0 if state == "committed" or (args.command == "recover-paired" and state == "activation_failed_rolled_back") else 1
     except ConcurrentDeploy as exc:
-        if manifest is not None:
+        if manifest is not None and manifest.paired_database_upgrade is None:
             try:
                 if args.command == "recover-paired":
                     record_recovery_error(manifest, str(exc))
@@ -1367,8 +1394,8 @@ def main() -> int:
         return 1
     except Exception as exc:
         if manifest is not None and args.command == "recover-paired":
-            record_recovery_error(manifest, str(exc))
-        if manifest is not None and args.command != "finalize-paired" and status_is_durable_terminal(manifest):
+            record_recovery_error(manifest, exc)
+        if manifest is not None and args.command != "finalize-paired" and manifest.paired_database_upgrade is None and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1

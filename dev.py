@@ -9682,7 +9682,7 @@ def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
 
 _DEPLOY_TERMINAL_STATES = {
     "committed", "precondition_failed", "activation_failed_rolled_back",
-    "activation_failed_rollback_failed", "rejected_concurrent",
+    "activation_failed_rollback_failed", "ordinary_activation_failed_rollback_failed", "rejected_concurrent",
 }
 _RESTART_TERMINAL_STATES = {
     "committed", "precondition_failed", "restart_failed", "rejected_concurrent",
@@ -9726,7 +9726,8 @@ def _status_is_terminal_for_owner(
         status = json.loads(status_path.read_text())
         if (
             status.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
-            and status.get("state") == "activation_failed_rollback_failed"
+            and (status.get("state") == "activation_failed_rollback_failed"
+                 or (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None))
         ):
             return False
         return status.get("transaction_id") == owner and status.get("state") in terminal_states
@@ -9818,6 +9819,13 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
             "Do not remove its active marker, redeploy, or invoke database rollback. "
             f"After confirming the old helper is absent, run ./dev.py prod finalize-paired {owner}; "
             "it verifies the running committed candidate and only retries publication/cleanup."
+        )
+    if paired and status.get("transaction_id") == owner and status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None:
+        return (
+            f"paired predecessor completion {owner} still owns its claim. "
+            "Do not clear the marker or redeploy. After confirming the old helper is absent, "
+            f"run ./dev.py prod recover-paired {owner}; it verifies the checkpointed running predecessor "
+            "and finalizes publication/status without snapshot replay."
         )
     resolved = status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed", "activation_failed_rolled_back"}
     if paired and not resolved:
@@ -10196,6 +10204,8 @@ def launchd_prod_deploy(
     transaction_id = controller.transaction_id or f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    if staging.exists() or staging.is_symlink():
+        raise FileExistsError("deployment transaction already exists; select a new transaction ID")
     source_kind = (
         "prepared_artifact" if controller.prepared_artifact is not None
         else "published_release" if release else "local_head"
@@ -10238,9 +10248,10 @@ def launchd_prod_deploy(
             if _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
                 raise SystemExit("installed configuration changed during claimed snapshot read")
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
-        transactions_dir.mkdir(parents=True, exist_ok=True)
+        _mkdir_durable(transactions_dir)
         _prune_launchd_deploy_transactions(transactions_dir, transaction_id)
-        staging.mkdir(parents=True)
+        staging.mkdir(mode=0o700)
+        _fsync_directory(staging.parent)
         staging.chmod(0o700)
         if controller.prepared_artifact is not None:
             if release or not controller.paired_database_upgrade or controller.expected_full_commit is None:
@@ -10409,6 +10420,14 @@ def launchd_prod_deploy(
         }
         _write_json_atomic(staging / "manifest.json", manifest)
         (staging / "manifest.json").chmod(0o400)
+        retained_artifacts = [
+            candidate_binary, candidate_plist, helper, helper_plist, staging / "manifest.json",
+        ]
+        retained_artifacts.extend(path for path in (rollback_binary, rollback_plist) if path.exists())
+        for artifact in retained_artifacts:
+            with artifact.open("rb") as stream:
+                os.fsync(stream.fileno())
+        _fsync_directory(staging)
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "prepared",
             "preparing_pid": os.getpid(), "source_kind": source_kind,
@@ -10429,6 +10448,7 @@ def launchd_prod_deploy(
         if controller is not None and controller.paired_database_upgrade and bootstrap_attempted:
             raise
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        terminal_status_written = False
         try:
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
                 "transaction_id": transaction_id, "state": "precondition_failed",
@@ -10442,8 +10462,10 @@ def launchd_prod_deploy(
                 "failure": f"{type(exc).__name__}: preparation failed before handoff",
                 "rollback_failure": None,
             })
+            terminal_status_written = True
         finally:
-            _release_launchd_deploy_claim(transaction_id)
+            if terminal_status_written:
+                _release_launchd_deploy_claim(transaction_id)
         raise
     _report_launchd_handoff(transaction_id, selected_identity)
 
