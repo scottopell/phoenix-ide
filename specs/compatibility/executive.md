@@ -23,7 +23,7 @@ Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as
 | REQ-COMP-005 | Policy applies to newly introduced or structurally changed internal timestamp columns. Unchanged historical timestamp columns are outside this initial convergence rule. |
 | REQ-COMP-006 | Legacy Direct WorkScopes are repaired forward to Direct authority without adding rollback guarantees. |
 | REQ-COMP-007 | Historical accepted source-locator payloads retain their original fingerprint and encoding authority. |
-| REQ-COMP-008 | `dev.py` keeps automatic selection on usable sccache/no cache, requires exact Kache 0.26.0 as an explicit opt-in, verifies daemon readiness/socket identity, reports actual selection, and scopes generated cache variables to build subprocesses. Restored-archive debug fidelity remains unqualified. |
+| REQ-COMP-008 | `dev.py` keeps automatic selection on usable sccache/no cache, requires exact Kache 0.26.0 on macOS arm64 as an explicit opt-in, verifies daemon readiness/socket identity, reports actual selection, and scopes generated cache variables to build subprocesses. Restored-archive debug fidelity remains unqualified. |
 
 ## Next work
 

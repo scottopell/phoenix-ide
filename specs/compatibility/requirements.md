@@ -134,10 +134,11 @@ THE SYSTEM SHALL reject any payload whose fingerprint matches neither its curren
 WHEN Phoenix automatically selects a compiler cache
 THE SYSTEM SHALL select an sccache executable that passes its version probe or no compiler cache
 AND SHALL report the fallback reason and backend actually selected
-AND SHALL NOT automatically select Kache while restored-archive source-level debug fidelity is unqualified
+AND SHALL NOT automatically select Kache v0.26.0
 
 WHEN an operator explicitly selects Kache
-THE SYSTEM SHALL require the executable to report exactly version `0.26.0`
+THE SYSTEM SHALL require a macOS arm64 host
+AND SHALL require the executable to report exactly version `0.26.0`
 AND SHALL require its local daemon to report readiness on the configured socket
 AND SHALL report that debug-symbol fidelity remains unqualified
 

@@ -35,6 +35,8 @@ class CompilerCacheTests(unittest.TestCase):
             return_value=("sccache 0.18.0", None)
             if "sccache" in installed
             else (None, "not installed or not on PATH"),
+        ), mock.patch.object(
+            self.dev, "_kache_host_error", return_value=None
         ), mock.patch.object(self.dev, "_ensure_kache_daemon", return_value=None):
             selected = self.dev._configure_compiler_cache(requested, **options)
             return selected, os.environ.copy()
@@ -81,6 +83,30 @@ class CompilerCacheTests(unittest.TestCase):
             str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
         )
         self.assertEqual("kache=trace", env["KACHE_LOG_FILE"])
+
+    def test_kache_host_support_is_limited_to_darwin_arm64(self):
+        with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(
+            self.dev.platform, "machine", return_value="arm64"
+        ):
+            self.assertIsNone(self.dev._kache_host_error())
+
+        for system, machine in (("linux", "aarch64"), ("win32", "AMD64"), ("darwin", "x86_64")):
+            with self.subTest(system=system, machine=machine), mock.patch.object(
+                self.dev.sys, "platform", system
+            ), mock.patch.object(self.dev.platform, "machine", return_value=machine):
+                error = self.dev._kache_host_error()
+                self.assertIn(f"unsupported host {system}/{machine.lower()}", error or "")
+                self.assertIn("qualified host is darwin/arm64", error or "")
+
+    def test_explicit_kache_rejects_unsupported_host_before_version_probe(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev, "_kache_host_error", return_value="unsupported host linux/x86_64"
+        ), mock.patch.object(self.dev, "_kache_binary", return_value="/bin/kache"), mock.patch.object(
+            self.dev, "_kache_version"
+        ) as version:
+            with self.assertRaisesRegex(SystemExit, "unsupported host linux/x86_64"):
+                self.dev._configure_compiler_cache("kache")
+        version.assert_not_called()
 
     def test_auto_reports_none_when_no_backend_is_installed(self):
         with mock.patch("builtins.print") as output:
@@ -216,6 +242,32 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev.subprocess, "run", side_effect=(starting, running)
         ), mock.patch.object(self.dev.time, "sleep"):
             self.assertIsNone(self.dev._wait_for_kache_daemon("/bin/kache", timeout=1))
+
+    def test_kache_readiness_rejects_non_object_status(self):
+        status = mock.Mock(returncode=0, stdout="null", stderr="")
+        clock = iter((0.0, 0.0, 1.0))
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.subprocess, "run", return_value=status
+        ), mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: next(clock)), mock.patch.object(
+            self.dev.time, "sleep"
+        ):
+            error = self.dev._wait_for_kache_daemon("/bin/kache", timeout=0.5)
+        self.assertEqual("daemon readiness response was not an object", error)
+
+    def test_kache_readiness_rejects_non_string_socket(self):
+        status = mock.Mock(
+            returncode=0,
+            stdout='{"daemon_running":true,"socket":[]}',
+            stderr="",
+        )
+        clock = iter((0.0, 0.0, 1.0))
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.subprocess, "run", return_value=status
+        ), mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: next(clock)), mock.patch.object(
+            self.dev.time, "sleep"
+        ):
+            error = self.dev._wait_for_kache_daemon("/bin/kache", timeout=0.5)
+        self.assertEqual("daemon readiness socket was not a string", error)
 
     def test_kache_readiness_rejects_wrong_socket(self):
         running = mock.Mock(

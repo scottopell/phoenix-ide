@@ -4,7 +4,7 @@ Phoenix uses one compiler-cache selection path for Rust checks, ordinary develop
 
 ## Installation
 
-Phoenix supports the qualified released Kache `0.26.0` command contract. Download the archive for the host architecture from the immutable [Kache v0.26.0 release](https://github.com/kunobi-ninja/kache/releases/tag/v0.26.0), verify its adjacent SHA-256 file, and put `kache` on `PATH`. `PHOENIX_KACHE_BIN=/absolute/path/to/kache` selects a verified executable outside `PATH`. Kache's interactive `init` is not required because `dev.py` provides `RUSTC_WRAPPER`, starts the daemon, and supplies a short private socket when an isolated `KACHE_CACHE_DIR` is used.
+Phoenix supports the qualified released Kache `0.26.0` command contract on macOS arm64. Download the archive for the host architecture from the immutable [Kache v0.26.0 release](https://github.com/kunobi-ninja/kache/releases/tag/v0.26.0), verify its adjacent SHA-256 file, and put `kache` on `PATH`. `PHOENIX_KACHE_BIN=/absolute/path/to/kache` selects a verified executable outside `PATH`. Kache's interactive `init` is not required because `dev.py` provides `RUSTC_WRAPPER`, starts the daemon, and supplies a short private socket when an isolated `KACHE_CACHE_DIR` is used.
 
 `sccache` remains supported when its executable is on `PATH`. Run `./dev.py doctor` to see the detected cache tools and versions; both are optional development prerequisites.
 
@@ -21,7 +21,7 @@ Phoenix supports the qualified released Kache `0.26.0` command contract. Downloa
 
 `KACHE_DISABLED=1` makes Kache unavailable under the same rules. An sccache candidate must execute its version probe successfully before selection.
 
-Every automatic build path excludes Kache v0.26.0 and falls through to sccache/no cache because restored macOS dependency archives emitted unresolved-object `dsymutil` warnings. Matching binary/`.dSYM` UUIDs and successful compilation did not prove source-level debug fidelity, including for development binaries. Explicit `PHOENIX_COMPILER_CACHE=kache` remains an informed opt-in and prints the fidelity warning at selection time; it does not change that open blocker.
+Every automatic build path excludes Kache v0.26.0 and falls through to sccache/no cache because restored macOS dependency archives emitted unresolved-object `dsymutil` warnings. Matching binary/`.dSYM` UUIDs and successful compilation did not prove source-level debug fidelity, including for development binaries. Explicit `PHOENIX_COMPILER_CACHE=kache` on macOS arm64 remains an informed opt-in and prints the fidelity warning at selection time; it does not change that open blocker.
 
 Phoenix-generated cache variables are scoped to direct Cargo subprocesses and the E2E harness that owns a Cargo build, so starting Phoenix does not force agent-executed Cargo commands in other repositories through Phoenix's selected cache. Relative backend cache/socket/config/runtime/log-destination paths are normalized against the invoking directory before daemon startup. Kache `KACHE_LOG_FILE` is a tracing filter and wrapper opt-in, not a path; Phoenix preserves it literally and normalizes only its `KACHE_LOG_FILE_PATH` destination. The Kache daemon starts from the same Cargo working directory as its wrapper, so implicit project-local configuration cannot diverge across production-build worktrees.
 

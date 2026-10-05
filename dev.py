@@ -4915,17 +4915,23 @@ def _wait_for_kache_daemon(
             )
             if result.returncode == 0:
                 status = json.loads(result.stdout)
-                if status.get("daemon_running") is True:
-                    expected = os.environ.get("KACHE_SOCKET_PATH")
-                    actual = status.get("socket")
-                    if expected and actual and Path(actual).resolve() != Path(expected).resolve():
-                        return f"daemon reported unexpected socket {actual}; expected {expected}"
-                    if expected and not actual:
-                        last_error = "daemon readiness omitted configured socket"
-                    else:
-                        return None
-                else:
+                if not isinstance(status, dict):
+                    last_error = "daemon readiness response was not an object"
+                    continue
+                if status.get("daemon_running") is not True:
                     last_error = "daemon did not report running"
+                    continue
+                expected = os.environ.get("KACHE_SOCKET_PATH")
+                actual = status.get("socket")
+                if actual is not None and not isinstance(actual, str):
+                    last_error = "daemon readiness socket was not a string"
+                    continue
+                if expected and actual and Path(actual).resolve() != Path(expected).resolve():
+                    return f"daemon reported unexpected socket {actual}; expected {expected}"
+                if expected and not actual:
+                    last_error = "daemon readiness omitted configured socket"
+                else:
+                    return None
             else:
                 last_error = (result.stderr or result.stdout).strip() or f"status exit {result.returncode}"
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
@@ -5002,6 +5008,13 @@ def _usable_sccache(binary: str | None) -> tuple[str | None, str | None]:
     return version, None
 
 
+def _kache_host_error() -> str | None:
+    machine = platform.machine().lower()
+    if sys.platform == "darwin" and machine == "arm64":
+        return None
+    return f"unsupported host {sys.platform}/{machine}; qualified host is darwin/arm64"
+
+
 def _configure_compiler_cache(
     requested: str | None = None, *, cargo_cwd: Path | None = None
 ) -> str:
@@ -5026,12 +5039,15 @@ def _configure_compiler_cache(
     kache_binary = _absolute_executable(_kache_binary()) if wants_kache else None
     sccache_binary = _absolute_executable(shutil.which("sccache"))
     kache_version = None
+    host_error = _kache_host_error() if wants_kache else None
     kache_error = (
         None
         if wants_kache
         else "requires explicit opt-in because restored-archive debug-symbol fidelity is unqualified"
     )
-    if wants_kache and _environment_flag("KACHE_DISABLED"):
+    if host_error:
+        kache_error = host_error
+    elif wants_kache and _environment_flag("KACHE_DISABLED"):
         kache_error = "KACHE_DISABLED is set"
     elif wants_kache and not kache_binary:
         configured = os.environ.get("PHOENIX_KACHE_BIN")
@@ -5044,27 +5060,22 @@ def _configure_compiler_cache(
         kache_version, kache_error = _kache_version(kache_binary)
 
     if automatic:
-        if kache_version:
-            backend = "kache"
+        sccache_version, sccache_error = _usable_sccache(sccache_binary)
+        if sccache_version:
+            print(f"  ⚠ kache unavailable; using sccache: {kache_error}")
+            backend = "sccache"
         else:
-            sccache_version, sccache_error = _usable_sccache(sccache_binary)
-            if sccache_version:
-                if kache_error:
-                    print(f"  ⚠ kache unavailable; using sccache: {kache_error}")
-                backend = "sccache"
-            else:
-                reasons = "; ".join(
-                    reason
-                    for reason in (
-                        f"kache: {kache_error}" if kache_error else None,
-                        f"sccache: {sccache_error}" if sccache_error else None,
-                    )
-                    if reason
+            reasons = "; ".join(
+                reason
+                for reason in (
+                    f"kache: {kache_error}",
+                    f"sccache: {sccache_error}" if sccache_error else None,
                 )
-                if reasons:
-                    print(f"  ⚠ compiler caches unavailable; continuing without: {reasons}")
-                print("  Compiler cache: none")
-                return "none"
+                if reason
+            )
+            print(f"  ⚠ compiler caches unavailable; continuing without: {reasons}")
+            print("  Compiler cache: none")
+            return "none"
     elif backend == "kache":
         if not kache_binary:
             raise SystemExit(f"requested compiler cache 'kache' is unavailable: {kache_error}")
