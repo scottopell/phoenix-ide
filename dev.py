@@ -3856,7 +3856,12 @@ def collect_doctor_results() -> list[DoctorResult]:
 
     kache_binary = _kache_binary()
     if kache_binary:
-        version, error = _kache_version(kache_binary)
+        kache_error = _kache_host_error()
+        if kache_error is None and _environment_flag("KACHE_DISABLED"):
+            kache_error = "KACHE_DISABLED is set"
+        version, error = (
+            (None, kache_error) if kache_error else _kache_version(kache_binary)
+        )
         results.append(DoctorResult(
             "kache",
             version is not None,
@@ -4849,6 +4854,7 @@ def _command_version(binary: str) -> tuple[str | None, str | None]:
             [binary, "--version"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=10,
             check=False,
         )
@@ -5094,24 +5100,10 @@ def _configure_compiler_cache(
         generated_socket = "KACHE_SOCKET_PATH" not in os.environ
         daemon_error = _ensure_kache_daemon(wrapper, cargo_cwd=cargo_cwd)
         if daemon_error:
-            if not automatic:
-                raise SystemExit(f"kache daemon failed to start: {daemon_error}")
             os.environ.pop("RUSTC_WRAPPER", None)
             if generated_socket:
                 os.environ.pop("KACHE_SOCKET_PATH", None)
-            sccache_version, sccache_error = _usable_sccache(sccache_binary)
-            if sccache_version:
-                assert sccache_binary is not None
-                _normalize_cache_paths("sccache")
-                print(f"  ⚠ kache unavailable; using sccache: {daemon_error}")
-                os.environ["RUSTC_WRAPPER"] = sccache_binary
-                os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")
-                print("  Compiler cache: sccache")
-                return "sccache"
-            detail = f"{daemon_error}; sccache: {sccache_error}"
-            print(f"  ⚠ kache unavailable; continuing without compiler cache: {detail}")
-            print("  Compiler cache: none")
-            return "none"
+            raise SystemExit(f"kache daemon failed to start: {daemon_error}")
         print(
             "  ⚠ kache restored-archive source-level debug fidelity is unqualified"
         )

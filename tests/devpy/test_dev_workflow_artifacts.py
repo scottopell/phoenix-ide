@@ -146,6 +146,44 @@ class DevWorkflowArtifactTests(unittest.TestCase):
 
         self.assertEqual("0", seen_environment["COREPACK_ENABLE_NETWORK"])
 
+    def test_doctor_reports_installed_kache_unhealthy_on_unsupported_host(self):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(self.dev, "_doctor_version", return_value=(True, "ok")),
+            mock.patch.object(self.dev, "_find_chromium_binary", return_value=None),
+            mock.patch.object(self.dev, "_kache_binary", return_value="/usr/bin/kache"),
+            mock.patch.object(
+                self.dev,
+                "_kache_host_error",
+                return_value="unsupported host linux/x86_64; qualified host is darwin/arm64",
+            ),
+            mock.patch.object(self.dev, "_kache_version") as version,
+            mock.patch.object(self.dev.shutil, "which", return_value=None),
+        ):
+            results = self.dev.collect_doctor_results()
+
+        version.assert_not_called()
+        kache = next(result for result in results if result.name == "kache")
+        self.assertFalse(kache.ok)
+        self.assertIn("unsupported host linux/x86_64", kache.detail)
+
+    def test_doctor_reports_disabled_kache_unhealthy(self):
+        with (
+            mock.patch.dict(os.environ, {"KACHE_DISABLED": "1"}, clear=True),
+            mock.patch.object(self.dev, "_doctor_version", return_value=(True, "ok")),
+            mock.patch.object(self.dev, "_find_chromium_binary", return_value=None),
+            mock.patch.object(self.dev, "_kache_binary", return_value="/usr/bin/kache"),
+            mock.patch.object(self.dev, "_kache_host_error", return_value=None),
+            mock.patch.object(self.dev, "_kache_version") as version,
+            mock.patch.object(self.dev.shutil, "which", return_value=None),
+        ):
+            results = self.dev.collect_doctor_results()
+
+        version.assert_not_called()
+        kache = next(result for result in results if result.name == "kache")
+        self.assertFalse(kache.ok)
+        self.assertEqual("KACHE_DISABLED is set", kache.detail)
+
     def test_doctor_uses_compiler_cache_sccache_validation(self):
         with (
             mock.patch.object(self.dev, "_doctor_version", return_value=(True, "ok")),
