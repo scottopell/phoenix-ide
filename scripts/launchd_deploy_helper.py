@@ -134,6 +134,18 @@ class ConcurrentDeploy(ActivationError):
     pass
 
 
+class VerifiedPredecessorFinalizationError(ActivationError):
+    pass
+
+
+def read_status(manifest: Manifest) -> dict:
+    try:
+        value = json.loads(Path(manifest.status_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -232,7 +244,7 @@ def write_status(
     recovery_mode: Optional[str] = None,
 ) -> None:
     try:
-        prior = json.loads(Path(manifest.status_path).read_text())
+        prior = read_status(manifest)
     except (OSError, json.JSONDecodeError):
         prior = {}
     if isinstance(prior, dict) and prior.get("transaction_id") == manifest.transaction_id and prior.get("recovery_mode") is not None:
@@ -825,10 +837,15 @@ def restore(
         health_insecure_tls=manifest.previous_health_insecure_tls,
         health_json=manifest.previous_health_json,
     )
-    restore_deployed_sha(manifest)
-    if manifest.paired_database_upgrade is not None:
-        assert rollback_plist is not None
-        commit_atomic_install(publication, Path(manifest.target_plist))
+    try:
+        restore_deployed_sha(manifest)
+        if manifest.paired_database_upgrade is not None:
+            assert rollback_plist is not None
+            commit_atomic_install(publication, Path(manifest.target_plist))
+    except Exception as exc:
+        if manifest.paired_database_upgrade is not None:
+            raise VerifiedPredecessorFinalizationError(str(exc)) from exc
+        raise
 
 
 def release_claim(manifest: Manifest) -> bool:
@@ -1053,7 +1070,7 @@ def activate(manifest: Manifest) -> str:
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:
                 rollback_failure = str(rollback_exc)
-                if manifest.paired_database_upgrade is not None:
+                if manifest.paired_database_upgrade is not None and not isinstance(rollback_exc, VerifiedPredecessorFinalizationError):
                     try:
                         launchctl.stop()
                         state, pid = launchctl.inspect()
@@ -1138,7 +1155,7 @@ def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = 
         except Exception as failure:
             error += f"; durable plist quarantine failed: {failure}"
     try:
-        prior = json.loads(Path(manifest.status_path).read_text())
+        prior = read_status(manifest)
     except (OSError, json.JSONDecodeError):
         prior = {}
     if prior.get("transaction_id") != manifest.transaction_id:
@@ -1172,7 +1189,7 @@ def finalize_paired(manifest: Manifest) -> str:
         old_helper = subprocess.run(["launchctl", "print", f"gui/{manifest.uid}/{manifest.helper_label}"], capture_output=True, text=True)
         if old_helper.returncode == 0 or not service_absence_confirmed(old_helper.stdout + "\n" + old_helper.stderr, manifest.helper_label, manifest.uid):
             raise ActivationError("activation helper absence unconfirmed")
-        status = json.loads(Path(manifest.status_path).read_text())
+        status = read_status(manifest)
         if status.get("transaction_id") != manifest.transaction_id or status.get("state") != "committed":
             raise ActivationError("finalization requires matching committed status")
         claim = Path(manifest.active_path)
@@ -1222,11 +1239,13 @@ def recover_paired(manifest: Manifest) -> str:
             raise ActivationError("paired recovery requires a paired transaction")
         claim = Path(manifest.active_path)
         try:
-            status = json.loads(Path(manifest.status_path).read_text())
+            status = read_status(manifest)
         except (OSError, json.JSONDecodeError):
             status = {}
         if claim.read_text().strip() != manifest.transaction_id or status.get("transaction_id", manifest.transaction_id) != manifest.transaction_id or status.get("state") not in {None, "prepared", "activating", "activation_failed_rollback_failed"}:
             raise ActivationError("paired recovery must own a retained unresolved transaction")
+        if status.get("state") in {"prepared", None} and not Path(manifest.paired_database_upgrade.proof_path).exists():
+            raise ActivationError("pre-activation state requires non-disruptive controller abandonment, not runtime rollback")
         launchctl = Launchctl(manifest)
         try:
             if status.get("recovery_mode") is not None:
@@ -1237,9 +1256,12 @@ def recover_paired(manifest: Manifest) -> str:
                     raise ActivationError("post-restore checkpoint has no running predecessor; refuse snapshot replay")
                 require_loaded_plist(manifest, launchctl, private)
                 wait_for_identity(manifest, manifest.previous, health_url=manifest.previous_health_url, health_insecure_tls=manifest.previous_health_insecure_tls, health_json=manifest.previous_health_json)
-                restore_deployed_sha(manifest)
-                publication = prepare_plist_publication(private, Path(manifest.target_plist))
-                commit_atomic_install(publication, Path(manifest.target_plist))
+                try:
+                    restore_deployed_sha(manifest)
+                    publication = prepare_plist_publication(private, Path(manifest.target_plist))
+                    commit_atomic_install(publication, Path(manifest.target_plist))
+                except Exception as exc:
+                    raise VerifiedPredecessorFinalizationError(str(exc)) from exc
                 write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"))
                 return "activation_failed_rolled_back"
             paired = manifest.paired_database_upgrade
@@ -1271,20 +1293,21 @@ def recover_paired(manifest: Manifest) -> str:
             return "activation_failed_rolled_back"
         except Exception as exc:
             failure = str(exc)
-            try:
-                launchctl.stop()
-                state, pid = launchctl.inspect()
-                if state != "not_loaded" or pid is not None:
-                    raise ActivationError("paired recovery teardown is unconfirmed")
-            except Exception as teardown:
-                failure += f"; recovery teardown failed: {teardown}"
+            if not isinstance(exc, VerifiedPredecessorFinalizationError):
+                try:
+                    launchctl.stop()
+                    state, pid = launchctl.inspect()
+                    if state != "not_loaded" or pid is not None:
+                        raise ActivationError("paired recovery teardown is unconfirmed")
+                except Exception as teardown:
+                    failure += f"; recovery teardown failed: {teardown}"
             record_recovery_error(manifest, failure, quarantine=True)
             return "activation_failed_rollback_failed"
 
 
 def status_is_durable_terminal(manifest: Manifest) -> bool:
     try:
-        status = json.loads(Path(manifest.status_path).read_text())
+        status = read_status(manifest)
         return (
             status.get("transaction_id") == manifest.transaction_id
             and status.get("state") in TERMINAL_STATES

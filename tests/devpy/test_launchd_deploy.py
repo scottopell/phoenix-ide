@@ -376,6 +376,34 @@ class ActivationTests(unittest.TestCase):
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute("SELECT value FROM post_recovery_write").fetchone()[0], "keep")
 
+    def test_verified_predecessor_publication_failure_preserves_running_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            _state, manifest, database, *_ = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("candidate failed"))
+            helper.write_status(manifest, "activation_failed_rollback_failed")
+            backend = mock.Mock()
+            backend.inspect.return_value = ("running", 101)
+            before = database.read_bytes()
+            with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "commit_atomic_install", side_effect=OSError("publication failed")), mock.patch.object(helper, "restore_database") as restored:
+                self.assertEqual(helper.recover_paired(manifest), "activation_failed_rollback_failed")
+                backend.stop.assert_not_called()
+                backend.start.assert_not_called()
+                restored.assert_not_called()
+            self.assertEqual(database.read_bytes(), before)
+            self.assertTrue(Path(manifest.active_path).exists())
+
+    def test_nonobject_recovery_status_is_rejected_before_disruption(self):
+        for value in ("[]", "null", '"bad"'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
+                manifest, *_ = self._full_paired_fixture(Path(td))
+                Path(manifest.active_path).write_text(manifest.transaction_id)
+                Path(manifest.status_path).write_text(value)
+                with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl") as backend:
+                    with self.assertRaises(helper.ActivationError):
+                        helper.recover_paired(manifest)
+                    backend.assert_not_called()
+                helper.record_recovery_error(manifest, "malformed status")
+                self.assertEqual(json.loads(Path(manifest.status_path).read_text())["state"], "activation_failed_rollback_failed")
+
     def test_loaded_plist_finalization_proof_rejects_lookalike_inode(self):
         with tempfile.TemporaryDirectory() as td:
             _state, manifest, _database, _binary, plist, *_ = self._activate_full_paired(Path(td))
@@ -565,7 +593,13 @@ class ActivationTests(unittest.TestCase):
                     helper.write_status(manifest, phase)
                 backend = FakeLaunchctl(manifest)
                 backend.inspect = mock.Mock(return_value=("not_loaded", None))
+                backend.events = []
                 with mock.patch.object(helper, "__file__", str(copied_helper)), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "restore_deployed_sha"), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+                    if phase in ("prepared", None):
+                        with self.assertRaisesRegex(helper.ActivationError, "non-disruptive"):
+                            helper.recover_paired(manifest)
+                        self.assertEqual(backend.events, [])
+                        continue
                     outcome = helper.recover_paired(manifest)
                     self.assertEqual(outcome, "activation_failed_rolled_back", Path(manifest.status_path).read_text())
                     self.assertFalse(Path(manifest.paired_database_upgrade.proof_path).exists())
@@ -1489,7 +1523,8 @@ class PreparationTests(unittest.TestCase):
             status.write_text(json.dumps({"transaction_id": "pending", "state": "committed", "finalization_pending": True}))
             with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
                 self.dev.cmd_prod_finalize_paired("pending")
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_count, 3)
+            self.assertIn("sqlite3", run.call_args_list[0].args[0][-1])
             self.assertIn("finalize-paired", run.call_args.args[0])
             self.assertFalse(any("bootstrap" in call.args[0] for call in run.call_args_list))
 
@@ -1527,6 +1562,22 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
             self.assertFalse(active.exists())
             self.assertEqual(json.loads(manifest.read_text()), {"paired_database_upgrade": {}})
+
+    def test_prepared_handoff_absent_abandons_without_runtime_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staging = root / "transactions" / "prepared"
+            staging.mkdir(parents=True)
+            (staging / "manifest.json").write_text(json.dumps({"paired_database_upgrade": {}}))
+            active, status = root / "active", root / "status.json"
+            active.write_text("prepared\n")
+            status.write_text(json.dumps({"transaction_id": "prepared", "source_kind": "prepared_artifact", "state": "prepared", "preparing_pid": 123}))
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                self.dev.cmd_prod_recover_paired("prepared")
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("--probe-service-absence", run.call_args.args[0])
+            self.assertFalse(active.exists())
+            self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
 
     def test_status_recovers_paired_guidance_from_claim_without_readable_status(self):
         for contents in (None, "{", "[]", "null"):
@@ -1973,6 +2024,11 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.dev.launchd_prod_deploy()
             self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+
+    def test_prod_stop_refuses_pending_paired_finalization(self):
+        with mock.patch.object(self.dev, "_paired_recovery_refusal", return_value="pending finalization"), mock.patch.object(self.dev, "detect_prod_env") as detect, self.assertRaisesRegex(SystemExit, "pending finalization"):
+            self.dev.cmd_prod_stop()
+        detect.assert_not_called()
 
     def test_prod_stop_uses_service_target_and_requires_absence(self):
         success = subprocess.CompletedProcess([], 0, "", "")

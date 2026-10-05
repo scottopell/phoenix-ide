@@ -10036,6 +10036,9 @@ def cmd_prod_finalize_paired(transaction_id: str) -> None:
     helper = Path(payload["paired_database_upgrade"]["controller_helper_path"])
     if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != payload["paired_database_upgrade"].get("controller_helper_sha256"):
         raise SystemExit("retained helper checksum mismatch")
+    interpreter = subprocess.run([sys.executable, "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"], capture_output=True, text=True)
+    if interpreter.returncode != 0:
+        raise SystemExit("current interpreter cannot run retained paired finalization helper")
     label = payload["helper_label"]
     absence = subprocess.run([sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
     if absence.returncode != 0:
@@ -10059,11 +10062,11 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
         recovery_status = {}
     if recovery_status.get("transaction_id") == transaction_id and recovery_status.get("state") == "committed":
         raise SystemExit("committed paired transactions cannot enter database rollback; inspect pending publication/cleanup guidance in prod status")
-    if not manifest_path.exists() or recovery_status.get("state") == "preparing":
+    if not manifest_path.exists() or recovery_status.get("state") in {"preparing", "prepared"}:
         with _launchd_claim_lock():
             status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-            if _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("source_kind") != "prepared_artifact" or status.get("state") != "preparing":
-                raise SystemExit("pre-manifest recovery must own an interrupted paired preparation")
+            if _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("source_kind") != "prepared_artifact" or status.get("state") not in {"preparing", "prepared"}:
+                raise SystemExit("pre-handoff recovery must own an interrupted paired preparation")
             owner_pid = status.get("preparing_pid")
             if not isinstance(owner_pid, int) or owner_pid <= 0:
                 raise SystemExit("interrupted preparation process identity is unavailable")
@@ -10378,7 +10381,8 @@ def launchd_prod_deploy(
         _write_json_atomic(staging / "manifest.json", manifest)
         (staging / "manifest.json").chmod(0o400)
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "prepared", "source_kind": source_kind,
+            "transaction_id": transaction_id, "state": "prepared",
+            "preparing_pid": os.getpid(), "source_kind": source_kind,
             "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
             "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
             "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
@@ -10908,6 +10912,9 @@ def cmd_prod_status():
 
 def cmd_prod_stop():
     """Stop production service (auto-detects environment)."""
+    refusal = _paired_recovery_refusal(_deploy_claim_owner())
+    if refusal is not None:
+        raise SystemExit(refusal)
     env = detect_prod_env()
 
     if env == "launchd":
