@@ -451,47 +451,13 @@ fn marker_identity(marker: &Path) -> Option<(String, String)> {
     Some((lines.next()?.to_string(), lines.next()?.to_string()))
 }
 
-fn systemd_status_command(path: &Path) -> Command {
-    let mut command = Command::new("sudo");
-    command.args(["-n", "cat"]).arg(path);
-    command
-}
-
-fn systemd_ownership_value(value: &serde_json::Value) -> Option<bool> {
-    let Some(object) = value.as_object() else {
-        return Some(true);
-    };
-    match object.get("retained_ownership") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Bool(retained)) => Some(*retained),
-        Some(_) => Some(true),
-    }
-}
-
-fn systemd_status_ownership(output: &std::process::Output) -> Option<bool> {
-    if !output.status.success() {
-        return if String::from_utf8_lossy(&output.stderr).contains("No such file or directory") {
-            None
-        } else {
-            Some(true)
-        };
-    }
-    match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-        Ok(value) => systemd_ownership_value(&value),
-        Err(_) => Some(true),
-    }
-}
-
 fn retained_deploy_ownership(state: &AppState, backend: ReleaseUpdateBackend) -> Option<bool> {
+    if !matches!(backend, ReleaseUpdateBackend::Launchd) {
+        return None;
+    }
     let Some(status) = status_path(state, backend) else {
         return Some(true);
     };
-    if matches!(backend, ReleaseUpdateBackend::Systemd) {
-        return match systemd_status_command(&status).output() {
-            Ok(output) => systemd_status_ownership(&output),
-            Err(_) => Some(true),
-        };
-    }
     let Some(parent) = status.parent() else {
         return Some(true);
     };
@@ -503,16 +469,12 @@ fn retained_deploy_ownership(state: &AppState, backend: ReleaseUpdateBackend) ->
 
 #[allow(clippy::too_many_lines)]
 fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransactionStatus {
-    let native_ownership = if matches!(backend, ReleaseUpdateBackend::Systemd) {
-        None
-    } else {
-        retained_deploy_ownership(state, backend)
-    };
+    let native_ownership = retained_deploy_ownership(state, backend);
     let Some(path) = status_path(state, backend) else {
         return ReleaseTransactionStatus::None;
     };
     let text = if matches!(backend, ReleaseUpdateBackend::Systemd) {
-        match systemd_status_command(&path).output() {
+        match Command::new("sudo").args(["-n", "cat"]).arg(&path).output() {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).into_owned()
             }
@@ -589,14 +551,15 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
             .map(|timestamp| timestamp.to_rfc3339())
     });
-    let finalization_pending = value
-        .get("finalization_pending")
-        .and_then(serde_json::Value::as_bool);
-    let retained_ownership = if matches!(backend, ReleaseUpdateBackend::Systemd) {
-        systemd_ownership_value(&value)
-    } else {
-        native_ownership
-    };
+    let launchd = matches!(backend, ReleaseUpdateBackend::Launchd);
+    let finalization_pending = launchd
+        .then(|| {
+            value
+                .get("finalization_pending")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .flatten();
+    let retained_ownership = native_ownership;
     let terminal = TERMINAL_STATUS_STATES.contains(&state.as_str())
         && finalization_pending != Some(true)
         && retained_ownership != Some(true);
@@ -623,9 +586,9 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
         updated_at,
         failure: string("failure"),
         rollback_failure: string("rollback_failure"),
-        recovery_mode: string("recovery_mode"),
+        recovery_mode: launchd.then(|| string("recovery_mode")).flatten(),
         finalization_pending,
-        committed_diagnostic: string("committed_diagnostic"),
+        committed_diagnostic: launchd.then(|| string("committed_diagnostic")).flatten(),
         retained_ownership,
         stale: status_is_stale,
     }
@@ -1128,7 +1091,7 @@ mod tests {
         app.runtime_env = Arc::new(
             phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(projections.path()),
         );
-        let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
+        let path = status_path(&app, ReleaseUpdateBackend::Launchd).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let active = path.parent().unwrap().join("active");
         for status in statuses {
@@ -1139,7 +1102,7 @@ mod tests {
                 let _ = fs::remove_file(&active);
             }
             let wire =
-                serde_json::to_value(read_status(&app, ReleaseUpdateBackend::BareLinux)).unwrap();
+                serde_json::to_value(read_status(&app, ReleaseUpdateBackend::Launchd)).unwrap();
             assert_eq!(wire["state"], status["state"]);
             assert_eq!(
                 wire["recovery_mode"],
@@ -1186,7 +1149,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         app.runtime_env =
             Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(root.path()));
-        let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
+        let path = status_path(&app, ReleaseUpdateBackend::Launchd).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let active = path.parent().unwrap().join("active");
         for terminal in TERMINAL_STATUS_STATES {
@@ -1201,51 +1164,44 @@ mod tests {
                 } else {
                     let _ = fs::remove_file(&active);
                 }
-                let wire = serde_json::to_value(read_status(&app, ReleaseUpdateBackend::BareLinux))
-                    .unwrap();
+                let wire =
+                    serde_json::to_value(read_status(&app, ReleaseUpdateBackend::Launchd)).unwrap();
                 assert_eq!(wire["retained_ownership"], retained);
                 assert_eq!(
-                    retained_deploy_ownership(&app, ReleaseUpdateBackend::BareLinux),
+                    retained_deploy_ownership(&app, ReleaseUpdateBackend::Launchd),
                     Some(retained)
                 );
             }
         }
     }
 
-    #[test]
-    fn systemd_ownership_uses_existing_status_command_and_legacy_omission() {
-        let path = Path::new("/var/lib/phoenix-ide/deploy/status.json");
-        let command = systemd_status_command(path);
-        assert_eq!(command.get_program(), "sudo");
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["-n", "cat", path.to_str().unwrap()]
-        );
-        for (body, expected) in [
-            (r#"{"state":"committed"}"#, None),
-            (r#"{"retained_ownership":false}"#, Some(false)),
-            (r#"{"retained_ownership":true}"#, Some(true)),
-            ("invalid", Some(true)),
-            ("[]", Some(true)),
-            (r#"{"retained_ownership":"invalid"}"#, Some(true)),
-            (r#"{"retained_ownership":null}"#, None),
+    #[tokio::test]
+    async fn non_launchd_status_preserves_baseline_without_ownership_projection() {
+        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        app.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(root.path()));
+        let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path.parent().unwrap().join("active"), "retained").unwrap();
+        fs::write(&path, serde_json::json!({"transaction_id":"terminal", "state":"committed", "finalization_pending":true, "retained_ownership":true, "recovery_mode":"migration_resumed", "committed_diagnostic":"launchd-only"}).to_string()).unwrap();
+        let wire =
+            serde_json::to_value(read_status(&app, ReleaseUpdateBackend::BareLinux)).unwrap();
+        for field in [
+            "retained_ownership",
+            "finalization_pending",
+            "recovery_mode",
+            "committed_diagnostic",
         ] {
-            let output = Command::new("sh")
-                .args(["-c", "printf '%s' \"$1\"", "fixture", body])
-                .output()
-                .unwrap();
-            assert_eq!(systemd_status_ownership(&output), expected);
+            assert!(wire[field].is_null());
         }
-        let denied = Command::new("sh")
-            .args(["-c", "echo 'sudo denied' >&2; exit 1"])
-            .output()
-            .unwrap();
-        assert_eq!(systemd_status_ownership(&denied), Some(true));
-        let absent = Command::new("sh")
-            .args(["-c", "echo 'No such file or directory' >&2; exit 1"])
-            .output()
-            .unwrap();
-        assert_eq!(systemd_status_ownership(&absent), None);
+        for backend in [
+            ReleaseUpdateBackend::BareLinux,
+            ReleaseUpdateBackend::Systemd,
+            ReleaseUpdateBackend::Unsupported,
+        ] {
+            assert_eq!(retained_deploy_ownership(&app, backend), None);
+        }
     }
 
     #[test]

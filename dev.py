@@ -10124,7 +10124,7 @@ def _status_is_terminal_for_owner(
     try:
         status = json.loads(status_path.read_text())
         if status_path == LAUNCHD_DEPLOY_STATUS_PATH and _ordinary_migration_owned(owner, status):
-            return status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed"}
+            return False
         if (
             status.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
             and (status.get("state") == "activation_failed_rollback_failed"
@@ -10238,13 +10238,17 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
         manifest = {}
     if not isinstance(manifest, dict):
         manifest = {}
-    if _deploy_claim_owner() == owner and _ordinary_migration_owned(owner, status) and not (
-        status.get("transaction_id") == owner and (status.get("state") == "precondition_failed" or (status.get("state") == "committed" and not status.get("finalization_pending")))
-    ):
+    if _deploy_claim_owner() == owner and _ordinary_migration_owned(owner, status):
         if status.get("state") == "committed":
             return (
                 "verified candidate commit is retained; publication-only finalization required, "
                 f"never restore the predecessor backup; use ./dev.py prod resume-migration {owner}"
+            )
+        if status.get("state") in {"activating", "migration_failed_stopped"} and status.get("candidate_exposed") is not False:
+            return (
+                f"ordinary migration {owner}: candidate may have accepted writes. Preserve live database; "
+                "never restore predecessor backup or resume predecessor. Candidate-only recovery requires "
+                "independent operator qualification; automatic recovery is unavailable. Claim remains fenced."
             )
         return (
             f"ordinary migration {owner} retains deployment ownership. Do not clear its marker, redeploy, restart, or stop. "
@@ -10581,6 +10585,8 @@ def cmd_prod_resume_migration(transaction_id: str) -> None:
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
     status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    if status.get("transaction_id") == transaction_id and status.get("state") in {"activating", "migration_failed_stopped"} and status.get("candidate_exposed") is not False:
+        raise SystemExit("Candidate may have accepted writes: preserve live database; never restore predecessor backup or resume predecessor. Candidate-only recovery requires independent operator qualification; automatic recovery is unavailable.")
     if status.get("transaction_id") == transaction_id and (status.get("state") == "preparing" or status.get("cleanup_pending") or status.get("abandoned_preparation")):
         _abandon_incomplete_migration_preparation(transaction_id, staging)
         return
@@ -11060,7 +11066,7 @@ def launchd_prod_deploy(
         _fsync_directory(staging)
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "prepared",
-            **({"ordinary_migration": True} if ordinary_policy else {}),
+            **({"ordinary_migration": True, "candidate_exposed": False} if ordinary_policy else {}),
             "preparing_pid": os.getpid(), "source_kind": source_kind,
             "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
             "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,

@@ -97,6 +97,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [081](081_manual-migration-resume-status-preserves-recovery-evidence.md) | Manual migration resume status preserves recovery evidence | Accepted | REQ-LDD-019, REQ-RU-008, REQ-COMP-003 |
 | [082](082_verified-modern-candidate-commit-precedes-autoload-publication.md) | Verified modern candidate commit precedes autoload publication | Accepted | REQ-LDD-019, REQ-PD-021, REQ-COMP-003 |
 | [083](083_terminal-runtime-status-does-not-release-deployment-ownership.md) | Terminal runtime status does not release deployment ownership | Accepted | REQ-LDD-019, REQ-RU-008, REQ-COMP-003 |
+| [084](084_ordinary-candidate-exposure-forbids-predecessor-restoration.md) | Ordinary candidate exposure forbids predecessor restoration | Accepted | REQ-LDD-019, REQ-PD-021, REQ-RU-008 |
 
 ## For agents: which decisions bind your task
 

@@ -67,6 +67,7 @@ entity DeployTransaction {
     expected: RuntimeIdentity
     previous: RuntimeIdentity?
     ordinary_policy: OrdinaryPolicy
+    candidate_exposed: Boolean?
     state: TransactionState
     created_at: Timestamp
     updated_at: Timestamp
@@ -555,6 +556,19 @@ rule RecordPairedFinalizationOutcome {
 --   Exact restored backup bytes/logical contents and captured predecessor
 --   identity/private configuration; no database restore is performed here.
 
+rule RecordOrdinaryCandidateExposure {
+    when: CandidateStartupRequested(transaction)
+    requires: transaction.state = activating
+    requires: transaction.ordinary_policy = modern_migration_stopped
+    ensures: transaction.candidate_exposed = true
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Persist conservative exposure before launchctl can start the candidate.
+        -- False permits only pre-exposure restoration; missing evidence is unknown,
+        -- never proof of no accepted writes. No network gate or server mode.
+}
+
 rule FailModernMigrationStopped {
     when: ActivationFailed(transaction, service, failure)
     requires: transaction.state = activating
@@ -567,11 +581,16 @@ rule FailModernMigrationStopped {
     @guidance
         -- Confirm candidate teardown and quarantine autoload configuration.
         -- Retain claim even if teardown is uncertain; never start predecessor.
+        -- Preserve exposure checkpoint across failure/status writes. Possible or
+        -- unknown exposure forbids predecessor backup restoration/resume; preserve
+        -- live data, require independently qualified candidate-only operator recovery.
+        -- Automatic post-exposure failed-activation recovery is unavailable.
         -- Admission requires modern_receipt_and_stopped_ownership_verified.
 }
 
 rule ResumeManuallyRestoredMigration {
     when: ManualMigrationResumeVerified(transaction, service)
+    requires: transaction.candidate_exposed = false
     requires: transaction.state in { prepared, activating, migration_failed_stopped }
     requires: transaction.ordinary_policy = modern_migration_stopped
     requires: active_claim_retained(transaction)
@@ -589,6 +608,20 @@ rule ResumeManuallyRestoredMigration {
         -- Preserve original candidate failure; append labelled resume diagnostics.
         -- Persist migration_resumed semantics using the predecessor-understood
         -- activation_failed_rolled_back status plus migration_resumed recovery_mode.
+}
+
+rule FinalizeOrdinaryPreconditionClaim {
+    when: MigrationResumeRequested(transaction, service)
+    requires: transaction.ordinary_policy = modern_migration_stopped
+    requires: transaction.state = precondition_failed
+    requires: active_claim_retained(transaction)
+    ensures: not DeploymentOwnsActivationClaim(transaction)
+
+    @guidance
+        -- Exact retained helper/operation/shared claim lock and matching durable
+        -- precondition outcome authorize owned claim finalization only. Preserve
+        -- status diagnostic; no runtime/database validation, startup or restoration.
+        -- Release error re-establishes the same fence for this release-only retry.
 }
 
 rule AbandonFailedMigrationPreparation {
@@ -635,9 +668,12 @@ rule FinalizeResumedMigrationClaim {
         -- status and reserve absent ownership before verification or mutation.
         -- A competing owner or superseding global status refuses without mutation.
         -- Preserve manual-restoration explanation in the predecessor's existing
-        -- failure diagnostic; current API also threads recovery_mode to the UI.
-        -- Current API derives retained ownership from actual active claim; UI
-        -- polling/approval remain fenced until release even for terminal status.
+        -- failure diagnostic; wire recovery-mode projection threads its semantics.
+        -- Launchd wire ownership projection derives actual active claim. Consumers
+        -- supporting it poll/gate approval until release for every terminal state.
+        -- Every active ordinary controller claim stays fenced regardless of state
+        -- or pending bit; only its owner can release it. Wire omission does not
+        -- invent an ownership capability in the consumer.
         -- After durable claim removal, transaction-local completion evidence makes
         -- private copies eligible for existing bounded pruning. Protect active,
         -- failed/pending/unknown transactions and external operator originals.
@@ -890,6 +926,16 @@ invariant LegacyIdentityIsRollbackOnly {
     for transaction in DeployTransactions:
         transaction.previous != null implies
             previous_rollback_identity_is_valid(transaction)
+}
+
+-- ordinary_controller_admission_fenced(transaction) -> Boolean
+--   Deploy/restart/stop cannot reap an ordinary owner based on terminal state
+--   or pending bit; its matching owner must release the claim.
+invariant ActiveOrdinaryMigrationClaimsAreNotReaped {
+    for transaction in DeployTransactions:
+        transaction.ordinary_policy = modern_migration_stopped
+        and active_claim_retained(transaction) implies
+            ordinary_controller_admission_fenced(transaction)
 }
 
 invariant OrdinaryRollbackIsRuntimeOnly {

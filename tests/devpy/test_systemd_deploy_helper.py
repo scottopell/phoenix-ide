@@ -651,120 +651,15 @@ class SystemdActivationTests(SystemdManifestValidationTests):
         self.assertEqual(before, self.policy.status_path.read_bytes())
         self.assertEqual(manifest.transaction_id, self.policy.active_path.read_text().strip())
 
-    def test_owned_terminal_status_release_failure_remains_fenced_for_retry(self):
-        manifest = self.manifest()
-        self.policy.active_path.write_text(manifest.transaction_id + "\n")
-        helper.write_status(manifest, "committed")
-        with mock.patch.object(helper, "mark_claim_released", side_effect=OSError("status release failure")):
-            with self.assertRaises(OSError):
-                helper.release_claim(manifest)
-        self.assertEqual(self.policy.active_path.read_text().strip(), manifest.transaction_id)
-        self.assertTrue(json.loads(self.policy.status_path.read_text())["retained_ownership"])
-        self.assertTrue(helper.release_claim(manifest))
-        self.assertFalse(json.loads(self.policy.status_path.read_text())["retained_ownership"])
-
-    def test_main_precondition_failure_releases_claim_without_replacing_diagnostic(self):
-        manifest = self.manifest()
-        self.policy.active_path.write_text(manifest.transaction_id + "\n")
-        def activate(_):
-            helper.write_status(manifest, "precondition_failed", failure="installation reservation failed")
-            raise helper.ActivationError("preparation failed")
-        with mock.patch.object(sys, "argv", ["helper", "activate", "--manifest", str(self.manifest_path)]), \
-             mock.patch.object(os, "geteuid", return_value=0), \
-             mock.patch.object(helper.ValidationPolicy, "production", return_value=self.policy), \
-             mock.patch.object(helper, "validate_manifest"), \
-             mock.patch.object(helper, "activate", side_effect=activate):
-            self.assertEqual(1, helper.main())
-        status = json.loads(self.policy.status_path.read_text())
-        self.assertEqual("precondition_failed", status["state"])
-        self.assertEqual("installation reservation failed", status["failure"])
-        self.assertFalse(status["retained_ownership"])
-        self.assertFalse(self.policy.active_path.exists())
-
-    def test_main_preserves_commit_and_fence_when_terminal_release_fails(self):
-        manifest = self.manifest()
-        self.policy.active_path.write_text(manifest.transaction_id + "\n")
-        def activate(_):
-            helper.write_status(manifest, "committed")
-            return "committed"
-        original = helper.mark_claim_released
-        def fail_once(path, txn, **kwargs):
-            if not kwargs.get("retained"):
-                raise OSError("terminal projection failed")
-            return original(path, txn, **kwargs)
-        with mock.patch.object(sys, "argv", ["helper", "activate", "--manifest", str(self.manifest_path)]), \
-             mock.patch.object(os, "geteuid", return_value=0), \
-             mock.patch.object(helper.ValidationPolicy, "production", return_value=self.policy), \
-             mock.patch.object(helper, "validate_manifest"), \
-             mock.patch.object(helper, "activate", side_effect=activate), \
-             mock.patch.object(helper, "mark_claim_released", side_effect=fail_once):
-            self.assertEqual(1, helper.main())
-        status = json.loads(self.policy.status_path.read_text())
-        self.assertEqual("committed", status["state"])
-        self.assertTrue(status["retained_ownership"])
-        self.assertEqual(manifest.transaction_id, self.policy.active_path.read_text().strip())
-        with mock.patch.object(sys, "argv", ["helper", "abandon", "--manifest", str(self.manifest_path)]), \
-             mock.patch.object(os, "geteuid", return_value=0), \
-             mock.patch.object(helper.ValidationPolicy, "production", return_value=self.policy), \
-             mock.patch.object(helper, "validate_manifest"), \
-             mock.patch.object(helper, "activate", side_effect=AssertionError("must not replay activation")):
-            self.assertEqual(0, helper.main())
-        self.assertEqual("committed", json.loads(self.policy.status_path.read_text())["state"])
-        self.assertFalse(json.loads(self.policy.status_path.read_text())["retained_ownership"])
-        self.assertFalse(self.policy.active_path.exists())
-
-    def test_terminal_release_crash_reconciles_absent_claim_without_replay(self):
-        class Crash(BaseException):
-            pass
-        manifest = self.manifest()
-        for policy_release in (False, True):
-            with self.subTest(policy_release=policy_release):
-                self.policy.active_path.write_text(manifest.transaction_id + "\n")
-                helper.write_status(manifest, "committed")
-                def release():
-                    return helper.release_policy_claim(manifest.transaction_id, self.policy) if policy_release else helper.release_claim(manifest)
-                with mock.patch.object(helper, "mark_claim_released", side_effect=Crash()), self.assertRaises(Crash):
-                    release()
-                self.assertFalse(self.policy.active_path.exists())
-                self.assertTrue(json.loads(self.policy.status_path.read_text())["retained_ownership"])
-                self.assertTrue(release())
-                self.assertFalse(json.loads(self.policy.status_path.read_text())["retained_ownership"])
-                self.policy.active_path.write_text("newer-owner\n")
-                before = self.policy.status_path.read_bytes()
-                self.assertFalse(release())
-                self.assertEqual(before, self.policy.status_path.read_bytes())
-                self.assertEqual("newer-owner\n", self.policy.active_path.read_text())
-
-    def test_status_release_fsync_failure_restores_retained_projection(self):
-        manifest = self.manifest()
-        self.policy.active_path.write_text(manifest.transaction_id + "\n")
-        helper.write_status(manifest, "committed")
-        original = helper.atomic_write
-        failed = False
-        def write(path, data, mode=0o600):
-            nonlocal failed
-            original(path, data, mode)
-            if path == self.policy.status_path and not json.loads(data)["retained_ownership"] and not failed:
-                failed = True
-                raise OSError("post-status fsync interrupted")
-        with mock.patch.object(helper, "atomic_write", side_effect=write), self.assertRaises(OSError):
-            helper.release_claim(manifest)
-        self.assertTrue(json.loads(self.policy.status_path.read_text())["retained_ownership"])
-        self.assertTrue(self.policy.active_path.exists())
-        self.assertTrue(helper.release_claim(manifest))
-        self.assertFalse(json.loads(self.policy.status_path.read_text())["retained_ownership"])
-
     def test_claim_release_requires_matching_terminal_status(self):
         manifest = self.manifest()
         self.policy.active_path.write_text("newer-transaction\n")
         helper.write_status(manifest, "committed")
         self.assertFalse(helper.release_claim(manifest))
-        self.assertTrue(json.loads(self.policy.status_path.read_text())["retained_ownership"])
         self.assertTrue(self.policy.active_path.exists())
         self.policy.active_path.write_text(manifest.transaction_id + "\n")
         self.assertTrue(helper.release_claim(manifest))
         self.assertFalse(self.policy.active_path.exists())
-        self.assertFalse(json.loads(self.policy.status_path.read_text())["retained_ownership"])
 
 
 if __name__ == "__main__":

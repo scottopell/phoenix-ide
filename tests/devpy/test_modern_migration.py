@@ -118,7 +118,7 @@ def fixture(root, version=112):
         ),
     )
     Path(manifest.active_path).write_text(manifest.transaction_id)
-    helper.write_status(manifest, "prepared")
+    helper.write_status(manifest, "prepared", candidate_exposed=False)
     return manifest, Backend(manifest)
 
 
@@ -155,13 +155,13 @@ class ModernMigrationTests(unittest.TestCase):
 
     def test_prepared_handoff_failure_can_explicitly_resume_matched_predecessor(self):
         self.assertEqual(helper.read_status(self.manifest)["state"], "prepared")
-        Path(self.manifest.status_path).write_text(json.dumps({"transaction_id": self.manifest.transaction_id, "state": "prepared", "preparing_pid": 999999}))
+        Path(self.manifest.status_path).write_text(json.dumps({"transaction_id": self.manifest.transaction_id, "state": "prepared", "candidate_exposed": False, "preparing_pid": 999999}))
         with mock.patch.object(helper.os, "kill", side_effect=ProcessLookupError()):
             self.assertEqual(helper.resume_migration(self.manifest), "migration_resumed")
         self.assertEqual([event for event in self.backend.events if isinstance(event, tuple)], [("start", self.manifest.rollback_plist)])
 
     def test_live_prepared_controller_prevents_resume_and_any_mutation(self):
-        Path(self.manifest.status_path).write_text(json.dumps({"transaction_id": self.manifest.transaction_id, "state": "prepared", "preparing_pid": os.getpid()}))
+        Path(self.manifest.status_path).write_text(json.dumps({"transaction_id": self.manifest.transaction_id, "state": "prepared", "candidate_exposed": False, "preparing_pid": os.getpid()}))
         before = Path(self.manifest.status_path).read_bytes()
         with self.assertRaisesRegex(helper.ActivationError, "controller still alive"):
             helper.resume_migration(self.manifest)
@@ -203,11 +203,13 @@ class ModernMigrationTests(unittest.TestCase):
             connection.execute("INSERT INTO _migrations VALUES (113, 'candidate')")
 
     def fail_activation(self):
-        self.backend.on_start = self.mutate
-        self.health.side_effect = helper.ActivationError("candidate health failed")
-        self.assertEqual("migration_failed_stopped", helper.activate(self.manifest))
-        self.backend.on_start = None
-        self.health.side_effect = None
+        original = helper.commit_atomic_install
+        def failed_install(source, target):
+            original(source, target)
+            self.mutate()
+            raise helper.ActivationError("candidate installation failed before exposure")
+        with mock.patch.object(helper, "commit_atomic_install", side_effect=failed_install):
+            self.assertEqual("migration_failed_stopped", helper.activate(self.manifest))
 
     def restore_manually(self):
         shutil.copyfile(self.manifest.ordinary_migration.backup_path, self.manifest.ordinary_migration.database_path)
@@ -226,21 +228,82 @@ class ModernMigrationTests(unittest.TestCase):
             with self.assertRaises((helper.ActivationError, TypeError)):
                 helper.Manifest.load(path)
 
-    def test_candidate_mutation_health_failure_never_starts_predecessor_or_restores_db(self):
+    def test_preexposure_install_failure_never_starts_predecessor_or_restores_db(self):
         with mock.patch.object(helper, "restore") as restore, mock.patch.object(helper, "restore_database") as restore_db:
             self.fail_activation()
         restore.assert_not_called()
         restore_db.assert_not_called()
-        self.assertEqual([("start", self.manifest.candidate_plist), "stop"], self.backend.events)
+        self.assertEqual(["stop"], self.backend.events)
         self.assertEqual(("not_loaded", None), self.backend.state)
         self.assertEqual(self.manifest.candidate_binary_sha256, helper.sha256(Path(self.manifest.target_binary)))
         self.assertFalse(Path(self.manifest.target_plist).exists())
         self.assertTrue(list(Path(self.manifest.status_path).parent.glob("*.quarantined")))
         self.assertTrue(Path(self.manifest.active_path).exists())
         self.assertFalse(helper.status_is_durable_terminal(self.manifest))
-        self.assertIn("candidate health failed", helper.read_status(self.manifest)["failure"])
+        self.assertIn("candidate installation failed before exposure", helper.read_status(self.manifest)["failure"])
         with sqlite3.connect(self.manifest.ordinary_migration.database_path) as connection:
             self.assertEqual(("candidate mutated",), connection.execute("SELECT value FROM preserved").fetchone())
+
+    def test_precommit_exposure_preserves_accepted_writes_and_forbids_predecessor_resume(self):
+        database = Path(self.manifest.ordinary_migration.database_path)
+        def accepts_request():
+            self.assertTrue(helper.read_status(self.manifest)["candidate_exposed"])
+            self.mutate()
+            with sqlite3.connect(database) as connection:
+                connection.execute("INSERT INTO preserved VALUES ('accepted user write')")
+        self.backend.on_start = accepts_request
+        self.health.side_effect = helper.ActivationError("identity unavailable after traffic")
+        self.assertEqual("migration_failed_stopped", helper.activate(self.manifest))
+        status = helper.read_status(self.manifest)
+        self.assertTrue(status["candidate_exposed"])
+        self.assertIn("never restore the predecessor backup", status["failure"])
+        self.assertTrue(Path(self.manifest.active_path).exists())
+        self.assertFalse(Path(self.manifest.target_plist).exists())
+        before = database.read_bytes()
+        events = self.backend.events[:]
+        with mock.patch.object(helper, "validate_ordinary_receipt", side_effect=AssertionError("no restore validation allowed")):
+            with self.assertRaisesRegex(helper.ActivationError, "automatic recovery is unavailable"):
+                helper.resume_migration(self.manifest)
+        self.assertEqual(events, self.backend.events)
+        self.assertEqual(before, database.read_bytes())
+        with sqlite3.connect(database) as connection:
+            self.assertIn(("accepted user write",), connection.execute("SELECT value FROM preserved").fetchall())
+
+    def test_failed_exposure_checkpoint_never_starts_candidate(self):
+        original = helper.write_status
+        def fail_checkpoint(manifest, state, **kwargs):
+            if kwargs.get("candidate_exposed") is True:
+                raise OSError("exposure persistence failed")
+            return original(manifest, state, **kwargs)
+        with mock.patch.object(helper, "write_status", side_effect=fail_checkpoint):
+            self.assertEqual("migration_failed_stopped", helper.activate(self.manifest))
+        self.assertFalse(any(isinstance(event, tuple) for event in self.backend.events))
+        self.assertFalse(helper.read_status(self.manifest)["candidate_exposed"])
+        self.assertTrue(Path(self.manifest.active_path).exists())
+
+    def test_unknown_exposure_never_becomes_false_or_authorizes_resume(self):
+        for value in (None, "invalid", "missing", "unreadable"):
+            with self.subTest(value=value):
+                Path(self.manifest.active_path).write_text(self.manifest.transaction_id)
+                status = {"transaction_id": self.manifest.transaction_id, "state": "activating"}
+                if value != "missing":
+                    status["candidate_exposed"] = value
+                Path(self.manifest.status_path).write_text("invalid json" if value == "unreadable" else json.dumps(status))
+                helper.write_status(self.manifest, "migration_failed_stopped", failure="unknown exposure")
+                self.assertIsNone(helper.read_status(self.manifest)["candidate_exposed"])
+                with self.assertRaisesRegex(helper.ActivationError, "automatic recovery is unavailable"):
+                    helper.resume_migration(self.manifest)
+
+    def test_precondition_claim_release_retry_has_no_runtime_database_or_status_replay(self):
+        helper.write_status(self.manifest, "precondition_failed", failure="receipt invalid")
+        status = Path(self.manifest.status_path).read_bytes()
+        database = Path(self.manifest.ordinary_migration.database_path).read_bytes()
+        argv = ["helper", "resume-migration", "--manifest", "unused", "--helper-label", self.manifest.helper_label, "--uid", str(self.manifest.uid)]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(helper.Manifest, "load", return_value=self.manifest), mock.patch.object(helper, "request_helper_bootout"), mock.patch.object(helper, "Launchctl", side_effect=AssertionError("release-only")):
+            self.assertEqual(0, helper.main())
+        self.assertEqual(status, Path(self.manifest.status_path).read_bytes())
+        self.assertEqual(database, Path(self.manifest.ordinary_migration.database_path).read_bytes())
+        self.assertFalse(Path(self.manifest.active_path).exists())
 
     def test_teardown_failure_is_diagnostic_and_retains_claim(self):
         self.backend.fail_stop = True
@@ -253,7 +316,7 @@ class ModernMigrationTests(unittest.TestCase):
         self.fail_activation()
         before = Path(self.manifest.ordinary_migration.database_path).read_bytes()
         self.assertEqual("migration_failed_stopped", helper.resume_migration(self.manifest))
-        self.assertEqual([("start", self.manifest.candidate_plist), "stop", "stop"], self.backend.events)
+        self.assertEqual(["stop", "stop"], self.backend.events)
         self.assertEqual(before, Path(self.manifest.ordinary_migration.database_path).read_bytes())
         self.assertIn("restored database checksum mismatch", helper.read_status(self.manifest)["failure"])
         self.assertTrue(Path(self.manifest.active_path).exists())
@@ -302,7 +365,7 @@ class ModernMigrationTests(unittest.TestCase):
                 self.assertEqual(b"operator-owned", sidecar.read_bytes())
                 self.assertIn("sidecars remain", helper.read_status(self.manifest)["failure"])
                 sidecar.unlink()
-        self.assertEqual(1, sum(isinstance(event, tuple) for event in self.backend.events))
+        self.assertEqual(0, sum(isinstance(event, tuple) for event in self.backend.events))
 
     def test_resume_health_failure_tears_down_and_checkpoint_refuses_replay(self):
         self.fail_activation()
@@ -434,7 +497,7 @@ class ModernMigrationTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual("migration_failed_stopped", helper.resume_migration(self.manifest))
             path.write_bytes(before)
-        self.assertEqual(1, sum(isinstance(event, tuple) for event in self.backend.events))
+        self.assertEqual(0, sum(isinstance(event, tuple) for event in self.backend.events))
         self.assertTrue(Path(self.manifest.active_path).exists())
 
     def test_resume_post_terminal_retained_claim_finalizes_without_runtime_or_db_replay(self):

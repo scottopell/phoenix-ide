@@ -263,6 +263,7 @@ def write_status(
     committed_diagnostic: Optional[str] = None,
     finalization_pending: bool = False,
     recovery_mode: Optional[str] = None,
+    candidate_exposed: Optional[bool] = None,
 ) -> None:
     try:
         prior = read_status(manifest)
@@ -270,6 +271,11 @@ def write_status(
         prior = {}
     if isinstance(prior, dict) and prior.get("transaction_id") == manifest.transaction_id and prior.get("recovery_mode") is not None:
         recovery_mode = recovery_mode or prior.get("recovery_mode")
+    if isinstance(prior, dict) and prior.get("transaction_id") == manifest.transaction_id:
+        if prior.get("candidate_exposed") is True:
+            candidate_exposed = True
+        elif candidate_exposed is None and prior.get("candidate_exposed") is False:
+            candidate_exposed = False
     status = {
         "transaction_id": manifest.transaction_id,
         "state": state,
@@ -287,6 +293,7 @@ def write_status(
         "committed_diagnostic": committed_diagnostic,
         "finalization_pending": finalization_pending,
         "recovery_mode": recovery_mode,
+        **({"candidate_exposed": candidate_exposed} if manifest.ordinary_migration is not None else {}),
     }
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
@@ -1266,6 +1273,8 @@ def activate(manifest: Manifest) -> str:
                 commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
                 launchctl.start(old_pid)
             else:
+                if manifest.ordinary_migration is not None:
+                    write_status(manifest, "activating", candidate_exposed=True)
                 launchctl.start(old_pid, plist_path=manifest.candidate_plist)
             wait_for_identity(manifest, manifest.expected)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
@@ -1567,6 +1576,8 @@ def recover_paired(manifest: Manifest) -> str:
 
 
 def fail_migration_stopped(manifest: Manifest, launchctl: Launchctl, failure: str) -> str:
+    if read_status(manifest).get("candidate_exposed") is not False:
+        failure += "\nCandidate may have accepted writes: preserve the live database; never restore the predecessor backup or resume predecessor. Candidate-only recovery requires independent operator qualification; automatic recovery is unavailable."
     diagnostics = []
     try:
         launchctl.stop()
@@ -1639,6 +1650,10 @@ def resume_migration(manifest: Manifest) -> str:
         status = reserve_migration_resume(manifest)
         if status.get("state") == "preparing":
             raise ActivationError("pre-bootstrap preparing migration requires controller cleanup-only abandonment")
+        if status.get("state") == "precondition_failed":
+            if not status_is_durable_terminal(manifest):
+                raise ActivationError("precondition claim finalization evidence is unavailable")
+            return "precondition_failed"
         if status.get("state") not in {"prepared", "activating", "migration_failed_stopped", "activation_failed_rolled_back", "committed"}:
             raise ActivationError("migration resume state does not authorize runtime recovery")
         if status.get("state") == "prepared":
@@ -1656,6 +1671,8 @@ def resume_migration(manifest: Manifest) -> str:
         launchctl = Launchctl(manifest)
         if status.get("state") == "committed":
             return finalize_committed_migration(manifest, launchctl, status)
+        if status.get("state") in {"prepared", "activating", "migration_failed_stopped"} and status.get("candidate_exposed") is not False:
+            raise ActivationError("candidate may have accepted writes; preserve live database, never restore predecessor backup or resume predecessor. Candidate-only recovery requires independent operator qualification; automatic recovery is unavailable")
         if status.get("state") == "activation_failed_rolled_back":
             if status.get("recovery_mode") != "migration_resumed":
                 raise ActivationError("migration terminal resume evidence mismatch")
@@ -1775,7 +1792,7 @@ def main() -> int:
             if args.command == "resume-migration" and not released:
                 raise ActivationError("migration claim finalization did not confirm owned removal")
         print(state, flush=True)
-        return 0 if state == "committed" or (args.command == "recover-paired" and state == "activation_failed_rolled_back") or (args.command == "resume-migration" and state == "migration_resumed") else 1
+        return 0 if state == "committed" or (args.command == "recover-paired" and state == "activation_failed_rolled_back") or (args.command == "resume-migration" and state in {"migration_resumed", "precondition_failed"}) else 1
     except ConcurrentDeploy as exc:
         if manifest is not None and not private_activation(manifest) and args.command != "resume-migration":
             try:

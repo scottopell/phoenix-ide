@@ -779,15 +779,6 @@ rule MatchingTerminalClaimReleased {
         or transaction.finalization = complete
     ensures: claim.active = false
 
-    @guidance
-        -- Systemd publishes retained ownership through the existing privileged
-        -- status-file transport, never a new privileged marker read. Unlink then
-        -- fsync claim parent before durably projecting released ownership.
-        -- Release failure preserves terminal outcome and re-establishes ownership.
-        -- Matching terminal release-only retry under claim lock reconciles an
-        -- absent marker after interruption; never replay activation. A competing
-        -- owner or superseding status refuses. Existing abandonment can settle a
-        -- durable terminal claim without replacing its verified outcome.
 }
 
 rule StaleClaimReleaseRejected {

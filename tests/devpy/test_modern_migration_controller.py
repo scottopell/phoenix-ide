@@ -356,6 +356,36 @@ class MigrationControllerTests(unittest.TestCase):
             self.assertTrue(Path(receipt["backup_path"]).exists())
             self.assertFalse(any("bootstrap" in event[1] for event in events if event[0] == "command"))
 
+    def test_postexposure_controller_resume_and_guidance_forbid_destructive_fallback(self):
+        with self.deployment() as (_, _, options, _, _, mocks):
+            dev.launchd_prod_deploy(controller=options)
+            dev._write_json_atomic(dev.LAUNCHD_DEPLOY_STATUS_PATH, {"transaction_id": "test-modern", "state": "migration_failed_stopped", "candidate_exposed": True, "ordinary_migration": True})
+            guidance = dev._paired_recovery_refusal("test-modern")
+            self.assertIn("never restore predecessor backup", guidance)
+            self.assertIn("automatic recovery is unavailable", guidance)
+            self.assertNotIn("run ./dev.py prod resume-migration", guidance)
+            mocks["subprocess.run"].reset_mock()
+            with self.assertRaises(SystemExit):
+                dev.cmd_prod_resume_migration("test-modern")
+            mocks["subprocess.run"].assert_not_called()
+            self.assertEqual("test-modern", dev._deploy_claim_owner())
+
+    def test_all_active_ordinary_terminal_owners_refuse_controller_reaping(self):
+        with self.deployment() as (_, staging, _, _, _, _):
+            staging.mkdir(parents=True)
+            (staging / "manifest.json").write_text(json.dumps({"ordinary_migration": {"schema": 1}}))
+            dev.LAUNCHD_DEPLOY_ACTIVE_PATH.write_text("txn\n")
+            for state in ("committed", "precondition_failed", "activation_failed_rolled_back"):
+                for pending in (False, True):
+                    with self.subTest(state=state, pending=pending):
+                        status = {"transaction_id": "txn", "state": state, "ordinary_migration": True, "finalization_pending": pending}
+                        dev.LAUNCHD_DEPLOY_STATUS_PATH.write_text(json.dumps(status))
+                        self.assertFalse(dev._status_is_terminal_for_owner(dev.LAUNCHD_DEPLOY_STATUS_PATH, "txn", dev._DEPLOY_TERMINAL_STATES))
+                        for claim in (dev._claim_launchd_deploy, dev._claim_launchd_restart):
+                            with self.assertRaises(dev.ConcurrentLaunchdOperation):
+                                claim("new-owner")
+                        self.assertEqual("txn", dev.LAUNCHD_DEPLOY_ACTIVE_PATH.read_text().strip())
+
     def test_actual_112_lifecycle_cleanup_failure_manual_restore_and_terminal_retry(self):
         from tests.devpy.test_modern_migration import helper, Backend, actual_migrations
         with self.deployment(release=True) as (_, staging, options, receipt, _, _):
@@ -402,11 +432,14 @@ class MigrationControllerTests(unittest.TestCase):
                 with sqlite3.connect(database) as connection:
                     connection.execute("INSERT INTO _migrations VALUES (?, ?, '2026-10-05')", actual_migrations(113)[-1])
                     connection.execute("CREATE TABLE candidate_changes (value TEXT)")
-            backend.on_start = candidate_mutation
             argv = ["helper", "activate", "--manifest", str(manifest_path), "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+            def failed_install(*args, **kwargs):
+                candidate_mutation()
+                raise helper.ActivationError("candidate installation failed before exposure")
             with mock.patch.object(helper, "__file__", manifest.ordinary_migration.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), mock.patch.object(helper, "request_helper_bootout"), mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("candidate failed")) as health:
-                with mock.patch.object(sys, "argv", argv):
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(helper, "commit_atomic_install", side_effect=failed_install):
                     self.assertEqual(helper.main(), 1)
+                self.assertFalse(helper.read_status(manifest)["candidate_exposed"])
                 self.assertEqual(helper.read_status(manifest)["state"], "migration_failed_stopped")
                 failed_projection = helper.read_status(manifest)
                 self.assertEqual(backend.state, ("not_loaded", None))
@@ -531,13 +564,13 @@ class MigrationControllerTests(unittest.TestCase):
                     dev._write_json_atomic(dev.LAUNCHD_DEPLOY_STATUS_PATH, {"transaction_id": "test-modern", "state": state})
                     self.assertFalse(dev._status_is_terminal_for_owner(dev.LAUNCHD_DEPLOY_STATUS_PATH, "test-modern", dev._DEPLOY_TERMINAL_STATES))
                     for action in (lambda: dev._claim_launchd_deploy("other"), lambda: dev._claim_launchd_restart("other"), dev.cmd_prod_stop):
-                        with self.assertRaisesRegex((SystemExit, dev.ConcurrentLaunchdOperation), "resume-migration"):
+                        with self.assertRaisesRegex((SystemExit, dev.ConcurrentLaunchdOperation), "resume-migration|candidate may have accepted writes"):
                             action()
                     self.assertEqual(dev._deploy_claim_owner(), "test-modern")
             for state in ("committed", "precondition_failed"):
                 dev._write_json_atomic(dev.LAUNCHD_DEPLOY_STATUS_PATH, {"transaction_id": "test-modern", "state": state})
-                self.assertIsNone(dev._paired_recovery_refusal("test-modern"))
-                self.assertTrue(dev._status_is_terminal_for_owner(dev.LAUNCHD_DEPLOY_STATUS_PATH, "test-modern", dev._DEPLOY_TERMINAL_STATES))
+                self.assertIsNotNone(dev._paired_recovery_refusal("test-modern"))
+                self.assertFalse(dev._status_is_terminal_for_owner(dev.LAUNCHD_DEPLOY_STATUS_PATH, "test-modern", dev._DEPLOY_TERMINAL_STATES))
 
     def test_preparing_policy_marker_fences_before_manifest_exists(self):
         with self.deployment() as (_, _, _, _, _, _):
