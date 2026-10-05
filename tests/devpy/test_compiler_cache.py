@@ -665,9 +665,7 @@ class CompilerCacheTests(unittest.TestCase):
                 "KACHE_SOCKET_PATH": "/tmp/kache.sock",
             },
         )
-        controller = mock.Mock()
-        controller.require_backend.return_value = "launchd"
-        controller.enabled = False
+        controller = self.dev.ProdDeployControllerOptions(backend="launchd")
         with mock.patch.object(
             self.dev, "_compiler_cache_subprocess_env", return_value=setup
         ) as configure, mock.patch.object(self.dev, "cmd_check") as check, mock.patch.object(
@@ -680,9 +678,7 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIs(setup, deploy.call_args.kwargs["compiler_cache_setup"])
 
     def test_independent_prod_deploys_configure_independently(self):
-        controller = mock.Mock()
-        controller.require_backend.return_value = "launchd"
-        controller.enabled = False
+        controller = self.dev.ProdDeployControllerOptions(backend="launchd")
         with mock.patch.object(
             self.dev,
             "_compiler_cache_subprocess_env",

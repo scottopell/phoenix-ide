@@ -356,10 +356,14 @@ TERMINAL_STATES = {
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
+    "ordinary_activation_failed_rollback_failed",
     "rejected_concurrent",
 }
 
-CLAIM_RELEASABLE_STATES = TERMINAL_STATES - {"activation_failed_rollback_failed"}
+CLAIM_RELEASABLE_STATES = TERMINAL_STATES - {
+    "activation_failed_rollback_failed",
+    "ordinary_activation_failed_rollback_failed",
+}
 
 
 class ActivationError(RuntimeError):
@@ -851,11 +855,11 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
             except Exception as rollback_exc:
                 write_status(
                     manifest,
-                    "activation_failed_rollback_failed",
+                    "ordinary_activation_failed_rollback_failed",
                     failure=failure,
                     rollback_failure=str(rollback_exc),
                 )
-                return "activation_failed_rollback_failed"
+                return "ordinary_activation_failed_rollback_failed"
         finally:
             if prepared is not None:
                 for path in prepared.paths():
