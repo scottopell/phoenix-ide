@@ -10,6 +10,21 @@ Rollback restores runtime artifacts and service state, not the SQLite database. 
 
 Live production deployment remains an explicitly gated operator action; automated validation uses disposable resources.
 
+## Paired controller implementation gap
+
+The accepted prepared-artifact paired contract (REQ-LDD-017) and Allium model are
+normative, but not implemented on `main`. PR #836 owns receipt admission,
+private SQLite paired recovery, private verified plist publication,
+preparation/activation claims, and pending post-commit/status guidance.
+This prerequisite PR changes documentation/specifications only and does not
+ship a controller or prove live qualification. Ordinary deployment/restart
+behavior remains separate. Current controller qualification is tracked in
+[PR #836](https://github.com/scottopell/phoenix-ide/pull/836).
+
+| Paired requirement | Main implementation / verification gap |
+| --- | --- |
+| REQ-LDD-017 | Not implemented on main; controller and regression closure owned by #836 |
+
 ## Requirement coverage
 
 | Requirement | Implementation / verification |
