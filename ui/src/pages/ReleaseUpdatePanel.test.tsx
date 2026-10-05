@@ -557,18 +557,20 @@ describe('ReleaseUpdatePanel', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-    const project = (status: Record<string, unknown>): ReleaseTransactionStatus => ({
-      kind: 'present', transaction_id: status.transaction_id as string, state: status.state as string,
-      source_commit: status.source_commit as string, release_tag: status.release_tag as string,
-      expected_version: status.expected_version as string, expected_git_sha: status.expected_git_sha as string,
-      created_at: null, updated_at: null, failure: status.failure as string,
-      rollback_failure: null, recovery_mode: status.recovery_mode as string | undefined, stale: false,
+    const project = (status: Record<string, unknown>): Extract<ReleaseTransactionStatus, { kind: 'present' }> => ({
+      kind: 'present', transaction_id: String(status['transaction_id']), state: String(status['state']),
+      source_commit: String(status['source_commit']), release_tag: String(status['release_tag']),
+      expected_version: String(status['expected_version']), expected_git_sha: String(status['expected_git_sha']),
+      created_at: null, updated_at: null, failure: String(status['failure']),
+      rollback_failure: null, recovery_mode: typeof status['recovery_mode'] === 'string' ? status['recovery_mode'] : null, stale: false,
     });
-    let transaction = project(statuses[0]);
+    const [failed, resumed] = statuses;
+    if (!failed || !resumed) throw new Error('Lifecycle must emit failure and resumed statuses');
+    let transaction = project(failed);
     vi.mocked(fetch).mockImplementation(() => json({ ...snapshot, transaction }));
     render(<ReleaseUpdatePanel />);
     await screen.findByText(/migration failed stopped/i);
-    transaction = project(statuses[1]);
+    transaction = project(resumed);
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Check for updates' })); });
     expect(await screen.findByText('● Activation failed; manual matched database restoration verified; captured predecessor resumed')).toBeInTheDocument();
     expect(screen.queryByText(/database not restored/i)).not.toBeInTheDocument();
