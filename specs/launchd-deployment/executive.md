@@ -54,8 +54,10 @@ It is qualified locally/CI only; no healthy production finalization was executed
 
 ## Requirement coverage
 
+
 | Requirement | Implementation / verification |
 | --- | --- |
+| REQ-LDD-018 | Finalization-only retry / no-runtime-no-DB fault and replay regressions; not shipped on main until #836 |
 | REQ-LDD-001 | `_helper_plist`, `launchd_prod_deploy`; disposable integration harness |
 | REQ-LDD-002 | `launchd_prod_deploy`, `_binary_identity`; preparation tests |
 | REQ-LDD-003 | `_claim_launchd_deploy`, helper `flock`; concurrent-deploy tests |

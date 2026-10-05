@@ -24,6 +24,8 @@ THE release deployment command SHALL require the tag, GitHub prerelease metadata
 
 ### REQ-PD-003 — Complete preparation before disruption
 
+For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to local/published sources.
+
 Before disrupting a running runtime, the system shall stage and validate the candidate, backend configuration, exact `.phoenix-ide.env` snapshot, rollback inputs, runtime identities and endpoints, destination-space reservations, artifact hashes, backend activation program, immutable handoff, and initial durable transaction status.
 
 ### REQ-PD-004 — Backend-owned activation
@@ -63,6 +65,8 @@ Ordinary deployment rollback shall restore runtime artifacts only and shall not 
 After exact verification, the system shall write `deployed.sha` from the selected candidate's embedded source commit and durably persist `committed` before releasing the claim. A nonterminal or interrupted transaction shall remain visible and actionable and shall never be inferred as successful solely from a PID, active unit, responsive port, or installed file.
 
 ### REQ-PD-012 — Configuration source of truth
+
+For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to local/published sources.
 
 Modern deployment shall load `.phoenix-ide.env` once and use that exact snapshot for preflight, installation, and candidate endpoint selection. Runtime status shall inspect installed configuration, rollback shall use the previous installed snapshot, and modern operation shall ignore rather than migrate or consult a legacy launchd override store, systemd drop-in, or inferred detached-daemon environment.
 

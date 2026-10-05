@@ -1021,7 +1021,7 @@ def activate(manifest: Manifest) -> str:
                     commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
                 except Exception as publish_exc:
                     diagnostics.append(f"candidate plist publish failed: {publish_exc}")
-                write_status(manifest, "committed", committed_diagnostic="; ".join(diagnostics) or None)
+                write_status(manifest, "committed", finalization_pending=bool(diagnostics), committed_diagnostic="; ".join(diagnostics) or None)
             return "committed"
         except Exception as activation_exc:
             failure = str(activation_exc)

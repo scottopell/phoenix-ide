@@ -462,6 +462,18 @@ class ActivationTests(unittest.TestCase):
                 self.assertEqual(binary.read_bytes(), b"new binary")
                 self.assertTrue(launchctl.loaded)
                 self.assertTrue(json.loads(Path(manifest.status_path).read_text())["committed_diagnostic"])
+                self.assertTrue(json.loads(Path(manifest.status_path).read_text())["finalization_pending"])
+                self.assertFalse(helper.status_is_durable_terminal(manifest))
+                self.assertTrue(Path(manifest.active_path).exists())
+                absent = subprocess.CompletedProcess([], 113, "", f'Could not find service "{manifest.helper_label}" in domain gui/{manifest.uid}')
+                backend = mock.Mock()
+                backend.inspect.return_value = ("running", 101)
+                with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "require_loaded_plist"), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper.subprocess, "run", return_value=absent):
+                    self.assertEqual(helper.finalize_paired(manifest), "committed")
+                self.assertFalse(Path(manifest.active_path).exists())
+                self.assertFalse(json.loads(Path(manifest.status_path).read_text())["finalization_pending"])
+                backend.stop.assert_not_called()
+                backend.start.assert_not_called()
 
     def test_full_paired_activate_health_failure_restores_database_and_predecessor(self):
         import sqlite3

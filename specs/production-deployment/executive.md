@@ -34,8 +34,10 @@ It is qualified locally/CI only; no healthy production finalization was executed
 
 ## Requirement coverage
 
+
 | Requirement | Current implementation / verification |
 | --- | --- |
+| REQ-PD-020 | Launchd-only finalize-paired routing / no bootstrap, captured helper and claim verification; not shipped on main until #836 |
 | REQ-PD-001 | `detect_prod_env`; backend status naming requires normalization |
 | REQ-PD-002 | typed local/release candidate preparation requires the complete 40-character embedded SHA to equal the selected full source commit across launchd, systemd, and bare Linux |
 | REQ-PD-003 | all three backends have complete local/release preparation paths and focused tests |
