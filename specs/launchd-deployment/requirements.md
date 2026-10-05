@@ -36,6 +36,8 @@ A deployment shall succeed only when the target job is running with a new PID an
 
 ### REQ-LDD-008 — Verified rollback
 
+For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. The unconditional artifact-rollback attempt below applies to ordinary sources.
+
 If activation fails after disruption, the system shall atomically restore and bootstrap the previous binary and plist, verify the captured previous runtime identity at the previous service endpoint, and durably distinguish successful runtime-artifact rollback from rollback failure.
 
 Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit shortened identity for a candidate, release asset, helper, or general downgrade path and shall not establish cross-version compatibility.
