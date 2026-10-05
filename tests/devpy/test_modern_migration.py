@@ -521,6 +521,78 @@ class ModernMigrationTests(unittest.TestCase):
         self.assertFalse(Path(self.manifest.active_path).exists())
         self.assertEqual(events, self.backend.events)
 
+    def test_candidate_publication_crash_checkpoint_preserves_accepted_writes(self):
+        class PowerLoss(BaseException):
+            pass
+        for boundary in ("before_commit", "after_checkpoint", "checkpoint_fsync_error", "after_publication", "final_status", "publication_error"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as td:
+                manifest, backend = fixture(Path(td).resolve())
+                database = Path(manifest.ordinary_migration.database_path)
+                def migrate():
+                    with sqlite3.connect(database) as connection:
+                        connection.execute("INSERT INTO _migrations VALUES (?, ?)", actual_migrations(113)[-1])
+                        connection.execute("INSERT INTO preserved VALUES ('candidate accepted')")
+                backend.on_start = migrate
+                real_status = helper.write_status
+                real_install = helper.commit_atomic_install
+                def write(manifest, state, **kwargs):
+                    if state == "committed" and kwargs.get("finalization_pending"):
+                        if boundary == "before_commit":
+                            raise PowerLoss()
+                        real_status(manifest, state, **kwargs)
+                        if boundary == "after_checkpoint":
+                            raise PowerLoss()
+                        if boundary == "checkpoint_fsync_error":
+                            raise OSError("status directory fsync interrupted")
+                        return
+                    if state == "committed" and not kwargs.get("finalization_pending") and boundary == "final_status":
+                        raise PowerLoss()
+                    return real_status(manifest, state, **kwargs)
+                def install(prepared, target):
+                    if target == Path(manifest.target_plist):
+                        self.assertEqual(helper.read_status(manifest)["state"], "committed")
+                        self.assertTrue(helper.read_status(manifest)["finalization_pending"])
+                        if boundary == "publication_error":
+                            raise OSError("publish failed")
+                        real_install(prepared, target)
+                        if boundary == "after_publication":
+                            raise PowerLoss()
+                        return
+                    return real_install(prepared, target)
+                with mock.patch.object(helper, "__file__", manifest.ordinary_migration.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "write_status", side_effect=write), mock.patch.object(helper, "commit_atomic_install", side_effect=install):
+                    if boundary in {"publication_error", "checkpoint_fsync_error"}:
+                        self.assertEqual(helper.activate(manifest), "committed")
+                    else:
+                        with self.assertRaises(PowerLoss):
+                            helper.activate(manifest)
+                self.assertTrue(Path(manifest.active_path).exists())
+                if boundary == "before_commit":
+                    self.assertEqual(helper.read_status(manifest)["state"], "activating")
+                    self.assertFalse(Path(manifest.target_plist).exists())
+                    continue
+                self.assertEqual(helper.read_status(manifest)["state"], "committed")
+                self.assertFalse(helper.status_is_durable_terminal(manifest))
+                with sqlite3.connect(database) as connection:
+                    connection.execute("INSERT INTO preserved VALUES ('accepted after interruption')")
+                before = database.read_bytes()
+                events = list(backend.events)
+                backend.on_start = None
+                for value in (manifest.ordinary_migration.backup_path, manifest.ordinary_migration.rehearsal_path, manifest.ordinary_migration.migration_registry_path):
+                    Path(value).unlink()
+                with mock.patch.object(helper, "__file__", manifest.ordinary_migration.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend):
+                    backend.state = ("not_loaded", None)
+                    with self.assertRaisesRegex(helper.ActivationError, "refuse startup or database replay"):
+                        helper.resume_migration(manifest)
+                    self.assertEqual(events, backend.events)
+                    backend.state = ("running", 123)
+                    self.assertEqual(helper.resume_migration(manifest), "committed")
+                self.assertEqual(events, backend.events)
+                self.assertEqual(before, database.read_bytes())
+                self.assertTrue(Path(manifest.target_plist).samefile(manifest.candidate_plist))
+                self.assertTrue(helper.status_is_durable_terminal(manifest))
+                self.assertTrue(helper.release_claim(manifest))
+                self.assertFalse(Path(manifest.active_path).exists())
+
     def test_activation_success_publishes_only_after_exact_identity_and_no_db_writes(self):
         before = Path(self.manifest.ordinary_migration.database_path).read_bytes()
         self.health.side_effect = lambda *_: self.assertFalse(Path(self.manifest.target_plist).exists())
@@ -529,15 +601,18 @@ class ModernMigrationTests(unittest.TestCase):
         self.assertEqual(before, Path(self.manifest.ordinary_migration.database_path).read_bytes())
         self.assertTrue(helper.status_is_durable_terminal(self.manifest))
 
-    def test_publication_failure_stops_candidate_even_after_commit_checkpoint(self):
+    def test_publication_failure_retains_committed_candidate_without_rollback(self):
         original = helper.commit_atomic_install
         def fail_publish(source, target):
             if target == Path(self.manifest.target_plist):
                 raise OSError("publication failed")
             original(source, target)
         with mock.patch.object(helper, "commit_atomic_install", side_effect=fail_publish):
-            self.assertEqual("migration_failed_stopped", helper.activate(self.manifest))
-        self.assertEqual(("not_loaded", None), self.backend.state)
+            self.assertEqual("committed", helper.activate(self.manifest))
+        self.assertEqual(("running", 123), self.backend.state)
+        self.assertEqual(helper.read_status(self.manifest)["state"], "committed")
+        self.assertTrue(helper.read_status(self.manifest)["finalization_pending"])
+        self.assertTrue(Path(self.manifest.active_path).exists())
         self.assertFalse(Path(self.manifest.target_plist).exists())
         self.assertFalse(helper.status_is_durable_terminal(self.manifest))
 
@@ -549,7 +624,7 @@ class ModernMigrationTests(unittest.TestCase):
             helper.resume_migration(self.manifest)
         Path(self.manifest.active_path).write_text(self.manifest.transaction_id)
         helper.write_status(self.manifest, "committed")
-        with self.assertRaisesRegex(helper.ActivationError, "own a retained"):
+        with self.assertRaisesRegex(helper.ActivationError, "refuse startup or database replay"):
             helper.resume_migration(self.manifest)
         self.assertEqual([], self.backend.events)
 

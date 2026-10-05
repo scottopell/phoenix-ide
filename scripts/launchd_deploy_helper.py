@@ -936,7 +936,7 @@ def release_claim(manifest: Manifest) -> bool:
         try:
             owner = claim.read_text().strip()
         except FileNotFoundError:
-            if manifest.ordinary_migration is not None and read_status(manifest).get("recovery_mode") == "migration_resumed":
+            if manifest.ordinary_migration is not None and status_is_durable_terminal(manifest):
                 fsync_dir(claim.parent)
                 return True
             return False
@@ -1261,11 +1261,11 @@ def activate(manifest: Manifest) -> str:
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
             private_commit = private_activation(manifest)
             write_status(
-                manifest, "activating" if manifest.ordinary_migration is not None else "committed",
+                manifest, "committed",
                 finalization_pending=private_commit,
                 committed_diagnostic="private publication/cleanup pending; login/reboot persistence unconfirmed" if private_commit else None,
             )
-            committed_durable = manifest.ordinary_migration is None
+            committed_durable = True
             diagnostics = []
             if capacity_reservation is not None:
                 try:
@@ -1284,14 +1284,14 @@ def activate(manifest: Manifest) -> str:
         except Exception as activation_exc:
             failure = str(activation_exc)
             disrupted = disrupted or launchctl.disruption_started
-            if manifest.ordinary_migration is not None and disrupted:
-                return fail_migration_stopped(manifest, launchctl, failure)
-            if committed_durable:
+            if committed_durable or (manifest.ordinary_migration is not None and read_status(manifest).get("state") == "committed"):
                 try:
-                    write_status(manifest, "committed", committed_diagnostic=f"paired finalization interrupted: {failure}", finalization_pending=True)
+                    write_status(manifest, "committed", committed_diagnostic=f"candidate finalization interrupted: {failure}", finalization_pending=True)
                 except Exception:
                     pass
                 return "committed"
+            if manifest.ordinary_migration is not None and disrupted:
+                return fail_migration_stopped(manifest, launchctl, failure)
             if not disrupted:
                 write_status(manifest, "precondition_failed", failure=failure)
                 raise
@@ -1571,6 +1571,35 @@ def fail_migration_stopped(manifest: Manifest, launchctl: Launchctl, failure: st
     return "migration_failed_stopped"
 
 
+def finalize_committed_migration(manifest: Manifest, launchctl: Launchctl, status: dict) -> str:
+    validate_manifest_identities(manifest)
+    validate_ordinary_runtime(manifest)
+    private = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "committed candidate plist")
+    verify_staged(manifest.target_binary, manifest.candidate_binary_sha256, "committed candidate binary")
+    published = Path(manifest.target_plist)
+    if published.exists():
+        verify_staged(str(published), manifest.candidate_plist_sha256, "published committed candidate plist")
+        if not published.samefile(private):
+            raise ActivationError("committed candidate publication identity mismatch")
+    state, pid = launchctl.inspect()
+    if state not in {"running", "active"} or pid is None:
+        raise ActivationError("committed candidate is not running; refuse startup or database replay")
+    require_loaded_plist(manifest, launchctl, private)
+    wait_for_identity(manifest, manifest.expected)
+    deployed = Path(manifest.deployed_sha_path)
+    if deployed.is_symlink() or deployed.read_text().strip() != manifest.source_commit:
+        raise ActivationError("committed candidate deployed identity mismatch")
+    if not published.exists():
+        publication = prepare_plist_publication(private, published)
+        try:
+            commit_atomic_install(publication, published)
+        finally:
+            publication.unlink(missing_ok=True)
+    fsync_dir(published.parent)
+    write_status(manifest, "committed", failure=status.get("failure"), finalization_pending=False)
+    return "committed"
+
+
 def resume_migration(manifest: Manifest) -> str:
     with Path(manifest.lock_path).open("a+") as lock:
         try:
@@ -1584,8 +1613,8 @@ def resume_migration(manifest: Manifest) -> str:
             owner = Path(manifest.active_path).read_text().strip()
         except FileNotFoundError:
             owner = None
-        terminal_resume = status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") == "migration_resumed"
-        if (owner != manifest.transaction_id and not (owner is None and terminal_resume)) or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"preparing", "prepared", "activating", "migration_failed_stopped", "activation_failed_rolled_back"}:
+        terminal_resume = (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") == "migration_resumed") or (status.get("state") == "committed" and not status.get("finalization_pending"))
+        if (owner != manifest.transaction_id and not (owner is None and terminal_resume)) or status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {"preparing", "prepared", "activating", "migration_failed_stopped", "activation_failed_rolled_back", "committed"}:
             raise ActivationError("migration resume must own a retained unresolved transaction")
         if status.get("state") in {"preparing", "prepared"}:
             pid = status.get("preparing_pid")
@@ -1600,6 +1629,8 @@ def resume_migration(manifest: Manifest) -> str:
             else:
                 raise ActivationError("preparing migration controller still alive")
         launchctl = Launchctl(manifest)
+        if status.get("state") == "committed":
+            return finalize_committed_migration(manifest, launchctl, status)
         if status.get("state") == "activation_failed_rolled_back":
             if status.get("recovery_mode") != "migration_resumed":
                 raise ActivationError("migration terminal resume evidence mismatch")
@@ -1664,7 +1695,7 @@ def resume_migration(manifest: Manifest) -> str:
             write_status(manifest, "activation_failed_rolled_back", failure="Manual offline matched database restoration verified; captured predecessor resumed. No automatic database restore was performed. Candidate failure: " + str(status.get("failure") or "unknown"), recovery_mode="migration_resumed")
             return "migration_resumed"
         except Exception as exc:
-            return fail_migration_stopped(manifest, launchctl, f"migration resume failed: {exc}")
+            return fail_migration_stopped(manifest, launchctl, str(status.get("failure") or "candidate activation diagnostic unavailable") + f"\nResume attempt failed: {exc}")
         finally:
             for path in prepared:
                 path.unlink(missing_ok=True)

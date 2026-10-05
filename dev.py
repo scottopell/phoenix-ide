@@ -10214,8 +10214,13 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
     if not isinstance(manifest, dict):
         manifest = {}
     if _deploy_claim_owner() == owner and _ordinary_migration_owned(owner, status) and not (
-        status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed"}
+        status.get("transaction_id") == owner and (status.get("state") == "precondition_failed" or (status.get("state") == "committed" and not status.get("finalization_pending")))
     ):
+        if status.get("state") == "committed":
+            return (
+                "verified candidate commit is retained; publication-only finalization required, "
+                f"never restore the predecessor backup; use ./dev.py prod resume-migration {owner}"
+            )
         return (
             f"ordinary migration {owner} retains deployment ownership. Do not clear its marker, redeploy, restart, or stop. "
             "Preserve its private backup/rehearsal and predecessor artifacts. "
@@ -10563,7 +10568,7 @@ def cmd_prod_resume_migration(transaction_id: str) -> None:
         if not isinstance(ordinary, dict) or payload.get("paired_database_upgrade") is not None or payload.get("source_kind") not in {"local_head", "published_release"}:
             raise ValueError("not an ordinary migration manifest")
         owner = _deploy_claim_owner()
-        terminal_resume = status.get("transaction_id") == transaction_id and status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") == "migration_resumed"
+        terminal_resume = status.get("transaction_id") == transaction_id and ((status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") == "migration_resumed") or (status.get("state") == "committed" and not status.get("finalization_pending")))
         if (owner != transaction_id and not (owner is None and terminal_resume)) or payload["transaction_id"] != transaction_id or payload["uid"] != os.getuid():
             raise ValueError("migration resume claim/manifest mismatch")
         helper = _migration_regular_path(ordinary["controller_helper_path"])

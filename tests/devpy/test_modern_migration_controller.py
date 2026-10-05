@@ -354,6 +354,12 @@ class MigrationControllerTests(unittest.TestCase):
                 failed_projection = helper.read_status(manifest)
                 self.assertEqual(backend.state, ("not_loaded", None))
                 self.assertEqual(helper.ordinary_database_ledger(database, registry)[-1][0], 113)
+                original_failure = helper.read_status(manifest)["failure"]
+                argv[1] = "resume-migration"
+                with mock.patch.object(sys, "argv", argv):
+                    self.assertEqual(helper.main(), 1)
+                self.assertIn(original_failure, helper.read_status(manifest)["failure"])
+                self.assertIn("Resume attempt failed:", helper.read_status(manifest)["failure"])
                 shutil.copyfile(manifest.ordinary_migration.backup_path, database)
                 backend.on_start = None
                 health.side_effect = None
@@ -364,6 +370,8 @@ class MigrationControllerTests(unittest.TestCase):
                 self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_rolled_back")
                 self.assertEqual(helper.read_status(manifest)["recovery_mode"], "migration_resumed")
                 self.assertIn("Manual offline matched database restoration verified", helper.read_status(manifest)["failure"])
+                self.assertIn("Candidate failure: " + original_failure, helper.read_status(manifest)["failure"])
+                self.assertIn("Resume attempt failed:", helper.read_status(manifest)["failure"])
                 for consumer in (ROOT / "crates/phoenix-ide/src/api/release_updates.rs", ROOT / "ui/src/pages/ReleaseUpdatePanel.tsx"):
                     self.assertIn("activation_failed_rolled_back", consumer.read_text())
                 with sqlite3.connect(database) as connection:
@@ -549,6 +557,17 @@ class MigrationControllerTests(unittest.TestCase):
             with mock.patch.object(dev.os, "kill", side_effect=ProcessLookupError()), mock.patch.object(dev.subprocess, "run", side_effect=run) as commands, self.assertRaisesRegex(SystemExit, "absence is unconfirmed"):
                 dev.cmd_prod_resume_migration("test-modern")
             self.assertEqual(commands.call_count, 2)
+            self.assertEqual(dev._deploy_claim_owner(), "test-modern")
+
+    def test_committed_pending_guidance_routes_only_to_candidate_publication(self):
+        with self.deployment() as (_, staging, options, _, _, _):
+            dev.launchd_prod_deploy(controller=options)
+            dev.LAUNCHD_DEPLOY_STATUS_PATH.write_text(json.dumps({"transaction_id": "test-modern", "state": "committed", "ordinary_migration": True, "finalization_pending": True}))
+            message = dev._paired_recovery_refusal("test-modern")
+            self.assertIn("publication-only finalization", message)
+            self.assertIn("never restore the predecessor backup", message)
+            with self.assertRaises(SystemExit):
+                dev._claim_launchd_deploy("next")
             self.assertEqual(dev._deploy_claim_owner(), "test-modern")
 
     def test_cli_options_and_resume_dispatch(self):

@@ -442,6 +442,7 @@ rule CommitVerifiedCandidate {
     requires: atomic_candidate_install(transaction)
     ensures: transaction.state = committed
     ensures: transaction.kind = PreparedArtifactDeployment implies transaction.finalization = pending
+    ensures: transaction.ordinary_policy = modern_migration_stopped implies transaction.finalization = pending
     ensures: DeployedShaWritten(transaction.source_commit)
     ensures: DurableStatusWritten(transaction)
 
@@ -452,6 +453,26 @@ rule CommitVerifiedCandidate {
         -- Publish the prepared candidate plist last. Publication/cleanup errors
         -- remain committed diagnostics, do not authorize rollback, and do not
         -- establish login/reboot persistence when publication is unconfirmed.
+}
+
+-- committed_migration_finalization_verified(transaction, service) -> Boolean
+--   Retained helper/claim/operation lock, exact running candidate/binary/private
+--   loaded plist/deployed SHA. Published plist is absent or same verified inode.
+
+rule FinalizeCommittedOrdinaryMigration {
+    when: MigrationResumeRequested(transaction, service)
+    requires: transaction.state = committed
+    requires: transaction.ordinary_policy = modern_migration_stopped
+    requires: committed_migration_finalization_verified(transaction, service)
+    ensures: transaction.state = committed
+    ensures: transaction.finalization = complete
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Durable verified candidate commit precedes autoload publication. Only
+        -- publish verified private plist and settle status/owned claim. Never stop,
+        -- start, inspect/restore database or captured predecessor. Unknown/stopped
+        -- evidence retains commit/fence; accepted candidate writes are authoritative.
 }
 
 rule ResumeCommittedPairedFinalization {
@@ -561,6 +582,7 @@ rule ResumeManuallyRestoredMigration {
         -- Failure before terminal success retains offline fence; an unresolved
         -- checkpoint refuses startup replay. Terminal success uses claim finalization.
         -- Deploy/restart/stop may not clear a retained migration claim.
+        -- Preserve original candidate failure; append labelled resume diagnostics.
         -- Persist migration_resumed semantics using the predecessor-understood
         -- activation_failed_rolled_back status plus migration_resumed recovery_mode.
 }
@@ -767,6 +789,9 @@ rule AbandonInterruptedPreparation {
 rule ReleaseMatchingTerminalClaim {
     when: TerminalStatusPersisted(transaction)
     requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, ordinary_activation_failed_rollback_failed, rejected_concurrent }
+    requires: transaction.ordinary_policy != modern_migration_stopped
+        or transaction.state != committed
+        or transaction.finalization = complete
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.state != committed
         or transaction.finalization = complete
