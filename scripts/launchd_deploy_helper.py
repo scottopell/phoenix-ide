@@ -213,12 +213,33 @@ def prepare_atomic_install(staged: Path, target: Path, mode: int) -> Path:
         raise
 
 
+def prepare_plist_publication(staged: Path, target: Path) -> Path:
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.publish-", dir=target.parent)
+    os.close(fd)
+    prepared = Path(name)
+    prepared.unlink()
+    try:
+        os.link(staged, prepared)
+        fsync_dir(target.parent)
+        return prepared
+    except BaseException:
+        prepared.unlink(missing_ok=True)
+        raise
+
+
 def commit_atomic_install(prepared: Path, target: Path) -> None:
     os.replace(prepared, target)
     fsync_dir(target.parent)
 
 
-def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = None, rollback_failure: Optional[str] = None) -> None:
+def write_status(
+    manifest: Manifest,
+    state: str,
+    *,
+    failure: Optional[str] = None,
+    rollback_failure: Optional[str] = None,
+    committed_diagnostic: Optional[str] = None,
+) -> None:
     status = {
         "transaction_id": manifest.transaction_id,
         "state": state,
@@ -232,6 +253,7 @@ def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = Non
         "updated_at": utc_now(),
         "failure": failure,
         "rollback_failure": rollback_failure,
+        "committed_diagnostic": committed_diagnostic,
     }
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
@@ -568,6 +590,10 @@ def restore_database(manifest: Manifest) -> None:
     validate_database(database)
 
 
+def service_absence_confirmed(output: str, label: str, uid: int) -> bool:
+    return re.search(r'^\s*Could not find service "' + re.escape(label) + r'" in domain (?:gui/' + str(uid) + r'|for user gui: ' + str(uid) + r')\s*$', output, re.MULTILINE) is not None
+
+
 class Launchctl:
     def __init__(self, manifest: Manifest, run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run):
         self.manifest = manifest
@@ -579,8 +605,7 @@ class Launchctl:
     def inspect(self) -> tuple[str, Optional[int]]:
         result = self.run(["launchctl", "print", self.target], capture_output=True, text=True)
         output = result.stdout + "\n" + result.stderr
-        absent = re.search(r'^\s*Could not find service "' + re.escape(self.manifest.label) + r'" in domain (?:gui/' + str(self.manifest.uid) + r'|for user gui: ' + str(self.manifest.uid) + r')\s*$', output, re.MULTILINE)
-        if absent is not None:
+        if service_absence_confirmed(output, self.manifest.label, self.manifest.uid):
             return "not_loaded", None
         if result.returncode != 0:
             raise ActivationError(f"launchctl print failed with exit {result.returncode}; service absence is unconfirmed")
@@ -610,15 +635,16 @@ class Launchctl:
         _state, old_pid = self.inspect()
         if _state == "not_loaded":
             return old_pid
-        result = self.run(["launchctl", "bootout", self.domain, self.manifest.target_plist], capture_output=True, text=True)
+        result = self.run(["launchctl", "bootout", self.target], capture_output=True, text=True)
         if result.returncode != 0:
             raise ActivationError(f"launchctl bootout failed with exit {result.returncode}")
         self.disruption_started = True
         self.wait(lambda state, pid: state == "not_loaded" and pid is None, time.monotonic() + self.manifest.transition_timeout_secs, "teardown")
         return old_pid
 
-    def start(self, old_pid: Optional[int]) -> int:
-        result = self.run(["launchctl", "bootstrap", self.domain, self.manifest.target_plist], capture_output=True, text=True)
+    def start(self, old_pid: Optional[int], *, plist_path: Optional[str] = None) -> int:
+        bootstrap_path = plist_path or self.manifest.target_plist
+        result = self.run(["launchctl", "bootstrap", self.domain, bootstrap_path], capture_output=True, text=True)
         if result.returncode != 0:
             raise ActivationError(f"launchctl bootstrap failed with exit {result.returncode}")
         _state, pid = self.wait(
@@ -712,8 +738,11 @@ def restore(
     manifest: Manifest,
     launchctl: Launchctl,
     prepared_rollback: Optional[tuple[Path, Path]] = None,
+    *,
+    database_snapshot: bool = True,
+    candidate_binary_mutated: bool = True,
+    rollback_plist: Optional[Path] = None,
 ) -> None:
-    # Candidate stop is always attempted before any paired database restoration.
     try:
         launchctl.stop()
         if manifest.paired_database_upgrade is not None:
@@ -724,7 +753,19 @@ def restore(
         if manifest.paired_database_upgrade is not None:
             raise
     if manifest.paired_database_upgrade is not None:
+        quarantined = quarantine_paired_plist(manifest)
+        if rollback_plist == Path(manifest.target_plist):
+            rollback_plist = quarantined
+    if manifest.paired_database_upgrade is not None and database_snapshot:
         restore_database(manifest)
+    elif manifest.paired_database_upgrade is not None:
+        assert_database_exclusive(manifest)
+        validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+        if sha256(Path(manifest.target_binary)) != manifest.rollback_binary_sha256:
+            raise ActivationError("unchanged predecessor binary proof failed")
+        captured = captured_paired_plist(manifest)
+        if captured is None:
+            raise ActivationError("unchanged predecessor configuration proof failed")
     if manifest.previous is None:
         if manifest.rollback_binary is not None or manifest.rollback_plist is not None:
             raise ActivationError("first-install rollback inputs are inconsistent")
@@ -737,17 +778,36 @@ def restore(
             raise ActivationError("failed first-install candidate remains loaded")
         restore_deployed_sha(manifest)
         return
-    if prepared_rollback is None:
-        rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
+
+    if candidate_binary_mutated:
+        if prepared_rollback is None:
+            rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
+            atomic_install(rollback_binary, Path(manifest.target_binary), 0o755)
+        else:
+            prepared_binary, _prepared_plist = prepared_rollback
+            commit_atomic_install(prepared_binary, Path(manifest.target_binary))
+
+    if manifest.paired_database_upgrade is not None:
+        rollback_plist = rollback_plist or captured_paired_plist(manifest)
+        if rollback_plist is None:
+            raise ActivationError("captured predecessor configuration is unverified")
+        verify_staged(str(rollback_plist), manifest.rollback_plist_sha256, "captured rollback plist")
         rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
-        atomic_install(rollback_binary, Path(manifest.target_binary), 0o755)
-        atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
+        publication = (
+            prepared_rollback[1] if prepared_rollback is not None
+            else prepare_plist_publication(rollback_plist, Path(manifest.target_plist))
+        )
+        old_pid = launchctl.inspect()[1]
+        launchctl.start(old_pid, plist_path=str(rollback_plist))
     else:
-        prepared_binary, prepared_plist = prepared_rollback
-        commit_atomic_install(prepared_binary, Path(manifest.target_binary))
-        commit_atomic_install(prepared_plist, Path(manifest.target_plist))
-    old_pid = launchctl.inspect()[1]
-    launchctl.start(old_pid)
+        if prepared_rollback is None:
+            rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
+            atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
+        else:
+            _prepared_binary, prepared_plist = prepared_rollback
+            commit_atomic_install(prepared_plist, Path(manifest.target_plist))
+        old_pid = launchctl.inspect()[1]
+        launchctl.start(old_pid)
     if (
         manifest.previous_health_url is None
         or manifest.previous_health_insecure_tls is None
@@ -762,6 +822,9 @@ def restore(
         health_json=manifest.previous_health_json,
     )
     restore_deployed_sha(manifest)
+    if manifest.paired_database_upgrade is not None:
+        assert rollback_plist is not None
+        commit_atomic_install(publication, Path(manifest.target_plist))
 
 
 def release_claim(manifest: Manifest) -> bool:
@@ -862,8 +925,10 @@ def activate(manifest: Manifest) -> str:
                 candidate_binary, Path(manifest.target_binary), 0o755
             )
             prepared_installs.append(prepared_candidate_binary)
-            prepared_candidate_plist = prepare_atomic_install(
-                candidate_plist, Path(manifest.target_plist), 0o600
+            prepared_candidate_plist = (
+                prepare_plist_publication(candidate_plist, Path(manifest.target_plist))
+                if manifest.paired_database_upgrade is not None
+                else prepare_atomic_install(candidate_plist, Path(manifest.target_plist), 0o600)
             )
             prepared_installs.append(prepared_candidate_plist)
             prepared_candidate = (prepared_candidate_binary, prepared_candidate_plist)
@@ -876,8 +941,10 @@ def activate(manifest: Manifest) -> str:
                     rollback_binary, Path(manifest.target_binary), 0o755
                 )
                 prepared_installs.append(prepared_rollback_binary)
-                prepared_rollback_plist = prepare_atomic_install(
-                    rollback_plist, Path(manifest.target_plist), 0o600
+                prepared_rollback_plist = (
+                    prepare_plist_publication(rollback_plist, Path(manifest.target_plist))
+                    if manifest.paired_database_upgrade is not None
+                    else prepare_atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
                 )
                 prepared_installs.append(prepared_rollback_plist)
                 prepared_rollback = (prepared_rollback_binary, prepared_rollback_plist)
@@ -900,6 +967,10 @@ def activate(manifest: Manifest) -> str:
         launchctl = Launchctl(manifest)
         write_status(manifest, "activating")
         disrupted = False
+        quarantined_previous_plist: Optional[Path] = None
+        candidate_binary_mutated = False
+        database_snapshot = False
+        committed_durable = False
         try:
             if manifest.paired_database_upgrade is not None:
                 # Production owns the database until launchd stops it; only the
@@ -908,28 +979,67 @@ def activate(manifest: Manifest) -> str:
             old_pid = launchctl.stop()
             disrupted = True
             if manifest.paired_database_upgrade is not None:
+                quarantined_previous_plist = quarantine_paired_plist(manifest)
+                if quarantined_previous_plist is None:
+                    raise ActivationError("paired predecessor plist is unavailable")
+                if sha256(quarantined_previous_plist) != manifest.rollback_plist_sha256:
+                    raise ActivationError("captured predecessor plist checksum mismatch")
                 # Exclusivity is meaningful only after launchd confirms teardown.
                 assert_database_exclusive(manifest)
                 validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
                 assert capacity_reservation is not None
                 _reservation_still_sufficient(manifest, capacity_reservation)
                 create_database_backup(manifest, capacity_reservation)
+                database_snapshot = True
+            candidate_binary_mutated = True
             commit_atomic_install(prepared_candidate[0], Path(manifest.target_binary))
-            commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
-            launchctl.start(old_pid)
+            if manifest.paired_database_upgrade is None:
+                commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
+                launchctl.start(old_pid)
+            else:
+                launchctl.start(old_pid, plist_path=manifest.candidate_plist)
             wait_for_identity(manifest, manifest.expected)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
             write_status(manifest, "committed")
+            committed_durable = True
+            if capacity_reservation is not None:
+                try:
+                    release_capacity_reservation(manifest, capacity_reservation)
+                except Exception as capacity_exc:
+                    write_status(manifest, "committed", committed_diagnostic=str(capacity_exc))
+            if manifest.paired_database_upgrade is not None:
+                try:
+                    commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
+                except Exception as publish_exc:
+                    write_status(manifest, "committed", committed_diagnostic=f"candidate plist publish failed: {publish_exc}")
             return "committed"
         except Exception as activation_exc:
             failure = str(activation_exc)
             disrupted = disrupted or launchctl.disruption_started
+            if committed_durable:
+                try:
+                    write_status(manifest, "committed", committed_diagnostic=failure)
+                except Exception:
+                    pass
+                return "committed"
             if not disrupted:
                 write_status(manifest, "precondition_failed", failure=failure)
                 raise
             try:
-                restore(manifest, launchctl, prepared_rollback)
+                restore(
+                    manifest,
+                    launchctl,
+                    prepared_rollback,
+                    database_snapshot=database_snapshot,
+                    candidate_binary_mutated=candidate_binary_mutated,
+                    rollback_plist=quarantined_previous_plist,
+                )
                 write_status(manifest, "activation_failed_rolled_back", failure=failure)
+                if manifest.paired_database_upgrade is not None and not database_snapshot:
+                    try:
+                        release_unsnapshotted_capacity(manifest)
+                    except Exception as cleanup_exc:
+                        write_status(manifest, "activation_failed_rolled_back", failure=failure, rollback_failure=f"verified unchanged resume; capacity cleanup failed: {cleanup_exc}")
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:
                 rollback_failure = str(rollback_exc)
@@ -953,14 +1063,14 @@ def activate(manifest: Manifest) -> str:
                 prepared.unlink(missing_ok=True)
 
 
-def quarantine_paired_plist(manifest: Manifest) -> None:
+def quarantine_paired_plist(manifest: Manifest) -> Optional[Path]:
     if manifest.paired_database_upgrade is None:
-        return
+        return None
     target = Path(manifest.target_plist)
     if target.is_symlink():
         raise ActivationError("unresolved target plist must not be a symlink")
     if not target.exists():
-        return
+        return None
     transaction = Path(manifest.paired_database_upgrade.proof_path).parent
     fd, name = tempfile.mkstemp(prefix="unresolved-launchagent-", suffix=".plist.quarantined", dir=transaction)
     os.close(fd)
@@ -969,6 +1079,46 @@ def quarantine_paired_plist(manifest: Manifest) -> None:
     destination.chmod(0o600)
     fsync_dir(transaction)
     fsync_dir(target.parent)
+    return destination
+
+
+def captured_paired_plist(manifest: Manifest) -> Optional[Path]:
+    """Return the retained predecessor plist only when its hash is proven."""
+    paired = manifest.paired_database_upgrade
+    if paired is None or manifest.rollback_plist_sha256 is None:
+        return None
+    target = Path(manifest.target_plist)
+    if target.exists() and not target.is_symlink() and sha256(target) == manifest.rollback_plist_sha256:
+        return target
+    transaction = Path(paired.proof_path).parent
+    matches = [
+        path for path in transaction.glob("unresolved-launchagent-*.plist.quarantined")
+        if not path.is_symlink() and path.is_file() and sha256(path) == manifest.rollback_plist_sha256
+    ]
+    return max(matches, key=lambda path: path.stat().st_mtime_ns) if matches else None
+
+
+def release_capacity_reservation(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
+    """Release only the temporary restore reservation; retain audit snapshot/proof."""
+    paired = manifest.paired_database_upgrade
+    if paired is None or reservation.restore_path != _restore_capacity_path(manifest, Path(paired.database_path)):
+        raise ActivationError("restore reservation does not belong to this paired transaction")
+    path = reservation.restore_path
+    if path.is_symlink():
+        raise ActivationError("restore reservation is a symlink")
+    path.unlink(missing_ok=True)
+    fsync_dir(path.parent)
+
+
+def release_unsnapshotted_capacity(manifest: Manifest) -> None:
+    database, backup, proof, _transaction = _paired_path_context(manifest)
+    if proof.exists() or proof.is_symlink():
+        return
+    for path in (backup, _restore_capacity_path(manifest, database)):
+        if path.is_symlink():
+            raise ActivationError("unsnapshotted capacity is a symlink")
+        path.unlink(missing_ok=True)
+        fsync_dir(path.parent)
 
 
 def record_recovery_error(manifest: Manifest, error: str, *, quarantine: bool = False) -> None:
@@ -1008,33 +1158,31 @@ def recover_paired(manifest: Manifest) -> str:
         launchctl = Launchctl(manifest)
         try:
             paired = manifest.paired_database_upgrade
-            if not Path(paired.proof_path).exists():
-                plist = Path(manifest.target_plist)
-                if not plist.exists():
-                    matches = [p for p in Path(paired.proof_path).parent.glob("unresolved-launchagent-*.plist.quarantined") if not p.is_symlink() and sha256(p) == manifest.rollback_plist_sha256]
-                    if not matches:
-                        raise ActivationError("captured predecessor configuration is unverified")
-                    plist = matches[-1]
-                if sha256(Path(manifest.target_binary)) != manifest.rollback_binary_sha256 or sha256(plist) != manifest.rollback_plist_sha256:
+            snapshot_exists = Path(paired.proof_path).exists() or Path(paired.proof_path).is_symlink()
+            if not snapshot_exists:
+                plist = captured_paired_plist(manifest)
+                if plist is None:
+                    raise ActivationError("captured predecessor configuration is unverified")
+                binary = Path(manifest.target_binary)
+                if not binary.exists() or sha256(binary) != manifest.rollback_binary_sha256:
                     raise ActivationError("interrupted transaction has no snapshot proof and runtime changes are unresolved")
-                launchctl.stop()
-                state, pid = launchctl.inspect()
-                if state != "not_loaded" or pid is not None:
-                    raise ActivationError("interrupted predecessor stop is unconfirmed")
-                assert_database_exclusive(manifest)
                 validate_legacy_database(Path(paired.database_path))
-                backup = Path(paired.backup_path)
-                restore_capacity = _restore_capacity_path(manifest, Path(paired.database_path))
-                required = _source_capacity_bytes(Path(paired.database_path))
-                for destination in (backup, restore_capacity):
-                    if not destination.exists():
-                        _allocate_private_sqlite(destination, required)
-                    _regular_nosymlink(destination, "interrupted capacity")
-                reservation = DatabaseCapacityReservation(backup, restore_capacity, required)
-                _reservation_still_sufficient(manifest, reservation)
-                create_database_backup(manifest, reservation)
-            restore(manifest, launchctl, None)
+                restore(
+                    manifest,
+                    launchctl,
+                    None,
+                    database_snapshot=False,
+                    candidate_binary_mutated=False,
+                    rollback_plist=plist,
+                )
+            else:
+                restore(manifest, launchctl, None)
             write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"))
+            if not snapshot_exists:
+                try:
+                    release_unsnapshotted_capacity(manifest)
+                except Exception as cleanup_exc:
+                    write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"), rollback_failure=f"verified unchanged resume; capacity cleanup failed: {cleanup_exc}")
             return "activation_failed_rolled_back"
         except Exception as exc:
             failure = str(exc)
@@ -1068,6 +1216,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", nargs="?", choices=["activate", "recover-paired"])
     parser.add_argument("--protocol-version", action="store_true")
+    parser.add_argument("--probe-service-absence")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--helper-label")
     parser.add_argument("--uid", type=int)
@@ -1075,6 +1224,9 @@ def main() -> int:
     if args.protocol_version:
         print(HANDOFF_PROTOCOL_VERSION)
         return 0
+    if args.probe_service_absence is not None and args.uid is not None:
+        result = subprocess.run(["launchctl", "print", f"gui/{args.uid}/{args.probe_service_absence}"], capture_output=True, text=True)
+        return 0 if result.returncode != 0 and service_absence_confirmed(result.stdout + "\n" + result.stderr, args.probe_service_absence, args.uid) else 1
     if args.manifest is None or args.helper_label is None or args.uid is None:
         parser.error("activation requires --manifest, --helper-label, and --uid")
     manifest = None

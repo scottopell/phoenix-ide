@@ -10,6 +10,14 @@ Ordinary rollback restores runtime artifacts and configuration without a databas
 
 Live production deployment remains an explicitly gated operator action; automated integration validation uses disposable resources.
 
+The paired launchd controller privately bootstraps candidate/predecessor plists
+and delays auto-load publication until their required verification boundary.
+Pre-snapshot failures resume only an unchanged, exclusively owned legacy pair;
+post-commit warnings do not authorize rollback or establish reboot persistence.
+The lifecycle/OS/filesystem/claim boundary table is in
+`specs/launchd-deployment/executive.md`. These refinements are qualification-only,
+not a later live deployment on devmbp.
+
 ## Requirement coverage
 
 | Requirement | Current implementation / verification |

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-04
-- **Affects:** specs/production-deployment, specs/launchd-deployment, specs/compatibility
+- **Affects:** specs/production-deployment, specs/launchd-deployment, specs/compatibility, specs/desktop-release (REQ-DESKTOP-REL-010)
 
 ## Context
 
@@ -28,6 +28,7 @@ The feature has no generic database rollback semantics and does not permit clean
 
 ## References
 
+- `specs/desktop-release/requirements.md` REQ-DESKTOP-REL-010 owns the protected preparation receipt consumed under REQ-LDD-017.
 - `specs/launchd-deployment/requirements.md`
 - `specs/compatibility/requirements.md`
 - `scripts/launchd_deploy_helper.py`

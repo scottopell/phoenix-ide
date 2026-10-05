@@ -112,9 +112,28 @@ before claim release. Any unverified recovery attempts teardown and retains the
 claim. The command is not a general downgrade or an activation retry.
 Before a snapshot proof exists, recovery is permitted only after verifying that
 the installed runtime/configuration still match the captured predecessor and the
-exclusively owned database remains legacy. It then creates a verified offline
-snapshot before restoring/restarting. A missing proof with changed runtime or
-modern database fails closed; it is not permission to discard the ownership fence.
+exclusively owned database remains legacy. It resumes that verified unchanged
+predecessor without fabricating a snapshot or claiming database restoration.
+A missing proof with changed runtime or modern database fails closed; it is not permission to discard the ownership fence.
+An interrupted `preparing` transaction without a manifest uses the same command:
+only matching preparation metadata, a dead recorded PID, and confirmed helper
+absence permit terminal status and owned-claim release. A live or reused PID,
+missing metadata, or unknown launchctl error refuses recovery without touching
+runtime/database. Initial preparation status is durable before claim publication.
+
+Paired activation quarantines the published predecessor before candidate mutation
+and bootstraps the candidate from a private plist. It publishes the candidate
+LaunchAgents plist only after exact identity and durable commit. Atomic hard-link
+publication preserves the loaded private plist inode, so installed-runtime restart
+continues to require the exact same file rather than accepting lookalike contents. Paired rollback
+also bootstraps privately and publishes only after matched database authorization
+and predecessor identity. Successful commit removes only the database-adjacent
+restore reservation; private audit backup/proof survive. Verified no-snapshot
+resume removes only the unproven backup seed and temporary restore reservation. A post-commit publication
+or cleanup error is displayed as a committed warning, never an automatic rollback.
+A missing published plist means login/reboot persistence is not established even
+though the verified candidate is running; do not infer recovery from claim release.
+
 Unresolved paired rollback quarantines the runtime's LaunchAgent plist outside
 `~/Library/LaunchAgents`, with durable directory synchronization, so login does
 not auto-start an unverified job. Verified paired recovery reinstalls the matching

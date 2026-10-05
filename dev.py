@@ -9817,7 +9817,7 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
     return None
 
 
-def _claim_launchd_deploy(transaction_id: str) -> None:
+def _claim_launchd_deploy(transaction_id: str, *, initial_status: dict | None = None) -> None:
     LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     LAUNCHD_DEPLOY_DIR.chmod(0o700)
     with _launchd_claim_lock():
@@ -9850,6 +9850,8 @@ def _claim_launchd_deploy(transaction_id: str) -> None:
                 f"another launchd deployment ({owner or 'unknown'}) is active or needs recovery. "
                 "Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
             )
+        if initial_status is not None:
+            _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
         fd = os.open(LAUNCHD_DEPLOY_ACTIVE_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as stream:
             stream.write(transaction_id + "\n")
@@ -10010,6 +10012,34 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
         raise SystemExit("paired recovery requires macOS and a safe transaction ID")
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
+    if not manifest_path.exists():
+        with _launchd_claim_lock():
+            status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+            if _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("source_kind") != "prepared_artifact" or status.get("state") != "preparing":
+                raise SystemExit("pre-manifest recovery must own an interrupted paired preparation")
+            owner_pid = status.get("preparing_pid")
+            if not isinstance(owner_pid, int) or owner_pid <= 0:
+                raise SystemExit("interrupted preparation process identity is unavailable")
+            try:
+                os.kill(owner_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise SystemExit("preparation process is still alive; ownership cannot be released")
+            label = f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}"
+            probe_helper = Path(__file__).resolve().parent / "scripts" / "launchd_deploy_helper.py"
+            result = subprocess.run([sys.executable, str(probe_helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+            if result.returncode != 0:
+                raise SystemExit("pre-manifest helper absence is unconfirmed")
+            status.update(
+                state="precondition_failed",
+                updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                failure="interrupted preparation ended before an activation manifest existed",
+            )
+            _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, status)
+            _release_launchd_deploy_claim_unlocked(transaction_id)
+        print("Interrupted pre-manifest paired preparation verified; runtime/database untouched and ownership released.")
+        return
     payload = json.loads(manifest_path.read_text())
     paired = payload.get("paired_database_upgrade")
     if not isinstance(paired, dict) or _paired_recovery_refusal(transaction_id) is None or _deploy_claim_owner() != transaction_id:
@@ -10018,9 +10048,12 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
     if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != paired["controller_helper_sha256"]:
         raise SystemExit("retained paired controller helper binding is invalid")
     label = payload["helper_label"]
-    observed = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True)
-    missing = f'Could not find service "{label}" in domain for user gui: {os.getuid()}'
-    if observed.returncode == 0 or missing not in observed.stdout + observed.stderr:
+    interpreter = Path(sys.executable).resolve()
+    probe = subprocess.run([str(interpreter), "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"], capture_output=True)
+    if probe.returncode != 0:
+        raise SystemExit("active Python interpreter cannot run paired SQLite recovery")
+    observed = subprocess.run([str(interpreter), str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+    if observed.returncode != 0:
         raise SystemExit("paired helper absence is unconfirmed; inspect it before recovery")
     plist = plistlib.loads(_helper_plist(label, helper, manifest_path, staging / "recovery.log", Path(sys.executable)))
     plist["ProgramArguments"][2] = "recover-paired"
@@ -10101,8 +10134,16 @@ def launchd_prod_deploy(
     release_commit = None
     release_tag = release
     selected_identity: RuntimeIdentity | None = None
+    initial_status = {
+        "transaction_id": transaction_id, "state": "preparing",
+        "preparing_pid": os.getpid(), "source_kind": source_kind,
+        "source_commit": source_commit, "release_commit": release_commit,
+        "release_tag": release_tag, "expected_version": None, "expected_git_sha": None,
+        "created_at": claimed_at, "updated_at": claimed_at,
+        "failure": None, "rollback_failure": None,
+    }
     try:
-        _claim_launchd_deploy(transaction_id)
+        _claim_launchd_deploy(transaction_id, initial_status=initial_status)
     except ActiveLaunchdRestart as exc:
         rejected_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
@@ -10117,16 +10158,7 @@ def launchd_prod_deploy(
         })
         raise
     try:
-        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "preparing",
-            "source_kind": source_kind,
-            "source_commit": source_commit,
-            "release_commit": release_commit,
-            "release_tag": release_tag,
-            "expected_version": None, "expected_git_sha": None,
-            "created_at": claimed_at, "updated_at": claimed_at,
-            "failure": None, "rollback_failure": None,
-        })
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
         transactions_dir.mkdir(parents=True, exist_ok=True)
         _prune_launchd_deploy_transactions(transactions_dir, transaction_id)
@@ -10228,7 +10260,7 @@ def launchd_prod_deploy(
                 f"expected {LAUNCHD_HANDOFF_PROTOCOL_VERSION}"
             )
         interpreter_check = subprocess.run(
-            [str(python_executable), "-c", "import fcntl, plistlib, ssl, urllib.request"],
+            [str(python_executable), "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"],
             capture_output=True,
         )
         if interpreter_check.returncode != 0:
@@ -10665,6 +10697,11 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Failure: {deploy['failure']}")
         if deploy.get("rollback_failure"):
             print(f"    Rollback failure: {deploy['rollback_failure']}")
+        if deploy.get("committed_diagnostic"):
+            print(f"    Committed warning: {deploy['committed_diagnostic']}")
+        refusal = _paired_recovery_refusal(deploy.get("transaction_id"))
+        if refusal is not None:
+            print(f"    RECOVERY: {refusal}")
         if deploy.get("state") in {"preparing", "prepared", "activating"}:
             age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(deploy["updated_at"])
             stale_after = (
@@ -10673,9 +10710,8 @@ def _print_launchd_deploy_status() -> None:
                 + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
             )
             if age.total_seconds() > stale_after:
-                refusal = _paired_recovery_refusal(deploy.get("transaction_id"))
                 if refusal is not None:
-                    print(f"    STALE: {refusal}")
+                    print("    STALE: paired recovery remains unresolved; follow RECOVERY above")
                 else:
                     print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
     except Exception as exc:

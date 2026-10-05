@@ -6,7 +6,7 @@ Native macOS production deployment prepares either local `HEAD` or a checksummed
 
 Installed-runtime restart is a separate launchd-owned transaction. It sends SIGHUP without unloading the socket-activated target, verifies a new PID with the same exact identity, preserves the binary, plist, environment, listener, and deployed SHA, and reports its own durable status without replacing deployment status.
 
-Rollback restores runtime artifacts and service state, not the SQLite database. It therefore does not guarantee that a restored older binary can use data migrated by the failed candidate and does not provide general downgrade compatibility.
+Ordinary rollback restores runtime artifacts and service state, not the SQLite database. It therefore does not guarantee that a restored older binary can use data migrated by the failed candidate and does not provide general downgrade compatibility.
 
 Live production deployment remains an explicitly gated operator action; automated validation uses disposable resources.
 
@@ -17,6 +17,26 @@ The prepared-artifact paired path is deliberately narrower than ordinary release
 - `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --paired-database-upgrade` is macOS launchd-only and rejects release aliases, first install, or a mismatched installed database path.
 - The receipt must identify the exact host-target standalone basename, submission UUID, full SHA, Developer ID/hardened/timestamp codesign evidence, and qualified notarization/ticket/Gatekeeper/helper evidence. Standalone `spctl` is not imposed because notarization may be stapled only to the containing app.
 - Recovery is fail-closed: do not delete the paired transaction or claim, manually inspect the retained proof and run offline SQLite integrity checks before restoring/starting the predecessor.
+
+## Paired interruption and ownership table
+
+| Boundary | OS / filesystem state | Supported outcome and ownership |
+| --- | --- | --- |
+| Preparing, no manifest | Predecessor unchanged; matching status/PID precede claim | Dead preparation PID plus confirmed helper absence permit terminal status then owned-claim release; missing evidence/live or reused PID refuses |
+| Helper admitted, before stop | Predecessor runs; private snapshot and DB-adjacent restore capacity physically allocated | Capacity failure reports precondition failure without disruption |
+| Stopped, before snapshot proof | Target service absent; predecessor plist quarantined; binary unchanged | Exclusive legacy DB plus captured binary/config hashes allow private predecessor resume; no DB restoration claimed; release unproven temporary allocations after verified terminal resume. Unknown ownership or modern DB stays stopped/fenced |
+| Snapshot verified, candidate installed/started | Matching snapshot/proof retained; candidate bootstraps private plist; no auto-loaded target plist | Install/start/health interruption retains claim and audit proof; login cannot discover an unverified candidate plist |
+| Failed candidate, paired restore | Service-target teardown; exclusive offline snapshot restore before predecessor binary/start | Private predecessor bootstrap; publish matching plist only after predecessor identity/deployed SHA; failed proof attempts teardown and retains claim/quarantine |
+| Exact candidate durably committed | Candidate identity and deployed SHA verified; commit durable before plist publication | Release only restore reservation, retaining backup/proof; publish prepared candidate plist last preserving the private bootstrap inode for strict restart verification. Cleanup/publication error is a displayed committed warning, never rollback; missing publication does not prove reboot persistence |
+| Terminal failed paired status | Recovery claim unresolved | `prod status` always presents `prod recover-paired` guidance, never generic marker removal |
+
+Focused regression coverage includes real launchctl command shapes, both exact
+missing-service spellings, wrong-target and I/O refusals, private bootstrap,
+BaseException interruption at install/start/health, capacity-growth unchanged
+resume, unsafe no-snapshot refusal, preparation ownership, SQLite interpreter
+probes, and reservation-only cleanup. These controller refinements are local/CI
+qualification; the devmbp deployment receipt below used an earlier controller
+and is not live verification of these refinements.
 
 ## Requirement coverage
 

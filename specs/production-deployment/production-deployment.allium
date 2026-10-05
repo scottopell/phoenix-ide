@@ -155,10 +155,12 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   before candidate startup.
 -- paired_predecessor_start_order_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, the matching database is
---   restored and integrity-checked before predecessor startup is authorized.
+--   restored and integrity-checked before predecessor startup, or no snapshot
+--   exists and exclusive legacy DB plus captured binary/config hashes prove
+--   an unchanged predecessor. The latter path claims no database restoration.
 -- predecessor_start_authorized(transaction) -> Boolean
---   Predecessor startup is authorized only after the matching database has been
---   restored and integrity-checked; no startup may occur before that point.
+--   Startup requires matched snapshot restoration or verified unchanged legacy
+--   database/runtime/configuration with exclusive offline ownership.
 -- candidate_teardown_attempted(transaction) -> Boolean
 --   Failed activation or recovery records an attempt to tear down the candidate;
 --   this does not claim an operating-system failure made teardown complete.
@@ -223,8 +225,8 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   feature-scoped and is represented by paired_predecessor_start_order_is_valid.
 -- paired_recovery_succeeded(transaction) -> Boolean
 --   True for ordinary sources when exact_previous_restored holds. For
---   prepared_artifact, exact_previous_restored, paired_database_proof_is_valid,
---   and paired_predecessor_start_order_is_valid all hold.
+--   prepared_artifact, exact_previous_restored and
+--   paired_predecessor_start_order_is_valid hold, including unchanged legacy resume.
 -- paired_transaction_retained(transaction) -> Boolean
 --   The private paired transaction directory, verified snapshot, proof files,
 --   and durable recovery status remain available for manual recovery.
@@ -239,6 +241,23 @@ variant BareLinuxHandoff : DeploymentHandoff {
 -- installed_environment_is_snapshot(transaction) -> Boolean
 --   The installed environment is the single snapshot used by preflight and
 --   endpoint selection, not a competing override layer.
+
+-- paired_snapshot_restored(transaction) -> Boolean
+--   A context-bound snapshot was restored and integrity-checked offline.
+-- paired_unchanged_predecessor_verified(transaction) -> Boolean
+--   No snapshot proof or candidate mutation exists; stopped service, exclusive
+--   legacy DB, and captured binary/configuration hashes authorize private resume.
+-- paired_publication_is_verified(transaction) -> Boolean
+--   Paired plists remain private during identity verification. Candidate autoload
+--   publication follows durable commit; predecessor publication follows matched
+--   DB authorization and identity verification. Publication preserves the private
+--   bootstrap inode so strict loaded-path restart verification remains valid.
+--   True for ordinary sources.
+-- pre_manifest_abandonment_verified(transaction) -> Boolean
+--   Matching preparing status preceded owned claim publication, no manifest
+--   exists, recorded preparation PID is dead, and helper absence is confirmed.
+-- PreparedAbandonmentVerified(transaction)
+--   Operator requested recovery and pre_manifest_abandonment_verified holds.
 
 rule PrepareCandidate {
     when: DeploymentRequested(transaction)
@@ -361,6 +380,19 @@ rule CandidateStartupPrepared {
     ensures: atomic_install_complete(transaction)
 }
 
+rule AbandonInterruptedPreparation {
+    when: PreparedAbandonmentVerified(transaction)
+    requires: transaction.state = preparing
+    requires: transaction.source_kind = prepared_artifact
+    requires: pre_manifest_abandonment_verified(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Release only the matching claim after terminal status; runtime/database
+        -- remain untouched. Missing evidence or a live/reused PID refuses recovery.
+}
+
 rule CommitVerifiedCandidate {
     when: CandidateRuntimeObserved(transaction)
     requires: transaction.state = activating
@@ -370,6 +402,13 @@ rule CommitVerifiedCandidate {
     ensures: transaction.state = committed
     ensures: DeployedShaWritten(transaction.source_commit)
     ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- For paired launchd, after durable commit release only the temporary
+        -- restore reservation and fsync its parent; retain audit snapshot/proof.
+        -- Publish the prepared candidate plist last. Publication/cleanup errors
+        -- remain committed diagnostics, do not authorize rollback, and do not
+        -- establish login/reboot persistence when publication is unconfirmed.
 }
 
 rule RollBackFailedOrdinaryActivation {
@@ -397,8 +436,15 @@ rule RollBackFailedPreparedPairedActivation {
     ensures: transaction.failure = failure
     ensures: DurableStatusWritten(transaction)
     ensures: RuntimeArtifactRollbackRecorded(transaction)
-    ensures: DatabaseRollbackCompleted(transaction)
+    ensures: paired_snapshot_restored(transaction) implies DatabaseRollbackCompleted(transaction)
+    ensures: paired_unchanged_predecessor_verified(transaction) implies not DatabaseRollbackClaimed(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
+
+    @guidance
+        -- After verified unchanged no-snapshot resume and durable terminal status,
+        -- release only temporary backup seed and DB-adjacent restore allocation.
+        -- Never remove a verified snapshot/proof. Cleanup failure is diagnostic
+        -- and does not tear down an already verified predecessor.
 }
 
 rule PreserveRollbackFailure {
@@ -498,6 +544,12 @@ invariant OrdinaryRollbackIsRuntimeOnly {
         and transaction.state = activation_failed_rolled_back implies
             RuntimeArtifactRollbackRecorded(transaction)
             and not DatabaseRollbackClaimed(transaction)
+}
+
+invariant PairedPublicationRequiresVerification {
+    for transaction in DeployTransactions:
+        transaction.source_kind = prepared_artifact implies
+            paired_publication_is_verified(transaction)
 }
 
 invariant PreparedArtifactIsLaunchdScoped {
