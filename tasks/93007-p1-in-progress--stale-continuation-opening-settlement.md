@@ -2,7 +2,7 @@
 
 ## Commission and admission
 
-One bounded successor SOURCE-REPAIR mission under Global's commission; not native or restart feature ownership. The user confirms API/scope inventory admission: unique scope `a7988772`, managed Explore, owned worktree `e87be297-daa2-43f9-82e4-f72b7fe2421c`, `gpt-6.1-sol/high/Standard`, and accepted roadmap #806 owner record `5993991748`.
+One bounded successor SOURCE-REPAIR mission under Global's commission; not native or restart feature ownership. The project coordinator supplied API/scope inventory admission (not direct human DB verification): unique scope `a7988772`, managed Explore, owned worktree `e87be297-daa2-43f9-82e4-f72b7fe2421c`, `gpt-6.1-sol/high/Standard`, and accepted roadmap #806 owner record `5993991748`.
 
 Checkout verified clean on `task-pending-e87be297` at `d6f94afaca8650fff75a638fd63c3e2c9eafc602`; cached `origin/main` matches. Explore network sandbox denied GitHub roadmap and remote readback. After approval, fetch/read back safe remote refs and verify the commissioned base without moving any checked-out main branch. Remain in the managed owned worktree.
 
@@ -37,7 +37,7 @@ Inspect interruption/recovery edges, durable replay fast paths, and runtime star
 
 ## Bounded implementation and regression plan
 
-1. Verify Work admission/base and atomically allocate the task. Read `specs/bedrock/requirements.md` (REQ-BED-036/037 and recovery obligations), applicable Bedrock Allium, `specs/compatibility/requirements.md`, and related migration/recovery tests before editing.
+1. Verify Work admission/base and atomically allocate the task. Read `specs/bedrock/requirements.md` (REQ-BED-021 and recovery obligations), applicable Bedrock Allium, `specs/compatibility/requirements.md`, and related migration/recovery tests before editing.
 2. Obtain only necessary read-only evidence for the exact named scopes when supported: prefer bounded warnings/traces; if exact DB inspection is needed, verify the actual deployment/database target first and restrict output to identities, kinds, booleans, lengths, migration versions, and equality results. No secrets or full transcripts; do not guess a target or send coordinator-chain messages.
 3. Add a regression representing a supported historical persisted continuation/opening and its real migration/materialization path. Compare reserved client key, canonical ID, content kind/encoding, authority, predecessor link, pending intent, and completed receipt. Demonstrate the stale gate or falsify this hypothesis. Where feasible, run the same reproducer against both deployed and commissioned source using isolated test data only.
 4. Fix the smallest proven persistence/settlement/migration boundary. Preserve atomicity and exact accepted identity. If persisted supported rows need repair, provide a narrowly justified forward migration or existing supported recovery-path repair, not a manual production write or a new general compatibility subsystem. Update normative contract/ADR only if a guarantee must change; do not rewrite historical migrations as a substitute for upgrading existing databases.
@@ -55,3 +55,21 @@ Inspect interruption/recovery edges, durable replay fast paths, and runtime star
 ## Explicit non-goals
 
 No raw production DB lifecycle writes, opening replay, host restart/deploy, edits in either blocked owner's tree, native feature work, TestFlight upload, #788/design resumption, RC #844 work, broad continuation redesign, removal of authority gates, or config/model changes outside this mission's own admission. No duplicate owner or coordinator-chain messaging.
+
+## Work checkpoint
+
+- Authoritative read-only `work_scopes` query: a7988772-cccd-4bc5-9a30-6c33df4da552 is active/work/allocated_worktree; runtime developer instructions grant full writes in this managed tree. Branch is task-stale-continuation-opening-settlement-source-repair-e87be297.
+- Approval committed the plain brief at 90f0a8f6a. Atomic allocator first returned 93006, colliding with a retained native-owner task outside this tree; a second `taskmd new` returned 93007. Only this mission's duplicate allocation and plain brief are removed, not any other owner's files. This is the mission's actual task ID.
+- Safe fetch and independent `ls-remote` verified current remote main d6f94afa. Roadmap #806 accepted marker includes 5993991748; reviewed generated body.
+- Read-only application DB query confirmed both writable successors have incoming manual intents and matching canonical user opening rows, exact text equality, valid predecessor linkage and a predecessor continuation row, but no completed handoff. The supplied third ID 06d4d773 was absent from conversations in this database. No transcript content or secrets queried.
+- Opening timestamps: native 2026-10-03T04:19:32+00:00; restart 2026-10-03T20:53:56+00:00. Migration ledger: 045 on Aug 19, 074/100/110/112 on Oct 4 at 18:56 UTC. Thus both existing canonical openings preceded installation of the corrected trigger and receipt schema. Proven supported historical producer: #581 canonicalized messages while migration 045 matched raw keys only; #724 migration 074 fixes future inserts but lacks historical reconciliation; migration 100 preserves those intents as user-authorized.
+- Added first focused forward-upgrade regression before any source repair. It installs migration 045, persists a canonical exact opening, observes stale intent, upgrades through 074/100 and the current runner, then asserts the same pending predicate must clear with exact receipt and no message replay. Initial compile/test is in flight.
+
+### Regression and repair evidence
+
+- Before repair: focused canonical historical upgrade regression exited 101, failing `already persisted exact opening must not fence subsequent chat` (1 failed, 0 passed).
+- After migration 113: same focused regression passed (1/1); five historical migration tests passed; phoenix-db clippy all-targets passed. Real send-chat service module passed 23/23 including pre-migration 409 and post-migration Delivered, while missing/mismatched openings stay blocked. Further exact-candidate qualification is in progress.
+- Migration 113 uses typed message deserialization, same-aggregate/root/role topology, manual authority, one exact raw/canonical opening identity (including conflicting kinds in ambiguity detection), literal non-meta user payload equality, one decodable predecessor continuation, and no competing receipt. Its receipt/intent/ledger commit is atomic. It changes no transcript row, durable turn, prompt, WorkScope, or settings. Generated-authority intents remain untouched.
+- Negative and transaction tests cover identity/payload/kind/scope/topology mismatch, ambiguous identities/summaries, conflicting valid receipts, generated authority, byte-preserving idempotence, injected receipt/deletion abort rollback of multiple candidates, and retry. No opening replay or gate edits.
+- DB crate broad run was intentionally terminated to avoid competing with normal `./dev.py check` (same tests included in its Rust lane); not a passing-suite claim.
+- Executive traceability updated under existing REQ-BED-021. No normative guarantee or general recovery subsystem added. Spec-authoring preflight: executive-only status/coverage change, no Allium/wire/type/helper changes; test symbols and requirement anchor checked.
