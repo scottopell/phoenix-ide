@@ -10,6 +10,8 @@ Database restore or replacement is an offline operator procedure. Phoenix does n
 
 Internal SQLite timestamps use mixed representations. New or changed internal timestamp columns must converge on explicitly unit-named integer Unix microseconds unless a more specific normative requirement identifies an external reader and requires another representation.
 
+Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as an explicit opt-in, with sccache and uncached automatic fallbacks. Automatic selection excludes Kache for every build surface because restored-archive source-level debug fidelity is unqualified; the fidelity blocker remains open. Cache selection is scoped to Cargo subprocesses and does not establish a general cross-version, remote-cache, performance, or debug-symbol compatibility guarantee.
+
 ## Requirement coverage
 
 | Requirement | Current coverage / gap |
@@ -19,6 +21,9 @@ Internal SQLite timestamps use mixed representations. New or changed internal ti
 | REQ-COMP-003 | Foundation acceptance covers manual offline paired restore, but production deployment can still launch an older candidate without proving that restore occurred, and the UI overstates runtime-artifact rollback. Enforcement and truthful messaging are tracked in task 44016. |
 | REQ-COMP-004 | Single managed-runtime ownership and offline replacement are defined; no live replacement or mixed-version sharing protocol is supported. Operator guidance and stale fencing machinery require follow-up audit. |
 | REQ-COMP-005 | Policy applies to newly introduced or structurally changed internal timestamp columns. Unchanged historical timestamp columns are outside this initial convergence rule. |
+| REQ-COMP-006 | Legacy Direct WorkScopes are repaired forward to Direct authority without adding rollback guarantees. |
+| REQ-COMP-007 | Historical accepted source-locator payloads retain their original fingerprint and encoding authority. |
+| REQ-COMP-008 | `dev.py` keeps automatic selection on usable sccache/no cache, requires exact Kache 0.26.0 on macOS arm64 as an explicit opt-in, verifies daemon readiness/socket identity, reports actual selection, and scopes generated cache variables to build subprocesses. Restored-archive debug fidelity remains unqualified. |
 
 ## Next work
 
