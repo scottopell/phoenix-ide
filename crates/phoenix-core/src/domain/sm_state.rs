@@ -677,6 +677,10 @@ mod tests {
         assert!(matches!(input, ToolInput::CoordinatorPresentSvg(_)));
         assert_eq!(input.tool_name(), "present_svg");
         assert_eq!(input.to_value()["work_scope_id"], "scope-1");
+        let persisted = serde_json::to_string(&input).unwrap();
+        let restored: ToolInput = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(restored, input);
+        assert!(matches!(restored, ToolInput::CoordinatorPresentSvg(_)));
     }
 
     #[test]
