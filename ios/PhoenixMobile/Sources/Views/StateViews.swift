@@ -114,6 +114,11 @@ struct StateDetailView: View {
     }
 }
 
+private struct QuestionPresentationIdentity: Hashable {
+    let requestId: String?
+    let legacyQuestions: [UserQuestion]
+}
+
 struct StateDetailBody: View {
     let state: ConversationState
     let presentationMode: String
@@ -167,7 +172,9 @@ struct StateDetailBody: View {
                         onAction(.respondToQuestions(requestId: requestId, answers: $0))
                     },
                     onDismiss: { onAction(.dismissQuestion(requestId: requestId)) })
-                    .id(requestId)
+                    .id(QuestionPresentationIdentity(
+                        requestId: requestId,
+                        legacyQuestions: requestId == nil ? questions : []))
             }
 
         case .awaitingTaskApproval(let title, let priority, let plan):

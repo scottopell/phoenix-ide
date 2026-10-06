@@ -80,9 +80,14 @@ final class ConversationStateTests: XCTestCase {
     }
 
     func testLegacyAwaitingUserResponsePreservesAbsentRequestIdentity() {
-        XCTAssertEqual(
-            parse("{\"type\":\"awaiting_user_response\",\"questions\":[]}"),
-            .awaitingUserResponse(questions: [], requestId: nil))
+        for raw in [
+            "{\"type\":\"awaiting_user_response\",\"questions\":[]}",
+            "{\"type\":\"awaiting_user_response\",\"request_id\":null,\"questions\":[]}",
+        ] {
+            XCTAssertEqual(
+                parse(raw),
+                .awaitingUserResponse(questions: [], requestId: nil))
+        }
     }
 
     func testAwaitingTaskApprovalCarriesTitlePriorityPlan() {

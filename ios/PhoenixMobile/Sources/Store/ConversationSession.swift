@@ -471,13 +471,14 @@ final class ConversationSession {
     /// Execute a session-scoped action per its declared delivery policy
     /// (ConversationAction). Online-only actions fail fast with a toast
     /// when offline — deliberately not queued, see the policy doc.
-    func perform(_ action: ConversationAction) {
-        guard acceptsConversationActions, actionAttempt == nil else { return }
+    @discardableResult
+    func perform(_ action: ConversationAction) -> Task<Void, Never>? {
+        guard acceptsConversationActions, actionAttempt == nil else { return nil }
         switch ClientOperation.conversationAction(action).policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
                 lastErrorToast = "This action needs a connection — it can't be queued."
-                return
+                return nil
             }
         case .outboxed:
             break  // never blocked on connectivity by definition
@@ -487,7 +488,7 @@ final class ConversationSession {
             action: action,
             originState: typedState,
             token: token)
-        Task {
+        return Task {
             do {
                 switch action {
                 case .cancel:

@@ -206,7 +206,12 @@ struct PhoenixAPI: Sendable {
     /// idle timeout covers gaps between events (the server keep-alives).
     private let streamSession: URLSession
 
-    init?(baseURL: URL, password: String?, allowSelfSigned: Bool) {
+    init?(
+        baseURL: URL,
+        password: String?,
+        allowSelfSigned: Bool,
+        configuration: URLSessionConfiguration = .default
+    ) {
         guard password?.isEmpty != false || baseURL.scheme?.lowercased() == "https" else {
             return nil
         }
@@ -216,7 +221,7 @@ struct PhoenixAPI: Sendable {
         let delegate = ServerTrustDelegate(allowSelfSigned: allowSelfSigned)
         self.trustDelegate = delegate
 
-        let config = URLSessionConfiguration.default
+        let config = configuration
         config.timeoutIntervalForRequest = 30
         config.waitsForConnectivity = false
         self.session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
