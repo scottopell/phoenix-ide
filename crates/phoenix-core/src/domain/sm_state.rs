@@ -35,6 +35,16 @@ pub struct PresentSvgInput {
     pub description: String,
 }
 
+/// Global Coordinator SVG publication input with explicit source authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorPresentSvgInput {
+    pub work_scope_id: String,
+    pub path: String,
+    pub title: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadImageInput {
     pub path: String,
@@ -157,6 +167,7 @@ pub enum ToolInput {
     KeywordSearch(KeywordSearchInput),
     ReadImage(ReadImageInput),
     PresentSvg(PresentSvgInput),
+    CoordinatorPresentSvg(CoordinatorPresentSvgInput),
     SpawnAgents(SpawnAgentsInput),
     SubmitResult(SubmitResultInput),
     SubmitError(SubmitErrorInput),
@@ -288,6 +299,9 @@ impl<'de> Deserialize<'de> for ToolInput {
             "present_svg" => {
                 parse_tool_input_or_malformed::<PresentSvgInput>("present_svg", payload)
             }
+            "coordinator_present_svg" => {
+                parse_tool_input_or_malformed::<CoordinatorPresentSvgInput>("present_svg", payload)
+            }
             "read_image" => parse_tool_input_or_malformed::<ReadImageInput>("read_image", payload),
             "spawn_agents" => {
                 parse_tool_input_or_malformed::<SpawnAgentsInput>("spawn_agents", payload)
@@ -352,6 +366,12 @@ impl From<PresentSvgInput> for ToolInput {
     }
 }
 
+impl From<CoordinatorPresentSvgInput> for ToolInput {
+    fn from(input: CoordinatorPresentSvgInput) -> Self {
+        Self::CoordinatorPresentSvg(input)
+    }
+}
+
 impl From<ReadImageInput> for ToolInput {
     fn from(input: ReadImageInput) -> Self {
         ToolInput::ReadImage(input)
@@ -399,7 +419,7 @@ impl ToolInput {
             ToolInput::Patch(_) => "patch",
             ToolInput::KeywordSearch(_) => "keyword_search",
             ToolInput::ReadImage(_) => "read_image",
-            ToolInput::PresentSvg(_) => "present_svg",
+            ToolInput::PresentSvg(_) | ToolInput::CoordinatorPresentSvg(_) => "present_svg",
             ToolInput::SpawnAgents(_) => "spawn_agents",
             ToolInput::SubmitResult(_) => "submit_result",
             ToolInput::SubmitError(_) => "submit_error",
@@ -425,6 +445,9 @@ impl ToolInput {
             ToolInput::KeywordSearch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::ReadImage(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::PresentSvg(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::CoordinatorPresentSvg(input) => {
+                serde_json::to_value(input).unwrap_or(Value::Null)
+            }
             ToolInput::SpawnAgents(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
@@ -488,6 +511,9 @@ impl ToolInput {
             "patch" => parse::<PatchInput>(name, value),
             "keyword_search" => parse::<KeywordSearchInput>(name, value),
             "read_image" => parse::<ReadImageInput>(name, value),
+            "present_svg" if matches!(contract, ToolInputContract::WorkScopeTarget) => {
+                parse::<CoordinatorPresentSvgInput>(name, value)
+            }
             "present_svg" => parse::<PresentSvgInput>(name, value),
             "spawn_agents" => parse::<SpawnAgentsInput>(name, value),
             "submit_result" => parse::<SubmitResultInput>(name, value),
@@ -637,6 +663,22 @@ mod tests {
     /// task 13018: previously both cases collapsed into the same `Unknown`
     /// variant, hiding "schema drift / bad LLM output" inside "tool we don't
     /// have."
+    #[test]
+    fn work_scope_contract_parses_coordinator_present_svg_without_malformed_fallback() {
+        let input = ToolInput::from_name_and_value_with_work_scope_target(
+            "present_svg",
+            serde_json::json!({
+                "work_scope_id": "scope-1",
+                "path": "/scope/chart.svg",
+                "title": "Chart",
+                "description": "A chart"
+            }),
+        );
+        assert!(matches!(input, ToolInput::CoordinatorPresentSvg(_)));
+        assert_eq!(input.tool_name(), "present_svg");
+        assert_eq!(input.to_value()["work_scope_id"], "scope-1");
+    }
+
     #[test]
     fn malformed_known_tool_is_distinct_from_unknown() {
         // `think` is a registered tool; `thoughts` is required as a string, but

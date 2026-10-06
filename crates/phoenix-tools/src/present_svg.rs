@@ -159,25 +159,56 @@ fn read_regular_file_beneath(root: &Path, path: &Path) -> Result<Vec<u8>, FileRe
         ));
     }
 
-    let root = CString::new(root.as_os_str().as_bytes()).map_err(|_| {
-        (
+    if !root.is_absolute() {
+        return Err((
             "policy_rejection",
-            "Selected WorkScope root is not a valid server path.",
-        )
-    })?;
+            "Selected WorkScope root must be an absolute server path.",
+        ));
+    }
+    let slash = CString::new("/").unwrap();
     let root_fd = unsafe {
         libc::open(
-            root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            slash.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
     if root_fd < 0 {
-        return Err((
-            "read_failure",
-            "Cannot open the selected active WorkScope root.",
-        ));
+        return Err(("read_failure", "Cannot open the server filesystem root."));
     }
     let mut directory = unsafe { std::fs::File::from_raw_fd(root_fd) };
+    for component in root.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => {
+                let name = CString::new(name.as_bytes()).map_err(|_| {
+                    (
+                        "policy_rejection",
+                        "Selected WorkScope root contains an invalid component.",
+                    )
+                })?;
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err((
+                        "read_failure",
+                        "Cannot open the selected WorkScope root without following symlinks.",
+                    ));
+                }
+                directory = unsafe { std::fs::File::from_raw_fd(fd) };
+            }
+            _ => {
+                return Err((
+                    "policy_rejection",
+                    "Selected WorkScope root contains unsupported path components.",
+                ))
+            }
+        }
+    }
 
     for component in &components[..components.len() - 1] {
         let Component::Normal(name) = component else {
