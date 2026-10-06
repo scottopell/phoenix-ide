@@ -143,14 +143,34 @@ final class ConversationSession {
     private var persistenceScope: String { Self.persistenceScope(for: api, credentialGeneration: credentialGeneration) }
     enum SnapshotLoadError: LocalizedError {
         case unprovenLegacyScope
+        case foreignPersistenceScope
 
         var errorDescription: String? {
-            "Cached conversation could not be loaded: legacy credential provenance is unavailable. Reconnect to reload it."
+            switch self {
+            case .unprovenLegacyScope:
+                "Cached conversation could not be loaded: legacy credential provenance is unavailable. Reconnect to reload it."
+            case .foreignPersistenceScope:
+                "Cached conversation belongs to a different credential. Reconnect to reload it."
+            }
         }
+    }
+
+    private func fenceSnapshotAuthority(_ error: SnapshotLoadError) {
+        legacySnapshotReadOnly = true
+        deliveryAllowed = false
+        snapshotPersistenceEnabled = false
+        snapshotLoadError = error
+        lastErrorToast = error.errorDescription
     }
 
     private(set) var snapshotLoadError: SnapshotLoadError?
     private(set) var snapshotSyncedAt: Date?
+
+    #if DEBUG
+    func awaitOutboxDrainForTesting() async {
+        await drainTask?.value
+    }
+    #endif
 
     init(
         conversationId: String,
@@ -171,22 +191,24 @@ final class ConversationSession {
         self.snapshotWriter = DiskStore.versionedWriter(
             name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)
 
-        if let snapshot = DiskStore.loadVersioned(
-            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion),
-           snapshot.persistenceScope == persistenceScope
+        switch DiskStore.loadVersionedResult(
+            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion)
         {
+        case let .value(snapshot) where snapshot.persistenceScope == persistenceScope:
             restore(snapshot.conversation, messages: snapshot.messages, lastSequenceId: snapshot.lastSequenceId,
                     transcriptGeneration: snapshot.transcriptGeneration, syncedAt: snapshot.syncedAt)
             reconcileOutbox()
-        } else if let legacy = DiskStore.loadVersioned(
-            LegacySnapshot.self, name: snapshotName, version: 1)
-        {
+        case .value:
+            fenceSnapshotAuthority(.foreignPersistenceScope)
+        case .missing, .incompatible, .unreadable:
+            guard let legacy = DiskStore.loadVersioned(
+                LegacySnapshot.self, name: snapshotName, version: 1)
+            else { return }
             legacySnapshotReadOnly = true
             deliveryAllowed = false
             snapshotPersistenceEnabled = false
             guard legacyPersistenceScope == persistenceScope else {
-                snapshotLoadError = .unprovenLegacyScope
-                lastErrorToast = snapshotLoadError?.errorDescription
+                fenceSnapshotAuthority(.unprovenLegacyScope)
                 return
             }
             restore(legacy.conversation, messages: legacy.messages, lastSequenceId: legacy.lastSequenceId,

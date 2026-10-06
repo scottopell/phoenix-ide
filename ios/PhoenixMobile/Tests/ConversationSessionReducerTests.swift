@@ -82,6 +82,40 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
+    func testForeignVersionTwoSnapshotFencesPersistedOutboxDelivery() async throws {
+        struct ScopedSnapshot: Codable {
+            let persistenceScope: String
+            let conversation: Conversation?
+            let messages: [Message]
+            let lastSequenceId: Int64
+            let transcriptGeneration: Int64?
+            let syncedAt: Date?
+        }
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-foreign-v2-\(UUID().uuidString)")
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        XCTAssertTrue(DiskStore.saveVersioned(
+            ScopedSnapshot(
+                persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: UUID()),
+                conversation: try conversation(), messages: [], lastSequenceId: 2,
+                transcriptGeneration: 1, syncedAt: Date()),
+            name: "conv-c1", version: 2))
+        let entry = await Outbox(conversationId: "c1").enqueue(text: "keep but do not send")
+        XCTAssertNotNil(entry)
+
+        let session = ConversationSession(
+            conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
+            credentialGeneration: UUID())
+
+        session.drainOutbox()
+        await session.awaitOutboxDrainForTesting()
+
+        XCTAssertEqual(session.outbox.visibleEntries.map(\.text), ["keep but do not send"])
+        XCTAssertEqual(session.outbox.entries.first?.attemptCount, 0)
+    }
+
+    @MainActor
     func testVersionOneSnapshotRejectsMissingAndForeignLegacyProvenance() async throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-session-rejected-\(UUID().uuidString)")

@@ -612,6 +612,27 @@ final class AppModelProductConversationTests: XCTestCase {
             version: ProductHistoryDeletionFenceStore.schemaVersion))
     }
 
+    func testUnreadableDeletionFenceBlocksRecoveryWithoutRemovingQueuedData() async {
+        let aggregateId = "pc-unreadable-fence"
+        let fenceName = ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId)
+        let fenceURL = DiskStore.url(for: fenceName)
+        try! FileManager.default.createDirectory(
+            at: fenceURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try! Data("not a fence".utf8).write(to: fenceURL)
+        let writer = Outbox(conversationId: "surviving-owner")
+        _ = await writer.enqueue(text: "preserve while fence is unreadable")
+        let persisted = await writer.flushPersistence()
+        XCTAssertTrue(persisted)
+
+        let recovered = await model().recoverProductHistoryDeletionFencesForTesting()
+
+        XCTAssertFalse(recovered)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fenceURL.path))
+        XCTAssertEqual(
+            Outbox(conversationId: "surviving-owner").visibleEntries.map(\.text),
+            ["preserve while fence is unreadable"])
+    }
+
     func testDeletionCleansMembersFromPreexistingWiderFence() async {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-wider-fence-\(UUID().uuidString)")

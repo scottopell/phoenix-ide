@@ -24,15 +24,25 @@ enum ProductHistoryDeletionFenceStore {
         DiskStore.versionedWriter(name: name(productConversationId: productConversationId), version: schemaVersion)
     }
 
-    static func fences() -> [PersistedProductHistoryDeletionFence] {
-        DiskStore.names(
+    enum Discovery {
+        case fences([PersistedProductHistoryDeletionFence])
+        case unreadable
+    }
+
+    static func discover() -> Discovery {
+        var fences: [PersistedProductHistoryDeletionFence] = []
+        for name in DiskStore.names(
             in: DiskStore.phoenixMobileDirectory(baseDirectory: DiskStore.baseDirectory), withPrefix: prefix)
-            .compactMap {
-                DiskStore.loadVersioned(
-                    PersistedProductHistoryDeletionFence.self,
-                    name: $0,
-                    version: schemaVersion)
+        {
+            switch DiskStore.loadVersionedResult(
+                PersistedProductHistoryDeletionFence.self, name: name, version: schemaVersion)
+            {
+            case let .value(fence): fences.append(fence)
+            case .missing: continue
+            case .incompatible, .unreadable: return .unreadable
             }
+        }
+        return .fences(fences)
     }
 }
 
@@ -655,8 +665,10 @@ final class AppModel {
     private func recoverProductHistoryDeletionFences(
         persistenceScope: String?, generation: Int
     ) async -> Bool {
-        guard let persistenceScope else { return false }
-        for fence in ProductHistoryDeletionFenceStore.fences() where fence.persistenceScope == persistenceScope {
+        guard let persistenceScope,
+              case let .fences(fences) = ProductHistoryDeletionFenceStore.discover()
+        else { return false }
+        for fence in fences where fence.persistenceScope == persistenceScope {
             guard await removeProductHistoryLocally(
                 productConversationId: fence.productConversationId,
                 transcriptIds: fence.transcriptIds,
