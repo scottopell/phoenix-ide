@@ -723,16 +723,8 @@
     flex: 0 1 auto;
   }
 
-  .statebar-mobile-primary:has(.statebar-conversation-extension-summary) .statebar-mobile-slug {
-    flex: 0 1 120px;
-  }
-
-  .statebar-mobile-primary:has(.statebar-conversation-extension-summary) .statebar-mobile-status {
-    max-width: 20px;
-  }
-
-  .statebar-mobile-primary:has(.statebar-conversation-extension-summary) .statebar-mobile-status .state-text {
-    display: none;
+  .statebar-mobile-section--conversation-extension > .statebar-conversation-extension-summary {
+    margin-bottom: 8px;
   }
 
   .statebar-mobile-section--conversation-extension {

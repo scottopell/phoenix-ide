@@ -1360,6 +1360,21 @@ export function StateBar({
     }`
     : undefined;
 
+  const compactTransportText = (() => {
+    switch (connectionState) {
+      case "connected":
+      case "reconnected":
+        return "Connected";
+      case "reconnecting":
+        return "Reconnecting";
+      case "offline":
+        return "Disconnected";
+      case "connecting":
+      case "disconnected":
+        return "Connecting";
+    }
+  })();
+
   if (usesCompactLayout) {
     const toggleMobileExpanded = () => setMobileExpanded((v) => !v);
     const handleCollapsedKey = (e: ReactKeyboardEvent) => {
@@ -1395,17 +1410,10 @@ export function StateBar({
             ) : (
               <span className="statebar-slug">&mdash;</span>
             )}
-            <div className="statebar-mobile-status" title={stateText}>
+            <div className="statebar-mobile-status" title={compactTransportText}>
               <span className={dotClass}></span>
-              {!mobileExpanded && (
-                <span className="state-text">{stateText}</span>
-              )}
+              <span className="state-text">{compactTransportText}</span>
             </div>
-            {conversationExtension && (
-              <div className="statebar-conversation-extension-summary">
-                {conversationExtension.summary}
-              </div>
-            )}
             <div className="statebar-mobile-actions">
               {renderFilesButton()}
               <button
@@ -1432,6 +1440,9 @@ export function StateBar({
                   className="statebar-mobile-section statebar-mobile-section--conversation-extension"
                   aria-label="Global activity and settings"
                 >
+                  <div className="statebar-conversation-extension-summary">
+                    {conversationExtension.summary}
+                  </div>
                   {conversationExtension.details}
                 </section>
               )}

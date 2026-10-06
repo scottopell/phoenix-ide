@@ -184,13 +184,40 @@ describe('StateBar conversation extension', () => {
       },
     });
 
-    expect(screen.getByText('Watching 2 Running 1 Auto On')).toBeVisible();
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(screen.getByText('Watching 2 Running 1 Auto On')).not.toBeVisible();
     expect(screen.getByText('Global activity details')).not.toBeVisible();
 
     fireEvent.click(document.querySelector('.statebar-chevron')!);
 
     expect(screen.getByText('Global activity details')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Collapse status bar' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(screen.getByText('Watching 2 Running 1 Auto On')).toBeVisible();
+  });
+
+  it.each([
+    ['connected', 'Connected'],
+    ['reconnecting', 'Reconnecting'],
+    ['offline', 'Disconnected'],
+  ] as const)('keeps %s transport status visible when collapsed and expanded', (connectionState, label) => {
+    setMobileViewport(true);
+    renderStateBar({
+      connectionState,
+      connectionAttempt: 2,
+      conversationExtension: {
+        summary: <span>Watching 3 Running 1 Auto On · Continuing</span>,
+        details: <div>Global activity details</div>,
+      },
+    });
+
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.getByText(/Watching 3/)).not.toBeVisible();
+
+    fireEvent.click(document.querySelector('.statebar-chevron')!);
+
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.getByText(/Watching 3/)).toBeVisible();
   });
 });
 
@@ -1322,7 +1349,7 @@ describe('StateBar mobile layout', () => {
     });
 
     expect(screen.getByText('explore-long-project')).toBeInTheDocument();
-    expect(screen.getByText('ready')).toBeInTheDocument();
+    expect(screen.getByText('Connected')).toBeInTheDocument();
     expect(screen.queryByText(/read-only/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /copy full working directory/i })).not.toBeInTheDocument();
 
