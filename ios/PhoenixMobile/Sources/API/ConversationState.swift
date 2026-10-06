@@ -52,7 +52,7 @@ enum ConversationState: Equatable {
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
-    case awaitingUserResponse(questions: [UserQuestion])
+    case awaitingUserResponse(questions: [UserQuestion], requestId: String?)
     case awaitingTaskApproval(title: String, priority: String, plan: String)
     case awaitingRecovery(message: String)
     case provisioning(jobId: String)
@@ -97,7 +97,9 @@ enum ConversationState: Equatable {
         case "awaiting_user_response":
             let questions = (json["questions"]?.arrayValue ?? [])
                 .compactMap(UserQuestion.parse)
-            return .awaitingUserResponse(questions: questions)
+            return .awaitingUserResponse(
+                questions: questions,
+                requestId: json["request_id"]?.stringValue)
         case "awaiting_task_approval":
             guard let title = json["title"]?.stringValue,
                   let priority = json["priority"]?.stringValue,

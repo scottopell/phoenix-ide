@@ -502,11 +502,15 @@ final class ConversationSession {
                 case .provideTaskFeedback(let feedback):
                     try await api.sendTaskFeedback(
                         conversationId: conversationId, annotations: feedback.text)
-                case .respondToQuestions(let answers):
+                case .respondToQuestions(let requestId, let answers):
                     try await api.respondToQuestion(
-                        conversationId: conversationId, answers: answers)
-                case .dismissQuestion:
-                    try await api.dismissQuestion(conversationId: conversationId)
+                        conversationId: conversationId,
+                        requestId: requestId,
+                        answers: answers)
+                case .dismissQuestion(let requestId):
+                    try await api.dismissQuestion(
+                        conversationId: conversationId,
+                        requestId: requestId)
                 }
             } catch {
                 guard actionAttempt?.token == token else { return }

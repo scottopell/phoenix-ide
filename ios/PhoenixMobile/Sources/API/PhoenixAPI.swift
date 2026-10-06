@@ -556,18 +556,26 @@ struct PhoenixAPI: Sendable {
     // Question response (awaiting_user_response): the server 409s when the
     // conversation isn't in that state — e.g. answered from another client.
 
-    func respondToQuestion(conversationId: String, answers: [String: String]) async throws {
+    func respondToQuestion(
+        conversationId: String,
+        requestId: String?,
+        answers: [String: String]
+    ) async throws {
         struct SuccessResponse: Codable { var success: Bool? }
+        var body: [String: Any] = ["answers": answers]
+        if let requestId { body["request_id"] = requestId }
         _ = try await post(
             "api/conversations/\(conversationId)/respond",
-            body: ["answers": answers],
+            body: body,
             as: SuccessResponse.self)
     }
 
-    func dismissQuestion(conversationId: String) async throws {
+    func dismissQuestion(conversationId: String, requestId: String?) async throws {
         struct SuccessResponse: Codable { var success: Bool? }
+        var body: [String: Any] = [:]
+        if let requestId { body["request_id"] = requestId }
         _ = try await post(
-            "api/conversations/\(conversationId)/dismiss-question", body: [:],
+            "api/conversations/\(conversationId)/dismiss-question", body: body,
             as: SuccessResponse.self)
     }
 
