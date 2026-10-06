@@ -38,7 +38,10 @@ pub use browser::{
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
-pub use present_svg::PresentSvgTool;
+pub use present_svg::{
+    CoordinatorPresentSvgTool, CoordinatorSvgSourceError, CoordinatorSvgSourceResolver,
+    PresentSvgTool,
+};
 pub use propose_task::ProposeTaskTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
