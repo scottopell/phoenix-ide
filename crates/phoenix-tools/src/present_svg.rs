@@ -136,6 +136,31 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, FileReadError> {
 }
 
 #[cfg(unix)]
+fn open_directory_component(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    invalid_message: &'static str,
+    read_message: &'static str,
+) -> Result<std::fs::File, FileReadError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_bytes()).map_err(|_| ("policy_rejection", invalid_message))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(("read_failure", read_message));
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
 fn read_regular_file_beneath(root: &Path, path: &Path) -> Result<Vec<u8>, FileReadError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -178,30 +203,16 @@ fn read_regular_file_beneath(root: &Path, path: &Path) -> Result<Vec<u8>, FileRe
     let mut directory = unsafe { std::fs::File::from_raw_fd(root_fd) };
     for component in root.components() {
         match component {
-            Component::RootDir => continue,
+            Component::RootDir => {}
             Component::Normal(name) => {
-                let name = CString::new(name.as_bytes()).map_err(|_| {
-                    (
-                        "policy_rejection",
-                        "Selected WorkScope root contains an invalid component.",
-                    )
-                })?;
-                let fd = unsafe {
-                    libc::openat(
-                        directory.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    return Err((
-                        "read_failure",
-                        "Cannot open the selected WorkScope root without following symlinks.",
-                    ));
-                }
-                directory = unsafe { std::fs::File::from_raw_fd(fd) };
+                directory = open_directory_component(
+                    &directory,
+                    name,
+                    "Selected WorkScope root contains an invalid component.",
+                    "Cannot open the selected WorkScope root without following symlinks.",
+                )?;
             }
-            _ => {
+            Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
                 return Err((
                     "policy_rejection",
                     "Selected WorkScope root contains unsupported path components.",
@@ -214,26 +225,12 @@ fn read_regular_file_beneath(root: &Path, path: &Path) -> Result<Vec<u8>, FileRe
         let Component::Normal(name) = component else {
             unreachable!();
         };
-        let name = CString::new(name.as_bytes()).map_err(|_| {
-            (
-                "policy_rejection",
-                "Source path contains an invalid component.",
-            )
-        })?;
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err((
-                "read_failure",
-                "Cannot open source beneath the selected WorkScope root; symlinks are unsupported.",
-            ));
-        }
-        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+        directory = open_directory_component(
+            &directory,
+            name,
+            "Source path contains an invalid component.",
+            "Cannot open source beneath the selected WorkScope root; symlinks are unsupported.",
+        )?;
     }
 
     let Component::Normal(filename) = components[components.len() - 1] else {
@@ -685,6 +682,24 @@ mod tests {
                 .await;
             assert!(!linked.is_success());
             assert!(linked.output().contains("read_failure"));
+        }
+        #[cfg(unix)]
+        {
+            let parent = tempfile::tempdir().unwrap();
+            let real_root = parent.path().join("real-root");
+            std::fs::create_dir(&real_root).unwrap();
+            std::fs::write(real_root.join("chart.svg"), SVG).unwrap();
+            let linked_root = parent.path().join("linked-root");
+            std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+            let linked_ancestor = PresentSvgTool
+                .run_for_coordinator_work_scope(
+                    input(&linked_root.join("chart.svg")),
+                    coordinator_context(store.clone(), "linked-root"),
+                    linked_root,
+                )
+                .await;
+            assert!(!linked_ancestor.is_success());
+            assert!(linked_ancestor.output().contains("read_failure"));
         }
         assert!(store.0.lock().unwrap().is_empty());
     }
