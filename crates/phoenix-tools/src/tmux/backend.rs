@@ -1,6 +1,6 @@
 //! External effects behind the tmux registry and `tmux_run`: tmux CLI
 //! invocations, socket-endpoint observation, and exact process liveness.
-//! [`SystemTmuxBackend`] is the production implementation; ADR-082 records why
+//! [`SystemTmuxBackend`] is the production implementation; ADR-087 records why
 //! the seam exists.
 
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
