@@ -8,8 +8,9 @@ use crate::send_chat_service::{
     SendChatApplicationService, SendChatRequest, SendChatServiceError, SendChatTarget,
 };
 use crate::tools::{
-    BashTool, CoordinatorPresentSvgTool, CoordinatorSvgSourceError, CoordinatorSvgSourceResolver,
-    Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget, WritingConversationTools,
+    AskUserQuestionTool, BashTool, CoordinatorPresentSvgTool, CoordinatorSvgSourceError,
+    CoordinatorSvgSourceResolver, Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget,
+    WritingConversationTools,
 };
 use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 
@@ -42,6 +43,7 @@ pub(crate) fn tools(
     tools.push(Arc::new(WatchConversation(watch_db.clone())));
     tools.push(Arc::new(UnwatchConversation(watch_db.clone())));
     tools.push(Arc::new(ListWatchedConversations(watch_db)));
+    tools.push(Arc::new(AskUserQuestionTool));
     tools
 }
 
@@ -1316,7 +1318,8 @@ mod tests {
                 "present_svg",
                 "watch_conversation",
                 "unwatch_conversation",
-                "list_watched_conversations"
+                "list_watched_conversations",
+                "ask_user_question"
             ]
         );
         let present_svg = coordinator
@@ -1332,6 +1335,77 @@ mod tests {
         assert!(present_svg
             .description()
             .contains("owned by this Global Coordinator transcript"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_registry_preserves_exact_authority() {
+        let (_, coordinator) = application_tools().await;
+        let registry = crate::tools::ToolRegistry::coordinator(coordinator, None);
+        let definitions = registry.definitions();
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "think",
+                "search_conversations",
+                "read_conversation",
+                "query_database",
+                "resolve_reference",
+                "send_conversation_message",
+                "bash",
+                "present_svg",
+                "watch_conversation",
+                "unwatch_conversation",
+                "list_watched_conversations",
+                "ask_user_question"
+            ]
+        );
+        let question = definitions
+            .iter()
+            .find(|definition| definition.name == "ask_user_question")
+            .unwrap();
+        assert_eq!(question.input_schema, AskUserQuestionTool.input_schema());
+        assert_eq!(question.description, AskUserQuestionTool.description());
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_registration_preserves_non_coordinator_boundaries() {
+        use crate::tools::{ExploreToolPolicy, ToolRegistry};
+
+        let policy =
+            ExploreToolPolicy::from_platform(&phoenix_core::platform::PlatformCapability::None {
+                details: "test".to_string(),
+            });
+        let (writing, _) = application_tools().await;
+        let registries = [
+            ("direct", ToolRegistry::direct(Vec::new()), true),
+            (
+                "writing_parent",
+                ToolRegistry::git_backed_writing_parent(Vec::new(), writing).unwrap(),
+                true,
+            ),
+            (
+                "explore",
+                ToolRegistry::explore("tasks", Vec::new(), policy),
+                true,
+            ),
+            (
+                "subagent_explore",
+                ToolRegistry::for_subagent_explore(policy),
+                false,
+            ),
+            ("subagent_work", ToolRegistry::for_subagent_work(), false),
+        ];
+        for (mode, registry, expected) in registries {
+            let count = registry
+                .definitions()
+                .iter()
+                .filter(|definition| definition.name == "ask_user_question")
+                .count();
+            assert_eq!(count, usize::from(expected), "{mode}");
+        }
     }
 
     #[tokio::test]
