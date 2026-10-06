@@ -405,14 +405,10 @@ WHEN a Close conversation request is in flight
 THE SYSTEM SHALL disable new message submission for that conversation
 UNTIL Close conversation fails or completes
 
-WHEN an authoritative ProductConversation snapshot contains exactly one transcript segment
-THE SYSTEM SHALL offer Close through that segment's conversation lifecycle endpoint
+WHEN an authoritative ProductConversation snapshot is available
+THE SYSTEM SHALL offer Close through the aggregate ProductConversation lifecycle endpoint
 
-WHEN an authoritative ProductConversation snapshot contains multiple transcript segments
-THE SYSTEM SHALL NOT invoke a per-conversation lifecycle endpoint for Close
-AND SHALL omit or disable Close with a concise unavailable explanation
-
-WHEN ProductConversation segment cardinality is not authoritatively known
+WHEN ProductConversation authority is not authoritatively known
 THE SYSTEM SHALL NOT offer Close
 
 WHEN the conversation is in a state that rejects ordinary chat
@@ -424,9 +420,8 @@ the message as steering
 stale intent — a Close conversation or cancel replayed minutes later can destroy
 work the user did in between. Only idempotency-keyed sends are safe to
 defer; the type forces each new action to make that choice explicitly. A
-per-conversation lifecycle endpoint cannot safely represent aggregate Close
-for a continued ProductConversation; no aggregate Close endpoint contract is
-defined for the iOS client.
+aggregate lifecycle endpoint preserves ProductConversation authority across
+all transcript segments, so Close cannot silently target only one segment.
 
 ---
 

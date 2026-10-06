@@ -57,15 +57,17 @@ final class ConversationSessionReducerTests: XCTestCase {
             name: "conv-c1",
             version: 1))
 
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        let credential = Keychain.CredentialRecord(
+            password: "", legacyServerURL: api.baseURL.absoluteString)
         let session = ConversationSession(
-            conversationId: "c1",
-            api: PhoenixAPI(
-                baseURL: URL(string: "https://phoenix.invalid")!,
-                password: nil,
-                allowSelfSigned: false)!,
-            connectivity: ConnectivityMonitor())
+            conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
+            credentialGeneration: credential.generation,
+            legacyPersistenceScope: credential.legacyPersistenceScope(serverURL: api.baseURL))
 
         XCTAssertEqual(session.messages.map(\.message_id), ["legacy"])
+        XCTAssertNil(session.snapshotLoadError)
         XCTAssertFalse(session.acceptsConversationActions)
         let didQueue = await session.send(text: "must not queue")
         XCTAssertFalse(didQueue)
@@ -76,6 +78,53 @@ final class ConversationSessionReducerTests: XCTestCase {
             pendingAnchorSequenceId: 3, pendingEvents: [], pendingTruncated: false)))
 
         XCTAssertTrue(session.acceptsConversationActions)
+    }
+
+    @MainActor
+    func testVersionOneSnapshotRejectsMissingAndForeignLegacyProvenance() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-rejected-\(UUID().uuidString)")
+        XCTAssertTrue(DiskStore.saveVersioned(
+            LegacySnapshot(
+                conversation: try conversation(), messages: [try message(id: "legacy", content: "[]")],
+                lastSequenceId: 2, transcriptGeneration: 1, syncedAt: Date()),
+            name: "conv-c1", version: 1))
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        let credential = Keychain.CredentialRecord(password: "")
+        let scope = ConversationSession.persistenceScope(for: api, credentialGeneration: credential.generation)
+        for proof in [nil, "https://other.invalid|\(credential.generation.uuidString)", "\(api.baseURL)|\(UUID())"] as [String?] {
+            let session = ConversationSession(
+                conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
+                credentialGeneration: credential.generation, legacyPersistenceScope: proof)
+            XCTAssertNil(session.conversation)
+            XCTAssertTrue(session.messages.isEmpty)
+            XCTAssertNotNil(session.snapshotLoadError)
+            XCTAssertNotNil(session.lastErrorToast)
+            XCTAssertFalse(session.acceptsConversationActions)
+            let queued = await session.send(text: "must not queue")
+            XCTAssertFalse(queued)
+            let saved = await session.flushSnapshotPersistence()
+            XCTAssertFalse(saved)
+            XCTAssertNil(ConversationSession.cachedConversation(
+                conversationId: "c1", persistenceScope: scope, legacyPersistenceScope: proof))
+        }
+        XCTAssertNotNil(ConversationSession.cachedConversation(
+            conversationId: "c1", persistenceScope: scope, legacyPersistenceScope: scope))
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+    }
+
+    @MainActor
+    func testPersistenceScopeUsesOnlyOpaqueGenerationNotPassword() {
+        let firstAPI = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: "first-secret", allowSelfSigned: false)!
+        let secondAPI = PhoenixAPI(
+            baseURL: firstAPI.baseURL, password: "second-secret", allowSelfSigned: false)!
+        let generation = UUID()
+        let scope = ConversationSession.persistenceScope(for: firstAPI, credentialGeneration: generation)
+        XCTAssertEqual(scope, "\(firstAPI.baseURL)|\(generation.uuidString)")
+        XCTAssertEqual(scope, ConversationSession.persistenceScope(for: secondAPI, credentialGeneration: generation))
+        XCTAssertNotEqual(scope, ConversationSession.persistenceScope(for: firstAPI, credentialGeneration: UUID()))
     }
 
     @MainActor

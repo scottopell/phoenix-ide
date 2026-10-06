@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import Observation
 
@@ -110,13 +109,19 @@ final class ConversationSession {
         cachedConversation(conversationId: conversationId) != nil
     }
 
-    static func cachedConversation(conversationId: String) -> Conversation? {
+    static func cachedConversation(
+        conversationId: String,
+        persistenceScope: String? = nil,
+        legacyPersistenceScope: String? = nil
+    ) -> Conversation? {
         if let snapshot = DiskStore.loadVersioned(
             Snapshot.self, name: "conv-\(conversationId)", version: snapshotSchemaVersion),
-           snapshot.syncedAt != nil
+           snapshot.syncedAt != nil,
+           persistenceScope == nil || snapshot.persistenceScope == persistenceScope
         {
             return snapshot.conversation
         }
+        guard let persistenceScope, legacyPersistenceScope == persistenceScope else { return nil }
         return DiskStore.loadVersioned(
             LegacySnapshot.self, name: "conv-\(conversationId)", version: 1)?.conversation
     }
@@ -125,25 +130,39 @@ final class ConversationSession {
     private var legacySnapshotReadOnly = false
     private var deliveryAllowed = true
 
-    static func persistenceScope(for api: PhoenixAPI) -> String {
-        let credential = api.password ?? ""
-        let digest = SHA256.hash(data: Data(credential.utf8)).map { String(format: "%02x", $0) }.joined()
-        return "\(api.baseURL.absoluteString)|\(digest)"
+    private static let unconfiguredGeneration = UUID()
+
+    static func persistenceScope(for api: PhoenixAPI, credentialGeneration: UUID? = nil) -> String {
+        let generation = credentialGeneration ?? unconfiguredGeneration
+        return "\(api.baseURL.absoluteString)|\(generation.uuidString)"
     }
 
-    private var persistenceScope: String { Self.persistenceScope(for: api) }
+    private var credentialGeneration: UUID?
+    private var persistenceScope: String { Self.persistenceScope(for: api, credentialGeneration: credentialGeneration) }
+    enum SnapshotLoadError: LocalizedError {
+        case unprovenLegacyScope
+
+        var errorDescription: String? {
+            "Cached conversation could not be loaded: legacy credential provenance is unavailable. Reconnect to reload it."
+        }
+    }
+
+    private(set) var snapshotLoadError: SnapshotLoadError?
     private(set) var snapshotSyncedAt: Date?
 
     init(
         conversationId: String,
         api: PhoenixAPI,
         connectivity: ConnectivityMonitor,
+        credentialGeneration: UUID? = nil,
+        legacyPersistenceScope: String? = nil,
         onConversationUpdate: ((Conversation) -> Void)? = nil,
         onHardDeleted: @escaping (String) -> Void = { _ in }
     ) {
         self.conversationId = conversationId
         self.api = api
         self.connectivity = connectivity
+        self.credentialGeneration = credentialGeneration
         self.onConversationUpdate = onConversationUpdate
         self.onHardDeleted = onHardDeleted
         self.outbox = Outbox(conversationId: conversationId)
@@ -163,6 +182,11 @@ final class ConversationSession {
             legacySnapshotReadOnly = true
             deliveryAllowed = false
             snapshotPersistenceEnabled = false
+            guard legacyPersistenceScope == persistenceScope else {
+                snapshotLoadError = .unprovenLegacyScope
+                lastErrorToast = snapshotLoadError?.errorDescription
+                return
+            }
             restore(legacy.conversation, messages: legacy.messages, lastSequenceId: legacy.lastSequenceId,
                     transcriptGeneration: legacy.transcriptGeneration, syncedAt: legacy.syncedAt)
         }
@@ -185,7 +209,7 @@ final class ConversationSession {
     }
 
     func start() {
-        guard !isHardDeleted, !legacySnapshotReadOnly else { return }
+        guard !isHardDeleted else { return }
         viewIsActive = true
         if connectivityToken == nil {
             connectivityToken = connectivity.addPathObserver(
@@ -195,8 +219,9 @@ final class ConversationSession {
         resumeLiveTasks()
     }
 
-    func replaceAPI(_ api: PhoenixAPI) {
+    func replaceAPI(_ api: PhoenixAPI, credentialGeneration: UUID? = nil) {
         self.api = api
+        self.credentialGeneration = credentialGeneration
         streamBlockedUntilConfigurationChange = false
         if viewIsActive {
             streamTask?.cancel()
@@ -273,7 +298,7 @@ final class ConversationSession {
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {
         guard !isHardDeleted else { return }
-        deliveryAllowed = true
+        if !legacySnapshotReadOnly { deliveryAllowed = true }
         resumeLiveTasks()
         drainOutbox()
     }
@@ -432,7 +457,9 @@ final class ConversationSession {
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
     func drainOutbox() {
-        guard drainTask == nil, !isHardDeleted, !isArchiving, deliveryAllowed else { return }
+        guard drainTask == nil, !isHardDeleted, !isArchiving,
+              !legacySnapshotReadOnly, deliveryAllowed
+        else { return }
         drainTask = Task {
             defer { drainTask = nil }
             // Loop until no sendable entries remain, so a message enqueued
@@ -645,6 +672,7 @@ final class ConversationSession {
         switch event {
         case .initSnapshot(let snap):
             legacySnapshotReadOnly = false
+            snapshotLoadError = nil
             snapshotPersistenceEnabled = true
             deliveryAllowed = true
             retryDelay = 1

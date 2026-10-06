@@ -293,6 +293,7 @@ rule AppForegroundsOnline {
     requires: session.view_open
     requires: session.state = dormant
     requires: NetworkPathAvailable()
+    requires: session.delivery_recovery_gate.fence_classified = true
 
     ensures: session.state = connecting
     ensures: QueueDeliveryTriggerOccurrence.created(session: session)
@@ -304,6 +305,7 @@ rule AppForegroundsOffline {
     requires: session.view_open
     requires: session.state = dormant
     requires: not NetworkPathAvailable()
+    requires: session.delivery_recovery_gate.fence_classified = true
 
     ensures: session.state = offline
     ensures: QueueDeliveryTriggerOccurrence.created(session: session)
@@ -353,6 +355,7 @@ rule NetworkPathRestored {
 
     requires: session.state = offline
     requires: session.view_open
+    requires: session.delivery_recovery_gate.fence_classified = true
 
     ensures: session.state = connecting
     ensures: QueueDeliveryTriggerOccurrence.created(session: session)
