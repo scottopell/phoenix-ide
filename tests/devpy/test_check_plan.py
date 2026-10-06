@@ -335,3 +335,43 @@ def workflow_order(group):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CargoTestTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+
+    def _with_file(self, values):
+        def fake_load(env, filename=".phoenix-ide.env"):
+            if values is None:
+                return None
+            env.update(values)
+            return "/host/.phoenix-ide.env"
+        return mock.patch.object(self.dev, "_load_env_file", side_effect=fake_load)
+
+    def test_default_without_override(self):
+        with self._with_file(None):
+            self.assertEqual(self.dev._cargo_test_timeout_secs({}), (900, None))
+
+    def test_host_env_file_sets_budget(self):
+        with self._with_file({self.dev.CARGO_TEST_TIMEOUT_ENV: "2700"}):
+            self.assertEqual(
+                self.dev._cargo_test_timeout_secs({}), (2700, "/host/.phoenix-ide.env"))
+
+    def test_process_environment_wins_over_host_file(self):
+        with self._with_file({self.dev.CARGO_TEST_TIMEOUT_ENV: "2700"}):
+            self.assertEqual(
+                self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: "1200"}),
+                (1200, "environment"))
+
+    def test_empty_value_means_default(self):
+        with self._with_file(None):
+            self.assertEqual(
+                self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: " "}),
+                (900, None))
+
+    def test_invalid_values_fail_loud(self):
+        for raw in ("abc", "0", "-5", "1.5"):
+            with self.subTest(raw=raw), self._with_file(None):
+                with self.assertRaisesRegex(SystemExit, "positive integer"):
+                    self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: raw})
