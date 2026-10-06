@@ -1932,25 +1932,33 @@ pub fn transition_parent(
         ) => Err(TransitionError::AwaitingUserResponse),
 
         (
-            ParentState::AwaitingUserResponse { .. },
-            ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
-                .with_effect(Effect::PersistHiddenSystemMarker {
-                    marker: USER_QUESTION_DISMISSED_MARKER,
-                    message_id: uuid::Uuid::new_v4().to_string(),
-                })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change()),
-        ),
+            ParentState::AwaitingUserResponse {
+                request_id: pending_request_id,
+                ..
+            },
+            ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed { request_id }),
+        ) if request_id == *pending_request_id => Ok(ParentTransitionResult::new(
+            ParentState::Core(CoreState::Idle),
+        )
+        .with_effect(Effect::PersistHiddenSystemMarker {
+            marker: USER_QUESTION_DISMISSED_MARKER,
+            message_id: uuid::Uuid::new_v4().to_string(),
+        })
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())),
 
         (
-            ParentState::AwaitingUserResponse { questions, .. },
+            ParentState::AwaitingUserResponse {
+                questions,
+                request_id: pending_request_id,
+                ..
+            },
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
+                request_id,
                 answers,
                 annotations,
             }),
-        ) => {
+        ) if request_id == *pending_request_id => {
             let answers_text = questions
                 .iter()
                 .filter_map(|q| {
@@ -1995,6 +2003,17 @@ pub fn transition_parent(
                 .with_effect(Effect::RequestLlm),
             )
         }
+
+        (
+            ParentState::AwaitingUserResponse { .. },
+            ParentEvent::Parent(
+                ParentOnlyEvent::UserQuestionResponse { .. }
+                | ParentOnlyEvent::UserQuestionDismissed { .. },
+            ),
+        ) => Err(TransitionError::InvalidTransition {
+            state: "AwaitingUserResponse",
+            event: "stale question request identity",
+        }),
 
         // ============================================================
         // Parent-only state: AwaitingRecovery (REQ-BED-030)
@@ -2473,8 +2492,8 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                let input = match call {
-                    AskUserQuestionCall::Typed(input) => input,
+                let mut input = match call {
+                    AskUserQuestionCall::Typed(input) => input.clone(),
                     AskUserQuestionCall::Malformed(err) => {
                         let err_msg = format!(
                             "ask_user_question input failed to parse: {err}. Re-emit the \
@@ -2503,6 +2522,28 @@ pub fn transition_parent(
                     }
                 };
 
+                if let Err(err) = input.validate_and_normalize() {
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let tool_result = ToolResult::error(tool.id.clone(), err);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result]).expect(
+                            "ask_user_question produces exactly one tool_use and one result",
+                        );
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
                 let tool_result = ToolResult::success(
                     tool.id.clone(),
                     "Awaiting user response. See following message for answers.".to_string(),
@@ -2519,8 +2560,9 @@ pub fn transition_parent(
 
                 return Ok(
                     ParentTransitionResult::new(ParentState::AwaitingUserResponse {
-                        questions: input.questions.clone(),
+                        questions: input.questions,
                         tool_use_id: tool.id.clone(),
+                        request_id: Some(phoenix_core::domain::sm_state::QuestionRequestId::new()),
                     })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
@@ -5857,6 +5899,110 @@ mod tests {
     }
 
     #[test]
+    fn question_request_identity_is_fresh_and_rejects_stale_actions() {
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let create_wait = || {
+            transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                Event::LlmResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "reused-provider-tool-id".into(),
+                        name: "ask_user_question".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    tool_calls: vec![make_ask_user_question_tool_call("reused-provider-tool-id")],
+                    end_turn: false,
+                    usage: Usage::default(),
+                    request_id: "llm-request".into(),
+                },
+            )
+            .unwrap()
+            .new_state
+        };
+
+        let q1 = create_wait();
+        let q2 = create_wait();
+        let ConvState::AwaitingUserResponse {
+            request_id: Some(q1_id),
+            tool_use_id: q1_tool_id,
+            ..
+        } = q1
+        else {
+            panic!("first call must create an identified wait");
+        };
+        let ConvState::AwaitingUserResponse {
+            request_id: Some(q2_id),
+            tool_use_id: q2_tool_id,
+            ..
+        } = &q2
+        else {
+            panic!("second call must create an identified wait");
+        };
+        assert!(!q1_id.as_str().is_empty());
+        assert_ne!(&q1_id, q2_id);
+        assert_eq!(q1_tool_id, *q2_tool_id);
+
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("Which library?".into(), "lodash".into());
+        assert!(matches!(
+            transition(
+                &q2,
+                &test_context(),
+                Event::UserQuestionResponse {
+                    request_id: Some(q1_id.clone()),
+                    answers: answers.clone(),
+                    annotations: None,
+                },
+            ),
+            Err(TransitionError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            transition(
+                &q2,
+                &test_context(),
+                Event::UserQuestionDismissed {
+                    request_id: Some(q1_id),
+                },
+            ),
+            Err(TransitionError::InvalidTransition { .. })
+        ));
+        let answered = transition(
+            &q2,
+            &test_context(),
+            Event::UserQuestionResponse {
+                request_id: Some(q2_id.clone()),
+                answers,
+                annotations: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            answered.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(transition(
+            &answered.new_state,
+            &test_context(),
+            Event::UserQuestionDismissed {
+                request_id: Some(q2_id.clone()),
+            },
+        )
+        .is_err());
+        assert!(transition(
+            &q2,
+            &test_context(),
+            Event::UserQuestionResponse {
+                request_id: None,
+                answers: std::collections::HashMap::new(),
+                annotations: None,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
     fn test_ask_user_question_must_be_only_tool() {
         use crate::state::ToolInput;
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
@@ -6133,6 +6279,7 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
+            request_id: None,
         };
 
         let mut answers = std::collections::HashMap::new();
@@ -6142,6 +6289,7 @@ mod tests {
             &state,
             &test_context(),
             Event::UserQuestionResponse {
+                request_id: None,
                 answers,
                 annotations: None,
             },
@@ -6183,9 +6331,15 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
+            request_id: None,
         };
 
-        let result = transition(&state, &test_context(), Event::UserQuestionDismissed).unwrap();
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserQuestionDismissed { request_id: None },
+        )
+        .unwrap();
 
         assert!(
             matches!(result.new_state, ConvState::Idle),
@@ -6230,6 +6384,7 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
+            request_id: None,
         };
 
         let result = transition(
@@ -6264,9 +6419,15 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
+            request_id: None,
         };
 
-        let dismissed = transition(&state, &test_context(), Event::UserQuestionDismissed).unwrap();
+        let dismissed = transition(
+            &state,
+            &test_context(),
+            Event::UserQuestionDismissed { request_id: None },
+        )
+        .unwrap();
 
         let result = transition(
             &dismissed.new_state,

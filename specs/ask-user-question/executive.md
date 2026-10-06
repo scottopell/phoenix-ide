@@ -16,7 +16,10 @@ Follows the `AwaitingTaskApproval` state machine pattern: executor intercepts
 the tool call, emits `AskUserQuestionPending`, state machine transitions to
 `AwaitingUserResponse`, SSE notifies the UI, user responds via
 `POST /conversations/{id}/respond`, `UserQuestionResponse` event resumes
-execution. Input validation enforces question/option count constraints and
+execution. Each new pending request has a Phoenix-owned identity persisted in
+conversation state; answer and dismiss mutations must match it while holding
+conversation admission. Legacy identity-absent waits remain identity-absent and
+answerable. Input validation enforces question/option count constraints and
 uniqueness. The tool is registered with `defer_loading: true` for tool search
 on supporting models. Tool result format is a human-readable string including
 selected labels, preview content, and user notes.
@@ -33,5 +36,6 @@ selected labels, preview content, and user notes.
 | **REQ-AUQ-006:** Parent Conversation Availability | ✅ Complete | Excluded from sub-agent `ToolRegistry` in `src/tools.rs` |
 | **REQ-AUQ-007:** Real-Time Waiting Feedback | ✅ Complete | `awaiting_user_response` in `ConversationState` SSE union in `ui/src/api.ts` |
 | **REQ-AUQ-008:** Low-Overhead Tool Availability | ✅ Complete | `defer_loading() -> bool { true }` in `ask_user_question.rs` |
+| **REQ-AUQ-009:** Bind Actions to the Current Pending Question | ✅ Complete | Persisted request identity, admission-locked HTTP validation, transition recheck, and request-keyed web panel |
 
-**Progress:** 8 of 8 complete
+**Progress:** 9 of 9 complete

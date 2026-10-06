@@ -7069,6 +7069,7 @@ mod tests {
                 ConvState::AwaitingUserResponse {
                     questions: Vec::new(),
                     tool_use_id: "question-tool".to_string(),
+                    request_id: None,
                 },
             ),
         ];

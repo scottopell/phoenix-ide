@@ -266,6 +266,7 @@ export function parseConversationState(raw: unknown): ConversationState {
       return {
         type: 'awaiting_user_response',
         questions: (obj['questions'] as UserQuestion[]) ?? [],
+        request_id: typeof obj['request_id'] === 'string' ? obj['request_id'] : undefined,
       };
     case 'context_exhausted':
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };
