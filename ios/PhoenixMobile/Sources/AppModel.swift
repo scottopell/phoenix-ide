@@ -371,6 +371,7 @@ final class AppModel {
     private var aggregateEventTaskId: UUID?
     private var aggregateRecoveryStartupTask: Task<Void, Never>?
     private var aggregateRecoveryStartupGeneration = 0
+    private var aggregateRecoveryAllowedGeneration: Int?
     private var aggregateReconciliationTask: Task<Bool, Never>?
     private(set) var aggregateReconciliationId: UUID?
     private var isForeground = true
@@ -421,6 +422,7 @@ final class AppModel {
 
     private func rebuildAPI() {
         apiGeneration += 1
+        aggregateRecoveryAllowedGeneration = nil
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
@@ -595,7 +597,9 @@ final class AppModel {
         generation: Int,
         reconcileOnOpen: Bool = false
     ) {
-        guard aggregateEventTask == nil else { return }
+        guard aggregateRecoveryAllowedGeneration == generation,
+              aggregateEventTask == nil
+        else { return }
         let taskId = UUID()
         aggregateEventTaskId = taskId
         aggregateEventTask = Task { [weak self] in
@@ -667,7 +671,10 @@ final class AppModel {
     ) async -> Bool {
         guard let persistenceScope,
               case let .fences(fences) = ProductHistoryDeletionFenceStore.discover()
-        else { return false }
+        else {
+            if apiGeneration == generation { aggregateRecoveryAllowedGeneration = nil }
+            return false
+        }
         for fence in fences where fence.persistenceScope == persistenceScope {
             guard await removeProductHistoryLocally(
                 productConversationId: fence.productConversationId,
@@ -676,6 +683,8 @@ final class AppModel {
                 expectedFence: fence)
             else { return false }
         }
+        guard apiGeneration == generation else { return false }
+        aggregateRecoveryAllowedGeneration = generation
         return true
     }
 
@@ -1666,6 +1675,7 @@ final class AppModel {
         credentialGeneration: UUID = ConversationSession.defaultTestingCredentialGeneration
     ) {
         apiGeneration &+= 1
+        aggregateRecoveryAllowedGeneration = apiGeneration
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
@@ -1827,12 +1837,20 @@ final class AppModel {
             version: ProductHistoryDeletionFenceStore.schemaVersion)
     }
 
-    func drainPersistedOutboxesForTesting() {
+    func foregroundAfterRecoveryForTesting() async -> Bool {
+        let recovered = await recoverProductHistoryDeletionFences(
+            persistenceScope: persistenceScope, generation: apiGeneration)
+        foregrounded()
         drainPersistedOutboxes()
+        return recovered
     }
 
     func drainSessionForTesting(conversationId: String) -> ConversationSession? {
         drainSessions[conversationId]
+    }
+
+    func drainPersistedOutboxesForTesting() {
+        drainPersistedOutboxes()
     }
 
     func handleAggregateHardDeletedForTesting(
@@ -1990,7 +2008,9 @@ final class AppModel {
 
     @discardableResult
     private func startAggregateReconciliation() -> Task<Bool, Never>? {
-        guard isForeground, connectivity.isOnline, api != nil else { return nil }
+        guard aggregateRecoveryAllowedGeneration == apiGeneration,
+              isForeground, connectivity.isOnline, api != nil
+        else { return nil }
         aggregateReconciliationTask?.cancel()
         for session in sessions.values { session.suspendDeliveryForReconciliation() }
         for session in drainSessions.values { session.suspendDeliveryForReconciliation() }
@@ -2169,7 +2189,9 @@ final class AppModel {
     /// half of the offline queue. Sessions created here don't start an SSE
     /// stream; they exist to drain (their outbox reconciles on next open).
     private func drainPersistedOutboxes() {
-        guard let api else { return }
+        guard aggregateRecoveryAllowedGeneration == apiGeneration,
+              let api
+        else { return }
         for name in DiskStore.names(withPrefix: "outbox-") {
             let conversationId = String(name.dropFirst("outbox-".count))
             guard !conversationId.isEmpty, sessions[conversationId] == nil else {

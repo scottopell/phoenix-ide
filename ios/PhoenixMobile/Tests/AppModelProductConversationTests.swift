@@ -612,6 +612,28 @@ final class AppModelProductConversationTests: XCTestCase {
             version: ProductHistoryDeletionFenceStore.schemaVersion))
     }
 
+    func testUnreadableFencePreventsForegroundRestartFromDrainingPersistedOutbox() async {
+        let aggregateId = "pc-unreadable-restart"
+        let fenceURL = DiskStore.url(for: ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId))
+        try! FileManager.default.createDirectory(
+            at: fenceURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try! Data("not a fence".utf8).write(to: fenceURL)
+        let writer = Outbox(conversationId: "deleted-owner")
+        _ = await writer.enqueue(text: "must not post while recovery is blocked")
+        let persisted = await writer.flushPersistence()
+        XCTAssertTrue(persisted)
+
+        let restarted = model()
+        let recovered = await restarted.foregroundAfterRecoveryForTesting()
+        await restarted.drainSessionForTesting(conversationId: "deleted-owner")?.awaitOutboxDrainForTesting()
+
+        XCTAssertFalse(recovered)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fenceURL.path))
+        let outbox = Outbox(conversationId: "deleted-owner")
+        XCTAssertEqual(outbox.entries.first?.attemptCount, 0)
+        XCTAssertEqual(outbox.visibleEntries.map(\.text), ["must not post while recovery is blocked"])
+    }
+
     func testUnreadableDeletionFenceBlocksRecoveryWithoutRemovingQueuedData() async {
         let aggregateId = "pc-unreadable-fence"
         let fenceName = ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId)
