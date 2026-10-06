@@ -212,10 +212,11 @@ final class AppModelProductConversationTests: XCTestCase {
         model.cancelAggregateReconciliationForTesting()
         XCTAssertNil(model.aggregateReconciliationId)
 
+        let startupGeneration = model.aggregateRecoveryStartupGenerationForTesting
         model.rebuildAPIForTesting()
-        await model.awaitAggregateRecoveryStartupForTesting()
+        let completedGeneration = await model.awaitAggregateRecoveryStartupForTesting()
 
-        XCTAssertNotNil(model.aggregateReconciliationId)
+        XCTAssertEqual(completedGeneration, startupGeneration + 1)
     }
 
     func testInstallAPIForTestingInvalidatesInheritedAPIWorkBeforeReplacement() {

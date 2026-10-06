@@ -53,6 +53,7 @@ final class ConversationSession {
     private var drainTask: Task<Void, Never>?
     private var staleCheckTask: Task<Void, Never>?
     private var snapshotPersistenceTask: Task<Void, Never>?
+    private var snapshotRemovalTask: Task<Void, Never>?
     private var cancelNeedsAgentDoneFallback = false
     /// localIds with a POST in flight — prevents duplicate concurrent sends
     /// of one entry (resending a *different* entry is always safe).
@@ -677,6 +678,10 @@ final class ConversationSession {
     func awaitSnapshotPersistenceForTesting() async {
         await snapshotPersistenceTask?.value
     }
+
+    func awaitSnapshotRemovalForTesting() async {
+        await snapshotRemovalTask?.value
+    }
     #endif
 
     func receive(_ event: PhoenixEvent) {
@@ -985,7 +990,8 @@ final class ConversationSession {
         let snapshotRemovalRevision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = snapshotRemovalRevision
         DiskStore.remove(name: snapshotName)
-        Task { [snapshotWriter] in
+        snapshotRemovalTask = Task { [weak self, snapshotWriter] in
+            defer { self?.snapshotRemovalTask = nil }
             await snapshotWriter.remove(revision: snapshotRemovalRevision)
         }
         outbox.clear()

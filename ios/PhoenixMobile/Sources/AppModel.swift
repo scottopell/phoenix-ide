@@ -25,14 +25,12 @@ enum ProductHistoryDeletionFenceStore {
     }
 
     static func fences() -> [PersistedProductHistoryDeletionFence] {
-        let suffix = ".v\(schemaVersion)"
-        return DiskStore.names(
+        DiskStore.names(
             in: DiskStore.phoenixMobileDirectory(baseDirectory: DiskStore.baseDirectory), withPrefix: prefix)
-            .compactMap { name in
-                guard name.hasSuffix(suffix) else { return nil }
-                return DiskStore.loadVersioned(
+            .compactMap {
+                DiskStore.loadVersioned(
                     PersistedProductHistoryDeletionFence.self,
-                    name: String(name.dropLast(suffix.count)),
+                    name: $0,
                     version: schemaVersion)
             }
     }
@@ -362,6 +360,7 @@ final class AppModel {
     private var aggregateEventTask: Task<Void, Never>?
     private var aggregateEventTaskId: UUID?
     private var aggregateRecoveryStartupTask: Task<Void, Never>?
+    private var aggregateRecoveryStartupGeneration = 0
     private var aggregateReconciliationTask: Task<Bool, Never>?
     private(set) var aggregateReconciliationId: UUID?
     private var isForeground = true
@@ -442,6 +441,7 @@ final class AppModel {
                       let api = self.api
                 else { return }
                 self.startAggregateEventStream(api: api, generation: generation)
+                self.aggregateRecoveryStartupGeneration &+= 1
                 self.startAggregateReconciliation()
             }
         }
@@ -1584,8 +1584,9 @@ final class AppModel {
         guard await fenceWriter.replace(
             expected: currentFence, replacement: mergedFence, revision: fenceRevision) == .replaced
         else { return false }
+        let fencedTranscriptIds = mergedFence.transcriptIds
         deletedProductHistoryIds.insert(productConversationId)
-        deletedProductHistoryIds.formUnion(allTranscriptIds)
+        deletedProductHistoryIds.formUnion(fencedTranscriptIds)
         tombstonesInstalled?()
 
         _ = productHistoryGenerations.begin(productConversationId: productConversationId)
@@ -1595,7 +1596,7 @@ final class AppModel {
         await historyWriter.remove(revision: revision)
         guard apiGeneration == startedGeneration else { return false }
 
-        for transcriptId in allTranscriptIds {
+        for transcriptId in fencedTranscriptIds {
             guard apiGeneration == startedGeneration else { return false }
             let openOwner = sessions.removeValue(forKey: transcriptId)
             let drainOwner = drainSessions.removeValue(forKey: transcriptId)
@@ -1623,7 +1624,7 @@ final class AppModel {
         }
 
         guard apiGeneration == startedGeneration else { return false }
-        listStore.remove(aggregateId: productConversationId)
+        guard listStore.removeAndPersist(aggregateId: productConversationId) else { return false }
         if pendingProductCloseConfirmation?.productConversationId == productConversationId {
             pendingProductCloseConfirmation = nil
             pendingProductCloseResolution.reset()
@@ -1635,7 +1636,7 @@ final class AppModel {
             productConversationId: "pending-close-confirmation")
         closeConfirmationReconciliationProductConversationIds.remove(productConversationId)
         if pendingOpenConversationId == productConversationId
-            || allTranscriptIds.contains(pendingOpenConversationId ?? "")
+            || fencedTranscriptIds.contains(pendingOpenConversationId ?? "")
         {
             pendingOpenConversationId = nil
         }
@@ -1707,8 +1708,13 @@ final class AppModel {
         aggregateEventTask != nil
     }
 
-    func awaitAggregateRecoveryStartupForTesting() async {
+    func awaitAggregateRecoveryStartupForTesting() async -> Int {
         await aggregateRecoveryStartupTask?.value
+        return aggregateRecoveryStartupGeneration
+    }
+
+    var aggregateRecoveryStartupGenerationForTesting: Int {
+        aggregateRecoveryStartupGeneration
     }
 
     func startAggregateEventStreamForTesting() {

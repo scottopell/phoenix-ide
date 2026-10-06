@@ -216,7 +216,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
-        await session.awaitSnapshotPersistenceForTesting()
+        await session.awaitSnapshotRemovalForTesting()
 
         XCTAssertTrue(session.isHardDeleted)
         XCTAssertTrue(session.messages.isEmpty)

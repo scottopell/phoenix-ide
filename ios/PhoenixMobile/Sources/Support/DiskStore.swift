@@ -260,11 +260,7 @@ enum DiskStore {
     }
 
     static func versionedWriter(name: String, version: Int) -> VersionedDiskWriter {
-        let legacyDestinationURL = url(for: name)
-        let destinationURL = url(for: "\(name).v\(version)")
-        if legacyDestinationURL != destinationURL {
-            versionedDestinations.removeValue(forKey: legacyDestinationURL)
-        }
+        let destinationURL = url(for: name)
         let destination = versionedDestinations[destinationURL]
             ?? VersionedDiskDestination(destination: destinationURL)
         versionedDestinations[destinationURL] = destination
@@ -382,11 +378,7 @@ enum DiskStore {
         _ type: T.Type, name: String, version: Int,
         migrate: ((_ storedVersion: Int, _ fileData: Data) -> T?)? = nil
     ) -> VersionedLoad<T> {
-        let versionedSource = url(for: "\(name).v\(version)")
-        let versioned = loadVersionedResult(
-            type, source: versionedSource, version: version, migrate: migrate)
-        guard case .missing = versioned else { return versioned }
-        return loadVersionedResult(type, source: url(for: name), version: version, migrate: migrate)
+        loadVersionedResult(type, source: url(for: name), version: version, migrate: migrate)
     }
 
     /// Names (without extension) of stored files matching a prefix. Used to

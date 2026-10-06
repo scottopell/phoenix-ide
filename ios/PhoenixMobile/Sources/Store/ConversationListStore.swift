@@ -355,7 +355,8 @@ final class ConversationListStore {
             runtime_role: existing.runtime_role))
     }
 
-    func remove(aggregateId: String) {
+    @discardableResult
+    func removeAndPersist(aggregateId: String) -> Bool {
         externalMutationGeneration += 1
         upsertsDuringRefresh[aggregateId] = nil
         if isRefreshing {
@@ -364,7 +365,11 @@ final class ConversationListStore {
         conversations.removeAll { $0.aggregateIdentity == aggregateId }
         transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateId }
         aggregateToCachedTranscript[aggregateId] = nil
-        persistCache()
+        return persistCache()
+    }
+
+    func remove(aggregateId: String) {
+        _ = removeAndPersist(aggregateId: aggregateId)
     }
 
     func aggregateId(forTranscriptRowId transcriptRowId: String) -> String? {
@@ -418,9 +423,15 @@ final class ConversationListStore {
         lastError = nil
     }
 
-    private func persistCache() {
-        guard let lastRefreshed else { return }
-        DiskStore.saveVersioned(
+    @discardableResult
+    private func persistCache() -> Bool {
+        guard let lastRefreshed else {
+            if case .missing = DiskStore.loadVersionedResult(
+                Cache.self, name: Self.cacheName, version: Self.schemaVersion)
+            { return true }
+            return false
+        }
+        return DiskStore.saveVersioned(
             Cache(
                 conversations: conversations,
                 transcriptToAggregate: transcriptToAggregate,
