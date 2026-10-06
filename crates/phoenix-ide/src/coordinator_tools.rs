@@ -1368,6 +1368,10 @@ mod tests {
             .unwrap();
         assert_eq!(question.input_schema, AskUserQuestionTool.input_schema());
         assert_eq!(question.description, AskUserQuestionTool.description());
+        assert!(
+            question.defer_loading,
+            "Coordinator AUQ must preserve REQ-AUQ-008 deferred loading"
+        );
     }
 
     #[tokio::test]

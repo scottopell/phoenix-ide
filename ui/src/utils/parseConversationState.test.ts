@@ -7,11 +7,12 @@ describe('parseConversationState recovery', () => {
     [{ type: 'awaiting_user_response', questions: [] }],
     [{ type: 'awaiting_user_response', questions: [], request_id: null }],
   ])('normalizes a legacy question request identity to absence', (raw) => {
-    expect(parseConversationState(raw)).toEqual({
+    const parsed = parseConversationState(raw);
+    expect(parsed).toEqual({
       type: 'awaiting_user_response',
       questions: [],
-      request_id: undefined,
     });
+    expect('request_id' in parsed).toBe(false);
   });
 
   it('preserves an identified question request identity', () => {

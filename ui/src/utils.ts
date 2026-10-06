@@ -262,12 +262,14 @@ export function parseConversationState(raw: unknown): ConversationState {
         priority: (obj['priority'] as string) ?? '',
         plan: (obj['plan'] as string) ?? '',
       };
-    case 'awaiting_user_response':
+    case 'awaiting_user_response': {
+      const requestId = obj['request_id'];
       return {
         type: 'awaiting_user_response',
         questions: (obj['questions'] as UserQuestion[]) ?? [],
-        request_id: typeof obj['request_id'] === 'string' ? obj['request_id'] : undefined,
+        ...(typeof requestId === 'string' ? { request_id: requestId } : {}),
       };
+    }
     case 'context_exhausted':
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };
     case 'recoverable_continuation_failure': {
