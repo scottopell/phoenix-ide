@@ -732,9 +732,11 @@
     margin-bottom: 8px;
   }
 
-  .statebar-mobile-section--conversation-extension {
-    display: block;
+  .statebar-mobile-section.statebar-mobile-section--conversation-extension {
+    display: flex;
     max-height: min(52dvh, 440px);
+    flex-direction: column;
+    align-items: stretch;
     overflow-y: auto;
   }
 
