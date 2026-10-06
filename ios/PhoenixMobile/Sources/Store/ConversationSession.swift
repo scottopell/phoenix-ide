@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 
@@ -37,7 +38,7 @@ final class ConversationSession {
         acceptsConversationActions && typedState.acceptsChatMessage
     }
     var acceptsConversationActions: Bool {
-        !isHardDeleted && !isArchiving && conversation?.archived != true
+        !legacySnapshotReadOnly && !isHardDeleted && !isArchiving && conversation?.archived != true
     }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
@@ -86,40 +87,51 @@ final class ConversationSession {
 
     /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
     /// versioning rule). Additive-optional fields (syncedAt) need no bump.
-    private static let snapshotSchemaVersion = 1
+    private static let snapshotSchemaVersion = 2
 
     private struct Snapshot: Codable, Sendable {
+        let persistenceScope: String
         var conversation: Conversation?
         var messages: [Message]
         var lastSequenceId: Int64
-        /// Missing only in snapshots written before transcript generations
-        /// were part of the iOS cache; nil forces replacement on next init.
         var transcriptGeneration: Int64?
-        /// Missing in snapshots written before cache freshness was tracked.
+        var syncedAt: Date?
+    }
+
+    private struct LegacySnapshot: Codable, Sendable {
+        var conversation: Conversation?
+        var messages: [Message]
+        var lastSequenceId: Int64
+        var transcriptGeneration: Int64?
         var syncedAt: Date?
     }
 
     static func hasCachedSnapshot(conversationId: String) -> Bool {
-        guard let snapshot = DiskStore.loadVersioned(
-            Snapshot.self,
-            name: "conv-\(conversationId)",
-            version: snapshotSchemaVersion)
-        else { return false }
-        return snapshot.conversation != nil && snapshot.syncedAt != nil
+        cachedConversation(conversationId: conversationId) != nil
     }
 
     static func cachedConversation(conversationId: String) -> Conversation? {
-        guard let snapshot = DiskStore.loadVersioned(
-            Snapshot.self,
-            name: "conv-\(conversationId)",
-            version: snapshotSchemaVersion),
-              snapshot.syncedAt != nil
-        else { return nil }
-        return snapshot.conversation
+        if let snapshot = DiskStore.loadVersioned(
+            Snapshot.self, name: "conv-\(conversationId)", version: snapshotSchemaVersion),
+           snapshot.syncedAt != nil
+        {
+            return snapshot.conversation
+        }
+        return DiskStore.loadVersioned(
+            LegacySnapshot.self, name: "conv-\(conversationId)", version: 1)?.conversation
     }
 
     private var transcriptGeneration: Int64?
+    private var legacySnapshotReadOnly = false
     private var deliveryAllowed = true
+
+    static func persistenceScope(for api: PhoenixAPI) -> String {
+        let credential = api.password ?? ""
+        let digest = SHA256.hash(data: Data(credential.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "\(api.baseURL.absoluteString)|\(digest)"
+    }
+
+    private var persistenceScope: String { Self.persistenceScope(for: api) }
     private(set) var snapshotSyncedAt: Date?
 
     init(
@@ -138,32 +150,42 @@ final class ConversationSession {
         self.snapshotWriter = DiskStore.versionedWriter(
             name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)
 
-        // Cached snapshot renders immediately; the stream refreshes it.
-        if let snap = DiskStore.loadVersioned(
-            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion)
+        if let snapshot = DiskStore.loadVersioned(
+            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion),
+           snapshot.persistenceScope == persistenceScope
         {
-            conversation = snap.conversation
-            messages = snap.messages
-            durableMessageSequenceCeiling = snap.messages.map(\.sequence_id).max() ?? 0
-            lastSequenceId = snap.lastSequenceId
-            transcriptGeneration = snap.transcriptGeneration
-            snapshotSyncedAt = snap.syncedAt
-            replayFromPendingAnchor = true
-            presentationMode = snap.conversation?.presentation_mode
-            // Busy flag follows the cached mode the same way live
-            // state_change events derive it — a snapshot taken mid-turn
-            // must not open looking idle.
-            agentWorking = presentationMode == "working"
-            rebuildToolUseIndex()
-            // A prior crash can leave the authoritative snapshot durable but
-            // the matching outbox row not yet pruned. Reconcile at load so the
-            // same user message never renders twice while offline.
+            restore(snapshot.conversation, messages: snapshot.messages, lastSequenceId: snapshot.lastSequenceId,
+                    transcriptGeneration: snapshot.transcriptGeneration, syncedAt: snapshot.syncedAt)
             reconcileOutbox()
+        } else if let legacy = DiskStore.loadVersioned(
+            LegacySnapshot.self, name: snapshotName, version: 1)
+        {
+            legacySnapshotReadOnly = true
+            deliveryAllowed = false
+            snapshotPersistenceEnabled = false
+            restore(legacy.conversation, messages: legacy.messages, lastSequenceId: legacy.lastSequenceId,
+                    transcriptGeneration: legacy.transcriptGeneration, syncedAt: legacy.syncedAt)
         }
     }
 
+    private func restore(
+        _ conversation: Conversation?, messages: [Message], lastSequenceId: Int64,
+        transcriptGeneration: Int64?, syncedAt: Date?
+    ) {
+        self.conversation = conversation
+        self.messages = messages
+        durableMessageSequenceCeiling = messages.map(\.sequence_id).max() ?? 0
+        self.lastSequenceId = lastSequenceId
+        self.transcriptGeneration = transcriptGeneration
+        snapshotSyncedAt = syncedAt
+        replayFromPendingAnchor = true
+        presentationMode = conversation?.presentation_mode
+        agentWorking = presentationMode == "working"
+        rebuildToolUseIndex()
+    }
+
     func start() {
-        guard !isHardDeleted else { return }
+        guard !isHardDeleted, !legacySnapshotReadOnly else { return }
         viewIsActive = true
         if connectivityToken == nil {
             connectivityToken = connectivity.addPathObserver(
@@ -287,6 +309,7 @@ final class ConversationSession {
             syncedAt = pendingAuthoritativeSyncedAt ?? snapshotSyncedAt
         }
         return Snapshot(
+            persistenceScope: persistenceScope,
             conversation: conversation,
             messages: Self.durableMessages(
                 messages, through: durableMessageSequenceCeiling),
@@ -363,7 +386,7 @@ final class ConversationSession {
     /// same idempotent delivery.
     @discardableResult
     func send(text: String, images: [ImagePayload] = []) async -> Bool {
-        guard !isHardDeleted else { return false }
+        guard !isHardDeleted, !legacySnapshotReadOnly else { return false }
         guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!trimmed.isEmpty || !images.isEmpty), acceptsChatMessage else {
@@ -621,6 +644,9 @@ final class ConversationSession {
         guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
+            legacySnapshotReadOnly = false
+            snapshotPersistenceEnabled = true
+            deliveryAllowed = true
             retryDelay = 1
             let previousSequenceFloor = lastSequenceId
             let generationMatches = transcriptGeneration == snap.transcriptGeneration

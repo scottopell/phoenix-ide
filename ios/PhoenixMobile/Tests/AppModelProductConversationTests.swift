@@ -45,22 +45,26 @@ final class AppModelProductConversationTests: XCTestCase {
 
     private func persistReadableSnapshot(conversation: Conversation) {
         struct Snapshot: Codable {
+            var persistenceScope: String
             var conversation: Conversation?
             var messages: [Message]
             var lastSequenceId: Int64
             var transcriptGeneration: Int64?
             var syncedAt: Date?
         }
+        let api = PhoenixAPI(
+            baseURL: URL(string: "http://127.0.0.1:1")!, password: nil, allowSelfSigned: false)!
 
         DiskStore.saveVersioned(
             Snapshot(
+                persistenceScope: ConversationSession.persistenceScope(for: api),
                 conversation: conversation,
                 messages: [],
                 lastSequenceId: 0,
                 transcriptGeneration: 1,
                 syncedAt: Date()),
             name: "conv-\(conversation.id)",
-            version: 1)
+            version: 2)
     }
 
     private func message(_ id: String, sequence: Int64) -> Message {

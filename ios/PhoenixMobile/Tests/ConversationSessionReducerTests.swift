@@ -35,6 +35,49 @@ final class ConversationSessionReducerTests: XCTestCase {
             from: Data("{\"message_id\":\"\(id)\",\"sequence_id\":2,\"message_type\":\"\(type)\",\"content\":\(content)}".utf8))
     }
 
+    private struct LegacySnapshot: Codable {
+        var conversation: Conversation?
+        var messages: [Message]
+        var lastSequenceId: Int64
+        var transcriptGeneration: Int64?
+        var syncedAt: Date?
+    }
+
+    @MainActor
+    func testVersionOneSnapshotRendersReadOnlyUntilAuthoritativeInit() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-legacy-\(UUID().uuidString)")
+        XCTAssertTrue(DiskStore.saveVersioned(
+            LegacySnapshot(
+                conversation: try conversation(),
+                messages: [try message(id: "legacy", content: "[]")],
+                lastSequenceId: 2,
+                transcriptGeneration: 1,
+                syncedAt: Date()),
+            name: "conv-c1",
+            version: 1))
+
+        let session = ConversationSession(
+            conversationId: "c1",
+            api: PhoenixAPI(
+                baseURL: URL(string: "https://phoenix.invalid")!,
+                password: nil,
+                allowSelfSigned: false)!,
+            connectivity: ConnectivityMonitor())
+
+        XCTAssertEqual(session.messages.map(\.message_id), ["legacy"])
+        XCTAssertFalse(session.acceptsConversationActions)
+        let didQueue = await session.send(text: "must not queue")
+        XCTAssertFalse(didQueue)
+
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(), messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 3,
+            pendingAnchorSequenceId: 3, pendingEvents: [], pendingTruncated: false)))
+
+        XCTAssertTrue(session.acceptsConversationActions)
+    }
+
     @MainActor
     func testMessageUpdateWaitsForMessageIdentity() throws {
         let session = makeSession()

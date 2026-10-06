@@ -314,15 +314,9 @@ rule AppForegroundClassifiesDeletionFenceBeforeQueueDelivery {
     when: AppForegrounded(session)
 
     requires: session.state != deleted
-    requires: exists DeliveryRecoveryGate{
-        session: session,
-        fence_classified: false
-    }
+    requires: session.delivery_recovery_gate.fence_classified = false
 
-    ensures: DeliveryRecoveryGate{
-        session: session,
-        fence_classified: true
-    }
+    ensures: session.delivery_recovery_gate.fence_classified = true
 }
 
 rule AppForegroundRetainedSessionTriggersQueueDelivery {
@@ -369,15 +363,9 @@ rule NetworkRestoreClassifiesDeletionFenceBeforeQueueDelivery {
     when: NetworkBecameAvailable(session)
 
     requires: session.state != deleted
-    requires: exists DeliveryRecoveryGate{
-        session: session,
-        fence_classified: false
-    }
+    requires: session.delivery_recovery_gate.fence_classified = false
 
-    ensures: DeliveryRecoveryGate{
-        session: session,
-        fence_classified: true
-    }
+    ensures: session.delivery_recovery_gate.fence_classified = true
 }
 
 rule NetworkRestoredOutsideOpenOfflineSessionTriggersQueueDelivery {
@@ -542,7 +530,8 @@ rule StaleOrDuplicateEventDiscarded {
 -- Rules -- terminal deletion
 ------------------------------------------------------------
 
-rule HardDeletionFencePrecedesCleanup {
+rule HardDeletionEventFencesAndCleansUp {
+    -- REQ-IOS-005
     when: ConversationHardDeleted(
         session,
         configuration_identity,
@@ -557,25 +546,6 @@ rule HardDeletionFencePrecedesCleanup {
             aggregate_authority: aggregate_authority
         )
         DurableHardDeleteFence.created(authority: authority, session: session)
-    ensures: session.view_open = false
-    ensures: session.interaction_enabled = false
-    ensures: session.state = deleted
-    @guidance
-        -- One authority transaction owns live-event, aggregate-not-found,
-        -- and startup-recovery deletion. It commits the exact configuration,
-        -- aggregate, and member fence; revalidates the configuration epoch;
-        -- terminally revokes member delivery and persistence capabilities;
-        -- awaits exact-scope transcript, queue, and list removal; verifies
-        -- absence; then retires that exact fence. Epoch mismatch leaves the
-        -- fence durable without process-local mutation.
-}
-
-rule HardDeletionEventReceived {
-    -- REQ-IOS-005
-    when: ConversationHardDeleted(session, configuration_identity, aggregate_authority)
-
-    requires: session.state = live
-
     ensures: session.state = deleted
     ensures: session.view_open = false
     ensures: session.interaction_enabled = false
@@ -588,6 +558,14 @@ rule HardDeletionEventReceived {
         for entry in queue/LocalQueueEntries where scope = session.scope:
             not exists entry
     ensures: ConversationClientStateDeletionOccurrence.created(session: session)
+    @guidance
+        -- One authority transaction owns live-event, aggregate-not-found,
+        -- and startup-recovery deletion. It commits the exact configuration,
+        -- aggregate, and member fence; revalidates the configuration epoch;
+        -- terminally revokes member delivery and persistence capabilities;
+        -- awaits exact-scope transcript, queue, and list removal; verifies
+        -- absence; then retires that exact fence. Epoch mismatch leaves the
+        -- fence durable without process-local mutation.
 }
 
 rule HardDeletionConfirmedWhileConnecting {
