@@ -1806,6 +1806,23 @@ final class AppModel {
             persistenceScope: persistenceScope, generation: apiGeneration)
     }
 
+    func persistedProductHistoryDeletionFenceForTesting(
+        productConversationId: String
+    ) -> PersistedProductHistoryDeletionFence? {
+        DiskStore.loadVersioned(
+            PersistedProductHistoryDeletionFence.self,
+            name: ProductHistoryDeletionFenceStore.name(productConversationId: productConversationId),
+            version: ProductHistoryDeletionFenceStore.schemaVersion)
+    }
+
+    func drainPersistedOutboxesForTesting() {
+        drainPersistedOutboxes()
+    }
+
+    func drainSessionForTesting(conversationId: String) -> ConversationSession? {
+        drainSessions[conversationId]
+    }
+
     func handleAggregateHardDeletedForTesting(
         productConversationId: String,
         transcriptIds: [String]

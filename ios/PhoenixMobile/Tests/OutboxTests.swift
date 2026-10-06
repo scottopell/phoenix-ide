@@ -379,6 +379,25 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
+    func testClearAndWaitCannotReviveAHistoricalOutboxArtifact() async {
+        freshDiskStore()
+        let conversationId = "c1"
+        let historical = makeEntry(conversationId: conversationId)
+        XCTAssertTrue(DiskStore.save([historical], name: "outbox-\(conversationId)"))
+
+        let outbox = Outbox(conversationId: conversationId)
+        XCTAssertEqual(outbox.visibleEntries.map(\.localId), [historical.localId])
+        _ = await outbox.enqueue(text: "written through the versioned writer")
+        let persisted = await outbox.flushPersistence()
+        XCTAssertTrue(persisted)
+
+        await outbox.clearAndWait()
+
+        XCTAssertFalse(DiskStore.names(withPrefix: "outbox-").contains("outbox-\(conversationId)"))
+        XCTAssertTrue(Outbox(conversationId: conversationId).visibleEntries.isEmpty)
+    }
+
+    @MainActor
     func testRecoverableEntryCanBeRetriedOrDismissed() async {
         freshDiskStore()
         let stale = makeEntry(

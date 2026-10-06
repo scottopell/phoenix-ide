@@ -47,6 +47,10 @@ final class ConversationListStore {
     /// Aggregate identities removed or archived after the current full refresh began.
     private var exclusionsDuringRefresh: Set<String> = []
 
+    #if DEBUG
+    var persistCacheOverrideForTesting: (() -> Bool)?
+    #endif
+
     init() {
         if let cache = DiskStore.loadVersioned(
             Cache.self, name: Self.cacheName, version: Self.schemaVersion)
@@ -136,6 +140,14 @@ final class ConversationListStore {
         }
         return confirmed
     }
+
+    #if DEBUG
+    func replaceAndPersistForTesting(_ conversations: [Conversation]) {
+        self.conversations = conversations
+        lastRefreshed = Date()
+        _ = persistCache()
+    }
+    #endif
 
     nonisolated static func preservingMissing(
         _ preserved: [String: Conversation],
@@ -425,6 +437,9 @@ final class ConversationListStore {
 
     @discardableResult
     private func persistCache() -> Bool {
+        #if DEBUG
+        if let persistCacheOverrideForTesting { return persistCacheOverrideForTesting() }
+        #endif
         guard let lastRefreshed else {
             if case .missing = DiskStore.loadVersionedResult(
                 Cache.self, name: Self.cacheName, version: Self.schemaVersion)

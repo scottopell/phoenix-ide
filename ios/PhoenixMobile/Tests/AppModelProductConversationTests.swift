@@ -209,6 +209,8 @@ final class AppModelProductConversationTests: XCTestCase {
 
     func testAPIRebuildRestartsAggregateReconciliationAfterPermanentFailure() async {
         let model = model()
+        model.serverURLString = "http://127.0.0.1:1"
+        _ = await model.awaitAggregateRecoveryStartupForTesting()
         model.cancelAggregateReconciliationForTesting()
         XCTAssertNil(model.aggregateReconciliationId)
 
@@ -608,6 +610,83 @@ final class AppModelProductConversationTests: XCTestCase {
             PersistedProductHistoryDeletionFence.self,
             name: ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId),
             version: ProductHistoryDeletionFenceStore.schemaVersion))
+    }
+
+    func testDeletionCleansMembersFromPreexistingWiderFence() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-wider-fence-\(UUID().uuidString)")
+        let generation = ConversationSession.defaultTestingCredentialGeneration
+        let baseURL = URL(string: "http://localhost")!
+        let api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)!
+        let aggregateId = "pc-wider"
+        let wider = PersistedProductHistoryDeletionFence(
+            persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: generation),
+            productConversationId: aggregateId,
+            transcriptIds: ["narrow", "queued-owner"])
+        let writer = ProductHistoryDeletionFenceStore.writer(productConversationId: aggregateId)
+        _ = await writer.save(wider, revision: writer.reserveRevision())
+        persistReadableSnapshot(conversation: conversation(id: "queued-owner", aggregateId: aggregateId))
+        let queued = OutboxEntry(
+            localId: "queued-id", conversationId: "queued-owner", text: "preserve only until deletion",
+            images: [], status: .pending, acceptedByServer: false, createdAt: Date(),
+            acceptedAt: nil, lastError: nil, attemptCount: 0)
+        XCTAssertTrue(DiskStore.saveVersioned(
+            [queued], name: "outbox-queued-owner", version: Outbox.schemaVersion))
+
+        let model = model(baseURL: baseURL)
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId, transcriptIds: ["narrow"])
+
+        XCTAssertTrue(removed)
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "queued-owner"))
+        XCTAssertEqual(Outbox(conversationId: "queued-owner").visibleEntries, [])
+        XCTAssertNil(model.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+    }
+
+    func testFailedListPersistenceRetainsFenceUntilRecoveryCompletes() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-fence-\(UUID().uuidString)")
+        let aggregateId = "pc-list-failure"
+        let deletedRow = conversation(id: "row-list", aggregateId: aggregateId)
+        let unrelated = OutboxEntry(
+            localId: "unrelated-id", conversationId: "unrelated-owner", text: "retain me",
+            images: [], status: .pending, acceptedByServer: false, createdAt: Date(),
+            acceptedAt: nil, lastError: nil, attemptCount: 0)
+        let model = model()
+        model.listStore.replaceAndPersistForTesting([deletedRow])
+        XCTAssertTrue(DiskStore.saveVersioned(
+            [unrelated], name: "outbox-unrelated-owner", version: Outbox.schemaVersion))
+        model.listStore.persistCacheOverrideForTesting = { false }
+
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId, transcriptIds: ["row-list"])
+
+        XCTAssertFalse(removed)
+        XCTAssertNotNil(model.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+        XCTAssertTrue(ConversationListStore().conversations.contains { $0.aggregateIdentity == aggregateId })
+
+        let restarted = self.model()
+        let recovered = await restarted.recoverProductHistoryDeletionFencesForTesting()
+        XCTAssertTrue(recovered)
+        XCTAssertNil(restarted.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+        XCTAssertFalse(ConversationListStore().conversations.contains { $0.aggregateIdentity == aggregateId })
+        XCTAssertEqual(Outbox(conversationId: "unrelated-owner").visibleEntries.map(\.text), ["retain me"])
+    }
+
+    func testPersistedOutboxIsEnumeratedAndReloadedByItsOwner() async throws {
+        let conversationId = "c1"
+        let writer = Outbox(conversationId: conversationId)
+        _ = await writer.enqueue(text: "deliver after restart")
+        let persisted = await writer.flushPersistence()
+        XCTAssertTrue(persisted)
+        XCTAssertTrue(DiskStore.names(withPrefix: "outbox-").contains("outbox-\(conversationId)"))
+
+        let model = self.model()
+        model.drainPersistedOutboxesForTesting()
+
+        let owner = try XCTUnwrap(model.drainSessionForTesting(conversationId: conversationId))
+        XCTAssertEqual(owner.conversationId, conversationId)
+        XCTAssertEqual(owner.outbox.visibleEntries.map(\.text), ["deliver after restart"])
     }
 
     func testAggregateDeletionTerminalizesRetainedOwnersMissingFromAliases() async throws {
