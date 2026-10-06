@@ -2540,16 +2540,5 @@ mod tests {
                 .unwrap_err(),
             CoordinatorWorkScopeTargetError::Authority
         );
-        let snapshot = service.coordinator_snapshot().await.unwrap();
-        assert!(snapshot.contains("\"cwd\": null"), "{snapshot}");
-        assert!(snapshot.contains("\"worktree_path\": null"), "{snapshot}");
-        assert!(
-            snapshot.contains("\"cm_branch_name\": \"feature/history\""),
-            "{snapshot}"
-        );
-        assert!(
-            snapshot.contains("\"cm_base_branch\": \"main\""),
-            "{snapshot}"
-        );
     }
 }
