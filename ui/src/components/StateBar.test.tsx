@@ -196,8 +196,25 @@ describe('StateBar conversation extension', () => {
     expect(screen.getByText('Watching 2 Running 1 Auto On')).toBeVisible();
   });
 
+  it('uses transport-owned text and dot for the Global compact indicator', () => {
+    setMobileViewport(true);
+    const { container } = renderStateBar({
+      convState: { type: 'error', message: 'failed', error_kind: 'server_error' },
+      connectionState: 'connected',
+      conversationExtension: {
+        summary: <span>Watching 3</span>,
+        details: <div>Global activity details</div>,
+      },
+    });
+
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(container.querySelector('.statebar-mobile-status .dot')).toHaveClass('idle');
+    expect(container.querySelector('.statebar-mobile-status .dot')).not.toHaveClass('error');
+  });
+
   it.each([
     ['connected', 'Connected'],
+    ['reconnected', 'Reconnected'],
     ['reconnecting', 'Reconnecting'],
     ['offline', 'Disconnected'],
   ] as const)('keeps %s transport status visible when collapsed and expanded', (connectionState, label) => {
@@ -218,6 +235,28 @@ describe('StateBar conversation extension', () => {
 
     expect(screen.getByText(label)).toBeVisible();
     expect(screen.getByText(/Watching 3/)).toBeVisible();
+  });
+});
+
+describe('ordinary compact conversation status', () => {
+  it.each([
+    [{ type: 'llm_requesting', attempt: 1 } as const, 'awaiting LLM response'],
+    [{ type: 'awaiting_task_approval', title: 'Approve task', priority: 'P1', plan: 'Proceed' } as const, 'awaiting approval'],
+    [{ type: 'error', message: 'failed', error_kind: 'server_error' } as const, 'error'],
+  ])('preserves the derived connected status for %j', (convState, label) => {
+    setMobileViewport(true);
+    renderStateBar({ convState });
+
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.queryByText('Connected')).not.toBeInTheDocument();
+  });
+
+  it('preserves the ordinary disconnected status', () => {
+    setMobileViewport(true);
+    renderStateBar({ connectionState: 'offline' });
+
+    expect(screen.getByText('offline')).toBeVisible();
+    expect(screen.queryByText('Disconnected')).not.toBeInTheDocument();
   });
 });
 
@@ -1349,7 +1388,7 @@ describe('StateBar mobile layout', () => {
     });
 
     expect(screen.getByText('explore-long-project')).toBeInTheDocument();
-    expect(screen.getByText('Connected')).toBeInTheDocument();
+    expect(screen.getByText('ready')).toBeInTheDocument();
     expect(screen.queryByText(/read-only/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /copy full working directory/i })).not.toBeInTheDocument();
 
