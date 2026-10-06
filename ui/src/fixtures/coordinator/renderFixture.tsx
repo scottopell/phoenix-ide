@@ -54,12 +54,18 @@ export function CoordinatorFixture({ scenario }: Props) {
 function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
   const [draft, setDraft] = useState('');
   const [images, setImages] = useState<ImageData[]>([]);
+  const [fixtureConnectionState, setFixtureConnectionState] = useState(scenario.connectionState);
   const store = useMemo(() => new ConversationStore(), []);
   const transcript = useMemo(
     () => messageListFixtureData(getMessageListScenario('compact-latest-expanded')),
     [],
   );
   const convState = scenario.working ? { type: 'llm_requesting', attempt: 1 } as const : { type: 'idle' } as const;
+  useEffect(() => {
+    if (!scenario.freezeReconnectAfterMount) return;
+    const timer = window.setTimeout(() => setFixtureConnectionState('reconnecting'), 0);
+    return () => window.clearTimeout(timer);
+  }, [scenario.freezeReconnectAfterMount]);
   const conversation: Conversation = {
     id: transcript.conversationId,
     slug: transcript.slug,
@@ -100,7 +106,7 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
               convState={convState}
               images={images}
               setImages={setImages}
-              isOffline={false}
+              isOffline={fixtureConnectionState !== 'connected'}
               failedMessages={[]}
               convModeLabel="Explore"
               draft={draft}
@@ -113,16 +119,16 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
             <StateBar
               conversation={conversation}
               convState={convState}
-              connectionState={scenario.connectionState}
-              connectionAttempt={scenario.connectionState === 'reconnecting' ? 2 : 0}
-              nextRetryIn={scenario.connectionState === 'offline' ? 4 : null}
+              connectionState={fixtureConnectionState}
+              connectionAttempt={fixtureConnectionState === 'reconnecting' ? 12 : 0}
+              nextRetryIn={fixtureConnectionState === 'offline' ? 4 : null}
               contextWindowUsed={16_000}
               modelContextWindow={200_000}
               phaseStateUpdatedAt={null}
-              conversationExtension={{
+              conversationExtension={scenario.globalActivity ? {
                 summary: <span>Watching 3 Running 1 Auto On · Continuing</span>,
                 details: <div>Fixture activity details</div>,
-              }}
+              } : undefined}
             />
           </div>
         </div>

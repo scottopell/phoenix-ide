@@ -210,6 +210,7 @@ describe('StateBar conversation extension', () => {
     expect(screen.getByText('Connected')).toBeVisible();
     expect(container.querySelector('.statebar-mobile-status .dot')).toHaveClass('idle');
     expect(container.querySelector('.statebar-mobile-status .dot')).not.toHaveClass('error');
+    expect(container.querySelector('.statebar-mobile-status')).toHaveClass('statebar-mobile-status--transport');
   });
 
   it.each([
@@ -249,6 +250,29 @@ describe('ordinary compact conversation status', () => {
 
     expect(screen.getByText(label)).toBeVisible();
     expect(screen.queryByText('Connected')).not.toBeInTheDocument();
+  });
+
+  it('does not duplicate ordinary status after expansion', () => {
+    setMobileViewport(true);
+    renderStateBar({ convState: { type: 'idle' } });
+
+    fireEvent.click(document.querySelector('.statebar-chevron')!);
+
+    expect(screen.getAllByText('ready')).toHaveLength(1);
+  });
+
+  it('keeps long ordinary reconnect status bounded with actions visible', () => {
+    setMobileViewport(true);
+    const { container } = renderStateBar({
+      connectionState: 'reconnecting',
+      connectionAttempt: 12,
+      convState: { type: 'llm_requesting', attempt: 1 },
+    });
+
+    const status = container.querySelector('.statebar-mobile-status');
+    expect(status).not.toHaveClass('statebar-mobile-status--transport');
+    expect(status).toHaveTextContent('reconnecting (12)');
+    expect(document.querySelector('.statebar-chevron')).toBeVisible();
   });
 
   it('preserves the ordinary disconnected status', () => {

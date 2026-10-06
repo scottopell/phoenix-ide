@@ -1411,9 +1411,14 @@ export function StateBar({
             ) : (
               <span className="statebar-slug">&mdash;</span>
             )}
-            <div className="statebar-mobile-status" title={compactStatus.text}>
+            <div
+              className={`statebar-mobile-status${conversationExtension ? " statebar-mobile-status--transport" : ""}`}
+              title={compactStatus.text}
+            >
               <span className={compactStatus.dotClass}></span>
-              <span className="state-text">{compactStatus.text}</span>
+              {(!mobileExpanded || conversationExtension) && (
+                <span className="state-text">{compactStatus.text}</span>
+              )}
             </div>
             <div className="statebar-mobile-actions">
               {renderFilesButton()}

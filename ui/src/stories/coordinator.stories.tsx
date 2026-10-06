@@ -16,3 +16,5 @@ export const TransportReconnecting = storyFor('transport-reconnecting');
 TransportReconnecting.storyName = 'transport-reconnecting';
 export const TransportDisconnected = storyFor('transport-disconnected');
 TransportDisconnected.storyName = 'transport-disconnected';
+export const OrdinaryReconnectingFrozen = storyFor('ordinary-reconnecting-frozen');
+OrdinaryReconnectingFrozen.storyName = 'ordinary-reconnecting-frozen';
