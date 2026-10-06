@@ -213,7 +213,7 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(model.aggregateReconciliationId)
 
         model.rebuildAPIForTesting()
-        await Task.yield()
+        await model.awaitAggregateRecoveryStartupForTesting()
 
         XCTAssertNotNil(model.aggregateReconciliationId)
     }

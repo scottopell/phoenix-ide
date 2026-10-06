@@ -76,6 +76,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             conversation: try conversation(), messages: [], agentWorking: false,
             presentationMode: "idle", lastSequenceId: 3,
             pendingAnchorSequenceId: 3, pendingEvents: [], pendingTruncated: false)))
+        await session.awaitSnapshotPersistenceForTesting()
 
         XCTAssertTrue(session.acceptsConversationActions)
     }
@@ -215,6 +216,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
+        await session.awaitSnapshotPersistenceForTesting()
 
         XCTAssertTrue(session.isHardDeleted)
         XCTAssertTrue(session.messages.isEmpty)

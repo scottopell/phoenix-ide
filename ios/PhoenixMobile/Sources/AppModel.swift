@@ -25,8 +25,16 @@ enum ProductHistoryDeletionFenceStore {
     }
 
     static func fences() -> [PersistedProductHistoryDeletionFence] {
-        DiskStore.names(in: DiskStore.phoenixMobileDirectory(baseDirectory: DiskStore.baseDirectory), withPrefix: prefix)
-            .compactMap { DiskStore.loadVersioned(PersistedProductHistoryDeletionFence.self, name: $0, version: schemaVersion) }
+        let suffix = ".v\(schemaVersion)"
+        return DiskStore.names(
+            in: DiskStore.phoenixMobileDirectory(baseDirectory: DiskStore.baseDirectory), withPrefix: prefix)
+            .compactMap { name in
+                guard name.hasSuffix(suffix) else { return nil }
+                return DiskStore.loadVersioned(
+                    PersistedProductHistoryDeletionFence.self,
+                    name: String(name.dropLast(suffix.count)),
+                    version: schemaVersion)
+            }
     }
 }
 
@@ -326,6 +334,13 @@ final class AppModel {
         return ConversationSession.persistenceScope(for: api, credentialGeneration: credential.generation)
     }
 
+    private func cachedConversation(conversationId: String) -> Conversation? {
+        ConversationSession.cachedConversation(
+            conversationId: conversationId,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
+    }
+
     var trustSelfSigned: Bool {
         didSet {
             UserDefaults.standard.set(trustSelfSigned, forKey: Self.trustSelfSignedKey)
@@ -346,6 +361,7 @@ final class AppModel {
     private var apiGeneration = 0
     private var aggregateEventTask: Task<Void, Never>?
     private var aggregateEventTaskId: UUID?
+    private var aggregateRecoveryStartupTask: Task<Void, Never>?
     private var aggregateReconciliationTask: Task<Bool, Never>?
     private(set) var aggregateReconciliationId: UUID?
     private var isForeground = true
@@ -400,6 +416,8 @@ final class AppModel {
         aggregateEventTask = nil
         aggregateEventTaskId = nil
         cancelAggregateReconciliation()
+        aggregateRecoveryStartupTask?.cancel()
+        aggregateRecoveryStartupTask = nil
         guard !credentialLoadFailed, credential != nil,
               let url = URL(string: serverURLString), url.host != nil else {
             api = nil
@@ -415,7 +433,8 @@ final class AppModel {
         for session in drainSessions.values { session.replaceAPI(rebuiltAPI, credentialGeneration: credential?.generation) }
         if isForeground {
             let generation = apiGeneration
-            Task { [weak self] in
+            aggregateRecoveryStartupTask = Task { [weak self] in
+                defer { self?.aggregateRecoveryStartupTask = nil }
                 guard let self,
                       await self.recoverProductHistoryDeletionFences(
                         persistenceScope: self.persistenceScope, generation: generation),
@@ -447,10 +466,7 @@ final class AppModel {
     func session(for conversationId: String) -> ConversationSession? {
         guard let api else { return nil }
         let aggregateId = aggregateIdentity(forTranscriptRowId: conversationId)
-            ?? ConversationSession.cachedConversation(
-                conversationId: conversationId,
-                persistenceScope: credential.map { ConversationSession.persistenceScope(for: api, credentialGeneration: $0.generation) },
-                legacyPersistenceScope: legacySnapshotPersistenceScope)?
+            ?? cachedConversation(conversationId: conversationId)?
                 .product_conversation_id
         guard !deletedProductHistoryIds.contains(conversationId),
               aggregateId.map({ !deletedProductHistoryIds.contains($0) }) ?? true
@@ -688,7 +704,7 @@ final class AppModel {
     ) -> Bool {
         aggregateIdentity(forTranscriptRowId: transcriptId) == productConversationId
             || session.conversation?.product_conversation_id == productConversationId
-            || ConversationSession.cachedConversation(conversationId: transcriptId)?
+            || cachedConversation(conversationId: transcriptId)?
                 .product_conversation_id == productConversationId
     }
 
@@ -1042,7 +1058,7 @@ final class AppModel {
         let coordinator = await Self.coordinatorAttentionEvidence(
             rememberedId: coordinatorConversationId,
             fetch: { _ in try await api.getCoordinatorProjection() },
-            cached: { ConversationSession.cachedConversation(conversationId: $0) })
+            cached: { cachedConversation(conversationId: $0) })
         guard isCurrent() else { return false }
         if let coordinator {
             await attention.refreshAdditionalEvidenceAndNotifyIfNeeded(
@@ -1088,7 +1104,7 @@ final class AppModel {
     private func rememberedCoordinatorAggregateIds() -> Set<String> {
         guard let coordinatorConversationId else { return [] }
         let aggregateId = listStore.aggregateId(forTranscriptRowId: coordinatorConversationId)
-            ?? ConversationSession.cachedConversation(conversationId: coordinatorConversationId)?
+            ?? cachedConversation(conversationId: coordinatorConversationId)?
                 .aggregateIdentity
             ?? coordinatorConversationId
         return [aggregateId]
@@ -1525,6 +1541,10 @@ final class AppModel {
         return try await fetch(conversation.transcriptRowIdentity).canonical_root.transcript_row_id
     }
 
+    private func verifiedRemoval(writer: VersionedDiskWriter) -> Bool {
+        writer.isMissing()
+    }
+
     private func removeProductHistoryLocally(
         productConversationId: String,
         transcriptIds: Set<String>,
@@ -1550,15 +1570,19 @@ final class AppModel {
             persistenceScope: persistenceScope,
             productConversationId: productConversationId,
             transcriptIds: allTranscriptIds)
-        guard expectedFence == nil || expectedFence == fence else { return false }
         let fenceWriter = ProductHistoryDeletionFenceStore.writer(productConversationId: productConversationId)
         let currentFence = DiskStore.loadVersioned(
             PersistedProductHistoryDeletionFence.self,
             name: ProductHistoryDeletionFenceStore.name(productConversationId: productConversationId),
             version: ProductHistoryDeletionFenceStore.schemaVersion)
+        guard expectedFence == nil || expectedFence == currentFence else { return false }
+        let mergedFence = PersistedProductHistoryDeletionFence(
+            persistenceScope: persistenceScope,
+            productConversationId: productConversationId,
+            transcriptIds: (currentFence?.transcriptIds ?? []).union(fence.transcriptIds))
         let fenceRevision = fenceWriter.reserveRevision()
         guard await fenceWriter.replace(
-            expected: currentFence, replacement: fence, revision: fenceRevision) == .replaced
+            expected: currentFence, replacement: mergedFence, revision: fenceRevision) == .replaced
         else { return false }
         deletedProductHistoryIds.insert(productConversationId)
         deletedProductHistoryIds.formUnion(allTranscriptIds)
@@ -1585,10 +1609,17 @@ final class AppModel {
                 await session.outbox.clearAndWait()
                 guard apiGeneration == startedGeneration else { return false }
             }
-            let snapshotWriter = DiskStore.versionedWriter(name: "conv-\(transcriptId)", version: 2)
+            let snapshotName = "conv-\(transcriptId)"
+            let snapshotWriter = DiskStore.versionedWriter(name: snapshotName, version: 2)
             await snapshotWriter.remove(revision: snapshotWriter.reserveRevision())
-            let outboxWriter = DiskStore.versionedWriter(name: "outbox-\(transcriptId)", version: 1)
+            guard verifiedRemoval(writer: snapshotWriter) else { return false }
+            let outboxName = "outbox-\(transcriptId)"
+            let outboxWriter = DiskStore.versionedWriter(name: outboxName, version: 1)
             await outboxWriter.remove(revision: outboxWriter.reserveRevision())
+            DiskStore.remove(name: outboxName)
+            guard verifiedRemoval(writer: outboxWriter),
+                  !DiskStore.listNames(prefix: outboxName).contains(outboxName)
+            else { return false }
         }
 
         guard apiGeneration == startedGeneration else { return false }
@@ -1611,14 +1642,15 @@ final class AppModel {
         removeAttentionNotifications(productConversationId: productConversationId)
         let retirementRevision = fenceWriter.reserveRevision()
         guard await fenceWriter.replace(
-            expected: fence, replacement: nil, revision: retirementRevision) == .replaced
+            expected: mergedFence, replacement: nil, revision: retirementRevision) == .replaced
         else { return false }
         return true
     }
 
     #if DEBUG
     func installAPIForTesting(
-        baseURL: URL = URL(string: "http://127.0.0.1:1")!, credentialGeneration: UUID = UUID()
+        baseURL: URL = URL(string: "http://127.0.0.1:1")!,
+        credentialGeneration: UUID = ConversationSession.defaultTestingCredentialGeneration
     ) {
         apiGeneration &+= 1
         aggregateEventTask?.cancel()
@@ -1673,6 +1705,10 @@ final class AppModel {
 
     var aggregateEventStreamOwnedForTesting: Bool {
         aggregateEventTask != nil
+    }
+
+    func awaitAggregateRecoveryStartupForTesting() async {
+        await aggregateRecoveryStartupTask?.value
     }
 
     func startAggregateEventStreamForTesting() {
@@ -1895,7 +1931,7 @@ final class AppModel {
                 String($0.dropFirst("conv-".count))
             })
         for transcriptId in ownedTranscriptIds {
-            let cached = ConversationSession.cachedConversation(conversationId: transcriptId)
+            let cached = cachedConversation(conversationId: transcriptId)
             guard transcriptId != rememberedCoordinatorTranscriptId,
                   cached?.isCoordinator != true
             else { continue }

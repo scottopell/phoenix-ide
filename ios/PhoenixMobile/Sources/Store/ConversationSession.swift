@@ -52,6 +52,7 @@ final class ConversationSession {
     private var streamTask: Task<Void, Never>?
     private var drainTask: Task<Void, Never>?
     private var staleCheckTask: Task<Void, Never>?
+    private var snapshotPersistenceTask: Task<Void, Never>?
     private var cancelNeedsAgentDoneFallback = false
     /// localIds with a POST in flight — prevents duplicate concurrent sends
     /// of one entry (resending a *different* entry is always safe).
@@ -130,10 +131,10 @@ final class ConversationSession {
     private var legacySnapshotReadOnly = false
     private var deliveryAllowed = true
 
-    private static let unconfiguredGeneration = UUID()
+    static let defaultTestingCredentialGeneration = UUID()
 
     static func persistenceScope(for api: PhoenixAPI, credentialGeneration: UUID? = nil) -> String {
-        let generation = credentialGeneration ?? unconfiguredGeneration
+        let generation = credentialGeneration ?? defaultTestingCredentialGeneration
         return "\(api.baseURL.absoluteString)|\(generation.uuidString)"
     }
 
@@ -355,7 +356,8 @@ final class ConversationSession {
         let snapshot = snapshotForPersistence(authoritative: authoritative)
         let revision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = revision
-        Task { [weak self, snapshotWriter] in
+        snapshotPersistenceTask = Task { [weak self, snapshotWriter] in
+            defer { self?.snapshotPersistenceTask = nil }
             let didSave = await snapshotWriter.save(snapshot, revision: revision)
             self?.completeSnapshotPersistence(
                 snapshot, revision: revision, didSave: didSave)
@@ -372,14 +374,18 @@ final class ConversationSession {
         if didSave {
             snapshotSyncedAt = snapshot.syncedAt
             pendingAuthoritativeSyncedAt = nil
+            if legacySnapshotReadOnly {
+                legacySnapshotReadOnly = false
+                deliveryAllowed = true
+            }
             if snapshotNeedsOutboxReconciliation {
                 snapshotNeedsOutboxReconciliation = false
                 reconcileOutbox()
             }
-        }
-        if snapshotNeedsOutboxDrain {
-            snapshotNeedsOutboxDrain = false
-            drainOutbox()
+            if snapshotNeedsOutboxDrain {
+                snapshotNeedsOutboxDrain = false
+                drainOutbox()
+            }
         }
         return didSave
     }
@@ -667,14 +673,18 @@ final class ConversationSession {
 
     // MARK: - Reducer
 
+    #if DEBUG
+    func awaitSnapshotPersistenceForTesting() async {
+        await snapshotPersistenceTask?.value
+    }
+    #endif
+
     func receive(_ event: PhoenixEvent) {
         guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
-            legacySnapshotReadOnly = false
             snapshotLoadError = nil
             snapshotPersistenceEnabled = true
-            deliveryAllowed = true
             retryDelay = 1
             let previousSequenceFloor = lastSequenceId
             let generationMatches = transcriptGeneration == snap.transcriptGeneration
