@@ -1,4 +1,4 @@
-# ADR-083: Legacy AUQ waits retain identity absence
+# ADR-082: Legacy AUQ waits retain identity absence
 
 - **Status:** Accepted
 - **Date:** 2026-10-06
