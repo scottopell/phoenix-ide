@@ -12,3 +12,7 @@ export const ConversationIdle = storyFor('conversation-idle');
 ConversationIdle.storyName = 'conversation-idle';
 export const ConversationWorking = storyFor('conversation-working');
 ConversationWorking.storyName = 'conversation-working';
+export const TransportReconnecting = storyFor('transport-reconnecting');
+TransportReconnecting.storyName = 'transport-reconnecting';
+export const TransportDisconnected = storyFor('transport-disconnected');
+TransportDisconnected.storyName = 'transport-disconnected';

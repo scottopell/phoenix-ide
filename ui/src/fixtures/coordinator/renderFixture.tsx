@@ -40,7 +40,7 @@ export function CoordinatorFixture({ scenario }: Props) {
             <CoordinatorPage
               fixtureData={{
                 coordinatorId,
-                conversation: <FixtureConversation working={scenario.working} />,
+                conversation: <FixtureConversation scenario={scenario} />,
               }}
             />
           )}
@@ -51,7 +51,7 @@ export function CoordinatorFixture({ scenario }: Props) {
   );
 }
 
-function FixtureConversation({ working }: { working: boolean }) {
+function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
   const [draft, setDraft] = useState('');
   const [images, setImages] = useState<ImageData[]>([]);
   const store = useMemo(() => new ConversationStore(), []);
@@ -59,7 +59,7 @@ function FixtureConversation({ working }: { working: boolean }) {
     () => messageListFixtureData(getMessageListScenario('compact-latest-expanded')),
     [],
   );
-  const convState = working ? { type: 'llm_requesting', attempt: 1 } as const : { type: 'idle' } as const;
+  const convState = scenario.working ? { type: 'llm_requesting', attempt: 1 } as const : { type: 'idle' } as const;
   const conversation: Conversation = {
     id: transcript.conversationId,
     slug: transcript.slug,
@@ -113,12 +113,16 @@ function FixtureConversation({ working }: { working: boolean }) {
             <StateBar
               conversation={conversation}
               convState={convState}
-              connectionState="connected"
-              connectionAttempt={0}
-              nextRetryIn={null}
+              connectionState={scenario.connectionState}
+              connectionAttempt={scenario.connectionState === 'reconnecting' ? 2 : 0}
+              nextRetryIn={scenario.connectionState === 'offline' ? 4 : null}
               contextWindowUsed={16_000}
               modelContextWindow={200_000}
               phaseStateUpdatedAt={null}
+              conversationExtension={{
+                summary: <span>Watching 3 Running 1 Auto On · Continuing</span>,
+                details: <div>Fixture activity details</div>,
+              }}
             />
           </div>
         </div>

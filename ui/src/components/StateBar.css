@@ -698,8 +698,7 @@
   }
 
   .statebar-mobile-status {
-    flex: 0 1 auto;
-    max-width: 34vw;
+    flex: 0 0 auto;
   }
 
   .statebar-mobile-status .state-text,
