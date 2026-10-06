@@ -8,7 +8,8 @@ use crate::send_chat_service::{
     SendChatApplicationService, SendChatRequest, SendChatServiceError, SendChatTarget,
 };
 use crate::tools::{
-    BashTool, Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget, WritingConversationTools,
+    BashTool, CoordinatorPresentSvgTool, CoordinatorSvgSourceError, CoordinatorSvgSourceResolver,
+    Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget, WritingConversationTools,
 };
 use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 
@@ -34,7 +35,10 @@ pub(crate) fn tools(
         .into_tools()
         .collect::<Vec<_>>();
     tools.insert(3, Arc::new(ResolveReference(service.clone())));
-    tools.push(Arc::new(WorkScopeCoordinatorBash(service)));
+    tools.push(Arc::new(WorkScopeCoordinatorBash(service.clone())));
+    tools.push(Arc::new(CoordinatorPresentSvgTool::new(Arc::new(
+        GlobalCoordinatorSvgSourceResolver(service),
+    ))));
     tools.push(Arc::new(WatchConversation(watch_db.clone())));
     tools.push(Arc::new(UnwatchConversation(watch_db.clone())));
     tools.push(Arc::new(ListWatchedConversations(watch_db)));
@@ -197,7 +201,20 @@ impl Tool for WorkScopeCoordinatorBash {
                     .await
                 {
                     Ok(path) => path,
-                    Err(error) => return ToolOutput::error(error),
+                    Err(error) => {
+                        let message = match error {
+                            crate::api::global_read::CoordinatorWorkScopeTargetError::Authority => {
+                                "active persisted WorkScope with a live owner not found for Coordinator bash run"
+                            }
+                            crate::api::global_read::CoordinatorWorkScopeTargetError::Persistence => {
+                                "failed to resolve Coordinator bash WorkScope"
+                            }
+                            crate::api::global_read::CoordinatorWorkScopeTargetError::Read => {
+                                "active persisted WorkScope root is unavailable or invalid"
+                            }
+                        };
+                        return ToolOutput::error(message);
+                    }
                 };
                 let display = json!({
                     "work_scope_id": binding.work_scope_id.clone(),
@@ -240,6 +257,32 @@ impl Tool for WorkScopeCoordinatorBash {
             }
         }
         output
+    }
+}
+
+struct GlobalCoordinatorSvgSourceResolver(GlobalReadService);
+
+#[async_trait]
+impl CoordinatorSvgSourceResolver for GlobalCoordinatorSvgSourceResolver {
+    async fn resolve_active_work_scope_root(
+        &self,
+        work_scope_id: &str,
+    ) -> Result<std::path::PathBuf, CoordinatorSvgSourceError> {
+        self.0
+            .resolve_active_work_scope_bash_target(work_scope_id)
+            .await
+            .map(|binding| binding.path)
+            .map_err(|error| match error {
+                crate::api::global_read::CoordinatorWorkScopeTargetError::Authority => {
+                    CoordinatorSvgSourceError::Authority
+                }
+                crate::api::global_read::CoordinatorWorkScopeTargetError::Persistence => {
+                    CoordinatorSvgSourceError::Persistence
+                }
+                crate::api::global_read::CoordinatorWorkScopeTargetError::Read => {
+                    CoordinatorSvgSourceError::Read
+                }
+            })
     }
 }
 
@@ -1270,11 +1313,25 @@ mod tests {
                 "resolve_reference",
                 "send_conversation_message",
                 "bash",
+                "present_svg",
                 "watch_conversation",
                 "unwatch_conversation",
                 "list_watched_conversations"
             ]
         );
+        let present_svg = coordinator
+            .iter()
+            .find(|tool| tool.name() == "present_svg")
+            .unwrap();
+        let schema = present_svg.input_schema();
+        assert_eq!(
+            schema["required"],
+            json!(["work_scope_id", "path", "title", "description"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(present_svg
+            .description()
+            .contains("owned by this Global Coordinator transcript"));
     }
 
     #[tokio::test]
@@ -1448,6 +1505,32 @@ mod tests {
         assert_eq!(body["outcome"], "rejected");
         assert_eq!(body["reason_code"], "self_target_rejected");
         assert!(db.get_messages("origin").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_present_svg_rejects_unknown_work_scope_before_source_read() {
+        let (writing, coordinator) = application_tools().await;
+        drop(writing);
+        let tool = coordinator
+            .into_iter()
+            .find(|tool| tool.name() == "present_svg")
+            .unwrap();
+        let output = tool
+            .run(
+                json!({
+                    "work_scope_id": "missing-scope",
+                    "path": "/tmp/must-not-be-read.svg",
+                    "title": "Missing",
+                    "description": "This source must not be read."
+                }),
+                context("global-transcript"),
+            )
+            .await;
+
+        assert!(!output.is_success());
+        assert!(output
+            .output()
+            .contains("Active persisted WorkScope with a live owner not found"));
     }
 
     #[tokio::test]
