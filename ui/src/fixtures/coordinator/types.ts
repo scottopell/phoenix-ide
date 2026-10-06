@@ -6,6 +6,7 @@ export interface CoordinatorScenario {
   connectionState: 'connected' | 'reconnecting' | 'offline';
   globalActivity: boolean;
   freezeReconnectAfterMount?: boolean;
+  staleWatchdog?: boolean;
 }
 
 export type CoordinatorScenarioId =
@@ -13,4 +14,5 @@ export type CoordinatorScenarioId =
   | 'conversation-working'
   | 'transport-reconnecting'
   | 'transport-disconnected'
-  | 'ordinary-reconnecting-frozen';
+  | 'ordinary-reconnecting-frozen'
+  | 'global-watchdog-stale';

@@ -1360,7 +1360,7 @@ export function StateBar({
     }`
     : undefined;
 
-  const compactStatus = conversationExtension ? (() => {
+  const compactStatus = conversationExtension && !watchdogStale ? (() => {
     switch (connectionState) {
       case "connected":
         return { text: "Connected", dotClass: "dot idle" };

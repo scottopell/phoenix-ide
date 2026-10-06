@@ -18,3 +18,5 @@ export const TransportDisconnected = storyFor('transport-disconnected');
 TransportDisconnected.storyName = 'transport-disconnected';
 export const OrdinaryReconnectingFrozen = storyFor('ordinary-reconnecting-frozen');
 OrdinaryReconnectingFrozen.storyName = 'ordinary-reconnecting-frozen';
+export const GlobalWatchdogStale = storyFor('global-watchdog-stale');
+GlobalWatchdogStale.storyName = 'global-watchdog-stale';

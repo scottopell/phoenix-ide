@@ -85,6 +85,7 @@ function renderStateBar({
   connectionAttempt = 0,
   phaseStateUpdatedAt,
   lastSseEventAt,
+  lastSseEventAtRef,
   firstByteRequestId,
   turnRetryContext,
   onOpenFiles,
@@ -103,6 +104,7 @@ function renderStateBar({
   connectionAttempt?: number;
   phaseStateUpdatedAt?: number | null;
   lastSseEventAt?: number;
+  lastSseEventAtRef?: ComponentProps<typeof StateBar>['lastSseEventAtRef'];
   firstByteRequestId?: string | null;
   turnRetryContext?: ComponentProps<typeof StateBar>['turnRetryContext'];
   onOpenFiles?: ComponentProps<typeof StateBar>['onOpenFiles'];
@@ -146,6 +148,9 @@ function renderStateBar({
   }
   if (lastSseEventAt !== undefined) {
     props.lastSseEventAtRef = { current: lastSseEventAt };
+  }
+  if (lastSseEventAtRef !== undefined) {
+    props.lastSseEventAtRef = lastSseEventAtRef;
   }
   if (firstByteRequestId !== undefined) {
     props.firstByteRequestId = firstByteRequestId;
@@ -1139,6 +1144,7 @@ describe('StateBar working-phase indicators', () => {
   });
 
   it('overrides working text with "no signal from server" when watchdog stale (REQ-WPV-004)', () => {
+    vi.useFakeTimers();
     // 40s since the last observed SSE event > 35s threshold.
     renderStateBar({
       convState: { type: 'llm_requesting', attempt: 1 },
@@ -1148,6 +1154,31 @@ describe('StateBar working-phase indicators', () => {
     expect(screen.getByText(/no signal from server for 40s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/degraded/);
+  });
+
+  it('prioritizes Global watchdog degradation and clears it after a fresh event', () => {
+    vi.useFakeTimers();
+    setMobileViewport(true);
+    const lastEventRef = { current: T_NOW };
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW,
+      lastSseEventAtRef: lastEventRef,
+      conversationExtension: {
+        summary: <span>Watching 3</span>,
+        details: <div>Global activity details</div>,
+      },
+    });
+
+    expect(screen.getByText('Connected')).toBeVisible();
+    act(() => vi.advanceTimersByTime(36_000));
+    expect(screen.getByText(/no signal from server for 36s/i)).toBeVisible();
+    expect(document.querySelector('.statebar-mobile-status .dot')).toHaveClass('degraded');
+
+    lastEventRef.current = Date.now();
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(screen.queryByText(/no signal from server/i)).not.toBeInTheDocument();
   });
 
   it('does NOT trip the watchdog when not in a working phase', () => {

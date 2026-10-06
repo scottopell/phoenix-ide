@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import type { Conversation, ImageData } from '../../api';
 import { InputArea } from '../../components/InputArea';
@@ -55,6 +55,8 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
   const [draft, setDraft] = useState('');
   const [images, setImages] = useState<ImageData[]>([]);
   const [fixtureConnectionState, setFixtureConnectionState] = useState(scenario.connectionState);
+  const fixturePhaseStartedAt = useMemo(() => Date.now() - 12_000, []);
+  const fixtureLastEventAtRef = useRef(Date.now() - (scenario.staleWatchdog ? 36_000 : 0));
   const store = useMemo(() => new ConversationStore(), []);
   const transcript = useMemo(
     () => messageListFixtureData(getMessageListScenario('compact-latest-expanded')),
@@ -124,7 +126,8 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
               nextRetryIn={fixtureConnectionState === 'offline' ? 4 : null}
               contextWindowUsed={16_000}
               modelContextWindow={200_000}
-              phaseStateUpdatedAt={null}
+              phaseStateUpdatedAt={scenario.working ? fixturePhaseStartedAt : null}
+              lastSseEventAtRef={fixtureLastEventAtRef}
               conversationExtension={scenario.globalActivity ? {
                 summary: <span>Watching 3 Running 1 Auto On · Continuing</span>,
                 details: <div>Fixture activity details</div>,
