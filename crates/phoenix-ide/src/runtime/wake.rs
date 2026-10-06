@@ -1464,62 +1464,90 @@ mod tests {
         assert_eq!(pending_count(&repo).await, 1);
     }
 
-    #[tokio::test]
-    async fn startup_restart_discovery_reuses_live_tmux_socket_without_registry_entry() {
-        if which::which("tmux").is_err() {
-            return;
-        }
+    /// Restarted wake discovery against a fresh registry (no entry) and a
+    /// persistent fake tmux server holding one exited window. Returns the
+    /// terminal projected for a binding that names `binding_token`, or the
+    /// live server token when `None`.
+    async fn restart_discovery_terminal(
+        binding_token: Option<String>,
+    ) -> phoenix_workflow::wake_profile::WakeTerminalPayload {
+        use phoenix_tools::tmux::fake_backend::FakeTmuxBackend;
+
         let (_db, repo, scope) = open_repo().await;
-        let tmux_owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
-        let cwd_tmp = tempfile::TempDir::new().unwrap();
-        let tmux = Arc::new(tmux_owner.registry());
+        let socket_dir = tempfile::TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = || {
+            Arc::new(phoenix_tools::TmuxRegistry::with_backend(
+                socket_dir.path().to_path_buf(),
+                fake.clone(),
+                None,
+            ))
+        };
         let resource_scope = crate::work_scope::ResourceScopeKey::Work(
             crate::work_scope::WorkScopeId::parse(&scope.0).unwrap(),
         );
-        let server = tmux
-            .ensure_live(&resource_scope, cwd_tmp.path(), None, None)
+        let server = registry()
+            .ensure_live(&resource_scope, socket_dir.path(), None, None)
             .await
             .unwrap();
         let socket_path = server.read().await.socket_path.clone();
-        let server_token = server.read().await.server_token.clone();
-        let output = tokio::process::Command::new("tmux")
-            .args([
-                "-S",
-                &socket_path.to_string_lossy(),
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "bash",
-                "-lc",
-                "printf '__PHOENIX_EXIT__ exit_code=0 occurred_at_ms=1700000000000\\n'; exec ${SHELL:-/bin/bash} -i",
-            ])
-            .output()
-            .await
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let live_token = server.read().await.server_token.clone();
         drop(server);
-        let fresh_registry = Arc::new(tmux_owner.registry());
-        let workflow_id = register_tmux(&repo, &scope, &server_token, &window_id, 50).await;
-        let inspector = Arc::new(RuntimeRegistryInspector::new(
-            Arc::new(phoenix_tools::BashHandleRegistry::new()),
-            fresh_registry,
-        ));
+        let window_id = fake.add_window(
+            &socket_path,
+            "__PHOENIX_EXIT__ exit_code=0 occurred_at_ms=10000\n",
+        );
+        let token = binding_token.unwrap_or(live_token);
+        let workflow_id = register_tmux(&repo, &scope, &token, &window_id, 50).await;
+
         let worker = WakeWorker::new(
             repo.clone(),
-            inspector,
+            Arc::new(RuntimeRegistryInspector::new(
+                Arc::new(phoenix_tools::BashHandleRegistry::new()),
+                registry(),
+            )),
             Arc::new(TestClock::new(10)),
             ProcessIncarnation(99),
         );
         worker.run_once().await.unwrap();
-        let binding = repo
-            .fetch_binding(phoenix_workflow::WorkflowId(workflow_id))
-            .await
-            .unwrap();
-        assert!(binding.is_some());
-        tmux_owner.shutdown();
+
+        assert!(fake.server(&socket_path).unwrap().live);
+        let pending = repo.list_pending("conv").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].workflow_id.0, workflow_id);
+        pending[0].receipt.terminal.clone()
+    }
+
+    /// REQ-TMUX-005: after a restart the registry has no entry, yet the wake
+    /// worker rediscovers the persistent server by its durable token and
+    /// projects the window's exit marker.
+    #[tokio::test]
+    async fn startup_restart_discovery_reuses_live_tmux_socket_without_registry_entry() {
+        assert!(matches!(
+            restart_discovery_terminal(None).await,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Fired {
+                evidence: WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
+                    status: TmuxTerminalStatus::ExitMarkerObserved,
+                    exit_code: Some(0),
+                    occurred_at: Timestamp(10),
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    /// A binding whose token names no live server is never matched to a
+    /// different server by socket path; it is reported forgotten.
+    #[tokio::test]
+    async fn startup_restart_discovery_forgets_window_of_unmatched_server_token() {
+        assert!(matches!(
+            restart_discovery_terminal(Some(uuid::Uuid::new_v4().to_string())).await,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Forgotten {
+                reason: WakeForgottenReason::TmuxHandleMissing,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
