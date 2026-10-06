@@ -129,8 +129,34 @@ function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
               phaseStateUpdatedAt={scenario.working ? fixturePhaseStartedAt : null}
               lastSseEventAtRef={fixtureLastEventAtRef}
               conversationExtension={scenario.globalActivity ? {
-                summary: <span>Watching 3 Running 1 Auto On · Continuing</span>,
-                details: <div>Fixture activity details</div>,
+                summary: (
+                  <span className="global-statebar-summary">
+                    <span>Watching 3</span>
+                    <span>Running 1</span>
+                    <span className="global-statebar-summary__auto">Auto On · Continuing</span>
+                  </span>
+                ),
+                details: (
+                  <div className="global-statebar-activity__details">
+                    <section className="global-active-watches" aria-label="Active watches">
+                      <strong>Watching</strong>
+                      {['Review release readiness', 'Fix mobile transcript', 'Verify reconnect recovery'].map((title) => (
+                        <div className="global-active-watch" key={title}>
+                          <div><a href="#fixture-watch">{title}</a><span>Working</span></div>
+                          <a href="#fixture-transcript">current transcript</a>
+                          <details className="global-activity-metadata"><summary>Details</summary></details>
+                        </div>
+                      ))}
+                    </section>
+                    <section className="global-live-commands" aria-label="Running commands">
+                      <strong>Running</strong>
+                      <div className="global-live-command">
+                        <div><strong>Global visual QA</strong><code>pnpm test</code><span>Started just now</span></div>
+                        <div className="global-live-command-actions"><a href="#fixture-output">output →</a></div>
+                      </div>
+                    </section>
+                  </div>
+                ),
               } : undefined}
             />
           </div>
