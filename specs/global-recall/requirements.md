@@ -35,7 +35,7 @@ WHEN the Coordinator evaluates current Phoenix activity
 THE SYSTEM SHALL provide bounded relational facts rather than application-inferred open, stalled, or attention classifications
 
 WHEN a user opens the Coordinator surface
-THE surface SHALL present only the normal Coordinator conversation
+THE surface SHALL present the normal Coordinator conversation together with only the bounded subordinate activity surfaces admitted by REQ-GR-010
 
 THE facts SHALL distinguish durable ProductConversation identity, derived root transcript-row identity, and latest execution-row identity and SHALL include current state, state-update time, conversation-update time, available task metadata, attached WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
 
@@ -201,9 +201,18 @@ AND a WorkScope identifier SHALL NOT be accepted as read or message target synta
 ### REQ-GR-010: Keep the Coordinator Surface Chat-Only
 
 WHEN a user opens `/global`
-THE SYSTEM SHALL present only the normal Coordinator transcript, composer, conversation status, and conversation navigation
+THE SYSTEM SHALL present the normal Coordinator transcript, composer, conversation status, and conversation navigation
+AND MAY present bounded subordinate activity surfaces containing only:
+- still-running Bash commands launched by the Coordinator, their authoritative command metadata, output navigation, and supported exact-stop controls; and
+- the current server-backed set of active Coordinator watch subscriptions, with authoritative conversation identity and navigation
 
-THE SYSTEM SHALL NOT present a separate current-attention pane, open-work list, deterministic work search, or Conversation/Work view selector
+THE activity surfaces SHALL remain subordinate to the transcript and composer
+
+THE Bash activity surface SHALL NOT invent durable or cross-restart command state
+
+THE watch activity surface SHALL reflect current subscription state rather than reconstructing state from transcript history
+
+THE SYSTEM SHALL NOT present a separate current-attention pane, open-work list, deterministic work search, cross-scope resource explorer, or Conversation/Work view selector
 
 THE composer SHALL provide a compact action that submits a normal read-only Coordinator message requesting a current-work briefing
 

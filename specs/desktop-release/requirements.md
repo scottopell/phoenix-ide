@@ -109,3 +109,15 @@ THE SYSTEM SHALL refuse to make it latest if a newer stable release is already l
 
 WHEN retrying an existing exact release tag,
 THE SYSTEM SHALL preserve the historical tagged build identity while using the protected workflow's current publication verifier.
+
+## REQ-DESKTOP-REL-010 — Protected preparation without release mutation
+
+WHEN an authorized operator requests desktop artifact preparation from `main`,
+THE SYSTEM SHALL bind preparation to the exact current `main` commit and source version, run both supported macOS architectures through the same protected Developer ID signing, notarization, stapling, Gatekeeper, embedded-helper, and checksum verification path used for release artifacts, and retain the resulting artifacts and sanitized verification receipts as GitHub Actions artifacts that are not attached to or published as a GitHub Release.
+
+The preparation producer and paired launchd consumer under `specs/launchd-deployment/requirements.md` REQ-LDD-017 SHALL share receipt schema `1`: operation `prepare-main`, exact full source commit and version, host target, exact standalone basename and SHA-256, and checks for Developer ID signature, hardened runtime, accepted notarization with submission UUID, validated stapled ticket, accepted Gatekeeper, and identical embedded helper bytes. Local receipt validation SHALL NOT authenticate workflow origin; the operator SHALL establish the protected run/source association independently.
+
+WHILE executing preparation,
+THE SYSTEM SHALL NOT create or move a tag, create or mutate a GitHub release, run release publication, deploy, or install the prepared artifacts.
+
+The preparation identity SHALL NOT authorize a release version, release tag, stable/RC classification decision, or byte-identical future rebuild. Public release SHALL continue to require the separately authorized version-bump/tag/publication flow.

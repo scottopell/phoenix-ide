@@ -358,8 +358,17 @@ AND SHALL preserve the error's existing retry and dismissal policy
 AND SHALL NOT infer automatic continuation from the transcript tail
 
 WHEN server restarts
-THE SYSTEM SHALL restore ordinary interrupted conversations to idle state
+THE SYSTEM SHALL restore an ordinary interrupted provider request with no independently recoverable durable obligation to idle state
 AND preserve complete message history
+
+WHEN server restarts after an active materialized direct turn has durably committed a complete tool-result round but before its next model step settles
+THE SYSTEM SHALL use that exact accepted-turn identity and generation as the sole recovery baton
+AND SHALL dispatch the next model step without browser, SSE, or user-message activity
+AND SHALL transfer that one outstanding obligation through the durable continuation operation when continuation changes the transcript conversation, without creating concurrent predecessor and successor batons
+AND SHALL NOT replay an in-flight or unknown-effect tool
+AND SHALL honor a committed cancellation, terminal outcome, newer accepted input, or pending approval according to its existing durable authority before dispatch
+AND after the bounded number of restart recoveries within the same user turn, SHALL settle the exact accepted turn as an explicit persisted failure and release its conversation ownership
+AND a transcript shape, assistant promise, or system prompt without that durable owner SHALL NOT create recovery work
 
 WHEN server restarts after an accepted steering batch has committed its user or skill messages and awaiting-LLM state but before the first response settles
 THE SYSTEM SHALL preserve the awaiting-LLM state
@@ -373,7 +382,7 @@ WHEN server restarts with a conversation in `awaiting_continuation`, `recoverabl
 THE SYSTEM SHALL preserve the durable continuation operation identity and recovery state
 AND materialize the pending continuation operation at startup
 
-**Rationale:** Users expect their conversation history to survive server restarts. Ordinary interrupted turns resume from idle so users can re-send their last message. An already-accepted steering turn cannot safely be resent after its queue row has been atomically consumed, so its immutable acceptance and transcript evidence provide a narrow restart owner until the first response settles. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
+**Rationale:** Users expect their conversation history and accepted obligations to survive server restarts. A provider request without an independently recoverable durable effect resumes from idle because its external outcome is unknown. A materialized accepted turn with safely persisted tool results still owes a model step, so its exact durable identity—not transcript prose—authorizes bounded recovery. An already-accepted steering turn cannot safely be resent after its queue row has been atomically consumed, so its immutable acceptance and transcript evidence provide a narrow restart owner until the first response settles. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
 
 ---
 

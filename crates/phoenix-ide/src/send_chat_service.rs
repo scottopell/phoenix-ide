@@ -1430,6 +1430,190 @@ mod tests {
         db
     }
 
+    async fn historical_manual_opening(
+        db: &crate::db::Database,
+        predecessor: &str,
+        accepted_text: Option<&str>,
+    ) -> String {
+        let handoff = "historical manual handoff";
+        db.create_conversation(predecessor, predecessor, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            &format!("{predecessor}-summary"),
+            predecessor,
+            &crate::db::MessageContent::continuation(handoff),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            predecessor,
+            &crate::db::ConvState::ContextExhausted {
+                summary: handoff.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) =
+            db.continue_conversation(predecessor).await.unwrap()
+        else {
+            panic!("expected successor");
+        };
+        let opening_key = format!("{predecessor}-opening");
+        if let Some(text) = accepted_text {
+            db.add_message(
+                &format!("{}:{opening_key}", successor.id),
+                &successor.id,
+                &crate::db::MessageContent::user(text),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        // Insert the stale intent after the message so the current insert-time
+        // trigger does not settle a fixture representing the historical raw-ID miss.
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, user_agent, opening_authority, created_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, 'user_authorized_instruction', ?5)",
+        )
+        .bind(predecessor)
+        .bind(&successor.id)
+        .bind(opening_key)
+        .bind(handoff)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        successor.id
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Three historical fixtures share one migration pass.
+    async fn historical_manual_opening_repair_unfences_service_chat_only_with_matching_evidence() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let db = &state.db;
+        let matching =
+            historical_manual_opening(db, "matching-history", Some("historical manual handoff"))
+                .await;
+        let pending = historical_manual_opening(db, "pending-history", None).await;
+        let mismatched =
+            historical_manual_opening(db, "mismatched-history", Some("different accepted text"))
+                .await;
+        let service = super::SendChatApplicationService::new(db.clone(), state.runtime.clone());
+        let ordinary_request = |successor: &str| SendChatRequest {
+            conversation_id: successor.to_string(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            text: "ordinary subsequent chat".to_string(),
+            message_id: format!("ordinary-{successor}"),
+            expansion_policy: MessageExpansionPolicy::LiteralText,
+            ..request()
+        };
+        for successor in [&matching, &pending, &mismatched] {
+            assert!(!db
+                .is_reserved_continuation_opening(
+                    successor,
+                    &ordinary_request(successor).message_id
+                )
+                .await
+                .unwrap());
+            assert!(matches!(
+                service.send(ordinary_request(successor)).await.unwrap(),
+                SendChatOutcome::Rejected {
+                    code: "continuation_opening_pending",
+                    ..
+                }
+            ));
+        }
+        let historical_messages = db.get_messages(&matching).await.unwrap();
+        assert_eq!(historical_messages.len(), 1);
+        assert_eq!(
+            historical_messages[0].message_id,
+            format!("{matching}:matching-history-opening")
+        );
+
+        // Migration 113 is data-only; unstamp it on this isolated in-memory fixture.
+        assert_eq!(
+            sqlx::query("DELETE FROM _migrations WHERE version = 113")
+                .execute(db.pool())
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            phoenix_db::run_pending_migrations(db.pool()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            phoenix_db::run_pending_migrations(db.pool()).await.unwrap(),
+            0
+        );
+        assert!(!db
+            .has_pending_continuation_opening(&matching)
+            .await
+            .unwrap());
+        let receipt: (String, String) = sqlx::query_as(
+            "SELECT continuation_message_id, accepted_successor_message_id
+             FROM completed_continuation_handoffs WHERE predecessor_conversation_id = ?1",
+        )
+        .bind("matching-history")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt,
+            (
+                "matching-history-summary".to_string(),
+                historical_messages[0].message_id.clone(),
+            )
+        );
+        let repaired_messages = db.get_messages(&matching).await.unwrap();
+        assert_eq!(repaired_messages.len(), 1);
+        assert_eq!(
+            repaired_messages[0].sequence_id,
+            historical_messages[0].sequence_id
+        );
+        assert_eq!(repaired_messages[0].content, historical_messages[0].content);
+        assert_eq!(
+            service.send(ordinary_request(&matching)).await.unwrap(),
+            SendChatOutcome::Delivered
+        );
+        assert!(db
+            .workflow_repository()
+            .load_active_runtime_turn(&ConversationAuthority(matching))
+            .await
+            .unwrap()
+            .is_some());
+        for successor in [&pending, &mismatched] {
+            assert!(db
+                .has_pending_continuation_opening(successor)
+                .await
+                .unwrap());
+            assert!(matches!(
+                service.send(ordinary_request(successor)).await.unwrap(),
+                SendChatOutcome::Rejected {
+                    code: "continuation_opening_pending",
+                    ..
+                }
+            ));
+        }
+        let mut reserved_mismatch = ordinary_request(&pending);
+        reserved_mismatch.message_id = "pending-history-opening".to_string();
+        reserved_mismatch.expansion_policy = MessageExpansionPolicy::ExpandReferences;
+        assert!(matches!(
+            service.send(reserved_mismatch).await.unwrap(),
+            SendChatOutcome::Rejected {
+                code: "continuation_opening_mismatch",
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn generated_predecessor_context_preserves_display_bytes_but_not_user_authority() {
         let db = crate::db::Database::open_in_memory().await.unwrap();

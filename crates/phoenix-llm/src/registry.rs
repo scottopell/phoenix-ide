@@ -616,12 +616,12 @@ impl ModelRegistry {
     }
 
     /// Pick the default model from available services.
-    /// Prefers claude-sonnet-5 > claude-sonnet-4-6 > any available > hardcoded fallback.
     fn pick_default_model(
         services: &HashMap<String, Arc<dyn LlmService>>,
         config: &LlmConfig,
     ) -> String {
         const PREFERRED: &[&str] = &[
+            "gpt-6.1-sol",
             "claude-sonnet-5",
             "claude-sonnet-4-6",
             "claude-sonnet-4-5",
@@ -2029,11 +2029,11 @@ mod tests {
         let both = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&only_luna)).default_model_id(),
-            "gpt-6-astra"
+            "gpt-6.1-sol"
         );
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&both)).default_model_id(),
-            "gpt-6-astra"
+            "gpt-6.1-sol"
         );
     }
 
@@ -2327,6 +2327,31 @@ mod tests {
         let registry = ModelRegistry::new(&config);
 
         assert_eq!(registry.default_model_id(), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn product_default_prefers_gpt_61_sol_without_overriding_explicit_defaults() {
+        let mut config = LlmConfig {
+            anthropic_api_key: Some("test-key".into()),
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert_eq!(registry.default_model_id(), "gpt-6.1-sol");
+        assert_eq!(
+            registry.effective_effort("gpt-6.1-sol", None),
+            phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::Medium)
+        );
+        assert_eq!(
+            registry.effective_effort("gpt-6.1-sol", Some(ModelEffort::High)),
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::High)
+        );
+
+        config.default_model = Some("claude-opus-4-6".into());
+        assert_eq!(
+            ModelRegistry::new(&config).default_model_id(),
+            "claude-opus-4-6"
+        );
     }
 
     #[test]
@@ -2992,7 +3017,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert_eq!(registry.default_model_id(), "gpt-6-astra");
+        assert_eq!(registry.default_model_id(), "gpt-6.1-sol");
     }
 
     /// `pick_default_model` must not pin to a configured `DEFAULT_MODEL` that

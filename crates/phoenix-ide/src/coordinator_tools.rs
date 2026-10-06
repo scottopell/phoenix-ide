@@ -186,7 +186,7 @@ impl Tool for WorkScopeCoordinatorBash {
             Err(error) => return ToolOutput::error(error),
         };
         let context_input = invocation.to_context_tool_value();
-        let spawn_target = match &invocation {
+        let (spawn_target, environment_display) = match &invocation {
             BashInvocation::Run {
                 target: BashSpawnTarget::WorkScope(work_scope_id),
                 ..
@@ -199,10 +199,20 @@ impl Tool for WorkScopeCoordinatorBash {
                     Ok(path) => path,
                     Err(error) => return ToolOutput::error(error),
                 };
-                ValidatedBashSpawnTarget {
-                    working_dir: binding.path,
-                    lifecycle_scope: binding.work_scope_id,
-                }
+                let display = json!({
+                    "work_scope_id": binding.work_scope_id.clone(),
+                    "cwd": binding.path.clone(),
+                    "owner_name": binding.owner_name,
+                    "owner_product_conversation_id": binding.owner_product_conversation_id,
+                    "project_path": binding.project_path,
+                });
+                (
+                    ValidatedBashSpawnTarget {
+                        working_dir: binding.path.clone(),
+                        lifecycle_scope: binding.work_scope_id.clone(),
+                    },
+                    display,
+                )
             }
             BashInvocation::Run {
                 target: BashSpawnTarget::Context,
@@ -214,9 +224,22 @@ impl Tool for WorkScopeCoordinatorBash {
                 return BashTool.run(context_input, ctx).await;
             }
         };
-        BashTool
+        let mut output = BashTool
             .run_explicit_target(context_input, spawn_target, ctx)
-            .await
+            .await;
+        if matches!(invocation, BashInvocation::Run { .. }) {
+            match &mut output {
+                ToolOutput::Success { display_data, .. }
+                | ToolOutput::Error { display_data, .. } => {
+                    let display = display_data.get_or_insert_with(|| json!({}));
+                    if let Some(object) = display.as_object_mut() {
+                        object.insert("coordinator_environment".to_string(), environment_display);
+                    }
+                }
+                ToolOutput::TrustedInstructions(_) => {}
+            }
+        }
+        output
     }
 }
 
@@ -547,7 +570,19 @@ impl Tool for SendConversationMessage {
             outcome = output.kind(),
             "Cross-conversation message action committed"
         );
-        encode_message_output(&output)
+        let display_identity = match output.conversation_id() {
+            Some(conversation_id) => self
+                .service
+                .conversation_display_identity(conversation_id)
+                .await
+                .ok(),
+            None => None,
+        };
+        let encoded = encode_message_output(&output);
+        match display_identity {
+            Some(identity) => encoded.with_display(json!({ "recipient_identity": identity })),
+            None => encoded,
+        }
     }
 }
 
@@ -620,6 +655,16 @@ fn app_error_message(error: crate::api::handlers::AppError) -> String {
             "reference resolution failed".to_string()
         }
     }
+}
+
+#[cfg(test)]
+fn structured_search_result(hits: &[crate::db::RetrievedChunk]) -> (usize, Vec<String>) {
+    (
+        hits.len(),
+        hits.iter()
+            .map(|hit| format!("{}:{}", hit.conversation_id, hit.message_id))
+            .collect(),
+    )
 }
 
 fn result(value: Result<String, String>) -> ToolOutput {
@@ -700,6 +745,506 @@ mod tests {
         let tool = WorkScopeCoordinatorBash(GlobalReadService::new(db, retriever));
         let context = context("coordinator");
         (tool, context)
+    }
+
+    /// Release-only, opt-in fixture benchmark. It is ignored so normal test
+    /// runs never touch a private database. The Python driver supplies the
+    /// immutable fixture and frozen scenarios through environment variables.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "private production fixture benchmark; run via dev.py conversation-search run"]
+    #[allow(
+        clippy::format_collect,
+        clippy::large_stack_arrays,
+        clippy::too_many_lines
+    )]
+    async fn production_conversation_search_benchmark() {
+        enum InvocationResult {
+            Retriever(Result<Vec<crate::db::RetrievedChunk>, String>),
+            Tool {
+                ok: bool,
+                output: String,
+                result_count: Option<usize>,
+                result_identity: Option<Vec<String>>,
+            },
+        }
+
+        use crate::db::MessageRetriever;
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        fn digest_file(path: &str) -> String {
+            let mut file = std::fs::File::open(path).expect("open benchmark fixture");
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 1024 * 1024];
+            loop {
+                let read = file.read(&mut buffer).expect("read benchmark fixture");
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        fn digest_bytes(bytes: &[u8]) -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+        async fn observe_sqlite_regime(db: &crate::db::Database) -> Value {
+            let mut connection = db
+                .pool()
+                .acquire()
+                .await
+                .expect("acquire benchmark connection");
+            let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query SQLite version");
+            let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query journal mode");
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query synchronous mode");
+            let busy_timeout_ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query busy timeout");
+            let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query foreign keys");
+            let query_only: i64 = sqlx::query_scalar("PRAGMA query_only")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query query_only");
+            json!({
+                "sqlite_version": sqlite_version,
+                "journal_mode": journal_mode,
+                "synchronous": synchronous,
+                "busy_timeout_ms": busy_timeout_ms,
+                "foreign_keys": foreign_keys != 0,
+                "query_only": query_only != 0,
+            })
+        }
+
+        let db_path = std::env::var("PHOENIX_SEARCH_BENCH_DB")
+            .expect("PHOENIX_SEARCH_BENCH_DB must point at an immutable fixture");
+        let scenario_path = std::env::var("PHOENIX_SEARCH_BENCH_SCENARIOS")
+            .expect("PHOENIX_SEARCH_BENCH_SCENARIOS must point at frozen scenarios");
+        let output_path = std::env::var("PHOENIX_SEARCH_BENCH_OUT")
+            .expect("PHOENIX_SEARCH_BENCH_OUT must point at a private result file");
+        let manifest_path = std::env::var("PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST")
+            .expect("PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST must identify capture metadata");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("read capture manifest"),
+        )
+        .expect("parse capture manifest");
+        let fixture = std::path::Path::new(&db_path)
+            .canonicalize()
+            .expect("canonicalize fixture");
+        assert_eq!(
+            manifest["snapshot_path"].as_str(),
+            Some(fixture.to_str().unwrap()),
+            "fixture path differs from capture manifest"
+        );
+        assert_eq!(
+            manifest["size_bytes"].as_u64(),
+            Some(std::fs::metadata(&fixture).unwrap().len()),
+            "fixture size differs from capture manifest"
+        );
+        let fixture_sha256 = digest_file(fixture.to_str().unwrap());
+        assert_eq!(
+            manifest["sha256"].as_str(),
+            Some(fixture_sha256.as_str()),
+            "fixture hash differs from capture manifest"
+        );
+        let scenario_bytes = std::fs::read(&scenario_path).expect("read scenarios");
+        let scenario_digest = digest_bytes(&scenario_bytes);
+        let scenarios: serde_json::Value =
+            serde_json::from_slice(&scenario_bytes).expect("parse scenarios");
+        let mut samples = Vec::new();
+        let mut failures = Vec::new();
+        let mut explain_plans = Vec::new();
+        let mut case_policies = Vec::new();
+        let explain = std::env::var_os("PHOENIX_SEARCH_BENCH_EXPLAIN").is_some();
+        let sqlite_regime = {
+            let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+            observe_sqlite_regime(&db).await
+        };
+        // Validate the immutable fixture before marking any retriever as
+        // reconciled. This is setup evidence, not a measured search path. The
+        // bounded batches keep SQLite bind counts reasonable while the existing
+        // freshness check compares typed source content (including attachments)
+        // with the indexed fingerprint.
+        let freshness_batch_size: usize = 64;
+        let fixture_validation = {
+            let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+            let retriever = db.fts_retriever();
+            let transcript_ids: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT conversation_id FROM messages ORDER BY conversation_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .expect("list fixture transcript ids");
+            for batch in transcript_ids.chunks(freshness_batch_size) {
+                if !retriever
+                    .is_fresh_for(batch)
+                    .await
+                    .expect("check fixture index freshness")
+                {
+                    panic!(
+                        "benchmark fixture is stale: FTS freshness failed for a transcript batch ({} transcripts)",
+                        batch.len()
+                    );
+                }
+            }
+            let orphan_counts: (i64, i64, i64) = sqlx::query_as(
+                "SELECT\n                     COALESCE(SUM(CASE WHEN m.message_id IS NULL THEN 1 ELSE 0 END), 0),\n                     COALESCE(SUM(CASE WHEN f.rowid IS NULL THEN 1 ELSE 0 END), 0),\n                     (SELECT COUNT(*)\n                        FROM message_fts f\n                        LEFT JOIN message_fts_rows r ON r.fts_rowid = f.rowid\n                       WHERE r.fts_rowid IS NULL)\n                   FROM message_fts_rows r\n                   LEFT JOIN messages m ON m.message_id = r.message_id\n                   LEFT JOIN message_fts f ON f.rowid = r.fts_rowid",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("check fixture FTS orphan rows");
+            let (locator_orphans, missing_physical_rows, unlocated_physical_rows) = orphan_counts;
+            assert!(
+                locator_orphans == 0 && missing_physical_rows == 0 && unlocated_physical_rows == 0,
+                "benchmark fixture has stale FTS rows: locator_orphans={locator_orphans}, missing_physical_rows={missing_physical_rows}, unlocated_physical_rows={unlocated_physical_rows}"
+            );
+            json!({
+                "transcript_count": transcript_ids.len(),
+                "freshness_batch_size": freshness_batch_size,
+                "locator_orphans": locator_orphans,
+                "missing_physical_rows": missing_physical_rows,
+                "unlocated_physical_rows": unlocated_physical_rows,
+            })
+        };
+        'scenarios: for scenario in scenarios["scenarios"].as_array().expect("scenarios array") {
+            let case_id = scenario["id"].as_str().unwrap();
+            let query = scenario["query"].as_str().unwrap();
+            let expected = scenario["expected"].as_str().unwrap_or("hit");
+            let context = context("benchmark");
+            let is_retriever = scenario["kind"] == "retriever";
+            let is_scoped = scenario["scope"] == "conversation";
+            // Resolve the exact request policy before any timed operation. This
+            // metadata applies even when EXPLAIN output is disabled.
+            let policy_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+            let policy_retriever = Arc::new(policy_db.fts_retriever());
+            policy_retriever.mark_reconciled();
+            let policy_service = GlobalReadService::new(policy_db, policy_retriever.clone());
+            if case_id == "broad-common" {
+                let request = policy_service
+                    .search_request(query)
+                    .await
+                    .expect("broad policy")
+                    .with_limit(1000);
+                let eligible = tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    policy_retriever.retrieve(request),
+                )
+                .await
+                .expect("broad timeout")
+                .expect("broad results");
+                assert!(eligible.len() >= 1000, "broad candidate has fewer than1000 eligible matches; choose another candidate before benchmarking");
+            }
+            let policy_request = if is_retriever && is_scoped {
+                crate::db::RetrievalRequest::natural_language(
+                    query,
+                    crate::db::RetrievalScope::Conversations(
+                        scenario["conversation_ids"]
+                            .as_array()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(|id| id.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    10,
+                )
+            } else {
+                policy_service
+                    .search_request(query)
+                    .await
+                    .expect("build search request")
+            };
+            let lexical_expression = crate::db::Fts5Retriever::lexical_expression(&policy_request);
+            let policy = serde_json::json!({
+                "scope": format!("{:?}", policy_request.scope()),
+                "visibility": format!("{:?}", policy_request.visibility()),
+                "grouping": format!("{:?}", policy_request.grouping()),
+                "match_mode": format!("{:?}", policy_request.match_mode()),
+                "limit": policy_request.limit(),
+                "lexical_expression": lexical_expression,
+            });
+            let tool_oracle = if is_retriever {
+                None
+            } else {
+                Some(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        policy_service.search_hits(query),
+                    )
+                    .await
+                    .expect("oracle timeout")
+                    .expect("oracle result"),
+                )
+            };
+            let setup_count = if let Some(hits) = &tool_oracle {
+                hits.len()
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    policy_retriever.retrieve(policy_request.clone()),
+                )
+                .await
+                .expect("scoped preflight timeout")
+                .expect("scoped preflight")
+                .len()
+            };
+            assert!((expected == "hit" && setup_count > 0) || (expected == "no_hit" && setup_count == 0), "scenario expected result does not match actual policy; choose suitable fixture before measurement");
+            let tool_expected_output = if let Some(hits) = &tool_oracle {
+                Some(
+                    policy_service
+                        .format_search_hits(hits)
+                        .await
+                        .expect("oracle formatting"),
+                )
+            } else {
+                None
+            };
+            let surfaces: &[&str] = if is_retriever {
+                &["retriever"]
+            } else {
+                &["tool", "retriever"]
+            };
+            for surface in surfaces {
+                case_policies.push(serde_json::json!({
+                    "case_id": case_id,
+                    "surface": surface,
+                    "policy": policy,
+                }));
+                if explain {
+                    let plan_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+                    let plan_retriever = Arc::new(plan_db.fts_retriever());
+                    plan_retriever.mark_reconciled();
+                    let plan = plan_retriever
+                        .explain(policy_request.clone())
+                        .await
+                        .expect("explain retrieval");
+                    eprintln!("EXPLAIN {case_id} ({surface}): {plan:?}");
+                    explain_plans.push(serde_json::json!({
+                        "case_id": case_id, "surface": surface,
+                        "query": query, "policy": policy, "plan": plan,
+                    }));
+                }
+                // A newly opened pool gives one separately labeled setup
+                // connection observation. Subsequent calls are serial warm
+                // observations; OS cache state is intentionally uncontrolled.
+                let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+                let retriever = Arc::new(db.fts_retriever());
+                retriever.mark_reconciled();
+                let service = GlobalReadService::new(db.clone(), retriever.clone());
+                let tool = SearchConversations(service.clone());
+                let retrieval_request = (*surface == "retriever").then(|| policy_request.clone());
+                for (phase, count) in [
+                    (
+                        "first_retrieval_after_pool_setup_connection_setup_excluded_os_cache_uncontrolled",
+                        1usize,
+                    ),
+                    ("warmup_discarded", 1usize),
+                    ("warm", 10usize),
+                ] {
+                    for iteration in 0..count {
+                        let started = Instant::now();
+                        let invocation = async {
+                            if *surface == "retriever" {
+                                let request = retrieval_request
+                                    .clone()
+                                    .expect("retrieval request prepared before timing");
+                                InvocationResult::Retriever(
+                                    retriever
+                                        .retrieve(request)
+                                        .await
+                                        .map_err(|error| error.to_string()),
+                                )
+                            } else {
+                                let result = tool
+                                    .run(serde_json::json!({"query": query}), context.clone())
+                                    .await;
+                                let output = result.output().to_string();
+                                InvocationResult::Tool {
+                                    ok: result.is_success(),
+                                    output,
+                                    result_count: None,
+                                    result_identity: None,
+                                }
+                            }
+                        };
+                        let (timed_out, invocation_result) = match tokio::time::timeout(
+                            Duration::from_secs(300),
+                            invocation,
+                        )
+                        .await
+                        {
+                            Ok(result) => (false, result),
+                            Err(_) => (
+                                true,
+                                InvocationResult::Tool {
+                                    ok: false,
+                                    output: "per-case timeout after 300 seconds".to_string(),
+                                    result_count: None,
+                                    result_identity: None,
+                                },
+                            ),
+                        };
+                        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let (ok, output, result_count, result_identity, format_error) =
+                            match invocation_result {
+                                InvocationResult::Retriever(Ok(hits)) => {
+                                    let (count, identity) = structured_search_result(&hits);
+                                    (
+                                        true,
+                                        serde_json::to_string(&hits).unwrap(),
+                                        Some(count),
+                                        Some(identity),
+                                        None,
+                                    )
+                                }
+                                InvocationResult::Retriever(Err(error)) => {
+                                    (false, error, None, None, None)
+                                }
+                                InvocationResult::Tool {
+                                    ok,
+                                    output,
+                                    result_count,
+                                    result_identity,
+                                } => {
+                                    if ok {
+                                        let hits = tool_oracle.as_ref().expect("tool oracle");
+                                        let expected_output = tool_expected_output
+                                            .as_ref()
+                                            .expect("oracle formatting");
+                                        let (count, identity) = structured_search_result(hits);
+                                        if &output == expected_output {
+                                            (true, output, Some(count), Some(identity), None)
+                                        } else {
+                                            (
+                                                false,
+                                                output,
+                                                Some(count),
+                                                Some(identity),
+                                                Some(
+                                                    "tool output differs from service formatter"
+                                                        .to_string(),
+                                                ),
+                                            )
+                                        }
+                                    } else {
+                                        (false, output, result_count, result_identity, None)
+                                    }
+                                }
+                            };
+                        let digest = digest_bytes(output.as_bytes());
+                        samples.push(serde_json::json!({
+                            "case_id": case_id, "surface": surface,
+                            "phase": phase, "iteration": iteration,
+                            "duration_ms": duration_ms,
+                            "ok": ok, "result": output, "result_digest": digest,
+                            "result_bytes": output.len(), "result_count": result_count,
+                            "result_identity": result_identity, "expected": expected,
+                        }));
+                        if !ok {
+                            failures.push(format!("benchmark scenario {case_id}/{phase} failed; private evidence retained"));
+                        }
+                        if let Some(error) = format_error {
+                            failures.push(format!(
+                                "benchmark scenario {case_id} returned invalid hit format: {error}"
+                            ));
+                        }
+                        if expected == "no_hit" && result_count != Some(0) {
+                            failures
+                                .push(format!("expected no-hit case {case_id}, got tool output"));
+                        }
+                        if expected == "hit" && result_count == Some(0) {
+                            failures.push(format!("expected hit case {case_id}, got zero results"));
+                        }
+                        if timed_out {
+                            break 'scenarios;
+                        }
+                    }
+                }
+            }
+        }
+        let value = serde_json::json!({"fixture_sha256": fixture_sha256,
+            "scenario_digest": scenario_digest, "profile": "release",
+            "commit": std::env::var("PHOENIX_SEARCH_BENCH_COMMIT").unwrap_or_else(|_| "unknown".into()),
+            "environment": {"host": std::env::var("PHOENIX_SEARCH_BENCH_HOST").unwrap_or_default(), "platform": std::env::var("PHOENIX_SEARCH_BENCH_PLATFORM").unwrap_or_default(), "processor": std::env::var("PHOENIX_SEARCH_BENCH_PROCESSOR").unwrap_or_default(), "cpu_count": std::env::var("PHOENIX_SEARCH_BENCH_CPU_COUNT").unwrap_or_default()},
+            "sqlite_pragmas": sqlite_regime,
+            "fixture_validation": fixture_validation,
+            "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
+            "warmup_runs": 1, "measured_warm_runs": 10,
+            "tool_oracle_regime": "one precomputed service query per tool case before sequence; broad-common additionally validates1000 eligible rows; scoped case preflights actual retrieval once",
+            "measurement_regimes": ["first_retrieval_after_pool_setup_connection_setup_excluded_os_cache_uncontrolled", "warm"],
+            "case_policies": case_policies,
+            "explain_plans": explain_plans, "explain_enabled": explain,
+            "samples": samples});
+        let output = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&output_path, output).unwrap();
+        let mut perms = std::fs::metadata(&output_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&output_path, perms).unwrap();
+        }
+        assert!(
+            failures.is_empty(),
+            "benchmark failures (raw samples saved): {failures:?}"
+        );
+    }
+
+    #[test]
+    fn structured_search_oracle_preserves_count_and_ordered_ids() {
+        let hit = |conversation_id: &str, message_id: &str| crate::db::RetrievedChunk {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            chunk: crate::db::ChunkRef {
+                ordinal: 0,
+                char_range: None,
+            },
+            message_type: phoenix_core::domain::db_schema::MessageType::User,
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            created_at: chrono::Utc::now(),
+            snippet: "snippet".to_string(),
+            score: 0.0,
+            transcript_generation: 0,
+            message_count: 1,
+        };
+        let hits = vec![
+            hit("conversation-a", "message-1"),
+            hit("conversation-b", "message-2"),
+        ];
+
+        assert_eq!(
+            structured_search_result(&hits),
+            (
+                2,
+                vec![
+                    "conversation-a:message-1".to_string(),
+                    "conversation-b:message-2".to_string(),
+                ]
+            )
+        );
     }
 
     #[tokio::test]

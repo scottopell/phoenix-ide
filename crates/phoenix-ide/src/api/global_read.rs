@@ -199,10 +199,13 @@ pub(crate) struct GlobalReadService {
     stable_resolution_test_hook: Option<Arc<StableResolutionTestHook>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ValidatedCoordinatorBashSpawnTarget {
     pub(crate) path: std::path::PathBuf,
     pub(crate) work_scope_id: phoenix_core::work_scope::WorkScopeId,
+    pub(crate) owner_name: String,
+    pub(crate) owner_product_conversation_id: Option<String>,
+    pub(crate) project_path: Option<String>,
 }
 
 #[cfg(test)]
@@ -249,23 +252,15 @@ impl GlobalReadService {
                AND environment.lifecycle = 'active'
                AND environment.environment_kind <> 'none'
                AND EXISTS (
-                   SELECT 1
-                   FROM conversations owner
-                   LEFT JOIN product_conversations product
-                     ON product.id = owner.product_conversation_id
+                   SELECT 1 FROM conversations owner
+                   LEFT JOIN product_conversations product ON product.id = owner.product_conversation_id
                    WHERE owner.work_scope_id = environment.id
-                     AND (
-                         (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
-                         OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0)
-                     )
-                     AND json_extract(owner.state, '$.type') NOT IN (
-                         'completed', 'failed', 'handed_off', 'creation_failed',
-                         'creation_cancelled', 'terminal'
-                     )
-                     AND NOT (
-                         json_extract(owner.state, '$.type') = 'context_exhausted'
-                         AND owner.continued_in_conv_id IS NOT NULL
-                     )
+                     AND ((product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                       OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0))
+                     AND owner.state_kind NOT IN (
+                       'completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal')
+                     AND NOT (owner.state_kind = 'context_exhausted'
+                       AND owner.continued_in_conv_id IS NOT NULL)
                )",
         )
         .bind(requested_work_scope_id)
@@ -277,6 +272,30 @@ impl GlobalReadService {
                 .to_string()
         })?;
         let (work_scope_id, worktree_path, cwd) = row;
+        let (owner_name, owner_product_conversation_id, project_path) =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT COALESCE(NULLIF(root.chain_name, ''), NULLIF(root.title, ''), NULLIF(root.slug, ''), 'Untitled conversation'), owner.product_conversation_id, project.canonical_path
+             FROM conversations owner
+             LEFT JOIN projects project ON project.id = owner.project_id
+             LEFT JOIN product_conversations product ON product.id = owner.product_conversation_id
+             LEFT JOIN conversations root ON root.product_conversation_id = product.id
+               AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM conversations predecessor
+                 WHERE predecessor.product_conversation_id = root.product_conversation_id
+                   AND predecessor.continued_in_conv_id = root.id)
+             WHERE owner.work_scope_id = ?1
+               AND owner.parent_conversation_id IS NULL
+               AND owner.continued_in_conv_id IS NULL
+               AND ((product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                 OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0))
+               AND owner.state_kind NOT IN (
+                 'completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal')
+             ORDER BY owner.created_at DESC LIMIT 1",
+        )
+        .bind(&work_scope_id)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(|error| format!("failed to resolve Coordinator bash environment identity: {error}"))?;
         let preferred = worktree_path
             .as_deref()
             .filter(|path| !path.trim().is_empty())
@@ -291,6 +310,9 @@ impl GlobalReadService {
             path: canonical,
             work_scope_id: phoenix_core::work_scope::WorkScopeId::parse(work_scope_id)
                 .map_err(|error| format!("invalid persisted WorkScope id: {error}"))?,
+            owner_name,
+            owner_product_conversation_id,
+            project_path,
         })
     }
 
@@ -305,6 +327,14 @@ impl GlobalReadService {
     }
 
     pub(crate) async fn search(&self, query: &str) -> Result<String, String> {
+        let hits = self.search_hits(query).await?;
+        self.format_search_hits(&hits).await
+    }
+
+    pub(crate) async fn search_hits(
+        &self,
+        query: &str,
+    ) -> Result<Vec<crate::db::RetrievedChunk>, String> {
         let query = query.trim();
         if query.is_empty() {
             return Err("query is required".to_string());
@@ -315,23 +345,34 @@ impl GlobalReadService {
                     .to_string(),
             );
         }
-        let coordinator_chain = self.coordinator_chain_ids().await?;
         let hits = self
             .message_retriever
-            .retrieve(RetrievalRequest::natural_language(
-                query,
-                RetrievalScope::GlobalExcluding(coordinator_chain),
-                SEARCH_TOP_K,
-            ))
+            .retrieve(self.search_request(query).await?)
             .await
             .map_err(|e| format!("search failed: {e}"))?;
+        Ok(hits)
+    }
+
+    pub(crate) async fn format_search_hits(
+        &self,
+        hits: &[crate::db::RetrievedChunk],
+    ) -> Result<String, String> {
         if hits.is_empty() {
             Ok("No matching messages found.".to_string())
         } else {
-            format_global_search_hits(self, &hits)
+            format_global_search_hits(self, hits)
                 .await
-                .map_err(|error| format!("search citation failed: {error}"))
+                .map_err(|e| format!("search citation failed: {e}"))
         }
+    }
+
+    pub(crate) async fn search_request(&self, query: &str) -> Result<RetrievalRequest, String> {
+        let coordinator_chain = self.coordinator_chain_ids().await?;
+        Ok(RetrievalRequest::natural_language(
+            query,
+            RetrievalScope::GlobalExcluding(coordinator_chain),
+            SEARCH_TOP_K,
+        ))
     }
 
     async fn coordinator_chain_ids(&self) -> Result<Vec<String>, String> {
@@ -395,6 +436,34 @@ impl GlobalReadService {
             .await
             .map(|conversation| conversation.product_conversation_id.to_string())
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn conversation_display_identity(
+        &self,
+        conversation_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let aggregate = self
+            .db
+            .get_ordinary_product_conversation(&conversation.product_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let root = aggregate.root.conversation;
+        let display_name = root
+            .chain_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| root.title.clone().filter(|title| !title.trim().is_empty()))
+            .or_else(|| root.slug.clone().filter(|slug| !slug.trim().is_empty()))
+            .unwrap_or_else(|| "Untitled conversation".to_string());
+        Ok(serde_json::json!({
+            "display_name": display_name,
+            "transcript_slug": conversation.slug,
+        }))
     }
 
     pub(crate) async fn resolve_message_target(
@@ -475,7 +544,7 @@ async fn ordinary_product_citation(
         }))
 }
 
-async fn format_global_search_hits(
+pub(crate) async fn format_global_search_hits(
     service: &GlobalReadService,
     hits: &[crate::db::RetrievedChunk],
 ) -> Result<String, DbError> {

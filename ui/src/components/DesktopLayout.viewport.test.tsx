@@ -8,6 +8,8 @@ import {
 } from './viewportRoutes';
 
 const appCss = readFileSync(`${process.cwd()}/src/index.css`, 'utf8');
+const automaticContinuationCss = readFileSync(`${process.cwd()}/src/components/AutomaticContinuationControl.css`, 'utf8');
+const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
 function ruleFor(selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -158,6 +160,22 @@ describe('app viewport ownership', () => {
   });
 
   it('gives chat shells one dynamic viewport owner and contains the document', () => {
+    expect(appCss).toMatch(/--app-safe-area-top:\s*0px;/);
+    expect(appCss).toMatch(
+      /@media\s*\(display-mode:\s*standalone\)\s*\{\s*:root\s*\{[^}]*--app-safe-area-top:\s*env\(safe-area-inset-top,\s*0px\);/s,
+    );
+    expect(appCss).toMatch(
+      /@media\s*\(display-mode:\s*standalone\)\s*\{\s*\.app-viewport:not\(\.desktop-layout\)\s*\{[^}]*padding-top:\s*var\(--app-safe-area-top\);/s,
+    );
+    expect(ruleFor('.app-viewport')).not.toMatch(/padding-top/);
+    expect(appCss).toMatch(/\.app-viewport:not\(\.desktop-layout\) \.product-conversation-page,[^{]*\.app-viewport:not\(\.desktop-layout\) \.coordinator-page\s*\{[^}]*height:\s*100%;/s);
+    expect(appCss).not.toMatch(/\.list-page #main-area\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top/s);
+    expect(appCss).not.toMatch(/#conversation-nav\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top/s);
+    expect(appCss).toMatch(/body:not\(\.app-viewport-active\) \.list-page #main-area\s*\{[^}]*padding-top:\s*var\(--app-safe-area-top\);/s);
+    expect(appCss).toMatch(/\.share-banner\s*\{[^}]*padding-top:\s*calc\(8px \+ var\(--app-safe-area-top\)\);/s);
+    expect(appCss).toMatch(/\.terminal-page:not\(\.desktop-main \.terminal-page\)\s*\{[^}]*padding-top:\s*var\(--app-safe-area-top\);/s);
+    expect(productConversationCss).toMatch(/\.product-conversation-page__recall-panel\s*\{[^}]*inset:\s*calc\(52px \+ var\(--app-safe-area-top\)\)/s);
+    expect(automaticContinuationCss).toMatch(/\.automatic-continuation__panel\s*\{[^}]*top:\s*calc\(52px \+ var\(--app-safe-area-top\)\);/s);
     const viewportRule = ruleFor('.app-viewport');
     expect(viewportRule).toMatch(/height:\s*100dvh;/);
     expect(viewportRule).toMatch(/min-height:\s*0;/);

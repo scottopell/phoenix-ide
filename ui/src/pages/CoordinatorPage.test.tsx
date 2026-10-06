@@ -11,6 +11,9 @@ const { apiMock } = vi.hoisted(() => ({
     resolveCoordinatorRoute: vi.fn(),
     getCoordinatorAutomaticContinuation: vi.fn(),
     updateCoordinatorAutomaticContinuation: vi.fn(),
+    listLiveCoordinatorBashHandles: vi.fn(),
+    listActiveCoordinatorWatches: vi.fn(),
+    stopLiveCoordinatorBashHandle: vi.fn(),
   },
 }));
 
@@ -23,12 +26,18 @@ vi.mock('./ConversationPage', () => ({
   ConversationPage: ({
     routePrefix,
     composerQuickAction,
+    stateBarExtension,
   }: {
     routePrefix?: string;
     composerQuickAction?: { label: string; compactLabel: string; prompt: string };
+    stateBarExtension?: { summary: React.ReactNode; details: React.ReactNode };
   }) => (
     <div>
       Shared conversation runtime {routePrefix}
+      <div data-testid="mock-statebar">
+        {stateBarExtension?.summary}
+        {stateBarExtension?.details}
+      </div>
       {composerQuickAction && (
         <button type="button" data-prompt={composerQuickAction.prompt}>
           {composerQuickAction.compactLabel}
@@ -70,9 +79,13 @@ const coordinatorConversation = (): Conversation => ({
 
 describe('CoordinatorPage', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     vi.clearAllMocks();
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
+    apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([]);
+    apiMock.listActiveCoordinatorWatches.mockResolvedValue([]);
+    apiMock.stopLiveCoordinatorBashHandle.mockResolvedValue(undefined);
     apiMock.getCoordinatorAutomaticContinuation.mockResolvedValue({
       aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-product' },
       auto_continue_on_context_exhaustion: false,
@@ -83,6 +96,73 @@ describe('CoordinatorPage', () => {
       auto_continue_on_context_exhaustion: true,
       admission: null,
     });
+  });
+
+  it('shows the current server-backed watch inventory with readable names and secondary IDs', async () => {
+    apiMock.listActiveCoordinatorWatches.mockResolvedValue([{
+      product_conversation_id: 'product-readable',
+      transcript_id: 'transcript-readable',
+      transcript_slug: 'fix-readable-target',
+      display_name: 'Fix readable target',
+      project_path: '/repo/phoenix',
+      state: 'idle',
+    }]);
+    renderPage();
+    const activity = (await screen.findByText(/Watching [\d…]/)).closest('.global-statebar-summary')!;
+    await waitFor(() => expect(activity).toHaveTextContent('Watching 1'));
+    expect(await screen.findByRole('region', { name: 'Active watches' })).toBeInTheDocument();
+
+    expect(screen.getByRole('link', { name: 'Fix readable target' })).toHaveAttribute('href', '/product-conversations/product-readable');
+    expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/fix-readable-target');
+    expect(screen.getByTitle('ProductConversation ID')).toHaveTextContent('product-readable');
+  });
+
+  it('removes ended watches when the current server inventory refreshes', async () => {
+    apiMock.listActiveCoordinatorWatches
+      .mockResolvedValueOnce([{
+        product_conversation_id: 'product-ended', transcript_id: 'transcript-ended', transcript_slug: null,
+        display_name: 'Ending watch', project_path: null, state: 'idle',
+      }])
+      .mockResolvedValue([]);
+    renderPage();
+    expect(await screen.findByRole('link', { name: 'Ending watch' })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Active watches' })).not.toBeInTheDocument(), { timeout: 3_000 });
+  });
+
+  it('retains the last successful watch inventory and reports refresh failure', async () => {
+    apiMock.listActiveCoordinatorWatches
+      .mockResolvedValueOnce([{
+        product_conversation_id: 'product-retained', transcript_id: 'transcript-retained', transcript_slug: null,
+        display_name: 'Retained watch', project_path: null, state: 'idle',
+      }])
+      .mockRejectedValue(new Error('offline'));
+    renderPage();
+    expect(await screen.findByRole('link', { name: 'Retained watch' })).toBeInTheDocument();
+    expect(await screen.findByRole('status', {}, { timeout: 3_000 })).toHaveTextContent('Could not refresh active watches');
+    expect(screen.getByRole('link', { name: 'Retained watch' })).toBeInTheDocument();
+  });
+
+  it('shows only server-reported live Coordinator commands with inspect navigation', async () => {
+    apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([{
+      handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123, can_stop: true,
+    }]);
+
+    renderPage('/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source');
+
+    await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
+    const running = await screen.findByRole('region', { name: 'Running commands' });
+    expect(running).toHaveTextContent('UI tests');
+    expect(running).toHaveTextContent('pnpm test');
+    expect(running).toHaveTextContent('Started');
+    const commandDetails = screen.getAllByText('Details').at(-1)?.closest('details');
+    expect(commandDetails).not.toHaveAttribute('open');
+    fireEvent.click(commandDetails!.querySelector('summary')!);
+    expect(running).toHaveTextContent('/repo/ui');
+    expect(running).toHaveTextContent('b-live');
+    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    fireEvent.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
+    expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
   });
 
   it('mounts only the shared conversation runtime with the briefing action', async () => {
@@ -105,6 +185,7 @@ describe('CoordinatorPage', () => {
     renderPage();
 
     const control = await screen.findByTestId('automatic-continuation-control');
+    expect(screen.getByTestId('mock-statebar')).toContainElement(control);
     fireEvent.click(control.querySelector('summary')!);
     const checkbox = screen.getByRole('checkbox', { name: 'Automatically accept future generated handoffs and continue' });
     await waitFor(() => {

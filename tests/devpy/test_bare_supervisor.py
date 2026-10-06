@@ -306,11 +306,58 @@ class BareTransactionTests(unittest.TestCase):
             supervisor.SupervisorError("rollback failed"),
         ])
         state = owner.activate(self.transaction_id, supervisor.sha256(path))
-        self.assertEqual("activation_failed_rollback_failed", state)
+        self.assertEqual("ordinary_activation_failed_rollback_failed", state)
         self.assertEqual(self.transaction_id, self.layout.active_file.read_text().strip())
         status = __import__("json").loads(self.layout.status_file.read_text())
         self.assertEqual("candidate wrong", status["failure"])
         self.assertEqual("rollback failed", status["rollback_failure"])
+        self.assertEqual(state, status["state"])
+        self.assertEqual("a" * 40, self.layout.deployed_sha.read_text().strip())
+
+    def test_restart_preserves_both_rollback_failure_statuses_without_retry(self):
+        self.install_previous()
+        path = self.manifest(previous=True)
+        manifest_hash = supervisor.sha256(path)
+        owner = supervisor.Supervisor(self.layout)
+        manifest, *_ = owner.validated_transaction(self.transaction_id, manifest_hash)
+        supervisor.write_text_atomic(self.layout.active_file, self.transaction_id)
+        owner.restart_installed = mock.Mock()
+        owner.restore_previous = mock.Mock()
+        owner.start_child = mock.Mock()
+        for state in (
+            "activation_failed_rollback_failed",
+            "ordinary_activation_failed_rollback_failed",
+        ):
+            with self.subTest(state=state):
+                owner.transaction_status(manifest, manifest_hash, state, "candidate failed", "rollback failed")
+                before = self.layout.status_file.read_bytes()
+                owner.reconcile()
+                self.assertEqual(before, self.layout.status_file.read_bytes())
+                self.assertEqual(self.transaction_id, self.layout.active_file.read_text().strip())
+                owner.restart_installed.assert_not_called()
+                owner.restore_previous.assert_not_called()
+                owner.start_child.assert_not_called()
+                with mock.patch.object(owner, "validated_transaction", return_value=(
+                    manifest, None, None, None, None,
+                )), self.assertRaisesRegex(supervisor.SupervisorError, "unresolved"):
+                    owner.activate("tx-next", manifest_hash)
+
+    def test_restart_rollback_failure_emits_ordinary_status_and_retains_claim(self):
+        self.install_previous()
+        path = self.manifest(previous=True)
+        manifest_hash = supervisor.sha256(path)
+        owner = supervisor.Supervisor(self.layout)
+        manifest, *_ = owner.validated_transaction(self.transaction_id, manifest_hash)
+        supervisor.write_text_atomic(self.layout.active_file, self.transaction_id)
+        owner.transaction_status(manifest, manifest_hash, "activating", "candidate failed", phase="rolling_back")
+        owner.restore_previous = mock.Mock(side_effect=supervisor.SupervisorError("rollback failed"))
+        owner.reconcile()
+        status = __import__("json").loads(self.layout.status_file.read_text())
+        self.assertEqual("ordinary_activation_failed_rollback_failed", status["state"])
+        self.assertEqual("candidate failed", status["failure"])
+        self.assertEqual("rollback failed", status["rollback_failure"])
+        self.assertEqual(self.transaction_id, self.layout.active_file.read_text().strip())
+        self.assertEqual("a" * 40, self.layout.deployed_sha.read_text().strip())
 
     def reset_transaction(self):
         if self.transaction.exists():

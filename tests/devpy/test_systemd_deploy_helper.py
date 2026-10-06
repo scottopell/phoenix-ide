@@ -567,13 +567,32 @@ class SystemdActivationTests(SystemdManifestValidationTests):
             side_effect=helper.ActivationError("candidate crashed"),
         ):
             state = helper.activate(manifest, controller)
-        self.assertEqual("activation_failed_rollback_failed", state)
+        self.assertEqual("ordinary_activation_failed_rollback_failed", state)
         status = json.loads(self.policy.status_path.read_text())
         self.assertEqual("candidate crashed", status["failure"])
         self.assertEqual("rollback start failed", status["rollback_failure"])
+        self.assertEqual(state, status["state"])
+        self.assertEqual("a" * 40, Path(self.targets.deployed_sha).read_text().strip())
         self.assertEqual(manifest.transaction_id, self.policy.active_path.read_text().strip())
         self.assertTrue(helper.status_is_durable_terminal(manifest))
         self.assertFalse(helper.release_claim(manifest))
+
+    def test_both_rollback_failure_statuses_retain_claim_and_reject_next_deployment(self):
+        manifest = self.manifest()
+        self.policy.active_path.write_text(manifest.transaction_id + "\n")
+        for state in (
+            "activation_failed_rollback_failed",
+            "ordinary_activation_failed_rollback_failed",
+        ):
+            with self.subTest(state=state):
+                helper.write_status(manifest, state, failure="candidate failed", rollback_failure="rollback failed")
+                before = self.policy.status_path.read_bytes()
+                self.assertTrue(helper.status_is_durable_terminal(manifest))
+                self.assertFalse(helper.release_claim(manifest))
+                with self.assertRaises(helper.ConcurrentDeploy):
+                    helper.acquire_claim("f" * 32, self.policy)
+                self.assertEqual(manifest.transaction_id, self.policy.active_path.read_text().strip())
+                self.assertEqual(before, self.policy.status_path.read_bytes())
 
     def test_manifest_validation_failure_finalizes_status_and_releases_claim(self):
         manifest = self.manifest()
