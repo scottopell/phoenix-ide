@@ -289,6 +289,10 @@ describe('ChainPage — submit + stream', () => {
 
     // Stream tokens via the captured SSE handle.
     expect(sseHandles).toHaveLength(1);
+    act(() => sseHandles[0]!.emit({ type: 'chain_qa_token', chain_qa_id: 'qa-new', delta: 'unfinished narration' }));
+    await waitFor(() => expect(screen.getByText(/unfinished narration/)).toBeInTheDocument());
+    act(() => sseHandles[0]!.emit({ type: 'chain_qa_answer_reset', chain_qa_id: 'qa-new' }));
+    expect(screen.queryByText(/unfinished narration/)).not.toBeInTheDocument();
     act(() => {
       sseHandles[0]!.emit({
         type: 'chain_qa_token',

@@ -149,6 +149,25 @@ describe('chainReducer', () => {
     });
   });
 
+  it('resets only the rejected answer and streams the next attempt incrementally', () => {
+    let atom = createInitialChainAtom();
+    for (const chainQaId of ['qa-1', 'qa-2']) {
+      atom = dispatch(atom, { type: 'OPTIMISTIC_INFLIGHT_ADD', chainQaId, question: 'q' });
+      atom = dispatch(atom, { type: 'TOKEN_APPENDED', chainQaId, delta: 'narration' });
+    }
+    const sibling = atom.inflight['qa-2'];
+    atom = dispatch(atom, { type: 'ANSWER_RESET', chainQaId: 'qa-1' });
+    expect(atom.inflight['qa-1']?.answer).toBe('');
+    expect(atom.inflight['qa-1']?.preToken).toBe(true);
+    expect(atom.inflight['qa-2']).toBe(sibling);
+    expect(dispatch(atom, { type: 'ANSWER_RESET', chainQaId: 'unknown' })).toBe(atom);
+    atom = dispatch(atom, { type: 'TOKEN_APPENDED', chainQaId: 'qa-1', delta: 'terminal' });
+    expect(atom.inflight['qa-1']?.answer).toBe('terminal');
+    expect(atom.inflight['qa-1']?.preToken).toBe(false);
+    atom = dispatch(atom, { type: 'TOKEN_APPENDED', chainQaId: 'qa-1', delta: ' answer' });
+    expect(atom.inflight['qa-1']?.answer).toBe('terminal answer');
+  });
+
   describe('INFLIGHT_FAIL / INFLIGHT_DROP', () => {
     it('INFLIGHT_FAIL surfaces the error and replaces partial answer', () => {
       let atom = dispatch(createInitialChainAtom(), {

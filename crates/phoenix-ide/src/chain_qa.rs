@@ -594,6 +594,12 @@ impl ChainQa {
                 role: MessageRole::User,
                 content: results,
             });
+            if turn + 1 < remaining_turns {
+                runtime.publish(ChainSseEvent::AnswerReset {
+                    chain_qa_id: prep.row_id.clone(),
+                });
+                partial.clear();
+            }
         }
         Err(RunInvocationError {
             error: ChainQaError::Llm("Q&A request limit reached before a terminal answer".into()),
@@ -1413,6 +1419,7 @@ mod tool_policy_tests {
     ) -> (
         Result<AnswerOutcome, RunInvocationError>,
         Arc<DeniedFinalQaLlm>,
+        Vec<ChainSseEvent>,
     ) {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("qa-denied-root", "qa-denied", "/tmp", true, None, None)
@@ -1441,12 +1448,30 @@ mod tool_policy_tests {
             language: crate::llm_language::LlmLanguage::PhoenixNative,
         };
         let runtime = qa.runtime_registry.get_or_create(&prep.root_id).await;
-        (qa.run_answer_invocation(&prep, &runtime).await, llm)
+        let (mut events, _guard) = runtime.subscribe();
+        let outcome = qa.run_answer_invocation(&prep, &runtime).await;
+        let mut received = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            received.push(event);
+        }
+        (outcome, llm, received)
     }
 
     #[tokio::test]
     async fn final_tool_call_gets_one_unavailable_result_and_replay_before_terminal_answer() {
-        let (outcome, llm) = run_denied_final(1, true).await;
+        let (outcome, llm, events) = run_denied_final(1, true).await;
+        assert!(
+            matches!(&events[..], [ChainSseEvent::Token { delta, .. }, ChainSseEvent::AnswerReset { .. }, ChainSseEvent::Token { delta: answer, .. }] if delta == "unfinished narration" && answer == "terminal answer")
+        );
+        let mut displayed = String::new();
+        for event in events {
+            match event {
+                ChainSseEvent::Token { delta, .. } => displayed.push_str(&delta),
+                ChainSseEvent::AnswerReset { .. } => displayed.clear(),
+                _ => panic!("unexpected lifecycle event before finalization"),
+            }
+        }
+        assert_eq!(displayed, "terminal answer");
         assert_eq!(
             outcome
                 .unwrap_or_else(|failure| panic!("{}", failure.error))
@@ -1461,15 +1486,23 @@ mod tool_policy_tests {
 
     #[tokio::test]
     async fn final_tool_calls_exhaust_existing_request_budget_without_false_success() {
-        let (outcome, llm) = run_denied_final(usize::MAX, true).await;
+        let (outcome, llm, events) = run_denied_final(usize::MAX, true).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ChainSseEvent::AnswerReset { .. }))
+                .count(),
+            MAX_QA_TURNS - 2
+        );
+        assert!(matches!(events.last(), Some(ChainSseEvent::Token { .. })));
         let Err(failure) = outcome else {
             panic!("tool calls cannot complete an answer")
         };
         assert!(failure.error.to_string().contains("request limit"));
-        assert!(failure
-            .partial_answer
-            .unwrap()
-            .contains("unfinished narration"));
+        assert_eq!(
+            failure.partial_answer.as_deref(),
+            Some("unfinished narration")
+        );
         assert_eq!(
             llm.final_requests.load(std::sync::atomic::Ordering::SeqCst),
             MAX_QA_TURNS - 1
@@ -1478,7 +1511,7 @@ mod tool_policy_tests {
 
     #[tokio::test]
     async fn nonterminal_final_text_is_failed_with_partial_answer() {
-        let (outcome, _) = run_denied_final(0, false).await;
+        let (outcome, _, _) = run_denied_final(1, false).await;
         let Err(failure) = outcome else {
             panic!("nonterminal text cannot complete an answer")
         };

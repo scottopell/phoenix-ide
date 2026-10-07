@@ -252,6 +252,8 @@ export function ChainPage() {
           chainQaId: evt.chain_qa_id,
           delta: evt.delta,
         });
+      } else if (evt.type === 'chain_qa_answer_reset') {
+        dispatch({ type: 'ANSWER_RESET', chainQaId: evt.chain_qa_id });
       } else if (evt.type === 'chain_qa_completed') {
         // Drop the in-flight entry and refetch to pick up the persisted row.
         dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
