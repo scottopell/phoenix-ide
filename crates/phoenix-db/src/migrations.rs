@@ -643,13 +643,32 @@ CREATE UNIQUE INDEX federation_enrollments_one_active_caller
 
 const MIGRATION_116: &str = r"
 CREATE TABLE federation_peer_connections (
-    peer_instance_id TEXT PRIMARY KEY NOT NULL,
+    peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
+        typeof(peer_instance_id) = 'text'
+        AND length(peer_instance_id) = 36
+        AND peer_instance_id = lower(peer_instance_id)
+        AND substr(peer_instance_id, 9, 1) = '-'
+        AND substr(peer_instance_id, 14, 1) = '-'
+        AND substr(peer_instance_id, 15, 1) = '4'
+        AND substr(peer_instance_id, 19, 1) = '-'
+        AND substr(peer_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(peer_instance_id, 24, 1) = '-'
+        AND length(replace(peer_instance_id, '-', '')) = 32
+        AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
     peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
     base_url TEXT NOT NULL UNIQUE CHECK(
-        base_url GLOB 'https://*'
+        typeof(base_url) = 'text'
+        AND base_url GLOB 'https://?*/'
+        AND length(base_url) > length('https:///')
         AND base_url NOT LIKE '%@%'
         AND base_url NOT LIKE '%?%'
         AND base_url NOT LIKE '%#%'
+        AND instr(base_url, '%') = 0
+        AND instr(base_url, char(9)) = 0
+        AND instr(base_url, char(10)) = 0
+        AND instr(base_url, char(13)) = 0
+        AND instr(base_url, ' ') = 0
         AND substr(base_url, -1) = '/'
         AND instr(substr(base_url, 9), '/') = length(substr(base_url, 9))
     ),

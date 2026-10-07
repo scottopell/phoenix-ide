@@ -102,6 +102,50 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn schema_rejects_malformed_peer_identity_and_origins() {
+        let db = Database::open_in_memory().await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let bearer = format!("phx_peer_{}", "a".repeat(43));
+        for id in [
+            "not-a-uuid",
+            "00000000-0000-0000-0000-000000000000",
+            "21f7f8de-8051-5b89-8680-0195ef798b6a",
+            "00000000-0000-4000-0000-000000000000",
+        ] {
+            assert!(sqlx::query(
+                "INSERT INTO federation_peer_connections
+                     (peer_instance_id, peer_display_name, base_url, bearer_credential, created_at_us)
+                 VALUES (?1, 'peer', 'https://peer.example/', ?2, 1)",
+            )
+            .bind(id)
+            .bind(&bearer)
+            .execute(db.pool())
+            .await
+            .is_err(), "{id}");
+        }
+        for origin in [
+            "https:///",
+            "https://%2F/",
+            "https://peer.example /",
+            "https://peer.example\n/",
+        ] {
+            assert!(sqlx::query(
+                "INSERT INTO federation_peer_connections
+                     (peer_instance_id, peer_display_name, base_url, bearer_credential, created_at_us)
+                 VALUES (?1, 'peer', ?2, ?3, 1)",
+            )
+            .bind(InstanceId::new().to_string())
+            .bind(origin)
+            .bind(&bearer)
+            .execute(db.pool())
+            .await
+            .is_err(), "{origin:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn peer_connection_round_trips_and_replaces_by_instance() {
         let db = Database::open_in_memory().await.unwrap();
         crate::migrations::run_pending_migrations(db.pool())
