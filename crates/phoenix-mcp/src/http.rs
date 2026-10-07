@@ -4615,7 +4615,7 @@ mod tests {
                     &server,
                     "at-1",
                     Some("rt-1"),
-                    &["mcp.read"],
+                    &["mcp.read", "mcp.write"],
                     1,
                 ))
                 .await
@@ -4635,6 +4635,12 @@ mod tests {
                 crate::McpConnState::Unauthorized
             );
             let params = query_params(&pending_auth_url(&manager).await.unwrap());
+            assert_eq!(
+                params["scope"]
+                    .split_whitespace()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["mcp.read", "mcp.write"].into_iter().collect()
+            );
             server.route("/token", token_response("at-3", Some("rt-3"), None));
             server.push_responses(handshake_responses("sess-3"));
             manager

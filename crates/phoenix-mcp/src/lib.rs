@@ -3704,7 +3704,9 @@ impl McpClientManager {
         // Silent refresh before any re-prompt: a restored token whose access
         // half expired offline refreshes on this first 401 (REQ-MCP-012).
         let stored = oauth_rt.store().token(name).await.unwrap_or_default();
+        let mut prior_scopes = configured_oauth_scopes(entry).to_vec();
         if let Some(token) = stored {
+            extend_unique(&mut prior_scopes, token.scopes.iter().map(String::as_str));
             if matches!(action, OAuthHandshakeAction::Refresh) && token.refresh_token.is_some() {
                 match oauth_refresh(&oauth_rt, name, url, www_authenticate.as_deref(), &token).await
                 {
@@ -3750,7 +3752,7 @@ impl McpClientManager {
             name,
             entry,
             www_authenticate.as_deref(),
-            Vec::new(),
+            prior_scopes,
         )
         .await
         .map_err(|e| {
