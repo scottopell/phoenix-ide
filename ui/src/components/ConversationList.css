@@ -365,3 +365,42 @@
   border-radius: 8px;
   vertical-align: middle;
 }
+
+.product-conversation-actions {
+  flex: 0 0 auto;
+}
+
+.conv-item.product-conversation-list-row:has(.product-conversation-actions .conv-item-actions) {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.conv-item.product-conversation-list-row:has(.conv-item-actions) > .conv-item-main {
+  flex-basis: 100%;
+}
+
+.product-conversation-actions:has(.conv-item-actions) {
+  flex-basis: 100%;
+}
+
+.product-conversation-actions > button.conv-action-btn {
+  float: right;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.product-conversation-actions .conv-item-actions {
+  clear: both;
+  position: static;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+}
+
+.product-conversation-actions .conv-item-actions .conv-action-btn {
+  color: var(--text-primary);
+  justify-content: flex-start;
+  text-align: left;
+  white-space: normal;
+}

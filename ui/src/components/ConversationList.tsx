@@ -185,7 +185,15 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   onProductConversationClose,
   onProductConversationDelete,
   onProductConversationRename,
+  isMenuOpen,
+  onToggleMenu,
+  onCloseMenu,
+  menuRef,
 }: {
+  isMenuOpen: boolean;
+  onToggleMenu: (event: React.MouseEvent, id: string) => void;
+  onCloseMenu: () => void;
+  menuRef?: React.RefObject<HTMLDivElement> | undefined;
   row: ProductConversationListRow;
   isActive: boolean;
   isKeyboardSelected: boolean;
@@ -247,40 +255,51 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
         </div>
       </button>
       {(onProductConversationRename || onProductConversationClose || onProductConversationDelete) && (
-        <div className="conv-actions">
+        <div ref={menuRef} className="conv-item-menu-container product-conversation-actions" onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            event.stopPropagation();
+            onCloseMenu();
+            event.currentTarget.querySelector<HTMLButtonElement>('.conv-item-menu-btn')?.focus();
+          }
+        }}>
+          <button type="button" className="conv-item-menu-btn conv-action-btn"
+            aria-label={`Actions for conversation ${displayTitle}`} aria-expanded={isMenuOpen}
+            onClick={(event) => onToggleMenu(event, row.product_conversation_id)}>⋮</button>
+          {isMenuOpen && <div className="conv-item-actions" aria-label={`Actions for ${displayTitle}`}>
           {onProductConversationRename && row.lifecycle.state === 'open'
             && !(row.lifecycle.close_action.availability === 'unavailable'
               && row.lifecycle.close_action.reason === 'active_close_attempt') && (
             <button
               type="button"
               className="conv-action-btn"
-              onClick={(event) => { event.stopPropagation(); onProductConversationRename(row); }}
+              onClick={(event) => { event.stopPropagation(); onCloseMenu(); onProductConversationRename(row); }}
               aria-label={`Rename conversation ${displayTitle}`}
               title="Rename"
             >
-              ✎
+              Rename
             </button>
           )}
           {onProductConversationDelete && row.lifecycle.state === 'history' && (
             <button
               type="button"
               className="conv-action-btn danger"
-              onClick={(event) => { event.stopPropagation(); onProductConversationDelete(row); }}
+              onClick={(event) => { event.stopPropagation(); onCloseMenu(); onProductConversationDelete(row); }}
               aria-label={`Delete conversation ${displayTitle}`}
               title="Delete permanently"
             >
-              ×
+              Delete permanently
             </button>
           )}
           {onProductConversationClose && closeAction?.availability === 'available' && (
             <button
               type="button"
               className="conv-action-btn danger"
-              onClick={(event) => { event.stopPropagation(); onProductConversationClose(row); }}
+              onClick={(event) => { event.stopPropagation(); onCloseMenu(); onProductConversationClose(row); }}
               aria-label={`Close conversation ${displayTitle}`}
               title="Close"
             >
-              ×
+              Close conversation
             </button>
           )}
           {onProductConversationClose && closeAction?.availability === 'unavailable' && (
@@ -291,9 +310,10 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               aria-label={`Close conversation ${displayTitle}. ${closeUnavailableReason}`}
               title={closeUnavailableReason}
             >
-              ×
+              Close conversation — {closeUnavailableReason}
             </button>
           )}
+          </div>}
         </div>
       )}
     </li>
@@ -741,6 +761,7 @@ export function ConversationList({
   }, [displayProductList, effectiveListDensity, groupedItems, isChainCollapsed, usingProductRows]);
 
   const { selectedId } = useKeyboardNav({
+    enabled: expandedId === null,
     items: keyboardItems,
     ...(usingProductRows
       ? {
@@ -910,6 +931,10 @@ export function ConversationList({
             <ProductConversationListRowView
               key={row.product_conversation_id}
               row={row}
+              isMenuOpen={expandedId === row.product_conversation_id}
+              onToggleMenu={toggleActions}
+              onCloseMenu={closeRowMenu}
+              menuRef={expandedId === row.product_conversation_id ? menuRef : undefined}
               isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
               isKeyboardSelected={selectedId === row.product_conversation_id}
               effectiveCwd={[...conversations, ...archivedConversations].find((conversation) => (

@@ -225,6 +225,49 @@ describe('ProductConversation presentation transitions', () => {
 });
 
 describe('ProductConversation row actions', () => {
+  it('dismisses the single action disclosure on Escape and outside click without opening the row', () => {
+    const onOpen = vi.fn();
+    const row = makeProductConversation('menu');
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={[row]}
+      onProductConversationClick={onOpen} onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} /></MemoryRouter>);
+    const trigger = view.getByRole('button', { name: 'Actions for conversation Root menu' });
+    expect(view.queryByRole('button', { name: 'Rename conversation Root menu' })).toBeNull();
+    fireEvent.click(trigger);
+    const rename = view.getByRole('button', { name: 'Rename conversation Root menu' });
+    rename.focus();
+    fireEvent.keyDown(rename, { key: 'Escape' });
+    expect(trigger).toHaveFocus();
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(trigger);
+    fireEvent.mouseDown(document.body);
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['open', { state: 'open', close_action: { availability: 'available' } }, false, true, true, false],
+    ['history', { state: 'history' }, true, false, false, true],
+    ['closing', { state: 'open', close_action: { availability: 'unavailable', reason: 'active_close_attempt' } }, false, false, true, false],
+  ] as const)('preserves %s lifecycle action guards', (_name, lifecycle, history, rename, close, remove) => {
+    const row = makeProductConversation('guards', { lifecycle });
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={history ? [] : [row]}
+      archivedProductConversations={history ? [row] : []} showArchived={history}
+      onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} onProductConversationDelete={vi.fn()} /></MemoryRouter>);
+    fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root guards' }));
+    expect(!!view.queryByRole('button', { name: 'Rename conversation Root guards' })).toBe(rename);
+    expect(!!view.queryByRole('button', { name: /^Close conversation/ })).toBe(close);
+    expect(!!view.queryByRole('button', { name: 'Delete conversation Root guards' })).toBe(remove);
+    if (_name === 'closing') expect(view.getByRole('button', { name: /^Close conversation/ })).toBeDisabled();
+  });
+
+  it('does not introduce destructive actions when offline callbacks are absent', () => {
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={[makeProductConversation('offline')]}
+      onProductConversationRename={vi.fn()} /></MemoryRouter>);
+    fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root offline' }));
+    expect(view.queryByRole('button', { name: /^Close conversation/ })).toBeNull();
+    expect(view.queryByRole('button', { name: /^Delete conversation/ })).toBeNull();
+  });
+
   it('exposes keyboard/touch accessible row actions without triggering row navigation', () => {
     const row = makeProductConversation('actions-open', { canonical_root: { transcript_row_id: 'root-actions', slug: 'Action Product', title: 'Action Product' } });
     const onOpen = vi.fn();
@@ -244,6 +287,7 @@ describe('ProductConversation row actions', () => {
       </MemoryRouter>,
     );
 
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Action Product' }));
     const rename = getByRole('button', { name: /Rename conversation Action Product/ });
     const close = getByRole('button', { name: /Close conversation Action Product/ });
     expect(rename).toBeInTheDocument();
@@ -251,8 +295,8 @@ describe('ProductConversation row actions', () => {
 
     rename.focus();
     fireEvent.click(rename);
-    close.focus();
-    fireEvent.click(close);
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Action Product' }));
+    fireEvent.click(getByRole('button', { name: /Close conversation Action Product/ }));
 
     expect(onRename).toHaveBeenCalledWith(row);
     expect(onClose).toHaveBeenCalledWith(row);
@@ -480,9 +524,11 @@ describe('ConversationList — product conversations', () => {
       </MemoryRouter>,
     );
 
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Root pc-blocked' }));
     expect(getByRole('button', {
       name: /Close conversation Root pc-blocked\. Resolve the pending task approval before closing/,
     })).toBeDisabled();
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Root pc-available' }));
     fireEvent.click(getByRole('button', { name: 'Close conversation Root pc-available' }));
     expect(close).toHaveBeenCalledWith(available);
   });

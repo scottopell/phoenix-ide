@@ -100,6 +100,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.renameProductConversation).mockResolvedValue(renamed);
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Rename conversation Mobile Product' }));
     const input = screen.getByRole('textbox');
     fireEvent.change(input, { target: { value: 'Renamed on Mobile' } });
@@ -137,6 +138,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
@@ -155,6 +157,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
@@ -184,6 +187,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
@@ -204,6 +208,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Close conversation Mobile Product' }));
     expect(screen.getByText(/moves the conversation to read-only History and stops its active work/)).toBeInTheDocument();
     touchActivate(screen.getByRole('button', { name: 'Close' }));
