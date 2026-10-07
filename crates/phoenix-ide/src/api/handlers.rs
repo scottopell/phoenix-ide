@@ -2227,10 +2227,7 @@ async fn create_product_conversation(
         }
     };
     Ok(Json(ProductConversationCreateAcceptedResponse {
-        canonical_route: format!(
-            "/c/{}",
-            published.product_conversation_id
-        ),
+        canonical_route: format!("/c/{}", published.product_conversation_id),
         product_conversation_id: published.product_conversation_id,
         transcript_row_id: published.transcript_row_id,
     }))
