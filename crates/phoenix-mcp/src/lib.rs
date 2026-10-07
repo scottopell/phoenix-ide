@@ -150,6 +150,11 @@ pub trait McpTransport: Send + Sync {
         false
     }
 
+    /// Stop unsolicited background work while retaining remote session ownership.
+    async fn quiesce(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
     /// Tear down the transport and confirm owned resources have exited.
     async fn shutdown(&self) -> Result<(), TransportError>;
 }
@@ -2059,16 +2064,26 @@ impl McpClientManager {
             error = %error,
             "MCP OAuth authorization failed at the authorization server"
         );
-        // Retain the denial as a failure rather than letting the server vanish
-        // from status (REQ-MCP-018). The pending URL is already cleared, so
-        // this records `failed`, not `unauthorized`.
-        if let Some(
-            OAuthFlowOwner::Reconnect(handle, epoch) | OAuthFlowOwner::Remove(handle, epoch),
-        ) = flow.and_then(|flow| flow.owner)
-        {
-            handle
-                .fail(epoch, format!("authorization failed: {error}"))
-                .await;
+        match flow.and_then(|flow| flow.owner) {
+            Some(OAuthFlowOwner::Reconnect(handle, epoch)) => {
+                handle
+                    .fail(epoch, format!("authorization failed: {error}"))
+                    .await;
+            }
+            Some(OAuthFlowOwner::Remove(handle, epoch)) if handle.snapshot().epoch == epoch => {
+                match handle.remove().await {
+                    Ok(()) => match self.oauth.store().delete_token(&name).await {
+                        Ok(()) => self.remove_current_handle(&name, &handle).await,
+                        Err(error) => {
+                            tracing::warn!(server = %name, %error, "OAuth denial removal token cleanup failed");
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(server = %name, %error, "OAuth denial removal session cleanup failed");
+                    }
+                }
+            }
+            Some(OAuthFlowOwner::Remove(_, _)) | None => {}
         }
         Some(name)
     }
@@ -3023,11 +3038,10 @@ impl McpClientManager {
                         }
                     }
                     match handle.snapshot().state {
-                        SupervisorState::Failed => (handle, true),
+                        SupervisorState::Failed | SupervisorState::Removed => (handle, true),
                         SupervisorState::Ready(_)
                         | SupervisorState::Connecting
-                        | SupervisorState::Recovering
-                        | SupervisorState::Removed => {
+                        | SupervisorState::Recovering => {
                             unchanged.push(name);
                             continue;
                         }

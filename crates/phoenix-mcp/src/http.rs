@@ -140,7 +140,7 @@ impl HttpTransport {
     /// the session and protocol version (REQ-MCP-006). Idempotent: a transport
     /// runs `initialize` once, but a second call is a no-op rather than a
     /// second stream. The task is detached and survives until the transport is
-    /// torn down (`shutdown`/`Drop`), so `tools/list_changed` keeps arriving
+    /// quiesced or torn down, so `tools/list_changed` keeps arriving
     /// between requests instead of only on a POST reply.
     fn start_server_stream(&self) {
         let mut slot = self.stream_task.lock().unwrap();
@@ -466,20 +466,24 @@ impl McpTransport for HttpTransport {
         true
     }
 
-    async fn shutdown(&self) -> Result<(), TransportError> {
-        // Stop the server-initiated GET stream before ending the session: a
-        // task still reconnecting would race the DELETE and re-open against a
-        // session about to vanish (REQ-MCP-006).
-        let mut background_error = None;
+    async fn quiesce(&self) -> Result<(), TransportError> {
         let stream_task = self.stream_task.lock().unwrap().take();
         if let Some(task) = stream_task {
             task.abort();
             if let Err(error) = task.await {
                 if !error.is_cancelled() {
-                    background_error = Some(format!("stream task failed during shutdown: {error}"));
+                    return Err(TransportError::Disconnected(format!(
+                        "MCP server '{}': stream task failed during quiescence: {error}",
+                        self.name,
+                    )));
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), TransportError> {
+        let background_error = self.quiesce().await.err();
         // End the server-side session explicitly so it does not linger until
         // expiry (REQ-MCP-005). Stateless servers have nothing to delete.
         let session_id = self.session_id.lock().unwrap().clone();
@@ -517,10 +521,7 @@ impl McpTransport for HttpTransport {
             }
         }
         match background_error {
-            Some(error) => Err(TransportError::Disconnected(format!(
-                "MCP server '{}': {error}",
-                self.name
-            ))),
+            Some(error) => Err(error),
             None => Ok(()),
         }
     }
@@ -3830,6 +3831,202 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    struct FailOnceDeleteStore {
+        inner: Arc<dyn crate::OAuthStore>,
+        fail_next: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::OAuthStore for FailOnceDeleteStore {
+        async fn registration(
+            &self,
+            issuer: &str,
+        ) -> Result<Option<OAuthRegistrationRecord>, String> {
+            self.inner.registration(issuer).await
+        }
+        async fn upsert_registration(
+            &self,
+            record: &OAuthRegistrationRecord,
+        ) -> Result<(), String> {
+            self.inner.upsert_registration(record).await
+        }
+        async fn token(&self, name: &str) -> Result<Option<OAuthTokenRecord>, String> {
+            self.inner.token(name).await
+        }
+        async fn upsert_token(&self, record: &OAuthTokenRecord) -> Result<(), String> {
+            self.inner.upsert_token(record).await
+        }
+        async fn delete_token(&self, name: &str) -> Result<(), String> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err("injected token deletion failure".into());
+            }
+            self.inner.delete_token(name).await
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_oauth_owner_is_forgotten_after_denial_cleanup_succeeds() {
+        for cleanup_succeeds in [false, true] {
+            let server = TestServer::start(handshake_responses("sess-1")).await;
+            let manager = ready_refreshable_manager(&server).await;
+            let handle = manager.servers.read().await.get("remote").unwrap().clone();
+            let crate::supervisor::RecoveryClaim::Leader(permit) =
+                handle.claim_oauth_recovery(0).await
+            else {
+                panic!("OAuth recovery owner");
+            };
+            manager
+                .step_up_authorization(
+                    "remote",
+                    &handle,
+                    &permit,
+                    "Bearer error=\"insufficient_scope\", scope=\"write\"",
+                )
+                .await
+                .unwrap();
+            let state = query_params(&pending_auth_url(&manager).await.unwrap())
+                .remove("state")
+                .unwrap();
+            assert_eq!(manager.reload_from_configs(vec![]).await.failed.len(), 1);
+            if cleanup_succeeds {
+                *server.routes.delete_bearer.lock().unwrap() = None;
+                server.push_responses(vec![delete_ack()]);
+            }
+            assert_eq!(
+                manager
+                    .fail_oauth_authorization(&state, "access_denied")
+                    .await
+                    .as_deref(),
+                Some("remote")
+            );
+            assert_eq!(
+                manager.servers.read().await.contains_key("remote"),
+                !cleanup_succeeds
+            );
+            assert!(pending_auth_url(&manager).await.is_none());
+            if !cleanup_succeeds {
+                assert!(matches!(
+                    handle.snapshot().state,
+                    crate::supervisor::SupervisorState::Failed
+                ));
+                *server.routes.delete_bearer.lock().unwrap() = None;
+                server.push_responses(vec![delete_ack()]);
+                assert!(manager.reload_from_configs(vec![]).await.failed.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn readding_removed_owner_reconnects_after_callback_token_delete_failure() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        let crate::supervisor::RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await
+        else {
+            panic!("OAuth recovery owner");
+        };
+        manager
+            .step_up_authorization(
+                "remote",
+                &handle,
+                &permit,
+                "Bearer error=\"insufficient_scope\", scope=\"write\"",
+            )
+            .await
+            .unwrap();
+        let state = query_params(&pending_auth_url(&manager).await.unwrap())
+            .remove("state")
+            .unwrap();
+        assert_eq!(manager.reload_from_configs(vec![]).await.failed.len(), 1);
+        manager.set_oauth_store(Arc::new(FailOnceDeleteStore {
+            inner: manager.oauth.store(),
+            fail_next: std::sync::atomic::AtomicBool::new(true),
+        }));
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        server.push_responses(vec![delete_ack()]);
+        let error = manager
+            .complete_oauth_authorization(&state, "code", Some(&server.base()))
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected token deletion failure"));
+        assert!(matches!(
+            handle.snapshot().state,
+            crate::supervisor::SupervisorState::Removed
+        ));
+        *server.routes.delete_bearer.lock().unwrap() = None;
+        server.push_responses(handshake_responses("sess-2"));
+        let result = manager
+            .reload_from_configs(vec![("remote".into(), permit.config)])
+            .await;
+        assert!(result.failed.is_empty());
+        assert_eq!(result.restarted, vec!["remote"]);
+        assert!(handle.snapshot().is_ready());
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oauth_claim_quiesces_http_stream_without_deleting_the_session() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        server.set_get_responses(vec![delayed(sse_response(": keepalive\n\n"), 30_000)]);
+        let bearer: crate::SharedBearer = Arc::default();
+        *bearer.write().unwrap() = Some("expired".into());
+        let transport = Arc::new(
+            HttpTransport::connect(
+                "remote",
+                &server.url,
+                &HashMap::new(),
+                &HttpAuth::None,
+                Arc::clone(&bearer),
+                discard_sink(),
+            )
+            .unwrap(),
+        );
+        let mut mcp = crate::McpServer {
+            name: "remote".into(),
+            transport: transport.clone(),
+            config: http_config(&server.url, HttpAuth::None),
+            tools: std::sync::RwLock::new(Vec::new()),
+            tools_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+            oauth_bearer: bearer,
+        };
+        mcp.initialize().await.unwrap();
+        mcp.list_tools().await.unwrap();
+        let abort = transport
+            .stream_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        let handle = crate::supervisor::SupervisorHandle::connected(mcp);
+        let crate::supervisor::RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await
+        else {
+            panic!("OAuth recovery owner");
+        };
+        assert!(abort.is_finished());
+        assert!(transport.stream_task.lock().unwrap().is_none());
+        assert_eq!(
+            transport.session_id.lock().unwrap().as_deref(),
+            Some("sess-1")
+        );
+        assert!(!server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.http_method() == "DELETE"));
+        *server.routes.delete_bearer.lock().unwrap() = Some("Bearer fresh".into());
+        server.push_responses(vec![delete_ack()]);
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .unwrap());
+        assert!(transport.session_id.lock().unwrap().is_none());
+        handle.remove().await.unwrap();
     }
 
     #[tokio::test]

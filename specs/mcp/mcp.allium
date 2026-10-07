@@ -273,6 +273,7 @@ rule OAuthFlowFailed {
     when: OAuthFlowFailed(srv, error)
 
     requires: srv.oauth_phase in { discovering, registering, awaiting_user }
+    requires: not authorization_removes_server(srv)
 
     ensures: srv.state = failed
     ensures: srv.last_error = error
@@ -282,6 +283,19 @@ rule OAuthFlowFailed {
         -- Cancelling the pending flow clears any surfaced authorization URL, so
         -- PendingUrlOnlyWhileUnauthorized holds once the server is `failed` and
         -- status/UI consumers do not see a stale authorize link for a dead flow.
+}
+
+rule RemovedServerAuthorizationDenied {
+    when: OAuthFlowFailed(srv, error)
+
+    requires: authorization_removes_server(srv)
+
+    ensures: PendingAuthorizationCancelled(srv)
+
+    @guidance
+        -- Retry session cleanup without reconnecting. Successful cleanup and
+        -- token deletion forget the server; either failure retains non-callable
+        -- ownership for a later removal or same-config re-addition to retry.
 }
 
 ------------------------------------------------------------
@@ -458,6 +472,7 @@ rule OAuthClientRegistered {
 rule OAuthAuthorized {
     when: OperatorCompletedAuthorization(srv, code)
 
+    requires: not authorization_removes_server(srv)
     requires: srv.oauth_phase = awaiting_user
     requires: callback_state_matches(srv, code)
     requires: redirect_issuer_valid(srv, code)
@@ -492,6 +507,26 @@ rule OAuthAuthorized {
         -- allowing its old config to overwrite the reload after cleanup.
 }
 
+rule RemovedServerAuthorized {
+    when: OperatorCompletedAuthorization(srv, code)
+
+    requires: authorization_removes_server(srv)
+    requires: srv.oauth_phase = awaiting_user
+    requires: callback_state_matches(srv, code)
+    requires: redirect_issuer_valid(srv, code)
+
+    ensures: SessionDeleted(srv)
+    ensures: not exists OAuthToken{server_name: srv.name}
+    ensures: not exists srv
+
+    @guidance
+        -- Exchange the code, apply its access token only to the retained OAuth
+        -- transport, and finish DELETE without creating a replacement. Session
+        -- cleanup failure retains retry ownership. If token deletion fails
+        -- after the session is gone, same-config re-addition reconnects the
+        -- retained removed handle instead of classifying it as unchanged.
+}
+
 -- A 401 on a previously authorized server: the access token expired or was
 -- revoked. Refresh rather than re-prompt.
 rule TokenRefreshNeeded {
@@ -509,6 +544,8 @@ rule TokenRefreshNeeded {
         -- rejected on DELETE. Concurrent recovery requests join that epoch.
         -- Cancel active calls before retaining the old session for cleanup;
         -- cancellation does not authorize replay of those other calls.
+        -- Quiesce the server-initiated HTTP stream without deleting the session,
+        -- so retained ownership does not keep reconnecting with stale credentials.
         -- A transient refresh failure retains the token and cleanup ownership
         -- while the same epoch retries; it does not discard the session.
         -- Token persistence, invalidation, and re-prompt publication share the
@@ -888,6 +925,10 @@ invariant OneTokenPerServer {
 -- Helpers
 ------------------------------------------------------------
 
+-- authorization_removes_server(srv): Bool
+--   True iff the pending authorization owns cleanup for a removed configuration,
+--   rather than reconnection. Re-adding that configuration restores reconnect intent.
+--
 -- discovered_tools(srv): List<String>
 --   The tool names from the server's tools/list response (paginated).
 --

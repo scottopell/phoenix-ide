@@ -103,6 +103,12 @@ refresh or scope step-up preparation.
 `queued_removal_uses_the_bearer_recovered_by_refresh` covers removal queued
 during token refresh. `slow_connection_does_not_block_another_servers_oauth_refresh`
 verifies that one blocked handshake does not serialize another server's recovery.
+`removed_oauth_owner_is_forgotten_after_denial_cleanup_succeeds` covers denial
+with successful and failed removal cleanup.
+`readding_removed_owner_reconnects_after_callback_token_delete_failure` covers
+re-addition after a token-store deletion error.
+`oauth_claim_quiesces_http_stream_without_deleting_the_session` verifies that
+retained sessions stop their server-initiated stream before credential recovery.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

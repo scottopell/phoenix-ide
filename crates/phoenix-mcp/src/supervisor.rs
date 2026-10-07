@@ -766,9 +766,15 @@ impl Actor {
                                 std::mem::replace(&mut self.state, SupervisorState::Recovering)
                             {
                                 self.teardown_retry
-                                    .push(RetainedTransport::OAuthRecovery(server));
+                                    .push(RetainedTransport::OAuthRecovery(Arc::clone(&server)));
+                                server
+                                    .transport
+                                    .quiesce()
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            } else {
+                                Ok(())
                             }
-                            Ok(())
                         }
                     };
                     match teardown {
