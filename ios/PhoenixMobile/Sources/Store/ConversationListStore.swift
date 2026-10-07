@@ -197,13 +197,15 @@ final class ConversationListStore {
         conversations.contains { $0.aggregateIdentity == aggregateId }
     }
 
+    private static func snapshotMetadata(name: String) -> SnapshotMetadata? {
+        DiskStore.loadVersioned(SnapshotMetadata.self, name: name, version: 2)
+            ?? DiskStore.loadVersioned(SnapshotMetadata.self, name: name, version: 1)
+    }
+
     private func hydrateIndexesFromSnapshots() {
         for name in DiskStore.listNames(prefix: "conv-") {
 
-            guard let snapshot = DiskStore.loadVersioned(
-                SnapshotMetadata.self,
-                name: name,
-                version: 1),
+            guard let snapshot = Self.snapshotMetadata(name: name),
                 let conversation = snapshot.conversation,
                 let aggregateId = conversation.product_conversation_id,
                 aggregateExists(aggregateId)

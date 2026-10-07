@@ -8,6 +8,15 @@ final class ConversationListStoreTests: XCTestCase {
         var lastRefreshed: Date
     }
 
+    private struct SnapshotV2: Codable {
+        var persistenceScope: String
+        var conversation: Conversation?
+        var messages: [Message]
+        var lastSequenceId: Int64
+        var transcriptGeneration: Int64?
+        var syncedAt: Date?
+    }
+
     private func conversation(
         id: String,
         aggregateId: String? = nil,
@@ -254,6 +263,27 @@ final class ConversationListStoreTests: XCTestCase {
         reloaded.upsert(try conversation(id: "row-1", aggregateId: "pc-1", title: "late predecessor update"))
         XCTAssertEqual(reloaded.conversations.count, 1)
         XCTAssertEqual(reloaded.conversations.first?.aggregateIdentity, "pc-1")
+    }
+
+    @MainActor
+    func testV1ListMigrationHydratesPredecessorAliasFromV2Snapshot() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-v2-snapshot-\(UUID().uuidString)")
+        let predecessor = try conversation(id: "row-1", aggregateId: "pc-1", title: "predecessor")
+        let successor = try conversation(id: "row-2", aggregateId: "pc-1", title: "successor")
+        XCTAssertTrue(DiskStore.saveVersioned(
+            LegacyCache(conversations: [successor], lastRefreshed: Date()),
+            name: "conversations", version: 1))
+        XCTAssertTrue(DiskStore.saveVersioned(
+            SnapshotV2(
+                persistenceScope: "scope", conversation: predecessor, messages: [], lastSequenceId: 0,
+                transcriptGeneration: nil, syncedAt: Date()),
+            name: "conv-row-1", version: 2))
+
+        let store = ConversationListStore()
+
+        XCTAssertEqual(store.aggregateId(forTranscriptRowId: "row-1"), "pc-1")
+        XCTAssertEqual(store.cachedTranscriptRowId(forAggregateId: "pc-1"), "row-1")
     }
 
     @MainActor

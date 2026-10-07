@@ -78,6 +78,7 @@ entity IosConversationSession {
     cache: CachedConversation with session = this
     delivery_owner: DeliveryOwner with session = this
     retry_window: RetryWindow with session = this
+    delivery_recovery_gate: DeliveryRecoveryGate with session = this
 
     transitions state {
         dormant -> connecting
