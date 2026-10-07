@@ -4324,6 +4324,16 @@ mod tests {
                 .await;
             let new = query_params(&pending_auth_url(&manager).await.unwrap());
             assert_ne!(new["state"], old["state"]);
+            let epoch = handle.snapshot().epoch;
+            let repeated = manager
+                .reload_from_configs(vec![("remote".into(), config.clone())])
+                .await;
+            assert_eq!(repeated.unchanged, vec!["remote"]);
+            assert_eq!(handle.snapshot().epoch, epoch);
+            assert_eq!(
+                query_params(&pending_auth_url(&manager).await.unwrap())["state"],
+                new["state"]
+            );
             assert!(manager
                 .complete_oauth_authorization(&old["state"], "old", Some(&server.base()))
                 .await

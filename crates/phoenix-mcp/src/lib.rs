@@ -3152,6 +3152,17 @@ impl McpClientManager {
                 }
             }
             let (handle, is_restart) = match existing {
+                Some(handle)
+                    if matches!(&handle.snapshot().recovery_target,
+                    RecoveryTarget::Reconfigure(queued) if queued == &config)
+                        && !matches!(
+                            handle.snapshot().state,
+                            SupervisorState::Failed | SupervisorState::Removed
+                        ) =>
+                {
+                    unchanged.push(name);
+                    continue;
+                }
                 Some(handle) if handle.snapshot().config == config => {
                     handle.retain_configured().await;
                     {

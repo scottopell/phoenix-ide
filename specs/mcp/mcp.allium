@@ -808,6 +808,8 @@ rule ReloadDefersConfigurationForOAuthCleanup {
 
     @guidance
         -- Queue the latest desired configuration with the recovery owner.
+        -- An identical queued configuration leaves its live authorization nonce
+        -- and recovery epoch unchanged; a failed flow still supports explicit retry.
         -- Preserve the old grant and epoch through transient refresh attempts.
         -- If authorization is pending or denied, cancel its old nonce and
         -- publish a new cleanup authorization with its challenge and scope union.
