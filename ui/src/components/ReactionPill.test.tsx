@@ -293,16 +293,24 @@ describe('reaction pill', () => {
     expect(original).not.toHaveClass('reaction-dock-reserved');
   });
 
-  it('scrolls an unpinned bottom selection above the touch dock once', async () => {
-    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 550, 200, 50));
+  it('keeps an unpinned bottom selection above the touch dock after later scrolling', async () => {
+    const listeners = new Map<string, EventListener>();
+    let rangeBottom = 600;
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockImplementation(() => new DOMRect(0, rangeBottom - 50, 200, 50));
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
       if (this.id === 'input-area') return new DOMRect(0, 580, 390, 80);
       if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
       return new DOMRect(0, 0, 390, 700);
     });
+    vi.spyOn(window, 'addEventListener').mockImplementation((type, listener) => {
+      if (typeof listener === 'function') listeners.set(type, listener);
+    });
     render(<Fixture touchDocked body="" />);
     const scroller = document.getElementById('messages')!;
     await waitFor(() => expect(scroller.scrollTop).toBe(98));
+    rangeBottom = 620;
+    act(() => listeners.get('scroll')?.(new Event('scroll')));
+    await waitFor(() => expect(scroller.scrollTop).toBe(216));
     expect(screen.getByRole('textbox')).not.toHaveFocus();
   });
 

@@ -58,7 +58,6 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     let frame = 0;
     let observedComposer: Element | null = null;
     let observedScroller: HTMLElement = scroller;
-    let selectionClearanceApplied = false;
     let observedObstructions = new Set<Element>();
     const initialComposer = document.getElementById('input-area');
     const scrollerAncestors = new Set<Element>();
@@ -82,7 +81,6 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         resize.unobserve(observedScroller);
         observedScroller = liveScroller;
         scroller = liveScroller;
-        selectionClearanceApplied = false;
         resize.observe(observedScroller);
         if (touchDocked) observedScroller.classList.add('reaction-dock-reserved');
       }
@@ -105,7 +103,8 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const bottom = viewportTop + (viewport?.height ?? window.innerHeight) - safeBottom;
       const transcript = observedScroller.getBoundingClientRect();
       const restoredRange = restoreReactionRange(source);
-      const range = restoredRange ?? (sourceRange && observedScroller.contains(sourceRange.commonAncestorContainer) ? sourceRange : null);
+      const fallbackOwner = sourceRange?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]');
+      const range = restoredRange ?? (sourceRange && fallbackOwner && observedScroller.contains(fallbackOwner) ? sourceRange : null);
       const rect = range?.getBoundingClientRect();
       if (returning.current && rect && rect.height > 0) {
         returning.current = false;
@@ -149,9 +148,8 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         }
         observedObstructions = nextObstructions;
         y = Math.min(bottom, obstructionTop) - height - 12;
-        if (!selectionClearanceApplied && visible && rect && rect.bottom > y - 12) {
+        if (visible && rect && rect.bottom > y - 12) {
           observedScroller.scrollTop += rect.bottom - (y - 12);
-          selectionClearanceApplied = true;
         }
       } else if (visible && rect) {
         x = rect.left;
