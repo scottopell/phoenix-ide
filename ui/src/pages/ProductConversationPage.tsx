@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
+import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
@@ -25,7 +26,16 @@ import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
-import { subscribeCloseSnapshotChanged } from '../notifications';
+import {
+  getProductConversationSnapshotChangeSequence,
+  getProductConversationDeleteSequence,
+  productConversationSnapshotChangedSince,
+  productConversationDeletedSince,
+  subscribeCloseSnapshotChanged,
+  subscribeProductConversationDeleted,
+  subscribeProductConversationSnapshotChanged,
+  subscribeProductConversationsReconciled,
+} from '../notifications';
 import { generateUUID } from '../utils/uuid';
 import './ProductConversationPage.css';
 
@@ -123,6 +133,7 @@ function toMessage(message: EnrichedMessage, occurrenceToken?: string): Message 
     sequence_id: message.sequence_id,
     message_type: message.message_type,
     content: message.content as Message['content'],
+    origin: message.origin,
     display_data: occurrenceToken
       ? {
         ...(((message.display_data ?? null) as Exclude<Message['display_data'], undefined>) ?? {}),
@@ -352,6 +363,7 @@ function countSnapshotMessages(snapshot: ProductConversationSnapshotView): numbe
 function chainFromSnapshot(snapshot: ProductConversationSnapshotView, qaHistory: ChainQaRow[]): ChainView {
   return {
     root_conv_id: snapshot.chain_qa_compatibility?.root_transcript_row_id ?? snapshot.requested_transcript_row_id,
+    product_conversation_id: snapshot.product_conversation_id,
     chain_name: null,
     display_name: snapshot.presentation.display_name,
     archived: snapshot.ordinary_lifecycle === 'history',
@@ -716,6 +728,9 @@ function ProductConversationHeader({
             disabled={recallDisabled}
           />
         )}
+        <AutomaticContinuationControl
+          scope={{ kind: 'ordinary', reference: snapshot.product_conversation_id }}
+        />
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
             <summary>Work</summary>
@@ -738,12 +753,18 @@ function ProductConversationPageInner() {
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
   const ownedSnapshotRef = useRef<OwnedSnapshot | null>(null);
+  const snapshotChangeSequenceRef = useRef(0);
   const snapshot = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
     ? ownedSnapshot.value
     : null;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [snapshotRetry, setSnapshotRetry] = useState(0);
+  useEffect(() => {
+    const refresh = () => setSnapshotRetry((value) => value + 1);
+    window.addEventListener('phoenix:automatic-continuation-updated', refresh);
+    return () => window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
+  }, []);
   const [openSnapshotGeneration, setOpenSnapshotGeneration] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
@@ -754,6 +775,8 @@ function ProductConversationPageInner() {
   const [historyGeneration, setHistoryGeneration] = useState(0);
   const [restoreCommand, setRestoreCommand] = useState<TranscriptPositioningInput | null>(null);
   const routeGenerationRef = useRef(0);
+  const aggregateDeletedRef = useRef(false);
+  const pendingAuthoritativeIdentitiesRef = useRef<ReadonlySet<string> | null>(null);
   const openMeasurementRef = useRef<ProductConversationOpenMeasurement | null>(null);
   if (openMeasurementRef.current?.routeReference !== productConversationId) {
     openMeasurementRef.current = productConversationId ? {
@@ -789,6 +812,8 @@ function ProductConversationPageInner() {
 
   useEffect(() => {
     routeGenerationRef.current += 1;
+    aggregateDeletedRef.current = false;
+    pendingAuthoritativeIdentitiesRef.current = null;
     paginationRequestRef.current += 1;
     setLatestProjection(null);
     setRestoreCommand(null);
@@ -799,11 +824,18 @@ function ProductConversationPageInner() {
 
   useEffect(() => {
     if (!productConversationId) return;
+    if (aggregateDeletedRef.current) {
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
     const isBackgroundRefresh = ownedSnapshotRef.current?.productConversationId === productConversationId;
     if (!isBackgroundRefresh) setLoading(true);
     setError(null);
     setOlderError(null);
+    const snapshotChangeSequence = getProductConversationSnapshotChangeSequence();
+    const deleteSequence = getProductConversationDeleteSequence();
+    snapshotChangeSequenceRef.current = snapshotChangeSequence;
 
     const candidateMeasurement = openMeasurementRef.current;
     const measurement = candidateMeasurement && !candidateMeasurement.reported
@@ -818,7 +850,18 @@ function ProductConversationPageInner() {
       : api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
     request
       .then((next) => {
-        if (cancelled) return;
+        if (cancelled || aggregateDeletedRef.current) return;
+        if (productConversationDeletedSince([
+          productConversationId,
+          next.product_conversation_id,
+          ...next.segments.map((segment) => segment.transcript_row_id),
+        ], deleteSequence)) {
+          aggregateDeletedRef.current = true;
+          setOwnedSnapshot(null);
+          setLatestProjection(null);
+          setError('This product conversation was deleted.');
+          return;
+        }
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
         setOwnedSnapshot((current) => ({
@@ -828,13 +871,29 @@ function ProductConversationPageInner() {
             : next,
         }));
         if (!isBackgroundRefresh) setHistoryGeneration(0);
+        if (next.product_conversation_id !== productConversationId
+          && productConversationSnapshotChangedSince(
+            next.product_conversation_id,
+            snapshotChangeSequence,
+          )) {
+          setSnapshotRetry((retry) => retry + 1);
+        }
       })
       .catch((err) => {
         if (cancelled) return;
         if (measurement && openMeasurementRef.current === measurement) {
           measurement.request = undefined;
         }
-        setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
+        if (err instanceof ApiResponseError && err.status === 404 && isBackgroundRefresh) {
+          aggregateDeletedRef.current = true;
+          routeGenerationRef.current += 1;
+          paginationRequestRef.current += 1;
+          setOwnedSnapshot(null);
+          setLatestProjection(null);
+          setError('This product conversation was deleted.');
+        } else {
+          setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -843,6 +902,70 @@ function ProductConversationPageInner() {
       cancelled = true;
     };
   }, [productConversationId, snapshotRetry]);
+
+  useEffect(() => {
+    const canonicalId = snapshot?.product_conversation_id;
+    const identities = new Set([
+      productConversationId,
+      canonicalId,
+    ].filter((identity): identity is string => Boolean(identity)));
+    let refreshed = false;
+    const refresh = () => {
+      if (refreshed) return;
+      refreshed = true;
+      setSnapshotRetry((retry) => retry + 1);
+    };
+    const unsubscribes = [...identities].map((identity) => (
+      subscribeProductConversationSnapshotChanged(identity, refresh)
+    ));
+    if (canonicalId && canonicalId !== productConversationId
+      && productConversationSnapshotChangedSince(
+        canonicalId,
+        snapshotChangeSequenceRef.current,
+      )) {
+      refresh();
+    }
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [productConversationId, snapshot?.product_conversation_id, snapshotRetry]);
+
+  useEffect(() => {
+    const identities = new Set([
+      productConversationId,
+      snapshot?.product_conversation_id,
+      snapshot?.latest_transcript_row_id,
+      snapshot?.canonical_root.transcript_row_id,
+      ...((snapshot?.segments ?? []).map((segment) => segment.transcript_row_id)),
+    ].filter((id): id is string => Boolean(id)));
+    return subscribeProductConversationDeleted(identities, () => {
+      aggregateDeletedRef.current = true;
+      routeGenerationRef.current += 1;
+      paginationRequestRef.current += 1;
+      setOwnedSnapshot(null);
+      setLatestProjection(null);
+      setLoading(false);
+      setError('This product conversation was deleted.');
+    });
+  }, [productConversationId, snapshot]);
+
+  useEffect(() => subscribeProductConversationsReconciled((authoritativeIdentities) => {
+    const canonicalId = snapshot?.product_conversation_id;
+    if (!canonicalId) {
+      pendingAuthoritativeIdentitiesRef.current = authoritativeIdentities;
+      return;
+    }
+    pendingAuthoritativeIdentitiesRef.current = null;
+    if (authoritativeIdentities.has(canonicalId)) return;
+    setSnapshotRetry((retry) => retry + 1);
+  }), [snapshot?.product_conversation_id]);
+
+  useEffect(() => {
+    const canonicalId = snapshot?.product_conversation_id;
+    const authoritativeIdentities = pendingAuthoritativeIdentitiesRef.current;
+    if (!canonicalId || !authoritativeIdentities) return;
+    pendingAuthoritativeIdentitiesRef.current = null;
+    if (authoritativeIdentities.has(canonicalId)) return;
+    setSnapshotRetry((retry) => retry + 1);
+  }, [snapshot?.product_conversation_id]);
 
   useEffect(() => {
     const notificationIds = new Set([

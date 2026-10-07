@@ -18,6 +18,7 @@ vi.mock('../api', async (importOriginal) => {
 });
 
 import { ProcessInspectorPanel } from './ProcessInspectorPanel';
+import { accumulateOutputEntries, MAX_OUTPUT_ENTRIES, type OutputEntry } from './ProcessInspectorPanel.output';
 
 const getInsp = vi.mocked(api.getBashHandleInspection);
 
@@ -54,6 +55,44 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+function outputEntries(from: number, count: number): OutputEntry[] {
+  return Array.from({ length: count }, (_, index) => ({ kind: 'line', offset: from + index, text: `line-${from + index}` }));
+}
+
+describe('accumulateOutputEntries', () => {
+  it('keeps all entries below capacity', () => {
+    const prior = outputEntries(0, 2);
+    const incoming = outputEntries(2, 3);
+    expect(accumulateOutputEntries(prior, incoming)).toEqual([...prior, ...incoming]);
+  });
+
+  it('keeps the full window at exact capacity', () => {
+    const entries = outputEntries(0, MAX_OUTPUT_ENTRIES);
+    expect(accumulateOutputEntries([], entries)).toEqual(entries);
+  });
+
+  it('drops the oldest entry one over capacity', () => {
+    const entries = outputEntries(0, MAX_OUTPUT_ENTRIES + 1);
+    expect(accumulateOutputEntries([], entries)).toEqual(entries.slice(1));
+  });
+
+  it('trims an incoming batch larger than capacity to its newest entries', () => {
+    const incoming = outputEntries(0, MAX_OUTPUT_ENTRIES + 7);
+    expect(accumulateOutputEntries([], incoming)).toEqual(incoming.slice(-MAX_OUTPUT_ENTRIES));
+  });
+
+  it('preserves the prior array on an empty update', () => {
+    const prior = outputEntries(0, 2);
+    expect(accumulateOutputEntries(prior, [])).toBe(prior);
+  });
+
+  it('preserves newest ordering across accumulated updates', () => {
+    const first = outputEntries(0, 3);
+    const second = outputEntries(3, 2);
+    expect(accumulateOutputEntries(first, second).map((entry) => entry.kind === 'line' ? entry.offset : -1)).toEqual([0, 1, 2, 3, 4]);
+  });
+});
+
 describe('ProcessInspectorPanel — output accumulation', () => {
   it('seeds with no `since`, then polls with `since = end_offset`, appending lines', async () => {
     getInsp
@@ -76,9 +115,11 @@ describe('ProcessInspectorPanel — output accumulation', () => {
 
     // Poll call advances `since` to the prior `end_offset` (2).
     expect(getInsp).toHaveBeenLastCalledWith('b-1', 'conv-1', 2);
-    // Prior lines retained, new line appended.
+    // Prior lines retained, new line appended in stable output order.
     expect(screen.getByText('first')).toBeTruthy();
     expect(screen.getByText('third')).toBeTruthy();
+    const renderedLines = Array.from(document.querySelectorAll('.pinsp-output-line:not(.pinsp-output-line--partial)'));
+    expect(renderedLines.map((line) => line.textContent)).toEqual(['first', 'second', 'third']);
   });
 
   it('renders the live partial as a trailing in-progress line, replaced (not appended) each poll', async () => {
@@ -169,50 +210,6 @@ describe('ProcessInspectorPanel — output accumulation', () => {
 
     // Only the seed fetch — no polling on a terminal handle.
     expect(getInsp).toHaveBeenCalledTimes(1);
-  });
-
-  it('caps accumulated entries at the scrollback bound, dropping the oldest while keeping the newest', async () => {
-    const CAP = 5000;
-    // Seed with one line, then drive enough polls that the running total of
-    // appended lines exceeds the UI cap.
-    getInsp.mockResolvedValueOnce(
-      snap({ output: { start_offset: 0, end_offset: 1, truncated_before: false, lines: lines([0, 'line-0']) } }),
-    );
-
-    await renderPanel();
-    expect(screen.getByText('line-0')).toBeTruthy();
-
-    // One poll delivers a batch large enough to exceed CAP in a single update,
-    // so the sliding-window trim is exercised with exactly one re-render. The
-    // earlier shape (seven polls each re-rendering a growing multi-thousand-row
-    // DOM) is what made this test time out under load — not the cap logic — so
-    // we drive the same trim deterministically with a single batch.
-    const BATCH = CAP + 1000; // seed + batch = CAP + 1001 observed, > CAP
-    const batch: [number, string][] = [];
-    let offset = 1;
-    for (let i = 0; i < BATCH; i++) {
-      batch.push([offset, `line-${offset}`]);
-      offset++;
-    }
-    getInsp.mockResolvedValueOnce(
-      snap({ output: { start_offset: 1, end_offset: offset, truncated_before: false, lines: lines(...batch) } }),
-    );
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1000);
-    });
-
-    const total = 1 + BATCH; // CAP + 1001
-    const newest = total - 1; // last offset observed
-    // The newest line is retained…
-    expect(screen.getByText(`line-${newest}`)).toBeTruthy();
-    // …the line exactly at the cap boundary (the oldest survivor) is retained…
-    expect(screen.getByText(`line-${total - CAP}`)).toBeTruthy();
-    // …and lines older than the cap window are dropped.
-    expect(screen.queryByText('line-0')).toBeNull();
-    expect(screen.queryByText(`line-${total - CAP - 1}`)).toBeNull();
-    // Exactly CAP line rows remain.
-    const rendered = document.querySelectorAll('.pinsp-output-line:not(.pinsp-output-line--partial)');
-    expect(rendered.length).toBe(CAP);
   });
 
   it('stays pinned to the bottom on a partial-only update while following (no new full lines)', async () => {

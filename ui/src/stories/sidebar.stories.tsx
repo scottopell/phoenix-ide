@@ -21,3 +21,6 @@ ExpandedEmptyProject.storyName = 'expanded-empty-project';
 
 export const CollapsedOverflow = storyFor('collapsed-overflow');
 CollapsedOverflow.storyName = 'collapsed-overflow';
+
+export const ProductActionsContinued = storyFor('product-actions-continued');
+ProductActionsContinued.storyName = 'product-actions-continued';

@@ -4,10 +4,16 @@
   height: 100dvh;
   min-height: 0;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
   color: var(--text-primary);
 }
 
-.coordinator-conversation,
+.coordinator-conversation {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .coordinator-conversation #app {
   height: 100%;
   min-height: 0;
@@ -36,4 +42,150 @@
 
 .coordinator-error {
   color: var(--accent-red);
+}
+
+.global-statebar-summary {
+  display: flex;
+  min-width: 0;
+  gap: 10px;
+  overflow: hidden;
+  align-items: center;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.global-statebar-summary > span {
+  flex: 0 0 auto;
+}
+
+.global-statebar-summary__auto {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.global-statebar-activity__details {
+  display: grid;
+  gap: 8px;
+}
+
+.global-active-watches {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.global-active-watch {
+  display: grid;
+  gap: 3px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-color);
+}
+
+.global-active-watch > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.global-active-watch code,
+.global-active-watch span {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.global-activity-metadata {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.global-activity-metadata summary {
+  cursor: pointer;
+}
+
+.global-activity-metadata code {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.global-live-commands {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.global-live-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.global-live-command > div {
+  display: grid;
+  min-width: 0;
+}
+
+.global-live-command code {
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-live-command > div > span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-live-command-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.global-live-command a {
+  color: var(--accent-blue);
+  white-space: nowrap;
+}
+
+.global-live-command button {
+  min-width: 44px;
+  min-height: 44px;
+  color: var(--accent-red);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.global-live-commands-error {
+  margin: 0;
+  color: var(--accent-red);
+  font-size: 0.85rem;
+}
+
+@media (width <= 768px) {
+  .global-statebar-summary {
+    gap: 4px;
+    font-size: max(0.68rem, 10px);
+  }
 }

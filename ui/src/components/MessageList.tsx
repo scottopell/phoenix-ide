@@ -9,6 +9,7 @@ import {
   forwardRef,
   useImperativeHandle,
 } from 'react';
+import { inputOriginPresentation } from '../conversation/inputOriginPresentation';
 import { useDensity } from '../hooks/useDensity';
 import { useLiveBashProgressForToolIds } from '../conversation';
 import {
@@ -172,6 +173,7 @@ const MessageSquareIcon = () => (
 );
 
 interface MessageListProps {
+  sourceCallTarget?: { messageId: string; toolUseId: string } | null;
   messages: Message[];
   pendingMessages: PendingUserMessage[];
   convState: ConversationState;
@@ -317,9 +319,9 @@ function renderHistoricalUnit(
       const c = unit.message.content as { name?: string; trigger?: string; args?: string; source?: string; snippet?: string; files?: { original_name: string; size_bytes: number; stored_path?: string }[] };
       const trigger = c.trigger?.trim() || [c.name ? `/${c.name}` : '/skill', c.args?.trim()].filter(Boolean).join(' ');
       return (
-        <div id={`message-${unit.message.message_id}`} className="message user" data-sequence-id={unit.message.sequence_id}>
+        <div id={`message-${unit.message.message_id}`} className={`message ${inputOriginPresentation(unit.message.origin).className}`} data-sequence-id={unit.message.sequence_id}>
           <div className="message-header">
-            <span className="message-sender">You</span>
+            <span className="message-sender">{inputOriginPresentation(unit.message.origin).label}</span>
             {unit.message.created_at && (
               <span className="message-time" title={new Date(unit.message.created_at).toLocaleString()}>
                 {formatMessageTime(unit.message.created_at)}
@@ -372,6 +374,22 @@ function renderHistoricalUnit(
           {...(onRevealHandled ? { onRevealHandled } : {})}
         />
       );
+    case 'continuation': {
+      const summary = (unit.message.content as { summary?: string })?.summary;
+      if (!summary) return null;
+      const revealedSummary = activeHighlight?.owner === 'message-text'
+        ? renderHighlightedText(summary, activeHighlight.start, activeHighlight.end)
+        : undefined;
+      return (
+        <div id={`message-${unit.message.message_id}`}>
+          <CompletedContinuationBoundary
+            summary={summary}
+            revealedSummary={revealedSummary}
+            revealSummary={revealedSummary !== undefined}
+          />
+        </div>
+      );
+    }
     case 'system': {
       const displayData = unit.message.display_data as ProductHistoricalHandoffDisplayData | null;
       if (displayData?.hidden) return null;
@@ -534,6 +552,7 @@ function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (
 }
 
 function MessageListImpl({
+  sourceCallTarget,
   messages,
   pendingMessages,
   convState,
@@ -653,6 +672,16 @@ function MessageListImpl({
     [conversationId],
   );
   const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
+  const sourceToolId = sourceCallTarget?.toolUseId ?? null;
+  const sourceMessageId = sourceCallTarget?.messageId ?? null;
+  const sourceRevealRequest = useMemo<AgentTextRevealRequest | null>(() => {
+    const sourceUnit = sourceMessageId ? findHistoricalUnitLocationByMessageId(historicalUnits, sourceMessageId) : null;
+    return sourceUnit && sourceToolId ? {
+      unitKey: historicalUnits[sourceUnit.unitIndex]!.key, fragmentId: 'tool-use-input',
+      revealTarget: { kind: 'tool-use-input', toolUseId: sourceToolId, fragmentId: 'tool-use-input' }, nonce: 0,
+    } : null;
+  }, [historicalUnits, sourceMessageId, sourceToolId]);
+
   const [findRevealVersion, setFindRevealVersion] = useState(0);
   const handleFindCommands = useCallback((commands: readonly FindSessionCommand<ConversationSearchMatchTarget, HTMLElement | null>[]) => {
     commands.forEach((command) => {
@@ -1411,10 +1440,19 @@ function MessageListImpl({
     scrollToUnitIndex(
       location.unitIndex,
       grouped ? location.memberMessageId : undefined,
-      grouped ? location.toolUseId : undefined,
+      sourceToolId ?? (grouped ? location.toolUseId : undefined),
     );
     return true;
-  }, [historicalUnits, scrollToUnitIndex]);
+  }, [historicalUnits, scrollToUnitIndex, sourceToolId]);
+
+  const revealedSourceRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = sourceMessageId && sourceToolId ? `${sourceMessageId}:${sourceToolId}` : null;
+    if (!key) { revealedSourceRef.current = null; return; }
+    if (revealedSourceRef.current !== key && sourceMessageId && scrollToMessageId(sourceMessageId)) {
+      revealedSourceRef.current = key;
+    }
+  }, [sourceMessageId, sourceToolId, scrollToMessageId]);
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
@@ -1543,13 +1581,13 @@ function MessageListImpl({
                 ...(unit.kind === 'tool_only_agent_turn_group' && location
                   ? { memberMessageId: location.memberMessageId }
                   : {}),
-                ...(unit.kind === 'tool_only_agent_turn_group' && location?.toolUseId
-                  ? { toolUseId: location.toolUseId }
+                ...((sourceToolId || (unit.kind === 'tool_only_agent_turn_group' && location?.toolUseId))
+                  ? { toolUseId: sourceToolId ?? location!.toolUseId }
                   : {}),
               };
               const grouped = unit.kind === 'tool_only_agent_turn_group';
-              const targetSelector = grouped && location?.toolUseId
-                ? `[data-tool-id="${CSS.escape(location.toolUseId)}"]`
+              const targetSelector = sourceToolId || (grouped && location?.toolUseId)
+                ? `[data-tool-id="${CSS.escape(sourceToolId ?? location!.toolUseId!)}"]`
                 : grouped && location
                   ? `#message-${CSS.escape(location.memberMessageId)}, [data-message-id="${CSS.escape(location.memberMessageId)}"]`
                   : undefined;
@@ -1582,6 +1620,7 @@ function MessageListImpl({
                   effect.command.targetMessageId,
                 );
                 const unit = historicalUnits[effect.targetIndex];
+                if (sourceToolId) return `[data-tool-id="${CSS.escape(sourceToolId)}"]`;
                 if (unit?.kind !== 'tool_only_agent_turn_group' || !location) return undefined;
                 return location.toolUseId
                   ? `[data-tool-id="${CSS.escape(location.toolUseId)}"]`
@@ -1621,7 +1660,7 @@ function MessageListImpl({
           break;
       }
     }
-  }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted]);
+  }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted, sourceToolId]);
 
   const dispatchTranscriptPositioning = useCallback((event: TranscriptPositioningEvent) => {
     const next = reduceTranscriptPositioning(transcriptPositioningStateRef.current, event);
@@ -1763,7 +1802,7 @@ function MessageListImpl({
           unit.kind !== 'sub_agent_status'
             && unit.kind !== 'streaming_agent'
             && agentTurnsInHistoricalUnit(unit).some((member) => member.key === latestAgentKey),
-          pendingRevealRequest && pendingRevealRequest.unitKey === unit.key ? pendingRevealRequest : null,
+          sourceRevealRequest?.unitKey === unit.key ? sourceRevealRequest : pendingRevealRequest && pendingRevealRequest.unitKey === unit.key ? pendingRevealRequest : null,
           activeFindHighlight && activeFindHighlight.unitKey === unit.key
             ? (
                 activeFindRevealTarget?.kind === 'agent-text'
@@ -1787,7 +1826,7 @@ function MessageListImpl({
         )}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pendingRevealRequest, activeFindHighlight, activeFindRevealTarget, handleRevealHandled, pulseMountedRow],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, sourceRevealRequest, pendingRevealRequest, activeFindHighlight, activeFindRevealTarget, handleRevealHandled, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(

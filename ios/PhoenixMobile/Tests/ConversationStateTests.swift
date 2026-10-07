@@ -56,7 +56,7 @@ final class ConversationStateTests: XCTestCase {
 
     func testAwaitingUserResponseCarriesTypedQuestions() {
         let raw = """
-        {"type":"awaiting_user_response",
+        {"type":"awaiting_user_response","request_id":"request-q2",
          "questions":[{"question":"Which db?","header":"DB",
                        "options":[{"label":"sqlite","description":"file-backed"},
                                   {"label":"postgres","description":""}],
@@ -76,7 +76,18 @@ final class ConversationStateTests: XCTestCase {
                 UserQuestion(
                     question: "Which features?", header: "Feat",
                     options: [], multiSelect: true),
-            ]))
+            ], requestId: "request-q2"))
+    }
+
+    func testLegacyAwaitingUserResponsePreservesAbsentRequestIdentity() {
+        for raw in [
+            "{\"type\":\"awaiting_user_response\",\"questions\":[]}",
+            "{\"type\":\"awaiting_user_response\",\"request_id\":null,\"questions\":[]}",
+        ] {
+            XCTAssertEqual(
+                parse(raw),
+                .awaitingUserResponse(questions: [], requestId: nil))
+        }
     }
 
     func testAwaitingTaskApprovalCarriesTitlePriorityPlan() {
@@ -95,9 +106,11 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(
             parse("{\"type\":\"awaiting_recovery\",\"message\":\"Retrying\"}"),
             .awaitingRecovery(message: "Retrying"))
-        XCTAssertEqual(parse("{\"type\":\"provisioning\"}"), .provisioning)
+        XCTAssertEqual(
+            parse("{\"type\":\"provisioning\",\"job_id\":\"creation-job\"}"),
+            .provisioning(jobId: "creation-job"))
         XCTAssertTrue(ConversationState.awaitingRecovery(message: "Retrying").isCancellable)
-        XCTAssertTrue(ConversationState.provisioning.isCancellable)
+        XCTAssertTrue(ConversationState.provisioning(jobId: "creation-job").isCancellable)
     }
 
     func testErrorCarriesMessage() {
@@ -250,13 +263,20 @@ final class ConversationStateTests: XCTestCase {
     }
 
     func testQuestionActionUnlocksWhenPromptIdentityChanges() {
-        let original = ConversationState.awaitingUserResponse(questions: [
-            UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
-        ])
-        let followUp = ConversationState.awaitingUserResponse(questions: [
-            UserQuestion(question: "Next?", header: "Two", options: [], multiSelect: false),
-        ])
-        let action = ConversationAction.respondToQuestions(answers: ["First?": "yes"])
+        let original = ConversationState.awaitingUserResponse(
+            questions: [
+                UserQuestion(
+                    question: "Same?", header: "One", options: [], multiSelect: false),
+            ],
+            requestId: "request-q1")
+        let followUp = ConversationState.awaitingUserResponse(
+            questions: [
+                UserQuestion(
+                    question: "Same?", header: "One", options: [], multiSelect: false),
+            ],
+            requestId: "request-q2")
+        let action = ConversationAction.respondToQuestions(
+            requestId: "request-q1", answers: ["Same?": "yes"])
 
         XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
             action: action, origin: original, current: original))
@@ -280,7 +300,8 @@ final class ConversationStateTests: XCTestCase {
                 .acceptsChatMessage)
         XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).acceptsChatMessage)
         XCTAssertFalse(
-            ConversationState.awaitingUserResponse(questions: []).acceptsChatMessage)
+            ConversationState.awaitingUserResponse(
+                questions: [], requestId: nil).acceptsChatMessage)
         XCTAssertFalse(
             ConversationState.awaitingTaskApproval(title: "", priority: "", plan: "")
                 .acceptsChatMessage)

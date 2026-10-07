@@ -46,6 +46,7 @@ pub enum PersistError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SteeringDrainMessage {
     pub content: MessageContent,
+    pub origin: phoenix_core::domain::db_schema::InputOrigin,
     pub display_data: Option<Value>,
     pub usage_data: Option<UsageData>,
     pub message_id: String,
@@ -118,6 +119,11 @@ pub enum Effect {
         /// extra `message_exists` query.
         idempotent: bool,
     },
+    /// User input accepted by a parent interaction (approval feedback or question response).
+    PersistUserInputMessage {
+        content: MessageContent,
+        message_id: String,
+    },
     PersistAuthoritativeUserMessage {
         payload: PreparedDirectTurnPayload,
         authority: DirectTurnAttemptAuthority,
@@ -165,7 +171,10 @@ pub enum Effect {
     AbortLlm,
 
     /// Cancel all pending sub-agents
-    CancelSubAgents { ids: Vec<String> },
+    CancelSubAgents {
+        ids: Vec<String>,
+        cause: crate::event::CancelCause,
+    },
 
     /// Notify parent of sub-agent completion (sub-agent only)
     NotifyParent { outcome: SubAgentOutcome },
@@ -241,13 +250,13 @@ pub enum Effect {
     /// Notify client of context exhaustion - REQ-BED-021
     NotifyContextExhausted { summary: String },
 
-    /// Execute git operations for task approval (REQ-BED-028).
+    /// Adopt an approved task in the current conversation (REQ-BED-028).
     ///
-    /// `task_file` (relative to the conversation cwd) is the canonical
-    /// source: the executor reads it from disk to derive task id, slug,
-    /// priority, and status, then sets up the branch and worktree. The
-    /// remaining fields are the snapshot the user approved and are used for
-    /// the user-facing branch announcement message.
+    /// `task_file` (relative to the conversation cwd) is the canonical source:
+    /// the executor reads it from disk to derive task id, slug, priority, and
+    /// status, then sets up the branch and worktree. The remaining fields are
+    /// the snapshot the user approved and are used for the user-facing branch
+    /// announcement message.
     ApproveTask {
         task_file: String,
         title: String,
@@ -315,6 +324,7 @@ impl Effect {
     ) -> Self {
         let text = text.into();
         let submitted = SubmittedDirectTurnIdentity {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: text.clone(),
             images: images.clone(),
             files: files.clone().into_iter().map(Into::into).collect(),

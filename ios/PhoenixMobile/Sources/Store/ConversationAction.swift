@@ -27,9 +27,9 @@ enum ConversationAction: Equatable {
     case provideTaskFeedback(TaskFeedback)
     /// Answer the agent's questions (awaiting_user_response). Answers are
     /// keyed by question text, encoded per QuestionAnswers.
-    case respondToQuestions(answers: [String: String])
+    case respondToQuestions(requestId: String?, answers: [String: String])
     /// Dismiss the questions without answering and return the conversation to idle.
-    case dismissQuestion
+    case dismissQuestion(requestId: String?)
 
     var waitsForAuthoritativeStateChange: Bool {
         true
@@ -40,6 +40,8 @@ enum ConversationAction: Equatable {
 enum ClientOperation {
     case chat
     case archive
+    case close
+    case delete
     case conversationAction(ConversationAction)
 
     enum DeliveryPolicy: Equatable {
@@ -51,7 +53,7 @@ enum ClientOperation {
         switch self {
         case .chat:
             return .outboxed
-        case .archive, .conversationAction:
+        case .archive, .close, .delete, .conversationAction:
             return .onlineOnly
         }
     }

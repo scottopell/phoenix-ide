@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { generateUUID } from '../utils/uuid';
-import type { FileAttachment, ImageData, QueuedSteeringMessage } from '../api';
+import type { FileAttachment, ImageData, InputOrigin, QueuedSteeringMessage } from '../api';
 
 /**
  * A queued message is either:
@@ -30,6 +30,8 @@ export interface QueuedMessage {
   text: string;
   images: ImageData[];
   files?: FileAttachment[];
+  /** Trusted origin assigned when the local API boundary accepts the send. */
+  origin?: InputOrigin;
   timestamp: number;
   status: MessageStatus;
   /** Last authoritative phase-event sequence before steering acceptance. */
@@ -39,6 +41,7 @@ export interface QueuedMessage {
 /** The exact data needed to render a not-yet-delivered user bubble. */
 export interface PendingUserMessage {
   localId: string;
+  origin?: InputOrigin;
   text: string;
   images: ImageData[];
   files?: FileAttachment[];
@@ -81,14 +84,19 @@ export function deriveDisplayedPendingMessages(
   );
   const renderAuthoritative = (message: QueuedSteeringMessage): PendingUserMessage => ({
     localId: message.message_id,
+    origin: message.origin ?? { kind: 'unknown_historical' },
     text: message.text,
     images: message.images,
     files: message.files,
     status: 'steering_queued',
   });
-  const unmatchedLocal = localPendingMessages.filter(
-    (message) => !authoritativeIds.has(message.localId),
-  );
+  const unmatchedLocal = localPendingMessages
+    .filter((message) => !authoritativeIds.has(message.localId))
+    // Local optimistic entries are admitted by this client through the user
+    // API boundary. Do not let a missing legacy field turn steering into an
+    // historical server-originated input; authoritative queue entries above
+    // retain the server's exact origin, including unknown_historical.
+    .map((message) => ({ ...message, origin: message.origin ?? { kind: 'user_api' as const } }));
   return [
     ...unmatchedLocal.filter((message) => message.status === 'accepted'),
     ...steeringMessages.map(renderAuthoritative),
@@ -136,7 +144,11 @@ function loadQueueFromStorage(conversationId: string | undefined): QueuedMessage
     const parsed = JSON.parse(stored) as QueuedMessage[];
     // Keep only entries tagged for this conversation; drop foreign-tagged and
     // untagged rows (spec rule RehydrateQueueForConversationOnly).
-    return parsed.filter((m) => m.conversationId === conversationId);
+    return parsed
+      .filter((m) => m.conversationId === conversationId)
+      // Optimistic sends cross a reload before the server can echo them. The
+      // local admission boundary is the trusted source for their channel.
+      .map((m) => ({ ...m, origin: m.origin ?? { kind: 'user_api' as const } }));
   } catch (error) {
     console.warn('Error reading message queue from localStorage:', error);
     return [];
@@ -228,6 +240,7 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
       files,
       timestamp: Date.now(),
       status: 'pending',
+      origin: { kind: 'user_api' },
     };
     updateMessages(prev => [...prev, msg]);
     return msg;

@@ -30,8 +30,9 @@ use crate::sqlite_telemetry::{
 use crate::sqlite_workload::{SqliteAccessKind, SqliteWorkloadCategory, SqliteWorkloadCollector};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::db_schema::{Message, MessageType};
+use phoenix_core::domain::db_schema::{InputOrigin, Message, MessageType};
 use phoenix_core::domain::message_text::index_text;
+use serde::Serialize;
 use sqlx::{Connection, Row, SqlitePool};
 use thiserror::Error;
 
@@ -143,6 +144,12 @@ impl RetrievalRequest {
         self.match_mode
     }
 
+    #[must_use]
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
     /// Maximum number of results returned after policy application.
     #[must_use]
     pub fn limit(&self) -> usize {
@@ -154,7 +161,7 @@ impl RetrievalRequest {
 /// message in the lexical backend (`ordinal` 0, `char_range` `None`); a
 /// chunking backend assigns a distinct ordinal/range per chunk. Present
 /// unconditionally so the result shape is stable across backends.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChunkRef {
     /// 0 for a whole-message chunk.
     pub ordinal: u32,
@@ -163,7 +170,7 @@ pub struct ChunkRef {
 }
 
 /// One ranked retrieval result, carrying provenance (REQ-RET-006).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RetrievedChunk {
     /// Source conversation.
     pub conversation_id: String,
@@ -173,6 +180,8 @@ pub struct RetrievedChunk {
     pub chunk: ChunkRef,
     /// Role of the source message.
     pub message_type: MessageType,
+    /// Server-recorded source of the message, not inferred from its role.
+    pub origin: InputOrigin,
     /// When the source message was written.
     pub created_at: DateTime<Utc>,
     /// Display/assembly snippet around the match.
@@ -260,6 +269,12 @@ pub struct Fts5Retriever {
 }
 
 impl Fts5Retriever {
+    /// The backend lexical expression generated from this natural-language request.
+    #[must_use]
+    pub fn lexical_expression(request: &RetrievalRequest) -> Option<String> {
+        build_fts_query(&request.query, request.match_mode)
+    }
+
     /// Build a retriever over the given pool. Call [`Self::reconcile`] once at
     /// startup to bring the index in line with `messages`.
     #[must_use]
@@ -339,7 +354,7 @@ impl Fts5Retriever {
         .fetch_one(&self.pool)
         .await?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at FROM messages",
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id FROM messages",
         )
         .try_map(crate::parse_message_row)
         .fetch_all(&self.pool)
@@ -393,7 +408,7 @@ impl Fts5Retriever {
     ) -> Result<FtsMessageReconcileOutcome, RetrievalError> {
         let mut tx = self.pool.begin().await?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(&planned_message.message_id)
@@ -497,6 +512,123 @@ impl Fts5Retriever {
     }
 }
 
+fn build_retrieval_sql(
+    request: &RetrievalRequest,
+    raw_prefix_guard: Option<(&str, Option<&str>)>,
+) -> String {
+    let (scope_ids, excluding): (&[String], bool) = match &request.scope {
+        RetrievalScope::Global => (&[], false),
+        RetrievalScope::GlobalExcluding(ids) => (ids, true),
+        RetrievalScope::Conversations(ids) => (ids, false),
+    };
+
+    let mut sql = String::from(
+        "WITH ranked_hits AS (\
+             SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
+                    meta.message_type, meta.created_at, source.origin_kind, \
+                    source.origin_product_conversation_id, source.origin_transcript_id, \
+                    source.origin_subscription_event_id, source.origin_source_message_id, source.origin_source_tool_use_id, c.transcript_generation, \
+                    (SELECT COUNT(*) FROM messages count_source WHERE count_source.conversation_id = c.id) AS message_count, \
+                    snippet(message_fts, 0, '', '', '…', 24) AS snippet, \
+                    bm25(message_fts) AS score",
+    );
+    sql.push_str(
+        " FROM message_fts \
+           JOIN message_fts_rows meta ON meta.fts_rowid = message_fts.rowid \
+           JOIN messages source ON source.message_id = meta.message_id \
+           JOIN conversations c ON c.id = meta.conversation_id \
+           WHERE message_fts MATCH ? \
+             AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
+    );
+    if request.visibility == RetrievalVisibility::UserTopLevel {
+        sql.push_str(
+            " AND c.user_initiated = 1 AND c.runtime_role = 'user' \
+              AND c.parent_conversation_id IS NULL \
+              AND NOT (c.archived = 1 AND EXISTS (\
+                  SELECT 1 FROM conversation_creation_jobs j \
+                  WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
+              ))",
+        );
+    }
+    if let Some((_, earlier_expr)) = raw_prefix_guard {
+        if earlier_expr.is_some() {
+            sql.push_str(
+                " AND (message_fts.rowid IN (\
+                    SELECT rowid FROM message_fts WHERE message_fts MATCH ?\
+                  ) OR instr(lower(message_fts.text), ?) > 0)",
+            );
+        } else {
+            sql.push_str(" AND instr(lower(message_fts.text), ?) > 0");
+        }
+    }
+    if !scope_ids.is_empty() {
+        if excluding {
+            sql.push_str(" AND meta.conversation_id NOT IN (");
+        } else {
+            sql.push_str(" AND +meta.conversation_id IN (");
+        }
+        for i in 0..scope_ids.len() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+        }
+        sql.push(')');
+    }
+    sql.push(')');
+    match request.grouping {
+        RetrievalGrouping::None => {
+            sql.push_str(
+                " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
+                  FROM ranked_hits \
+                  ORDER BY score, created_at DESC \
+                  LIMIT ?",
+            );
+        }
+        RetrievalGrouping::BestPerConversation => {
+            sql.push_str(
+                ", grouped_hits AS (\
+                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score, \
+                            ROW_NUMBER() OVER (\
+                                PARTITION BY conversation_id \
+                                ORDER BY score, created_at DESC, message_id\
+                            ) AS conversation_rank \
+                     FROM ranked_hits\
+                 ) \
+                 SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
+                 FROM grouped_hits \
+                 WHERE conversation_rank = 1 \
+                 ORDER BY score, created_at DESC, conversation_id \
+                 LIMIT ?",
+            );
+        }
+    }
+
+    sql
+}
+
+type RetrievalMatchParts = Option<(String, Option<(String, Option<String>)>)>;
+
+fn retrieval_match_parts(request: &RetrievalRequest) -> RetrievalMatchParts {
+    let match_expr = build_fts_query(&request.query, request.match_mode)?;
+    let terms = content_terms(&request.query);
+    let raw_prefix_guard = if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
+        terms.last().and_then(|term| {
+            raw_prefix_guard(term).map(|guard| {
+                let earlier = terms[..terms.len() - 1]
+                    .iter()
+                    .map(|term| format!("\"{term}\""))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                (guard, (!earlier.is_empty()).then_some(earlier))
+            })
+        })
+    } else {
+        None
+    };
+    Some((match_expr, raw_prefix_guard))
+}
+
 impl Fts5Retriever {
     #[allow(clippy::too_many_lines)]
     async fn retrieve_match_expr(
@@ -505,97 +637,7 @@ impl Fts5Retriever {
         match_expr: &str,
         raw_prefix_guard: Option<(&str, Option<&str>)>,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let (scope_ids, excluding): (&[String], bool) = match &request.scope {
-            RetrievalScope::Global => (&[], false),
-            RetrievalScope::GlobalExcluding(ids) => (ids, true),
-            RetrievalScope::Conversations(ids) => {
-                if ids.is_empty() {
-                    return Ok(Vec::new());
-                }
-                (ids, false)
-            }
-        };
-
-        let mut sql = String::from(
-            "WITH ranked_hits AS (\
-                 SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
-                        meta.message_type, meta.created_at, c.transcript_generation, \
-                        (SELECT COUNT(*) FROM messages count_source WHERE count_source.conversation_id = c.id) AS message_count, \
-                        snippet(message_fts, 0, '', '', '…', 24) AS snippet, \
-                        bm25(message_fts) AS score",
-        );
-        sql.push_str(
-            " FROM message_fts \
-               JOIN message_fts_rows meta ON meta.fts_rowid = message_fts.rowid \
-               JOIN messages source ON source.message_id = meta.message_id \
-               JOIN conversations c ON c.id = meta.conversation_id \
-               WHERE message_fts MATCH ? \
-                 AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
-        );
-        if request.visibility == RetrievalVisibility::UserTopLevel {
-            sql.push_str(
-                " AND c.user_initiated = 1 AND c.runtime_role = 'user' \
-                  AND c.parent_conversation_id IS NULL \
-                  AND NOT (c.archived = 1 AND EXISTS (\
-                      SELECT 1 FROM conversation_creation_jobs j \
-                      WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
-                  ))",
-            );
-        }
-        if let Some((_, earlier_expr)) = raw_prefix_guard {
-            if earlier_expr.is_some() {
-                sql.push_str(
-                    " AND (message_fts.rowid IN (\
-                        SELECT rowid FROM message_fts WHERE message_fts MATCH ?\
-                      ) OR instr(lower(message_fts.text), ?) > 0)",
-                );
-            } else {
-                sql.push_str(" AND instr(lower(message_fts.text), ?) > 0");
-            }
-        }
-        if !scope_ids.is_empty() {
-            if excluding {
-                sql.push_str(" AND meta.conversation_id NOT IN (");
-            } else {
-                sql.push_str(" AND meta.conversation_id IN (");
-            }
-            for i in 0..scope_ids.len() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-            }
-            sql.push(')');
-        }
-        sql.push(')');
-        match request.grouping {
-            RetrievalGrouping::None => {
-                sql.push_str(
-                    " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score \
-                      FROM ranked_hits \
-                      ORDER BY score, created_at DESC \
-                      LIMIT ?",
-                );
-            }
-            RetrievalGrouping::BestPerConversation => {
-                sql.push_str(
-                    ", grouped_hits AS (\
-                         SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score, \
-                                ROW_NUMBER() OVER (\
-                                    PARTITION BY conversation_id \
-                                    ORDER BY score, created_at DESC, message_id\
-                                ) AS conversation_rank \
-                         FROM ranked_hits\
-                     ) \
-                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score \
-                     FROM grouped_hits \
-                     WHERE conversation_rank = 1 \
-                     ORDER BY score, created_at DESC, conversation_id \
-                     LIMIT ?",
-                );
-            }
-        }
-
+        let sql = build_retrieval_sql(request, raw_prefix_guard);
         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(match_expr);
         if let Some((guard, earlier_expr)) = raw_prefix_guard {
             if let Some(earlier_expr) = earlier_expr {
@@ -603,16 +645,62 @@ impl Fts5Retriever {
             }
             q = q.bind(guard);
         }
+        let scope_ids = match &request.scope {
+            RetrievalScope::Global => &[] as &[String],
+            RetrievalScope::GlobalExcluding(ids) | RetrievalScope::Conversations(ids) => ids,
+        };
         for id in scope_ids {
             q = q.bind(id);
         }
-        let limit = i64::try_from(request.limit).unwrap_or(i64::MAX);
-        q = q.bind(limit);
-
+        q = q.bind(i64::try_from(request.limit).unwrap_or(i64::MAX));
         q.try_map(parse_chunk_row)
             .fetch_all(&self.pool)
             .await
             .map_err(Into::into)
+    }
+
+    /// Return `EXPLAIN QUERY PLAN` for the exact retrieval statement and binds.
+    /// This diagnostic query is intentionally outside timed benchmark invocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::Db`] when `SQLite` cannot execute the diagnostic query.
+    pub async fn explain(&self, request: RetrievalRequest) -> Result<Vec<String>, RetrievalError> {
+        if matches!(&request.scope, RetrievalScope::Conversations(ids) if ids.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let Some((match_expr, raw_prefix_guard)) = retrieval_match_parts(&request) else {
+            return Ok(Vec::new());
+        };
+        let sql = build_retrieval_sql(
+            &request,
+            raw_prefix_guard
+                .as_ref()
+                .map(|(guard, earlier)| (guard.as_str(), earlier.as_deref())),
+        );
+        let mut q =
+            sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}"))).bind(match_expr);
+        if let Some((guard, earlier_expr)) = raw_prefix_guard.as_ref() {
+            if let Some(earlier_expr) = earlier_expr {
+                q = q.bind(earlier_expr);
+            }
+            q = q.bind(guard);
+        }
+        let scope_ids = match &request.scope {
+            RetrievalScope::Global => &[] as &[String],
+            RetrievalScope::GlobalExcluding(ids) | RetrievalScope::Conversations(ids) => ids,
+        };
+        for id in scope_ids {
+            q = q.bind(id);
+        }
+        q = q.bind(i64::try_from(request.limit).unwrap_or(i64::MAX));
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("detail")
+                    .map_err(RetrievalError::Db)
+            })
+            .collect()
     }
 }
 
@@ -626,23 +714,11 @@ impl MessageRetriever for Fts5Retriever {
         &self,
         request: RetrievalRequest,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let Some(match_expr) = build_fts_query(&request.query, request.match_mode) else {
+        if matches!(&request.scope, RetrievalScope::Conversations(ids) if ids.is_empty()) {
             return Ok(Vec::new());
-        };
-        let terms = content_terms(&request.query);
-        let raw_prefix_guard = if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
-            terms.last().and_then(|term| {
-                raw_prefix_guard(term).map(|guard| {
-                    let earlier = terms[..terms.len() - 1]
-                        .iter()
-                        .map(|term| format!("\"{term}\""))
-                        .collect::<Vec<_>>()
-                        .join(" OR ");
-                    (guard, (!earlier.is_empty()).then_some(earlier))
-                })
-            })
-        } else {
-            None
+        }
+        let Some((match_expr, raw_prefix_guard)) = retrieval_match_parts(&request) else {
+            return Ok(Vec::new());
         };
         self.retrieve_match_expr(
             &request,
@@ -672,7 +748,7 @@ impl MessageRetriever for Fts5Retriever {
         // Current source messages for these conversations.
         let mut messages = {
             let sql = format!(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at \
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id \
                  FROM messages WHERE conversation_id IN ({placeholders})"
             );
             let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
@@ -763,8 +839,10 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::ProductConversationUnavailable(_)
         | crate::DbError::SteeringQueueFull
         | crate::DbError::CloseFoundationPrecondition(_)
+        | crate::DbError::CloseFoundationStaleLatest { .. }
         | crate::DbError::CloseFoundationRepairRequired(_)
         | crate::DbError::CloseFoundationNotFound(_)
+        | crate::DbError::SubAgentLifecycleConflict(_)
         | crate::DbError::DirectTurnConflict(_)
         | crate::DbError::ForkProposalConflict(_)
         | crate::DbError::GitRepositoryWorkScopeProjectConflict { .. }
@@ -1163,6 +1241,26 @@ fn parse_chunk_row(row: sqlx::sqlite::SqliteRow) -> Result<RetrievedChunk, sqlx:
             char_range: None,
         },
         message_type: crate::parse_message_type(&row.try_get::<String, _>("message_type")?),
+        origin: InputOrigin::from_db_parts(
+            &row.try_get::<String, _>("origin_kind")?,
+            row.try_get("origin_product_conversation_id")?,
+            row.try_get("origin_transcript_id")?,
+            row.try_get("origin_subscription_event_id")?,
+        )
+        .and_then(|origin| {
+            origin.with_source_call_columns(
+                row.try_get("origin_source_message_id")
+                    .map_err(|e| e.to_string())?,
+                row.try_get("origin_source_tool_use_id")
+                    .map_err(|e| e.to_string())?,
+            )
+        })
+        .map_err(|error| {
+            sqlx::Error::Decode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?,
         created_at: crate::parse_datetime(&row.try_get::<String, _>("created_at")?),
         snippet: truncate_chars(&snippet, MAX_SNIPPET_CHARS),
         score: row.try_get("score")?,
@@ -1406,6 +1504,7 @@ mod tests {
     async fn standalone_fts_upsert_records_exact_shared_collector_outcomes() {
         let db = seed().await;
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "fts-outcome".to_string(),
             conversation_id: "c-a".to_string(),
             sequence_id: 1,
@@ -1520,6 +1619,136 @@ mod tests {
             .unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].message_id, "m2");
+    }
+
+    #[test]
+    fn natural_language_tool_policy_is_exact_not_palette_prefix() {
+        let request = RetrievalRequest::natural_language("abcdef", RetrievalScope::Global, 20);
+        assert_eq!(request.match_mode(), RetrievalMatchMode::ExactTerms);
+        assert_eq!(
+            Fts5Retriever::lexical_expression(&request),
+            Some("\"abcdef\"".to_string())
+        );
+        let palette = RetrievalRequest::palette_conversation_search("abcdef", 20);
+        assert_eq!(palette.match_mode(), RetrievalMatchMode::FinalTokenPrefix);
+    }
+
+    #[tokio::test]
+    async fn scoped_results_match_global_filter_before_limit_for_numeric_text_ids() {
+        let db = seed().await;
+        for id in ["00123", "9007199254740993", "123"] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        db.add_message(
+            "scope-out-strong",
+            "123",
+            &MessageContent::user("scopeproof ".repeat(32)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "scope-in-1",
+            "00123",
+            &MessageContent::user("scopeproof"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "scope-in-2",
+            "9007199254740993",
+            &MessageContent::user("scopeproof"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let retriever = db.fts_retriever();
+        let scope = ["00123".to_string(), "9007199254740993".to_string()];
+        let limit = 2;
+        let scoped_request = RetrievalRequest {
+            query: "scopeproof".to_string(),
+            scope: RetrievalScope::Conversations(scope.to_vec()),
+            visibility: RetrievalVisibility::All,
+            grouping: RetrievalGrouping::None,
+            match_mode: RetrievalMatchMode::ExactTerms,
+            limit,
+        };
+        let scoped = retriever.retrieve(scoped_request).await.unwrap();
+
+        // The unbounded global candidate set is the reference for applying the
+        // same scope and limit in Rust. A bounded global query would be an
+        // invalid oracle because the stronger out-of-scope hit would starve it.
+        let global = retriever
+            .retrieve(RetrievalRequest {
+                query: "scopeproof".to_string(),
+                scope: RetrievalScope::Global,
+                visibility: RetrievalVisibility::All,
+                grouping: RetrievalGrouping::None,
+                match_mode: RetrievalMatchMode::ExactTerms,
+                limit: usize::MAX,
+            })
+            .await
+            .unwrap();
+        assert_eq!(global[0].conversation_id, "123");
+        let expected = global
+            .into_iter()
+            .filter(|hit| scope.contains(&hit.conversation_id))
+            .take(limit)
+            .collect::<Vec<_>>();
+        assert_eq!(scoped.len(), limit);
+        assert_eq!(
+            format!("{scoped:?}"),
+            format!("{expected:?}"),
+            "scoped retrieval must equal global ranking filtered before limiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn broad_preflight_uses_eligible_not_raw_matches() {
+        let db = seed().await;
+        for index in 0..20 {
+            db.add_message(
+                &format!("excluded-broad-{index}"),
+                "c-a",
+                &MessageContent::user("broadcandidate"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.add_message(
+            "eligible-broad",
+            "c-b",
+            &MessageContent::user("broadcandidate"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let retriever = db.fts_retriever();
+        assert_eq!(
+            retriever
+                .retrieve(global_request("broadcandidate").with_limit(1000))
+                .await
+                .unwrap()
+                .len(),
+            21
+        );
+        let policy = RetrievalRequest::natural_language(
+            "broadcandidate",
+            RetrievalScope::GlobalExcluding(vec!["c-a".into()]),
+            20,
+        )
+        .with_limit(1000);
+        assert_eq!(retriever.retrieve(policy).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1888,6 +2117,93 @@ mod tests {
                 .unwrap();
         assert_eq!(current_fts_rows, 1);
         assert_eq!(current_locator_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn retrieval_reads_canonical_message_origin_in_both_groupings() {
+        let db = seed().await;
+        db.add_message(
+            "provenance-hit",
+            "c-a",
+            &MessageContent::user("distinctive provenance needle"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let sender = db.get_conversation("c-a").await.unwrap();
+        sqlx::query(
+            "UPDATE messages SET origin_kind = 'internal_conversation', \
+             origin_product_conversation_id = ?1, origin_transcript_id = ?2, origin_source_message_id = 'sender-call-message', origin_source_tool_use_id = 'sender-call-tool' \
+             WHERE message_id = 'provenance-hit'",
+        )
+        .bind(sender.product_conversation_id.as_str())
+        .bind(&sender.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        for grouping in [
+            RetrievalGrouping::None,
+            RetrievalGrouping::BestPerConversation,
+        ] {
+            let hits = db
+                .fts_retriever()
+                .retrieve(RetrievalRequest {
+                    query: "provenance needle".to_string(),
+                    scope: RetrievalScope::Global,
+                    visibility: RetrievalVisibility::All,
+                    grouping,
+                    match_mode: RetrievalMatchMode::ExactTerms,
+                    limit: 10,
+                })
+                .await
+                .unwrap();
+            let hit = hits
+                .iter()
+                .find(|hit| hit.message_id == "provenance-hit")
+                .unwrap();
+            assert_eq!(
+                hit.origin,
+                InputOrigin::InternalConversation {
+                    product_conversation_id: sender.product_conversation_id.clone(),
+                    transcript_id: sender.id.clone(),
+                    source_call: Some(Box::new(phoenix_core::domain::db_schema::SourceToolCall {
+                        message_id: "sender-call-message".into(),
+                        tool_use_id: "sender-call-tool".into()
+                    })),
+                }
+            );
+        }
+
+        db.watch_product_conversation(&sender.product_conversation_id)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO coordinator_watch_events(event_id, watch_id, source_occurrence_kind, source_occurrence_id, source_generation, source_transcript_id, terminal_kind, occurred_at_us) SELECT 'event-1', id, 'creation', 'test-creation', 0, 'c-a', 'completed', 1790640000000000 FROM coordinator_watches WHERE source_product_conversation_id = ?1 AND ended_at_us IS NULL")
+            .bind(sender.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "UPDATE messages SET origin_kind = 'subscription_event', \
+             origin_product_conversation_id = NULL, origin_transcript_id = NULL, \
+             origin_source_message_id = NULL, origin_source_tool_use_id = NULL, origin_subscription_event_id = 'event-1' WHERE message_id = 'provenance-hit'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let hits = db
+            .fts_retriever()
+            .retrieve(RetrievalRequest::natural_language(
+                "provenance",
+                RetrievalScope::Global,
+                10,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits[0].origin,
+            InputOrigin::SubscriptionEvent {
+                event_id: "event-1".into()
+            }
+        );
     }
 
     #[tokio::test]

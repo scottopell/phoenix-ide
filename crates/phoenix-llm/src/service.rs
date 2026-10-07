@@ -241,6 +241,11 @@ impl LlmService for LlmServiceImpl {
             && openai::is_official_responses_route(self.openai_responses_base_url.as_deref())
     }
 
+    fn uses_official_anthropic(&self) -> bool {
+        self.spec.backend == crate::ModelBackend::Anthropic
+            && anthropic::is_official_anthropic_route(self.anthropic_base_url.as_deref())
+    }
+
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
         if self.use_codex_backend && openai::supports_responses_lite(&self.spec.api_name) {
             super::ContinuationRequestLimits::codex_responses_lite()
@@ -476,6 +481,7 @@ mod tests {
         let request = LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -653,10 +659,10 @@ mod tests {
     fn unsupported_codex_model_attempt_transport_is_http_sse() {
         let mut spec = all_models()
             .into_iter()
-            .find(|model| model.id == "gpt-5.5")
-            .expect("gpt-5.5 must be in the model registry");
+            .find(|model| model.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol must be in the model registry");
         spec.backend = crate::ModelBackend::OpenAIResponses;
-        spec.api_name = "gpt-5.5".to_string();
+        spec.api_name = "unsupported-codex-model".to_string();
         let mut service = LlmServiceImpl::new(
             spec,
             LlmAuth::new(Arc::new(MissingCredential), AuthStyle::PlainBearer),
@@ -678,10 +684,10 @@ mod tests {
     async fn unsupported_codex_auth_failure_records_http_sse_transport() {
         let mut spec = all_models()
             .into_iter()
-            .find(|model| model.id == "gpt-5.5")
-            .expect("gpt-5.5 must be in the model registry");
+            .find(|model| model.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol must be in the model registry");
         spec.backend = crate::ModelBackend::OpenAIResponses;
-        spec.api_name = "gpt-5.5".to_string();
+        spec.api_name = "unsupported-codex-model".to_string();
         let mut service = LlmServiceImpl::new(
             spec,
             LlmAuth::new(Arc::new(MissingCredential), AuthStyle::PlainBearer),
@@ -713,10 +719,10 @@ mod tests {
     async fn unsupported_codex_deadline_before_adapter_records_http_sse_transport() {
         let mut spec = all_models()
             .into_iter()
-            .find(|model| model.id == "gpt-5.5")
-            .expect("gpt-5.5 must be in the model registry");
+            .find(|model| model.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol must be in the model registry");
         spec.backend = crate::ModelBackend::OpenAIResponses;
-        spec.api_name = "gpt-5.5".to_string();
+        spec.api_name = "unsupported-codex-model".to_string();
         let mut service = LlmServiceImpl::new(
             spec,
             LlmAuth::new(Arc::new(DelayedCredential), AuthStyle::PlainBearer),
@@ -848,11 +854,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gpt6_sol_luna_codex_use_websocket_and_responses_lite_limits() {
+        for model in ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+            let spec = all_models()
+                .into_iter()
+                .find(|spec| spec.id == model)
+                .unwrap();
+            let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
+            let service = LlmServiceImpl {
+                spec,
+                auth,
+                anthropic_base_url: None,
+                openai_responses_base_url: Some(crate::CODEX_BACKEND_URL.to_string()),
+                openai_chat_completions_base_url: None,
+                custom_headers: Vec::new(),
+                request_tags: BTreeMap::new(),
+                use_codex_backend: true,
+                codex_credential: None,
+                codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
+                attempt_deadline: LlmAttemptDeadline::default(),
+            };
+            assert_eq!(
+                service.attempt_transport(true),
+                crate::LlmTransport::Websocket
+            );
+            assert_eq!(
+                service.continuation_request_limits(),
+                crate::ContinuationRequestLimits::codex_responses_lite()
+            );
+        }
+    }
+
     fn chat_gateway_service_with_api_name(api_name: &str) -> LlmServiceImpl {
         let mut spec = all_models()
             .into_iter()
-            .find(|s| s.id == "gpt-5.5")
-            .expect("gpt-5.5 must be in the model registry");
+            .find(|s| s.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol must be in the model registry");
         spec.backend = crate::ModelBackend::OpenAIChatCompletions;
         spec.api_name = api_name.to_string();
         let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
@@ -902,8 +940,8 @@ mod tests {
     fn openai_format_base_urls_are_isolated() {
         let mut responses_spec = all_models()
             .into_iter()
-            .find(|s| s.id == "gpt-5.5")
-            .expect("gpt-5.5 must be in the model registry");
+            .find(|s| s.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol must be in the model registry");
         responses_spec.backend = crate::ModelBackend::OpenAIResponses;
         let mut chat_spec = responses_spec.clone();
         chat_spec.backend = crate::ModelBackend::OpenAIChatCompletions;

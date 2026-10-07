@@ -20,3 +20,79 @@
   color: var(--text-primary);
   border-color: var(--accent-blue);
 }
+
+.coordinator-result-card,
+.coordinator-environment {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--bg-secondary) 82%, transparent);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.coordinator-result-heading,
+.coordinator-result-row,
+.coordinator-watch-row,
+.coordinator-environment {
+  align-items: center;
+}
+
+.coordinator-result-row {
+  display: grid;
+  grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.coordinator-result-row > span,
+.coordinator-result-note,
+.coordinator-watch-row > span,
+.coordinator-environment > strong {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.coordinator-result-row a,
+.coordinator-watch-row a {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--accent-blue);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.coordinator-result-note,
+.coordinator-result-error {
+  margin: 0;
+}
+
+.coordinator-result-error,
+.coordinator-send-rejected strong {
+  color: var(--accent-red);
+}
+
+.coordinator-watch-list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.coordinator-watch-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.coordinator-environment {
+  grid-template-columns: auto auto minmax(0, 1fr);
+  margin-bottom: 6px;
+}
+
+.coordinator-environment code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

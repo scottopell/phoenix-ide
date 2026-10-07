@@ -553,7 +553,7 @@ describe('ConversationPage message delivery reconciliation', () => {
       store.dispatch(slug, {
         type: 'sse_steer_message_queued',
         sequenceId: 1,
-        message: { message_id: messageId, text: 'must stay cancelled', images: [], files: [] },
+        message: { message_id: messageId, origin: { kind: 'user_api' }, text: 'must stay cancelled', images: [], files: [] },
       });
       store.dispatch(slug, {
         type: 'sse_steer_message_cancelled',

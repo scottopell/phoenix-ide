@@ -78,6 +78,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::AttachedWorkChild
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
@@ -96,6 +97,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::AttachedWorkChild
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
@@ -114,6 +116,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::AttachedWorkChild
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
@@ -141,6 +144,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Work { .. }
+                | ConvMode::AttachedWorkChild
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Branch mode");
@@ -159,12 +163,23 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Work { .. }
+                | ConvMode::AttachedWorkChild
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Branch mode");
                 }
             }
         }
+    }
+
+    #[test]
+    fn attached_work_child_marker_has_no_owned_environment() {
+        let mode = ConvMode::AttachedWorkChild;
+        assert!(mode.worktree_path().is_none());
+        assert!(mode.worktree_config().is_none());
+        let json = serde_json::to_string(&mode).unwrap();
+        assert_eq!(json, r#"{"mode":"AttachedWorkChild"}"#);
+        assert_eq!(serde_json::from_str::<ConvMode>(&json).unwrap(), mode);
     }
 
     // ========================================================================
@@ -860,11 +875,12 @@ mod random_walk {
                             })
                             .collect();
                         Event::UserQuestionResponse {
+                            request_id: None,
                             answers,
                             annotations: None,
                         }
                     }
-                    _ => Event::UserQuestionDismissed,
+                    _ => Event::UserQuestionDismissed { request_id: None },
                 }
             }
 

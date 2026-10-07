@@ -2,6 +2,20 @@ import XCTest
 @testable import PhoenixMobile
 
 final class RenderingReducerTests: XCTestCase {
+    func testSourceCallLinkPinsOriginalToolAndHistoricalAbsenceStaysUnavailable() throws {
+        let origin = InputOrigin.internalConversation(productConversationId: "product", transcriptId: "original-member", sourceCall: SourceToolCall(message_id: "assistant-message", tool_use_id: "send-tool"))
+        let url = try XCTUnwrap(origin.sourceCallURL(serverURL: "https://example.test"))
+        XCTAssertEqual(url.path, "/c/original-member")
+        XCTAssertEqual(url.fragment, "message-assistant-message")
+        XCTAssertTrue(url.query?.contains("source_tool=send-tool") == true)
+        XCTAssertFalse(origin.sourceCallUnavailable)
+        let historical = InputOrigin.internalConversation(productConversationId: "product", transcriptId: "original-member")
+        XCTAssertNil(historical.sourceCallURL(serverURL: "https://example.test"))
+        XCTAssertTrue(historical.sourceCallUnavailable)
+        XCTAssertEqual(historical.sourceTranscriptURL(serverURL: "https://example.test/phoenix")?.path, "/phoenix/c/original-member")
+        XCTAssertEqual(origin.sourceCallURL(serverURL: "https://example.test/phoenix/")?.path, "/phoenix/c/original-member")
+    }
+
     func testKnownNoteShapesUseUserFacingFields() {
         XCTAssertEqual(
             MessageView.noteText(
@@ -22,6 +36,53 @@ final class RenderingReducerTests: XCTestCase {
                 messageType: "error",
                 content: .object(["message": .string("Something failed")])),
             "Something failed")
+    }
+
+    func testMessageOriginDecodingAndCachedHistoricalFallback() throws {
+        let cases: [(String, InputOrigin, String)] = [
+            (#"{"kind":"internal_conversation","product_conversation_id":"product-1","transcript_id":"transcript-1","source_call":{"message_id":"source-message","tool_use_id":"source-tool"}}"#, .internalConversation(productConversationId: "product-1", transcriptId: "transcript-1", sourceCall: SourceToolCall(message_id: "source-message", tool_use_id: "source-tool")), "Conversation from @transcript:transcript-1 (conversation ID product-1)"),
+            (#"{"kind":"user_api"}"#, .userApi, "User API"),
+            (#"{"kind":"internal_conversation","product_conversation_id":"product-1","transcript_id":"transcript-1"}"#,
+             .internalConversation(productConversationId: "product-1", transcriptId: "transcript-1"),
+             "Conversation from @transcript:transcript-1 (conversation ID product-1)"),
+            (#"{"kind":"system_generated"}"#, .systemGenerated, "System input"),
+            (#"{"kind":"subscription_event","event_id":"event-1"}"#,
+             .subscriptionEvent(eventId: "event-1"), "Conversation event"),
+            (#"{"kind":"unknown_historical"}"#, .unknownHistorical, "Unknown input"),
+        ]
+        let base = #"{"message_id":"m1","sequence_id":1,"message_type":"user","content":{"text":"hello"}"#
+        let historical = try JSONDecoder().decode(Message.self, from: Data((base + "}").utf8))
+        XCTAssertEqual(historical.inputOrigin, .unknownHistorical)
+        XCTAssertEqual(historical.inputOrigin.label, "Unknown input")
+        for (json, expected, label) in cases {
+            let raw = base + ",\"origin\":" + json + "}"
+            let decoded = try JSONDecoder().decode(Message.self, from: Data(raw.utf8))
+            XCTAssertEqual(decoded.inputOrigin, expected)
+            XCTAssertEqual(decoded.inputOrigin.label, label)
+            let roundTrip = try JSONDecoder().decode(Message.self, from: JSONEncoder().encode(decoded))
+            XCTAssertEqual(roundTrip.inputOrigin, expected)
+        }
+    }
+
+    func testOnlyUserApiOriginIsHumanAcrossMessageRolesAndCacheRoundTrip() throws {
+        let origins: [(InputOrigin, Bool)] = [
+            (.userApi, true),
+            (.internalConversation(productConversationId: "pc-parent", transcriptId: "row-parent"), false),
+            (.unknownHistorical, false),
+            (.systemGenerated, false),
+            (.subscriptionEvent(eventId: "event-1"), false),
+        ]
+        for (origin, isHuman) in origins {
+            XCTAssertEqual(origin.isUserApiInput, isHuman)
+            for type in ["user", "skill", "agent"] {
+                let message = Message(
+                    message_id: "m-\(type)", conversation_id: "c1", sequence_id: 1,
+                    message_type: type, content: .object(["text": .string("same text")]),
+                    display_data: nil, created_at: nil, origin: origin)
+                let restored = try JSONDecoder().decode(Message.self, from: JSONEncoder().encode(message))
+                XCTAssertEqual(restored.inputOrigin.isUserApiInput, isHuman, type)
+            }
+        }
     }
 
     func testDisplayDataPatchPreservesExistingMetadataAndToolStarts() {

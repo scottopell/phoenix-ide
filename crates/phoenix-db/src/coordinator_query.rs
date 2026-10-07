@@ -249,7 +249,10 @@ unsafe extern "C" fn authorize(
     let detail = unsafe { optional_c_string(arg2) };
     let allowed = match action {
         ffi::SQLITE_SELECT | ffi::SQLITE_RECURSIVE => true,
-        ffi::SQLITE_READ => object.as_deref().is_some_and(object_allowed),
+        ffi::SQLITE_READ => object
+            .as_deref()
+            .zip(detail.as_deref())
+            .is_some_and(|(table, column)| read_allowed(table, column)),
         ffi::SQLITE_FUNCTION => detail.as_deref().is_some_and(function_allowed),
         _ => false,
     };
@@ -273,9 +276,21 @@ unsafe extern "C" fn check_progress(user_data: *mut c_void) -> c_int {
     i32::from(Instant::now() >= state.deadline)
 }
 
-fn object_allowed(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    !name.starts_with("sqlite_") && !name.starts_with("message_fts_") && name != "message_fts"
+fn read_allowed(table: &str, column: &str) -> bool {
+    let table = table.to_ascii_lowercase();
+    let column = column.to_ascii_lowercase();
+    !table.starts_with("sqlite_")
+        && !table.starts_with("message_fts_")
+        && table != "message_fts"
+        && !matches!(
+            (table.as_str(), column.as_str()),
+            ("auth_sessions", "token" | "password_fingerprint")
+                | ("share_tokens", "token")
+                | ("mcp_oauth_registrations", "client_secret")
+                | ("mcp_oauth_tokens", "access_token" | "refresh_token")
+                | ("federation_enrollments", "credential_verifier")
+                | ("federation_peer_connections", "bearer_credential")
+        )
 }
 
 fn function_allowed(name: &str) -> bool {
@@ -606,7 +621,7 @@ mod tests {
         let path = dir.path().join("query.db");
         let db = rusqlite_for_test(&path);
         db.execute_batch(
-            "CREATE TABLE conversations(id TEXT, state TEXT, state_updated_at TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             CREATE TABLE workflow_external_acceptance_bindings(id TEXT, idempotency_key TEXT, receipt_handle BLOB, disposition_handle BLOB, status TEXT);\n             CREATE TABLE messages(message_id TEXT, content TEXT, display_data TEXT);\n             CREATE TABLE message_images(message_id TEXT, ordinal INTEGER, media_type TEXT, data TEXT);\n             CREATE TABLE workflow_effects(id TEXT, intent_payload BLOB, status TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_execution\",\"pending\":\"secret\"}', '2026-07-21', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
+            "CREATE TABLE conversations(id TEXT, state TEXT, state_updated_at TEXT, updated_at TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             CREATE TABLE workflow_external_acceptance_bindings(id TEXT, idempotency_key TEXT, receipt_handle BLOB, disposition_handle BLOB, status TEXT);\n             CREATE TABLE messages(message_id TEXT, content TEXT, display_data TEXT);\n             CREATE TABLE message_images(message_id TEXT, ordinal INTEGER, media_type TEXT, data TEXT);\n             CREATE TABLE workflow_effects(id TEXT, intent_payload BLOB, status TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_execution\",\"pending\":\"secret\"}', '2026-07-21', '2026-07-21');",
         )
         .unwrap();
         (dir, path)
@@ -657,7 +672,6 @@ mod tests {
             "SELECT id, state FROM conversations",
             "SELECT content FROM messages",
             "SELECT secret FROM future_secret_store",
-            "SELECT token_hash FROM auth_sessions",
             "SELECT claim_token FROM conversation_creation_jobs",
             "SELECT idempotency_key, receipt_handle, disposition_handle FROM workflow_external_acceptance_bindings",
             "SELECT data FROM message_images",
@@ -665,6 +679,25 @@ mod tests {
         ] {
             execute_coordinator_query(path.to_str().unwrap(), sql).unwrap();
         }
+    }
+
+    #[test]
+    fn credential_guard_is_table_and_column_specific() {
+        for (table, column) in [
+            ("auth_sessions", "token"),
+            ("auth_sessions", "password_fingerprint"),
+            ("share_tokens", "token"),
+            ("mcp_oauth_registrations", "client_secret"),
+            ("mcp_oauth_tokens", "access_token"),
+            ("mcp_oauth_tokens", "refresh_token"),
+            ("federation_enrollments", "credential_verifier"),
+            ("federation_peer_connections", "bearer_credential"),
+        ] {
+            assert!(!read_allowed(table, column), "{table}.{column}");
+        }
+        assert!(read_allowed("unrelated", "token"));
+        assert!(read_allowed("auth_sessions", "created_at"));
+        assert!(read_allowed("future_secret_store", "secret"));
     }
 
     #[test]

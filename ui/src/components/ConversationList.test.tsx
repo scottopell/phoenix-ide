@@ -8,6 +8,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import type { Conversation, ProductConversationListRow } from '../api';
+import { FocusScopeProvider } from '../hooks/useFocusScope';
+import { ShortcutHelpPanel } from './ShortcutHelpPanel';
 
 // Spy on a util that the row body calls during render. Counting these calls
 // is a reliable proxy for component-body executions: when React.memo bails
@@ -37,6 +39,7 @@ vi.mock('../utils', async () => {
 });
 
 import { ConversationList, ConversationRow, ChainBlock } from './ConversationList';
+import { productConversationPresentationIndicator } from './ConversationList.presentation';
 
 describe('ConversationList — global navigation', () => {
   it('exposes a labeled Coordinator entry from the mobile list header', () => {
@@ -154,11 +157,205 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
     slug: `root-${id}`,
     title: `Root ${id}`,
   },
-  ordinary_lifecycle: 'open',
+  lifecycle: { state: 'open', close_action: { availability: 'available' } },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
   ...overrides,
+});
+
+describe('ProductConversation presentation indicator', () => {
+  it.each([
+    ['needs_action kind', makeProductConversation('needs-kind', { presentation: { kind: 'needs_action', display_name: 'Needs Kind' } }), 'Needs action', 'awaiting-approval'],
+    ['awaiting user response mode', makeProductConversation('awaiting-mode', { presentation: { kind: 'state', display_name: 'Awaiting', presentation_mode: 'needs_action' } }), 'Needs action', 'awaiting-approval'],
+    ['working mode', makeProductConversation('working-mode', { presentation: { kind: 'state', display_name: 'Working', presentation_mode: 'working' } }), 'Working', 'working'],
+    ['error mode', makeProductConversation('error-mode', { presentation: { kind: 'state', display_name: 'Error', presentation_mode: 'error' } }), 'Error', 'error'],
+    ['done mode', makeProductConversation('done-mode', { presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }), 'Completed', 'terminal'],
+    ['history idle', makeProductConversation('history-idle', { lifecycle: { state: 'history' }, presentation: { kind: 'state', display_name: 'History', presentation_mode: 'idle' } }), 'History', 'terminal'],
+  ])('%s maps to one authoritative indicator', (_name, row, label, dotClass) => {
+    expect(productConversationPresentationIndicator(row)).toEqual({ label, ariaLabel: label, dotClass });
+  });
+
+  it('renders one indicator element for a continued product conversation row', () => {
+    const row = makeProductConversation('continued-indicator', {
+      canonical_root: { transcript_row_id: 'root-row', slug: 'root-slug', title: 'Root Title' },
+      latest_transcript_row_id: 'latest-row',
+      presentation: { kind: 'state', display_name: 'Awaiting User', presentation_mode: 'needs_action' },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[row]} />
+      </MemoryRouter>,
+    );
+
+    const rowNode = container.querySelector('[data-product-conversation-id="continued-indicator"]');
+    expect(rowNode).not.toBeNull();
+    expect(rowNode!.querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(rowNode as HTMLElement).getByLabelText('Needs action')).toBeInTheDocument();
+  });
+});
+
+describe('ProductConversation presentation transitions', () => {
+  it('rerenders working to needs action to done with exactly one indicator', () => {
+    const base = makeProductConversation('transition-row', { presentation: { kind: 'state', display_name: 'Working', presentation_mode: 'working' } });
+    const { container, rerender } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[base]} />
+      </MemoryRouter>,
+    );
+    const row = () => container.querySelector('[data-product-conversation-id="transition-row"]') as HTMLElement;
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Working')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Needs Action', presentation_mode: 'needs_action' } }]} />
+      </MemoryRouter>,
+    );
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Needs action')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }]} />
+      </MemoryRouter>,
+    );
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Completed')).toBeInTheDocument();
+  });
+});
+
+describe('ProductConversation row actions', () => {
+  it('leaves Escape to the actual topmost shortcut help panel', () => {
+    const closeHelp = vi.fn();
+    const content = (visible: boolean) => <FocusScopeProvider><MemoryRouter>
+      <ConversationList {...defaultProps} productConversations={[makeProductConversation('under-panel')]} onProductConversationRename={vi.fn()} />
+      <ShortcutHelpPanel visible={visible} onClose={closeHelp} />
+    </MemoryRouter></FocusScopeProvider>;
+    const view = render(content(false));
+    const trigger = view.getByRole('button', { name: 'Actions for conversation Root under-panel' });
+    fireEvent.click(trigger);
+    view.rerender(content(true));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(closeHelp).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    view.rerender(content(false));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    expect(trigger).toHaveFocus();
+  });
+
+  it('does not offer empty actions for offline History or mismatched callbacks', () => {
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} showArchived archivedProductConversations={[makeProductConversation('empty', { lifecycle: { state: 'history' } })]} onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} /></MemoryRouter>);
+    expect(view.queryByRole('button', { name: /^Actions for conversation/ })).toBeNull();
+  });
+
+  it('dismisses after focus leaves the menu but lets a closed trigger Escape bubble', () => {
+    const bubble = vi.fn();
+    const view = render(<MemoryRouter><div onKeyDown={bubble}><button>Outside focus</button><ConversationList {...defaultProps} productConversations={[makeProductConversation('escape')]} onProductConversationRename={vi.fn()} /></div></MemoryRouter>);
+    const trigger = view.getByRole('button', { name: 'Actions for conversation Root escape' });
+    fireEvent.click(trigger);
+    const outside = view.getByRole('button', { name: 'Outside focus' });
+    outside.focus();
+    fireEvent.keyDown(outside, { key: 'Escape' });
+    expect(trigger).toHaveFocus();
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    expect(bubble).not.toHaveBeenCalled();
+    fireEvent.keyDown(trigger, { key: 'Escape' });
+    expect(bubble).toHaveBeenCalledTimes(1);
+  });
+
+  it('restores list keyboard navigation when the expanded row disappears', () => {
+    const open = vi.fn();
+    const first = makeProductConversation('first');
+    const second = makeProductConversation('second');
+    const props = { ...defaultProps, onProductConversationClick: open, onProductConversationRename: vi.fn() };
+    const view = render(<MemoryRouter><ConversationList {...props} productConversations={[first, second]} /></MemoryRouter>);
+    fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root first' }));
+    view.rerender(<MemoryRouter><ConversationList {...props} productConversations={[second]} /></MemoryRouter>);
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(open).toHaveBeenCalledWith(second);
+  });
+
+  it('dismisses the single action disclosure on Escape and outside click without opening the row', () => {
+    const onOpen = vi.fn();
+    const row = makeProductConversation('menu');
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={[row]}
+      onProductConversationClick={onOpen} onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} /></MemoryRouter>);
+    const trigger = view.getByRole('button', { name: 'Actions for conversation Root menu' });
+    expect(view.queryByRole('button', { name: 'Rename conversation Root menu' })).toBeNull();
+    fireEvent.click(trigger);
+    const rename = view.getByRole('button', { name: 'Rename conversation Root menu' });
+    rename.focus();
+    fireEvent.keyDown(rename, { key: 'Escape' });
+    expect(trigger).toHaveFocus();
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(trigger);
+    fireEvent.mouseDown(document.body);
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['open', { state: 'open', close_action: { availability: 'available' } }, false, true, true, false],
+    ['history', { state: 'history' }, true, false, false, true],
+    ['closing', { state: 'open', close_action: { availability: 'unavailable', reason: 'active_close_attempt' } }, false, false, true, false],
+  ] as const)('preserves %s lifecycle action guards', (_name, lifecycle, history, rename, close, remove) => {
+    const row = makeProductConversation('guards', { lifecycle });
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={history ? [] : [row]}
+      archivedProductConversations={history ? [row] : []} showArchived={history}
+      onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} onProductConversationDelete={vi.fn()} /></MemoryRouter>);
+    fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root guards' }));
+    expect(!!view.queryByRole('button', { name: 'Rename conversation Root guards' })).toBe(rename);
+    expect(!!view.queryByRole('button', { name: /^Close conversation/ })).toBe(close);
+    expect(!!view.queryByRole('button', { name: 'Delete conversation Root guards' })).toBe(remove);
+    if (_name === 'closing') expect(view.getByRole('button', { name: /^Close conversation/ })).toBeDisabled();
+  });
+
+  it('does not introduce destructive actions when offline callbacks are absent', () => {
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={[makeProductConversation('offline')]}
+      onProductConversationRename={vi.fn()} /></MemoryRouter>);
+    fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root offline' }));
+    expect(view.queryByRole('button', { name: /^Close conversation/ })).toBeNull();
+    expect(view.queryByRole('button', { name: /^Delete conversation/ })).toBeNull();
+  });
+
+  it('exposes keyboard/touch accessible row actions without triggering row navigation', () => {
+    const row = makeProductConversation('actions-open', { canonical_root: { transcript_row_id: 'root-actions', slug: 'Action Product', title: 'Action Product' } });
+    const onOpen = vi.fn();
+    const onRename = vi.fn();
+    const onClose = vi.fn();
+
+    const { getByRole } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          productConversations={[row]}
+          onProductConversationClick={onOpen}
+          onProductConversationRename={onRename}
+          onProductConversationClose={onClose}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Action Product' }));
+    const rename = getByRole('button', { name: /Rename conversation Action Product/ });
+    const close = getByRole('button', { name: /Close conversation Action Product/ });
+    expect(rename).toBeInTheDocument();
+    expect(close).toBeInTheDocument();
+
+    rename.focus();
+    fireEvent.click(rename);
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Action Product' }));
+    fireEvent.click(getByRole('button', { name: /Close conversation Action Product/ }));
+
+    expect(onRename).toHaveBeenCalledWith(row);
+    expect(onClose).toHaveBeenCalledWith(row);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
 });
 
 describe('ConversationRow — cached PR badge', () => {
@@ -316,7 +513,7 @@ describe('ConversationList — product conversations', () => {
       presentation: { kind: 'state', display_name: 'Working surface', presentation_mode: 'working' },
     });
     const archived = makeProductConversation('pc-archived', {
-      ordinary_lifecycle: 'history',
+      lifecycle: { state: 'history' },
       canonical_root: { transcript_row_id: 'root-archived', slug: 'root-archived', title: 'Archived Root' },
       presentation: { kind: 'state', display_name: 'Retained history', presentation_mode: 'done' },
     });
@@ -359,9 +556,40 @@ describe('ConversationList — product conversations', () => {
     expect(historyRow).not.toHaveTextContent('Retained history');
   });
 
+  it('uses server-authoritative Close availability without inferring from lifecycle or presentation', () => {
+    const close = vi.fn();
+    const blocked = makeProductConversation('pc-blocked', {
+      lifecycle: { state: 'open', close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' } },
+      presentation: { kind: 'state', display_name: 'Blocked', presentation_mode: 'idle' },
+    });
+    const available = makeProductConversation('pc-available', {
+      lifecycle: { state: 'open', close_action: { availability: 'available' } },
+      presentation: { kind: 'needs_action', display_name: 'Needs action' },
+    });
+
+    const { getByRole } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          productConversations={[blocked, available]}
+          onProductConversationClose={close}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Root pc-blocked' }));
+    expect(getByRole('button', {
+      name: /Close conversation Root pc-blocked\. Resolve the pending task approval before closing/,
+    })).toBeDisabled();
+    fireEvent.click(getByRole('button', { name: 'Actions for conversation Root pc-available' }));
+    fireEvent.click(getByRole('button', { name: 'Close conversation Root pc-available' }));
+    expect(close).toHaveBeenCalledWith(available);
+  });
+
   it('renders History working directory from archived member rows', () => {
     const archived = makeProductConversation('pc-archived', {
-      ordinary_lifecycle: 'history',
+      lifecycle: { state: 'history' },
       latest_transcript_row_id: 'archived-member',
       canonical_root: { transcript_row_id: 'archived-member', slug: 'archived-root', title: 'Archived Root' },
     });

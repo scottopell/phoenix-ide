@@ -165,6 +165,157 @@ export function getProductConversationListRevision(): number {
   return productConversationListRevision;
 }
 
+const PRODUCT_CONVERSATIONS_RECONCILED_EVENT = 'phoenix:product-conversations-reconciled';
+
+type ProductConversationsReconciledDetail = {
+  authoritativeIdentities: ReadonlySet<string>;
+};
+
+export function notifyProductConversationsReconciled(
+  authoritativeIdentities: ReadonlySet<string>,
+): void {
+  window.dispatchEvent(new CustomEvent<ProductConversationsReconciledDetail>(
+    PRODUCT_CONVERSATIONS_RECONCILED_EVENT,
+    { detail: { authoritativeIdentities } },
+  ));
+}
+
+export function subscribeProductConversationsReconciled(
+  listener: (authoritativeIdentities: ReadonlySet<string>) => void,
+): () => void {
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent<ProductConversationsReconciledDetail>).detail;
+    if (detail) listener(detail.authoritativeIdentities);
+  };
+  window.addEventListener(PRODUCT_CONVERSATIONS_RECONCILED_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATIONS_RECONCILED_EVENT, handler);
+}
+
+const PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT = 'phoenix:product-conversation-snapshot-changed';
+let productConversationSnapshotChangeSequence = 0;
+const productConversationSnapshotChangeSequencesById = new Map<string, number>();
+
+type ProductConversationSnapshotChangedDetail = {
+  productConversationId: string;
+};
+
+export function notifyProductConversationSnapshotChanged(productConversationId: string): void {
+  productConversationSnapshotChangeSequence += 1;
+  productConversationSnapshotChangeSequencesById.set(
+    productConversationId,
+    productConversationSnapshotChangeSequence,
+  );
+  window.dispatchEvent(new CustomEvent<ProductConversationSnapshotChangedDetail>(
+    PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT,
+    { detail: { productConversationId } },
+  ));
+}
+
+export function getProductConversationSnapshotChangeSequence(): number {
+  return productConversationSnapshotChangeSequence;
+}
+
+export function productConversationSnapshotChangedSince(
+  productConversationId: string,
+  sequence: number,
+): boolean {
+  return (productConversationSnapshotChangeSequencesById.get(productConversationId) ?? 0) > sequence;
+}
+
+export function subscribeProductConversationSnapshotChanged(
+  productConversationId: string,
+  listener: () => void,
+): () => void {
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent<ProductConversationSnapshotChangedDetail>).detail;
+    if (detail?.productConversationId === productConversationId) listener();
+  };
+  window.addEventListener(PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT, handler);
+}
+
+const PRODUCT_CONVERSATION_DELETED_EVENT = 'phoenix:product-conversation-deleted';
+let productConversationDeleteSequence = 0;
+const productConversationDeleteSequencesById = new Map<string, number>();
+
+type ProductConversationDeletedDetail = {
+  productConversationId: string;
+  deletedConversationIds: string[];
+};
+
+export function notifyProductConversationDeleted(
+  productConversationId: string,
+  deletedConversationIds: string[],
+): void {
+  productConversationDeleteSequence += 1;
+  for (const identity of [productConversationId, ...deletedConversationIds]) {
+    productConversationDeleteSequencesById.set(identity, productConversationDeleteSequence);
+  }
+  window.dispatchEvent(new CustomEvent<ProductConversationDeletedDetail>(
+    PRODUCT_CONVERSATION_DELETED_EVENT,
+    { detail: { productConversationId, deletedConversationIds } },
+  ));
+}
+
+export function notifyProductConversationHardDeleted(
+  productConversationId: string,
+  deletedConversationIds: string[],
+): void {
+  notifyProductConversationDeleted(productConversationId, deletedConversationIds);
+  window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
+    detail: {
+      conversationId: productConversationId,
+      deletedConversationIds,
+    },
+  }));
+}
+
+export function getProductConversationDeleteSequence(): number {
+  return productConversationDeleteSequence;
+}
+
+export function productConversationDeletedSince(
+  identities: Iterable<string>,
+  sequence: number,
+): boolean {
+  return [...identities].some(
+    (identity) => (productConversationDeleteSequencesById.get(identity) ?? 0) > sequence,
+  );
+}
+
+const PRODUCT_CONVERSATION_CLOSED_EVENT = 'phoenix:product-conversation-closed';
+
+export function notifyProductConversationClosed(productConversationId: string): void {
+  window.dispatchEvent(new CustomEvent<string>(PRODUCT_CONVERSATION_CLOSED_EVENT, {
+    detail: productConversationId,
+  }));
+}
+
+export function subscribeProductConversationClosed(
+  listener: (productConversationId: string) => void,
+): () => void {
+  const handler = (event: Event) => {
+    const productConversationId = (event as CustomEvent<string>).detail;
+    if (productConversationId) listener(productConversationId);
+  };
+  window.addEventListener(PRODUCT_CONVERSATION_CLOSED_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATION_CLOSED_EVENT, handler);
+}
+
+export function subscribeProductConversationDeleted(
+  identities: ReadonlySet<string>,
+  listener: () => void,
+): () => void {
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent<ProductConversationDeletedDetail>).detail;
+    if (!detail) return;
+    if (identities.has(detail.productConversationId)
+      || detail.deletedConversationIds.some((id) => identities.has(id))) listener();
+  };
+  window.addEventListener(PRODUCT_CONVERSATION_DELETED_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATION_DELETED_EVENT, handler);
+}
+
 const CLOSE_SNAPSHOT_CHANGED_EVENT = 'phoenix:close-snapshot-changed';
 
 export type CloseSnapshotInvalidationSource = 'close' | 'stream';

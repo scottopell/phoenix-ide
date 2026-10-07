@@ -7,6 +7,48 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, canChangeModelInState, ConflictError, type ConversationState } from './api';
 import { canCancelConversationState } from './utils';
 
+describe('question response API identity', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    }));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('includes the pending identity in answer and dismiss bodies', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+
+    await api.respondToQuestion('conversation', 'request-q2', { Question: 'Answer' });
+    await api.dismissQuestion('conversation', 'request-q2');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/conversations/conversation/respond',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          request_id: 'request-q2',
+          answers: { Question: 'Answer' },
+          annotations: undefined,
+        }),
+      },
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/conversations/conversation/dismiss-question',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ request_id: 'request-q2' }),
+      },
+    );
+  });
+});
+
 describe('api.continueConversation', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
@@ -278,6 +320,63 @@ describe('conversation message history clients', () => {
     );
   });
 
+  it('GETs and PUTs ordinary automatic continuation by encoded aggregate reference', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        aggregate: { kind: 'ordinary', product_conversation_id: 'pc/1' },
+        auto_continue_on_context_exhaustion: true,
+        admission: null,
+      }),
+    } as unknown as Response);
+
+    await api.getProductConversationAutomaticContinuation('pc/1');
+    await api.updateProductConversationAutomaticContinuation('pc/1', true);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/product-conversations/pc%2F1/automatic-continuation',
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/product-conversations/pc%2F1/automatic-continuation',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_continue_on_context_exhaustion: true }),
+      },
+    );
+  });
+
+  it('GETs and PUTs Global Coordinator automatic continuation', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator' },
+        auto_continue_on_context_exhaustion: false,
+        admission: null,
+      }),
+    } as unknown as Response);
+
+    await api.getCoordinatorAutomaticContinuation();
+    await api.updateCoordinatorAutomaticContinuation(false);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/global/coordinator/automatic-continuation');
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/global/coordinator/automatic-continuation',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_continue_on_context_exhaustion: false }),
+      },
+    );
+  });
+
   it('GETs the product conversation list', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
@@ -302,6 +401,30 @@ describe('conversation message history clients', () => {
     await api.listProductConversationCreations();
 
     expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation');
+  });
+
+  it('returns the authoritative member set from aggregate deletion', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        success: true,
+        outcome: {
+          type: 'deleted',
+          deleted_conversation_ids: ['root-1', 'agent-1'],
+        },
+      }),
+    } as unknown as Response);
+
+    await expect(api.deleteChain('root/1')).resolves.toEqual({
+      success: true,
+      outcome: {
+        type: 'deleted',
+        deleted_conversation_ids: ['root-1', 'agent-1'],
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/api/chains/root%2F1', { method: 'DELETE' });
   });
 
   it('POSTs cancel product creation', async () => {

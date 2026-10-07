@@ -38,7 +38,10 @@ pub use browser::{
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
-pub use present_svg::PresentSvgTool;
+pub use present_svg::{
+    CoordinatorPresentSvgTool, CoordinatorSvgSourceError, CoordinatorSvgSourceResolver,
+    PresentSvgTool,
+};
 pub use propose_task::ProposeTaskTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
@@ -705,6 +708,14 @@ impl ToolContext {
     #[must_use]
     pub fn llm_selector(&self) -> &Arc<dyn LlmSelector> {
         &self.llm_selector
+    }
+
+    #[must_use]
+    pub fn source_tool_call(&self) -> Option<phoenix_core::domain::db_schema::SourceToolCall> {
+        Some(phoenix_core::domain::db_schema::SourceToolCall {
+            message_id: self.svg_assistant_message_id.clone()?,
+            tool_use_id: self.tool_use_id.clone()?,
+        })
     }
 
     #[must_use]

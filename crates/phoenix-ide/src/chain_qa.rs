@@ -17,7 +17,7 @@
 use crate::chain_runtime::{ChainRuntime, ChainRuntimeRegistry, ChainSseEvent};
 use crate::db::{
     ChainQaRow, Conversation, Database, DbError, Message, MessageContent, MessageRetriever,
-    MessageType, NewChainQa, RetrievalRequest, RetrievalScope, RetrievedChunk,
+    NewChainQa, RetrievalRequest, RetrievalScope, RetrievedChunk,
 };
 use chrono::Utc;
 use phoenix_llm::{
@@ -330,6 +330,7 @@ impl ChainQa {
     /// "I'll search…" narration never reaches the user. When the model stops
     /// calling tools (or the turn cap is hit), a dedicated final turn with no
     /// tools streams the answer token-by-token over the chain broadcaster.
+    #[allow(clippy::too_many_lines)] // bounded agent loop keeps replay/tool sequencing visible
     async fn run_answer_invocation(
         &self,
         prep: &PreparedInvocation,
@@ -352,10 +353,14 @@ impl ChainQa {
              with read_conversation to answer."
         };
 
+        let mut provider_replay: Option<
+            phoenix_core::domain::provider_replay::AnthropicReplayPayload,
+        > = None;
         let mut messages = vec![LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(format!(
-                "Chain skeleton (members in order):\n{}\n---\nQuestion: {}{}",
+                "Conversation transcripts (in order):\n{}\n---\nQuestion: {}{}",
                 prep.skeleton, prep.question, coverage_note
             ))],
         }];
@@ -376,6 +381,8 @@ impl ChainQa {
                 prep.effective_effort,
                 prep.max_output_tokens,
             );
+            let mut request = request;
+            request.provider_replay = provider_replay.clone();
             let resp = prep
                 .service
                 .complete(&request)
@@ -384,6 +391,28 @@ impl ChainQa {
                     error: ChainQaError::from(e),
                     partial_answer: None,
                 })?;
+
+            if let Some(update) = resp.provider_replay.clone() {
+                use phoenix_core::domain::provider_replay::{
+                    AnthropicReplayPayload, AnthropicReplayUpdate,
+                };
+                match update {
+                    AnthropicReplayUpdate::Append(response) => {
+                        let mut sets = provider_replay
+                            .take()
+                            .map_or_else(Vec::new, |p| p.response_sets);
+                        sets.push(response.with_owner_message_id(format!("chain-qa-{turn}")));
+                        provider_replay =
+                            Some(AnthropicReplayPayload::new(sets).map_err(|error| {
+                                RunInvocationError {
+                                    error: ChainQaError::Llm(error.to_string()),
+                                    partial_answer: None,
+                                }
+                            })?);
+                    }
+                    AnthropicReplayUpdate::Clear => provider_replay = None,
+                }
+            }
 
             let tool_calls: Vec<(String, String, serde_json::Value)> = resp
                 .tool_uses()
@@ -411,6 +440,7 @@ impl ChainQa {
                     partial_answer: None,
                 })?;
             messages.push(LlmMessage {
+                source_message_id: Some(format!("chain-qa-{turn}")),
                 role: MessageRole::Assistant,
                 content: resp.content.clone(),
             });
@@ -438,6 +468,7 @@ impl ChainQa {
                 });
             }
             messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: results,
             });
@@ -455,7 +486,13 @@ impl ChainQa {
             .live_snapshot(&prep.root_id)
             .await
             .unwrap_or(prep.snapshot);
-        let answer = self.stream_final_answer(&messages, prep, runtime).await?;
+        // The forced-answer request changes the tool surface. Settle private
+        // Anthropic replay before that boundary rather than carrying signed
+        // planning blocks into a different prefix.
+        provider_replay = None;
+        let answer = self
+            .stream_final_answer(&messages, provider_replay, prep, runtime)
+            .await?;
         Ok(AnswerOutcome { answer, snapshot })
     }
 
@@ -478,6 +515,7 @@ impl ChainQa {
     async fn stream_final_answer(
         &self,
         messages: &[LlmMessage],
+        provider_replay: Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
     ) -> Result<String, RunInvocationError> {
@@ -491,6 +529,8 @@ impl ChainQa {
             prep.effective_effort,
             prep.max_output_tokens,
         );
+        let mut request = request;
+        request.provider_replay = provider_replay;
         let (chunk_tx, mut chunk_rx) = mpsc::channel::<TokenChunk>(256);
         let qa_id = prep.row_id.clone();
         let runtime_handle = Arc::clone(runtime);
@@ -631,7 +671,9 @@ impl ChainQa {
                 }
                 if !member_ids.iter().any(|m| m == conv_id) {
                     return (
-                        format!("error: conversation {conv_id} is not part of this chain"),
+                        format!(
+                            "error: transcript {conv_id} is not part of this ProductConversation"
+                        ),
                         true,
                     );
                 }
@@ -778,6 +820,7 @@ fn build_agent_request(
             crate::llm_language::chain_qa_agent_system_prompt(language),
         )],
         messages: messages.to_vec(),
+        provider_replay: None,
         tools,
         max_tokens: Some(
             max_output_tokens.map_or(ANSWER_MAX_TOKENS, |limit| limit.min(ANSWER_MAX_TOKENS)),
@@ -805,9 +848,9 @@ fn qa_tools(search_enabled: bool) -> Vec<ToolDefinition> {
     if search_enabled {
         tools.push(ToolDefinition {
             name: "search_conversations".to_string(),
-            description: "Search this chain's messages by relevance to a natural-language query. \
-                Returns ranked snippets, each tagged with its source conversation id. Use this to \
-                locate where something was discussed, then read that conversation in full."
+            description: "Search this ProductConversation's transcript messages by relevance to a natural-language query. \
+                Returns ranked snippets tagged with their exact source transcript id. Use this to \
+                locate where something was discussed, then read that transcript."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -834,7 +877,7 @@ fn qa_tools(search_enabled: bool) -> Vec<ToolDefinition> {
             "properties": {
                 "conversation_id": {
                     "type": "string",
-                    "description": "A conversation id from the chain skeleton or a search result."
+                    "description": "An exact transcript id from the transcript list or a search result."
                 },
                 "cursor": {
                     "type": "integer",
@@ -854,9 +897,10 @@ fn format_search_hits(hits: &[RetrievedChunk]) -> String {
     for hit in hits {
         let _ = writeln!(
             out,
-            "[#{} · {} · {}] {}",
+            "[#{} · {}{} · {}] {}",
             hit.conversation_id,
-            hit.message_type,
+            crate::api::global_read::attributed_role(hit.message_type, &hit.origin),
+            crate::api::global_read::attributed_sender(&hit.origin),
             hit.created_at.format("%Y-%m-%d"),
             hit.snippet.trim()
         );
@@ -893,7 +937,7 @@ fn read_page(messages: &[Message], cursor: usize) -> String {
     }
     // `pos` is now the total transcript length (unless we stopped early).
     if out.is_empty() && !has_more {
-        return "(end of conversation)".to_string();
+        return "(end of transcript)".to_string();
     }
     if has_more {
         format!("{out}\n[… more content; call read_conversation again with cursor={end}]")
@@ -925,15 +969,11 @@ fn render_full_transcript(messages: &[Message]) -> String {
 /// path. Factored out so [`read_page`] can stream the transcript a message at a
 /// time without materializing the whole thing.
 fn render_message_line(m: &Message) -> String {
-    let label = match m.message_type {
-        MessageType::User => "User",
-        MessageType::Agent => "Agent",
-        MessageType::Tool => "Tool",
-        MessageType::System => "System",
-        MessageType::Error => "Error",
-        MessageType::Continuation => "Continuation",
-        MessageType::Skill => "Skill",
-    };
+    let label = format!(
+        "{}{}",
+        crate::api::global_read::attributed_role(m.message_type, &m.origin),
+        crate::api::global_read::attributed_sender(&m.origin)
+    );
     let body = match &m.content {
         // `llm_text()` is the expanded form the model actually saw (e.g.
         // @file content), not the display shorthand. Attached images aren't

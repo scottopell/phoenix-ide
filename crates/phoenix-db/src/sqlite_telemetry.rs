@@ -1224,6 +1224,7 @@ mod tests {
         let error = fts_upsert(
             &contending_pool,
             &Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "sensitive-message-id".to_string(),
                 conversation_id: "busy-conversation".to_string(),
                 sequence_id: 1,

@@ -124,9 +124,31 @@ describe('buildConversationChapters', () => {
     const units = [userUnit('u1', 'first question', 5), userUnit('u2', 'second', 7)];
     const chapters = buildConversationChapters(units);
     expect(chapters).toEqual([
-      { unitIndex: 0, kind: 'prompt', label: 'first question', sequenceId: 5 },
-      { unitIndex: 1, kind: 'prompt', label: 'second', sequenceId: 7 },
+      { unitIndex: 0, kind: 'prompt', label: 'first question', sequenceId: 5, origin: { kind: 'unknown_historical' } },
+      { unitIndex: 1, kind: 'prompt', label: 'second', sequenceId: 7, origin: { kind: 'unknown_historical' } },
     ]);
+  });
+
+  it('excludes typed watch events without displacing human prompts or transcript indices after reload', () => {
+    const human = userUnit('human', 'Conversation event is text I want to discuss');
+    if (human.kind === 'user') human.message.origin = { kind: 'user_api' };
+    const events = [1, 2, 3].map((n) => {
+      const unit = userUnit(`event-${n}`, `Notification ${n}`, n + 1);
+      if (unit.kind === 'user') unit.message.origin = { kind: 'subscription_event', event_id: `event-${n}` };
+      return unit;
+    });
+    const reply = agentTurnUnit('reply', [{ type: 'text', text: LONG_PROSE }], 5);
+    const next = userUnit('successor:human', 'Next real prompt', 6);
+    if (next.kind === 'user') {
+      next.message.origin = { kind: 'user_api' };
+      next.message.conversation_id = 'successor';
+    }
+    const units = [human, ...events, reply, next];
+    expect(buildConversationChapters(units.slice(0, 4)).map((c) => c.unitIndex)).toEqual([0]);
+    expect(buildConversationChapters(units).map((c) => c.unitIndex)).toEqual([0, 4, 5]);
+    expect(buildConversationChapters(JSON.parse(JSON.stringify(units)))).toEqual(buildConversationChapters(units));
+    expect(units).toHaveLength(6);
+    expect(buildConversationChapters(units)[0]?.label).toContain('Conversation event');
   });
 
   it('skips whitespace-only user prompts', () => {
@@ -186,11 +208,28 @@ describe('buildConversationChapters', () => {
     expect(chapters.map((c) => c.kind)).toEqual(['prompt', 'prose', 'prompt']);
   });
 
+  it('carries channel provenance through persisted and authoritative queued prompts without changing indexes', () => {
+    const api = userUnit('api', 'API request', 1);
+    if (api.kind !== 'user') throw new Error('expected user');
+    api.message.origin = { kind: 'user_api' };
+    const internal = userUnit('internal', 'Forwarded request', 3);
+    if (internal.kind !== 'user') throw new Error('expected user');
+    internal.message.origin = { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-pc', transcript_id: 'source-row' };
+    const queued = pendingUserUnit('queued', 'Queued internal request');
+    if (queued.kind !== 'pending_user') throw new Error('expected pending user');
+    queued.message.origin = internal.message.origin;
+    const chapters = buildConversationChapters([api, agentTurnUnit('reply', [{ type: 'text', text: LONG_PROSE }]), internal, queued]);
+    expect(chapters.map(({ unitIndex, sequenceId }) => [unitIndex, sequenceId])).toEqual([[0, 1], [1, 2], [2, 3], [3, undefined]]);
+    expect(chapters.map((chapter) => chapter.origin)).toEqual([
+      { kind: 'user_api' }, undefined, internal.message.origin, internal.message.origin,
+    ]);
+  });
+
   it('includes pending user messages with an undefined sequenceId', () => {
     const units = [pendingUserUnit('local-1', 'queued prompt')];
     const chapters = buildConversationChapters(units);
     expect(chapters).toEqual([
-      { unitIndex: 0, kind: 'prompt', label: 'queued prompt', sequenceId: undefined },
+      { unitIndex: 0, kind: 'prompt', label: 'queued prompt', sequenceId: undefined, origin: { kind: 'user_api' } },
     ]);
   });
 });

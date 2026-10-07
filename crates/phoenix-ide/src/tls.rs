@@ -59,6 +59,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn bounded_post_shutdown_drain<F>(
     drain: F,
     label: &'static str,
@@ -214,11 +215,30 @@ pub(crate) async fn wait_for_fatal_local_authority(
 pub(crate) async fn drain_concurrently<OwnerDrain, ConnectionDrain>(
     owner_drain: OwnerDrain,
     connection_drain: ConnectionDrain,
-) where
+) -> ConnectionDrain::Output
+where
     OwnerDrain: std::future::Future,
     ConnectionDrain: std::future::Future,
 {
-    let (_, _) = tokio::join!(owner_drain, connection_drain);
+    let (_, connection_result) = tokio::join!(owner_drain, connection_drain);
+    connection_result
+}
+
+async fn finish_fatal_https_drain(
+    runtime: &crate::runtime::RuntimeManager,
+    deadline: tokio::time::Instant,
+    bash_handles: &crate::tools::bash::BashHandleRegistry,
+) {
+    let fatal_tail = async {
+        runtime.fence_fatal_local_authority().await;
+        crate::tools::bash::shutdown_kill_tree_until(deadline, bash_handles).await;
+    };
+    let _ = bounded_post_shutdown_drain_until(
+        deadline,
+        fatal_tail,
+        "HTTPS fatal authority during drain",
+    )
+    .await;
 }
 
 pub async fn serve_https(
@@ -247,6 +267,7 @@ pub async fn serve_https(
     loop {
         tokio::select! {
             () = &mut shutdown => {
+                runtime.begin_process_shutdown();
                 drop(listener);
                 tracing::info!("HTTPS listener stopped accepting new connections");
                 break;
@@ -322,9 +343,23 @@ pub async fn serve_https(
         }
     }
 
-    let _ = bounded_post_shutdown_drain(graceful.shutdown(), "HTTPS").await;
-
-    Ok(())
+    let deadline = runtime
+        .fatal_local_authority_deadline()
+        .expect("process shutdown deadline must be set before HTTPS drain");
+    let drain = bounded_post_shutdown_drain_until(
+        deadline,
+        drain_concurrently(runtime.drain_process_shutdown(), graceful.shutdown()),
+        "HTTPS",
+    );
+    tokio::pin!(drain);
+    tokio::select! {
+        _ = &mut drain => Ok(()),
+        boundary = wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
+            tracing::error!(?boundary, "fatal local SQLite authority loss during HTTPS drain");
+            finish_fatal_https_drain(runtime, deadline, bash_handles).await;
+            Err(crate::FatalLocalAuthorityExit.into())
+        }
+    }
 }
 
 fn log_alpn(

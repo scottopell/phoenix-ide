@@ -498,7 +498,7 @@ describe('WorkControlBar — continuation gate (REQ-WAB-009)', () => {
       document.querySelector('.work-actions-continuation-note'),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Continued — actions belong on the continuation/i),
+      screen.getByText(/Continued — actions are available on the current transcript/i),
     ).toBeInTheDocument();
 
     // No primary glow in the continued case.
@@ -2455,7 +2455,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.queryByRole('button', { name: 'Resume PR inference' })).not.toBeInTheDocument();
-    expect(screen.getByText('Continued — actions belong on the continuation.')).toBeInTheDocument();
+    expect(screen.getByText('Continued — actions are available on the current transcript.')).toBeInTheDocument();
   });
 
   it('offers desktop inference recovery for an unresolved explicit selection', async () => {
@@ -2705,7 +2705,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
-    expect(screen.getByText('Continued — actions belong on the continuation.')).toBeInTheDocument();
+    expect(screen.getByText('Continued — actions are available on the current transcript.')).toBeInTheDocument();
   });
 
   it('keeps Address feedback for a cached PR before associations load', () => {

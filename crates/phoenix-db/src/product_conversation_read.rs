@@ -5,10 +5,10 @@ use phoenix_core::domain::product_conversation::{
 };
 use phoenix_core::work_scope::RuntimeRole;
 use serde::Serialize;
-use sqlx::{Executor, Row, SqliteConnection};
+use sqlx::{Connection, Row, SqliteConnection};
 use tracing::Instrument;
 
-use crate::{Database, DbError, DbResult, MessageContent, MessageType};
+use crate::{CloseProjection, Database, DbError, DbResult, MessageContent, MessageType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProductConversation {
@@ -26,10 +26,32 @@ pub struct ProductConversationAggregate {
     pub source: Option<ProductConversationSource>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductConversationCloseAvailability {
+    Available,
+    Unavailable(ProductConversationCloseUnavailableReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductConversationCloseUnavailableReason {
+    ActiveCloseAttempt,
+    AwaitingTaskApproval,
+    AwaitingContinuation,
+    HandedOffWithoutContinuation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductConversationListLifecycle {
+    Open {
+        close_availability: ProductConversationCloseAvailability,
+    },
+    History,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductConversationListProjection {
     pub product_conversation_id: ProductConversationId,
-    pub lifecycle: OrdinaryProductConversationLifecycle,
+    pub lifecycle: ProductConversationListLifecycle,
     pub root_transcript_row_id: String,
     pub root_slug: Option<String>,
     pub root_title: Option<String>,
@@ -39,9 +61,16 @@ pub struct ProductConversationListProjection {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrdinaryProductConversationCitation {
+    pub product_conversation_id: ProductConversationId,
+    pub root_title: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductConversationSnapshotRead {
     pub aggregate: ProductConversationAggregate,
+    pub close: Option<CloseProjection>,
     pub messages: Vec<(i64, crate::Message)>,
     pub requested_transcript_row_id: String,
 }
@@ -207,6 +236,61 @@ fn message_content_from_row(
     MessageContent::from_stored_json(message_type, content).map_err(DbError::Serialization)
 }
 
+fn list_projection_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<ProductConversationListProjection> {
+    let product_conversation_id = row
+        .try_get::<String, _>("product_conversation_id")?
+        .parse::<ProductConversationId>()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let lifecycle = row.try_get::<String, _>("ordinary_lifecycle")?;
+    let lifecycle =
+        OrdinaryProductConversationLifecycle::from_db_str(&lifecycle).ok_or_else(|| {
+            DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
+        })?;
+    let latest_state = serde_json::from_str(&row.try_get::<String, _>("latest_state")?)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let close_availability = if row.try_get::<bool, _>("has_active_close_attempt")? {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::ActiveCloseAttempt,
+        )
+    } else if row.try_get::<bool, _>("has_awaiting_task_approval")? {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::AwaitingTaskApproval,
+        )
+    } else if row.try_get::<bool, _>("has_awaiting_continuation")? {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::AwaitingContinuation,
+        )
+    } else if matches!(&latest_state, crate::ConvState::HandedOff { .. }) {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::HandedOffWithoutContinuation,
+        )
+    } else {
+        ProductConversationCloseAvailability::Available
+    };
+    let lifecycle = match lifecycle {
+        OrdinaryProductConversationLifecycle::Open => {
+            ProductConversationListLifecycle::Open { close_availability }
+        }
+        OrdinaryProductConversationLifecycle::History => ProductConversationListLifecycle::History,
+    };
+    Ok(ProductConversationListProjection {
+        product_conversation_id,
+        lifecycle,
+        root_transcript_row_id: row.try_get("root_transcript_row_id")?,
+        root_slug: row.try_get("root_slug")?,
+        root_title: row.try_get("root_title")?,
+        latest_transcript_row_id: row.try_get("latest_transcript_row_id")?,
+        latest_state,
+        latest_continued_in_conv_id: row.try_get("latest_continued_in_conv_id")?,
+        updated_at: row
+            .try_get::<String, _>("updated_at")?
+            .parse::<DateTime<Utc>>()
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
+    })
+}
+
 fn continuation_summary(row: &sqlx::sqlite::SqliteRow, content_column: &str) -> DbResult<String> {
     let content = serde_json::from_str(&row.try_get::<String, _>(content_column)?)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -231,7 +315,7 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
             json_extract(value, '$.tail_message_id') AS tail_message_id
      FROM json_each(?2)
- ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, transcript.ordinal
+ ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
  FROM transcript
  CROSS JOIN messages INDEXED BY messages_conversation_sequence
    ON messages.conversation_id = transcript.id
@@ -295,6 +379,171 @@ impl Database {
         })
     }
 
+    /// Sets the user-visible title on the canonical root transcript row for one ordinary aggregate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
+    /// [`DbError::ProductConversationUnavailable`] when the aggregate is in History,
+    /// and a database or decode error when persisted aggregate data is invalid.
+    pub async fn set_ordinary_product_conversation_title(
+        &self,
+        reference: &str,
+        title: &str,
+    ) -> DbResult<ProductConversationId> {
+        self.mutate_ordinary_product_conversation_title_authority(reference, title)
+            .await
+    }
+
+    /// Sets the compatibility chain-name override without replacing the aggregate title fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
+    /// [`DbError::ProductConversationUnavailable`] when the aggregate is in History,
+    /// and a database or decode error when persisted aggregate data is invalid.
+    pub async fn set_ordinary_product_conversation_legacy_title(
+        &self,
+        reference: &str,
+        title: &str,
+    ) -> DbResult<ProductConversationId> {
+        self.mutate_ordinary_product_conversation_legacy_title_authority(reference, Some(title))
+            .await
+    }
+
+    /// Clears the legacy name override while preserving the aggregate title.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
+    /// [`DbError::ProductConversationUnavailable`] when the aggregate is in History,
+    /// and a database or decode error when persisted aggregate data is invalid.
+    pub async fn clear_ordinary_product_conversation_legacy_title(
+        &self,
+        reference: &str,
+    ) -> DbResult<ProductConversationId> {
+        self.mutate_ordinary_product_conversation_legacy_title_authority(reference, None)
+            .await
+    }
+
+    async fn mutate_ordinary_product_conversation_legacy_title_authority(
+        &self,
+        reference: &str,
+        title: Option<&str>,
+    ) -> DbResult<ProductConversationId> {
+        let mut connection = self.pool.acquire().await?;
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let now = chrono::Utc::now();
+        let result = async {
+            let resolved =
+                Self::resolve_ordinary_product_conversation_on(&mut transaction, reference).await?;
+            crate::close_foundation::require_product_conversation_admission_tx(
+                &mut transaction,
+                &resolved.requested_transcript_row_id,
+            )
+            .await?;
+            let result = sqlx::query(
+                "UPDATE conversations
+                 SET chain_name = ?1, updated_at = ?2
+                 WHERE product_conversation_id = ?3
+                   AND user_initiated = 1
+                   AND runtime_role = 'user'
+                   AND parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations predecessor
+                       WHERE predecessor.product_conversation_id = conversations.product_conversation_id
+                         AND predecessor.continued_in_conv_id = conversations.id
+                   )",
+            )
+            .bind(title)
+            .bind(now.to_rfc3339())
+            .bind(resolved.product_conversation_id.as_str())
+            .execute(&mut *transaction)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(DbError::ConversationNotFound(reference.to_string()));
+            }
+            Ok::<ProductConversationId, DbError>(resolved.product_conversation_id)
+        }
+        .await;
+        match result {
+            Ok(product_conversation_id) => {
+                transaction.commit().await?;
+                Ok(product_conversation_id)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn mutate_ordinary_product_conversation_title_authority(
+        &self,
+        reference: &str,
+        title: &str,
+    ) -> DbResult<ProductConversationId> {
+        let mut connection = self.pool.acquire().await?;
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let now = chrono::Utc::now();
+        let result = async {
+            let resolved =
+                Self::resolve_ordinary_product_conversation_on(&mut transaction, reference).await?;
+            crate::close_foundation::require_product_conversation_admission_tx(
+                &mut transaction,
+                &resolved.requested_transcript_row_id,
+            )
+            .await?;
+            let row = sqlx::query(
+                "SELECT root.id
+                 FROM conversations root
+                 WHERE root.product_conversation_id = ?1
+                   AND root.user_initiated = 1
+                   AND root.runtime_role = 'user'
+                   AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations predecessor
+                       WHERE predecessor.product_conversation_id = root.product_conversation_id
+                         AND predecessor.continued_in_conv_id = root.id
+                   )
+                 ORDER BY root.id ASC
+                 LIMIT 1",
+            )
+            .bind(resolved.product_conversation_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(row) = row else {
+                return Err(DbError::ConversationNotFound(reference.to_string()));
+            };
+            let root_id: String = row.try_get("id")?;
+            let result = sqlx::query(
+                "UPDATE conversations
+                 SET title = ?1, chain_name = NULL, updated_at = ?2
+                 WHERE id = ?3",
+            )
+            .bind(title)
+            .bind(now.to_rfc3339())
+            .bind(&root_id)
+            .execute(&mut *transaction)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(DbError::ConversationNotFound(reference.to_string()));
+            }
+            Ok::<ProductConversationId, DbError>(resolved.product_conversation_id)
+        }
+        .await;
+        match result {
+            Ok(product_conversation_id) => {
+                transaction.commit().await?;
+                Ok(product_conversation_id)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Lists the one-row sidebar projection for every ordinary product conversation.
     /// This deliberately does not hydrate each aggregate's transcript or handoff history.
     ///
@@ -345,15 +594,24 @@ impl Database {
                         ROW_NUMBER() OVER (PARTITION BY product_conversation_id ORDER BY ordinal DESC) AS latest_rank
                  FROM transcript
              ), activity AS (
-                 SELECT transcript.product_conversation_id, MAX(conversation.updated_at) AS updated_at
+                 SELECT transcript.product_conversation_id, MAX(conversation.updated_at) AS updated_at,
+                        MAX(conversation.state_kind = 'awaiting_task_approval') AS has_awaiting_task_approval,
+                        MAX(conversation.state_kind = 'awaiting_continuation') AS has_awaiting_continuation
                  FROM transcript JOIN conversations conversation ON conversation.id = transcript.id
                  GROUP BY transcript.product_conversation_id
              )
              SELECT product.id AS product_conversation_id, product.ordinary_lifecycle,
-                    root.id AS root_transcript_row_id, root.slug AS root_slug, root.title AS root_title,
+                    root.id AS root_transcript_row_id, root.slug AS root_slug,
+                    COALESCE(root.chain_name, root.title) AS root_title,
                     latest.id AS latest_transcript_row_id, latest.state AS latest_state,
                     latest.continued_in_conv_id AS latest_continued_in_conv_id,
-                    activity.updated_at
+                    activity.updated_at, activity.has_awaiting_task_approval,
+                    activity.has_awaiting_continuation,
+                    EXISTS (
+                        SELECT 1 FROM close_obligations obligation
+                        WHERE obligation.product_conversation_id = product.id
+                          AND obligation.phase <> 'completed'
+                    ) AS has_active_close_attempt
              FROM product_conversations product
              JOIN ranked root_ranked ON root_ranked.product_conversation_id = product.id AND root_ranked.root_rank = 1
              JOIN ranked latest_ranked ON latest_ranked.product_conversation_id = product.id AND latest_ranked.latest_rank = 1
@@ -365,35 +623,67 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                let product_conversation_id = row
-                    .try_get::<String, _>("product_conversation_id")?
-                    .parse::<ProductConversationId>()
-                    .map_err(|error| DbError::Serialization(error.to_string()))?;
-                let lifecycle = row.try_get::<String, _>("ordinary_lifecycle")?;
-                let lifecycle = OrdinaryProductConversationLifecycle::from_db_str(&lifecycle)
-                    .ok_or_else(|| {
-                        DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
-                    })?;
-                let latest_state = serde_json::from_str(&row.try_get::<String, _>("latest_state")?)
-                    .map_err(|error| DbError::Serialization(error.to_string()))?;
-                Ok(ProductConversationListProjection {
-                    product_conversation_id,
-                    lifecycle,
-                    root_transcript_row_id: row.try_get("root_transcript_row_id")?,
-                    root_slug: row.try_get("root_slug")?,
-                    root_title: row.try_get("root_title")?,
-                    latest_transcript_row_id: row.try_get("latest_transcript_row_id")?,
-                    latest_state,
-                    latest_continued_in_conv_id: row.try_get("latest_continued_in_conv_id")?,
-                    updated_at: row
-                        .try_get::<String, _>("updated_at")?
-                        .parse::<DateTime<Utc>>()
-                        .map_err(|error| DbError::Serialization(error.to_string()))?,
-                })
+        rows.iter().map(list_projection_from_row).collect()
+    }
+
+    /// Reads citation metadata without hydrating the aggregate transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or identity decode error when citation metadata cannot be read.
+    pub async fn ordinary_product_conversation_citation(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<OrdinaryProductConversationCitation>> {
+        let row = sqlx::query(
+            "SELECT product.id AS product_conversation_id, \
+                    COALESCE(root.chain_name, root.title, root.slug, root.id) AS root_title \
+             FROM product_conversations product \
+             JOIN conversations root ON root.product_conversation_id = product.id \
+             WHERE product.id = ?1 AND product.kind = 'ordinary' \
+               AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM conversations predecessor \
+                   WHERE predecessor.product_conversation_id = product.id \
+                     AND predecessor.continued_in_conv_id = root.id \
+               ) \
+             LIMIT 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(OrdinaryProductConversationCitation {
+                product_conversation_id: ProductConversationId::parse(
+                    row.try_get::<String, _>("product_conversation_id")?,
+                )
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                root_title: row.try_get("root_title")?,
             })
-            .collect()
+        })
+        .transpose()
+    }
+
+    /// Reads the persisted kind for a live `ProductConversation` identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or decode error when the persisted kind cannot be read.
+    pub async fn product_conversation_kind(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<ProductConversationKind>> {
+        let kind: Option<String> =
+            sqlx::query_scalar("SELECT kind FROM product_conversations WHERE id = ?1")
+                .bind(product_conversation_id.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        kind.map(|kind| {
+            ProductConversationKind::from_db_str(&kind).ok_or_else(|| {
+                DbError::Serialization(format!("unknown product conversation kind: {kind}"))
+            })
+        })
+        .transpose()
     }
 
     /// Reads one ordinary aggregate from its durable product identity.
@@ -557,27 +847,32 @@ impl Database {
             .acquire()
             .instrument(tracing::info_span!("product_conversation.pool_wait"))
             .await?;
-        connection
-            .execute("BEGIN")
+        let mut tx = connection
+            .begin()
             .instrument(tracing::info_span!("product_conversation.begin_read"))
             .await?;
         let result = async {
-            let resolved =
-                Self::resolve_ordinary_product_conversation_on(&mut connection, reference)
-                    .instrument(tracing::info_span!("product_conversation.resolve"))
-                    .await?;
+            let resolved = Self::resolve_ordinary_product_conversation_on(&mut tx, reference)
+                .instrument(tracing::info_span!("product_conversation.resolve"))
+                .await?;
             tracing::Span::current().record(
                 "product.reference",
                 resolved.product_conversation_id.as_str(),
             );
             let aggregate = Self::get_ordinary_product_conversation_on(
-                &mut connection,
+                &mut tx,
                 &resolved.product_conversation_id,
             )
             .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
+            let close = Self::get_active_close_projection_for_product_on(
+                &mut tx,
+                aggregate.product_conversation.id(),
+            )
+            .instrument(tracing::info_span!("product_conversation.close"))
+            .await?;
             let messages = Self::get_product_conversation_messages_page_on(
-                &mut connection,
+                &mut tx,
                 aggregate.product_conversation.id(),
                 before,
                 segment_ceilings,
@@ -587,6 +882,7 @@ impl Database {
             .await?;
             Ok(ProductConversationSnapshotRead {
                 aggregate,
+                close,
                 messages,
                 requested_transcript_row_id: resolved.requested_transcript_row_id,
             })
@@ -596,8 +892,7 @@ impl Database {
             "product.reference" = tracing::field::Empty,
         ))
         .await;
-        connection
-            .execute("ROLLBACK")
+        tx.rollback()
             .instrument(tracing::info_span!("product_conversation.rollback_read"))
             .await?;
         result
@@ -791,10 +1086,15 @@ impl Database {
             let summary = continuation_summary(&row, "continuation_content")?;
             let accepted_content =
                 message_content_from_row(&row, "accepted_message_type", "accepted_content")?;
-            let accepted_is_duplicate_summary = matches!(
-                accepted_content,
-                MessageContent::User(user) if user.text == summary
-            );
+            let accepted_is_duplicate_summary = match accepted_content {
+                MessageContent::User(user) => user.text == summary,
+                MessageContent::Continuation(continuation) => continuation.summary == summary,
+                MessageContent::Agent(_)
+                | MessageContent::Tool(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Skill(_) => false,
+            };
             return Ok(Some(ProductConversationHandoff::Completed {
                 predecessor_transcript_row_id: predecessor.to_string(),
                 successor_transcript_row_id: successor.to_string(),
@@ -966,7 +1266,7 @@ impl Database {
                    AND successor.parent_conversation_id IS NULL
              )
              SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, transcript.ordinal
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
              FROM transcript
              JOIN messages ON messages.conversation_id = transcript.id
              WHERE (?2 IS NULL
@@ -1063,8 +1363,131 @@ mod tests {
         ContinuationContent, ContinueOutcome, ConvState, MessageContent,
         NewContinuationDispatchIntent,
     };
+    use phoenix_core::domain::close::TranscriptConversationId;
     use phoenix_workflow::ClientTurnKey;
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn source_call_survives_real_snapshot_and_message_page() {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "source-projection",
+                "source-projection",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: conversation.product_conversation_id.clone(),
+            transcript_id: conversation.id.clone(),
+            source_call: Some(Box::new(SourceToolCall {
+                message_id: "source-assistant".into(),
+                tool_use_id: "source-call".into(),
+            })),
+        };
+        db.add_message_with_seq_and_origin(
+            "received",
+            &conversation.id,
+            1,
+            &MessageContent::user("forwarded"),
+            None,
+            None,
+            &origin,
+        )
+        .await
+        .unwrap();
+        let snapshot = db
+            .read_ordinary_product_conversation_snapshot(&conversation.id, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.messages[0].1.origin, origin);
+        let page = db
+            .get_product_conversation_messages_page(&conversation.product_conversation_id, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page[0].1.origin, origin);
+    }
+
+    #[tokio::test]
+    async fn cancelled_snapshot_returns_a_clean_connection() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            assert_cancelled_snapshot_returns_a_clean_connection(),
+        )
+        .await
+        .expect("cancelled snapshot cleanup did not complete");
+    }
+
+    async fn assert_cancelled_snapshot_returns_a_clean_connection() {
+        for pause_after in [1, 20] {
+            let db = Database::open_in_memory().await.unwrap();
+            let root = db
+                .create_conversation("cancel-root", "cancel-root", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut connection = db.pool.acquire().await.unwrap();
+            {
+                let mut handle = connection.lock_handle().await.unwrap();
+                let raw = handle.as_raw_handle().as_ptr() as usize;
+                let mut entered_tx = Some(entered_tx);
+                let mut active_steps = 0;
+                handle.set_progress_handler(1, move || {
+                    // SAFETY: SQLite invokes this callback on the owning connection's
+                    // worker; the handle remains live and this call only reads its flag.
+                    let active =
+                        unsafe { libsqlite3_sys::sqlite3_get_autocommit(raw as *mut _) == 0 };
+                    if active {
+                        active_steps += 1;
+                        if active_steps == pause_after {
+                            entered_tx.take().unwrap().send(()).unwrap();
+                            let _ = release_rx.recv();
+                        }
+                    }
+                    true
+                });
+            }
+            drop(connection);
+            let mut read =
+                Box::pin(db.read_ordinary_product_conversation_snapshot(&root.id, None, None, 10));
+            tokio::select! {
+                result = &mut read => panic!("snapshot completed before cancellation: {result:?}"),
+                entered = entered_rx => entered.unwrap(),
+            }
+            drop(read);
+            release_tx.send(()).unwrap();
+
+            let mut connection = db.pool.acquire().await.unwrap();
+            {
+                let mut handle = connection.lock_handle().await.unwrap();
+                handle.remove_progress_handler();
+                // SAFETY: the locked handle excludes concurrent SQLite access.
+                assert_ne!(
+                    unsafe {
+                        libsqlite3_sys::sqlite3_get_autocommit(handle.as_raw_handle().as_ptr())
+                    },
+                    0,
+                    "cancelled snapshot left a transaction open"
+                );
+            }
+            drop(connection);
+            let tx = db
+                .pool
+                .begin()
+                .await
+                .expect("cancelled snapshot must not poison the pool");
+            tx.rollback().await.unwrap();
+            db.read_ordinary_product_conversation_snapshot(&root.id, None, None, 10)
+                .await
+                .unwrap();
+        }
+    }
 
     async fn performance_fixture(
         segment_count: usize,
@@ -1138,8 +1561,7 @@ mod tests {
     }
 
     async fn measure_snapshot_stages(db: &Database, reference: &str) -> (u128, u128, u128, u128) {
-        let mut connection = db.pool.acquire().await.unwrap();
-        connection.execute("BEGIN").await.unwrap();
+        let mut connection = db.pool.begin().await.unwrap();
         let started = Instant::now();
         let resolved =
             Database::resolve_ordinary_product_conversation_on(&mut connection, reference)
@@ -1167,7 +1589,7 @@ mod tests {
         assert_eq!(messages.len(), 51);
         let page_micros = started.elapsed().as_micros();
         let started = Instant::now();
-        connection.execute("ROLLBACK").await.unwrap();
+        connection.rollback().await.unwrap();
         let rollback_micros = started.elapsed().as_micros();
         (
             resolve_micros,
@@ -1422,6 +1844,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_read_includes_active_close_projection() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("snapshot-close", "snapshot-close", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &TranscriptConversationId::parse(conversation.id.clone()).unwrap(),
+            "snapshot-close-attempt",
+        )
+        .await
+        .unwrap();
+
+        let snapshot = db
+            .read_ordinary_product_conversation_snapshot(&conversation.id, None, None, 1)
+            .await
+            .unwrap();
+
+        let close = snapshot.close.expect("active Close projection");
+        assert_eq!(
+            close.obligation.attempt_id().as_str(),
+            "snapshot-close-attempt"
+        );
+        assert_eq!(
+            close.obligation.product_conversation_id(),
+            &conversation.product_conversation_id
+        );
+    }
+
+    #[tokio::test]
     async fn list_lifecycle_uses_aggregate_authority_despite_legacy_archived_bit() {
         let db = Database::open_in_memory().await.unwrap();
         let conversation = db
@@ -1446,7 +1899,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             projection.lifecycle,
-            OrdinaryProductConversationLifecycle::Open
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Available,
+            }
         );
 
         sqlx::query(
@@ -1474,7 +1929,235 @@ mod tests {
             .unwrap();
         assert_eq!(
             projection.lifecycle,
-            OrdinaryProductConversationLifecycle::History
+            ProductConversationListLifecycle::History
+        );
+    }
+
+    #[tokio::test]
+    async fn list_title_uses_effective_aggregate_rename() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "title-authority",
+                "title-authority",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET title = 'Aggregate Title', chain_name = 'Legacy Override' WHERE id = ?1")
+            .bind(&conversation.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let projections = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap();
+        let projection = projections
+            .iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+
+        assert_eq!(projection.root_title.as_deref(), Some("Legacy Override"));
+    }
+
+    #[tokio::test]
+    async fn list_projects_close_availability_from_close_preconditions() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "close-availability",
+                "close-availability",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let projection = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle,
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Available,
+            }
+        );
+
+        db.update_conversation_state(&conversation.id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        let projection = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle,
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Available,
+            }
+        );
+
+        db.update_conversation_state(
+            &conversation.id,
+            &ConvState::AwaitingContinuation {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "continue".to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let projection = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle,
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Unavailable(
+                    ProductConversationCloseUnavailableReason::AwaitingContinuation,
+                ),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn list_projects_task_approval_as_a_typed_close_blocker() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("close-approval", "close-approval", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &conversation.id,
+            &ConvState::AwaitingTaskApproval {
+                task_file: "tasks/00001-p1-ready--close.md".to_string(),
+                title: "Close".to_string(),
+                priority: phoenix_core::task_source::Priority::P1,
+                plan: "plan".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let projection = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle,
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Unavailable(
+                    ProductConversationCloseUnavailableReason::AwaitingTaskApproval,
+                ),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_title_clear_restores_original_title_fallback() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("legacy-title", "original-title", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let original_title = conversation.title.clone();
+
+        db.set_ordinary_product_conversation_legacy_title(&conversation.id, "Temporary Override")
+            .await
+            .unwrap();
+        let renamed = db.get_conversation(&conversation.id).await.unwrap();
+        assert_eq!(renamed.chain_name.as_deref(), Some("Temporary Override"));
+        assert_eq!(renamed.title, original_title);
+
+        db.clear_ordinary_product_conversation_legacy_title(&conversation.id)
+            .await
+            .unwrap();
+        let cleared = db.get_conversation(&conversation.id).await.unwrap();
+        assert_eq!(cleared.chain_name, None);
+        assert_eq!(cleared.title, original_title);
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_history_without_mutating_title() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("rename-history", "rename-history", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET title = 'Original', chain_name = 'Legacy' WHERE id = ?1",
+        )
+        .bind(&conversation.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.set_ordinary_product_conversation_title(&conversation.id, "Changed").await,
+            Err(DbError::ProductConversationUnavailable(id))
+                if id == conversation.product_conversation_id
+        ));
+        assert!(matches!(
+            db.clear_ordinary_product_conversation_legacy_title(&conversation.id).await,
+            Err(DbError::ProductConversationUnavailable(id))
+                if id == conversation.product_conversation_id
+        ));
+        let row = sqlx::query("SELECT title, chain_name FROM conversations WHERE id = ?1")
+            .bind(&conversation.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            row.try_get::<Option<String>, _>("title")
+                .unwrap()
+                .as_deref(),
+            Some("Original")
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("chain_name")
+                .unwrap()
+                .as_deref(),
+            Some("Legacy")
         );
     }
 
