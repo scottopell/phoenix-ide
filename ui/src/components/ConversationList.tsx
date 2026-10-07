@@ -865,7 +865,10 @@ export function ConversationList({
     }
   }, [activeSlug, displayProductList, groupedItems, collapsedChains, effectiveListDensity]);
 
-  const closeRowMenu = useCallback(() => setExpandedId(null), []);
+  const closeRowMenu = useCallback(() => {
+    menuRef.current?.querySelector<HTMLButtonElement>('.conv-item-menu-btn')?.focus();
+    setExpandedId(null);
+  }, []);
 
   const isEmpty = usingProductRows ? displayProductList.length === 0 : displayList.length === 0;
 

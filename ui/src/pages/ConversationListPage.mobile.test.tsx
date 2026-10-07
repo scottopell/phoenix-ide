@@ -121,6 +121,25 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(screen.queryByRole('button', { name: 'Close conversation Mobile Product' })).toBeNull();
   });
 
+  it.each(['open', 'history'] as const)('restores Actions focus after %s confirmation cancellation', async (state) => {
+    if (state === 'history') vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [{ ...productConversation(), lifecycle: { state: 'history' } }] });
+    render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
+    if (state === 'history') fireEvent.click(await screen.findByRole('button', { name: 'History 1' }));
+    const trigger = await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' });
+    trigger.focus();
+    fireEvent.click(trigger);
+    const action = screen.getByRole('button', { name: `${state === 'history' ? 'Delete' : 'Close'} conversation Mobile Product` });
+    action.focus();
+    fireEvent.click(action);
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).toHaveFocus();
+    fireEvent.click(cancel);
+    expect(trigger).toHaveFocus();
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
+    expect(api.closeProductConversation).not.toHaveBeenCalled();
+    expect(api.deleteChain).not.toHaveBeenCalled();
+  });
+
   it('uses aggregate deletion for History with one parent transcript', async () => {
     const history = {
       ...productConversation(),
