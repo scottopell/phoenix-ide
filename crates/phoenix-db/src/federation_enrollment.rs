@@ -43,6 +43,15 @@ impl EnrollmentCommit {
     }
 }
 
+fn persisted_timestamp(observed_clock_us: i64, previous_created_at: Option<i64>) -> DbResult<i64> {
+    if observed_clock_us < 0 {
+        return Err(DbError::Serialization(
+            "federation enrollment clock is before the Unix epoch".into(),
+        ));
+    }
+    Ok(observed_clock_us.max(previous_created_at.unwrap_or(0)))
+}
+
 impl Database {
     /// Replace any active receiver-issued credential for one caller instance.
     ///
@@ -80,9 +89,10 @@ impl Database {
         .bind(caller_instance_id.to_string())
         .fetch_optional(&mut *tx)
         .await?;
-        let now = observed_clock_us
-            .unwrap_or_else(|| Utc::now().timestamp_micros())
-            .max(previous_created_at.unwrap_or(0));
+        let now = persisted_timestamp(
+            observed_clock_us.unwrap_or_else(|| Utc::now().timestamp_micros()),
+            previous_created_at,
+        )?;
         sqlx::query(
             "UPDATE federation_enrollments SET revoked_at_us = ?2
              WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
@@ -157,9 +167,10 @@ impl Database {
         .bind(caller_instance_id.to_string())
         .fetch_optional(&mut *tx)
         .await?;
-        let now = observed_clock_us
-            .unwrap_or_else(|| Utc::now().timestamp_micros())
-            .max(previous_created_at.unwrap_or(0));
+        let now = persisted_timestamp(
+            observed_clock_us.unwrap_or_else(|| Utc::now().timestamp_micros()),
+            previous_created_at,
+        )?;
         let result = sqlx::query(
             "UPDATE federation_enrollments SET revoked_at_us = ?2
              WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
@@ -309,6 +320,27 @@ mod tests {
                 .caller_instance_id,
             first_caller
         );
+    }
+
+    #[tokio::test]
+    async fn negative_clock_is_rejected_before_monotonic_clamping() {
+        let db = test_db().await;
+        let caller = InstanceId::new();
+        let verifier = FederationCredentialVerifier::from_bearer(b"bearer");
+        assert!(db
+            .replace_federation_enrollment_with_commit(
+                caller,
+                "peer",
+                &verifier,
+                EnrollmentCommit::Normal,
+                Some(-1),
+            )
+            .await
+            .is_err());
+        assert!(db
+            .revoke_federation_enrollment_at(caller, Some(-1))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
