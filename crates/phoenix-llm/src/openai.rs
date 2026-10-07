@@ -135,8 +135,9 @@ pub async fn complete(
         return Err(responses_http_error(status.as_u16(), &body));
     }
 
-    let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|e| {
-        LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
+    let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|_| {
+        tracing::debug!(body_bytes = body.len(), "malformed Responses API response");
+        LlmError::invalid_response("Failed to parse Responses API response")
     })?;
 
     bind_responses_model(
@@ -2090,8 +2091,10 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
     let mut content = Vec::new();
 
     for output in resp.output {
-        let output: ResponsesOutputView = serde_json::from_value(output.0)
-            .map_err(|error| LlmError::invalid_response(error.to_string()))?;
+        let output: ResponsesOutputView = serde_json::from_value(output.0).map_err(|_| {
+            tracing::debug!("malformed Responses API output item");
+            LlmError::invalid_response("Failed to parse Responses API output item")
+        })?;
         match output.r#type.as_str() {
             "message" => {
                 if let Some(output_content) = output.content {
@@ -4061,6 +4064,75 @@ mod tests {
         .expect("wrapped error maps");
         assert_eq!(error.kind, crate::LlmErrorKind::PromptRejected);
         assert!(error.kind.is_user_resumable());
+    }
+
+    #[tokio::test]
+    async fn nonstreaming_malformed_response_never_exposes_private_output() {
+        let app = Router::new().route(
+            "/responses",
+            axum::routing::post(|Json(request): Json<serde_json::Value>| async move {
+                assert_eq!(request["model"], "gpt-5.6");
+                Json(serde_json::json!({
+                    "id":"private-response",
+                    "model":"gpt-5.6",
+                    "status":"completed",
+                    "output":[{
+                        "type":"reasoning",
+                        "id":"private-item",
+                        "summary":[],
+                        "encrypted_content":"PRIVATE_ENCRYPTED_SENTINEL",
+                        "unknown_private":"PRIVATE_UNKNOWN_SENTINEL"
+                    }],
+                    "usage":{"input_tokens":"PRIVATE_SERDE_SENTINEL","output_tokens":1}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let request = empty_request();
+        let official_request = serde_json::to_value(translate_to_backend_request(
+            "gpt-5.6", &request, false, true,
+        ))
+        .unwrap();
+        assert_eq!(
+            official_request["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        let error = complete(
+            &codex_spec(),
+            "test-key",
+            Some(&url),
+            &[],
+            &BTreeMap::new(),
+            &request,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::InvalidResponse);
+        assert_eq!(error.message, "Failed to parse Responses API response");
+        for sentinel in [
+            "PRIVATE_ENCRYPTED_SENTINEL",
+            "PRIVATE_UNKNOWN_SENTINEL",
+            "PRIVATE_SERDE_SENTINEL",
+        ] {
+            assert!(!error.message.contains(sentinel));
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn malformed_private_output_view_returns_content_free_error() {
+        let mut wire = reasoning_response("r1", "c1");
+        wire["output"][0]["content"] = serde_json::json!("PRIVATE_VIEW_SENTINEL");
+        wire["output"][0]["encrypted_content"] = serde_json::json!("PRIVATE_ENCRYPTED_SENTINEL");
+        let error =
+            normalize_responses_api_response(serde_json::from_value(wire).unwrap()).unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::InvalidResponse);
+        assert_eq!(error.message, "Failed to parse Responses API output item");
+        assert!(!error.message.contains("PRIVATE_VIEW_SENTINEL"));
+        assert!(!error.message.contains("PRIVATE_ENCRYPTED_SENTINEL"));
     }
 
     #[tokio::test]
