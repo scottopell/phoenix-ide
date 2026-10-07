@@ -112,7 +112,7 @@ describe('CoordinatorPage', () => {
     await waitFor(() => expect(activity).toHaveTextContent('Watching 1'));
     expect(await screen.findByRole('region', { name: 'Active watches' })).toBeInTheDocument();
 
-    expect(screen.getByRole('link', { name: 'Fix readable target' })).toHaveAttribute('href', '/product-conversations/product-readable');
+    expect(screen.getByRole('link', { name: 'Fix readable target' })).toHaveAttribute('href', '/c/product-readable');
     expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/fix-readable-target');
     expect(screen.getByTitle('ProductConversation ID')).toHaveTextContent('product-readable');
   });
@@ -159,7 +159,7 @@ describe('CoordinatorPage', () => {
     fireEvent.click(commandDetails!.querySelector('summary')!);
     expect(running).toHaveTextContent('/repo/ui');
     expect(running).toHaveTextContent('b-live');
-    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
     fireEvent.click(screen.getByRole('button', { name: 'stop' }));
     await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
@@ -243,6 +243,22 @@ describe('CoordinatorPage', () => {
     expect(screen.getByText('/global/old-coordinator?view=history#message-source')).toBeInTheDocument();
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('old-coordinator');
     expect(await screen.findByTestId('automatic-continuation-control')).toBeInTheDocument();
+  });
+
+  it.each(['old-member', 'conv-coordinator'])('validates and selects direct Global query member %s', async (pin) => {
+    render(<MemoryRouter initialEntries={[`/global/conv-coordinator?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`]}><Routes>
+      <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+    </Routes></MemoryRouter>);
+    await screen.findByText('Shared conversation runtime /global');
+    expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(pin);
+    expect(screen.getByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
+  });
+
+  it.each(['', 'foreign', 'old&source_transcript=other'])('fails closed on invalid direct Global pin %s', async (pin) => {
+    apiMock.resolveCoordinatorRoute.mockImplementation(async (reference: string) => ({ coordinator_id: reference === 'conv-coordinator' ? 'conv-coordinator' : null }));
+    renderPage(`/global/conv-coordinator?source_transcript=${pin}`);
+    await screen.findByText('Original source conversation unavailable');
+    expect(screen.queryByText('Shared conversation runtime /global')).toBeNull();
   });
 
   it('keeps an unavailable exact source member in the Coordinator error layout', async () => {

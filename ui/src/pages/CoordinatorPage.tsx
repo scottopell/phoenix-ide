@@ -164,15 +164,38 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     setLoading(true);
     setResolvedCoordinatorId(null);
     let cancelled = false;
+    setResolvedCoordinatorId(null);
+    setError(null);
     api.ensureGlobalCoordinator()
-      .then((coordinator) => {
+      .then(async (coordinator) => {
         if (cancelled) return;
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
         const topologyChanged = topologyRevision > consumedTopologyRevision.current;
         consumedTopologyRevision.current = topologyRevision;
-        const pinnedSource = new URLSearchParams(locationRef.current.search).has('source_tool');
+        const query = new URLSearchParams(locationRef.current.search);
+        const pins = query.getAll('source_transcript');
+        const pinnedSource = pins.length > 0 || query.has('source_tool');
+        if (pins.length > 0) {
+          const pin = pins[0];
+          if (pins.length !== 1 || !pin || pin.trim() !== pin) {
+            setError('Original source conversation unavailable');
+            return;
+          }
+          const [owner, selected] = await Promise.all([
+            api.resolveCoordinatorRoute(slug ?? coordinator.conversation.id),
+            api.resolveCoordinatorRoute(pin),
+          ]);
+          if (cancelled) return;
+          if (!owner.coordinator_id || owner.coordinator_id !== selected.coordinator_id) {
+            setError('Original source conversation unavailable');
+            return;
+          }
+          setResolvedCoordinatorId(pin);
+          if (slug !== pin) navigate(`/global/${pin}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+          return;
+        }
         if (topologyChanged && !pinnedSource && slug !== coordinator.conversation.id) {
           navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
         } else if (!slug || slug === coordinator.conversation.id) {
@@ -204,7 +227,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [fixtureData, navigate, slug, topologyRevision]);
+  }, [fixtureData, navigate, slug, topologyRevision, location.search]);
 
   const handleAutomaticContinuationStatus = useCallback((status: string, requiresAttention: boolean) => {
     setAutomaticContinuationStatus(status);
