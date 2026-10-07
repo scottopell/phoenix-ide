@@ -948,11 +948,12 @@ invariant OneTokenPerServer {
 ------------------------------------------------------------
 
 -- authorization_removes_server(srv): Bool
+--   True iff the pending authorization owns cleanup for a removed configuration,
+--   rather than reconnection. Re-adding that configuration restores reconnect intent.
+--
 -- retry_requires_authorization(srv): Bool
 --   True when retained OAuth session cleanup owns a denied authorization's
 --   requested scopes, requiring fresh authorization before session deletion.
---   True iff the pending authorization owns cleanup for a removed configuration,
---   rather than reconnection. Re-adding that configuration restores reconnect intent.
 --
 -- discovered_tools(srv): List<String>
 --   The tool names from the server's tools/list response (paginated).
