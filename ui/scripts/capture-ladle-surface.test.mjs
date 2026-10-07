@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { __testables, buildLadleStoryUrl } from './capture-ladle-surface.mjs';
+import packageJson from '../package.json';
+import { __testables, buildLadleStoryUrl, selectCaptureEntries, verifyInstalledBrowser } from './capture-ladle-surface.mjs';
 
 const { normalizeViewportMatrix, playwrightInstallArgs, screenshotFileName } = __testables;
 
@@ -63,4 +64,27 @@ describe('capture-ladle-surface viewport helpers', () => {
       'viewportMatrix[0] must include finite width and height',
     );
   });
+});
+
+describe('bounded installed-browser capture', () => {
+  it('selects exact scenarios and viewports and rejects unknown or empty input', () => {
+    const stories = [{ id: 'open' }, { id: 'history' }];
+    expect(selectCaptureEntries(stories, 'history', 'id', 'stories')).toEqual([stories[1]]);
+    expect(selectCaptureEntries(stories, undefined, 'id', 'stories')).toBe(stories);
+    expect(() => selectCaptureEntries(stories, 'open,missing', 'id', 'stories')).toThrow('unknown');
+    expect(() => selectCaptureEntries(stories, '', 'id', 'stories')).toThrow('unknown');
+    expect(selectCaptureEntries([{ name: 'mobile' }, { name: 'desktop' }], 'mobile', 'name', 'viewports')).toEqual([{ name: 'mobile' }]);
+  });
+  it('verifies an existing executable and rejects a missing one without installing', async () => {
+    await expect(verifyInstalledBrowser(process.execPath)).resolves.toBeUndefined();
+    await expect(verifyInstalledBrowser('/nonexistent/phoenix-capture-browser')).rejects.toThrow();
+  });
+});
+
+it('standard sidebar and mobile entrypoints delegate browser installation to the guarded runner', () => {
+  const scripts = packageJson.scripts;
+  for (const name of ['qa:sidebar', 'qa:mobile-conversation-list']) {
+    expect(scripts[name]).toMatch(/^PHOENIX_LADLE=1 node scripts\/capture-/);
+    expect(scripts[name]).not.toContain('playwright install');
+  }
 });
