@@ -96,7 +96,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [080](080_close-stops-bound-fsmonitor-daemons.md) | Close stops bound fsmonitor daemons instead of reconfiguring Git | Accepted | REQ-WL-002b; Close retirement quarantine and descriptor scan |
 | [081](081_global-coordinator-borrows-workscope-svg-source-authority.md) | Global Coordinator borrows WorkScope SVG source authority | Accepted | REQ-SVG-001, REQ-GR-007 |
 | [082](082_legacy-auq-waits-retain-identity-absence.md) | Legacy AUQ waits retain identity absence | Accepted | REQ-AUQ-009, REQ-COMP-001; `QuestionRequestId`, `AwaitingUserResponse` |
-| [083](083_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
+| [083](083_federation-instance-identity-and-known-credential-query-exclusions.md) | Federation establishes stable instance identity and excludes known credentials from agent SQL | Accepted | REQ-GR-011A; federation instance identity |
+| [084](084_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
 
 ## For agents: which decisions bind your task
 
@@ -109,6 +110,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
+| Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
