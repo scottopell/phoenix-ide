@@ -547,7 +547,11 @@ impl ResponsesStreamAccumulator {
     }
 
     fn complete_output_items(&mut self, terminal: &[serde_json::Value]) {
-        if self.output_items.is_empty() {
+        if self.output_items.iter().all(|(ordinal, collected)| {
+            terminal
+                .get(*ordinal)
+                .is_some_and(|item| preserves_completed_output(&collected.0, item))
+        }) {
             self.output_items.extend(
                 terminal
                     .iter()
@@ -1266,9 +1270,13 @@ async fn complete_codex_websocket(
                 .lock()
                 .expect("cooldown mutex poisoned")
                 .reset();
-            if let Some(canonical_output) = canonical_server_output(server_output) {
+            let continuation_output = match &response.provider_replay {
+                Some(ProviderReplayUpdate::Responses(set)) => Some(set.output_items.clone()),
+                _ => canonical_server_output(server_output),
+            };
+            if let Some(output) = continuation_output {
                 let mut prefix = full_input;
-                prefix.extend(canonical_output);
+                prefix.extend(output);
                 session.response_id = Some(response_id);
                 session.compatibility = Some(compatibility);
                 session.prefix = prefix;
@@ -3861,6 +3869,18 @@ mod tests {
                 }
                 let n = state.ws_requests.lock().await.len();
                 let answer = format!("answer-{n}");
+                if marker.contains("ws-tool-round") && n <= 2 {
+                    let mut response = reasoning_response(&format!("resp-{n}"), &format!("call-{n}"));
+                    response["model"] = request["model"].clone();
+                    if n == 1 {
+                        response["output"].as_array_mut().unwrap().remove(0);
+                        response["output"][0]["phase"] = serde_json::json!("commentary");
+                    }
+                    socket.send(AxumWsMessage::Text(serde_json::json!({
+                        "type":"response.completed", "response":response
+                    }).to_string())).await.unwrap();
+                    continue;
+                }
                 if marker.contains("unsupported-output") {
                     socket.send(AxumWsMessage::Text(serde_json::json!({
                         "type":"response.completed",
@@ -4041,6 +4061,91 @@ mod tests {
         .expect("wrapped error maps");
         assert_eq!(error.kind, crate::LlmErrorKind::PromptRejected);
         assert!(error.kind.is_user_resumable());
+    }
+
+    #[tokio::test]
+    async fn websocket_tool_rounds_continue_with_exact_private_output_prefix() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let mut request = request_with(&[("ws-tool-round", MessageRole::User)]);
+        request.tool_availability = restricted_request(&["bash"])
+            .tool_availability
+            .with_continuation_id("tool-context".into())
+            .unwrap();
+        for round in 1..=3 {
+            let response = complete_streaming(
+                &codex_spec(),
+                "account-a",
+                Some(&url),
+                &[],
+                &BTreeMap::new(),
+                &request,
+                &tx,
+                true,
+                Some(&sessions),
+            )
+            .await
+            .unwrap();
+            if round == 3 {
+                assert!(response.end_turn);
+                break;
+            }
+            let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay else {
+                panic!("tool round requires full replay");
+            };
+            let owner = format!("owner-{round}");
+            request.messages.push(LlmMessage {
+                source_message_id: Some(owner.clone()),
+                role: MessageRole::Assistant,
+                content: set.public_content.clone(),
+            });
+            request
+                .responses_replay
+                .push(set.with_owner_message_id(owner));
+            request.messages.push(LlmMessage {
+                source_message_id: None,
+                role: MessageRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("call-{round}"),
+                    content: format!("ws-tool-round-result-{round}"),
+                    is_error: false,
+                    images: vec![],
+                }],
+            });
+        }
+        let requests = state.ws_requests.lock().await;
+        assert_eq!(state.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(requests.len(), 3);
+        for round in 1..=2 {
+            assert_eq!(requests[round].0, requests[0].0);
+            assert_eq!(
+                requests[round].1["previous_response_id"],
+                format!("resp-{round}")
+            );
+            assert_eq!(
+                requests[round].1["input"],
+                serde_json::json!([{
+                    "type":"function_call_output",
+                    "call_id":format!("call-{round}"),
+                    "output":format!("ws-tool-round-result-{round}")
+                }])
+            );
+            assert_eq!(requests[round].1["prompt_cache_key"], "integration");
+        }
+        assert_eq!(
+            request.responses_replay[0].output_items[0]["phase"],
+            "commentary"
+        );
+        assert_eq!(
+            request.responses_replay[1].output_items[0]["encrypted_content"],
+            "opaque"
+        );
+        assert_eq!(
+            request.responses_replay[1].output_items[0]["unexpected"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]
@@ -5075,6 +5180,27 @@ mod tests {
             panic!("completed function call and reasoning must remain replayable");
         };
         assert_eq!(set.output_items, wire["output"].as_array().unwrap().clone());
+    }
+
+    #[tokio::test]
+    async fn complete_terminal_superset_recovers_tool_round_from_completed_commentary() {
+        let mut wire = reasoning_response("r1", "c1");
+        wire["output"].as_array_mut().unwrap().swap(0, 1);
+        wire["output"][0]["phase"] = serde_json::json!("commentary");
+        let mut accumulator = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let event = serde_json::json!({
+            "type":"response.output_item.done",
+            "output_index":0,
+            "item":wire["output"][0]
+        });
+        accumulator
+            .process_event("response.output_item.done", &event.to_string(), &tx)
+            .await
+            .unwrap();
+        let response =
+            finish_with_terminal_output(accumulator, &wire, wire["output"].clone()).await;
+        assert_exact_completed_replay(&response, &wire);
     }
 
     #[tokio::test]

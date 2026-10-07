@@ -393,8 +393,14 @@ rule CodexWebSocketContinuationSelected {
         -- with input removed, so model, instructions/tools/tool choice, reasoning,
         -- store/stream/include, service tier, cache key, text controls, tags, and
         -- every future non-input field participate automatically. A successful
-        -- terminal event replaces the session prefix with full input plus exact
-        -- server output. Auth/model/property/compaction or non-prefix changes do
+        -- tool-round terminal event replaces the session prefix with full input
+        -- plus the exact accepted opaque output envelopes used by the next
+        -- private replay. IDs, phase, reasoning, and unknown fields participate
+        -- in the same prefix equality; normalization cannot disable ordinary
+        -- incremental tool continuation. A settled terminal event uses its
+        -- representable public-input projection; unsupported output disables
+        -- incremental reuse while retaining the healthy socket.
+        -- Auth/model/property/compaction or non-prefix changes do
         -- not reuse the old response id.
         -- Text deltas and codex.rate_limits quota snapshots are emitted through
         -- the bounded single-consumer channel as their frames arrive. Only a
@@ -705,18 +711,23 @@ rule ResponsesOutputItemCollected {
 -- A response.completed event ends the stream successfully. Usage is
 -- recorded. Fallback: if no per-item.done events were seen, the output
 -- items are recovered from the terminal event's /response/output array.
+-- A lossless full terminal superset can also complete a partial collection.
 rule ResponsesStreamCompleted {
-    when: ResponsesCompletedEvent(stream, input_tokens, output_tokens, cached_tokens, cache_write_tokens, terminal_output)
+    when: ResponsesCompletedEvent(stream, input_tokens, output_tokens, cached_tokens, cache_write_tokens, terminal_output, terminal_preserves_completed_items)
 
     requires: stream.status = accumulating
+
+    let collected_count = stream.output_items.count
 
     ensures:
         stream.input_tokens = input_tokens
         stream.output_tokens = output_tokens
         stream.cached_tokens = cached_tokens
         stream.cache_write_tokens = cache_write_tokens
-        if stream.output_items.count = 0:
-            stream.recovered_from_completed = true
+        if collected_count = 0 or terminal_preserves_completed_items:
+            if collected_count = 0 or terminal_output.count > collected_count:
+                stream.recovered_from_completed = true
+            ResponsesOutputItem.deleted(stream: stream)
             for kind in terminal_output:
                 ResponsesOutputItem.created(stream: stream, item_kind: kind)
         stream.status = done
@@ -729,10 +740,16 @@ rule ResponsesStreamCompleted {
         -- Without recovery the accumulator finalized empty and Phoenix
         -- persisted "end_turn with empty content" despite being billed
         -- for output tokens. /response/output in the terminal event is
-        -- authoritative when the per-item stream produced nothing.
-        -- The `if` guard reads resulting state: output_items.count
-        -- reflects items created by prior ResponsesOutputItemCollected
-        -- firings, before this rule creates any.
+        -- authoritative when the per-item stream produced nothing, or when
+        -- it is a verified lossless completion of the collected output.
+        -- terminal_preserves_completed_items is true only when every collected
+        -- envelope is present at its original output index and every existing
+        -- field is unchanged. The terminal array may then supply missing items
+        -- in provider order. Replacing the collection preserves all evidence.
+        -- Empty, partial, or conflicting terminal arrays cannot erase collected
+        -- items. Same-ID terminal envelopes may enrich a collected item only
+        -- by preserving every existing field; shifted partial-array positions
+        -- do not establish output order. Null values remain values.
 }
 
 -- An `error` SSE event terminates the stream. The error code is routed
