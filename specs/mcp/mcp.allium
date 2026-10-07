@@ -547,12 +547,18 @@ rule TokenRefreshNeeded {
         -- non-callable cleanup ownership. Do not require its session DELETE
         -- to succeed before refreshing: the expired bearer can also be
         -- rejected on DELETE. Concurrent recovery requests join that epoch.
+        -- If transport recovery won first and its DELETE failed, an OAuth
+        -- failure observed on the same original epoch upgrades that retained
+        -- cleanup owner and reserves a fresh recovery epoch. Config supersession
+        -- clears this provenance, so unrelated cleanup cannot receive a bearer.
         -- Cancel active calls before retaining the old session for cleanup;
         -- cancellation does not authorize replay of those other calls.
         -- Quiesce the server-initiated HTTP stream without deleting the session,
         -- so retained ownership does not keep reconnecting with stale credentials.
         -- A transient refresh failure retains the token and cleanup ownership
         -- while the same epoch retries; it does not discard the session.
+        -- Reauthorization setup errors settle as failed with explicit retry
+        -- ownership; only token-refresh transport failures retry automatically.
         -- Token persistence, invalidation, and re-prompt publication share the
         -- per-server config-reconciliation mutation fence. Check the recovery epoch after
         -- acquiring that fence, so a superseded retry cannot mutate credentials

@@ -355,6 +355,11 @@ explicit unchanged-configuration reload SHALL request authorization again
 with those scopes before attempting authenticated session deletion.
 Stream-quiescence failure SHALL settle as failed with teardown ownership
 retained, rather than remaining in recovery without an authorization URL.
+An OAuth failure from the same observed connection epoch SHALL be able to
+take over transport recovery whose session cleanup failed, obtaining a bearer
+before retrying that cleanup. Reauthorization setup failure SHALL settle as
+failed and require explicit retry; only transient token-refresh failures retry
+automatically while retaining the existing grant.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very

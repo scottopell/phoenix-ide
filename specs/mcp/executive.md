@@ -114,6 +114,11 @@ upgrade, preserved scopes on explicit reload, stale callback rejection, and
 authenticated cleanup before replacement publication.
 `oauth_quiescence_failure_settles_failed_and_retains_cleanup` covers a visible
 failed state and retained teardown ownership when stream quiescence fails.
+`oauth_failure_takes_over_failed_transport_cleanup_from_same_epoch` covers
+transport recovery winning leadership before OAuth recovery, with expired
+DELETE followed by refreshed DELETE and a ready replacement.
+`rejected_refresh_with_unstartable_authorization_settles_failed` verifies
+visible failure without an endless retry, followed by explicit authorization retry.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

@@ -2231,13 +2231,21 @@ impl McpClientManager {
                     .await
                 {
                     Ok(()) => RefreshServerOutcome::Reprompt(error),
-                    Err(error) => RefreshServerOutcome::Transient(error),
+                    Err(error) => {
+                        handle
+                            .deny_oauth(permit.epoch, error.clone(), Vec::new())
+                            .await;
+                        RefreshServerOutcome::Failed(error)
+                    }
                 }
             }
-            Err(flow_error) => RefreshServerOutcome::Transient(format!(
-                "MCP server '{name}': OAuth refresh rejected ({reason}) and re-authorization \
-                 could not start: {flow_error}"
-            )),
+            Err(flow_error) => {
+                let error = format!("MCP server '{name}': OAuth refresh rejected ({reason}) and re-authorization could not start: {flow_error}");
+                handle
+                    .deny_oauth(permit.epoch, error.clone(), Vec::new())
+                    .await;
+                RefreshServerOutcome::Failed(error)
+            }
         }
     }
 

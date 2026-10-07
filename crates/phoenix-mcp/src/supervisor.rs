@@ -454,6 +454,7 @@ enum OAuthCleanupNext {
     Reconnect(McpServerConfig),
 }
 
+#[derive(Clone, Copy)]
 enum RecoveryKind {
     Transport,
     OAuth,
@@ -556,6 +557,7 @@ enum Command {
 }
 
 enum RetainedTransport {
+    TransportRecovery(Arc<McpServer>),
     OAuthRecovery {
         server: Arc<McpServer>,
         retry_scopes: Option<Vec<String>>,
@@ -566,7 +568,9 @@ enum RetainedTransport {
 impl RetainedTransport {
     fn server(&self) -> &McpServer {
         match self {
-            Self::OAuthRecovery { server, .. } | Self::Other(server) => server,
+            Self::OAuthRecovery { server, .. }
+            | Self::TransportRecovery(server)
+            | Self::Other(server) => server,
         }
     }
 }
@@ -638,7 +642,8 @@ impl Actor {
                             RetainedTransport::OAuthRecovery { retry_scopes, .. } => {
                                 retry_scopes.take()
                             }
-                            RetainedTransport::Other(_) => None,
+                            RetainedTransport::TransportRecovery(_)
+                            | RetainedTransport::Other(_) => None,
                         })
                 } else {
                     None
@@ -836,7 +841,46 @@ impl Actor {
                 kind,
                 reply,
             } => {
-                if matches!(self.state, SupervisorState::Recovering)
+                if matches!(kind, RecoveryKind::OAuth)
+                    && matches!(self.state, SupervisorState::Failed)
+                    && self.recovery_from == Some(observed_epoch)
+                    && self
+                        .teardown_retry
+                        .iter()
+                        .any(|retained| matches!(retained, RetainedTransport::TransportRecovery(_)))
+                {
+                    for cancellation in self.active_calls.values() {
+                        cancellation.cancel();
+                    }
+                    self.active_calls.clear();
+                    for retained in &mut self.teardown_retry {
+                        if let RetainedTransport::TransportRecovery(server) = retained {
+                            *retained = RetainedTransport::OAuthRecovery {
+                                server: Arc::clone(server),
+                                retry_scopes: None,
+                            };
+                        }
+                    }
+                    self.epoch = self.epoch.wrapping_add(1);
+                    self.state = SupervisorState::Recovering;
+                    for retained in &self.teardown_retry {
+                        if matches!(retained, RetainedTransport::OAuthRecovery { .. }) {
+                            if let Err(error) = retained.server().transport.quiesce().await {
+                                let error = error.to_string();
+                                self.state = SupervisorState::Failed;
+                                self.recovery_from = None;
+                                self.publish_snapshot(Some(error.clone()), None);
+                                let _ = reply.send(RecoveryClaim::Unavailable(error));
+                                return;
+                            }
+                        }
+                    }
+                    self.publish_snapshot(None, None);
+                    let _ = reply.send(RecoveryClaim::Leader(RecoveryPermit {
+                        epoch: self.epoch,
+                        config: self.snapshot.config.clone(),
+                    }));
+                } else if matches!(self.state, SupervisorState::Recovering)
                     && self.recovery_from == Some(observed_epoch)
                 {
                     let _ = reply.send(RecoveryClaim::Follow(self.snapshots.subscribe()));
@@ -846,7 +890,15 @@ impl Actor {
                     self.recovery_from = Some(observed_epoch);
                     self.epoch = self.epoch.wrapping_add(1);
                     let teardown = match kind {
-                        RecoveryKind::Transport => self.stop_server().await,
+                        RecoveryKind::Transport => {
+                            if let SupervisorState::Ready(server) =
+                                std::mem::replace(&mut self.state, SupervisorState::Recovering)
+                            {
+                                self.teardown_retry
+                                    .push(RetainedTransport::TransportRecovery(server));
+                            }
+                            self.stop_server().await
+                        }
                         RecoveryKind::OAuth => {
                             for cancellation in self.active_calls.values() {
                                 cancellation.cancel();
@@ -880,7 +932,9 @@ impl Actor {
                         }
                         Err(error) => {
                             self.state = SupervisorState::Failed;
-                            self.recovery_from = None;
+                            if matches!(kind, RecoveryKind::OAuth) {
+                                self.recovery_from = None;
+                            }
                             self.publish_snapshot(Some(error.clone()), None);
                             let _ = reply.send(RecoveryClaim::Unavailable(error));
                         }
@@ -1646,6 +1700,47 @@ mod epoch_tests {
             .unwrap());
         assert!(bearer.read().unwrap().is_none());
         assert!(handle.snapshot().is_ready());
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_oauth_claim_upgrades_failed_transport_recovery() {
+        let (mut serving, attempts) = retry_shutdown_server(0);
+        let bearer = Arc::clone(&serving.oauth_bearer);
+        let (started, mut started_rx) = mpsc::unbounded_channel();
+        let releases = Arc::new(Semaphore::new(0));
+        serving.transport = Arc::new(RetryShutdownTransport {
+            attempts: Arc::clone(&attempts),
+            fail_quiesce: false,
+            failures_remaining: AtomicUsize::new(1),
+            shutdown_gate: Some((started, Arc::clone(&releases))),
+        });
+        let handle = SupervisorHandle::connected(serving);
+        let transport_claim = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.claim_recovery(0).await }
+        });
+        started_rx.recv().await.unwrap();
+        let mut oauth_claim = Box::pin(handle.claim_oauth_recovery(0));
+        assert!(futures::poll!(oauth_claim.as_mut()).is_pending());
+        releases.add_permits(1);
+        assert!(matches!(
+            transport_claim.await.unwrap(),
+            RecoveryClaim::Unavailable(_)
+        ));
+        let RecoveryClaim::Leader(permit) = oauth_claim.await else {
+            panic!("OAuth takeover");
+        };
+        assert_eq!(permit.epoch, 2);
+        releases.add_permits(1);
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .unwrap());
+        assert_eq!(bearer.read().unwrap().as_deref(), Some("fresh"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let (replacement, _, _) = server(http_config());
+        assert!(handle.publish(permit.epoch, replacement).await);
         handle.remove().await.unwrap();
     }
 

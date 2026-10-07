@@ -3867,6 +3867,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_failure_takes_over_failed_transport_cleanup_from_same_epoch() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        assert!(matches!(
+            handle.claim_recovery(0).await,
+            crate::supervisor::RecoveryClaim::Unavailable(_)
+        ));
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-2"));
+        manager
+            .recover_oauth(
+                "remote",
+                &handle,
+                0,
+                crate::OAuthRecoveryKind::Refresh {
+                    www_authenticate: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(handle.snapshot().is_ready());
+        {
+            let requests = server.requests.lock().unwrap();
+            let deletes = requests
+                .iter()
+                .filter(|request| request.request_line.starts_with("DELETE "))
+                .collect::<Vec<_>>();
+            assert_eq!(deletes.len(), 2);
+            assert_eq!(deletes[0].header("authorization"), Some("Bearer at-1"));
+            assert_eq!(deletes[1].header("authorization"), Some("Bearer at-2"));
+        }
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_with_unstartable_authorization_settles_failed() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        *manager.oauth.redirect_base.lock().unwrap() = None;
+        let mut rejected = json_doc(&serde_json::json!({"error": "invalid_grant"}));
+        rejected.status = 400;
+        server.route("/token", rejected);
+        server.push_responses(vec![unauthorized(&server)]);
+        let error = manager
+            .call_tool("remote", "report", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("re-authorization could not start"),
+            "{error}"
+        );
+        assert!(pending_auth_url(&manager).await.is_none());
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Failed);
+        tokio::time::timeout(Duration::from_secs(1), manager.await_background_tasks())
+            .await
+            .unwrap();
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        let config = handle.snapshot().config;
+        manager
+            .reload_from_configs(vec![("remote".into(), config)])
+            .await;
+        assert!(pending_auth_url(&manager).await.is_some());
+        *server.routes.delete_bearer.lock().unwrap() = None;
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn denied_step_up_can_reauthorize_on_unchanged_reload() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = ready_refreshable_manager(&server).await;
