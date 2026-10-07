@@ -73,6 +73,10 @@ value UserQuestion {
     question: String
 }
 
+value QuestionRequestAuthority {
+    request_id: String?
+}
+
 value TaskProposalSnapshot {
     task_file: String
     title: String
@@ -390,6 +394,7 @@ variant Parent : Conversation {
 
     proposal_snapshot: TaskProposalSnapshot when parent_status = awaiting_task_approval
     pending_questions: List<UserQuestion> when parent_status = awaiting_user_response
+    pending_question_authority: QuestionRequestAuthority when parent_status = awaiting_user_response
     recovery_kind: RecoveryKind when parent_status = awaiting_recovery
     recovery_resume_target: RecoveryResumeTarget when parent_status = awaiting_recovery
     recovery_message: String when parent_status = awaiting_recovery
@@ -991,8 +996,10 @@ rule AskUserQuestionIntercepted {
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "ask_user_question"
     let questions = parse_questions(tool_calls.first)
+    let request_id = fresh_question_request_id()
     ensures: conversation.parent_status = awaiting_user_response
     ensures: conversation.pending_questions = questions
+    ensures: conversation.pending_question_authority.request_id = request_id
 }
 
 -- REQ-BED-019: Context threshold reached (parent -> continuation)
@@ -1325,8 +1332,9 @@ rule CancelDuringTaskApproval {
 -- ===========================================================
 
 rule UserAnswersQuestion {
-    when: UserAnswersQuestion(conversation, answers, annotations?)
+    when: UserAnswersQuestion(conversation, request_id?, answers, annotations?)
     requires: conversation.parent_status = awaiting_user_response
+    requires: request_id = conversation.pending_question_authority.request_id
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
@@ -1340,8 +1348,9 @@ rule UserAnswersQuestion {
 -- marker so a server restart treats the conversation as a settled idle rather
 -- than auto-continuing the dismissed turn.
 rule UserDismissesQuestion {
-    when: UserDismissesQuestion(conversation)
+    when: UserDismissesQuestion(conversation, request_id?)
     requires: conversation.parent_status = awaiting_user_response
+    requires: request_id = conversation.pending_question_authority.request_id
     ensures: conversation.core_status = idle
     ensures: QuestionDismissed(conversation)
 }
@@ -2910,6 +2919,7 @@ surface UserConversation {
         conversation.context_warning
         conversation.proposal_snapshot when conversation.parent_status = awaiting_task_approval
         conversation.pending_questions when conversation.parent_status = awaiting_user_response
+        conversation.pending_question_authority when conversation.parent_status = awaiting_user_response
         conversation.error_message when conversation.core_status = error
         conversation.recovery_message when conversation.parent_status = awaiting_recovery
         conversation.recovery_kind when conversation.parent_status = awaiting_recovery
@@ -2932,10 +2942,12 @@ surface UserConversation {
                  }
         TaskApprovalDecided(conversation, decision)
             when conversation.parent_status = awaiting_task_approval
-        UserAnswersQuestion(conversation, answers, annotations?)
+        UserAnswersQuestion(conversation, request_id?, answers, annotations?)
             when conversation.parent_status = awaiting_user_response
-        UserDismissesQuestion(conversation)
+             and request_id = conversation.pending_question_authority.request_id
+        UserDismissesQuestion(conversation, request_id?)
             when conversation.parent_status = awaiting_user_response
+             and request_id = conversation.pending_question_authority.request_id
         UserTriggersContinuation(conversation, operation_id)
             when conversation.core_status in { idle, recoverable_continuation_failure }
         UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)

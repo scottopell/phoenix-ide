@@ -1933,24 +1933,23 @@ pub fn transition_parent(
 
         (
             ParentState::AwaitingUserResponse {
-                request_id: pending_request_id,
-                ..
+                request_authority, ..
             },
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed { request_id }),
-        ) if request_id == *pending_request_id => Ok(ParentTransitionResult::new(
-            ParentState::Core(CoreState::Idle),
-        )
-        .with_effect(Effect::PersistHiddenSystemMarker {
-            marker: USER_QUESTION_DISMISSED_MARKER,
-            message_id: uuid::Uuid::new_v4().to_string(),
-        })
-        .with_effect(Effect::PersistState)
-        .with_effect(Effect::notify_state_change())),
+        ) if request_authority.matches_submitted(request_id.as_ref()) => Ok(
+            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
+                .with_effect(Effect::PersistHiddenSystemMarker {
+                    marker: USER_QUESTION_DISMISSED_MARKER,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change()),
+        ),
 
         (
             ParentState::AwaitingUserResponse {
                 questions,
-                request_id: pending_request_id,
+                request_authority,
                 ..
             },
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
@@ -1958,7 +1957,7 @@ pub fn transition_parent(
                 answers,
                 annotations,
             }),
-        ) if request_id == *pending_request_id => {
+        ) if request_authority.matches_submitted(request_id.as_ref()) => {
             let answers_text = questions
                 .iter()
                 .filter_map(|q| {
@@ -2562,7 +2561,8 @@ pub fn transition_parent(
                     ParentTransitionResult::new(ParentState::AwaitingUserResponse {
                         questions: input.questions,
                         tool_use_id: tool.id.clone(),
-                        request_id: Some(phoenix_core::domain::sm_state::QuestionRequestId::new()),
+                        request_authority:
+                            phoenix_core::domain::sm_state::QuestionRequestAuthority::new(),
                     })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
@@ -5925,7 +5925,7 @@ mod tests {
         let q1 = create_wait();
         let q2 = create_wait();
         let ConvState::AwaitingUserResponse {
-            request_id: Some(q1_id),
+            request_authority: q1_authority,
             tool_use_id: q1_tool_id,
             ..
         } = q1
@@ -5933,13 +5933,15 @@ mod tests {
             panic!("first call must create an identified wait");
         };
         let ConvState::AwaitingUserResponse {
-            request_id: Some(q2_id),
+            request_authority: q2_authority,
             tool_use_id: q2_tool_id,
             ..
         } = &q2
         else {
             panic!("second call must create an identified wait");
         };
+        let q1_id = q1_authority.request_id().unwrap().clone();
+        let q2_id = q2_authority.request_id().unwrap();
         assert!(!q1_id.as_str().is_empty());
         assert_ne!(&q1_id, q2_id);
         assert_eq!(q1_tool_id, *q2_tool_id);
@@ -6271,6 +6273,8 @@ mod tests {
     fn test_awaiting_user_response_with_answer_goes_to_llm_requesting() {
         use crate::state::UserQuestion;
 
+        let request_authority = QuestionRequestAuthority::new();
+        let request_id = request_authority.request_id().unwrap().clone();
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
                 question: "Which library?".to_string(),
@@ -6279,7 +6283,7 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_id: None,
+            request_authority,
         };
 
         let mut answers = std::collections::HashMap::new();
@@ -6289,7 +6293,7 @@ mod tests {
             &state,
             &test_context(),
             Event::UserQuestionResponse {
-                request_id: None,
+                request_id: Some(request_id),
                 answers,
                 annotations: None,
             },
@@ -6323,6 +6327,8 @@ mod tests {
     fn test_awaiting_user_response_dismisses_without_resuming_llm() {
         use crate::state::UserQuestion;
 
+        let request_authority = QuestionRequestAuthority::new();
+        let request_id = request_authority.request_id().unwrap().clone();
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
                 question: "Which library?".to_string(),
@@ -6331,13 +6337,15 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_id: None,
+            request_authority,
         };
 
         let result = transition(
             &state,
             &test_context(),
-            Event::UserQuestionDismissed { request_id: None },
+            Event::UserQuestionDismissed {
+                request_id: Some(request_id),
+            },
         )
         .unwrap();
 
@@ -6384,7 +6392,7 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_id: None,
+            request_authority: QuestionRequestAuthority::new(),
         };
 
         let result = transition(
@@ -6411,6 +6419,8 @@ mod tests {
     fn test_user_message_after_question_dismissal_resumes_agent() {
         use crate::state::UserQuestion;
 
+        let request_authority = QuestionRequestAuthority::new();
+        let request_id = request_authority.request_id().unwrap().clone();
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
                 question: "Which library?".to_string(),
@@ -6419,13 +6429,15 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_id: None,
+            request_authority,
         };
 
         let dismissed = transition(
             &state,
             &test_context(),
-            Event::UserQuestionDismissed { request_id: None },
+            Event::UserQuestionDismissed {
+                request_id: Some(request_id),
+            },
         )
         .unwrap();
 

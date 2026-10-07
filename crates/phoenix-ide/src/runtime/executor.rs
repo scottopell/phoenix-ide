@@ -20986,7 +20986,7 @@ mod steer_drain_detector_tests {
             ConvState::AwaitingUserResponse {
                 questions: vec![],
                 tool_use_id: "question".into(),
-                request_id: None,
+                request_authority: QuestionRequestAuthority::new(),
             },
         ];
         assert!(continuation_states.iter().all(trusted_request_continues));

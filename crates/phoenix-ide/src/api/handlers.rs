@@ -6082,13 +6082,16 @@ async fn respond_to_question(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let ConvState::AwaitingUserResponse { request_id, .. } = &conv.state else {
+    let ConvState::AwaitingUserResponse {
+        request_authority, ..
+    } = &conv.state
+    else {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation is not awaiting a user response",
             "wrong_state",
         ))));
     };
-    validate_question_request_identity(request_id.as_ref(), req.request_id.as_ref())?;
+    validate_question_request_identity(request_authority.request_id(), req.request_id.as_ref())?;
 
     require_ordinary_mutation_admission(&state, &id, "question response").await?;
 
@@ -6127,7 +6130,10 @@ async fn dismiss_question(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let ConvState::AwaitingUserResponse { request_id, .. } = &conv.state else {
+    let ConvState::AwaitingUserResponse {
+        request_authority, ..
+    } = &conv.state
+    else {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation is not awaiting a user response",
             "wrong_state",
@@ -6136,7 +6142,7 @@ async fn dismiss_question(
     let submitted_request_id = payload
         .as_ref()
         .and_then(|Json(body)| body.request_id.as_ref());
-    validate_question_request_identity(request_id.as_ref(), submitted_request_id)?;
+    validate_question_request_identity(request_authority.request_id(), submitted_request_id)?;
 
     require_ordinary_mutation_admission(&state, &id, "question dismissal").await?;
 
@@ -13634,7 +13640,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 &ConvState::AwaitingUserResponse {
                     questions: vec![],
                     tool_use_id: "tool-question".to_string(),
-                    request_id: None,
+                    request_authority: QuestionRequestAuthority::new(),
                 },
             )
             .await
@@ -17962,16 +17968,15 @@ mod wake_handler_tests {
     async fn legacy_pending_question_accepts_empty_body_dismissal() {
         let state = make_test_state().await;
         seed_conversation(&state, "legacy-question").await;
+        let legacy_state: ConvState = serde_json::from_value(serde_json::json!({
+            "type": "awaiting_user_response",
+            "questions": [],
+            "tool_use_id": "legacy-tool"
+        }))
+        .expect("deserialize pre-identity pending question");
         state
             .db
-            .update_conversation_state(
-                "legacy-question",
-                &ConvState::AwaitingUserResponse {
-                    questions: vec![],
-                    tool_use_id: "legacy-tool".into(),
-                    request_id: None,
-                },
-            )
+            .update_conversation_state("legacy-question", &legacy_state)
             .await
             .expect("persist legacy pending question");
 
@@ -18006,7 +18011,7 @@ mod wake_handler_tests {
                 &ConvState::AwaitingUserResponse {
                     questions: vec![],
                     tool_use_id: "provider-tool".into(),
-                    request_id: Some(crate::state_machine::state::QuestionRequestId::new()),
+                    request_authority: crate::state_machine::state::QuestionRequestAuthority::new(),
                 },
             )
             .await

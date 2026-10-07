@@ -142,6 +142,45 @@ impl std::fmt::Display for QuestionRequestId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct QuestionRequestAuthority(Option<QuestionRequestId>);
+
+impl QuestionRequestAuthority {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Some(QuestionRequestId::new()))
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> Option<&QuestionRequestId> {
+        self.0.as_ref()
+    }
+
+    #[must_use]
+    pub fn matches_submitted(&self, submitted: Option<&QuestionRequestId>) -> bool {
+        self.request_id() == submitted
+    }
+
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl<'de> Deserialize<'de> for QuestionRequestAuthority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<QuestionRequestId>::deserialize(deserializer).map(Self)
+    }
+}
+
+fn legacy_question_request_authority() -> QuestionRequestAuthority {
+    QuestionRequestAuthority(None)
+}
+
 /// A single question presented to the user (REQ-AUQ-001)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserQuestion {
@@ -651,18 +690,22 @@ mod tests {
             "tool_use_id": "provider-tool"
         }))
         .expect("legacy pending question should deserialize");
-        let ConvState::AwaitingUserResponse { request_id, .. } = &legacy else {
+        let ConvState::AwaitingUserResponse {
+            request_authority, ..
+        } = &legacy
+        else {
             panic!("expected awaiting user response");
         };
-        assert_eq!(request_id, &None);
+        assert!(request_authority.is_legacy());
         let serialized = serde_json::to_value(&legacy).unwrap();
         assert!(serialized.get("request_id").is_none());
 
-        let request_id = QuestionRequestId::new();
+        let request_authority = QuestionRequestAuthority::new();
+        let request_id = request_authority.request_id().unwrap().clone();
         let identified = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "provider-tool".into(),
-            request_id: Some(request_id.clone()),
+            request_authority,
         };
         let restored: ConvState =
             serde_json::from_value(serde_json::to_value(&identified).unwrap())
@@ -1102,7 +1145,7 @@ mod tests {
             ConvState::AwaitingUserResponse {
                 questions: vec![],
                 tool_use_id: "t1".into(),
-                request_id: None,
+                request_authority: QuestionRequestAuthority::new(),
             },
             ConvState::ContextExhausted {
                 summary: "s".into(),
@@ -1500,9 +1543,13 @@ pub enum ConvState {
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
-        // owned: pre-identity pending waits remain answerable with a tokenless legacy request.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_id: Option<QuestionRequestId>,
+        // owned: pre-identity pending waits deserialize into legacy authority; current code cannot construct it.
+        #[serde(
+            default = "legacy_question_request_authority",
+            rename = "request_id",
+            skip_serializing_if = "QuestionRequestAuthority::is_legacy"
+        )]
+        request_authority: QuestionRequestAuthority,
     },
 
     /// Context window exhausted - conversation is read-only
@@ -1606,7 +1653,7 @@ pub enum ParentState {
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
-        request_id: Option<QuestionRequestId>,
+        request_authority: QuestionRequestAuthority,
     },
     ContextExhausted {
         summary: String,
@@ -1665,11 +1712,11 @@ impl From<ParentState> for ConvState {
             ParentState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
-                request_id,
+                request_authority,
             } => ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
-                request_id,
+                request_authority,
             },
             ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
             ParentState::HandedOff { successor_conv_id } => {
@@ -1884,11 +1931,11 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
-                request_id,
+                request_authority,
             } => Ok(ParentState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
-                request_id,
+                request_authority,
             }),
             ConvState::ContextExhausted { summary } => {
                 Ok(ParentState::ContextExhausted { summary })

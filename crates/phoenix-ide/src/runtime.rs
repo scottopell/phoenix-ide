@@ -13664,7 +13664,7 @@ mod scope_liveness_tests {
                 &ConvState::AwaitingUserResponse {
                     questions: Vec::new(),
                     tool_use_id: "answered-question".to_string(),
-                    request_id: None,
+                    request_authority: QuestionRequestAuthority::new(),
                 },
             )
             .await
@@ -13733,7 +13733,7 @@ mod scope_liveness_tests {
         let wait = ConvState::AwaitingUserResponse {
             questions: Vec::new(),
             tool_use_id: "follow-up-question".to_string(),
-            request_id: None,
+            request_authority: QuestionRequestAuthority::new(),
         };
         manager
             .db()
@@ -14696,7 +14696,7 @@ mod scope_liveness_tests {
                 &ConvState::AwaitingUserResponse {
                     questions: Vec::new(),
                     tool_use_id: "question".to_string(),
-                    request_id: None,
+                    request_authority: QuestionRequestAuthority::new(),
                 },
             )
             .await
