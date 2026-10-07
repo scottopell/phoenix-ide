@@ -1,0 +1,1 @@
+Promote deliberately qualified Kache v1.0.0 to Phoenix’s automatic compiler-cache default on supported macOS arm64 hosts. Pin the exact release, prefer it ahead of sccache with honest fallback, update compatibility requirements/docs and supersede the temporary debug-fidelity hold, and retain explicit backend overrides.

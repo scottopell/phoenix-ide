@@ -32,7 +32,7 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev,
             "_kache_version",
-            return_value=("0.26.0", None),
+            return_value=("1.0.0", None),
         ), mock.patch.object(
             self.dev,
             "_usable_sccache",
@@ -60,19 +60,15 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("explicit", selected)
         self.assertEqual("custom", env["RUSTC_WRAPPER"])
 
-    def test_auto_preserves_sccache_until_kache_debug_fidelity_is_qualified(self):
-        with mock.patch("builtins.print") as output:
-            selected, env = self.configure(installed={"kache", "sccache"})
-        self.assertEqual("sccache", selected)
+    def test_auto_prefers_qualified_kache(self):
+        selected, env = self.configure(installed={"kache", "sccache"})
+
+        self.assertEqual("kache", selected)
         self.assertEqual(
-            str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"]
-        )
-        output.assert_any_call(
-            "  ⚠ kache unavailable; using sccache: "
-            "requires explicit opt-in because restored-archive debug-symbol fidelity is unqualified"
+            str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
         )
 
-    def test_explicit_kache_remains_opt_in_with_fidelity_warning(self):
+    def test_explicit_kache_selects_backend(self):
         with mock.patch("builtins.print") as output:
             selected, env = self.configure(
                 "kache",
@@ -80,9 +76,7 @@ class CompilerCacheTests(unittest.TestCase):
                 installed={"kache", "sccache"},
             )
         self.assertEqual("kache", selected)
-        output.assert_any_call(
-            "  ⚠ kache restored-archive source-level debug fidelity is unqualified"
-        )
+        output.assert_any_call("  Compiler cache: kache 1.0.0")
         self.assertEqual(
             str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
         )
@@ -153,8 +147,16 @@ class CompilerCacheTests(unittest.TestCase):
         warning = self.dev._sccache_limit_warning("twenty gigs")
         self.assertIn("unsupported cache size", warning)
 
-    def test_auto_does_not_use_unqualified_kache_when_sccache_is_unavailable(self):
-        selected, env = self.configure(installed={"kache"})
+    def test_auto_uses_kache_when_sccache_is_unavailable(self):
+        with mock.patch.object(self.dev, "_kache_host_error", return_value=None):
+            selected, env = self.configure(installed={"kache"})
+            self.assertEqual("kache", selected)
+            self.assertEqual(
+                str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"]
+            )
+
+    def test_auto_falls_back_to_none_when_kache_and_sccache_are_unusable(self):
+        selected, env = self.configure(installed=set())
         self.assertEqual("none", selected)
         self.assertNotIn("RUSTC_WRAPPER", env)
 
@@ -192,7 +194,7 @@ class CompilerCacheTests(unittest.TestCase):
 
     @unittest.skipUnless(
         sys.platform == "darwin" and platform.machine().lower() == "arm64",
-        "Kache v0.26.0 is qualified only on macOS arm64",
+        "Kache v1.0.0 is qualified only on macOS arm64",
     )
     def test_local_kache_binary_is_supported(self):
         with mock.patch.dict(
@@ -200,7 +202,7 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(self.dev.Path, "is_file", return_value=True), mock.patch.object(
             self.dev.os, "access", return_value=True
         ), mock.patch.object(
-            self.dev, "_kache_version", return_value=("0.26.0", None)
+            self.dev, "_kache_version", return_value=("1.0.0", None)
         ), mock.patch.object(
             self.dev, "_ensure_kache_daemon", return_value=None
         ) as ensure:
@@ -222,6 +224,34 @@ class CompilerCacheTests(unittest.TestCase):
                 os.environ["KACHE_SOCKET_PATH"],
                 r"^/tmp/private-kache/[0-9a-f]{16}\.sock$",
             )
+
+    def test_generated_socket_identity_includes_daemon_environment(self):
+        with mock.patch.object(
+            self.dev, "_private_kache_socket_dir", return_value=Path("/tmp/private-kache")
+        ), mock.patch.dict(
+            os.environ, {"KACHE_CACHE_DIR": "/cache/a"}, clear=True
+        ):
+            first = self.dev._generated_kache_socket("/bin/kache", cargo_cwd=Path("/repo"))
+            second = self.dev._generated_kache_socket("/bin/kache", cargo_cwd=Path("/repo"))
+            os.environ["KACHE_CACHE_DIR"] = "/cache/b"
+            changed = self.dev._generated_kache_socket("/bin/kache", cargo_cwd=Path("/repo"))
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
+
+    def test_generated_socket_reuses_running_daemon(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev, "_generated_kache_socket", return_value=Path("/tmp/kache.sock")
+        ), mock.patch.object(
+            self.dev, "_kache_socket_lock", return_value=contextlib.nullcontext()
+        ), mock.patch.object(
+            self.dev, "_start_kache_daemon_locked", return_value=None
+        ) as start:
+            self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
+
+        start.assert_called_once_with(
+            "/bin/kache", cargo_cwd=None, reuse_running=True
+        )
 
     def test_config_override_gets_generated_socket(self):
         with mock.patch.dict(
@@ -406,7 +436,6 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(self.dev.subprocess, "run") as run:
             error = self.dev._ensure_kache_daemon("/bin/kache")
         self.assertIn("environment cannot be verified", error or "")
-        self.assertIn("kache daemon stop", error or "")
         run.assert_not_called()
 
     def test_kache_daemon_rejects_unknown_existing_state(self):
@@ -419,7 +448,6 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(self.dev.subprocess, "run") as run:
             error = self.dev._ensure_kache_daemon("/bin/kache")
         self.assertIn("cannot verify existing daemon environment", error or "")
-        self.assertIn("kache daemon stop", error or "")
         run.assert_not_called()
 
     def test_kache_readiness_polls_until_running(self):
@@ -541,13 +569,87 @@ class CompilerCacheTests(unittest.TestCase):
                 self.assertRegex(socket_path.name, r"^[0-9a-f]{16}\.sock$")
             run.assert_called_once()
 
-    def test_auto_reports_explicit_opt_in_requirement_before_sccache_fallback(self):
-        with mock.patch("builtins.print") as output:
-            selected, _ = self.configure(installed={"sccache"})
+    def test_auto_falls_back_to_usable_sccache_when_kache_is_unavailable(self):
+        selected, env = self.configure(installed={"sccache"})
         self.assertEqual("sccache", selected)
-        output.assert_any_call(
-            "  ⚠ kache unavailable; using sccache: "
-            "requires explicit opt-in because restored-archive debug-symbol fidelity is unqualified"
+        self.assertEqual(
+            str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"]
+        )
+
+    def test_auto_falls_back_to_usable_sccache_when_kache_is_incompatible(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.shutil, "which", side_effect=lambda name: f"/bin/{name}"
+        ), mock.patch.object(
+            self.dev, "_kache_version", return_value=(None, "unsupported kache 0.9.0")
+        ), mock.patch.object(
+            self.dev, "_usable_sccache", return_value=("sccache 0.18.0", None)
+        ):
+            selected = self.dev._configure_compiler_cache("auto")
+            env = os.environ.copy()
+
+        self.assertEqual("sccache", selected)
+        self.assertEqual(
+            str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"]
+        )
+
+    def test_auto_falls_back_to_usable_sccache_when_kache_daemon_fails(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.shutil, "which", side_effect=lambda name: f"/bin/{name}"
+        ), mock.patch.object(
+            self.dev, "_kache_host_error", return_value=None
+        ), mock.patch.object(
+            self.dev, "_kache_version", return_value=("1.0.0", None)
+        ), mock.patch.object(
+            self.dev, "_ensure_kache_daemon", return_value="socket failed"
+        ), mock.patch.object(
+            self.dev, "_usable_sccache", return_value=("sccache 0.18.0", None)
+        ):
+            selected = self.dev._configure_compiler_cache("auto")
+            env = os.environ.copy()
+
+        self.assertEqual("sccache", selected)
+        self.assertEqual(
+            str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"]
+        )
+        self.assertNotIn("KACHE_SOCKET_PATH", env)
+        self.assertNotIn("KACHE_CONFIG", env)
+
+    def test_auto_falls_back_to_none_when_kache_daemon_and_sccache_fail(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.shutil, "which", side_effect=lambda name: f"/bin/{name}"
+        ), mock.patch.object(
+            self.dev, "_kache_host_error", return_value=None
+        ), mock.patch.object(
+            self.dev, "_kache_version", return_value=("1.0.0", None)
+        ), mock.patch.object(
+            self.dev, "_ensure_kache_daemon", return_value="socket failed"
+        ), mock.patch.object(
+            self.dev, "_usable_sccache", return_value=(None, "bad architecture")
+        ):
+            selected = self.dev._configure_compiler_cache("auto")
+            env = os.environ.copy()
+
+        self.assertEqual("none", selected)
+        self.assertNotIn("RUSTC_WRAPPER", env)
+        self.assertNotIn("KACHE_SOCKET_PATH", env)
+        self.assertNotIn("KACHE_CONFIG", env)
+
+    def test_auto_falls_back_to_usable_sccache_on_unqualified_host(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.shutil, "which", side_effect=lambda name: f"/bin/{name}"
+        ), mock.patch.object(
+            self.dev,
+            "_kache_host_error",
+            return_value="unsupported host linux/x86_64",
+        ), mock.patch.object(
+            self.dev, "_usable_sccache", return_value=("sccache 0.18.0", None)
+        ):
+            selected = self.dev._configure_compiler_cache("auto")
+            env = os.environ.copy()
+
+        self.assertEqual("sccache", selected)
+        self.assertEqual(
+            str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"]
         )
 
     def test_explicit_kache_reports_invalid_configured_binary(self):
@@ -589,25 +691,13 @@ class CompilerCacheTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "bad architecture"):
                 self.dev._configure_compiler_cache("sccache")
 
-    def test_auto_never_probes_or_starts_kache(self):
-        with mock.patch("builtins.print"), mock.patch.dict(
-            os.environ, {}, clear=True
-        ), mock.patch.object(
-            self.dev.shutil, "which", return_value=None
-        ), mock.patch.object(self.dev, "_kache_version") as version, mock.patch.object(
-            self.dev, "_ensure_kache_daemon"
-        ) as daemon:
-            self.assertEqual("none", self.dev._configure_compiler_cache("auto"))
-        version.assert_not_called()
-        daemon.assert_not_called()
-
     def test_explicit_kache_fails_when_daemon_fails(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             self.dev.shutil, "which", side_effect=lambda name: "/bin/kache" if name == "kache" else None
         ), mock.patch.object(
             self.dev, "_kache_host_error", return_value=None
         ), mock.patch.object(
-            self.dev, "_kache_version", return_value=("0.26.0", None)
+            self.dev, "_kache_version", return_value=("1.0.0", None)
         ), mock.patch.object(self.dev, "_ensure_kache_daemon", return_value="socket failed"):
             with self.assertRaisesRegex(SystemExit, "kache daemon failed to start: socket failed"):
                 self.dev._configure_compiler_cache("kache")
@@ -626,14 +716,14 @@ class CompilerCacheTests(unittest.TestCase):
 
     def test_kache_version_accepts_qualified_release(self):
         with mock.patch.object(
-            self.dev, "_command_version", return_value=("kache 0.26.0", None)
+            self.dev, "_command_version", return_value=("kache 1.0.0", None)
         ):
-            self.assertEqual(("0.26.0", None), self.dev._kache_version("/bin/kache"))
+            self.assertEqual(("1.0.0", None), self.dev._kache_version("/bin/kache"))
 
     def test_kache_version_rejects_unqualified_patch_and_prerelease(self):
         for output, expected in (
-            ("kache 0.26.1", "unsupported"),
-            ("kache 0.26.0-rc1", "unrecognized"),
+            ("kache 1.0.1", "unsupported"),
+            ("kache 1.0.0-rc1", "unrecognized"),
         ):
             with self.subTest(output=output), mock.patch.object(
                 self.dev, "_command_version", return_value=(output, None)

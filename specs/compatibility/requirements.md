@@ -131,16 +131,19 @@ THE SYSTEM SHALL reject any payload whose fingerprint matches neither its curren
 
 ### REQ-COMP-008 — Qualified Compiler-Cache Compatibility
 
-WHEN Phoenix automatically selects a compiler cache
+WHEN Phoenix automatically selects a compiler cache on macOS arm64
+THE SYSTEM SHALL prefer Kache when its executable reports exactly version `1.0.0` and its local daemon reports readiness on the configured socket
+AND SHALL otherwise fall through to an sccache executable that passes its version probe or no compiler cache
+AND SHALL report each fallback reason and the backend actually selected
+
+WHEN Phoenix automatically selects a compiler cache on any other host
 THE SYSTEM SHALL select an sccache executable that passes its version probe or no compiler cache
 AND SHALL report the fallback reason and backend actually selected
-AND SHALL NOT automatically select Kache v0.26.0
 
 WHEN an operator explicitly selects Kache
 THE SYSTEM SHALL require a macOS arm64 host
-AND SHALL require the executable to report exactly version `0.26.0`
+AND SHALL require the executable to report exactly version `1.0.0`
 AND SHALL require its local daemon to report readiness on the configured socket
-AND SHALL report that debug-symbol fidelity remains unqualified
 
 WHEN an operator explicitly selects Kache or sccache
 THE SYSTEM SHALL fail actionably if that backend is unusable
@@ -155,6 +158,6 @@ THE SYSTEM SHALL scope automatically generated compiler-cache environment variab
 AND SHALL NOT propagate them into the Phoenix server or agent-executed commands
 
 THE SYSTEM SHALL guarantee this contract only for selection and local subprocess setup
-AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or restored-archive source-level debug fidelity
+AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, or cross-version cache compatibility
 
-**Rationale:** Compiler caching is an optional development optimization. Exact qualification, explicit opt-in for unqualified fidelity, and subprocess scoping prevent an accelerator from becoming an implicit correctness or compatibility promise.
+**Rationale:** Compiler caching is an optional development optimization. Exact release and host qualification, honest fallback, and subprocess scoping prevent an accelerator from becoming an implicit broad compatibility or performance promise.

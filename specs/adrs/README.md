@@ -92,7 +92,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [076](076_prepared-artifact-paired-launchd-upgrade-fails-closed.md) | Prepared artifacts pair a clean controller with private SQLite proof and fail-closed rollback | Accepted | REQ-LDD-017, REQ-PD-018, REQ-COMP-003, REQ-DESKTOP-REL-010 |
 | [077](077_committed-paired-finalization-is-publication-only.md) | Committed paired finalization is publication-only; recovered startup checkpoints forbid snapshot replay | Accepted | REQ-LDD-017, REQ-LDD-018, REQ-PD-018, REQ-PD-020, REQ-COMP-003 |
 | [078](078_kache-first-automatic-compiler-cache.md) | Automatic compiler caching prefers released Kache | Superseded by ADR-079 | development methodology; REQ-COMP-001 |
-| [079](079_kache-explicit-pending-debug-fidelity.md) | Kache remains explicit pending restored debug fidelity | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
+| [079](079_kache-explicit-pending-debug-fidelity.md) | Kache remains explicit pending restored debug fidelity | Superseded by ADR-088 | development methodology; REQ-COMP-001, REQ-COMP-008 |
 | [080](080_close-stops-bound-fsmonitor-daemons.md) | Close stops bound fsmonitor daemons instead of reconfiguring Git | Accepted | REQ-WL-002b; Close retirement quarantine and descriptor scan |
 | [081](081_global-coordinator-borrows-workscope-svg-source-authority.md) | Global Coordinator borrows WorkScope SVG source authority | Accepted | REQ-SVG-001, REQ-GR-007 |
 | [082](082_legacy-auq-waits-retain-identity-absence.md) | Legacy AUQ waits retain identity absence | Accepted | REQ-AUQ-009, REQ-COMP-001; `QuestionRequestId`, `AwaitingUserResponse` |
@@ -101,6 +101,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [085](085_codex-continuation-requires-an-identified-account.md) | Codex continuation requires an identified account | Accepted | REQ-LLM-004h, REQ-LLM-004i; account-bound route admission |
 | [086](086_mcp-credential-removal-has-durable-intent.md) | MCP credential removal has durable intent | Accepted | REQ-MCP-012; credential-removal recovery |
 | [087](087_tmux-effects-go-through-a-backend-seam.md) | Tmux effects go through a backend seam, and tests use an in-memory fake | Accepted | tmux registry and `tmux_run`; Close retirement of tmux servers |
+| [088](088_kache-v1-restores-automatic-selection.md) | Qualified Kache v1 restores automatic compiler-cache selection | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
 
 ## For agents: which decisions bind your task
 
@@ -110,7 +111,7 @@ Consult the relevant ADRs before starting work of each kind.
 | --- | --- |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
-| Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
+| Selecting or qualifying development compiler-cache defaults | 088, then 079, 078, and 034 |
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |

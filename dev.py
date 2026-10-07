@@ -4845,7 +4845,7 @@ def _append_git_config_override(key, value, environ=None):
 _COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
 
 
-_SUPPORTED_KACHE_VERSION = "0.26.0"
+_SUPPORTED_KACHE_VERSION = "1.0.0"
 
 
 def _command_version(binary: str) -> tuple[str | None, str | None]:
@@ -4875,7 +4875,7 @@ def _kache_version(binary: str) -> tuple[str | None, str | None]:
         return None, f"unrecognized version output: {detail}"
     version = match.group(1)
     if version != _SUPPORTED_KACHE_VERSION:
-        return None, f"unsupported kache {version}; Phoenix supports released kache 0.26.0"
+        return None, f"unsupported kache {version}; Phoenix supports released kache {_SUPPORTED_KACHE_VERSION}"
     return version, None
 
 
@@ -4989,15 +4989,16 @@ def _kache_socket_lock(socket_path: Path):
             os.close(descriptor)
 
 
-def _start_kache_daemon_locked(binary: str, *, cargo_cwd: Path | None) -> str | None:
+def _start_kache_daemon_locked(
+    binary: str, *, cargo_cwd: Path | None, reuse_running: bool = False
+) -> str | None:
     running, status_error = _kache_daemon_is_running(binary, cargo_cwd=cargo_cwd)
     if status_error:
-        return f"cannot verify existing daemon environment: {status_error}; run 'kache daemon stop' and retry"
+        return f"cannot verify existing daemon environment: {status_error}"
     if running:
-        return (
-            "selected socket already has a running daemon whose environment cannot be verified; "
-            "run 'kache daemon stop' and retry"
-        )
+        if reuse_running:
+            return None
+        return "selected socket already has a running daemon whose environment cannot be verified"
 
     try:
         result = subprocess.run(
@@ -5017,15 +5018,34 @@ def _start_kache_daemon_locked(binary: str, *, cargo_cwd: Path | None) -> str | 
     return _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
 
 
+def _generated_kache_socket(binary: str, *, cargo_cwd: Path | None) -> Path:
+    daemon_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("KACHE_") and key != "KACHE_SOCKET_PATH"
+    }
+    identity = json.dumps(
+        {
+            "binary": str(Path(binary).resolve()),
+            "cargo_cwd": str(Path(cargo_cwd or ROOT).resolve()),
+            "environment": daemon_environment,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return _private_kache_socket_dir() / f"{digest}.sock"
+
+
 def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str | None:
-    if os.name != "nt" and "KACHE_SOCKET_PATH" not in os.environ:
-        socket_identity = os.environ.get("KACHE_CACHE_DIR") or str(Path(cargo_cwd or ROOT).resolve())
-        digest = hashlib.sha256(socket_identity.encode()).hexdigest()[:16]
+    generated_socket = os.name != "nt" and "KACHE_SOCKET_PATH" not in os.environ
+    if generated_socket:
         try:
-            socket_dir = _private_kache_socket_dir()
+            os.environ["KACHE_SOCKET_PATH"] = str(
+                _generated_kache_socket(binary, cargo_cwd=cargo_cwd)
+            )
         except OSError as error:
             return str(error)
-        os.environ["KACHE_SOCKET_PATH"] = str(socket_dir / f"{digest}.sock")
 
     socket = os.environ.get("KACHE_SOCKET_PATH")
     if not socket:
@@ -5033,7 +5053,9 @@ def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str |
 
     try:
         with _kache_socket_lock(Path(socket)):
-            return _start_kache_daemon_locked(binary, cargo_cwd=cargo_cwd)
+            return _start_kache_daemon_locked(
+                binary, cargo_cwd=cargo_cwd, reuse_running=generated_socket
+            )
     except OSError as error:
         return f"cannot lock Kache socket setup: {error}"
 
@@ -5129,6 +5151,15 @@ def _kache_host_error() -> str | None:
     return f"unsupported host {sys.platform}/{machine}; qualified host is darwin/arm64"
 
 
+def _restore_environment_prefix(prefix: str, original: dict[str, str]) -> None:
+    for key in tuple(os.environ):
+        if key.startswith(prefix) and key not in original:
+            os.environ.pop(key)
+    for key, value in original.items():
+        if key.startswith(prefix):
+            os.environ[key] = value
+
+
 def _configure_compiler_cache(
     requested: str | None = None, *, cargo_cwd: Path | None = None
 ) -> str:
@@ -5149,47 +5180,46 @@ def _configure_compiler_cache(
         return "none"
 
     automatic = backend == "auto"
-    wants_kache = backend == "kache"
+    wants_kache = automatic or backend == "kache"
+    original_environment = os.environ.copy()
     kache_binary = _absolute_executable(_kache_binary()) if wants_kache else None
     sccache_binary = _absolute_executable(shutil.which("sccache"))
     kache_version = None
     host_error = _kache_host_error() if wants_kache else None
-    kache_error = (
-        None
-        if wants_kache
-        else "requires explicit opt-in because restored-archive debug-symbol fidelity is unqualified"
-    )
-    if host_error:
-        kache_error = host_error
-    elif wants_kache and _environment_flag("KACHE_DISABLED"):
+    kache_error = host_error
+    if not kache_error and wants_kache and _environment_flag("KACHE_DISABLED"):
         kache_error = "KACHE_DISABLED is set"
-    elif wants_kache and not kache_binary:
+    elif not kache_error and wants_kache and not kache_binary:
         configured = os.environ.get("PHOENIX_KACHE_BIN")
         kache_error = (
             f"PHOENIX_KACHE_BIN is not an executable file: {configured}"
             if configured
             else "not installed or not on PATH"
         )
-    elif kache_binary:
+    elif not kache_error and kache_binary:
         kache_version, kache_error = _kache_version(kache_binary)
 
+    sccache_error = None
     if automatic:
-        sccache_version, sccache_error = _usable_sccache(sccache_binary)
-        if sccache_version:
-            print(f"  ⚠ kache unavailable; using sccache: {kache_error}")
-            backend = "sccache"
+        if kache_error is None:
+            backend = "kache"
         else:
-            reasons = "; ".join(
-                reason
-                for reason in (
-                    f"kache: {kache_error}",
-                    f"sccache: {sccache_error}" if sccache_error else None,
+            sccache_version, sccache_error = _usable_sccache(sccache_binary)
+            if sccache_version:
+                print(f"  ⚠ kache unavailable; using sccache: {kache_error}")
+                backend = "sccache"
+            else:
+                reasons = "; ".join(
+                    reason
+                    for reason in (
+                        f"kache: {kache_error}",
+                        f"sccache: {sccache_error}" if sccache_error else None,
+                    )
+                    if reason
                 )
-                if reason
-            )
-            print(f"  ⚠ compiler caches unavailable; continuing without: {reasons}")
-            print("  Compiler cache: none")
-            return "none"
+                print(f"  ⚠ compiler caches unavailable; continuing without: {reasons}")
+                print("  Compiler cache: none")
+                return "none"
     elif backend == "kache":
         if not kache_binary:
             raise SystemExit(f"requested compiler cache 'kache' is unavailable: {kache_error}")
@@ -5211,12 +5241,25 @@ def _configure_compiler_cache(
             os.environ.pop("RUSTC_WRAPPER", None)
             if generated_socket:
                 os.environ.pop("KACHE_SOCKET_PATH", None)
-            raise SystemExit(f"kache daemon failed to start: {daemon_error}")
-        print(
-            "  ⚠ kache restored-archive source-level debug fidelity is unqualified"
-        )
-        print(f"  Compiler cache: kache {kache_version}")
-    else:
+            if not automatic:
+                raise SystemExit(f"kache daemon failed to start: {daemon_error}")
+            _restore_environment_prefix("KACHE_", original_environment)
+            sccache_version, sccache_error = _usable_sccache(sccache_binary)
+            if sccache_version:
+                print(f"  ⚠ kache unavailable; using sccache: daemon failed to start: {daemon_error}")
+                backend = "sccache"
+                wrapper = sccache_binary
+                assert wrapper is not None
+                _normalize_cache_paths(backend)
+                os.environ["RUSTC_WRAPPER"] = wrapper
+            else:
+                reason = f"kache daemon: {daemon_error}; sccache: {sccache_error}"
+                print(f"  ⚠ compiler caches unavailable; continuing without: {reason}")
+                print("  Compiler cache: none")
+                return "none"
+        else:
+            print(f"  Compiler cache: kache {kache_version}")
+    if backend == "sccache":
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")
         print("  Compiler cache: sccache")
     return backend
