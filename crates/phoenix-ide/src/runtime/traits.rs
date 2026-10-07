@@ -2712,6 +2712,7 @@ pub struct ToolRegistryExecutor {
     /// Named-worker descriptions used to construct the base tool registry.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     writing_tools: Option<WritingConversationTools>,
+    predecessor_tool: Option<Arc<dyn crate::tools::Tool>>,
     coordinator_skill_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
 }
 
@@ -2728,6 +2729,7 @@ impl ToolRegistryExecutor {
             mcp_manager: None,
             agent_catalog,
             writing_tools: None,
+            predecessor_tool: None,
             coordinator_skill_catalog: None,
         }
     }
@@ -2745,6 +2747,7 @@ impl ToolRegistryExecutor {
             mcp_manager: Some(manager),
             agent_catalog,
             writing_tools: None,
+            predecessor_tool: None,
             coordinator_skill_catalog: None,
         }
     }
@@ -2761,6 +2764,12 @@ impl ToolRegistryExecutor {
     #[must_use]
     pub fn with_writing_tools(mut self, tools: Option<WritingConversationTools>) -> Self {
         self.writing_tools = tools;
+        self
+    }
+
+    #[must_use]
+    pub fn with_predecessor_tool(mut self, tool: Arc<dyn crate::tools::Tool>) -> Self {
+        self.predecessor_tool = Some(tool);
         self
     }
 
@@ -2880,6 +2889,12 @@ impl ToolExecutor for ToolRegistryExecutor {
             }
             None => ToolRegistry::direct(self.agent_catalog.to_vec()).with_propose_task(),
         };
+        let registry = match &self.predecessor_tool {
+            Some(tool) => registry
+                .try_with_host_bound_tool(tool.clone())
+                .expect("fresh writing registry cannot collide with host-bound predecessor tool"),
+            None => registry,
+        };
         self.swap_registry(registry);
         tracing::info!("Tool registry upgraded to Git-backed writing mode");
     }
@@ -2914,7 +2929,69 @@ mod tool_registry_executor_tests {
     }
 
     #[tokio::test]
+    async fn direct_keeps_global_writing_and_host_bound_predecessor() {
+        let writing = WritingConversationTools::new(
+            Arc::new(NamedMarker("search_conversations")),
+            Arc::new(NamedMarker("read_conversation")),
+            Arc::new(NamedMarker("query_database")),
+            Arc::new(NamedMarker("send_conversation_message")),
+        )
+        .unwrap();
+        let registry = ToolRegistry::direct(Vec::new())
+            .try_with_writing_conversation_tools(writing)
+            .unwrap()
+            .try_with_host_bound_tool(Arc::new(NamedMarker("previous_transcripts")))
+            .unwrap();
+        let executor = ToolRegistryExecutor::builtin_only(registry, Arc::from(Vec::new()));
+        let names = executor
+            .definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(names.contains("search_conversations"));
+        assert!(names.contains("send_conversation_message"));
+        assert!(names.contains("previous_transcripts"));
+    }
+
+    #[tokio::test]
+    async fn explore_upgrade_preserves_host_bound_predecessor_without_global_authority() {
+        let predecessor: Arc<dyn Tool> = Arc::new(NamedMarker("previous_transcripts"));
+        let registry = ToolRegistry::explore(
+            "tasks",
+            Vec::new(),
+            crate::tools::ExploreToolPolicy::from_platform(
+                &phoenix_core::platform::PlatformCapability::None {
+                    details: "test".to_string(),
+                },
+            ),
+        )
+        .try_with_host_bound_tool(predecessor.clone())
+        .unwrap();
+        let executor = ToolRegistryExecutor::builtin_only(registry, Arc::from(Vec::new()))
+            .with_predecessor_tool(predecessor);
+
+        let names = |definitions: Vec<phoenix_llm::ToolDefinition>| {
+            definitions
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let before = names(executor.definitions().await);
+        assert!(before.contains("previous_transcripts"));
+        assert!(!before.contains("search_conversations"));
+        assert!(!before.contains("send_conversation_message"));
+        executor.upgrade_to_work_mode();
+        let after = names(executor.definitions().await);
+        assert!(after.contains("previous_transcripts"));
+        assert!(!after.contains("search_conversations"));
+        assert!(!after.contains("send_conversation_message"));
+        assert!(after.contains("propose_task"));
+    }
+
+    #[tokio::test]
     async fn explore_upgrade_preserves_writing_tools_and_propose_task() {
+        let predecessor: Arc<dyn Tool> = Arc::new(NamedMarker("previous_transcripts"));
         let executor = ToolRegistryExecutor::builtin_only(
             ToolRegistry::explore(
                 "tasks",
@@ -2924,9 +3001,12 @@ mod tool_registry_executor_tests {
                         details: "test".to_string(),
                     },
                 ),
-            ),
+            )
+            .try_with_host_bound_tool(predecessor.clone())
+            .unwrap(),
             Arc::from(Vec::new()),
         )
+        .with_predecessor_tool(predecessor)
         .with_writing_tools(Some(
             WritingConversationTools::new(
                 Arc::new(NamedMarker("search_conversations")),
@@ -2948,6 +3028,11 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "previous_transcripts"));
         assert!(executor
             .definitions()
             .await
