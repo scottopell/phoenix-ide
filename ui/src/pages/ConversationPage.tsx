@@ -2545,8 +2545,12 @@ function ConversationPageContent({
         </>
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
+          key={convStateForChildren.request_id ?? 'legacy-question'}
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
+          {...(convStateForChildren.request_id === undefined
+            ? {}
+            : { requestId: convStateForChildren.request_id })}
           showToast={showInfo}
           readOnly={readOnly || isArchived}
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}

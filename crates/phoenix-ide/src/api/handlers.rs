@@ -5988,10 +5988,79 @@ async fn continue_conversation(
 
 #[derive(Deserialize)]
 struct RespondToQuestionPayload {
+    #[serde(default)]
+    request_id: Option<crate::state_machine::state::QuestionRequestId>,
     answers: std::collections::HashMap<String, String>,
     #[serde(default)]
     annotations:
         Option<std::collections::HashMap<String, crate::state_machine::state::QuestionAnnotation>>,
+}
+
+#[derive(Deserialize)]
+struct DismissQuestionPayload {
+    #[serde(default)]
+    request_id: Option<crate::state_machine::state::QuestionRequestId>,
+}
+
+fn validate_question_request_identity(
+    pending: Option<&crate::state_machine::state::QuestionRequestId>,
+    submitted: Option<&crate::state_machine::state::QuestionRequestId>,
+) -> Result<(), AppError> {
+    if pending == submitted {
+        return Ok(());
+    }
+    let (message, error_type) = if pending.is_some() && submitted.is_none() {
+        (
+            "This question requires a request identity. Update Phoenix or answer it from the web client.",
+            "question_request_identity_required",
+        )
+    } else {
+        (
+            "This question is no longer current. Reload before answering or dismissing it.",
+            "stale_question_request",
+        )
+    };
+    Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+        message, error_type,
+    ))))
+}
+
+#[cfg(test)]
+mod question_request_identity_tests {
+    use super::*;
+    use crate::state_machine::state::QuestionRequestId;
+
+    #[test]
+    fn identity_validation_preserves_legacy_and_requires_exact_new_identity() {
+        let current = QuestionRequestId::new();
+        let stale = QuestionRequestId::new();
+
+        assert!(validate_question_request_identity(None, None).is_ok());
+        assert!(validate_question_request_identity(Some(&current), Some(&current)).is_ok());
+
+        let missing = validate_question_request_identity(Some(&current), None).unwrap_err();
+        let AppError::Conflict(missing) = missing else {
+            panic!("missing identity must be a conflict");
+        };
+        assert_eq!(missing.error_type, "question_request_identity_required");
+        assert!(missing.error.contains("Update Phoenix"));
+        assert!(missing.error.contains("web client"));
+
+        let mismatch =
+            validate_question_request_identity(Some(&current), Some(&stale)).unwrap_err();
+        let AppError::Conflict(mismatch) = mismatch else {
+            panic!("stale identity must be a conflict");
+        };
+        assert_eq!(mismatch.error_type, "stale_question_request");
+    }
+
+    #[test]
+    fn empty_dismiss_payload_deserializes_as_legacy_absence() {
+        let payload: Option<DismissQuestionPayload> = None;
+        assert!(payload.is_none());
+        let json: DismissQuestionPayload = serde_json::from_str("{}").unwrap();
+        assert_eq!(json.request_id, None);
+    }
 }
 
 async fn respond_to_question(
@@ -6013,12 +6082,16 @@ async fn respond_to_question(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
+    let ConvState::AwaitingUserResponse {
+        request_authority, ..
+    } = &conv.state
+    else {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation is not awaiting a user response",
             "wrong_state",
         ))));
-    }
+    };
+    validate_question_request_identity(request_authority.request_id(), req.request_id.as_ref())?;
 
     require_ordinary_mutation_admission(&state, &id, "question response").await?;
 
@@ -6027,6 +6100,7 @@ async fn respond_to_question(
         .send_event(
             &id,
             Event::UserQuestionResponse {
+                request_id: req.request_id,
                 answers: req.answers,
                 annotations: req.annotations,
             },
@@ -6040,6 +6114,7 @@ async fn respond_to_question(
 async fn dismiss_question(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    payload: Option<Json<DismissQuestionPayload>>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state
         .runtime
@@ -6055,18 +6130,30 @@ async fn dismiss_question(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
+    let ConvState::AwaitingUserResponse {
+        request_authority, ..
+    } = &conv.state
+    else {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation is not awaiting a user response",
             "wrong_state",
         ))));
-    }
+    };
+    let submitted_request_id = payload
+        .as_ref()
+        .and_then(|Json(body)| body.request_id.as_ref());
+    validate_question_request_identity(request_authority.request_id(), submitted_request_id)?;
 
     require_ordinary_mutation_admission(&state, &id, "question dismissal").await?;
 
     state
         .runtime
-        .send_event(&id, Event::UserQuestionDismissed)
+        .send_event(
+            &id,
+            Event::UserQuestionDismissed {
+                request_id: payload.and_then(|Json(body)| body.request_id),
+            },
+        )
         .await
         .map_err(AppError::BadRequest)?;
 
@@ -13553,6 +13640,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 &ConvState::AwaitingUserResponse {
                     questions: vec![],
                     tool_use_id: "tool-question".to_string(),
+                    request_authority: crate::state_machine::state::QuestionRequestAuthority::new(),
                 },
             )
             .await
@@ -17874,6 +17962,92 @@ mod wake_handler_tests {
             )
             .await
             .expect("router response")
+    }
+
+    #[tokio::test]
+    async fn legacy_pending_question_accepts_empty_body_dismissal() {
+        let state = make_test_state().await;
+        seed_conversation(&state, "legacy-question").await;
+        let legacy_state: ConvState = serde_json::from_value(serde_json::json!({
+            "type": "awaiting_user_response",
+            "questions": [],
+            "tool_use_id": "legacy-tool"
+        }))
+        .expect("deserialize pre-identity pending question");
+        state
+            .db
+            .update_conversation_state("legacy-question", &legacy_state)
+            .await
+            .expect("persist legacy pending question");
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/conversations/legacy-question/dismiss-question")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let conversation = state
+            .db
+            .get_conversation("legacy-question")
+            .await
+            .expect("load conversation");
+        assert_eq!(conversation.state, ConvState::Idle);
+    }
+
+    #[tokio::test]
+    async fn identified_pending_question_rejects_empty_body_with_actionable_conflict() {
+        let state = make_test_state().await;
+        seed_conversation(&state, "identified-question").await;
+        state
+            .db
+            .update_conversation_state(
+                "identified-question",
+                &ConvState::AwaitingUserResponse {
+                    questions: vec![],
+                    tool_use_id: "provider-tool".into(),
+                    request_authority: crate::state_machine::state::QuestionRequestAuthority::new(),
+                },
+            )
+            .await
+            .expect("persist identified pending question");
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/conversations/identified-question/dismiss-question")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error_type"], "question_request_identity_required");
+        assert!(payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("Update Phoenix"));
+        assert!(payload["error"].as_str().unwrap().contains("web client"));
+        assert!(matches!(
+            state
+                .db
+                .get_conversation("identified-question")
+                .await
+                .expect("load conversation")
+                .state,
+            ConvState::AwaitingUserResponse { .. }
+        ));
     }
 
     #[tokio::test]

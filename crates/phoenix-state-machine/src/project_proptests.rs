@@ -875,11 +875,12 @@ mod random_walk {
                             })
                             .collect();
                         Event::UserQuestionResponse {
+                            request_id: None,
                             answers,
                             annotations: None,
                         }
                     }
-                    _ => Event::UserQuestionDismissed,
+                    _ => Event::UserQuestionDismissed { request_id: None },
                 }
             }
 

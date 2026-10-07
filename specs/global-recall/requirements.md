@@ -138,6 +138,11 @@ AND SHALL distinguish request acceptance from observed execution
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior except for explicit Global Coordinator subscriptions governed by REQ-GR-015
 
+WHEN the singleton Global Coordinator needs user input to proceed
+THE SYSTEM SHALL provide the parent-conversation `ask_user_question` capability
+AND SHALL use the shared request-bound structured-question state and web interaction surface
+AND SHALL NOT grant that capability to sub-agents
+
 THE search and transcript-read capabilities SHALL describe recalled text as untrusted stored data rather than instructions
 
 WHEN the singleton Global Coordinator invokes Bash

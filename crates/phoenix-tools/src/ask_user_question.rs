@@ -87,6 +87,10 @@ impl Tool for AskUserQuestionTool {
         })
     }
 
+    fn defer_loading(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
         // This runs when the input failed to parse as AskUserQuestionInput
         // (fell through to ToolInput::Unknown) and wasn't intercepted by

@@ -95,6 +95,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [079](079_kache-explicit-pending-debug-fidelity.md) | Kache remains explicit pending restored debug fidelity | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
 | [080](080_close-stops-bound-fsmonitor-daemons.md) | Close stops bound fsmonitor daemons instead of reconfiguring Git | Accepted | REQ-WL-002b; Close retirement quarantine and descriptor scan |
 | [081](081_global-coordinator-borrows-workscope-svg-source-authority.md) | Global Coordinator borrows WorkScope SVG source authority | Accepted | REQ-SVG-001, REQ-GR-007 |
+| [082](082_legacy-auq-waits-retain-identity-absence.md) | Legacy AUQ waits retain identity absence | Accepted | REQ-AUQ-009, REQ-COMP-001; `QuestionRequestId`, `AwaitingUserResponse` |
 
 ## For agents: which decisions bind your task
 
@@ -105,6 +106,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
 | Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
+| Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
@@ -167,6 +169,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
       │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
+      │   ├── ADR-082 (Legacy AUQ waits retain identity absence)
       │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
