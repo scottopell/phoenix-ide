@@ -13640,7 +13640,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 &ConvState::AwaitingUserResponse {
                     questions: vec![],
                     tool_use_id: "tool-question".to_string(),
-                    request_authority: QuestionRequestAuthority::new(),
+                    request_authority: crate::state_machine::state::QuestionRequestAuthority::new(),
                 },
             )
             .await
