@@ -258,6 +258,16 @@ impl SupervisorHandle {
             .await
     }
 
+    pub(crate) async fn remove_after_oauth(
+        &self,
+        epoch: u64,
+        access_token: String,
+    ) -> Result<bool, String> {
+        self.oauth_cleanup(epoch, access_token, OAuthCleanupNext::Remove)
+            .await
+            .map(|epoch| epoch.is_some())
+    }
+
     async fn oauth_cleanup(
         &self,
         epoch: u64,
@@ -413,6 +423,7 @@ pub(crate) enum RecoveryClaim {
 }
 
 enum OAuthCleanupNext {
+    Remove,
     Recovering,
     Reconnect(McpServerConfig),
 }
@@ -797,6 +808,11 @@ impl Actor {
                 match self.stop_server().await {
                     Ok(()) => {
                         match next {
+                            OAuthCleanupNext::Remove => {
+                                self.epoch = self.epoch.wrapping_add(1);
+                                self.recovery_from = None;
+                                self.state = SupervisorState::Removed;
+                            }
                             OAuthCleanupNext::Recovering => {
                                 self.state = SupervisorState::Recovering;
                             }

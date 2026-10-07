@@ -994,8 +994,13 @@ fn oauth_resource_url(config: &McpServerConfig) -> Option<&str> {
 /// (`oauth_phase = awaiting_user` in `specs/mcp/mcp.allium`). Keyed by server
 /// name in `OAuthRuntime::pending`; the `state_nonce` binds the callback to
 /// exactly this flow.
+enum OAuthFlowOwner {
+    Reconnect(SupervisorHandle, u64),
+    Remove(SupervisorHandle, u64),
+}
+
 struct PendingAuthFlow {
-    owner: Option<(SupervisorHandle, u64)>,
+    owner: Option<OAuthFlowOwner>,
     config: McpServerConfig,
     state_nonce: String,
     pkce_verifier: String,
@@ -1047,7 +1052,7 @@ impl PendingAuthFlow {
 /// listener is bound.
 struct OAuthRuntime {
     store: std::sync::RwLock<Arc<dyn OAuthStore>>,
-    mutations: tokio::sync::Mutex<()>,
+    mutations: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     redirect_base: std::sync::Mutex<Option<String>>,
     /// A diagnostic surfaced on `unauthorized` status entries when the resolved
     /// redirect base is unreachable from another machine (a loopback redirect
@@ -1071,7 +1076,7 @@ impl Default for OAuthRuntime {
     fn default() -> Self {
         Self {
             store: std::sync::RwLock::new(Arc::new(oauth::MemoryOAuthStore::default())),
-            mutations: tokio::sync::Mutex::new(()),
+            mutations: std::sync::Mutex::new(HashMap::new()),
             redirect_base: std::sync::Mutex::new(None),
             redirect_warning: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1083,6 +1088,15 @@ impl Default for OAuthRuntime {
 }
 
 impl OAuthRuntime {
+    fn mutation_gate(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.mutations
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     fn store(&self) -> Arc<dyn OAuthStore> {
         Arc::clone(&self.store.read().unwrap())
     }
@@ -1635,7 +1649,8 @@ fn oauth_recovery_kind_parts(
 
 /// Outcome of refreshing an authorized server's token mid-recovery.
 enum RefreshServerOutcome {
-    Refreshed(String),
+    Refreshed,
+    Failed(String),
     Superseded,
     /// The refresh could not be attempted/completed for a reason that says
     /// nothing about the token (network failure to the authorization
@@ -1901,7 +1916,8 @@ impl McpClientManager {
         // the new config), or a newer flow may already have persisted its own
         // token (which a stale exchange must not overwrite or delete). A dead
         // flow's exchange result is simply discarded.
-        let _serial = self.oauth.mutations.lock().await;
+        let gate = self.oauth.mutation_gate(&name);
+        let _serial = gate.lock().await;
         let resolved = {
             let mut pending = self.oauth.pending.lock().unwrap();
             match pending.get(&name) {
@@ -1926,6 +1942,28 @@ impl McpClientManager {
             refresh_token: response.refresh_token,
             expires_at: response.expires_at,
         };
+        let reconnect_owner = match resolved.owner {
+            Some(OAuthFlowOwner::Reconnect(handle, epoch)) => Some((handle, epoch)),
+            None => None,
+            Some(OAuthFlowOwner::Remove(handle, epoch)) => {
+                if let Some(listener) = self.oauth.loopback_listeners.lock().unwrap().remove(&name)
+                {
+                    listener.abort();
+                }
+                self.pending_oauth_urls.write().await.remove(&name);
+                if !handle
+                    .remove_after_oauth(epoch, record.access_token)
+                    .await?
+                {
+                    return Err(format!(
+                        "MCP server '{name}': removal authorization was superseded"
+                    ));
+                }
+                self.oauth.store().delete_token(&name).await?;
+                self.remove_current_handle(&name, &handle).await;
+                return Ok(name);
+            }
+        };
         self.oauth
             .store()
             .upsert_token(&record)
@@ -1935,7 +1973,7 @@ impl McpClientManager {
         self.pending_oauth_urls.write().await.remove(&name);
         let config = resolved.config;
         let owner = self
-            .restart_oauth_owner(&name, &config, resolved.owner, record.access_token)
+            .restart_oauth_owner(&name, &config, reconnect_owner, record.access_token)
             .await?;
         let (handle, epoch) = if let Some(owner) = owner {
             owner
@@ -2003,8 +2041,13 @@ impl McpClientManager {
                 .find(|(_, flow)| flow.state_nonce == state_nonce)
                 .map(|(name, _)| name.clone())
         }?;
+        let gate = self.oauth.mutation_gate(&name);
+        let _mutations = gate.lock().await;
         let flow = {
             let mut pending = self.oauth.pending.lock().unwrap();
+            if pending.get(&name)?.state_nonce != state_nonce {
+                return None;
+            }
             pending.remove(&name)
         };
         if let Some(handle) = self.oauth.loopback_listeners.lock().unwrap().remove(&name) {
@@ -2019,7 +2062,10 @@ impl McpClientManager {
         // Retain the denial as a failure rather than letting the server vanish
         // from status (REQ-MCP-018). The pending URL is already cleared, so
         // this records `failed`, not `unauthorized`.
-        if let Some((handle, epoch)) = flow.and_then(|flow| flow.owner) {
+        if let Some(
+            OAuthFlowOwner::Reconnect(handle, epoch) | OAuthFlowOwner::Remove(handle, epoch),
+        ) = flow.and_then(|flow| flow.owner)
+        {
             handle
                 .fail(epoch, format!("authorization failed: {error}"))
                 .await;
@@ -2038,7 +2084,8 @@ impl McpClientManager {
         permit: &RecoveryPermit,
         www_authenticate: Option<&str>,
     ) -> RefreshServerOutcome {
-        let _serial = self.oauth.mutations.lock().await;
+        let gate = self.oauth.mutation_gate(name);
+        let _serial = gate.lock().await;
         let snapshot = handle.snapshot();
         if snapshot.epoch != permit.epoch || !matches!(snapshot.state, SupervisorState::Recovering)
         {
@@ -2058,7 +2105,8 @@ impl McpClientManager {
                 return self
                     .reprompt_after_refresh_failure(
                         name,
-                        config,
+                        handle,
+                        permit,
                         www_authenticate,
                         "no stored token",
                     )
@@ -2071,12 +2119,19 @@ impl McpClientManager {
             }
         };
         match oauth_refresh(&self.oauth, name, &url, www_authenticate, &token).await {
-            Ok(access_token) => RefreshServerOutcome::Refreshed(access_token),
+            Ok(access_token) => match handle
+                .finish_oauth_cleanup(permit.epoch, access_token)
+                .await
+            {
+                Ok(true) => RefreshServerOutcome::Refreshed,
+                Ok(false) => RefreshServerOutcome::Superseded,
+                Err(error) => RefreshServerOutcome::Failed(error),
+            },
             Err(RefreshFailure::Transient(e)) => RefreshServerOutcome::Transient(format!(
                 "MCP server '{name}': OAuth token refresh failed: {e}"
             )),
             Err(RefreshFailure::Rejected(e)) => {
-                self.reprompt_after_refresh_failure(name, config, www_authenticate, &e)
+                self.reprompt_after_refresh_failure(name, handle, permit, www_authenticate, &e)
                     .await
             }
         }
@@ -2095,8 +2150,30 @@ impl McpClientManager {
         let Some(flow) = pending.get_mut(name) else {
             return Err("MCP OAuth flow disappeared before publication".to_string());
         };
-        flow.owner = Some((handle.clone(), epoch));
+        flow.owner = Some(OAuthFlowOwner::Reconnect(handle.clone(), epoch));
         Ok(())
+    }
+
+    async fn await_owned_oauth_flow(
+        &self,
+        name: &str,
+        handle: &SupervisorHandle,
+        epoch: u64,
+        error: String,
+    ) -> Result<(), String> {
+        self.bind_pending_flow_owner(name, handle, epoch)?;
+        let url = self
+            .pending_oauth_urls
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| "MCP OAuth URL disappeared before publication".to_string())?;
+        if handle.await_oauth(epoch, url, error).await {
+            Ok(())
+        } else {
+            Err("MCP OAuth recovery was superseded".to_string())
+        }
     }
 
     /// `TokenRefreshFailed`: discard the dead token and surface a fresh
@@ -2104,10 +2181,12 @@ impl McpClientManager {
     async fn reprompt_after_refresh_failure(
         &self,
         name: &str,
-        config: &McpServerConfig,
+        handle: &SupervisorHandle,
+        permit: &RecoveryPermit,
         www_authenticate: Option<&str>,
         reason: &str,
     ) -> RefreshServerOutcome {
+        let config = &permit.config;
         tracing::warn!(
             server = %name,
             "OAuth refresh rejected ({reason}); discarding token and re-prompting"
@@ -2125,9 +2204,18 @@ impl McpClientManager {
         )
         .await
         {
-            Ok(auth_url) => RefreshServerOutcome::Reprompt(format!(
-                "MCP server '{name}': authorization expired; re-authorize at {auth_url}"
-            )),
+            Ok(auth_url) => {
+                let error = format!(
+                    "MCP server '{name}': authorization expired; re-authorize at {auth_url}"
+                );
+                match self
+                    .await_owned_oauth_flow(name, handle, permit.epoch, error.clone())
+                    .await
+                {
+                    Ok(()) => RefreshServerOutcome::Reprompt(error),
+                    Err(error) => RefreshServerOutcome::Transient(error),
+                }
+            }
             Err(flow_error) => RefreshServerOutcome::Transient(format!(
                 "MCP server '{name}': OAuth refresh rejected ({reason}) and re-authorization \
                  could not start: {flow_error}"
@@ -2147,7 +2235,8 @@ impl McpClientManager {
         permit: &RecoveryPermit,
         www_authenticate: &str,
     ) -> Result<(), String> {
-        let _serial = self.oauth.mutations.lock().await;
+        let gate = self.oauth.mutation_gate(name);
+        let _serial = gate.lock().await;
         let snapshot = handle.snapshot();
         if snapshot.epoch != permit.epoch || !matches!(snapshot.state, SupervisorState::Recovering)
         {
@@ -2183,7 +2272,13 @@ impl McpClientManager {
                     url = %auth_url,
                     "Tool call needs additional scopes; awaiting re-authorization"
                 );
-                Ok(())
+                self.await_owned_oauth_flow(
+                    name,
+                    handle,
+                    permit.epoch,
+                    "additional OAuth scopes required".to_string(),
+                )
+                .await
             }
             Err(e) => Err(format!(
                 "MCP server '{name}': insufficient scope and re-authorization could not \
@@ -2225,7 +2320,8 @@ impl McpClientManager {
         let pending = Arc::clone(&self.pending_oauth_urls);
         let oauth = Arc::clone(&self.oauth);
         tokio::spawn(async move {
-            let _mutations = oauth.mutations.lock().await;
+            let gate = oauth.mutation_gate(&connect_name);
+            let _mutations = gate.lock().await;
             if handle.snapshot().epoch != epoch {
                 return;
             }
@@ -2247,7 +2343,7 @@ impl McpClientManager {
                         {
                             let mut flows = oauth.pending.lock().unwrap();
                             if let Some(flow) = flows.get_mut(&name) {
-                                flow.owner = Some((handle.clone(), epoch));
+                                flow.owner = Some(OAuthFlowOwner::Reconnect(handle.clone(), epoch));
                             }
                         }
                         handle
@@ -2741,24 +2837,6 @@ impl McpClientManager {
                     handle.fail(permit.epoch, error.clone()).await;
                     return Err(McpToolCallError::Failed(error));
                 }
-                let mutations = self.oauth.mutations.lock().await;
-                self.bind_pending_flow_owner(server_name, handle, permit.epoch)
-                    .map_err(McpToolCallError::Failed)?;
-                let url = self
-                    .pending_oauth_urls
-                    .read()
-                    .await
-                    .get(server_name)
-                    .cloned()
-                    .unwrap_or_default();
-                handle
-                    .await_oauth(
-                        permit.epoch,
-                        url,
-                        "additional OAuth scopes required".to_string(),
-                    )
-                    .await;
-                drop(mutations);
                 self.wait_for_ready(handle, &CancellationToken::new()).await
             }
         }
@@ -2771,23 +2849,15 @@ impl McpClientManager {
         permit: &RecoveryPermit,
         outcome: RefreshServerOutcome,
     ) -> Result<(), McpToolCallError> {
-        let _mutations = self.oauth.mutations.lock().await;
+        let gate = self.oauth.mutation_gate(server_name);
+        let _mutations = gate.lock().await;
         if handle.snapshot().epoch != permit.epoch {
             return Err(McpToolCallError::Failed(
                 "MCP OAuth recovery was superseded".to_string(),
             ));
         }
         match outcome {
-            RefreshServerOutcome::Refreshed(access_token) => {
-                if !handle
-                    .finish_oauth_cleanup(permit.epoch, access_token)
-                    .await
-                    .map_err(McpToolCallError::Failed)?
-                {
-                    return Err(McpToolCallError::Failed(
-                        "MCP OAuth recovery was superseded".to_string(),
-                    ));
-                }
+            RefreshServerOutcome::Refreshed => {
                 match Self::connect_one(
                     server_name,
                     &permit.config,
@@ -2818,20 +2888,9 @@ impl McpClientManager {
                     }
                 }
             }
-            RefreshServerOutcome::Reprompt(error) => {
-                self.bind_pending_flow_owner(server_name, handle, permit.epoch)
-                    .map_err(McpToolCallError::Failed)?;
-                let url = self
-                    .pending_oauth_urls
-                    .read()
-                    .await
-                    .get(server_name)
-                    .cloned()
-                    .unwrap_or_default();
-                handle.await_oauth(permit.epoch, url, error.clone()).await;
-                Err(McpToolCallError::Failed(error))
-            }
-            RefreshServerOutcome::Transient(error) => Err(McpToolCallError::Failed(error)),
+            RefreshServerOutcome::Reprompt(error)
+            | RefreshServerOutcome::Transient(error)
+            | RefreshServerOutcome::Failed(error) => Err(McpToolCallError::Failed(error)),
             RefreshServerOutcome::Superseded => Err(McpToolCallError::Failed(
                 "MCP OAuth recovery was superseded".to_string(),
             )),
@@ -2892,7 +2951,8 @@ impl McpClientManager {
         let mut failed = Vec::new();
         let mut removed = Vec::new();
         for name in removed_names {
-            let _mutations = self.oauth.mutations.lock().await;
+            let gate = self.oauth.mutation_gate(&name);
+            let _mutations = gate.lock().await;
             let handle = { self.servers.read().await.get(&name).cloned() };
             if let Some(handle) = handle {
                 let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
@@ -2914,7 +2974,7 @@ impl McpClientManager {
                     Err(error) => {
                         if let Some(mut flow) = pending_flow {
                             let epoch = handle.snapshot().epoch;
-                            flow.owner = Some((handle.clone(), epoch));
+                            flow.owner = Some(OAuthFlowOwner::Remove(handle.clone(), epoch));
                             self.oauth
                                 .pending
                                 .lock()
@@ -2940,7 +3000,8 @@ impl McpClientManager {
         let mut restarted = Vec::new();
         let mut unchanged = Vec::new();
         for (name, config) in desired {
-            let mutations = self.oauth.mutations.lock().await;
+            let gate = self.oauth.mutation_gate(&name);
+            let mutations = gate.lock().await;
             let existing = self.servers.read().await.get(&name).cloned();
             if existing.is_none() {
                 let stale_flow = self.oauth.pending.lock().unwrap().remove(&name);
@@ -2950,6 +3011,17 @@ impl McpClientManager {
             }
             let (handle, is_restart) = match existing {
                 Some(handle) if handle.snapshot().config == config => {
+                    {
+                        let mut flows = self.oauth.pending.lock().unwrap();
+                        if let Some(flow) = flows.get_mut(&name) {
+                            if matches!(flow.owner, Some(OAuthFlowOwner::Remove(_, _))) {
+                                flow.owner = Some(OAuthFlowOwner::Reconnect(
+                                    handle.clone(),
+                                    handle.snapshot().epoch,
+                                ));
+                            }
+                        }
+                    }
                     match handle.snapshot().state {
                         SupervisorState::Failed => (handle, true),
                         SupervisorState::Ready(_)
@@ -3059,7 +3131,6 @@ impl McpClientManager {
 
     pub async fn shutdown(&self) {
         let _serial = self.reload_serial.lock().await;
-        let _mutations = self.oauth.mutations.lock().await;
         let handles: Vec<(String, SupervisorHandle)> = self
             .servers
             .read()
@@ -3068,6 +3139,8 @@ impl McpClientManager {
             .map(|(name, handle)| (name.clone(), handle.clone()))
             .collect();
         for (name, handle) in handles {
+            let gate = self.oauth.mutation_gate(&name);
+            let _mutations = gate.lock().await;
             match handle.shutdown().await {
                 Ok(()) => {
                     self.remove_current_handle(&name, &handle).await;

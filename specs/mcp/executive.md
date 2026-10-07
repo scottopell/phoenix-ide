@@ -93,8 +93,16 @@ ensuring newer credentials and cancelled flows survive the old recovery.
 replacement handshake while a configuration reload is queued, then verifies
 that the new endpoint is ready without an obsolete OAuth token or prompt.
 `failed_removal_preserves_oauth_cleanup_owner_for_callback` covers a callback
-after failed removal. Supervisor regressions cover cancellation before cleanup
+after failed removal and proves it completes removal without reconnecting.
+`readding_a_server_restores_reconnect_intent_after_failed_removal` covers an
+explicitly restored configuration. Supervisor regressions cover cancellation before cleanup
 and preservation of unrelated stale transport credentials.
+`oauth_prompt_binds_cleanup_owner_before_recovery_returns` verifies prompt
+ownership and authenticated cleanup for an immediate callback after rejected
+refresh or scope step-up preparation.
+`queued_removal_uses_the_bearer_recovered_by_refresh` covers removal queued
+during token refresh. `slow_connection_does_not_block_another_servers_oauth_refresh`
+verifies that one blocked handshake does not serialize another server's recovery.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

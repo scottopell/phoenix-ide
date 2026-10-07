@@ -512,9 +512,12 @@ rule TokenRefreshNeeded {
         -- A transient refresh failure retains the token and cleanup ownership
         -- while the same epoch retries; it does not discard the session.
         -- Token persistence, invalidation, and re-prompt publication share the
-        -- config-reconciliation mutation fence. Check the recovery epoch after
+        -- per-server config-reconciliation mutation fence. Check the recovery epoch after
         -- acquiring that fence, so a superseded retry cannot mutate credentials
         -- or create a flow for its old config.
+        -- Bind a re-authorization flow to its cleanup owner and publish the
+        -- awaiting-authorization state before releasing the mutation fence,
+        -- so an immediate callback cannot resolve it as an unowned flow.
 }
 
 -- Refresh succeeded: update the stored token (including a rotated refresh
@@ -538,6 +541,9 @@ rule TokenRefreshed {
         -- configuration changes. Check its epoch after acquiring the fence;
         -- any connect-side refresh, token deletion, or authorization prompt
         -- must finish before a newer configuration becomes authoritative.
+        -- Keep the refresh fence through bearer transfer and retained-session
+        -- cleanup so a queued removal cannot discard the new token while
+        -- retaining a transport that still uses the old credential.
         -- Only transports retained by this OAuth recovery receive its new
         -- bearer; unrelated stale teardown retries retain their credentials.
         -- The request whose 401 triggered the refresh (a tools/call or
@@ -589,7 +595,9 @@ rule InsufficientScopeStepUp {
         -- Claim exclusive OAuth recovery without requiring DELETE with the
         -- narrow bearer. Retain the old session as non-callable cleanup
         -- ownership until authorization supplies the upgraded bearer, then
-        -- complete cleanup before publishing a replacement.
+        -- complete cleanup before publishing a replacement. Bind the flow
+        -- to the recovery epoch and publish awaiting-authorization under the
+        -- same mutation fence before admitting its callback.
         -- 403 insufficient_scope + WWW-Authenticate carries the required
         -- scope. The authorization URL requests the UNION of the existing
         -- token's persisted `scopes` and the challenged scope (read before the
@@ -758,6 +766,12 @@ rule ReloadRemovesServer {
         -- terminate() the connection and discard the persisted token. Leave the
         -- per-authorization-server registration in place for servers that still
         -- share it. HTTP session teardown is the sibling rule below.
+        -- Failed teardown retains cleanup ownership. A pending authorization
+        -- flow is rebound to that epoch with removal intent; its callback
+        -- supplies credentials for DELETE and forgets the server and token
+        -- without reconnecting it. Re-adding the same configuration restores
+        -- reconnect intent before the callback is admitted.
+
 }
 
 -- Removing a session-bearing HTTP server ends its remote session with a DELETE
