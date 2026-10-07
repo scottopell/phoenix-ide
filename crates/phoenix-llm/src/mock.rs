@@ -157,20 +157,39 @@ impl Scenario {
 /// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     let text = request.messages.iter().rev().find_map(|m| {
-        if m.role != super::types::MessageRole::User {
-            return None;
-        }
-        let text = m
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        text.contains("[[scenario:").then_some(text)
+        (m.role == super::types::MessageRole::User).then(|| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
     })?;
-    let start = text.find("[[scenario:").expect("filtered above") + "[[scenario:".len();
+    parse_scenario_text(&text).or_else(|| {
+        request
+            .messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == super::types::MessageRole::User)
+            .filter_map(|m| {
+                let text = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                parse_scenario_text(&text)
+            })
+            .find(|scenario| matches!(scenario, Scenario::AskUserQuestion { .. }))
+    })
+}
+
+fn parse_scenario_text(text: &str) -> Option<Scenario> {
+    let start = text.find("[[scenario:")? + "[[scenario:".len();
     let rest = text.get(start..)?;
     let end = rest.find("]]")?;
     let name = rest.get(..end)?.trim();
@@ -1060,6 +1079,19 @@ mod tests {
             parse_scenario(&request),
             Some(Scenario::AskUserQuestion { ordinal: 0 })
         ));
+    }
+
+    #[test]
+    fn non_question_scenario_does_not_survive_later_user_message() {
+        let mut request = user_req("[[scenario:think]]");
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "later message".into(),
+            }],
+        });
+        assert!(parse_scenario(&request).is_none());
     }
 
     #[test]
