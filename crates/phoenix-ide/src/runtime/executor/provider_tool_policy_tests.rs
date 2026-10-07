@@ -120,9 +120,7 @@ async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reo
     let directory = tempfile::TempDir::new().unwrap();
     let path = directory.path().join("conversation.db");
     let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    phoenix_db::migrations::run_pending_migrations(db.pool())
-        .await
-        .unwrap();
+    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
     db.create_conversation(
         CONVERSATION,
         CONVERSATION,
