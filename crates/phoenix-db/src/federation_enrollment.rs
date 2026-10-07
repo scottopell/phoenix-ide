@@ -23,6 +23,26 @@ fn decode_enrollment(row: &sqlx::sqlite::SqliteRow) -> DbResult<FederationEnroll
     })
 }
 
+#[derive(Clone, Copy)]
+enum EnrollmentCommit {
+    Normal,
+    #[cfg(test)]
+    CommittedAckLost,
+}
+
+impl EnrollmentCommit {
+    async fn execute(self, tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> DbResult<()> {
+        tx.commit().await?;
+        #[cfg(test)]
+        if matches!(self, Self::CommittedAckLost) {
+            return Err(DbError::Serialization(
+                "injected committed enrollment acknowledgement loss".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Database {
     /// Replace any active receiver-issued credential for one caller instance.
     ///
@@ -34,8 +54,24 @@ impl Database {
         caller_display_name: &str,
         credential_verifier: &FederationCredentialVerifier,
     ) -> DbResult<FederationEnrollment> {
-        let now = Utc::now().timestamp_micros();
+        self.replace_federation_enrollment_with_commit(
+            caller_instance_id,
+            caller_display_name,
+            credential_verifier,
+            EnrollmentCommit::Normal,
+        )
+        .await
+    }
+
+    async fn replace_federation_enrollment_with_commit(
+        &self,
+        caller_instance_id: InstanceId,
+        caller_display_name: &str,
+        credential_verifier: &FederationCredentialVerifier,
+        commit: EnrollmentCommit,
+    ) -> DbResult<FederationEnrollment> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = Utc::now().timestamp_micros();
         sqlx::query(
             "UPDATE federation_enrollments SET revoked_at_us = ?2
              WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
@@ -65,8 +101,24 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         let enrollment = decode_enrollment(&row)?;
-        tx.commit().await?;
-        Ok(enrollment)
+        match commit.execute(tx).await {
+            Ok(()) => Ok(enrollment),
+            Err(commit_error) => match self
+                .authenticate_federation_verifier(credential_verifier)
+                .await
+            {
+                Ok(Some(committed))
+                    if committed.caller_instance_id == caller_instance_id
+                        && committed.caller_display_name == caller_display_name =>
+                {
+                    Ok(committed)
+                }
+                Ok(_) => Err(commit_error),
+                Err(classification_error) => Err(DbError::Serialization(format!(
+                    "enrollment commit failed ({commit_error}); exact verifier classification failed: {classification_error}"
+                ))),
+            },
+        }
     }
 
     /// Revoke the active receiver-issued credential for one caller instance.
@@ -77,14 +129,17 @@ impl Database {
         &self,
         caller_instance_id: InstanceId,
     ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = Utc::now().timestamp_micros();
         let result = sqlx::query(
             "UPDATE federation_enrollments SET revoked_at_us = ?2
              WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
         )
         .bind(caller_instance_id.to_string())
-        .bind(Utc::now().timestamp_micros())
-        .execute(&self.pool)
+        .bind(now)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() != 0)
     }
 
@@ -137,6 +192,29 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn committed_replacement_is_classified_by_exact_verifier() {
+        let db = test_db().await;
+        let caller = InstanceId::new();
+        let verifier = FederationCredentialVerifier::from_bearer(b"bearer");
+
+        let enrollment = db
+            .replace_federation_enrollment_with_commit(
+                caller,
+                "peer",
+                &verifier,
+                EnrollmentCommit::CommittedAckLost,
+            )
+            .await
+            .unwrap();
+        assert_eq!(enrollment.caller_instance_id, caller);
+        assert!(db
+            .authenticate_federation_verifier(&verifier)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -224,6 +302,35 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn schema_rejects_invalid_timestamp_domains() {
+        let db = test_db().await;
+        let caller = InstanceId::new();
+        let verifier = FederationCredentialVerifier::from_bearer(b"bearer").to_string();
+        assert!(sqlx::query(
+            "INSERT INTO federation_enrollments
+                 (id, caller_instance_id, caller_display_name, credential_verifier, created_at_us)
+             VALUES (?1, ?2, 'peer', ?3, -1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(caller.to_string())
+        .bind(&verifier)
+        .execute(db.pool())
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO federation_enrollments
+                 (id, caller_instance_id, caller_display_name, credential_verifier, created_at_us)
+             VALUES (?1, ?2, 'peer', ?3, 'not-an-integer')",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(caller.to_string())
+        .bind(&verifier)
+        .execute(db.pool())
+        .await
+        .is_err());
     }
 
     #[tokio::test]

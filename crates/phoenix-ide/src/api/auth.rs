@@ -339,6 +339,10 @@ fn check_bearer_password(
     let Some(token) = bearer_token(req) else {
         return BearerCheck::Absent;
     };
+    if token.starts_with("phx_peer_") {
+        throttle.record_failure(key);
+        return BearerCheck::Invalid;
+    }
 
     if throttle.is_locked(key) {
         return BearerCheck::LockedOut;
@@ -771,6 +775,20 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap()
+    }
+
+    #[test]
+    fn peer_token_namespace_never_authenticates_as_owner_password() {
+        let throttle = LoginThrottle::new();
+        assert!(matches!(
+            check_bearer_password(
+                &bearer_req("phx_peer_same-secret"),
+                "phx_peer_same-secret",
+                &throttle,
+                "peer",
+            ),
+            BearerCheck::Invalid
+        ));
     }
 
     /// (a) Repeated wrong-Bearer guesses from one peer lock that peer out, and a

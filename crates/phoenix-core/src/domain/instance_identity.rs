@@ -1,6 +1,14 @@
 use std::fmt;
 use std::str::FromStr;
 
+#[derive(Debug, thiserror::Error)]
+pub enum InstanceIdParseError {
+    #[error("invalid UUID: {0}")]
+    InvalidUuid(#[from] uuid::Error),
+    #[error("instance identity must be UUIDv4")]
+    NotVersionFour,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InstanceId(uuid::Uuid);
 
@@ -24,10 +32,14 @@ impl fmt::Display for InstanceId {
 }
 
 impl FromStr for InstanceId {
-    type Err = uuid::Error;
+    type Err = InstanceIdParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        uuid::Uuid::parse_str(value).map(Self)
+        let uuid = uuid::Uuid::parse_str(value)?;
+        if uuid.get_version_num() != 4 {
+            return Err(InstanceIdParseError::NotVersionFour);
+        }
+        Ok(Self(uuid))
     }
 }
 
@@ -67,5 +79,25 @@ impl fmt::Display for FederationCredentialVerifier {
             write!(formatter, "{byte:02x}")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_identity_rejects_non_v4_uuids() {
+        for value in [
+            "00000000-0000-0000-0000-000000000000",
+            "d9428888-122b-11e1-b85c-61cd3cbb3210",
+            "21f7f8de-8051-5b89-8680-0195ef798b6a",
+        ] {
+            assert!(matches!(
+                InstanceId::from_str(value),
+                Err(InstanceIdParseError::NotVersionFour)
+            ));
+        }
+        assert!(InstanceId::from_str(&InstanceId::new().to_string()).is_ok());
     }
 }

@@ -624,8 +624,13 @@ CREATE TABLE federation_enrollments (
         AND credential_verifier = lower(credential_verifier)
         AND credential_verifier NOT GLOB '*[^0-9a-f]*'
     ),
-    created_at_us INTEGER NOT NULL,
-    revoked_at_us INTEGER
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    revoked_at_us INTEGER CHECK(
+        revoked_at_us IS NULL
+        OR (typeof(revoked_at_us) = 'integer' AND revoked_at_us >= created_at_us)
+    )
 );
 CREATE UNIQUE INDEX federation_enrollments_one_active_caller
     ON federation_enrollments(caller_instance_id) WHERE revoked_at_us IS NULL;
