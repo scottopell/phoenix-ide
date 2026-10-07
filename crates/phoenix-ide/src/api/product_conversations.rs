@@ -1732,7 +1732,7 @@ mod tests {
         assert_eq!(rows[0]["canonical_root"]["slug"], "root-slug");
         assert_eq!(
             rows[0]["canonical_route"],
-            format!("/product-conversations/{}", root.product_conversation_id)
+            format!("/c/{}", root.product_conversation_id)
         );
         assert_eq!(rows[0]["presentation"]["display_name"], "Root Slug");
         assert_eq!(rows[0]["latest_transcript_row_id"], successor.id);
@@ -1756,7 +1756,7 @@ mod tests {
         assert_eq!(snapshot["requested_transcript_row_id"], successor.id);
         assert_eq!(
             snapshot["canonical_route"],
-            format!("/product-conversations/{}", root.product_conversation_id)
+            format!("/c/{}", root.product_conversation_id)
         );
         assert_eq!(snapshot["segments"][0]["segment_ordinal"], 0);
         assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "historical");
@@ -1976,7 +1976,7 @@ mod tests {
             .create_conversation("root", "root-slug", "/tmp", true, None, None)
             .await
             .unwrap();
-        let expected_route = format!("/product-conversations/{}", root.product_conversation_id);
+        let expected_route = format!("/c/{}", root.product_conversation_id);
         state
             .db
             .rename_conversation(&root.id, "renamed-root")
