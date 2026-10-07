@@ -581,9 +581,33 @@ const MIGRATIONS: &[Migration] = &[
         name: "settle_historical_continuation_openings",
         sql: MIGRATION_113,
     },
+    Migration {
+        version: 114,
+        name: "persist_instance_identity",
+        sql: MIGRATION_114,
+    },
 ];
 
 const MIGRATION_113: &str = "";
+
+const MIGRATION_114: &str = r"
+CREATE TABLE instance_identity (
+    singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+    instance_id TEXT NOT NULL UNIQUE CHECK(
+        typeof(instance_id) = 'text'
+        AND length(instance_id) = 36
+        AND instance_id = lower(instance_id)
+        AND substr(instance_id, 9, 1) = '-'
+        AND substr(instance_id, 14, 1) = '-'
+        AND substr(instance_id, 15, 1) = '4'
+        AND substr(instance_id, 19, 1) = '-'
+        AND substr(instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(instance_id, 24, 1) = '-'
+        AND length(replace(instance_id, '-', '')) = 32
+        AND replace(instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    )
+);
+";
 
 const MIGRATION_112: &str = r"
 ALTER TABLE messages ADD COLUMN origin_source_message_id TEXT;
@@ -10177,6 +10201,14 @@ async fn apply_migration_body(
         settle_historical_continuation::run(tx).await?;
     } else {
         sqlx::raw_sql(migration.sql).execute(&mut **tx).await?;
+        if migration.version == 114 {
+            sqlx::query(
+                "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (1, ?1)",
+            )
+            .bind(phoenix_core::domain::instance_identity::InstanceId::new().to_string())
+            .execute(&mut **tx)
+            .await?;
+        }
     }
     Ok(())
 }
@@ -11780,8 +11812,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(4).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(5).copied().collect::<Vec<_>>(),
             vec![
+                (114, "persist_instance_identity"),
                 (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
                 (111, "coordinator_conversation_watches"),
