@@ -2166,6 +2166,20 @@ fn overload_startup_action(
     }
 }
 
+fn runtime_deadline_for(state: &ConvState, now: DateTime<Utc>) -> Option<Duration> {
+    match state {
+        ConvState::AwaitingSubAgents { .. } => Some(DEFAULT_SUBAGENT_TIMEOUT),
+        ConvState::CancellingTool { .. } => Some(CANCELLATION_DEADLINE),
+        ConvState::CancellingSubAgents { .. } => Some(CANCELLING_SUBAGENTS_DEADLINE),
+        ConvState::AwaitingRecovery {
+            resume:
+                phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { retry },
+            ..
+        } => Some((retry.deadline_at - now).to_std().unwrap_or_default()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskApprovalExecution {
     Initial,
@@ -2761,7 +2775,7 @@ where
         // so this only matters when a runtime is constructed straight into a
         // waiting state — but arming here (not only on transition) is what makes
         // the backstop structural rather than dependent on the entry path.
-        if let Some(d) = Self::deadline_for(&self.state) {
+        if let Some(d) = runtime_deadline_for(&self.state, Utc::now()) {
             self.deadline = Some(tokio::time::Instant::now() + d);
         }
 
@@ -3014,7 +3028,9 @@ where
         let status = helper.credential_status().await;
         let event = if status == phoenix_llm::credential_helper::CredentialStatus::Valid {
             tracing::info!("Credential helper succeeded, retrying LLM request");
-            Event::CredentialBecameAvailable
+            Event::CredentialBecameAvailable {
+                observed_at: Utc::now(),
+            }
         } else {
             tracing::info!(
                 ?status,
@@ -5031,15 +5047,6 @@ where
     /// backstop (REQ-BED-005a); `CancellingSubAgents` gets a 6-second last-resort
     /// backstop (2× the 3s sub-agent `CancellingTool` deadline) so real cancelled
     /// results win the drain before the parent presumes a vanished runtime dead.
-    fn deadline_for(state: &ConvState) -> Option<Duration> {
-        match state {
-            ConvState::AwaitingSubAgents { .. } => Some(DEFAULT_SUBAGENT_TIMEOUT),
-            ConvState::CancellingTool { .. } => Some(CANCELLATION_DEADLINE),
-            ConvState::CancellingSubAgents { .. } => Some(CANCELLING_SUBAGENTS_DEADLINE),
-            _ => None,
-        }
-    }
-
     /// Manage the unified liveness deadline on every transition. Arm a fresh
     /// deadline whenever the conversation changes into a (different) waiting
     /// state, using that state's `deadline_for` duration; clear it when the new
@@ -5064,7 +5071,7 @@ where
 
         let variant_changed =
             std::mem::discriminant(old_state) != std::mem::discriminant(&self.state);
-        match Self::deadline_for(&self.state) {
+        match runtime_deadline_for(&self.state, Utc::now()) {
             Some(duration) if variant_changed => {
                 self.deadline = Some(tokio::time::Instant::now() + duration);
                 tracing::debug!(
@@ -5093,6 +5100,18 @@ where
             ConvState::CancellingTool { .. } => self.handle_cancelling_tool_timeout().await,
             ConvState::CancellingSubAgents { .. } => {
                 self.handle_cancelling_sub_agents_timeout().await;
+            }
+            ConvState::AwaitingRecovery {
+                resume:
+                    phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { .. },
+                ..
+            } => {
+                if let Err(error) = self
+                    .process_event(Event::OverloadRetryDeadlineExpired)
+                    .await
+                {
+                    tracing::warn!(%error, "Failed to expire overload retry during credential recovery");
+                }
             }
             other => {
                 tracing::debug!(
@@ -24332,6 +24351,38 @@ mod overload_startup_tests {
                 delay: std::time::Duration::from_secs(8),
                 attempt: 4,
             }
+        );
+    }
+
+    #[test]
+    fn recovered_credential_wait_uses_persisted_overload_deadline() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let state = ConvState::AwaitingRecovery {
+            message: "refreshing credentials".to_string(),
+            error_kind: crate::db::ErrorKind::Auth,
+            recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+            resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                retry: ServerOverloadRetry {
+                    target: ServerOverloadTarget::Ordinary,
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: 2,
+                    started_at: now,
+                    deadline_at: now + chrono::Duration::seconds(120),
+                },
+            },
+        };
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+
+        assert_eq!(
+            runtime_deadline_for(&restored, now + chrono::Duration::seconds(113)),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            runtime_deadline_for(&restored, now + chrono::Duration::seconds(120)),
+            Some(Duration::ZERO)
         );
     }
 

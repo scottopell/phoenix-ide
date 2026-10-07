@@ -883,18 +883,6 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
             },
         );
     let error = value.get("error").unwrap_or(value);
-    if std::ptr::eq(error, value) {
-        let code = value
-            .get("code")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown_error");
-        let message = value
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(code);
-        return Some(classify_responses_error(code, message));
-    }
-    let body = serde_json::json!({ "error": error }).to_string();
     let mut headers = HeaderMap::new();
     if let Some(raw_headers) = value.get("headers").and_then(serde_json::Value::as_object) {
         for (name, raw_value) in raw_headers {
@@ -914,6 +902,21 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
             }
         }
     }
+    if std::ptr::eq(error, value) {
+        let code = value
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown_error");
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(code);
+        return Some(overload_retry_guidance(
+            classify_responses_error(code, message),
+            &headers,
+        ));
+    }
+    let body = serde_json::json!({ "error": error }).to_string();
     let wrapped_code = error.get("code").and_then(serde_json::Value::as_str);
     if matches!(wrapped_code, Some("server_is_overloaded" | "slow_down")) {
         let message = error
@@ -3781,6 +3784,42 @@ mod tests {
 
         assert_eq!(error.kind, crate::LlmErrorKind::UsageLimitReached);
         assert_eq!(error.retry_after(), None);
+    }
+
+    #[test]
+    fn flat_websocket_capacity_preserves_retry_after() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status": 503,
+            "code": "server_is_overloaded",
+            "message": "at capacity",
+            "headers": { "retry-after": "12" }
+        }))
+        .expect("flat overload");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(
+            error.retry_after(),
+            Some(crate::RetryAfter::WithinLimit(Duration::from_secs(12)))
+        );
+    }
+
+    #[test]
+    fn flat_websocket_slow_down_preserves_over_limit_retry_after() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status": 429,
+            "code": "slow_down",
+            "message": "reduce request rate",
+            "headers": { "retry-after": 31 }
+        }))
+        .expect("flat overload");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(
+            error.retry_after(),
+            Some(crate::RetryAfter::ExceedsLimit(Duration::from_secs(31)))
+        );
     }
 
     #[test]

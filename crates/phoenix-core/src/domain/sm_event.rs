@@ -717,7 +717,9 @@ pub enum Event {
     /// Credential helper succeeded — conversations in `AwaitingRecovery` should retry.
     #[allow(dead_code)]
     // Constructed by executor in Phase 2 (credential helper settlement wiring)
-    CredentialBecameAvailable,
+    CredentialBecameAvailable {
+        observed_at: DateTime<Utc>,
+    },
     /// Credential helper failed — conversations in `AwaitingRecovery` transition to `Error`.
     #[allow(dead_code)]
     // Constructed by executor in Phase 2 (credential helper settlement wiring)
@@ -819,7 +821,7 @@ impl Event {
             Event::UserQuestionDismissed { .. } => "UserQuestionDismissed",
             Event::DismissError => "DismissError",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
-            Event::CredentialBecameAvailable => "CredentialBecameAvailable",
+            Event::CredentialBecameAvailable { .. } => "CredentialBecameAvailable",
             Event::CredentialHelperFailed { .. } => "CredentialHelperFailed",
             Event::TaskResolved { .. } => "TaskResolved",
             Event::SteerMessage { .. } => "SteerMessage",
@@ -964,7 +966,9 @@ pub enum ParentOnlyEvent {
         request_id: Option<QuestionRequestId>,
     },
     DismissError,
-    CredentialBecameAvailable,
+    CredentialBecameAvailable {
+        observed_at: DateTime<Utc>,
+    },
     CredentialHelperFailed {
         message: String,
     },
@@ -1214,8 +1218,8 @@ impl TryFrom<Event> for ParentEvent {
                 ParentOnlyEvent::UserQuestionDismissed { request_id },
             )),
             Event::DismissError => Ok(ParentEvent::Parent(ParentOnlyEvent::DismissError)),
-            Event::CredentialBecameAvailable => Ok(ParentEvent::Parent(
-                ParentOnlyEvent::CredentialBecameAvailable,
+            Event::CredentialBecameAvailable { observed_at } => Ok(ParentEvent::Parent(
+                ParentOnlyEvent::CredentialBecameAvailable { observed_at },
             )),
             Event::CredentialHelperFailed { message } => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialHelperFailed { message },
@@ -1421,7 +1425,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::UserQuestionResponse { .. }
             | Event::UserQuestionDismissed { .. }
             | Event::DismissError
-            | Event::CredentialBecameAvailable
+            | Event::CredentialBecameAvailable { .. }
             | Event::CredentialHelperFailed { .. }
             | Event::TaskResolved { .. }
             | Event::SteerMessage { .. }
@@ -1476,7 +1480,7 @@ impl ParentEvent {
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::UserQuestionDismissed { .. } => "UserQuestionDismissed",
                 ParentOnlyEvent::DismissError => "DismissError",
-                ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
+                ParentOnlyEvent::CredentialBecameAvailable { .. } => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",
                 ParentOnlyEvent::TaskResolved { .. } => "TaskResolved",
             },

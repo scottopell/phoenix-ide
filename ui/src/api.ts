@@ -524,12 +524,31 @@ export interface QuestionOption {
 }
 
 export interface ContinuationSummaryRequest {
+  operation_id: string;
   rejected_tool_calls: ToolCall[];
+  attempt: number;
+}
+
+export type ServerOverloadTarget =
+  | { type: 'ordinary' }
+  | { type: 'continuation'; operation_id: string; rejected_tool_calls: ToolCall[] };
+
+export type ServerOverloadPhase =
+  | { type: 'waiting'; retry_at: string }
+  | { type: 'in_flight' };
+
+export interface ServerOverloadRetry {
+  target: ServerOverloadTarget;
+  phase: ServerOverloadPhase;
+  attempt: number;
+  started_at: string;
+  deadline_at: string;
 }
 
 export type RecoveryResumeTarget =
   | { type: 'conversation_turn' }
-  | { type: 'continuation_summary'; request: ContinuationSummaryRequest };
+  | { type: 'continuation_summary'; request: ContinuationSummaryRequest }
+  | { type: 'server_overload_retry'; retry: ServerOverloadRetry };
 
 export type ConversationState =
   | { type: 'idle' }

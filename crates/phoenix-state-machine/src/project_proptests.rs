@@ -806,7 +806,9 @@ mod random_walk {
             }
 
             ConvState::AwaitingRecovery { .. } => match rng.random_range(0..3) {
-                0 => Event::CredentialBecameAvailable,
+                0 => Event::CredentialBecameAvailable {
+                    observed_at: chrono::Utc::now(),
+                },
                 1 => Event::CredentialHelperFailed {
                     message: random_string(rng, 15),
                 },

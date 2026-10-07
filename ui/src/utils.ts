@@ -1,6 +1,15 @@
 // Utility functions
 
-import type { ConversationState, RecoveryResumeTarget, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
+import type {
+  ConversationState,
+  RecoveryResumeTarget,
+  ServerOverloadPhase,
+  ServerOverloadTarget,
+  ToolCall,
+  PendingSubAgent,
+  SubAgentResult,
+  UserQuestion,
+} from './api';
 import { getErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 
@@ -186,16 +195,67 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-function parseRecoveryResumeTarget(raw: Record<string, unknown>): RecoveryResumeTarget {
+function parseServerOverloadTarget(raw: unknown): ServerOverloadTarget | null {
+  if (!isRecord(raw)) return null;
+  if (raw['type'] === 'ordinary') return { type: 'ordinary' };
+  if (raw['type'] === 'continuation'
+    && typeof raw['operation_id'] === 'string'
+    && Array.isArray(raw['rejected_tool_calls'])) {
+    return {
+      type: 'continuation',
+      operation_id: raw['operation_id'],
+      rejected_tool_calls: raw['rejected_tool_calls'] as ToolCall[],
+    };
+  }
+  return null;
+}
+
+function parseServerOverloadPhase(raw: unknown): ServerOverloadPhase | null {
+  if (!isRecord(raw)) return null;
+  if (raw['type'] === 'in_flight') return { type: 'in_flight' };
+  if (raw['type'] === 'waiting' && typeof raw['retry_at'] === 'string') {
+    return { type: 'waiting', retry_at: raw['retry_at'] };
+  }
+  return null;
+}
+
+function parseRecoveryResumeTarget(raw: Record<string, unknown>): RecoveryResumeTarget | null {
+  if (raw['type'] === 'conversation_turn') return { type: 'conversation_turn' };
   if (raw['type'] === 'continuation_summary' && isRecord(raw['request'])) {
+    const request = raw['request'];
+    if (typeof request['operation_id'] !== 'string'
+      || typeof request['attempt'] !== 'number'
+      || !Array.isArray(request['rejected_tool_calls'])) return null;
     return {
       type: 'continuation_summary',
       request: {
-        rejected_tool_calls: (raw['request']['rejected_tool_calls'] as ToolCall[]) ?? [],
+        operation_id: request['operation_id'],
+        rejected_tool_calls: request['rejected_tool_calls'] as ToolCall[],
+        attempt: request['attempt'],
       },
     };
   }
-  return { type: 'conversation_turn' };
+  if (raw['type'] === 'server_overload_retry' && isRecord(raw['retry'])) {
+    const retry = raw['retry'];
+    const target = parseServerOverloadTarget(retry['target']);
+    const phase = parseServerOverloadPhase(retry['phase']);
+    if (!target
+      || !phase
+      || typeof retry['attempt'] !== 'number'
+      || typeof retry['started_at'] !== 'string'
+      || typeof retry['deadline_at'] !== 'string') return null;
+    return {
+      type: 'server_overload_retry',
+      retry: {
+        target,
+        phase,
+        attempt: retry['attempt'],
+        started_at: retry['started_at'],
+        deadline_at: retry['deadline_at'],
+      },
+    };
+  }
+  return null;
 }
 
 export function parseConversationState(raw: unknown): ConversationState {
@@ -333,15 +393,18 @@ export function parseConversationState(raw: unknown): ConversationState {
         error: presentation,
       };
     }
-    case 'awaiting_recovery':
+    case 'awaiting_recovery': {
+      const resume = isRecord(obj['resume'])
+        ? parseRecoveryResumeTarget(obj['resume'])
+        : null;
+      if (!resume) return invalidStateError('Invalid recovery resume target');
       return {
         type: 'awaiting_recovery',
         message: (obj['message'] as string) ?? '',
         recovery_kind: (obj['recovery_kind'] as string) ?? 'credential',
-        resume: isRecord(obj['resume'])
-          ? parseRecoveryResumeTarget(obj['resume'])
-          : { type: 'conversation_turn' },
+        resume,
       };
+    }
     default:
       console.warn(`Unknown conversation state type: ${String(type)}`);
       return invalidStateError(`Unknown state: ${String(type)}`);

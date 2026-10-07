@@ -2567,7 +2567,7 @@ pub fn transition_parent(
         // ============================================================
         (
             ParentState::AwaitingRecovery { resume, .. },
-            ParentEvent::Parent(ParentOnlyEvent::CredentialBecameAvailable),
+            ParentEvent::Parent(ParentOnlyEvent::CredentialBecameAvailable { observed_at }),
         ) => match resume {
             RecoveryResumeTarget::ConversationTurn => Ok(ParentTransitionResult::new(
                 ParentState::Core(CoreState::LlmRequesting { attempt: 1 }),
@@ -2585,26 +2585,62 @@ pub fn transition_parent(
                 }),
             ),
             RecoveryResumeTarget::ServerOverloadRetry { retry } => {
-                let effect = match &retry.target {
+                let next_attempt = retry.attempt + 1;
+                if next_attempt > OVERLOAD_MAX_ATTEMPTS {
+                    return overload_terminal(
+                        retry,
+                        "Automatic overload retry attempts exhausted during credential recovery"
+                            .to_string(),
+                        ErrorKind::ServerOverloaded,
+                        None,
+                    )
+                    .map(CoreTransitionResult::into_parent_result);
+                }
+                if observed_at >= retry.deadline_at {
+                    return overload_terminal(
+                        retry,
+                        "Server overload retry deadline elapsed during credential recovery"
+                            .to_string(),
+                        ErrorKind::ServerOverloaded,
+                        None,
+                    )
+                    .map(CoreTransitionResult::into_parent_result);
+                }
+                let mut next_retry = retry.clone();
+                next_retry.attempt = next_attempt;
+                next_retry.phase = ServerOverloadPhase::InFlight;
+                let effect = match &next_retry.target {
                     ServerOverloadTarget::Ordinary => Effect::RequestLlm,
                     target @ ServerOverloadTarget::Continuation { .. } => {
                         Effect::RequestContinuation {
                             request: target
-                                .continuation_request(retry.attempt)
+                                .continuation_request(next_attempt)
                                 .expect("continuation overload target reconstructs its request"),
                         }
                     }
                 };
                 Ok(ParentTransitionResult::new(ParentState::Core(
-                    CoreState::ServerOverloadRetrying {
-                        retry: retry.clone(),
-                    },
+                    CoreState::ServerOverloadRetrying { retry: next_retry },
                 ))
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
                 .with_effect(effect))
             }
         },
+
+        (
+            ParentState::AwaitingRecovery {
+                resume: RecoveryResumeTarget::ServerOverloadRetry { retry },
+                ..
+            },
+            ParentEvent::Core(CoreEvent::OverloadRetryDeadlineExpired),
+        ) => overload_terminal(
+            retry,
+            "Server overload retry deadline elapsed during credential recovery".to_string(),
+            ErrorKind::ServerOverloaded,
+            None,
+        )
+        .map(CoreTransitionResult::into_parent_result),
 
         (
             ParentState::AwaitingRecovery {
@@ -4994,14 +5030,24 @@ mod tests {
         let restored: ConvState =
             serde_json::from_str(&serde_json::to_string(&recovered.new_state).unwrap()).unwrap();
         assert_eq!(restored, recovered.new_state);
-        let resumed =
-            transition(&restored, &test_context(), Event::CredentialBecameAvailable).unwrap();
-        assert_eq!(resumed.new_state, state);
+        let resumed = transition(
+            &restored,
+            &test_context(),
+            Event::CredentialBecameAvailable {
+                observed_at: at + chrono::Duration::seconds(10),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            &resumed.new_state,
+            ConvState::ServerOverloadRetrying { retry }
+                if retry.attempt == 4 && retry.phase == ServerOverloadPhase::InFlight
+        ));
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
             Effect::RequestContinuation { request }
                 if request.operation_id == "continuation-auth"
-                    && request.attempt == 3
+                    && request.attempt == 4
                     && request.rejected_tool_calls == rejected_tool_calls
         )));
 
@@ -5024,6 +5070,140 @@ mod tests {
                     && failure.request.attempt == 3
                     && failure.request.rejected_tool_calls == rejected_tool_calls
         ));
+    }
+
+    #[test]
+    fn overload_credential_recovery_enforces_attempt_cap() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let state = ConvState::AwaitingRecovery {
+            message: "refreshing credentials".to_string(),
+            error_kind: ErrorKind::Auth,
+            recovery_kind: RecoveryKind::Credential,
+            resume: RecoveryResumeTarget::ServerOverloadRetry {
+                retry: ServerOverloadRetry {
+                    target: ServerOverloadTarget::Ordinary,
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: OVERLOAD_MAX_ATTEMPTS,
+                    started_at: at,
+                    deadline_at: at + chrono::Duration::seconds(120),
+                },
+            },
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::CredentialBecameAvailable {
+                observed_at: at + chrono::Duration::seconds(10),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::Error {
+                error_kind: ErrorKind::ServerOverloaded,
+                ..
+            }
+        ));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn overload_credential_recovery_enforces_deadline_on_success() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let operation_id = "credential-deadline".to_string();
+        let state = ConvState::AwaitingRecovery {
+            message: "refreshing credentials".to_string(),
+            error_kind: ErrorKind::Auth,
+            recovery_kind: RecoveryKind::Credential,
+            resume: RecoveryResumeTarget::ServerOverloadRetry {
+                retry: ServerOverloadRetry {
+                    target: ServerOverloadTarget::Continuation {
+                        operation_id: operation_id.clone(),
+                        rejected_tool_calls: vec![],
+                    },
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: 2,
+                    started_at: at,
+                    deadline_at: at + chrono::Duration::seconds(120),
+                },
+            },
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::CredentialBecameAvailable {
+                observed_at: at + chrono::Duration::seconds(120),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.request.operation_id == operation_id
+                    && failure.error_kind == ErrorKind::ServerOverloaded
+        ));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestContinuation { .. })));
+    }
+
+    #[test]
+    fn overload_deadline_expires_while_credential_helper_is_running() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let state = ConvState::AwaitingRecovery {
+            message: "refreshing credentials".to_string(),
+            error_kind: ErrorKind::Auth,
+            recovery_kind: RecoveryKind::Credential,
+            resume: RecoveryResumeTarget::ServerOverloadRetry {
+                retry: ServerOverloadRetry {
+                    target: ServerOverloadTarget::Ordinary,
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: 2,
+                    started_at: at,
+                    deadline_at: at + chrono::Duration::seconds(120),
+                },
+            },
+        };
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+
+        let result = transition(
+            &restored,
+            &test_context(),
+            Event::OverloadRetryDeadlineExpired,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::Error {
+                error_kind: ErrorKind::ServerOverloaded,
+                ref message,
+                ..
+            } if message.contains("deadline elapsed")
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyStateChange)));
     }
 
     #[test]
@@ -5499,7 +5679,9 @@ mod tests {
         let resumed = transition(
             &result.new_state,
             &test_context(),
-            Event::CredentialBecameAvailable,
+            Event::CredentialBecameAvailable {
+                observed_at: chrono::Utc::now(),
+            },
         )
         .unwrap();
 
@@ -5608,7 +5790,14 @@ mod tests {
             },
         };
 
-        let result = transition(&state, &test_context(), Event::CredentialBecameAvailable).unwrap();
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::CredentialBecameAvailable {
+                observed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
 
         assert!(matches!(
             result.new_state,
