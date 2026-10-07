@@ -379,7 +379,14 @@ pending authorization as unauthorized, including after successful token refresh.
 A handshake's authorization failure SHALL retain its challenge and OAuth cleanup
 ownership when session teardown also fails. A restored token SHALL still take
 the silent refresh path before reauthorization; a handshake rejected after that
-refresh SHALL request owned reauthorization without repeating the grant.
+refresh SHALL request owned reauthorization without repeating the grant, using
+that handshake's discovery challenge. A session DELETE authorization rejection
+SHALL admit OAuth cleanup recovery even when the handshake's primary failure
+is not an authorization error. Challenges from both failures SHALL contribute
+required scopes, with the latest supplied discovery metadata retained when later challenges
+omit it.
+Transient refresh or token persistence failures after successful handshake
+teardown SHALL retain recovery ownership and retry without manual reload.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very

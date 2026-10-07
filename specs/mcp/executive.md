@@ -159,3 +159,15 @@ recovery), the `OAuthPhase` authorization sub-lifecycle
 the `McpServer` / `OAuthRegistration` / `OAuthToken` entities, and invariants
 binding session ids and tokens to the HTTP/OAuth servers that own them.
 </content>
+
+`startup_refresh_after_successful_teardown_retries_transient_failure` verifies
+owned retry after token endpoint and token persistence failures, including a
+rotating refresh grant. `handshake_non_auth_failure_with_delete_401_uses_cleanup_challenge`
+verifies DELETE-only authorization rejection, challenge discovery, and fresh
+bearer cleanup. The successful-teardown refresh regression also verifies changed
+replacement discovery metadata and scope preservation.
+
+`handshake_and_delete_challenges_survive_refresh_rejection` verifies metadata
+retention and scope union through immediate and background grant rejection.
+Both clean and failed replacement teardown preserve initial discovery metadata
+when replacement challenges omit it.

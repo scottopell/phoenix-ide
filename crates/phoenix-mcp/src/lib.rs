@@ -351,6 +351,39 @@ enum OAuthHandshakeAction {
     Authorize,
 }
 
+fn merge_oauth_challenges<'a>(challenges: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut parameters = std::collections::BTreeMap::new();
+    let mut scopes = Vec::new();
+    let mut present = false;
+    for challenge in challenges {
+        present = true;
+        let mut parsed = oauth::parse_bearer_challenge(challenge);
+        if let Some(scope) = parsed.remove("scope") {
+            extend_unique(&mut scopes, scope.split_whitespace());
+        }
+        parameters.extend(parsed);
+    }
+    if !present {
+        return None;
+    }
+    if !scopes.is_empty() {
+        parameters.insert("scope".to_owned(), scopes.join(" "));
+    }
+    let parameters = parameters
+        .into_iter()
+        .map(|(key, value)| {
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("{key}=\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if parameters.is_empty() {
+        "Bearer".to_owned()
+    } else {
+        format!("Bearer {parameters}")
+    })
+}
+
 struct OAuthHandshakeCleanup {
     server: McpServer,
     www_authenticate: Option<String>,
@@ -410,13 +443,20 @@ impl HandshakeFailure {
         }
     }
 
-    fn authorization_challenge(&self) -> Option<&Option<String>> {
+    fn authorization_challenges<'a>(&'a self, challenges: &mut Vec<&'a Option<String>>) {
         match self {
             Self::Unauthorized {
                 www_authenticate, ..
-            } => Some(www_authenticate),
-            Self::Teardown { failure, .. } => failure.authorization_challenge(),
-            Self::Other(_) => None,
+            } => challenges.push(www_authenticate),
+            Self::Teardown {
+                failure, teardown, ..
+            } => {
+                failure.authorization_challenges(challenges);
+                if let TransportError::Unauthorized { www_authenticate } = teardown {
+                    challenges.push(www_authenticate);
+                }
+            }
+            Self::Other(_) => {}
         }
     }
 
@@ -424,24 +464,29 @@ impl HandshakeFailure {
         self,
         caller: Option<McpServer>,
         action: OAuthHandshakeAction,
+        prior_challenge: Option<&str>,
     ) -> ConnectFailure {
         let message = self.to_string();
+        let mut challenges = Vec::new();
+        self.authorization_challenges(&mut challenges);
+        let unauthorized = !challenges.is_empty();
+        let www_authenticate = merge_oauth_challenges(
+            prior_challenge
+                .into_iter()
+                .chain(challenges.into_iter().filter_map(|value| value.as_deref())),
+        );
         match self {
-            Self::Teardown { failure, retry, .. } => ConnectFailure {
+            Self::Teardown { retry, .. } => ConnectFailure {
                 message,
                 teardown_retry: retry.map(|server| *server).or(caller).map(|server| {
-                    match (
-                        oauth_resource_url(&server.config),
-                        failure.authorization_challenge(),
-                    ) {
-                        (Some(_), Some(www_authenticate)) => {
-                            ConnectTeardown::OAuth(OAuthHandshakeCleanup {
-                                server,
-                                www_authenticate: www_authenticate.clone(),
-                                action,
-                            })
-                        }
-                        _ => ConnectTeardown::Other(server),
+                    if oauth_resource_url(&server.config).is_some() && unauthorized {
+                        ConnectTeardown::OAuth(OAuthHandshakeCleanup {
+                            server,
+                            www_authenticate,
+                            action,
+                        })
+                    } else {
+                        ConnectTeardown::Other(server)
                     }
                 }),
             },
@@ -3686,10 +3731,14 @@ impl McpClientManager {
             return Ok(server);
         };
         if matches!(failure, HandshakeFailure::Teardown { .. }) {
-            return Err(failure.into_connect_failure(Some(server), OAuthHandshakeAction::Refresh));
+            return Err(failure.into_connect_failure(
+                Some(server),
+                OAuthHandshakeAction::Refresh,
+                None,
+            ));
         }
         let HandshakeFailure::Unauthorized {
-            www_authenticate,
+            mut www_authenticate,
             message,
         } = failure
         else {
@@ -3714,22 +3763,39 @@ impl McpClientManager {
                         *bearer.write().unwrap() = Some(access_token);
                         match server.fresh_recovery().await {
                             Ok(recovered) => return Ok(recovered),
-                            Err(HandshakeFailure::Unauthorized { .. }) => {
+                            Err(HandshakeFailure::Unauthorized {
+                                www_authenticate: challenge,
+                                ..
+                            }) => {
+                                www_authenticate = merge_oauth_challenges(
+                                    [www_authenticate.as_deref(), challenge.as_deref()]
+                                        .into_iter()
+                                        .flatten(),
+                                );
                                 // The freshly refreshed token was still
                                 // rejected; the grant chain is dead.
                                 let _ = oauth_rt.delete_token(name).await;
                             }
                             Err(other) => {
-                                return Err(other
-                                    .into_connect_failure(None, OAuthHandshakeAction::Authorize))
+                                return Err(other.into_connect_failure(
+                                    None,
+                                    OAuthHandshakeAction::Authorize,
+                                    www_authenticate.as_deref(),
+                                ))
                             }
                         }
                     }
                     Err(RefreshFailure::Transient(e)) => {
-                        return Err(format!(
-                            "MCP server '{name}': OAuth token refresh failed: {e}"
-                        )
-                        .into());
+                        return Err(ConnectFailure {
+                            message: format!(
+                                "MCP server '{name}': OAuth token refresh failed: {e}"
+                            ),
+                            teardown_retry: Some(ConnectTeardown::OAuth(OAuthHandshakeCleanup {
+                                server,
+                                www_authenticate,
+                                action: OAuthHandshakeAction::Refresh,
+                            })),
+                        });
                     }
                     Err(RefreshFailure::Rejected(e)) => {
                         tracing::warn!(

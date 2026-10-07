@@ -561,7 +561,15 @@ rule TokenRefreshNeeded {
         -- silently refreshing its restored token. Startup and replacement
         -- recovery share the refresh, retry, authorization, and cleanup paths.
         -- A handshake rejected after its silent refresh requests owned browser
-        -- authorization instead of repeating the grant indefinitely.
+        -- authorization instead of repeating the grant indefinitely, carrying
+        -- the replacement handshake's discovery challenge.
+        -- DELETE authorization rejection also admits OAuth cleanup ownership
+        -- after a non-auth handshake failure. Merge required scopes from both
+        -- failures and retain the latest supplied discovery metadata when
+        -- later challenges omit it.
+        -- Successful teardown does not end ownership when refresh or token
+        -- persistence fails transiently: retain the closed transport as the
+        -- recovery owner and retry through the same fenced path.
         -- Cancel active calls before retaining the old session for cleanup;
         -- cancellation does not authorize replay of those other calls.
         -- Quiesce the server-initiated HTTP stream without deleting the session,

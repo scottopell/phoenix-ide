@@ -512,6 +512,16 @@ impl McpTransport for HttpTransport {
             if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND
             {
                 self.session_id.lock().unwrap().take();
+            } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(TransportError::Unauthorized {
+                    www_authenticate: crate::oauth::select_bearer_challenge(
+                        response
+                            .headers()
+                            .get_all("www-authenticate")
+                            .iter()
+                            .filter_map(|value| value.to_str().ok()),
+                    ),
+                });
             } else {
                 return Err(TransportError::Disconnected(format!(
                     "MCP server '{}': session DELETE failed during shutdown with HTTP {}",
@@ -4430,6 +4440,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_refresh_after_successful_teardown_retries_transient_failure() {
+        for persistence_failure in [false, true] {
+            let server = TestServer::start(vec![]).await;
+            server.push_responses(vec![unauthorized(&server)]);
+            server.push_responses(handshake_responses("sess-2"));
+            install_oauth_discovery(&server, true);
+            server.route_seq(
+                "/token",
+                if persistence_failure {
+                    vec![
+                        token_response("at-2", Some("rt-2"), None),
+                        status_response(400, &[]),
+                    ]
+                } else {
+                    vec![
+                        status_response(503, &[]),
+                        status_response(503, &[]),
+                        token_response("at-2", Some("rt-2"), None),
+                    ]
+                },
+            );
+            let manager = McpClientManager::new();
+            manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+            manager
+                .oauth
+                .store()
+                .upsert_registration(&none_registration(&server.base()))
+                .await
+                .unwrap();
+            manager
+                .oauth
+                .store()
+                .upsert_token(&stored_token(
+                    &server,
+                    "at-1",
+                    Some("rt-1"),
+                    &["mcp.read"],
+                    1,
+                ))
+                .await
+                .unwrap();
+            if persistence_failure {
+                manager.set_oauth_store(Arc::new(FailingRefreshStore {
+                    inner: manager.oauth.store(),
+                    failures_remaining: std::sync::atomic::AtomicUsize::new(2),
+                    fail_lookup: std::sync::atomic::AtomicBool::new(false),
+                }));
+            }
+            manager
+                .reload_from_configs(vec![(
+                    "remote".into(),
+                    http_config(&server.url, HttpAuth::None),
+                )])
+                .await;
+            tokio::time::timeout(Duration::from_secs(15), manager.await_background_tasks())
+                .await
+                .unwrap();
+            assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+            assert!(pending_auth_url(&manager).await.is_none());
+            assert_eq!(
+                server.recorded_for_path("/token").len(),
+                if persistence_failure { 1 } else { 3 }
+            );
+            assert_eq!(
+                manager
+                    .oauth
+                    .store()
+                    .token("remote")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .refresh_token
+                    .as_deref(),
+                Some("rt-2")
+            );
+            server.push_responses(vec![delete_ack()]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_non_auth_failure_with_delete_401_uses_cleanup_challenge() {
+        let server = TestServer::start(vec![]).await;
+        let challenge = format!(
+            "Bearer resource_metadata=\"{}/cleanup-metadata\", scope=\"mcp.cleanup\"",
+            server.base()
+        );
+        let mut initial = handshake_responses("sess-1");
+        initial[2] = status_response(500, &[]);
+        server.push_responses(initial);
+        server.push_responses(vec![status_response(
+            401,
+            &[
+                ("www-authenticate", "Basic realm=\"legacy\""),
+                ("www-authenticate", &challenge),
+            ],
+        )]);
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-2"));
+        install_oauth_discovery(&server, true);
+        server.route("/cleanup-metadata", json_doc(&serde_json::json!({"resource":server.url, "authorization_servers":[server.base()], "scopes_supported":["mcp.cleanup"]})));
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        let manager = McpClientManager::new();
+        manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&none_registration(&server.base()))
+            .await
+            .unwrap();
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-1",
+                Some("rt-1"),
+                &["mcp.read"],
+                1,
+            ))
+            .await
+            .unwrap();
+        manager
+            .reload_from_configs(vec![(
+                "remote".into(),
+                http_config(&server.url, HttpAuth::None),
+            )])
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+            .await
+            .unwrap();
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+        assert!(!server.recorded_for_path("/cleanup-metadata").is_empty());
+        let deletes: Vec<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.http_method() == "DELETE")
+            .map(|request| request.header("authorization").map(str::to_owned))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![Some("Bearer at-1".into()), Some("Bearer at-2".into())]
+        );
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn handshake_and_delete_challenges_survive_refresh_rejection() {
+        for transient in [false, true] {
+            let server = TestServer::start(vec![]).await;
+            let challenge = format!(
+                "Bearer resource_metadata=\"{}/primary-metadata\", scope=\"mcp.write\"",
+                server.base()
+            );
+            let mut initial = handshake_responses("sess-1");
+            initial[2] = status_response(401, &[("www-authenticate", &challenge)]);
+            server.push_responses(initial);
+            server.push_responses(vec![status_response(
+                401,
+                &[("www-authenticate", "Bearer scope=\"mcp.cleanup\"")],
+            )]);
+            install_oauth_discovery(&server, true);
+            server.route(
+                "/.well-known/oauth-protected-resource/mcp",
+                status_response(404, &[]),
+            );
+            server.route("/primary-metadata", json_doc(&serde_json::json!({"resource":server.url,"authorization_servers":[server.base()],"scopes_supported":["mcp.read"]})));
+            let mut rejected = json_doc(&serde_json::json!({"error":"invalid_grant"}));
+            rejected.status = 400;
+            server.route_seq(
+                "/token",
+                if transient {
+                    vec![status_response(503, &[]), rejected]
+                } else {
+                    vec![rejected]
+                },
+            );
+            let manager = McpClientManager::new();
+            manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+            manager
+                .oauth
+                .store()
+                .upsert_registration(&none_registration(&server.base()))
+                .await
+                .unwrap();
+            manager
+                .oauth
+                .store()
+                .upsert_token(&stored_token(
+                    &server,
+                    "at-1",
+                    Some("rt-1"),
+                    &["mcp.read"],
+                    1,
+                ))
+                .await
+                .unwrap();
+            manager
+                .reload_from_configs(vec![(
+                    "remote".into(),
+                    http_config(&server.url, HttpAuth::None),
+                )])
+                .await;
+            tokio::time::timeout(Duration::from_secs(15), manager.await_background_tasks())
+                .await
+                .unwrap();
+            assert_eq!(
+                manager.status().await[0].state,
+                crate::McpConnState::Unauthorized
+            );
+            let params = query_params(&pending_auth_url(&manager).await.unwrap());
+            assert_eq!(
+                params["scope"]
+                    .split_whitespace()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["mcp.read", "mcp.write", "mcp.cleanup"]
+                    .into_iter()
+                    .collect()
+            );
+            assert!(!server.recorded_for_path("/primary-metadata").is_empty());
+            server.push_responses(vec![delete_ack()]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn startup_tools_list_401_and_failed_delete_refresh_silently() {
         for transient in [false, true] {
             let server = TestServer::start(vec![]).await;
@@ -4512,11 +4751,24 @@ mod tests {
     #[tokio::test]
     async fn refreshed_handshake_cleanup_preserves_auth_cause_without_repeating_grant() {
         let server = TestServer::start(vec![]).await;
-        server.push_responses(vec![unauthorized(&server)]);
+        let challenge = format!(
+            "Bearer resource_metadata=\"{}/original-metadata\", scope=\"mcp.original\"",
+            server.base()
+        );
+        server.push_responses(vec![status_response(
+            401,
+            &[("www-authenticate", &challenge)],
+        )]);
+        server.route("/original-metadata", json_doc(&serde_json::json!({"resource":server.url,"authorization_servers":[server.base()],"scopes_supported":["mcp.read"]})));
         let mut replacement = handshake_responses("sess-2");
-        replacement[2] = unauthorized(&server);
+        replacement[2] =
+            status_response(401, &[("www-authenticate", "Bearer scope=\"mcp.extra\"")]);
         server.push_responses(replacement);
         install_oauth_discovery(&server, true);
+        server.route(
+            "/.well-known/oauth-protected-resource/mcp",
+            status_response(404, &[]),
+        );
         server.route("/token", token_response("at-2", Some("rt-2"), None));
         *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-3".into());
         let manager = Arc::new(McpClientManager::new());
@@ -4554,6 +4806,14 @@ mod tests {
         );
         assert_eq!(server.recorded_for_path("/token").len(), 1);
         let params = query_params(&pending_auth_url(&manager).await.unwrap());
+        assert_eq!(
+            params["scope"]
+                .split_whitespace()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["mcp.read", "mcp.original", "mcp.extra"]
+                .into_iter()
+                .collect()
+        );
         server.route("/token", token_response("at-3", Some("rt-3"), None));
         server.push_responses(vec![delete_ack()]);
         server.push_responses(handshake_responses("sess-3"));
@@ -4585,19 +4845,41 @@ mod tests {
     async fn refreshed_handshake_with_successful_teardown_does_not_repeat_grant() {
         for session_on_replacement in [false, true] {
             let server = TestServer::start(vec![]).await;
-            let mut initial = handshake_responses("sess-1");
-            initial[2] = unauthorized(&server);
-            server.push_responses(initial);
-            server.push_responses(vec![delete_ack()]);
+            let initial_challenge = format!(
+                "Bearer resource_metadata=\"{}/original-metadata\", scope=\"mcp.original\"",
+                server.base()
+            );
+            server.push_responses(vec![status_response(
+                401,
+                &[("www-authenticate", &initial_challenge)],
+            )]);
+            server.route("/original-metadata", json_doc(&serde_json::json!({"resource":server.url,"authorization_servers":[server.base()],"scopes_supported":["mcp.read"]})));
+            let challenge = format!(
+                "Bearer resource_metadata=\"{}/replacement-metadata\", scope=\"mcp.extra\"",
+                server.base()
+            );
+            server.route("/replacement-metadata", json_doc(&serde_json::json!({"resource":server.url, "authorization_servers":[server.base()], "scopes_supported":["mcp.read"]})));
+            let challenge = if session_on_replacement {
+                challenge
+            } else {
+                "Bearer scope=\"mcp.extra\"".to_owned()
+            };
             if session_on_replacement {
                 let mut replacement = handshake_responses("sess-2");
-                replacement[2] = unauthorized(&server);
+                replacement[2] = status_response(401, &[("www-authenticate", &challenge)]);
                 server.push_responses(replacement);
                 server.push_responses(vec![delete_ack()]);
             } else {
-                server.push_responses(vec![unauthorized(&server)]);
+                server.push_responses(vec![status_response(
+                    401,
+                    &[("www-authenticate", &challenge)],
+                )]);
             }
             install_oauth_discovery(&server, true);
+            server.route(
+                "/.well-known/oauth-protected-resource/mcp",
+                status_response(404, &[]),
+            );
             server.route("/token", token_response("at-2", Some("rt-2"), None));
             *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-2".into());
             let manager = Arc::new(McpClientManager::new());
@@ -4639,7 +4921,9 @@ mod tests {
                 params["scope"]
                     .split_whitespace()
                     .collect::<std::collections::BTreeSet<_>>(),
-                ["mcp.read", "mcp.write"].into_iter().collect()
+                ["mcp.read", "mcp.write", "mcp.extra", "mcp.original"]
+                    .into_iter()
+                    .collect()
             );
             server.route("/token", token_response("at-3", Some("rt-3"), None));
             server.push_responses(handshake_responses("sess-3"));
