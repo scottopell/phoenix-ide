@@ -566,6 +566,14 @@ pub fn create_router(state: AppState) -> Router {
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
+        .route(
+            "/api/federation/enrollments",
+            post(super::federation::issue_enrollment),
+        )
+        .route(
+            "/api/federation/enrollments/:caller_instance_id/revoke",
+            post(super::federation::revoke_enrollment),
+        )
         // Codex / ChatGPT OAuth login (task 27104). PKCE+loopback and OpenAI's
         // custom device-code flow, both writing Phoenix's own
         // ~/.phoenix-ide/codex-auth.json (NOT Codex CLI's ~/.codex/auth.json —
@@ -17962,6 +17970,123 @@ mod wake_handler_tests {
             )
             .await
             .expect("router response")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One request journey proves owner, peer, replacement, and revocation boundaries.
+    async fn federation_enrollment_requires_owner_and_replaces_peer_credential() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        state.password = Some("owner-password".to_string());
+        let caller = phoenix_core::domain::instance_identity::InstanceId::new();
+        let request_body = serde_json::json!({
+            "caller_instance_id": caller,
+            "caller_display_name": "peer"
+        })
+        .to_string();
+
+        let first = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/enrollments")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer owner-password")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_bundle: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let first_token = first_bundle["token"].as_str().unwrap();
+
+        let forbidden = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/enrollments")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {first_token}"),
+                    )
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::UNAUTHORIZED);
+
+        let second = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/enrollments")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer owner-password")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_bundle: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        let second_token = second_bundle["token"].as_str().unwrap();
+        assert_ne!(first_token, second_token);
+
+        assert_eq!(
+            state
+                .db
+                .authenticate_federation_verifier(
+                    &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                        second_token.as_bytes(),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .caller_instance_id,
+            caller
+        );
+
+        let revoke = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/federation/enrollments/{caller}/revoke"))
+                    .header(axum::http::header::AUTHORIZATION, "Bearer owner-password")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::OK);
+
+        assert!(state
+            .db
+            .authenticate_federation_verifier(
+                &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    first_token.as_bytes(),
+                ),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .db
+            .authenticate_federation_verifier(
+                &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    second_token.as_bytes(),
+                ),
+            )
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

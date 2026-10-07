@@ -9,6 +9,7 @@ use phoenix_core::domain::tool_result_identity::{
 mod close_foundation;
 mod coordinator_query;
 mod coordinator_watches;
+mod federation_enrollment;
 pub use coordinator_watches::{PendingWatchEvent, WatchSnapshot};
 mod ddl;
 mod git_repository_reconciliation;
@@ -18286,6 +18287,16 @@ mod tests {
         .await
         .unwrap();
 
+        db.replace_federation_enrollment(
+            InstanceId::new(),
+            "peer",
+            &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                b"peer-secret",
+            ),
+        )
+        .await
+        .unwrap();
+
         for sql in [
             "SELECT token FROM auth_sessions",
             "SELECT password_fingerprint FROM auth_sessions",
@@ -18295,6 +18306,8 @@ mod tests {
             "SELECT client_secret FROM mcp_oauth_registrations",
             "SELECT access_token FROM mcp_oauth_tokens",
             "SELECT refresh_token FROM mcp_oauth_tokens",
+            "SELECT credential_verifier FROM federation_enrollments",
+            "SELECT * FROM federation_enrollments",
             "SELECT aliased_token FROM auth_session_view",
             "SELECT (SELECT token FROM auth_sessions) AS nested_token",
         ] {
@@ -18312,6 +18325,7 @@ mod tests {
             "SELECT id, conversation_id, created_at FROM share_tokens",
             "SELECT auth_server, client_id, token_endpoint_auth_method FROM mcp_oauth_registrations",
             "SELECT server_name, resource_uri, scopes, expires_at FROM mcp_oauth_tokens",
+            "SELECT id, caller_instance_id, caller_display_name, created_at_us, revoked_at_us FROM federation_enrollments",
         ] {
             assert!(!db.coordinator_query(sql).await.unwrap().rows.is_empty(), "{sql}");
         }

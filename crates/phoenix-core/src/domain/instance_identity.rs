@@ -30,3 +30,42 @@ impl FromStr for InstanceId {
         uuid::Uuid::parse_str(value).map(Self)
     }
 }
+
+impl serde::Serialize for InstanceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InstanceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationCredentialVerifier([u8; 32]);
+
+impl FederationCredentialVerifier {
+    #[must_use]
+    pub fn from_bearer(bearer: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(Sha256::digest(bearer).into())
+    }
+}
+
+impl fmt::Display for FederationCredentialVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}

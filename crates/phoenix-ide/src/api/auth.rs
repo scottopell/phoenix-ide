@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, FromRequestParts, State},
     http::{header, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -26,6 +26,27 @@ use serde::{Deserialize, Serialize};
 
 use super::assets::public_root_asset;
 use super::AppState;
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerAuthenticated;
+
+#[async_trait::async_trait]
+impl<S> FromRequestParts<S> for OwnerAuthenticated
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Self>()
+            .copied()
+            .ok_or(StatusCode::FORBIDDEN)
+    }
+}
 
 /// Lifetime of a minted session token. Drives both the `expires_at` persisted
 /// with the token and the `Max-Age` advertised on the `phoenix-auth` cookie, so
@@ -398,11 +419,12 @@ fn is_exempt_path(path: &str) -> bool {
 /// Axum middleware that enforces password auth when `PHOENIX_PASSWORD` is set.
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // No password configured — pass through (no auth required)
+    // No password configured — pass through as the owner channel.
     let Some(password) = &state.password else {
+        req.extensions_mut().insert(OwnerAuthenticated);
         return next.run(req).await;
     };
 
@@ -414,6 +436,7 @@ pub async fn auth_middleware(
     // Session cookie wins and is never throttled — a legitimate browser must
     // not be locked out by Bearer brute-force from the same peer IP.
     if cookie_is_valid(req.headers(), &state.sessions).await {
+        req.extensions_mut().insert(OwnerAuthenticated);
         return next.run(req).await;
     }
 
@@ -421,7 +444,10 @@ pub async fn auth_middleware(
     // login budget, so this 200/401 oracle cannot be used for unlimited guesses.
     let key = throttle_key(req.headers(), peer_from_extensions(&req));
     match check_bearer_password(&req, password, &state.login_throttle, &key) {
-        BearerCheck::Valid => next.run(req).await,
+        BearerCheck::Valid => {
+            req.extensions_mut().insert(OwnerAuthenticated);
+            next.run(req).await
+        }
         BearerCheck::LockedOut => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(
