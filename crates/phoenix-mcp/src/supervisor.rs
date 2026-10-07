@@ -22,6 +22,7 @@ pub(crate) enum SupervisorState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Snapshot {
+    pub(crate) pending_removal: bool,
     pub(crate) epoch: u64,
     pub(crate) state: SupervisorState,
     pub(crate) config: McpServerConfig,
@@ -90,6 +91,7 @@ impl SupervisorHandle {
 
     fn spawn(config: McpServerConfig, state: SupervisorState) -> Self {
         let initial = Snapshot {
+            pending_removal: false,
             epoch: 0,
             state: state.clone(),
             config,
@@ -358,6 +360,31 @@ impl SupervisorHandle {
         receive.await.ok().flatten()
     }
 
+    pub(crate) async fn defer_oauth_removal(&self) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::DeferOAuthRemoval { reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receive.await.unwrap_or(false)
+    }
+
+    pub(crate) async fn retain_configured(&self) {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::RetainConfigured { reply })
+            .await
+            .is_ok()
+        {
+            let _ = receive.await;
+        }
+    }
+
     pub(crate) async fn fail_with_teardown_retry(
         &self,
         epoch: u64,
@@ -472,6 +499,12 @@ struct QueuedCall {
 }
 
 enum Command {
+    DeferOAuthRemoval {
+        reply: oneshot::Sender<bool>,
+    },
+    RetainConfigured {
+        reply: oneshot::Sender<()>,
+    },
     DenyOAuth {
         epoch: u64,
         error: String,
@@ -609,6 +642,26 @@ impl Actor {
     #[allow(clippy::too_many_lines)]
     async fn handle(&mut self, command: Command) {
         match command {
+            Command::DeferOAuthRemoval { reply } => {
+                let deferred = matches!(self.state, SupervisorState::Recovering)
+                    && self.snapshot.pending_oauth_url.is_none()
+                    && self.teardown_retry.iter().any(|retained| {
+                        matches!(retained, RetainedTransport::OAuthRecovery { .. })
+                    });
+                if deferred {
+                    self.snapshot.pending_removal = true;
+                    self.publish_snapshot(self.snapshot.last_error.clone(), None);
+                }
+                let _ = reply.send(deferred);
+            }
+            Command::RetainConfigured { reply } => {
+                self.snapshot.pending_removal = false;
+                self.publish_snapshot(
+                    self.snapshot.last_error.clone(),
+                    self.snapshot.pending_oauth_url.clone(),
+                );
+                let _ = reply.send(());
+            }
             Command::DenyOAuth {
                 epoch,
                 error,
@@ -666,6 +719,7 @@ impl Actor {
                 let _ = reply.send(self.snapshot.clone());
             }
             Command::Reconfigure { config, reply } => {
+                self.snapshot.pending_removal = false;
                 for cancellation in self.active_calls.values() {
                     cancellation.cancel();
                 }

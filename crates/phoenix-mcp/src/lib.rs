@@ -2168,7 +2168,11 @@ impl McpClientManager {
         let Some(flow) = pending.get_mut(name) else {
             return Err("MCP OAuth flow disappeared before publication".to_string());
         };
-        flow.owner = Some(OAuthFlowOwner::Reconnect(handle.clone(), epoch));
+        flow.owner = Some(if handle.snapshot().pending_removal {
+            OAuthFlowOwner::Remove(handle.clone(), epoch)
+        } else {
+            OAuthFlowOwner::Reconnect(handle.clone(), epoch)
+        });
         Ok(())
     }
 
@@ -2930,6 +2934,16 @@ impl McpClientManager {
         }
         match outcome {
             RefreshServerOutcome::Refreshed => {
+                if handle.snapshot().pending_removal {
+                    handle.remove().await.map_err(McpToolCallError::Failed)?;
+                    self.oauth
+                        .store()
+                        .delete_token(server_name)
+                        .await
+                        .map_err(McpToolCallError::Failed)?;
+                    self.remove_current_handle(server_name, handle).await;
+                    return Ok(());
+                }
                 match Self::connect_one(
                     server_name,
                     &permit.config,
@@ -3027,6 +3041,10 @@ impl McpClientManager {
             let _mutations = gate.lock().await;
             let handle = { self.servers.read().await.get(&name).cloned() };
             if let Some(handle) = handle {
+                if handle.defer_oauth_removal().await {
+                    removed.push(name);
+                    continue;
+                }
                 let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
                 let removal = match self.oauth.store().delete_token(&name).await {
                     Ok(()) => handle.remove().await,
@@ -3083,6 +3101,7 @@ impl McpClientManager {
             }
             let (handle, is_restart) = match existing {
                 Some(handle) if handle.snapshot().config == config => {
+                    handle.retain_configured().await;
                     {
                         let mut flows = self.oauth.pending.lock().unwrap();
                         if let Some(flow) = flows.get_mut(&name) {

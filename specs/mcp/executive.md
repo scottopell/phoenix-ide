@@ -121,6 +121,9 @@ DELETE followed by refreshed DELETE and a ready replacement.
 visible failure without an endless retry, followed by explicit authorization retry.
 `unstartable_step_up_preserves_scope_union_for_explicit_retry` covers the
 equivalent scope-upgrade setup failure without losing the requested grants.
+`removal_preserves_transient_refresh_until_cleanup_or_readdition` covers removal
+between retries, removal after successful refresh, restored reconnect intent
+on re-addition, and cleanup-only authorization after the grant is rejected.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

@@ -360,6 +360,11 @@ take over transport recovery whose session cleanup failed, obtaining a bearer
 before retrying that cleanup. Reauthorization setup failure SHALL settle as
 failed and require explicit retry; only transient token-refresh failures retry
 automatically while retaining the existing grant.
+Removal requested between transient refresh attempts SHALL retain the grant
+and recovery epoch until authenticated cleanup finishes, then delete the token
+and forget the server without reconnecting. Re-adding the same configuration
+SHALL restore reconnect intent. A rejected grant during deferred removal SHALL
+transfer cleanup-only intent to the new authorization flow.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very

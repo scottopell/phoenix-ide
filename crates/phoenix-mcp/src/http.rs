@@ -3593,6 +3593,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removal_preserves_transient_refresh_until_cleanup_or_readdition() {
+        for (readd, reject_retry) in [(false, false), (true, false), (false, true)] {
+            let server = TestServer::start(handshake_responses("sess-1")).await;
+            let manager = ready_refreshable_manager(&server).await;
+            let handle = manager.servers.read().await.get("remote").unwrap().clone();
+            let mut rejected = json_doc(&serde_json::json!({"error": "invalid_grant"}));
+            rejected.status = 400;
+            server.route_seq(
+                "/token",
+                vec![
+                    status_response(503, &[]),
+                    if reject_retry {
+                        rejected
+                    } else {
+                        token_response("at-2", Some("rt-2"), None)
+                    },
+                ],
+            );
+            server.push_responses(vec![unauthorized(&server)]);
+            manager
+                .call_tool("remote", "report", serde_json::json!({}))
+                .await
+                .unwrap_err();
+            let epoch = handle.snapshot().epoch;
+            let removed = manager.reload_from_configs(vec![]).await;
+            assert_eq!(removed.removed, vec!["remote"]);
+            assert!(removed.failed.is_empty());
+            assert!(handle.snapshot().pending_removal);
+            assert_eq!(handle.snapshot().epoch, epoch);
+            assert!(manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .is_some());
+            if readd {
+                manager
+                    .reload_from_configs(vec![("remote".into(), handle.snapshot().config)])
+                    .await;
+                assert!(!handle.snapshot().pending_removal);
+            }
+            if !reject_retry {
+                server.push_responses(vec![delete_ack()]);
+            }
+            if readd {
+                server.push_responses(handshake_responses("sess-2"));
+            }
+            tokio::time::timeout(Duration::from_secs(15), manager.await_background_tasks())
+                .await
+                .unwrap();
+            if reject_retry {
+                let params = query_params(&pending_auth_url(&manager).await.unwrap());
+                assert!(matches!(
+                    manager
+                        .oauth
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .get("remote")
+                        .unwrap()
+                        .owner,
+                    Some(crate::OAuthFlowOwner::Remove(_, _))
+                ));
+                server.route("/token", token_response("at-2", Some("rt-2"), None));
+                server.push_responses(vec![delete_ack()]);
+                manager
+                    .complete_oauth_authorization(&params["state"], "code", Some(&server.base()))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(manager.servers.read().await.contains_key("remote"), readd);
+            if readd {
+                assert!(handle.snapshot().is_ready());
+                server.push_responses(vec![delete_ack()]);
+                manager.shutdown().await;
+            } else {
+                assert!(manager
+                    .oauth
+                    .store()
+                    .token("remote")
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    server
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|request| request.rpc_method() == "initialize")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn queued_removal_uses_the_bearer_recovered_by_refresh() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = ready_refreshable_manager(&server).await;

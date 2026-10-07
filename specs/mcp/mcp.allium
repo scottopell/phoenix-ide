@@ -574,6 +574,7 @@ rule TokenRefreshed {
     when: OAuthTokenRefreshed(srv)
 
     requires: srv.oauth_phase = refreshing
+    requires: not recovery_removes_server(srv)
 
     ensures: OAuthToken{server_name: srv.name}.access_token = refreshed_access_token(srv)
     ensures: OAuthToken{server_name: srv.name}.refresh_token = refreshed_refresh_token(srv)
@@ -599,6 +600,22 @@ rule TokenRefreshed {
         -- once authorized, so a normal token expiry never surfaces as a tool
         -- failure (see deferred ReAuthCallRetry). The state machine models the
         -- refresh; holding and replaying the specific request is executor-level.
+}
+
+rule RemovedServerTokenRefreshed {
+    when: OAuthTokenRefreshed(srv)
+
+    requires: srv.oauth_phase = refreshing
+    requires: recovery_removes_server(srv)
+
+    ensures: SessionDeleted(srv)
+    ensures: not exists OAuthToken{server_name: srv.name}
+    ensures: not exists srv
+
+    @guidance
+        -- Refresh and transfer the bearer before authenticated cleanup. Forget
+        -- the token and handle after cleanup succeeds, without initializing a
+        -- replacement. Cleanup failure retains ownership and the recovered bearer.
 }
 
 -- Refresh failed: discard the stale token so it cannot be reused or
@@ -825,6 +842,7 @@ rule ReloadRetriesDeniedAuthorization {
 -- deleted -- it is keyed by authorization server and may back other servers.
 rule ReloadRemovesServer {
     when: ReloadRemovedServer(srv)
+    requires: not removal_waits_for_refresh(srv)
 
     ensures: not exists OAuthToken{server_name: srv.name}
     ensures: not exists srv
@@ -841,6 +859,19 @@ rule ReloadRemovesServer {
 
 }
 
+rule ReloadDefersRemovalDuringRefresh {
+    when: ReloadRemovedServer(srv)
+    requires: removal_waits_for_refresh(srv)
+
+    ensures: srv.oauth_phase = refreshing
+
+    @guidance
+        -- Retain the grant and recovery epoch between transient refresh attempts.
+        -- Change the recovery's intent to cleanup-only. Same-config re-addition
+        -- restores reconnect intent before refresh completion. Definitive grant
+        -- rejection transfers removal intent into the pending authorization owner.
+}
+
 -- Removing a session-bearing HTTP server ends its remote session with a DELETE
 -- before the server is forgotten, so the common config-remove path does not
 -- leak the session until expiry (REQ-MCP-005). Mirrors the shutdown teardown;
@@ -850,6 +881,7 @@ rule ReloadDeletesRemovedHttpSession {
 
     requires: srv.transport = http
     requires: srv.session_id != null
+    requires: not removal_waits_for_refresh(srv)
 
     ensures: SessionDeleted(srv)
 }
@@ -954,6 +986,12 @@ invariant OneTokenPerServer {
 ------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------
+
+-- removal_waits_for_refresh(srv): Bool
+--   True when a non-callable OAuth cleanup owner is refreshing without a
+--   pending browser authorization; its grant and epoch must survive removal.
+-- recovery_removes_server(srv): Bool
+--   True when the active refresh owner has deferred removal intent.
 
 -- authorization_removes_server(srv): Bool
 --   True iff the pending authorization owns cleanup for a removed configuration,
