@@ -6273,7 +6273,7 @@ mod tests {
     fn test_awaiting_user_response_with_answer_goes_to_llm_requesting() {
         use crate::state::UserQuestion;
 
-        let request_authority = QuestionRequestAuthority::new();
+        let request_authority = phoenix_core::domain::sm_state::QuestionRequestAuthority::new();
         let request_id = request_authority.request_id().unwrap().clone();
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
@@ -6327,7 +6327,7 @@ mod tests {
     fn test_awaiting_user_response_dismisses_without_resuming_llm() {
         use crate::state::UserQuestion;
 
-        let request_authority = QuestionRequestAuthority::new();
+        let request_authority = phoenix_core::domain::sm_state::QuestionRequestAuthority::new();
         let request_id = request_authority.request_id().unwrap().clone();
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
@@ -6392,7 +6392,7 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_authority: QuestionRequestAuthority::new(),
+            request_authority: phoenix_core::domain::sm_state::QuestionRequestAuthority::new(),
         };
 
         let result = transition(
@@ -6419,7 +6419,7 @@ mod tests {
     fn test_user_message_after_question_dismissal_resumes_agent() {
         use crate::state::UserQuestion;
 
-        let request_authority = QuestionRequestAuthority::new();
+        let request_authority = phoenix_core::domain::sm_state::QuestionRequestAuthority::new();
         let request_id = request_authority.request_id().unwrap().clone();
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
