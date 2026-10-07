@@ -330,6 +330,11 @@ enum BearerCheck {
 /// routing every Bearer check through the same per-IP budget that gates
 /// `/api/auth/login`. A correct Bearer clears the counter; a wrong one records a
 /// failure; once locked out, further guesses are rejected without comparing.
+fn owner_password_matches(candidate: &str, configured: &str) -> bool {
+    !candidate.starts_with("phx_peer_")
+        && constant_time_eq(candidate.as_bytes(), configured.as_bytes())
+}
+
 fn check_bearer_password(
     req: &Request<Body>,
     password: &str,
@@ -339,16 +344,11 @@ fn check_bearer_password(
     let Some(token) = bearer_token(req) else {
         return BearerCheck::Absent;
     };
-    if token.starts_with("phx_peer_") {
-        throttle.record_failure(key);
-        return BearerCheck::Invalid;
-    }
-
     if throttle.is_locked(key) {
         return BearerCheck::LockedOut;
     }
 
-    if constant_time_eq(token.as_bytes(), password.as_bytes()) {
+    if owner_password_matches(token, password) {
         throttle.record_success(key);
         BearerCheck::Valid
     } else {
@@ -539,7 +539,7 @@ pub async fn auth_login(
             .into_response();
     }
 
-    if !constant_time_eq(body.password.as_bytes(), password.as_bytes()) {
+    if !owner_password_matches(&body.password, password) {
         state.login_throttle.record_failure(&key);
         return (
             StatusCode::UNAUTHORIZED,
@@ -780,6 +780,10 @@ mod tests {
     #[test]
     fn peer_token_namespace_never_authenticates_as_owner_password() {
         let throttle = LoginThrottle::new();
+        assert!(!owner_password_matches(
+            "phx_peer_same-secret",
+            "phx_peer_same-secret"
+        ));
         assert!(matches!(
             check_bearer_password(
                 &bearer_req("phx_peer_same-secret"),
@@ -788,6 +792,22 @@ mod tests {
                 "peer",
             ),
             BearerCheck::Invalid
+        ));
+    }
+
+    #[test]
+    fn peer_namespace_obeys_existing_lockout_before_recording_failure() {
+        let throttle = LoginThrottle::new();
+        let key = "peer";
+        for _ in 0..MAX_FAILURES {
+            assert!(matches!(
+                check_bearer_password(&bearer_req("wrong"), "owner", &throttle, key),
+                BearerCheck::Invalid
+            ));
+        }
+        assert!(matches!(
+            check_bearer_password(&bearer_req("phx_peer_token"), "owner", &throttle, key),
+            BearerCheck::LockedOut
         ));
     }
 

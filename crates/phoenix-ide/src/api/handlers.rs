@@ -17973,6 +17973,30 @@ mod wake_handler_tests {
     }
 
     #[tokio::test]
+    async fn peer_namespace_cannot_login_as_owner_via_json() {
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        state.password = Some("phx_peer_same-secret".to_string());
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        45123,
+                    ))))
+                    .body(Body::from(r#"{"password":"phx_peer_same-secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)] // One request journey proves owner, peer, replacement, and revocation boundaries.
     async fn federation_enrollment_requires_owner_and_replaces_peer_credential() {
         use axum::body::to_bytes;

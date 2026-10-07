@@ -59,6 +59,7 @@ impl Database {
             caller_display_name,
             credential_verifier,
             EnrollmentCommit::Normal,
+            None,
         )
         .await
     }
@@ -69,9 +70,19 @@ impl Database {
         caller_display_name: &str,
         credential_verifier: &FederationCredentialVerifier,
         commit: EnrollmentCommit,
+        observed_clock_us: Option<i64>,
     ) -> DbResult<FederationEnrollment> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = Utc::now().timestamp_micros();
+        let previous_created_at: Option<i64> = sqlx::query_scalar(
+            "SELECT created_at_us FROM federation_enrollments
+             WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
+        )
+        .bind(caller_instance_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let now = observed_clock_us
+            .unwrap_or_else(|| Utc::now().timestamp_micros())
+            .max(previous_created_at.unwrap_or(0));
         sqlx::query(
             "UPDATE federation_enrollments SET revoked_at_us = ?2
              WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
@@ -129,8 +140,26 @@ impl Database {
         &self,
         caller_instance_id: InstanceId,
     ) -> DbResult<bool> {
+        self.revoke_federation_enrollment_at(caller_instance_id, None)
+            .await
+    }
+
+    async fn revoke_federation_enrollment_at(
+        &self,
+        caller_instance_id: InstanceId,
+        observed_clock_us: Option<i64>,
+    ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = Utc::now().timestamp_micros();
+        let previous_created_at: Option<i64> = sqlx::query_scalar(
+            "SELECT created_at_us FROM federation_enrollments
+             WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
+        )
+        .bind(caller_instance_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let now = observed_clock_us
+            .unwrap_or_else(|| Utc::now().timestamp_micros())
+            .max(previous_created_at.unwrap_or(0));
         let result = sqlx::query(
             "UPDATE federation_enrollments SET revoked_at_us = ?2
              WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
@@ -206,6 +235,7 @@ mod tests {
                 "peer",
                 &verifier,
                 EnrollmentCommit::CommittedAckLost,
+                None,
             )
             .await
             .unwrap();
@@ -279,6 +309,64 @@ mod tests {
                 .caller_instance_id,
             first_caller
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_survives_clock_rollback() {
+        let db = test_db().await;
+        let caller = InstanceId::new();
+        let first = FederationCredentialVerifier::from_bearer(b"first");
+        let second = FederationCredentialVerifier::from_bearer(b"second");
+        db.replace_federation_enrollment_with_commit(
+            caller,
+            "peer",
+            &first,
+            EnrollmentCommit::Normal,
+            Some(100),
+        )
+        .await
+        .unwrap();
+
+        db.replace_federation_enrollment_with_commit(
+            caller,
+            "peer",
+            &second,
+            EnrollmentCommit::Normal,
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .authenticate_federation_verifier(&second)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn revocation_survives_clock_rollback() {
+        let db = test_db().await;
+        let caller = InstanceId::new();
+        let verifier = FederationCredentialVerifier::from_bearer(b"bearer");
+        db.replace_federation_enrollment_with_commit(
+            caller,
+            "peer",
+            &verifier,
+            EnrollmentCommit::Normal,
+            Some(100),
+        )
+        .await
+        .unwrap();
+
+        assert!(db
+            .revoke_federation_enrollment_at(caller, Some(1))
+            .await
+            .unwrap());
+        assert!(db
+            .authenticate_federation_verifier(&verifier)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
