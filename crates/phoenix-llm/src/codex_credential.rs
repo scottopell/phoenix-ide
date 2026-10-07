@@ -335,8 +335,8 @@ pub(crate) struct AccountBoundCodexCredential {
 
 impl AccountBoundCodexCredential {
     #[must_use]
-    pub(crate) fn new(source: Arc<CodexCredential>, account_id: String) -> Self {
-        Self { source, account_id }
+    pub(crate) fn new(source: Arc<CodexCredential>, account_id: String) -> Option<Self> {
+        (!account_id.trim().is_empty()).then_some(Self { source, account_id })
     }
 
     #[must_use]
@@ -746,7 +746,7 @@ mod tests {
         )
         .unwrap();
         let (credential, account_id) = CodexCredential::load(path.clone()).unwrap();
-        let bound = AccountBoundCodexCredential::new(credential, account_id.unwrap());
+        let bound = AccountBoundCodexCredential::new(credential, account_id.unwrap()).unwrap();
         assert_eq!(bound.get().await.as_deref(), Some(first_jwt.as_str()));
 
         let second_jwt = fake_jwt(now_unix() + 7200);

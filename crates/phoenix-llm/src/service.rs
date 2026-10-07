@@ -847,10 +847,9 @@ mod tests {
             )
             .unwrap();
             let (credential, account_id) = crate::CodexCredential::load(path).unwrap();
-            let bound = Arc::new(AccountBoundCodexCredential::new(
-                credential,
-                account_id.unwrap(),
-            ));
+            let bound = Arc::new(
+                AccountBoundCodexCredential::new(credential, account_id.unwrap()).unwrap(),
+            );
             let spec = all_models()
                 .into_iter()
                 .find(|spec| spec.id == "gpt-6-astra")
@@ -897,10 +896,8 @@ mod tests {
         )
         .unwrap();
         let (credential, account_id) = crate::CodexCredential::load(path).unwrap();
-        let bound = Arc::new(AccountBoundCodexCredential::new(
-            credential,
-            account_id.unwrap(),
-        ));
+        let bound =
+            Arc::new(AccountBoundCodexCredential::new(credential, account_id.unwrap()).unwrap());
         let mut spec = all_models()
             .into_iter()
             .find(|spec| spec.id == "gpt-6-astra")
