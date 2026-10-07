@@ -104,7 +104,8 @@ refresh or scope step-up preparation.
 during token refresh. `slow_connection_does_not_block_another_servers_oauth_refresh`
 verifies that one blocked handshake does not serialize another server's recovery.
 `removed_oauth_owner_is_forgotten_after_denial_cleanup_succeeds` covers denial
-with successful and failed removal cleanup.
+with successful and failed removal cleanup, including re-authorization after
+re-adding a denied removal while DELETE still requires a fresh bearer.
 `readding_removed_owner_reconnects_after_callback_token_delete_failure` covers
 re-addition after a token-store deletion error.
 `oauth_claim_quiesces_http_stream_without_deleting_the_session` verifies that
@@ -112,6 +113,9 @@ retained sessions stop their server-initiated stream before credential recovery.
 `denied_step_up_can_reauthorize_on_unchanged_reload` covers a denied scope
 upgrade, preserved scopes on explicit reload, stale callback rejection, and
 authenticated cleanup before replacement publication.
+`oauth_refresh_persistence_retry_does_not_repeat_rotating_grant` covers repeated
+store-write failures after rotation, one grant exchange, and fresh authenticated
+cleanup after the response is persisted.
 `oauth_quiescence_failure_settles_failed_and_retains_cleanup` covers a visible
 failed state and retained teardown ownership when stream quiescence fails.
 `oauth_failure_takes_over_failed_transport_cleanup_from_same_epoch` covers

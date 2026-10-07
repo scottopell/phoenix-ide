@@ -1069,6 +1069,7 @@ struct OAuthRuntime {
     #[cfg(test)]
     pending_publications: tokio::sync::watch::Sender<u64>,
     pending: std::sync::Mutex<HashMap<String, PendingAuthFlow>>,
+    unpersisted_refresh_tokens: std::sync::Mutex<HashMap<String, OAuthTokenRecord>>,
     /// Loopback callback listeners, keyed by server name. A server whose
     /// pre-registered OAuth app only allows a fixed `http://localhost:<port>/callback`
     /// redirect (it cannot register Phoenix's own callback route) gets a listener
@@ -1089,6 +1090,7 @@ impl Default for OAuthRuntime {
             #[cfg(test)]
             pending_publications: tokio::sync::watch::channel(0).0,
             pending: std::sync::Mutex::new(HashMap::new()),
+            unpersisted_refresh_tokens: std::sync::Mutex::new(HashMap::new()),
             loopback_listeners: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -1106,6 +1108,27 @@ impl OAuthRuntime {
 
     fn store(&self) -> Arc<dyn OAuthStore> {
         Arc::clone(&self.store.read().unwrap())
+    }
+
+    async fn delete_token(&self, name: &str) -> Result<(), String> {
+        self.unpersisted_refresh_tokens.lock().unwrap().remove(name);
+        self.store().delete_token(name).await
+    }
+
+    async fn persist_refreshed_token(
+        &self,
+        record: OAuthTokenRecord,
+    ) -> Result<String, RefreshFailure> {
+        self.store()
+            .upsert_token(&record)
+            .await
+            .map_err(RefreshFailure::Transient)?;
+        self.unpersisted_refresh_tokens
+            .lock()
+            .unwrap()
+            .remove(&record.server_name);
+        tracing::info!(server = %record.server_name, "Refreshed MCP OAuth access token");
+        Ok(record.access_token)
     }
 
     /// The redirect-unreachable diagnostic, when one applies (REQ-MCP-020).
@@ -1195,6 +1218,15 @@ async fn oauth_refresh(
     www_authenticate: Option<&str>,
     token: &OAuthTokenRecord,
 ) -> Result<String, RefreshFailure> {
+    let unpersisted = oauth_rt
+        .unpersisted_refresh_tokens
+        .lock()
+        .unwrap()
+        .get(name)
+        .cloned();
+    if let Some(record) = unpersisted {
+        return oauth_rt.persist_refreshed_token(record).await;
+    }
     let Some(refresh_token) = token.refresh_token.clone() else {
         return Err(RefreshFailure::Rejected(
             "stored token has no refresh token".to_string(),
@@ -1246,12 +1278,11 @@ async fn oauth_refresh(
         expires_at: response.expires_at,
     };
     oauth_rt
-        .store()
-        .upsert_token(&record)
-        .await
-        .map_err(RefreshFailure::Transient)?;
-    tracing::info!(server = %name, "Refreshed MCP OAuth access token");
-    Ok(response.access_token)
+        .unpersisted_refresh_tokens
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), record.clone());
+    oauth_rt.persist_refreshed_token(record).await
 }
 
 /// Resolve the OAuth client identity for an authorization server (REQ-MCP-010):
@@ -1838,7 +1869,7 @@ impl McpClientManager {
                 server = %name,
                 "Reload repointed, de-OAuthed, re-keyed, or changed configured scopes; discarding its stored token"
             );
-            if let Err(e) = self.oauth.store().delete_token(name).await {
+            if let Err(e) = self.oauth.delete_token(name).await {
                 tracing::warn!(server = %name, "Failed to delete invalidated OAuth token: {e}");
             }
         }
@@ -1967,7 +1998,7 @@ impl McpClientManager {
                         "MCP server '{name}': removal authorization was superseded"
                     ));
                 }
-                self.oauth.store().delete_token(&name).await?;
+                self.oauth.delete_token(&name).await?;
                 self.remove_current_handle(&name, &handle).await;
                 return Ok(name);
             }
@@ -2090,7 +2121,7 @@ impl McpClientManager {
             }
             Some(OAuthFlowOwner::Remove(handle, epoch)) if handle.snapshot().epoch == epoch => {
                 match handle.remove().await {
-                    Ok(()) => match self.oauth.store().delete_token(&name).await {
+                    Ok(()) => match self.oauth.delete_token(&name).await {
                         Ok(()) => self.remove_current_handle(&name, &handle).await,
                         Err(error) => {
                             tracing::warn!(server = %name, %error, "OAuth denial removal token cleanup failed");
@@ -2098,6 +2129,13 @@ impl McpClientManager {
                     },
                     Err(error) => {
                         tracing::warn!(server = %name, %error, "OAuth denial removal session cleanup failed");
+                        handle
+                            .deny_oauth(
+                                handle.snapshot().epoch,
+                                format!("authorization failed: {error}"),
+                                plan,
+                            )
+                            .await;
                     }
                 }
             }
@@ -2230,7 +2268,7 @@ impl McpClientManager {
             server = %name,
             "OAuth refresh rejected ({reason}); discarding token and re-prompting"
         );
-        if let Err(e) = self.oauth.store().delete_token(name).await {
+        if let Err(e) = self.oauth.delete_token(name).await {
             tracing::warn!(server = %name, "Failed to delete rejected OAuth token: {e}");
         }
         match begin_oauth_flow(
@@ -2318,7 +2356,7 @@ impl McpClientManager {
         if let Some(scopes) = challenge.get("scope") {
             extend_unique(&mut prior_scopes, scopes.split_whitespace());
         }
-        if let Err(e) = self.oauth.store().delete_token(name).await {
+        if let Err(e) = self.oauth.delete_token(name).await {
             tracing::warn!(server = %name, "Failed to delete narrow OAuth token: {e}");
         }
         match begin_oauth_flow(
@@ -2995,7 +3033,6 @@ impl McpClientManager {
                 if matches!(handle.snapshot().recovery_target, RecoveryTarget::Remove) {
                     handle.remove().await.map_err(McpToolCallError::Failed)?;
                     self.oauth
-                        .store()
                         .delete_token(server_name)
                         .await
                         .map_err(McpToolCallError::Failed)?;
@@ -3098,7 +3135,7 @@ impl McpClientManager {
                     continue;
                 }
                 let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
-                let removal = match self.oauth.store().delete_token(&name).await {
+                let removal = match self.oauth.delete_token(&name).await {
                     Ok(()) => handle.remove().await,
                     Err(error) => Err(error),
                 };
@@ -3374,7 +3411,7 @@ impl McpClientManager {
                         server = %name,
                         "Config no longer selects OAuth; discarding the stored token"
                     );
-                    if let Err(e) = oauth_rt.store().delete_token(name).await {
+                    if let Err(e) = oauth_rt.delete_token(name).await {
                         tracing::warn!(server = %name, "Failed to delete stale OAuth token: {e}");
                     }
                 }
@@ -3394,13 +3431,13 @@ impl McpClientManager {
                             server = %name,
                             "Stored OAuth token is bound to a different resource; discarding"
                         );
-                        let _ = oauth_rt.store().delete_token(name).await;
+                        let _ = oauth_rt.delete_token(name).await;
                     } else if token.is_expired() && token.refresh_token.is_none() {
                         tracing::info!(
                             server = %name,
                             "Stored OAuth token is expired with no refresh token; discarding"
                         );
-                        let _ = oauth_rt.store().delete_token(name).await;
+                        let _ = oauth_rt.delete_token(name).await;
                     } else {
                         // Silent restore: the bearer rides the first
                         // initialize. An expired-but-refreshable token rides
@@ -3454,7 +3491,7 @@ impl McpClientManager {
                             Err(HandshakeFailure::Unauthorized { .. }) => {
                                 // The freshly refreshed token was still
                                 // rejected; the grant chain is dead.
-                                let _ = oauth_rt.store().delete_token(name).await;
+                                let _ = oauth_rt.delete_token(name).await;
                             }
                             Err(other) => return Err(other.into_connect_failure(None)),
                         }
@@ -3470,14 +3507,14 @@ impl McpClientManager {
                             server = %name,
                             "OAuth refresh rejected ({e}); discarding token and re-prompting"
                         );
-                        let _ = oauth_rt.store().delete_token(name).await;
+                        let _ = oauth_rt.delete_token(name).await;
                     }
                 }
             } else {
                 // An unexpired stored token was rejected and cannot be
                 // refreshed: discard it before re-prompting so a stale
                 // credential never coexists with the fresh one.
-                let _ = oauth_rt.store().delete_token(name).await;
+                let _ = oauth_rt.delete_token(name).await;
             }
         }
 

@@ -302,6 +302,9 @@ rule RemovedServerAuthorizationDenied {
         -- Retry session cleanup without reconnecting. Successful cleanup and
         -- token deletion forget the server; either failure retains non-callable
         -- ownership for a later removal or same-config re-addition to retry.
+        -- Failed session cleanup retains the denied flow's scopes and discovery
+        -- challenge on its OAuth owner. Same-config re-addition requests fresh
+        -- authorization before retrying deletion with recovered credentials.
 }
 
 ------------------------------------------------------------
@@ -558,6 +561,10 @@ rule TokenRefreshNeeded {
         -- so retained ownership does not keep reconnecting with stale credentials.
         -- A transient refresh failure retains the token and cleanup ownership
         -- while the same epoch retries; it does not discard the session.
+        -- Once a refresh grant succeeds, retain its response until persistence
+        -- succeeds. Store failures retry that write instead of repeating the
+        -- grant with the replaced refresh token. Token invalidation discards
+        -- this unpersisted response under the same per-server mutation fence.
         -- Reauthorization setup errors settle as failed with explicit retry
         -- ownership; only token-refresh transport failures retry automatically.
         -- Token persistence, invalidation, and re-prompt publication share the

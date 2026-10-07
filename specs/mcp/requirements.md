@@ -330,7 +330,9 @@ still matches the server's configured URI; a changed URL (or authorization
 server), or a fully dead token (expired with no refresh token), discards the
 stored token instead of sending it to the new endpoint
 AND, on expiry or a post-authorization 401, refresh using the refresh token,
-persisting any rotated refresh token the server returns
+persisting any rotated refresh token the server returns; a successful grant
+whose local store write fails SHALL retain its response and retry persistence
+without repeating the grant with the replaced refresh token
 AND, when refresh fails, discard the stored token and return the server to an
 unauthorized state requiring a new authorization
 AND, when a tool call returns HTTP 403 `insufficient_scope` with a
@@ -349,11 +351,12 @@ A recovered bearer SHALL reach the retained session before configuration
 supersession can discard its stored token or retry cleanup with old credentials.
 Authorization retained solely to finish removal SHALL complete cleanup and
 forget the removed server and token without republishing its tools.
-A denied reconnect authorization SHALL clear its pending URL and settle as
+A denied authorization SHALL clear its pending URL and settle as
 failed while retaining the session cleanup owner and requested scopes. An
 explicit unchanged-configuration reload SHALL request authorization again
 with those scopes and the discovery challenge before attempting authenticated
-session deletion.
+session deletion, including when denied removal cleanup failed and the server
+is re-added.
 Stream-quiescence failure SHALL settle as failed with teardown ownership
 retained, rather than remaining in recovery without an authorization URL.
 An OAuth failure from the same observed connection epoch SHALL be able to

@@ -3975,6 +3975,128 @@ mod tests {
         }
     }
 
+    struct FailingRefreshStore {
+        inner: Arc<dyn crate::OAuthStore>,
+        failures_remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::OAuthStore for FailingRefreshStore {
+        async fn registration(
+            &self,
+            issuer: &str,
+        ) -> Result<Option<OAuthRegistrationRecord>, String> {
+            self.inner.registration(issuer).await
+        }
+        async fn upsert_registration(
+            &self,
+            record: &OAuthRegistrationRecord,
+        ) -> Result<(), String> {
+            self.inner.upsert_registration(record).await
+        }
+        async fn token(&self, name: &str) -> Result<Option<OAuthTokenRecord>, String> {
+            self.inner.token(name).await
+        }
+        async fn upsert_token(&self, record: &OAuthTokenRecord) -> Result<(), String> {
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err("injected token persistence failure".into());
+            }
+            self.inner.upsert_token(record).await
+        }
+        async fn delete_token(&self, name: &str) -> Result<(), String> {
+            self.inner.delete_token(name).await
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_persistence_retry_does_not_repeat_rotating_grant() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        manager.set_oauth_store(Arc::new(FailingRefreshStore {
+            inner: manager.oauth.store(),
+            failures_remaining: std::sync::atomic::AtomicUsize::new(2),
+        }));
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        let crate::supervisor::RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await
+        else {
+            panic!("OAuth recovery owner");
+        };
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        let outcome = manager
+            .refresh_authorized_server("remote", &handle, &permit, None)
+            .await;
+        assert!(matches!(outcome, crate::RefreshServerOutcome::Transient(_)));
+        let mut rejected = json_doc(&serde_json::json!({"error": "invalid_grant"}));
+        rejected.status = 400;
+        server.route("/token", rejected);
+        let outcome = manager
+            .refresh_authorized_server("remote", &handle, &permit, None)
+            .await;
+        assert!(matches!(outcome, crate::RefreshServerOutcome::Transient(_)));
+        assert_eq!(
+            manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "at-1"
+        );
+        assert!(!server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.http_method() == "DELETE"));
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-2"));
+        let outcome = manager
+            .refresh_authorized_server("remote", &handle, &permit, None)
+            .await;
+        assert!(matches!(outcome, crate::RefreshServerOutcome::Refreshed));
+        manager
+            .finish_oauth_refresh("remote", &handle, &permit, outcome)
+            .await
+            .unwrap();
+        assert!(handle.snapshot().is_ready());
+        assert!(pending_auth_url(&manager).await.is_none());
+        let token = manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.access_token, "at-2");
+        assert_eq!(token.refresh_token.as_deref(), Some("rt-2"));
+        assert!(manager
+            .oauth
+            .unpersisted_refresh_tokens
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.request_line.starts_with("POST /token "))
+                .count(),
+            1
+        );
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
     #[tokio::test]
     async fn oauth_failure_takes_over_failed_transport_cleanup_from_same_epoch() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
@@ -4476,9 +4598,33 @@ mod tests {
                     handle.snapshot().state,
                     crate::supervisor::SupervisorState::Failed
                 ));
-                *server.routes.delete_bearer.lock().unwrap() = None;
+                let result = manager
+                    .reload_from_configs(vec![("remote".into(), permit.config)])
+                    .await;
+                assert_eq!(result.failed.len(), 1);
+                let auth_url = pending_auth_url(&manager).await.unwrap();
+                let next = query_params(&auth_url);
+                assert_ne!(next["state"], state);
+                assert!(next["scope"]
+                    .split_whitespace()
+                    .any(|scope| scope == "write"));
+                assert!(manager
+                    .complete_oauth_authorization(&state, "obsolete", Some(&server.base()))
+                    .await
+                    .is_err());
+                server.route("/token", token_response("at-2", Some("rt-2"), None));
                 server.push_responses(vec![delete_ack()]);
-                assert!(manager.reload_from_configs(vec![]).await.failed.is_empty());
+                server.push_responses(handshake_responses("sess-2"));
+                manager
+                    .complete_oauth_authorization(&next["state"], "code", Some(&server.base()))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), handle.wait_for_settled())
+                    .await
+                    .unwrap();
+                assert!(handle.snapshot().is_ready());
+                server.push_responses(vec![delete_ack()]);
+                manager.shutdown().await;
             }
         }
     }
