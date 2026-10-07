@@ -243,14 +243,10 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     };
   }, [showInfo]);
 
-  // Extract active route owner. `/c/:slug` reads directly from the store. The
-  // aggregate `/product-conversations/:id` route derives its latest transcript
-  // row from the typed snapshot so desktop work-scope/file panels stay anchored
-  // to the currently-open latest transcript without backend changes.
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const productMatch = location.pathname.match(/^\/product-conversations\/([^/?#]+)/);
   const routeSlug = slugMatch?.[1] ?? null;
-  const productConversationId = productMatch?.[1] ?? null;
+  const productConversationId = productMatch?.[1] ?? routeSlug;
   const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
   const [productSnapshotRetry, setProductSnapshotRetry] = useState(0);
   useEffect(() => {
@@ -269,7 +265,8 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     return () => { cancelled = true; };
   }, [productConversationId, productSnapshotRetry]);
   const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
-  const activeSlug = routeSlug ?? ownedProductSnapshot?.latest_transcript_row_id ?? null;
+  const exactTranscript = new URLSearchParams(location.search).get('source_transcript');
+  const activeSlug = exactTranscript ?? ownedProductSnapshot?.latest_transcript_row_id ?? routeSlug;
   const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;

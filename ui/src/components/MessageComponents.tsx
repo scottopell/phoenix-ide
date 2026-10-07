@@ -1734,7 +1734,7 @@ type WatchSnapshot = {
 function canonicalTargetLink(target: string | undefined, conversationId: string | undefined) {
   if (!conversationId) return null;
   if (target?.startsWith('@conv:')) {
-    return `/product-conversations/${encodeURIComponent(target.slice('@conv:'.length))}`;
+    return `/c/${encodeURIComponent(target.slice('@conv:'.length))}`;
   }
   const transcript = target?.startsWith('@transcript:') ? target.slice('@transcript:'.length) : conversationId;
   return transcript ? `/c/${encodeURIComponent(transcript)}` : null;
@@ -1765,7 +1765,7 @@ export function SendConversationMessageView({ response }: { response: SendConver
 function WatchLink({ watch }: { watch: WatchSnapshot }) {
   return (
     <li className="coordinator-watch-row">
-      <Link to={`/product-conversations/${encodeURIComponent(watch.product_conversation_id)}`}>{watch.display_name ?? 'Open conversation'}</Link>
+      <Link to={`/c/${encodeURIComponent(watch.product_conversation_id)}`}>{watch.display_name ?? 'Open conversation'}</Link>
       <Link to={`/c/${encodeURIComponent(watch.transcript_slug ?? watch.current_transcript_id)}`}>current transcript</Link>
       <span>{watch.current_state?.type ?? 'active'}</span>
       {watch.project_path && <code>{watch.project_path}</code>}
@@ -1780,7 +1780,7 @@ export function UnwatchResultView({ response }: { response: UnwatchOutcome }) {
   return (
     <div className="coordinator-result-card">
       <strong>{response.ended ? 'Watch ended' : 'Watch not found'}</strong>
-      <Link to={`/product-conversations/${encodeURIComponent(response.product_conversation_id)}`}>@conv:{response.product_conversation_id}</Link>
+      <Link to={`/c/${encodeURIComponent(response.product_conversation_id)}`}>@conv:{response.product_conversation_id}</Link>
     </div>
   );
 }
@@ -1807,7 +1807,7 @@ function CoordinatorEnvironment({ displayData }: { displayData: Record<string, u
   const projectPath = typeof value['project_path'] === 'string' ? value['project_path'] : null;
   if (!scope && !cwd) return null;
   const ownerIdentity = ownerName && ownerProductConversationId
-    ? <Link to={`/product-conversations/${encodeURIComponent(ownerProductConversationId)}`} title={`Owning conversation: ${ownerName}`}>{ownerName}</Link>
+    ? <Link to={`/c/${encodeURIComponent(ownerProductConversationId)}`} title={`Owning conversation: ${ownerName}`}>{ownerName}</Link>
     : ownerName ? <span title="Historical environment owner; stable conversation unavailable">{ownerName}</span> : null;
   return <div className="coordinator-environment"><strong>Environment</strong>{ownerIdentity}{projectPath && <code title={projectPath}>{projectPath}</code>}{cwd && <code title={cwd}>{cwd}</code>}{(scope || ownerProductConversationId) && <details><summary>IDs</summary>{scope && <code>{scope}</code>}{ownerProductConversationId && <code>{ownerProductConversationId}</code>}</details>}</div>;
 }

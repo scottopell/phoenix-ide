@@ -709,7 +709,7 @@ function ProductConversationHeader({
         {source?.status === 'present' && (
           <span className="product-conversation-page__source" data-testid="product-conversation-source">
             {sourceRelationLabel(source)} from{' '}
-            <a href={`/product-conversations/${encodeURIComponent(source.source_product_conversation_id)}`}>
+            <a href={`/c/${encodeURIComponent(source.source_product_conversation_id)}`}>
               source conversation
             </a>
           </span>

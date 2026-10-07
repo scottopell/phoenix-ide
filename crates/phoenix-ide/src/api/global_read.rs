@@ -619,7 +619,7 @@ async fn read_conversation_page(
 ) -> Result<String, DbError> {
     let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
-        format!("Conversation @conv:{id}\nconversation link: /product-conversations/{id}\n")
+        format!("Conversation @conv:{id}\nconversation link: /c/{id}\n")
     });
     let title = stable.as_ref().map_or_else(
         || {
@@ -665,7 +665,7 @@ async fn read_conversation_around_message(
 
     let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
-        format!("Conversation @conv:{id}\nconversation link: /product-conversations/{id}\n")
+        format!("Conversation @conv:{id}\nconversation link: /c/{id}\n")
     });
     let title = stable.as_ref().map_or_else(
         || {
@@ -1161,16 +1161,34 @@ async fn resolve_reference_impl(
     raw: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let reference = raw.trim();
+    let canonical_product = if let Some(rest) = reference.strip_prefix("/c/") {
+        let (base, fragment) = split_fragment(rest);
+        let (id, query) = base.split_once('?').unwrap_or((base, ""));
+        let parsed = reqwest::Url::parse(&format!("http://route.invalid/?{query}"))
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        let exact = parsed.query_pairs().any(|(key, _)| key == "source_transcript");
+        if fragment.is_none() && !exact {
+            match service.db.resolve_ordinary_product_conversation(id).await {
+                Ok(product) if product.product_conversation_id.as_str() == id => Some(id),
+                Ok(_) | Err(DbError::ConversationNotFound(_)) => None,
+                Err(error) => return Err(map_db_not_found(error)),
+            }
+        } else { None }
+    } else { None };
+
     if let Some(rest) = reference
         .strip_prefix("/c/")
+        .filter(|_| canonical_product.is_none())
         .or_else(|| reference.strip_prefix("/global/"))
     {
         let (slug, fragment) = split_fragment(rest);
+        let slug = slug.split_once('?').map_or(slug, |(path, _)| path);
         let conv = load_conversation_by_slug_or_id(service, slug).await?;
+        let global = reference.starts_with("/global/");
         if let Some(message_id) = fragment.and_then(message_id_fragment) {
-            return resolve_message(service, conv, message_id, true).await;
+            return resolve_message(service, conv, message_id, global).await;
         }
-        return Ok(resolve_conversation(service, conv, true).await);
+        return Ok(resolve_conversation(service, conv, global).await);
     }
     if let Some(rest) = reference
         .strip_prefix("/chains/")
@@ -1182,6 +1200,7 @@ async fn resolve_reference_impl(
     if let Some(id) = reference
         .strip_prefix("@conv:")
         .or_else(|| reference.strip_prefix("/product-conversations/"))
+        .or(canonical_product)
     {
         if id.contains('#') {
             return Err(AppError::BadRequest(
@@ -1212,7 +1231,7 @@ async fn resolve_reference_impl(
         return Ok(ResolveGlobalReferenceResponse {
             kind: "product_conversation".to_string(),
             id: typed_id.to_string(),
-            href: Some(format!("/product-conversations/{typed_id}")),
+            href: Some(format!("/c/{typed_id}")),
             title: aggregate
                 .root
                 .conversation

@@ -52,7 +52,7 @@ function GlobalActiveWatches({ onCount }: { onCount: (count: ActivityCount) => v
       {watches.map((watch) => (
         <div className="global-active-watch" key={watch.product_conversation_id}>
           <div>
-            <Link to={`/product-conversations/${watch.product_conversation_id}`}>{watch.display_name}</Link>
+            <Link to={`/c/${watch.product_conversation_id}`}>{watch.display_name}</Link>
             <span>{humanizeState(watch.state)}</span>
           </div>
           <Link to={`/c/${encodeURIComponent(watch.transcript_slug || watch.transcript_id)}`}>current transcript</Link>

@@ -100,7 +100,7 @@ function AppRoutes() {
                 <Route path="/new" element={<NewConversationPage />} />
                 <Route path="/terminal" element={<TerminalPage />} />
                 <Route path="/c/:slug" element={<ConversationRouteRedirect />} />
-                <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
+                <Route path="/product-conversations/:slug" element={<ConversationRouteRedirect />} />
                 <Route path="/chains/:rootConvId" element={<ChainRouteRedirect />} />
                 <Route path="/codex/login" element={<CodexLoginPage />} />
                 <Route path="/about" element={<AboutDeploymentPage />} />
@@ -127,6 +127,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     aggregateResolutionUnavailable: boolean;
   } | null>(null);
   const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
+  const [exactMember, setExactMember] = useState<{ reference: string; transcript: string; open: boolean } | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
 
@@ -135,6 +136,8 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       setFallbackSnapshot(null);
       return;
     }
+    setExactMember(null);
+    setResolvedProduct(null);
     let cancelled = false;
     api.resolveCoordinatorRoute(reference)
       .then(async ({ coordinator_id }) => {
@@ -148,6 +151,11 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       .then((snapshot) => {
         if (!snapshot) return;
         if (!cancelled) {
+          const pinned = new URLSearchParams(location.search).get('source_transcript');
+          if (pinned === reference) {
+            setExactMember({ reference, transcript: pinned, open: snapshot.ordinary_lifecycle === 'open' });
+            return;
+          }
           setResolvedProduct({ reference, id: snapshot.product_conversation_id });
           if (location.pathname !== snapshot.canonical_route) {
             navigate({
@@ -170,7 +178,12 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     return () => { cancelled = true; };
   }, [location.hash, location.pathname, location.search, navigate, reference, retryToken]);
 
-  if (resolvedProduct?.reference === reference && !activeFallback) {
+  if (exactMember && exactMember.reference === reference) {
+    return <EmbeddedConversationPage slug={exactMember.transcript} suppressCanonicalization routePrefix="/c"
+      aggregateLifecycleOpen={exactMember.open} mutationEnabled={exactMember.open} />;
+  }
+
+  if (resolvedProduct && resolvedProduct.reference === reference && !activeFallback) {
     return <ProductConversationPage productId={resolvedProduct.id} />;
   }
 

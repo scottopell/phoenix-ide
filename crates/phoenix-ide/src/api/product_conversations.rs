@@ -43,7 +43,7 @@ use crate::send_chat_service::accepts_user_message_direct_or_steering;
 
 const DEFAULT_MESSAGE_LIMIT: usize = 50;
 const MAX_MESSAGE_LIMIT: usize = 200;
-const PRODUCT_CONVERSATION_ROUTE_PREFIX: &str = "/product-conversations/";
+const PRODUCT_CONVERSATION_ROUTE_PREFIX: &str = "/c/";
 
 #[derive(Debug, Deserialize)]
 pub struct SnapshotQuery {

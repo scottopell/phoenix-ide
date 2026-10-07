@@ -22,6 +22,10 @@ vi.mock('./pages/ConversationPage', () => ({
   },
 }));
 
+vi.mock('./pages/ProductConversationPage', () => ({
+  ProductConversationPage: ({ productId }: { productId: string }) => <div data-testid="product-page">{productId}</div>,
+}));
+
 function Location() {
   const location = useLocation();
   return <div data-testid="location">{location.pathname}{location.search}{location.hash}</div>;
@@ -71,6 +75,27 @@ describe('ProductConversationAliasRedirect', () => {
       '/product-conversations/product-1?from=search#message-m-1',
     );
     expect(embeddedSpy).not.toHaveBeenCalled();
+  });
+
+  it('renders a bare canonical product route without redirecting to a historical row', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      latest_transcript_row_id: 'successor', requested_transcript_row_id: 'root',
+    } as never);
+    renderAlias('product-1');
+    expect(await screen.findByTestId('product-page')).toHaveTextContent('product-1');
+    expect(embeddedSpy).not.toHaveBeenCalled();
+  });
+
+  it('pins an explicit transcript source on direct load instead of rendering the latest aggregate', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      latest_transcript_row_id: 'successor', requested_transcript_row_id: 'historical',
+    } as never);
+    renderAlias('historical', '/c/historical?source_transcript=historical&source_tool=send#message-source');
+    await screen.findByTestId('embedded-fallback');
+    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'historical', suppressCanonicalization: true }));
+    expect(screen.queryByTestId('product-page')).toBeNull();
   });
 
   it('retains ordinary non-aggregate direct-route behavior after an authoritative 404', async () => {
