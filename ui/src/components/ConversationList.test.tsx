@@ -225,6 +225,39 @@ describe('ProductConversation presentation transitions', () => {
 });
 
 describe('ProductConversation row actions', () => {
+  it('does not offer empty actions for offline History or mismatched callbacks', () => {
+    const view = render(<MemoryRouter><ConversationList {...defaultProps} showArchived archivedProductConversations={[makeProductConversation('empty', { lifecycle: { state: 'history' } })]} onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} /></MemoryRouter>);
+    expect(view.queryByRole('button', { name: /^Actions for conversation/ })).toBeNull();
+  });
+
+  it('dismisses after focus leaves the menu but lets a closed trigger Escape bubble', () => {
+    const bubble = vi.fn();
+    const view = render(<MemoryRouter><div onKeyDown={bubble}><button>Outside focus</button><ConversationList {...defaultProps} productConversations={[makeProductConversation('escape')]} onProductConversationRename={vi.fn()} /></div></MemoryRouter>);
+    const trigger = view.getByRole('button', { name: 'Actions for conversation Root escape' });
+    fireEvent.click(trigger);
+    const outside = view.getByRole('button', { name: 'Outside focus' });
+    outside.focus();
+    fireEvent.keyDown(outside, { key: 'Escape' });
+    expect(trigger).toHaveFocus();
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    expect(bubble).not.toHaveBeenCalled();
+    fireEvent.keyDown(trigger, { key: 'Escape' });
+    expect(bubble).toHaveBeenCalledTimes(1);
+  });
+
+  it('restores list keyboard navigation when the expanded row disappears', () => {
+    const open = vi.fn();
+    const first = makeProductConversation('first');
+    const second = makeProductConversation('second');
+    const props = { ...defaultProps, onProductConversationClick: open, onProductConversationRename: vi.fn() };
+    const view = render(<MemoryRouter><ConversationList {...props} productConversations={[first, second]} /></MemoryRouter>);
+    fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root first' }));
+    view.rerender(<MemoryRouter><ConversationList {...props} productConversations={[second]} /></MemoryRouter>);
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(open).toHaveBeenCalledWith(second);
+  });
+
   it('dismisses the single action disclosure on Escape and outside click without opening the row', () => {
     const onOpen = vi.fn();
     const row = makeProductConversation('menu');

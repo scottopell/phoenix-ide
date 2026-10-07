@@ -222,6 +222,10 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
         handed_off_without_continuation: 'Complete the continuation handoff before closing',
       } as const)[closeAction.reason]
     : undefined;
+  const canRename = !!onProductConversationRename && row.lifecycle.state === 'open'
+    && !(closeAction?.availability === 'unavailable' && closeAction.reason === 'active_close_attempt');
+  const canDelete = !!onProductConversationDelete && row.lifecycle.state === 'history';
+  const canClose = !!onProductConversationClose && closeAction !== null;
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
@@ -254,22 +258,13 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
-      {(onProductConversationRename || onProductConversationClose || onProductConversationDelete) && (
-        <div ref={menuRef} className="conv-item-menu-container product-conversation-actions" onKeyDown={(event) => {
-          if (event.key === 'Escape') {
-            event.preventDefault();
-            event.stopPropagation();
-            onCloseMenu();
-            event.currentTarget.querySelector<HTMLButtonElement>('.conv-item-menu-btn')?.focus();
-          }
-        }}>
+      {(canRename || canDelete || canClose) && (
+        <div ref={menuRef} className="conv-item-menu-container product-conversation-actions">
           <button type="button" className="conv-item-menu-btn conv-action-btn"
             aria-label={`Actions for conversation ${displayTitle}`} aria-expanded={isMenuOpen}
             onClick={(event) => onToggleMenu(event, row.product_conversation_id)}>⋮</button>
           {isMenuOpen && <div className="conv-item-actions" aria-label={`Actions for ${displayTitle}`}>
-          {onProductConversationRename && row.lifecycle.state === 'open'
-            && !(row.lifecycle.close_action.availability === 'unavailable'
-              && row.lifecycle.close_action.reason === 'active_close_attempt') && (
+          {canRename && onProductConversationRename && (
             <button
               type="button"
               className="conv-action-btn"
@@ -280,7 +275,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               Rename
             </button>
           )}
-          {onProductConversationDelete && row.lifecycle.state === 'history' && (
+          {canDelete && onProductConversationDelete && (
             <button
               type="button"
               className="conv-action-btn danger"
@@ -717,13 +712,29 @@ export function ConversationList({
         setExpandedId(null);
       }
     };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      const trigger = menuRef.current?.querySelector<HTMLButtonElement>('.conv-item-menu-btn');
+      setExpandedId(null);
+      trigger?.focus();
+    };
     document.addEventListener('mousedown', handleMouseDown);
-    return () => document.removeEventListener('mousedown', handleMouseDown);
+    document.addEventListener('keydown', handleEscape, true);
+    return () => {
+      document.removeEventListener('mousedown', handleMouseDown);
+      document.removeEventListener('keydown', handleEscape, true);
+    };
   }, [expandedId]);
 
   const displayList = showArchived ? archivedConversations : conversations;
   const displayProductList = showArchived ? archivedProductConversations : productConversations;
   const usingProductRows = productRowsAuthoritative || displayProductList.length > 0 || productConversations.length > 0 || archivedProductConversations.length > 0;
+
+  useLayoutEffect(() => {
+    if (expandedId && !menuRef.current) setExpandedId(null);
+  }, [expandedId, displayList, displayProductList, usingProductRows, onProductConversationRename, onProductConversationClose, onProductConversationDelete]);
 
   const groupedItems: SidebarItem[] = useMemo(() => {
     const roots = computeChainRoots(displayList);
