@@ -124,6 +124,14 @@ equivalent scope-upgrade setup failure without losing the requested grants.
 `removal_preserves_transient_refresh_until_cleanup_or_readdition` covers removal
 between retries, removal after successful refresh, restored reconnect intent
 on re-addition, and cleanup-only authorization after the grant is rejected.
+`denied_authorization_retry_preserves_challenge_directed_discovery` requires a
+nonstandard metadata URI across denial and explicit reload.
+`changed_configuration_waits_for_transient_oauth_cleanup` verifies both refresh
+success and rejected-grant authorization before applying a new resource.
+`changed_configuration_replaces_pending_cleanup_authorization` covers fresh
+nonce and preserved scopes when a pending or denied flow is reconfigured.
+`replacement_handshake_reauthorization_is_owned_and_visible` verifies owned,
+visible authorization when replacement initialization rejects the refreshed grant.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

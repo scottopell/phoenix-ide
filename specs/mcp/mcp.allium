@@ -285,7 +285,8 @@ rule OAuthFlowFailed {
         -- status/UI consumers do not see a stale authorize link for a dead flow.
         -- A denied reconnect authorization retains its session cleanup owner
         -- and requested scopes. An explicit unchanged-configuration reload
-        -- reserves a new epoch and requests those scopes before session DELETE.
+        -- reserves a new epoch and requests those scopes with the preserved
+        -- discovery challenge before session DELETE.
         -- Failure to quiesce an owned stream settles the supervisor as failed,
         -- retaining teardown ownership without a pending authorization URL.
 }
@@ -590,6 +591,10 @@ rule TokenRefreshed {
         -- configuration changes. Check its epoch after acquiring the fence;
         -- any connect-side refresh, token deletion, or authorization prompt
         -- must finish before a newer configuration becomes authoritative.
+        -- Initial and replacement connections share authorization publication:
+        -- bind the pending flow to its epoch and expose unauthorized status.
+        -- A queued configuration applies only after old-resource cleanup,
+        -- invalidating the old grant before connecting the new resource.
         -- Keep the refresh fence through bearer transfer and retained-session
         -- cleanup so a queued removal cannot discard the new token while
         -- retaining a transport that still uses the old credential.
@@ -738,6 +743,7 @@ rule ReloadAddsServerWithStoredToken {
 -- initialize does not echo an old Mcp-Session-Id to the new/restarted endpoint.
 rule ReloadRestartsServer {
     when: ReloadServerConfigChanged(srv, new_auth_scheme)
+    requires: not reconfiguration_waits_for_cleanup(srv)
 
     ensures: srv.state = reconnecting
     ensures: srv.auth_scheme = new_auth_scheme
@@ -758,6 +764,7 @@ rule ReloadClearsHttpSession {
     when: ReloadServerConfigChanged(srv, new_auth_scheme)
 
     requires: srv.transport = http
+    requires: not reconfiguration_waits_for_cleanup(srv)
 
     ensures: srv.session_id = null
 }
@@ -776,6 +783,7 @@ rule ReloadInvalidatesOAuth {
     requires: srv.transport = http
     requires: srv.auth_scheme = oauth
     requires: oauth_invalidated_by_reload(srv)
+    requires: not reconfiguration_waits_for_cleanup(srv)
 
     ensures: not exists OAuthToken{server_name: srv.name}
     ensures: PendingAuthorizationCancelled(srv)
@@ -792,11 +800,23 @@ rule ReloadInvalidatesOAuth {
         -- pre-repoint flow no longer satisfies callback_state_matches.
 }
 
--- Reload reconfigured a server that is mid-authorization (awaiting_user) with
--- no token persisted yet: the pending flow targets the old config and must be
--- cancelled even though there is no token to discard, or a delayed callback
--- from the old resource could satisfy the still-current flow (REQ-MCP-011).
--- The new auth_scheme is applied by ReloadRestartsServer.
+rule ReloadDefersConfigurationForOAuthCleanup {
+    when: ReloadServerConfigChanged(srv, new_auth_scheme)
+    requires: reconfiguration_waits_for_cleanup(srv)
+
+    ensures: CleanupOwnershipRetained(srv)
+
+    @guidance
+        -- Queue the latest desired configuration with the recovery owner.
+        -- Preserve the old grant and epoch through transient refresh attempts.
+        -- If authorization is pending or denied, cancel its old nonce and
+        -- publish a new cleanup authorization with its challenge and scope union.
+        -- After authenticated cleanup, apply ReloadInvalidatesOAuth and
+        -- ReloadRestartsServer before connecting the queued configuration.
+}
+
+-- A config change cancels the pending nonce, including when a new cleanup
+-- authorization must still target the old resource (REQ-MCP-011).
 rule ReloadCancelsPendingAuth {
     when: ReloadServerConfigChanged(srv, new_auth_scheme)
 
@@ -992,6 +1012,12 @@ invariant OneTokenPerServer {
 --   pending browser authorization; its grant and epoch must survive removal.
 -- recovery_removes_server(srv): Bool
 --   True when the active refresh owner has deferred removal intent.
+-- reconfiguration_waits_for_cleanup(srv): Bool
+--   True when OAuth recovery or its explicit authorization retry still owns
+--   old-resource teardown that requires recovered credentials.
+-- CleanupOwnershipRetained(srv): Bool
+--   The non-callable old transport and its credential recovery plan remain
+--   owned until authenticated cleanup finishes.
 
 -- authorization_removes_server(srv): Bool
 --   True iff the pending authorization owns cleanup for a removed configuration,
@@ -999,7 +1025,7 @@ invariant OneTokenPerServer {
 --
 -- retry_requires_authorization(srv): Bool
 --   True when retained OAuth session cleanup owns a denied authorization's
---   requested scopes, requiring fresh authorization before session deletion.
+--   requested scopes and challenge, requiring authorization before deletion.
 --
 -- discovered_tools(srv): List<String>
 --   The tool names from the server's tools/list response (paginated).

@@ -352,7 +352,8 @@ forget the removed server and token without republishing its tools.
 A denied reconnect authorization SHALL clear its pending URL and settle as
 failed while retaining the session cleanup owner and requested scopes. An
 explicit unchanged-configuration reload SHALL request authorization again
-with those scopes before attempting authenticated session deletion.
+with those scopes and the discovery challenge before attempting authenticated
+session deletion.
 Stream-quiescence failure SHALL settle as failed with teardown ownership
 retained, rather than remaining in recovery without an authorization URL.
 An OAuth failure from the same observed connection epoch SHALL be able to
@@ -365,6 +366,13 @@ and recovery epoch until authenticated cleanup finishes, then delete the token
 and forget the server without reconnecting. Re-adding the same configuration
 SHALL restore reconnect intent. A rejected grant during deferred removal SHALL
 transfer cleanup-only intent to the new authorization flow.
+A changed configuration requested during owned OAuth cleanup SHALL queue the
+new configuration while retaining the old resource's grant and cleanup plan.
+THE SYSTEM SHALL finish authenticated cleanup before invalidating that grant
+and applying the queued configuration. Pending authorization SHALL be replaced
+with a fresh nonce while preserving the cleanup discovery challenge and scopes.
+A replacement connection that requires authorization SHALL expose its owned
+pending authorization as unauthorized, including after successful token refresh.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very

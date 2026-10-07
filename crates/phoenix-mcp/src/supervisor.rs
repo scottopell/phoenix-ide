@@ -21,8 +21,21 @@ pub(crate) enum SupervisorState {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum RecoveryTarget {
+    Configured,
+    Remove,
+    Reconfigure(McpServerConfig),
+}
+
+#[derive(Clone)]
+pub(crate) struct OAuthRetryPlan {
+    pub(crate) scopes: Vec<String>,
+    pub(crate) www_authenticate: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct Snapshot {
-    pub(crate) pending_removal: bool,
+    pub(crate) recovery_target: RecoveryTarget,
     pub(crate) epoch: u64,
     pub(crate) state: SupervisorState,
     pub(crate) config: McpServerConfig,
@@ -91,7 +104,7 @@ impl SupervisorHandle {
 
     fn spawn(config: McpServerConfig, state: SupervisorState) -> Self {
         let initial = Snapshot {
-            pending_removal: false,
+            recovery_target: RecoveryTarget::Configured,
             epoch: 0,
             state: state.clone(),
             config,
@@ -334,14 +347,14 @@ impl SupervisorHandle {
         self.fail_with_teardown_retry(epoch, error, None).await
     }
 
-    pub(crate) async fn deny_oauth(&self, epoch: u64, error: String, scopes: Vec<String>) {
+    pub(crate) async fn deny_oauth(&self, epoch: u64, error: String, plan: OAuthRetryPlan) {
         let (reply, receive) = oneshot::channel();
         if self
             .mailbox
             .send(Command::DenyOAuth {
                 epoch,
                 error,
-                scopes,
+                plan,
                 reply,
             })
             .await
@@ -351,7 +364,7 @@ impl SupervisorHandle {
         }
     }
 
-    pub(crate) async fn retry_oauth(&self) -> Option<(RecoveryPermit, Vec<String>)> {
+    pub(crate) async fn retry_oauth(&self) -> Option<(RecoveryPermit, OAuthRetryPlan)> {
         let (reply, receive) = oneshot::channel();
         self.mailbox
             .send(Command::RetryOAuth { reply })
@@ -361,10 +374,19 @@ impl SupervisorHandle {
     }
 
     pub(crate) async fn defer_oauth_removal(&self) -> bool {
+        self.defer_oauth_transition(RecoveryTarget::Remove).await
+    }
+
+    pub(crate) async fn defer_oauth_reconfigure(&self, config: McpServerConfig) -> bool {
+        self.defer_oauth_transition(RecoveryTarget::Reconfigure(config))
+            .await
+    }
+
+    async fn defer_oauth_transition(&self, target: RecoveryTarget) -> bool {
         let (reply, receive) = oneshot::channel();
         if self
             .mailbox
-            .send(Command::DeferOAuthRemoval { reply })
+            .send(Command::DeferOAuthTransition { target, reply })
             .await
             .is_err()
         {
@@ -499,7 +521,8 @@ struct QueuedCall {
 }
 
 enum Command {
-    DeferOAuthRemoval {
+    DeferOAuthTransition {
+        target: RecoveryTarget,
         reply: oneshot::Sender<bool>,
     },
     RetainConfigured {
@@ -508,11 +531,11 @@ enum Command {
     DenyOAuth {
         epoch: u64,
         error: String,
-        scopes: Vec<String>,
+        plan: OAuthRetryPlan,
         reply: oneshot::Sender<()>,
     },
     RetryOAuth {
-        reply: oneshot::Sender<Option<(RecoveryPermit, Vec<String>)>>,
+        reply: oneshot::Sender<Option<(RecoveryPermit, OAuthRetryPlan)>>,
     },
     Status {
         reply: oneshot::Sender<Snapshot>,
@@ -593,7 +616,7 @@ enum RetainedTransport {
     TransportRecovery(Arc<McpServer>),
     OAuthRecovery {
         server: Arc<McpServer>,
-        retry_scopes: Option<Vec<String>>,
+        retry_plan: Option<OAuthRetryPlan>,
     },
     Other(Arc<McpServer>),
 }
@@ -642,20 +665,42 @@ impl Actor {
     #[allow(clippy::too_many_lines)]
     async fn handle(&mut self, command: Command) {
         match command {
-            Command::DeferOAuthRemoval { reply } => {
-                let deferred = matches!(self.state, SupervisorState::Recovering)
-                    && self.snapshot.pending_oauth_url.is_none()
+            Command::DeferOAuthTransition { target, reply } => {
+                let eligible = match target {
+                    RecoveryTarget::Remove => {
+                        matches!(self.state, SupervisorState::Recovering)
+                            && self.snapshot.pending_oauth_url.is_none()
+                    }
+                    RecoveryTarget::Reconfigure(_) => {
+                        matches!(self.state, SupervisorState::Recovering)
+                            || (matches!(self.state, SupervisorState::Failed)
+                                && self.teardown_retry.iter().any(|retained| {
+                                    matches!(
+                                        retained,
+                                        RetainedTransport::OAuthRecovery {
+                                            retry_plan: Some(_),
+                                            ..
+                                        }
+                                    )
+                                }))
+                    }
+                    RecoveryTarget::Configured => false,
+                };
+                let deferred = eligible
                     && self.teardown_retry.iter().any(|retained| {
                         matches!(retained, RetainedTransport::OAuthRecovery { .. })
                     });
                 if deferred {
-                    self.snapshot.pending_removal = true;
-                    self.publish_snapshot(self.snapshot.last_error.clone(), None);
+                    self.snapshot.recovery_target = target;
+                    self.publish_snapshot(
+                        self.snapshot.last_error.clone(),
+                        self.snapshot.pending_oauth_url.clone(),
+                    );
                 }
                 let _ = reply.send(deferred);
             }
             Command::RetainConfigured { reply } => {
-                self.snapshot.pending_removal = false;
+                self.snapshot.recovery_target = RecoveryTarget::Configured;
                 self.publish_snapshot(
                     self.snapshot.last_error.clone(),
                     self.snapshot.pending_oauth_url.clone(),
@@ -665,14 +710,14 @@ impl Actor {
             Command::DenyOAuth {
                 epoch,
                 error,
-                scopes,
+                plan,
                 reply,
             } => {
                 if epoch == self.epoch {
                     let mut retained_oauth = false;
                     for retained in &mut self.teardown_retry {
-                        if let RetainedTransport::OAuthRecovery { retry_scopes, .. } = retained {
-                            *retry_scopes = Some(scopes.clone());
+                        if let RetainedTransport::OAuthRecovery { retry_plan, .. } = retained {
+                            *retry_plan = Some(plan.clone());
                             retained_oauth = true;
                         }
                     }
@@ -692,8 +737,8 @@ impl Actor {
                     self.teardown_retry
                         .iter_mut()
                         .find_map(|retained| match retained {
-                            RetainedTransport::OAuthRecovery { retry_scopes, .. } => {
-                                retry_scopes.take()
+                            RetainedTransport::OAuthRecovery { retry_plan, .. } => {
+                                retry_plan.take()
                             }
                             RetainedTransport::TransportRecovery(_)
                             | RetainedTransport::Other(_) => None,
@@ -719,7 +764,7 @@ impl Actor {
                 let _ = reply.send(self.snapshot.clone());
             }
             Command::Reconfigure { config, reply } => {
-                self.snapshot.pending_removal = false;
+                self.snapshot.recovery_target = RecoveryTarget::Configured;
                 for cancellation in self.active_calls.values() {
                     cancellation.cancel();
                 }
@@ -911,7 +956,7 @@ impl Actor {
                         if let RetainedTransport::TransportRecovery(server) = retained {
                             *retained = RetainedTransport::OAuthRecovery {
                                 server: Arc::clone(server),
-                                retry_scopes: None,
+                                retry_plan: None,
                             };
                         }
                     }
@@ -963,7 +1008,7 @@ impl Actor {
                             {
                                 self.teardown_retry.push(RetainedTransport::OAuthRecovery {
                                     server: Arc::clone(&server),
-                                    retry_scopes: None,
+                                    retry_plan: None,
                                 });
                                 server
                                     .transport
