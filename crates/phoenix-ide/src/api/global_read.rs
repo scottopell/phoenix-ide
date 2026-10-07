@@ -1182,6 +1182,11 @@ async fn resolve_reference_impl(
                 .unwrap_or_default())
         };
         let id = decode(encoded_id)?;
+        if id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "Conversation reference must not be empty".into(),
+            ));
+        }
         let parsed = reqwest::Url::parse(&format!("http://route.invalid/?{query}"))
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
         let pins: Vec<_> = parsed
