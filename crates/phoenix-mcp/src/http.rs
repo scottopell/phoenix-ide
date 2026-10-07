@@ -1405,6 +1405,7 @@ mod tests {
             &http_config(&server.url, auth),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::default(),
+            crate::OAuthHandshakeAction::Refresh,
         )
         .await
         .map_err(|failure| failure.message)
@@ -2522,6 +2523,7 @@ mod tests {
             &http_config(&server.url, auth),
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
+            crate::OAuthHandshakeAction::Refresh,
         )
         .await
         .map_err(|failure| failure.message)
@@ -4580,6 +4582,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refreshed_handshake_with_successful_teardown_does_not_repeat_grant() {
+        for session_on_replacement in [false, true] {
+            let server = TestServer::start(vec![]).await;
+            let mut initial = handshake_responses("sess-1");
+            initial[2] = unauthorized(&server);
+            server.push_responses(initial);
+            server.push_responses(vec![delete_ack()]);
+            if session_on_replacement {
+                let mut replacement = handshake_responses("sess-2");
+                replacement[2] = unauthorized(&server);
+                server.push_responses(replacement);
+                server.push_responses(vec![delete_ack()]);
+            } else {
+                server.push_responses(vec![unauthorized(&server)]);
+            }
+            install_oauth_discovery(&server, true);
+            server.route("/token", token_response("at-2", Some("rt-2"), None));
+            *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-2".into());
+            let manager = Arc::new(McpClientManager::new());
+            manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+            manager
+                .oauth
+                .store()
+                .upsert_registration(&none_registration(&server.base()))
+                .await
+                .unwrap();
+            manager
+                .oauth
+                .store()
+                .upsert_token(&stored_token(
+                    &server,
+                    "at-1",
+                    Some("rt-1"),
+                    &["mcp.read"],
+                    1,
+                ))
+                .await
+                .unwrap();
+            manager
+                .reload_from_configs(vec![(
+                    "remote".into(),
+                    http_config(&server.url, HttpAuth::None),
+                )])
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+                .await
+                .unwrap();
+            assert_eq!(server.recorded_for_path("/token").len(), 1);
+            assert_eq!(
+                manager.status().await[0].state,
+                crate::McpConnState::Unauthorized
+            );
+            let params = query_params(&pending_auth_url(&manager).await.unwrap());
+            server.route("/token", token_response("at-3", Some("rt-3"), None));
+            server.push_responses(handshake_responses("sess-3"));
+            manager
+                .complete_oauth_authorization(&params["state"], "code", Some(&server.base()))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+                .await
+                .unwrap();
+            assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+            *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-3".into());
+            server.push_responses(vec![delete_ack()]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn changed_configuration_waits_for_transient_oauth_cleanup() {
         for reject_retry in [false, true] {
             let server = TestServer::start(handshake_responses("sess-1")).await;
@@ -5502,6 +5574,7 @@ mod tests {
             &preconfigured("cid-1"),
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
+            crate::OAuthHandshakeAction::Refresh,
         )
         .await
         .expect("connect with restored token");
@@ -5570,6 +5643,7 @@ mod tests {
             &configured("read"),
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
+            crate::OAuthHandshakeAction::Refresh,
         )
         .await
         .expect("connect with restored token");

@@ -145,6 +145,9 @@ covers the same handshake failure with successful and transient startup refresh.
 `refreshed_handshake_cleanup_preserves_auth_cause_without_repeating_grant`
 covers a rejected tools/list after one silent grant and preserved authorization
 provenance through fresh-recovery teardown failure.
+`refreshed_handshake_with_successful_teardown_does_not_repeat_grant` covers
+initialize and tools/list rejection after the first refresh when cleanup succeeds,
+with one grant followed by an owned prompt and successful browser authorization.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

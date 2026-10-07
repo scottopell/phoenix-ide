@@ -2562,7 +2562,9 @@ impl McpClientManager {
         Box::pin(async move {
             let pending = &self.pending_oauth_urls;
             let oauth = &self.oauth;
-            match Self::connect_one(name, config, Arc::clone(pending), Arc::clone(oauth)).await {
+            match Self::connect_one(name, config, Arc::clone(pending), Arc::clone(oauth), action)
+                .await
+            {
                 Ok(server) => {
                     if handle.publish(epoch, server).await {
                         pending.write().await.remove(name);
@@ -3614,6 +3616,7 @@ impl McpClientManager {
         entry: &McpServerConfig,
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
         oauth_rt: Arc<OAuthRuntime>,
+        action: OAuthHandshakeAction,
     ) -> Result<McpServer, ConnectFailure> {
         // A pre-configured client (Claude Code's `oauth` shape) is seeded only
         // once discovery resolves the authorization server's issuer, since the
@@ -3702,7 +3705,7 @@ impl McpClientManager {
         // half expired offline refreshes on this first 401 (REQ-MCP-012).
         let stored = oauth_rt.store().token(name).await.unwrap_or_default();
         if let Some(token) = stored {
-            if token.refresh_token.is_some() {
+            if matches!(action, OAuthHandshakeAction::Refresh) && token.refresh_token.is_some() {
                 match oauth_refresh(&oauth_rt, name, url, www_authenticate.as_deref(), &token).await
                 {
                     Ok(access_token) => {
@@ -3735,9 +3738,6 @@ impl McpClientManager {
                     }
                 }
             } else {
-                // An unexpired stored token was rejected and cannot be
-                // refreshed: discard it before re-prompting so a stale
-                // credential never coexists with the fresh one.
                 let _ = oauth_rt.delete_token(name).await;
             }
         }
@@ -5512,6 +5512,7 @@ for line in sys.stdin:
             config,
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
+            crate::OAuthHandshakeAction::Refresh,
         )
         .await
         .expect("connect fixture");
