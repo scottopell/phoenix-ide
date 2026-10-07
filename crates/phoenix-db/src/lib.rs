@@ -20128,6 +20128,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn overload_continuation_start_is_atomic_exact_and_idempotent() {
         use phoenix_core::domain::sm_state::{
             ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,

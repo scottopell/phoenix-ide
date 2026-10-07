@@ -1773,7 +1773,7 @@ fn overload_terminal(
         .with_effect(Effect::notify_state_change()))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn schedule_server_overload(
     target: ServerOverloadTarget,
     attempt: u32,
@@ -2340,7 +2340,7 @@ fn creation_provisioned_transition(
 /// that does not match the tool-call count, or a core transition that yields a
 /// state the parent layer cannot represent. These reflect reducer bugs, not
 /// reachable inputs.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::wildcard_enum_match_arm)]
 pub fn transition_parent(
     state: &ParentState,
     context: &ConvContext,
@@ -4567,6 +4567,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
     fn overload_deadline_expiry_is_not_provider_guidance() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -4821,6 +4822,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
     fn mixed_transient_failure_stays_in_original_overload_incident() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -4943,6 +4945,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
     fn continuation_overload_in_flight_failures_preserve_resume_target() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()

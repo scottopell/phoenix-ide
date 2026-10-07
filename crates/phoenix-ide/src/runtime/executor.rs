@@ -15129,6 +15129,7 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn active_direct_turn_terminal_classification_releases_exactly_once() {
         for (event, new_state, expected) in [
             (

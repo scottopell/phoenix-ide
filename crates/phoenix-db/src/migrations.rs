@@ -12066,13 +12066,13 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(7).copied().collect::<Vec<_>>(),
             vec![
+                (117, "admit_server_overload_retrying_state"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),
                 (114, "persist_instance_identity"),
                 (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
                 (111, "coordinator_conversation_watches"),
-                (110, "trusted_input_origin"),
             ]
         );
     }
