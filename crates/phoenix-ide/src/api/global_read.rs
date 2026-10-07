@@ -1156,10 +1156,29 @@ async fn resolve_work_scope(
     )
 }
 
-async fn resolve_reference_impl(
+fn decode_route_value(value: &str) -> Result<String, AppError> {
+    let url = reqwest::Url::parse(&format!(
+        "http://route.invalid/?value={}",
+        value.replace('+', "%2B")
+    ))
+    .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(url
+        .query_pairs()
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default())
+}
+
+enum WebReferenceResolution {
+    Product(String),
+    Exact(ResolveGlobalReferenceResponse),
+    NotWeb,
+}
+
+async fn resolve_web_reference(
     service: &GlobalReadService,
     raw: &str,
-) -> Result<ResolveGlobalReferenceResponse, AppError> {
+) -> Result<WebReferenceResolution, AppError> {
     let reference = raw.trim();
     let mut canonical_product = None;
     if let Some(rest) = reference
@@ -1169,19 +1188,7 @@ async fn resolve_reference_impl(
     {
         let (base, fragment) = split_fragment(rest);
         let (encoded_id, query) = base.split_once('?').unwrap_or((base, ""));
-        let decode = |value: &str| -> Result<String, AppError> {
-            let url = reqwest::Url::parse(&format!(
-                "http://route.invalid/?value={}",
-                value.replace('+', "%2B")
-            ))
-            .map_err(|error| AppError::BadRequest(error.to_string()))?;
-            Ok(url
-                .query_pairs()
-                .next()
-                .map(|(_, value)| value.into_owned())
-                .unwrap_or_default())
-        };
-        let id = decode(encoded_id)?;
+        let id = decode_route_value(encoded_id)?;
         if id.trim().is_empty() {
             return Err(AppError::BadRequest(
                 "Conversation reference must not be empty".into(),
@@ -1250,11 +1257,31 @@ async fn resolve_reference_impl(
                 }
             }
             if let Some(message_id) = fragment.and_then(message_id_fragment) {
-                return resolve_message(service, conv, &decode(message_id)?, global).await;
+                return resolve_message(service, conv, &decode_route_value(message_id)?, global)
+                    .await
+                    .map(WebReferenceResolution::Exact);
             }
-            return Ok(resolve_conversation(service, conv, global).await);
+            return Ok(WebReferenceResolution::Exact(
+                resolve_conversation(service, conv, global).await,
+            ));
         }
     }
+    Ok(canonical_product.map_or(
+        WebReferenceResolution::NotWeb,
+        WebReferenceResolution::Product,
+    ))
+}
+
+async fn resolve_reference_impl(
+    service: &GlobalReadService,
+    raw: &str,
+) -> Result<ResolveGlobalReferenceResponse, AppError> {
+    let reference = raw.trim();
+    let canonical_product = match resolve_web_reference(service, reference).await? {
+        WebReferenceResolution::Product(id) => Some(id),
+        WebReferenceResolution::Exact(resolved) => return Ok(resolved),
+        WebReferenceResolution::NotWeb => None,
+    };
     if let Some(rest) = reference
         .strip_prefix("/chains/")
         .or_else(|| reference.strip_prefix("@chain:"))
@@ -2225,8 +2252,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
+    async fn continued_scope_fixture() -> (
+        GlobalReadService,
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        phoenix_core::work_scope::WorkScopeId,
+        phoenix_core::work_scope::WorkScopeId,
+    ) {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         db.create_conversation("root-scope", "root-scope", "/tmp/root", true, None, None)
             .await
@@ -2280,6 +2311,13 @@ mod tests {
             .unwrap();
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
 
+        (service, product_id, root_scope_id, current_scope_id)
+    }
+
+    #[tokio::test]
+    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
+        let (service, product_id, root_scope_id, current_scope_id) =
+            continued_scope_fixture().await;
         let stable = service
             .resolve_reference(&format!("@conv:{product_id}"))
             .await

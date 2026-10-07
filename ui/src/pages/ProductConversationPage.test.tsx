@@ -1081,7 +1081,7 @@ describe('ProductConversationPage', () => {
     expect(screen.getByRole('heading', { name: 'Open title' })).toBeInTheDocument();
     const source = screen.getByTestId('product-conversation-source');
     expect(source).toHaveTextContent('Approved task from source conversation');
-    expect(screen.getByRole('link', { name: 'source conversation' })).toHaveAttribute('href', '/product-conversations/pc-source');
+    expect(screen.getByRole('link', { name: 'source conversation' })).toHaveAttribute('href', '/c/pc-source');
 
     unmount();
     renderPage();
