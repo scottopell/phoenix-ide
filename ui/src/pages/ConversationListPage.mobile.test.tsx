@@ -100,6 +100,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.renameProductConversation).mockResolvedValue(renamed);
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Rename conversation Mobile Product' }));
     const input = screen.getByRole('textbox');
     fireEvent.change(input, { target: { value: 'Renamed on Mobile' } });
@@ -120,6 +121,25 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(screen.queryByRole('button', { name: 'Close conversation Mobile Product' })).toBeNull();
   });
 
+  it.each(['open', 'history'] as const)('restores Actions focus after %s confirmation cancellation', async (state) => {
+    if (state === 'history') vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [{ ...productConversation(), lifecycle: { state: 'history' } }] });
+    render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
+    if (state === 'history') fireEvent.click(await screen.findByRole('button', { name: 'History 1' }));
+    const trigger = await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' });
+    trigger.focus();
+    fireEvent.click(trigger);
+    const action = screen.getByRole('button', { name: `${state === 'history' ? 'Delete' : 'Close'} conversation Mobile Product` });
+    action.focus();
+    fireEvent.click(action);
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).toHaveFocus();
+    fireEvent.click(cancel);
+    expect(trigger).toHaveFocus();
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
+    expect(api.closeProductConversation).not.toHaveBeenCalled();
+    expect(api.deleteChain).not.toHaveBeenCalled();
+  });
+
   it('uses aggregate deletion for History with one parent transcript', async () => {
     const history = {
       ...productConversation(),
@@ -137,6 +157,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
@@ -155,6 +176,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
@@ -184,6 +206,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
@@ -204,6 +227,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
+    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
     touchActivate(await screen.findByRole('button', { name: 'Close conversation Mobile Product' }));
     expect(screen.getByText(/moves the conversation to read-only History and stops its active work/)).toBeInTheDocument();
     touchActivate(screen.getByRole('button', { name: 'Close' }));
