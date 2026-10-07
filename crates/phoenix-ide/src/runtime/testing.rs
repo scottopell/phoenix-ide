@@ -2264,7 +2264,7 @@ impl StateStore for InMemoryStorage {
         _anchor_message_id: Option<&str>,
         live_definitions: &[phoenix_llm::ToolDefinition],
         callable_names: &std::collections::BTreeSet<String>,
-        _visible_message_ids: &[String],
+        _visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         _historical_tool_references: &[(String, String)],
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
         phoenix_core::domain::tool_availability::ToolAvailability::new(

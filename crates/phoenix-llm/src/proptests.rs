@@ -666,12 +666,11 @@ mod codex_request_shape {
         }
     }
 
-    /// Platform path leaves `store` unset and `instructions` only when system is provided.
     #[test]
-    fn platform_path_omits_store_and_default_instructions() {
+    fn platform_path_is_stateless_without_default_instructions() {
         let req = make_llm_request(vec![user_msg("hi")]);
         let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
-        assert_eq!(r.store, None);
+        assert_eq!(r.store, Some(false));
         assert_eq!(r.instructions, None);
     }
 
@@ -832,13 +831,11 @@ mod codex_request_shape {
         assert_eq!(a.as_str().len(), 36);
     }
 
-    /// `include` stays empty until Phoenix can preserve additional output
-    /// items, such as encrypted reasoning, in the transcript.
     #[test]
-    fn include_is_empty_on_both_paths() {
+    fn encrypted_reasoning_is_requested_on_verified_platform_route() {
         let req = make_llm_request(vec![user_msg("hi")]);
         let p = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
-        assert!(p.include.is_empty());
+        assert_eq!(p.include, vec!["reasoning.encrypted_content"]);
         let c = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
         assert!(c.include.is_empty());
     }

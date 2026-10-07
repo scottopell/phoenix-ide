@@ -88,7 +88,7 @@ impl LlmClient for RenderingAnthropicClient {
         ))
     }
 
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "claude-opus-5-5"
     }
 }
@@ -155,6 +155,7 @@ fn saved_message(id: &str, sequence: i64, content: MessageContent) -> Message {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reopen_and_retry() {
     let directory = tempfile::TempDir::new().unwrap();
     let path = directory.path().join("conversation.db");

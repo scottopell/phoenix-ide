@@ -725,6 +725,7 @@ struct CodexWsSession {
     compatibility: Option<serde_json::Value>,
     prefix: Vec<serde_json::Value>,
     connection_identity: Option<[u8; 32]>,
+    continuation_id: Option<String>,
 }
 
 fn reset_ws_session(session: &mut CodexWsSession) {
@@ -1013,6 +1014,13 @@ async fn complete_codex_websocket(
     if session.connection_identity != Some(identity) {
         reset_ws_session(&mut session);
         session.connection_identity = Some(identity);
+    }
+    if session.continuation_id.as_deref() != request.tool_availability.continuation_id() {
+        reset_ws_session(&mut session);
+        session.continuation_id = request
+            .tool_availability
+            .continuation_id()
+            .map(str::to_owned);
     }
     let attempt = AttemptMarker::begin(entry.clone());
 
@@ -4000,6 +4008,95 @@ mod tests {
         .expect("wrapped error maps");
         assert_eq!(error.kind, crate::LlmErrorKind::PromptRejected);
         assert!(error.kind.is_user_resumable());
+    }
+
+    #[tokio::test]
+    async fn websocket_retires_previous_response_on_durable_context_change() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let call = |context: &str, messages: &[(&str, MessageRole)]| {
+            let mut request = request_with(messages);
+            request.tool_availability = request
+                .tool_availability
+                .with_continuation_id(context.to_owned())
+                .unwrap();
+            let url = url.clone();
+            let sessions = sessions.clone();
+            let tx = tx.clone();
+            async move {
+                complete_streaming(
+                    &codex_spec(),
+                    "account-a",
+                    Some(&url),
+                    &[],
+                    &BTreeMap::new(),
+                    &request,
+                    &tx,
+                    true,
+                    Some(&sessions),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        call("original-a", &[("one", MessageRole::User)]).await;
+        call(
+            "original-a",
+            &[
+                ("one", MessageRole::User),
+                ("answer-1", MessageRole::Assistant),
+                ("two", MessageRole::User),
+            ],
+        )
+        .await;
+        {
+            let requests = state.ws_requests.lock().await;
+            assert_eq!(requests[1].1["previous_response_id"], "resp-1");
+        }
+        // A settled excursion to another provider produces a new A context,
+        // even though returning A sees the same public prefix plus a user turn.
+        call(
+            "returning-a",
+            &[
+                ("one", MessageRole::User),
+                ("answer-1", MessageRole::Assistant),
+                ("two", MessageRole::User),
+                ("answer-2", MessageRole::Assistant),
+                ("three", MessageRole::User),
+            ],
+        )
+        .await;
+        call(
+            "returning-a",
+            &[
+                ("one", MessageRole::User),
+                ("answer-1", MessageRole::Assistant),
+                ("two", MessageRole::User),
+                ("answer-2", MessageRole::Assistant),
+                ("three", MessageRole::User),
+                ("answer-3", MessageRole::Assistant),
+                ("four", MessageRole::User),
+            ],
+        )
+        .await;
+        let requests = state.ws_requests.lock().await;
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+        assert_ne!(requests[1].0, requests[2].0);
+        assert_eq!(requests[2].0, requests[3].0);
+        assert!(requests[2].1.get("previous_response_id").is_none());
+        assert_eq!(requests[2].1["input"].as_array().unwrap().len(), 7);
+        assert_eq!(requests[3].1["previous_response_id"], "resp-3");
+        assert_eq!(requests[3].1["input"].as_array().unwrap().len(), 1);
+        for (_, request) in requests.iter() {
+            assert_eq!(request["prompt_cache_key"], "integration");
+            assert!(request.get("continuation_id").is_none());
+        }
+        assert_eq!(
+            sessions.lock().await.by_cache_key.len(),
+            1,
+            "incarnation replacement must not grow the pool per context"
+        );
     }
 
     #[tokio::test]

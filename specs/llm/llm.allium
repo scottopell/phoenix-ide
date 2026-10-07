@@ -338,8 +338,9 @@ contract ProviderRequestProjection {
         -- Returning to a route establishes current policy afresh, without
         -- reviving retired private data, native events, or transport handles.
         -- Stale outcomes from the retired identity cannot restore them.
-        -- An explicit context-management history projection that removes native
-        -- tool-change anchors retires the whole native prefix/event context and
+        -- A request history projection that omits native tool-change anchors or
+        -- makes their insertion position illegal through adjacent user turns
+        -- retires the whole native prefix/event context and
         -- establishes current policy at a legal visible anchor. It does not
         -- relocate or selectively filter old events, rewrite private owners,
         -- or retire required private replay within an unsettled exchange.

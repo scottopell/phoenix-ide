@@ -2,7 +2,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use phoenix_core::domain::llm_types::ToolDefinition;
-use phoenix_core::domain::tool_availability::{PositionedToolChange, ToolAvailability, ToolChange};
+use phoenix_core::domain::tool_availability::{
+    PositionedToolChange, ToolAvailability, ToolChange, ToolPolicyMessage,
+};
 use sqlx::Row;
 
 use crate::{Database, DbError, DbResult};
@@ -22,6 +24,18 @@ fn identical(a: &ToolDefinition, b: &ToolDefinition) -> bool {
         && a.description == b.description
         && a.input_schema == b.input_schema
         && a.defer_loading == b.defer_loading
+}
+
+fn legal_anchor(messages: &[ToolPolicyMessage], id: &str) -> bool {
+    messages
+        .iter()
+        .position(|message| message.source_message_id.as_deref() == Some(id))
+        .is_some_and(|index| {
+            messages[index].role == phoenix_core::domain::llm_types::MessageRole::User
+                && messages.get(index + 1).is_none_or(|next| {
+                    next.role == phoenix_core::domain::llm_types::MessageRole::Assistant
+                })
+        })
 }
 
 type PolicyTransaction<'a> = sqlx::Transaction<'a, sqlx::Sqlite>;
@@ -75,7 +89,7 @@ async fn restored_reference_requires_prefix(
     tx: &mut PolicyTransaction<'_>,
     conversation_id: &str,
     retained: &[ToolDefinition],
-    visible_message_ids: &[String],
+    visible_messages: &[ToolPolicyMessage],
     historical_tool_references: &[(String, String)],
 ) -> DbResult<bool> {
     let initial_names: BTreeSet<String> = sqlx::query_scalar(
@@ -89,10 +103,10 @@ async fn restored_reference_requires_prefix(
     let additions = sqlx::query(
             "SELECT name,after_message_id FROM conversation_tool_context_changes WHERE conversation_id=?1 AND kind='addition' ORDER BY ordinal",
         ).bind(conversation_id).fetch_all(&mut **tx).await?;
-    let positions: BTreeMap<&str, usize> = visible_message_ids
+    let positions: BTreeMap<&str, usize> = visible_messages
         .iter()
         .enumerate()
-        .map(|(index, id)| (id.as_str(), index))
+        .filter_map(|(index, message)| message.source_message_id.as_deref().map(|id| (id, index)))
         .collect();
     let mut earliest_addition = BTreeMap::new();
     for addition in additions {
@@ -121,7 +135,7 @@ async fn establish_context(
     conversation_id: &str,
     route_key: &str,
     retained: &[ToolDefinition],
-    visible_message_ids: &[String],
+    visible_messages: &[ToolPolicyMessage],
     historical_tool_references: &[(String, String)],
 ) -> DbResult<()> {
     let previous_route: Option<String> = sqlx::query_scalar(
@@ -138,12 +152,12 @@ async fn establish_context(
     .await?;
     let history_window_changed = stored_anchors
         .iter()
-        .any(|id| !visible_message_ids.contains(id));
+        .any(|id| !legal_anchor(visible_messages, id));
     let restored_historical_schema = restored_reference_requires_prefix(
         tx,
         conversation_id,
         retained,
-        visible_message_ids,
+        visible_messages,
         historical_tool_references,
     )
     .await?;
@@ -241,12 +255,12 @@ async fn append_native_changes(
     tx: &mut PolicyTransaction<'_>,
     conversation_id: &str,
     anchor_message_id: Option<&str>,
-    visible_message_ids: &[String],
+    visible_messages: &[ToolPolicyMessage],
     changes: &mut Vec<PositionedToolChange>,
     pending: Vec<ToolChange>,
 ) -> DbResult<()> {
     if let Some(anchor) = anchor_message_id.filter(|_| !pending.is_empty()) {
-        if !visible_message_ids.iter().any(|id| id == anchor) {
+        if !legal_anchor(visible_messages, anchor) {
             return Err(DbError::Serialization(
                 "tool policy anchor is absent from projected history".into(),
             ));
@@ -301,7 +315,7 @@ impl Database {
         anchor_message_id: Option<&str>,
         live_definitions: &[ToolDefinition],
         callable_names: &BTreeSet<String>,
-        visible_message_ids: &[String],
+        visible_messages: &[ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
     ) -> DbResult<ToolAvailability> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
@@ -312,7 +326,7 @@ impl Database {
             conversation_id,
             route_key,
             policy.declarations(),
-            visible_message_ids,
+            visible_messages,
             historical_tool_references,
         )
         .await?;
@@ -331,13 +345,20 @@ impl Database {
             &mut tx,
             conversation_id,
             anchor_message_id,
-            visible_message_ids,
+            visible_messages,
             &mut changes,
             pending,
         )
         .await?;
+        let continuation_id: String = sqlx::query_scalar(
+            "SELECT continuation_id FROM conversation_tool_contexts WHERE conversation_id=?1",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
         let snapshot = policy
             .with_anthropic_context(initial, changes)
+            .and_then(|snapshot| snapshot.with_continuation_id(continuation_id))
             .map_err(DbError::Serialization)?;
         tx.commit().await?;
         Ok(snapshot)
@@ -349,11 +370,22 @@ mod tests {
     use super::*;
     use phoenix_core::domain::db_schema::{MessageContent, UserContent};
 
-    fn visible() -> Vec<String> {
-        ["user-a", "user-b", "anchor", "foreign"]
-            .into_iter()
-            .map(String::from)
-            .collect()
+    fn visible() -> Vec<ToolPolicyMessage> {
+        use phoenix_core::domain::llm_types::MessageRole::{Assistant, User};
+        [
+            ("user-a", User),
+            ("assistant-a", Assistant),
+            ("user-b", User),
+            ("assistant-b", Assistant),
+            ("anchor", User),
+            ("foreign", Assistant),
+        ]
+        .into_iter()
+        .map(|(id, role)| ToolPolicyMessage {
+            source_message_id: Some(id.into()),
+            role,
+        })
+        .collect()
     }
     fn tool(name: &str, revision: i32) -> ToolDefinition {
         ToolDefinition {
@@ -608,6 +640,7 @@ mod tests {
         reopened.pool().close().await;
     }
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn history_window_change_retires_whole_native_context() {
         let db = database().await;
         db.prepare_tool_availability(
@@ -640,7 +673,10 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        let projected = vec!["user-b".into()];
+        let projected = vec![ToolPolicyMessage {
+            source_message_id: Some("user-b".into()),
+            role: phoenix_core::domain::llm_types::MessageRole::User,
+        }];
         let compacted = db
             .prepare_tool_availability(
                 "policy",
@@ -861,6 +897,106 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(old, same);
+    }
+    #[test]
+    fn source_less_user_neighbor_prevents_native_insertion() {
+        use phoenix_core::domain::llm_types::MessageRole::{Assistant, User};
+        let messages = vec![
+            ToolPolicyMessage {
+                source_message_id: Some("anchor".into()),
+                role: User,
+            },
+            ToolPolicyMessage {
+                source_message_id: None,
+                role: User,
+            },
+            ToolPolicyMessage {
+                source_message_id: None,
+                role: Assistant,
+            },
+        ];
+        assert!(!legal_anchor(&messages, "anchor"));
+    }
+    #[tokio::test]
+    async fn revised_input_after_failed_attempt_rebaselines_illegal_anchor() {
+        use phoenix_core::domain::llm_types::MessageRole::User;
+        let db = database().await;
+        let first = vec![ToolPolicyMessage {
+            source_message_id: Some("user-a".into()),
+            role: User,
+        }];
+        db.prepare_tool_availability(
+            "policy",
+            "a",
+            Some("user-a"),
+            &[tool("a", 1)],
+            &BTreeSet::from(["a".into()]),
+            &first,
+            &[],
+        )
+        .await
+        .unwrap();
+        let failed = db
+            .prepare_tool_availability(
+                "policy",
+                "a",
+                Some("user-a"),
+                &[],
+                &BTreeSet::new(),
+                &first,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.anthropic_changes()[0].after_message_id, "user-a");
+        sqlx::query("INSERT INTO active_provider_replay_state (conversation_id,provider,model,response_id,payload) VALUES ('policy','anthropic','model','response','{}')").execute(db.pool()).await.unwrap();
+        let revised = vec![
+            ToolPolicyMessage {
+                source_message_id: Some("user-a".into()),
+                role: User,
+            },
+            ToolPolicyMessage {
+                source_message_id: Some("user-b".into()),
+                role: User,
+            },
+        ];
+        let resumed = db
+            .prepare_tool_availability(
+                "policy",
+                "a",
+                Some("user-b"),
+                &[],
+                &BTreeSet::new(),
+                &revised,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_ne!(failed.continuation_id(), resumed.continuation_id());
+        assert_eq!(resumed.anthropic_changes().len(), 1);
+        assert_eq!(resumed.anthropic_changes()[0].after_message_id, "user-b");
+        assert_eq!(resumed.declarations().len(), 1);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id='policy'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let retry = db
+            .prepare_tool_availability(
+                "policy",
+                "a",
+                Some("user-b"),
+                &[],
+                &BTreeSet::new(),
+                &revised,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed.continuation_id(), retry.continuation_id());
+        assert_eq!(retry.anthropic_changes().len(), 1);
     }
     #[tokio::test]
     async fn invalid_anchor_rolls_back_catalog_and_policy() {

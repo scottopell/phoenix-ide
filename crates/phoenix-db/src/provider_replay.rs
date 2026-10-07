@@ -12,6 +12,8 @@ use sqlx::Row;
 
 impl Database {
     #[cfg(test)]
+    /// # Errors
+    /// Returns errors from the atomic state and replay write.
     pub async fn update_state_and_provider_replay(
         &self,
         conversation_id: &str,
@@ -28,6 +30,8 @@ impl Database {
         .await
     }
     #[cfg(test)]
+    /// # Errors
+    /// Returns errors from the atomic message, state, and replay write.
     pub async fn persist_tool_round_state_and_provider_replay(
         &self,
         conversation_id: &str,
@@ -362,6 +366,69 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+}
+
+async fn apply_replay_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+) -> DbResult<()> {
+    use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
+    match update {
+        ProviderReplayUpdate::Anthropic(response) => {
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT payload FROM active_provider_replay_state WHERE conversation_id = ?1",
+            )
+            .bind(conversation_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let mut sets = existing
+                .map(|json| serde_json::from_str::<AnthropicReplayPayload>(&json))
+                .transpose()
+                .map_err(|error| {
+                    DbError::Serialization(format!("provider replay decode: {error}"))
+                })?
+                .map(|decoded| AnthropicReplayPayload::new(decoded.response_sets))
+                .transpose()
+                .map_err(|error| {
+                    DbError::Serialization(format!("provider replay validation: {error}"))
+                })?
+                .map_or_else(Vec::new, |payload| payload.response_sets);
+            if !sets
+                .iter()
+                .any(|set| set.identity.response_id == response.identity.response_id)
+            {
+                sets.push(response.clone());
+            }
+            let payload = AnthropicReplayPayload::new(sets)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let json = serde_json::to_string(&payload)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            sqlx::query(
+                    "INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES (?1, 'anthropic', ?2, ?3, ?4) ON CONFLICT(conversation_id) DO UPDATE SET model=excluded.model, response_id=excluded.response_id, payload=excluded.payload",
+                )
+                .bind(conversation_id)
+                .bind(&response.identity.model)
+                .bind(&response.identity.response_id)
+                .bind(json)
+                .execute(&mut **tx)
+                .await?;
+        }
+        ProviderReplayUpdate::Responses(response) => {
+            crate::responses_replay::append_tx(tx, conversation_id, response).await?;
+        }
+        ProviderReplayUpdate::Clear => {
+            sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -981,67 +1048,4 @@ mod tests {
             "expected Serialization error for unknown field, got {err:?}"
         );
     }
-}
-
-async fn apply_replay_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    conversation_id: &str,
-    update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
-) -> DbResult<()> {
-    use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
-    match update {
-        ProviderReplayUpdate::Anthropic(response) => {
-            let existing: Option<String> = sqlx::query_scalar(
-                "SELECT payload FROM active_provider_replay_state WHERE conversation_id = ?1",
-            )
-            .bind(conversation_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            let mut sets = existing
-                .map(|json| serde_json::from_str::<AnthropicReplayPayload>(&json))
-                .transpose()
-                .map_err(|error| {
-                    DbError::Serialization(format!("provider replay decode: {error}"))
-                })?
-                .map(|decoded| AnthropicReplayPayload::new(decoded.response_sets))
-                .transpose()
-                .map_err(|error| {
-                    DbError::Serialization(format!("provider replay validation: {error}"))
-                })?
-                .map_or_else(Vec::new, |payload| payload.response_sets);
-            if !sets
-                .iter()
-                .any(|set| set.identity.response_id == response.identity.response_id)
-            {
-                sets.push(response.clone());
-            }
-            let payload = AnthropicReplayPayload::new(sets)
-                .map_err(|error| DbError::Serialization(error.to_string()))?;
-            let json = serde_json::to_string(&payload)
-                .map_err(|error| DbError::Serialization(error.to_string()))?;
-            sqlx::query(
-                    "INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES (?1, 'anthropic', ?2, ?3, ?4) ON CONFLICT(conversation_id) DO UPDATE SET model=excluded.model, response_id=excluded.response_id, payload=excluded.payload",
-                )
-                .bind(conversation_id)
-                .bind(&response.identity.model)
-                .bind(&response.identity.response_id)
-                .bind(json)
-                .execute(&mut **tx)
-                .await?;
-        }
-        ProviderReplayUpdate::Responses(response) => {
-            crate::responses_replay::append_tx(tx, conversation_id, response).await?;
-        }
-        ProviderReplayUpdate::Clear => {
-            sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
-                .bind(conversation_id)
-                .execute(&mut **tx)
-                .await?;
-            sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
-                .bind(conversation_id)
-                .execute(&mut **tx)
-                .await?;
-        }
-    }
-    Ok(())
 }

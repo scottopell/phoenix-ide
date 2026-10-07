@@ -7732,7 +7732,12 @@ where
                 &callable_names,
                 &frozen_messages
                     .iter()
-                    .filter_map(|message| message.source_message_id.clone())
+                    .map(
+                        |message| phoenix_core::domain::tool_availability::ToolPolicyMessage {
+                            source_message_id: message.source_message_id.clone(),
+                            role: message.role,
+                        },
+                    )
                     .collect::<Vec<_>>(),
                 &historical_tool_references,
             )

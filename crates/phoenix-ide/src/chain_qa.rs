@@ -841,7 +841,7 @@ fn build_agent_request(
                     })
                     .collect()
             });
-        ToolAvailability::new(tools.clone(), Default::default())
+        ToolAvailability::new(tools.clone(), std::collections::BTreeSet::new())
             .expect("QA tool declarations are unique")
             .with_anthropic_context(tools, changes)
             .expect("QA withdrawals reference retained declarations")
@@ -1141,7 +1141,7 @@ mod tool_policy_tests {
             let mut response = phoenix_llm::LlmResponse::non_streaming(
                 vec![ContentBlock::text("ready")],
                 true,
-                Default::default(),
+                phoenix_llm::Usage::default(),
             );
             response.provider_replay = Some(ProviderReplayUpdate::Clear);
             if round < 2 {
@@ -1198,7 +1198,7 @@ mod tool_policy_tests {
             Ok(phoenix_llm::LlmResponse::non_streaming(
                 vec![ContentBlock::text("final answer")],
                 true,
-                Default::default(),
+                phoenix_llm::Usage::default(),
             ))
         }
 
@@ -1215,7 +1215,7 @@ mod tool_policy_tests {
             .await
             .unwrap();
         let llm = Arc::new(ResponsesQaLlm {
-            rounds: Default::default(),
+            rounds: std::sync::atomic::AtomicUsize::default(),
         });
         let registry = Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone()));
         let qa = ChainQa::new(db.clone(), registry, Arc::new(db.fts_retriever()));

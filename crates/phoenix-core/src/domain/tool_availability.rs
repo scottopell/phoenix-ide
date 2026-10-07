@@ -1,7 +1,13 @@
 //! Conversation policy and provider-specific request snapshots.
 use std::collections::BTreeSet;
 
-use super::llm_types::ToolDefinition;
+use super::llm_types::{MessageRole, ToolDefinition};
+
+#[derive(Debug, Clone)]
+pub struct ToolPolicyMessage {
+    pub source_message_id: Option<String>,
+    pub role: MessageRole,
+}
 
 #[derive(Debug, Clone)]
 pub enum ToolChange {
@@ -21,6 +27,7 @@ pub struct ToolAvailability {
     callable_names: BTreeSet<String>,
     anthropic_initial_declarations: Vec<ToolDefinition>,
     anthropic_changes: Vec<PositionedToolChange>,
+    continuation_id: Option<String>,
 }
 
 impl ToolAvailability {
@@ -42,6 +49,7 @@ impl ToolAvailability {
             declarations,
             callable_names,
             anthropic_changes: Vec::new(),
+            continuation_id: None,
         })
     }
 
@@ -90,6 +98,21 @@ impl ToolAvailability {
         self.anthropic_initial_declarations = initial;
         self.anthropic_changes = changes;
         Ok(self)
+    }
+
+    /// # Errors
+    /// Rejects an empty continuation identity.
+    pub fn with_continuation_id(mut self, continuation_id: String) -> Result<Self, String> {
+        if continuation_id.is_empty() {
+            return Err("empty continuation identity".into());
+        }
+        self.continuation_id = Some(continuation_id);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn continuation_id(&self) -> Option<&str> {
+        self.continuation_id.as_deref()
     }
 
     #[must_use]
@@ -161,6 +184,15 @@ mod tests {
             ToolAvailability::new(vec![definition("a"), definition("a")], BTreeSet::new()).is_err()
         );
         let policy = ToolAvailability::new(vec![definition("a")], BTreeSet::new()).unwrap();
+        assert!(policy.clone().with_continuation_id(String::new()).is_err());
+        assert_eq!(
+            policy
+                .clone()
+                .with_continuation_id("context".into())
+                .unwrap()
+                .continuation_id(),
+            Some("context")
+        );
         assert!(!policy.is_callable("a"));
         assert_eq!(policy.declarations().len(), 1);
     }

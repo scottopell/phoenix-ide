@@ -566,7 +566,7 @@ pub trait StateStore: Send + Sync {
         anchor_message_id: Option<&str>,
         live_definitions: &[phoenix_llm::ToolDefinition],
         callable_names: &std::collections::BTreeSet<String>,
-        visible_message_ids: &[String],
+        visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
     async fn load_responses_replay_state(
@@ -1274,7 +1274,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         anchor_message_id: Option<&str>,
         live_definitions: &[phoenix_llm::ToolDefinition],
         callable_names: &std::collections::BTreeSet<String>,
-        visible_message_ids: &[String],
+        visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
         (**self)
@@ -1284,7 +1284,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 anchor_message_id,
                 live_definitions,
                 callable_names,
-                visible_message_ids,
+                visible_messages,
                 historical_tool_references,
             )
             .await
@@ -2557,7 +2557,7 @@ impl StateStore for DatabaseStorage {
         anchor_message_id: Option<&str>,
         live_definitions: &[phoenix_llm::ToolDefinition],
         callable_names: &std::collections::BTreeSet<String>,
-        visible_message_ids: &[String],
+        visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
         self.db
@@ -2567,7 +2567,7 @@ impl StateStore for DatabaseStorage {
                 anchor_message_id,
                 live_definitions,
                 callable_names,
-                visible_message_ids,
+                visible_messages,
                 historical_tool_references,
             )
             .await
