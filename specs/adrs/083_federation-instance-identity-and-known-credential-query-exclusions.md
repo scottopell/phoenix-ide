@@ -18,11 +18,14 @@ A Phoenix installation needs a durable identity before it can participate in tru
 
 Persist exactly one random UUIDv4 per Phoenix database and expose it through a typed instance identity. Generate the UUID transactionally when its schema migration first initializes the database; reopening or rerunning migrations reads the same value.
 
-Keep Coordinator SQL broadly readable while denying reads of known credential-bearing columns in existing owner-session, share-token, and MCP OAuth tables. Enforce the exclusions in SQLite's authorizer before row values are returned. Match by table and column rather than by generic secret-like names.
+The receiving owner issues random directional bearer credentials for explicit caller identities. Persist only SHA-256 credential verifiers, structurally permit one active credential per caller identity, and replace the previous active credential in the same transaction that inserts its replacement. Owner authentication alone authorizes issuance and revocation; peer credentials do not inherit owner authority.
+
+Keep Coordinator SQL broadly readable while denying reads of known credential-bearing columns in existing owner-session, share-token, MCP OAuth, and federation enrollment tables. Enforce the exclusions in SQLite's authorizer before row values are returned. Match by table and column rather than by generic secret-like names.
 
 ## Consequences
 
 - Restart and reopen retain one instance identity; concurrent initialization cannot commit two identities.
+- Each caller identity has at most one active receiver-issued credential, and failed replacement cannot revoke the previous credential.
 - Restore behavior follows the persisted database identity and does not add a broader backup, clone, rollback, or live-replacement guarantee.
 - Existing known credentials do not appear through direct selects, wildcards, aliases, views, or subqueries.
 - Noncredential metadata and unrelated secret-like application data remain readable; unrestricted local Bash remains outside this bounded policy.

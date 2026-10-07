@@ -160,3 +160,19 @@ AND restore them on server restart
 **Rationale:** Share tokens represent a user decision ("I want to share
 this conversation"). They should survive server restarts so shared links
 don't break unexpectedly.
+
+### REQ-AUTH-009: Federation Enrollment Authority
+
+WHEN an owner-authenticated caller issues or replaces a directional federation enrollment
+THE SYSTEM SHALL mint a random receiver-issued bearer credential for exactly one caller instance identity and SHALL return the raw credential only in that issuance response
+
+WHEN a replacement enrollment commits for a caller instance identity
+THE SYSTEM SHALL revoke the previous active credential atomically and SHALL retain exactly one active credential verifier for that caller
+
+WHEN an owner-authenticated caller revokes a federation enrollment
+THE SYSTEM SHALL prevent that credential from authorizing subsequent peer operations
+
+WHILE a peer credential is presented to an owner-management route
+THE SYSTEM SHALL reject it without treating peer authentication as owner authentication
+
+THE SYSTEM SHALL persist only a nonrecoverable verifier of the peer credential and SHALL deny that verifier through bounded agent SQL reads

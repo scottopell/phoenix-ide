@@ -11,6 +11,7 @@ mod chains;
 pub mod codex_login;
 mod deployment;
 mod discovery;
+mod federation;
 mod git_handlers;
 pub(crate) mod global_read;
 pub(crate) mod handlers;
