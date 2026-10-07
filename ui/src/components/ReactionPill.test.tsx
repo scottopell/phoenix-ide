@@ -138,7 +138,7 @@ describe('reaction pill', () => {
     const view = render(<Fixture touchDocked />);
     const scroller = document.getElementById('messages')!;
     expect(scroller).toHaveClass('reaction-dock-reserved');
-    expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('66px');
+    expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('78px');
     view.unmount();
     expect(scroller).not.toHaveClass('reaction-dock-reserved');
     expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('');

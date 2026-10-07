@@ -987,6 +987,10 @@ body.app-viewport-active #root {
   background: var(--accent-blue-hover, #2563eb);
 }
 
+#main-area:has(.virtual-transcript.reaction-dock-reserved) .jump-to-newest {
+  bottom: calc(12px + var(--reaction-dock-height));
+}
+
 @keyframes jump-btn-fade-in {
   from {
     opacity: 0;

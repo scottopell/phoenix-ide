@@ -52,10 +52,11 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
         const sameSource = current?.source.messageId === selected.source.messageId
           && current.source.occurrenceToken === selected.source.occurrenceToken
           && current.source.quote === selected.source.quote;
-        const touchDocked = sameSource
-          ? current.presentation === 'touch-docked'
-          : selectionInput === 'touch'
-            || (selectionInput === null && (window.matchMedia?.('(any-pointer: coarse)').matches ?? false));
+        const touchDocked = selectionInput !== null
+          ? selectionInput === 'touch'
+          : sameSource
+            ? current.presentation === 'touch-docked'
+            : window.matchMedia?.('(any-pointer: coarse)').matches ?? false;
         store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: touchDocked ? 'touch-docked' : 'floating' });
         selectionInput = null;
         setNotice('');

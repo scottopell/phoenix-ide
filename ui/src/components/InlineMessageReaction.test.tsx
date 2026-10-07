@@ -131,6 +131,21 @@ describe('inline message reactions', () => {
     expect(screen.queryByText(/“Deterministic state patterns/)).not.toBeInTheDocument();
   });
 
+  it('uses the latest gesture when the same quote is reselected on a hybrid device', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    fireEvent.pointerDown(text, { pointerType: 'mouse' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'mouse' });
+    expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('floating');
+  });
+
   it('keeps keyboard selection in the floating pill on a hybrid device', async () => {
     setCoarsePointer(true);
     render(<Harness store={new InlineReactionStore()} append={vi.fn()} />);

@@ -78,6 +78,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       if (liveScroller && liveScroller !== observedScroller) {
         observedScroller.classList.remove('reaction-dock-reserved');
         observedScroller.style.removeProperty('--reaction-dock-height');
+        observedScroller.closest<HTMLElement>('#main-area')?.style.removeProperty('--reaction-dock-height');
         resize.unobserve(observedScroller);
         observedScroller = liveScroller;
         scroller = liveScroller;
@@ -104,7 +105,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const bottom = viewportTop + (viewport?.height ?? window.innerHeight) - safeBottom;
       const transcript = observedScroller.getBoundingClientRect();
       const restoredRange = restoreReactionRange(source);
-      const range = restoredRange ?? (sourceRange?.commonAncestorContainer.isConnected ? sourceRange : null);
+      const range = restoredRange ?? (sourceRange && observedScroller.contains(sourceRange.commonAncestorContainer) ? sourceRange : null);
       const rect = range?.getBoundingClientRect();
       if (returning.current && rect && rect.height > 0) {
         returning.current = false;
@@ -118,7 +119,11 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const pillWidth = Math.min(420, width - 24);
       el.style.width = `${pillWidth}px`;
       const height = el.getBoundingClientRect().height || 46;
-      if (touchDocked) observedScroller.style.setProperty('--reaction-dock-height', `${height + 12}px`);
+      if (touchDocked) {
+        const dockHeight = `${height + 24}px`;
+        observedScroller.style.setProperty('--reaction-dock-height', dockHeight);
+        observedScroller.closest<HTMLElement>('#main-area')?.style.setProperty('--reaction-dock-height', dockHeight);
+      }
       let y = Math.min(visibleBottom, bottom) - height - 12;
       let x = transcript.right - pillWidth - 12;
       if (touchDocked) {
@@ -174,6 +179,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       cancelAnimationFrame(frame);
       observedScroller.classList.remove('reaction-dock-reserved');
       observedScroller.style.removeProperty('--reaction-dock-height');
+      observedScroller.closest<HTMLElement>('#main-area')?.style.removeProperty('--reaction-dock-height');
       mutations.disconnect();
       resize.disconnect();
       window.removeEventListener('scroll', schedule, true);
