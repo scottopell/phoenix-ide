@@ -1161,34 +1161,81 @@ async fn resolve_reference_impl(
     raw: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let reference = raw.trim();
-    let canonical_product = if let Some(rest) = reference.strip_prefix("/c/") {
-        let (base, fragment) = split_fragment(rest);
-        let (id, query) = base.split_once('?').unwrap_or((base, ""));
-        let parsed = reqwest::Url::parse(&format!("http://route.invalid/?{query}"))
-            .map_err(|error| AppError::BadRequest(error.to_string()))?;
-        let exact = parsed.query_pairs().any(|(key, _)| key == "source_transcript");
-        if fragment.is_none() && !exact {
-            match service.db.resolve_ordinary_product_conversation(id).await {
-                Ok(product) if product.product_conversation_id.as_str() == id => Some(id),
-                Ok(_) | Err(DbError::ConversationNotFound(_)) => None,
-                Err(error) => return Err(map_db_not_found(error)),
-            }
-        } else { None }
-    } else { None };
-
+    let mut canonical_product = None;
     if let Some(rest) = reference
         .strip_prefix("/c/")
-        .filter(|_| canonical_product.is_none())
+        .or_else(|| reference.strip_prefix("/product-conversations/"))
         .or_else(|| reference.strip_prefix("/global/"))
     {
-        let (slug, fragment) = split_fragment(rest);
-        let slug = slug.split_once('?').map_or(slug, |(path, _)| path);
-        let conv = load_conversation_by_slug_or_id(service, slug).await?;
-        let global = reference.starts_with("/global/");
-        if let Some(message_id) = fragment.and_then(message_id_fragment) {
-            return resolve_message(service, conv, message_id, global).await;
+        let (base, fragment) = split_fragment(rest);
+        let (encoded_id, query) = base.split_once('?').unwrap_or((base, ""));
+        let decode = |value: &str| -> Result<String, AppError> {
+            let url = reqwest::Url::parse(&format!(
+                "http://route.invalid/?value={}",
+                value.replace('+', "%2B")
+            ))
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            Ok(url
+                .query_pairs()
+                .next()
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default())
+        };
+        let id = decode(encoded_id)?;
+        let parsed = reqwest::Url::parse(&format!("http://route.invalid/?{query}"))
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        let pins: Vec<_> = parsed
+            .query_pairs()
+            .filter(|(key, _)| key == "source_transcript")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        if pins.len() > 1
+            || pins
+                .first()
+                .is_some_and(|pin| pin.is_empty() || pin.trim() != pin)
+        {
+            return Err(AppError::BadRequest(
+                "Invalid exact transcript reference".into(),
+            ));
         }
-        return Ok(resolve_conversation(service, conv, global).await);
+        let global = reference.starts_with("/global/");
+        let product = service.db.resolve_ordinary_product_conversation(&id).await;
+        if pins.is_empty() && fragment.is_none() && !global {
+            if let Ok(product) = &product {
+                if product.product_conversation_id.as_str() == id
+                    || reference.starts_with("/product-conversations/")
+                {
+                    canonical_product = Some(product.product_conversation_id.to_string());
+                }
+            }
+        }
+        if canonical_product.is_none() {
+            let selected = pins.first().unwrap_or(&id);
+            let conv = load_conversation_by_slug_or_id(service, selected).await?;
+            if let Some(pin) = pins.first() {
+                if conv.id != *pin {
+                    return Err(AppError::BadRequest(
+                        "Exact transcript must identify a transcript row".into(),
+                    ));
+                }
+                let owner = load_conversation_by_slug_or_id(service, &id).await;
+                let same_product = match &product {
+                    Ok(product) => conv.product_conversation_id == product.product_conversation_id,
+                    Err(_) => owner.as_ref().is_ok_and(|owner| {
+                        owner.product_conversation_id == conv.product_conversation_id
+                    }),
+                };
+                if !same_product {
+                    return Err(AppError::BadRequest(
+                        "Transcript is not a member of this conversation".into(),
+                    ));
+                }
+            }
+            if let Some(message_id) = fragment.and_then(message_id_fragment) {
+                return resolve_message(service, conv, &decode(message_id)?, global).await;
+            }
+            return Ok(resolve_conversation(service, conv, global).await);
+        }
     }
     if let Some(rest) = reference
         .strip_prefix("/chains/")
@@ -1199,8 +1246,7 @@ async fn resolve_reference_impl(
     }
     if let Some(id) = reference
         .strip_prefix("@conv:")
-        .or_else(|| reference.strip_prefix("/product-conversations/"))
-        .or(canonical_product)
+        .or(canonical_product.as_deref())
     {
         if id.contains('#') {
             return Err(AppError::BadRequest(
@@ -2253,10 +2299,40 @@ mod tests {
             .resolve_reference("@transcript:root-scope")
             .await
             .unwrap();
-        assert_eq!(exact.href.as_deref(), Some("/c/root-scope?source_transcript=root-scope"));
-        let pinned = service.resolve_reference(exact.href.as_deref().unwrap()).await.unwrap();
+        assert_eq!(
+            exact.href.as_deref(),
+            Some("/c/root-scope?source_transcript=root-scope")
+        );
+        let pinned = service
+            .resolve_reference(exact.href.as_deref().unwrap())
+            .await
+            .unwrap();
         assert_eq!(pinned.id, exact.id);
         assert_eq!(pinned.work_scope, exact.work_scope);
+        for path in [
+            format!("/c/{product_id}"),
+            format!("/product-conversations/{product_id}"),
+        ] {
+            let pinned = service
+                .resolve_reference(&format!(
+                    "{path}?source_transcript=root%2Dscope&viewer=inspect"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(pinned.id, exact.id);
+            assert_eq!(pinned.work_scope, exact.work_scope);
+            for suffix in [
+                "source_transcript=",
+                "source_transcript=missing",
+                "source_transcript=root-scope&source_transcript=other",
+            ] {
+                assert!(service
+                    .resolve_reference(&format!("{path}?{suffix}"))
+                    .await
+                    .is_err());
+            }
+        }
+
         assert_eq!(
             exact.work_scope,
             ResolvedWorkScope::Available {
