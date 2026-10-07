@@ -5926,7 +5926,7 @@ impl RuntimeManager {
                     );
                 ToolRegistryExecutor::builtin_only(
                     ToolRegistry::coordinator(
-                        crate::coordinator_tools::tools(service, send_chat),
+                        crate::coordinator_tools::tools(service, send_chat, self.db.clone()),
                         coordinator_catalog.clone(),
                     ),
                     agent_catalog.clone(),

@@ -36,11 +36,53 @@ pub struct RemoteQueryDatabaseRequest {
     pub sql: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct RemoteQueryDatabaseResponse {
     pub destination_instance_id: InstanceId,
     pub caller_instance_id: InstanceId,
     pub result: phoenix_db::CoordinatorQueryResult,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FederationClientError {
+    #[error("peer connection not found")]
+    PeerNotFound,
+    #[error("peer database lookup failed: {0}")]
+    Database(#[from] phoenix_db::DbError),
+    #[error("federation request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("destination identity mismatch")]
+    DestinationMismatch,
+}
+
+pub async fn query_remote_database(
+    db: &crate::db::Database,
+    peer_instance_id: InstanceId,
+    sql: &str,
+) -> Result<RemoteQueryDatabaseResponse, FederationClientError> {
+    let peer = db.federation_peer_connection(peer_instance_id).await?;
+    let peer = peer.ok_or(FederationClientError::PeerNotFound)?;
+    let endpoint = peer.base_url.query_database_endpoint();
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let response = client
+        .post(endpoint.as_url().clone())
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&serde_json::json!({
+            "destination_instance_id": peer_instance_id,
+            "sql": sql,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RemoteQueryDatabaseResponse>()
+        .await?;
+    if response.destination_instance_id != peer_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    Ok(response)
 }
 
 fn random_peer_token() -> String {
