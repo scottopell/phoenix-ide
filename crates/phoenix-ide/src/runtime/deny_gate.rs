@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 pub struct CheckedToolCall {
     name: String,
     input: Value,
+    expected_input_schema: Option<Value>,
 }
 
 impl CheckedToolCall {
@@ -31,8 +32,19 @@ impl CheckedToolCall {
     }
 
     /// Consume the proof, yielding the validated name and input for execution.
+    #[cfg(test)]
     pub fn into_parts(self) -> (String, Value) {
         (self.name, self.input)
+    }
+
+    #[must_use]
+    pub fn with_input_schema(mut self, input_schema: Value) -> Self {
+        self.expected_input_schema = Some(input_schema);
+        self
+    }
+
+    pub fn into_bound_parts(self) -> (String, Value, Option<Value>) {
+        (self.name, self.input, self.expected_input_schema)
     }
 
     /// Test-only mint. `#[cfg(test)]` keeps it out of production builds, so the
@@ -42,6 +54,7 @@ impl CheckedToolCall {
         Self {
             name: name.into(),
             input,
+            expected_input_schema: None,
         }
     }
 }
@@ -85,7 +98,11 @@ impl DenyGate {
         if name == "bash" {
             bash_deny_rule(&input)?;
         }
-        Ok(CheckedToolCall { name, input })
+        Ok(CheckedToolCall {
+            name,
+            input,
+            expected_input_schema: None,
+        })
     }
 }
 

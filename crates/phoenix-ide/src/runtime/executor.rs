@@ -829,7 +829,7 @@ where
         };
     }
     let output = tool_executor
-        .execute(checked, tool_ctx)
+        .execute(checked.with_input_schema(request_schema), tool_ctx)
         .instrument(span.clone())
         .await;
 
@@ -20205,6 +20205,15 @@ mod steer_drain_detector_tests {
             ConvState::LlmRequesting { attempt: 1 },
             vec![],
         );
+        rt.tool_executor = Arc::new(Arc::new(
+            MockToolExecutor::new().with_tool("bash", crate::tools::ToolOutput::success("ok")),
+        ));
+        storage.seed_tool_admission_policy(
+            &rt.context.conversation_id,
+            phoenix_core::domain::tool_availability::ToolAvailability::all(
+                rt.tool_executor.definitions().await,
+            ),
+        );
         rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
             content: vec![ContentBlock::ToolUse {
                 id: "tool-1".into(),
@@ -20665,10 +20674,19 @@ mod steer_drain_detector_tests {
 
     #[tokio::test]
     async fn trusted_payload_survives_staged_tool_round() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-trusted-tool-round",
             ConvState::LlmRequesting { attempt: 1 },
             vec![],
+        );
+        rt.tool_executor = Arc::new(Arc::new(
+            MockToolExecutor::new().with_tool("bash", crate::tools::ToolOutput::success("ok")),
+        ));
+        storage.seed_tool_admission_policy(
+            &rt.context.conversation_id,
+            phoenix_core::domain::tool_availability::ToolAvailability::all(
+                rt.tool_executor.definitions().await,
+            ),
         );
         rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
             tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),

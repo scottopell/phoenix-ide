@@ -2886,7 +2886,7 @@ impl ToolRegistryExecutor {
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
     async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
-        let (name, input) = call.into_parts();
+        let (name, input, expected_schema) = call.into_bound_parts();
         // Look up the tool while holding the read lock, then drop the guard
         // before the async .run() call (RwLockReadGuard is !Send).
         let tool = {
@@ -2897,18 +2897,35 @@ impl ToolExecutor for ToolRegistryExecutor {
             registry.find_tool(&name)
         };
         if let Some(t) = tool {
+            if expected_schema
+                .as_ref()
+                .is_some_and(|expected| *expected != t.input_schema())
+            {
+                return Some(ToolOutput::error(
+                    "EUNAVAIL: tool input schema changed before execution",
+                ));
+            }
             return Some(t.run(input, ctx).await);
         }
 
         // Fall back to live MCP tool resolution.
         if let Some(ref manager) = self.mcp_manager {
-            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name(manager, &name).await
+            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name_with_schema(
+                manager,
+                &name,
+                expected_schema.as_ref(),
+            )
+            .await
             {
                 return Some(mcp_tool.run(input, ctx).await);
             }
         }
 
-        None
+        expected_schema.map(|_| {
+            ToolOutput::error(
+                "EUNAVAIL: tool is unavailable or its input schema changed before execution",
+            )
+        })
     }
 
     fn coordinator_skill_catalog(
