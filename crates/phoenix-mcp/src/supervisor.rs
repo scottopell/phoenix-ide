@@ -1720,7 +1720,10 @@ mod epoch_tests {
             let handle = handle.clone();
             async move { handle.claim_recovery(0).await }
         });
-        started_rx.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let mut oauth_claim = Box::pin(handle.claim_oauth_recovery(0));
         assert!(futures::poll!(oauth_claim.as_mut()).is_pending());
         releases.add_permits(1);
