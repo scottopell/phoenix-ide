@@ -66,6 +66,10 @@ impl MockLlmClient {
 
 #[async_trait]
 impl LlmClient for MockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.requests.lock().unwrap().push(request.clone());
         self.request_count_tx.send_modify(|count| *count += 1);
@@ -149,6 +153,10 @@ impl StreamingMockLlmClient {
 
 #[async_trait]
 impl LlmClient for StreamingMockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         // Not used — complete_streaming is the intended path.
         Err(LlmError::network(
@@ -292,6 +300,10 @@ impl DelayedMockLlmClient {
 
 #[async_trait]
 impl LlmClient for DelayedMockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.inner.requests.lock().unwrap().push(request.clone());
         self.request_started.notify_waiters();

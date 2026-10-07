@@ -296,6 +296,7 @@ AND SHALL return one matching unavailable error result without execution when au
 
 WHEN preparing a provider request
 THE SYSTEM SHALL render the current conversation policy using only controls supported by the selected route and model
+AND SHALL bind request preparation and dispatch to the same resolved provider service so a registry reload cannot retarget prepared private continuation
 AND SHALL preserve required provider-private continuation through retry and restart
 AND SHALL scope Codex continuation to its selected account identity, preserving it through same-account token refresh and retiring it before requests under another account
 AND SHALL admit Codex routes only when their account identity is known

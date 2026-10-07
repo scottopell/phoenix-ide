@@ -653,6 +653,8 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError>;
+
     fn continuation_route_key(&self) -> Result<String, LlmError> {
         Ok(self.model_id().to_owned())
     }
@@ -1425,6 +1427,10 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
 #[async_trait]
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        T::freeze_for_request(Arc::clone(self.as_ref()))
+    }
+
     fn continuation_route_key(&self) -> Result<String, LlmError> {
         (**self).continuation_route_key()
     }
@@ -2776,6 +2782,12 @@ impl RegistryLlmClient {
 
 #[async_trait]
 impl LlmClient for RegistryLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(Arc::new(FrozenServiceClient {
+            service: self.service()?,
+        }))
+    }
+
     fn continuation_route_key(&self) -> Result<String, LlmError> {
         self.service()
             .map(|service| service.continuation_route_key())
@@ -2804,6 +2816,41 @@ impl LlmClient for RegistryLlmClient {
             phoenix_llm::ContinuationRequestLimits::TokenWindowOnly,
             |llm| llm.continuation_request_limits(),
         )
+    }
+}
+
+struct FrozenServiceClient {
+    service: Arc<dyn phoenix_llm::LlmService>,
+}
+
+#[async_trait]
+impl LlmClient for FrozenServiceClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
+        Ok(self.service.continuation_route_key())
+    }
+
+    async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.service.complete(request).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        self.service.complete_streaming(request, chunk_tx).await
+    }
+
+    fn model_id(&self) -> &str {
+        self.service.model_id()
+    }
+
+    fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
+        self.service.continuation_request_limits()
     }
 }
 
@@ -3085,6 +3132,128 @@ mod tool_registry_executor_tests {
 #[cfg(test)]
 mod registry_llm_client_tests {
     use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn frozen_request_cannot_send_prepared_private_replay_through_reloaded_account() {
+        use phoenix_core::domain::{
+            llm_types::{EffectiveEffort, EffectiveServiceTier, PromptCacheKey},
+            provider_replay::ProviderReplayUpdate,
+            responses_replay::ResponsesResponseSet,
+        };
+        use phoenix_llm::CredentialSource;
+
+        let directory = tempfile::tempdir().unwrap();
+        let write_account = |name: &str| {
+            let path = directory.path().join(format!("{name}.json"));
+            std::fs::write(&path, format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9.","refresh_token":"test","account_id":"{name}"}}}}"#,
+            )).unwrap();
+            path
+        };
+        let first_path = write_account("account-a");
+        let first_credential = phoenix_llm::CodexCredential::load(first_path).unwrap().0;
+        let registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(Arc::clone(&first_credential)),
+            ..Default::default()
+        }));
+        let client = Arc::new(Arc::new(
+            RegistryLlmClient::new(Arc::clone(&registry), "gpt-5.6-sol".into())
+                .with_connection(Some("codex".into())),
+        ));
+        let frozen = Arc::clone(&client).freeze_for_request().unwrap();
+        let first_route = frozen.continuation_route_key().unwrap();
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("frozen", "frozen", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let policy = db
+            .prepare_tool_availability(
+                "frozen",
+                &first_route,
+                None,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        let replay = ResponsesResponseSet {
+            response_id: "response-a".into(),
+            model: "gpt-5.6-sol".into(),
+            owner_message_id: "owner-a".into(),
+            public_content: vec![],
+            output_items: vec![serde_json::json!({
+                "type":"reasoning", "id":"reason-a", "encrypted_content":"account-a-private",
+            })],
+        };
+        db.update_state_and_replay(
+            "frozen",
+            &ConvState::LlmRequesting { attempt: 1 },
+            Utc::now(),
+            &ProviderReplayUpdate::Responses(replay.clone()),
+        )
+        .await
+        .unwrap();
+        let request = LlmRequest {
+            system: vec![],
+            messages: vec![],
+            provider_replay: None,
+            responses_replay: db.load_responses_replay_state("frozen").await.unwrap(),
+            tool_availability: policy.clone(),
+            max_tokens: Some(100),
+            effective_effort: EffectiveEffort::native_unknown(),
+            service_tier: EffectiveServiceTier::Standard,
+            telemetry: None,
+            cache_key: PromptCacheKey::ephemeral(),
+        };
+        assert_eq!(request.responses_replay, vec![replay.clone()]);
+        first_credential.revoke().await;
+        let second_path = write_account("account-b");
+        assert!(
+            registry
+                .reload_codex_credential_with(Some(second_path))
+                .credential_loaded
+        );
+        assert!(registry
+            .current_codex_credential()
+            .unwrap()
+            .get()
+            .await
+            .is_some());
+        let second = Arc::clone(&client).freeze_for_request().unwrap();
+        assert_ne!(second.continuation_route_key().unwrap(), first_route);
+        assert_eq!(frozen.continuation_route_key().unwrap(), first_route);
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(1);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            frozen.complete_streaming(&request, &chunk_tx),
+        )
+        .await
+        .expect("revoked originating credential must fail before transport")
+        .unwrap_err();
+        assert_eq!(error.kind, phoenix_llm::LlmErrorKind::Auth);
+        assert!(error.message.contains("credential signed out"));
+        assert_eq!(
+            db.load_responses_replay_state("frozen").await.unwrap(),
+            vec![replay]
+        );
+        let retained = db
+            .prepare_tool_availability(
+                "frozen",
+                &first_route,
+                None,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained.continuation_id(), policy.continuation_id());
+    }
 
     fn codex_registry() -> (tempfile::TempDir, Arc<ModelRegistry>) {
         let dir = tempfile::tempdir().unwrap();

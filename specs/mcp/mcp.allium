@@ -975,12 +975,15 @@ invariant SupersededCompletionCannotPublish {
 }
 
 invariant SchemaBoundInvocationsCannotRetarget {
-    -- An invocation carrying an admitted schema selects one supervisor handle.
+    -- At MCP invocation admission, a call carrying its originating request's
+    -- admitted schema selects one live supervisor handle. Tool advertisement
+    -- does not bind a supervisor incarnation across generation or restart.
     -- Queuing, connection recovery, and retry retain that handle and schema.
     -- Immediately before tools/call, the supervisor compares the admitted
     -- schema with its serving connection's cached tool definition. Absence or
-    -- mismatch returns EUNAVAIL without provider I/O. Reload cannot redirect
-    -- old arguments to a replacement supervisor or a different schema.
+    -- mismatch returns EUNAVAIL without provider I/O. Once the handle is
+    -- selected, reload cannot redirect that invocation to a replacement
+    -- supervisor or a different schema.
     -- Callers without a schema retain their own invocation contracts.
 }
 

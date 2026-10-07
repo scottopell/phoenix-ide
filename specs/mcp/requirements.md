@@ -377,7 +377,7 @@ servers finishing connection (or arriving via reload) after a conversation
 starts still contribute their tools.
 
 WHEN an invocation carries its admitted tool schema
-THE SYSTEM SHALL bind it to the selected server supervisor
+THE SYSTEM SHALL select and bind one live server supervisor at MCP invocation admission
 AND SHALL check that schema against the serving connection's definition immediately before sending each call, including recovery retries
 AND SHALL return an unavailable error without sending the call if the definition is absent or changed.
 

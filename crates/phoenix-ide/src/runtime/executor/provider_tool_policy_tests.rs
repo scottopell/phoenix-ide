@@ -71,6 +71,10 @@ impl RenderingAnthropicClient {
 
 #[async_trait]
 impl LlmClient for RenderingAnthropicClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     fn continuation_route_key(&self) -> Result<String, LlmError> {
         Ok("anthropic:https://api.anthropic.com/v1/messages:claude-opus-5-5".into())
     }

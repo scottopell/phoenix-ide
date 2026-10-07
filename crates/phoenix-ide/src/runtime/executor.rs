@@ -7547,7 +7547,11 @@ where
         let dispatch_generation = self.llm_request_generation;
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
-        let llm_client = self.llm_client.clone();
+        let llm_client = self
+            .llm_client
+            .clone()
+            .freeze_for_request()
+            .map_err(|error| error.to_string())?;
         let tool_executor = self.tool_executor.clone();
         let storage = self.storage.clone();
         let conv_id = self.context.conversation_id.clone();

@@ -342,6 +342,10 @@ contract ProviderRequestProjection {
         -- Omitting a foreign wire control does not remove its conversation policy.
 
     @invariant ContinuationBelongsToContext
+        -- Resolve the selected service once before request preparation. Derive
+        -- continuation identity and project private replay for that service,
+        -- then dispatch through the same immutable service binding. A registry
+        -- reload cannot retarget prepared data to a different account or route.
         -- Private replay, native tool-change events, and server/transport
         -- continuation handles are bound to their originating route and
         -- continuation identity. Retry/restart of the same context retains
