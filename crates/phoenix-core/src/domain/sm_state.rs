@@ -168,6 +168,12 @@ impl QuestionRequestAuthority {
     }
 }
 
+impl Default for QuestionRequestAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'de> Deserialize<'de> for QuestionRequestAuthority {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
