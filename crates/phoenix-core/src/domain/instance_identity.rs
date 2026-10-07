@@ -63,6 +63,91 @@ impl<'de> serde::Deserialize<'de> for InstanceId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerBaseUrl(url::Url);
+
+#[derive(Debug, thiserror::Error)]
+pub enum PeerBaseUrlError {
+    #[error("invalid peer URL: {0}")]
+    Invalid(#[from] url::ParseError),
+    #[error("peer URL must use HTTPS")]
+    NotHttps,
+    #[error("peer URL must not contain credentials, query, or fragment")]
+    ContainsAmbientData,
+    #[error("peer URL must be an origin without a path")]
+    ContainsPath,
+}
+
+impl FromStr for PeerBaseUrl {
+    type Err = PeerBaseUrlError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let url = url::Url::parse(value)?;
+        if url.scheme() != "https" {
+            return Err(PeerBaseUrlError::NotHttps);
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(PeerBaseUrlError::ContainsAmbientData);
+        }
+        if url.path() != "/" {
+            return Err(PeerBaseUrlError::ContainsPath);
+        }
+        Ok(Self(url))
+    }
+}
+
+impl fmt::Display for PeerBaseUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl PeerBaseUrl {
+    /// Resolve one fixed federation API path against this peer origin.
+    ///
+    /// # Errors
+    /// Returns a URL parse error if the supplied path is not a valid relative reference.
+    pub fn endpoint(&self, path: &str) -> Result<url::Url, url::ParseError> {
+        self.0.join(path)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerBearerCredential(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid peer bearer credential")]
+pub struct PeerBearerCredentialError;
+
+impl PeerBearerCredential {
+    /// Parse a receiver-issued federation bearer credential.
+    ///
+    /// # Errors
+    /// Returns an error when the credential is outside the reserved token namespace or shape.
+    pub fn parse(value: String) -> Result<Self, PeerBearerCredentialError> {
+        let encoded = value
+            .strip_prefix("phx_peer_")
+            .ok_or(PeerBearerCredentialError)?;
+        if encoded.len() != 43
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(PeerBearerCredentialError);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FederationCredentialVerifier([u8; 32]);
 
 impl FederationCredentialVerifier {
@@ -85,6 +170,32 @@ impl fmt::Display for FederationCredentialVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_base_url_requires_a_bare_https_origin() {
+        assert!(PeerBaseUrl::from_str("https://peer.example").is_ok());
+        for value in [
+            "http://peer.example",
+            "https://user@peer.example",
+            "https://peer.example/path",
+            "https://peer.example/?query=yes",
+            "https://peer.example/#fragment",
+        ] {
+            assert!(PeerBaseUrl::from_str(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn peer_bearer_credential_requires_issued_shape() {
+        assert!(PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).is_ok());
+        for value in [
+            "owner-password".to_string(),
+            "phx_peer_short".to_string(),
+            format!("phx_peer_{}=", "a".repeat(42)),
+        ] {
+            assert!(PeerBearerCredential::parse(value).is_err());
+        }
+    }
 
     #[test]
     fn instance_identity_rejects_non_v4_uuids() {
