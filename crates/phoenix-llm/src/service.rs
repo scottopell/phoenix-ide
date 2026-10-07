@@ -249,11 +249,23 @@ impl LlmService for LlmServiceImpl {
                 .as_deref()
                 .unwrap_or("https://api.openai.com/v1/chat/completions"),
         };
-        format!(
+        let route = format!(
             "{}:{}:{endpoint}",
             self.spec.backend.header_value(),
             self.spec.api_name
-        )
+        );
+        if self.use_codex_backend {
+            let account_id = self
+                .codex_credential
+                .as_ref()
+                .map(|credential| credential.account_id());
+            format!(
+                "{route}:codex-account={}",
+                serde_json::to_string(&account_id).expect("optional account string serializes")
+            )
+        } else {
+            route
+        }
     }
 
     fn uses_codex_bridge(&self) -> bool {
@@ -306,9 +318,10 @@ impl LlmServiceImpl {
         }
         if let Some(ref cred) = self.codex_credential {
             headers.retain(|(name, _)| !name.eq_ignore_ascii_case("chatgpt-account-id"));
-            if let Some(account_id) = cred.account_id() {
-                headers.push(("chatgpt-account-id".to_string(), account_id));
-            }
+            headers.push((
+                "chatgpt-account-id".to_string(),
+                cred.account_id().to_owned(),
+            ));
             // OpenAI-Beta is required by the ChatGPT-backend Responses
             // endpoint for the experimental Responses surface; Codex CLI
             // and Pi both send it. `originator` is OpenAI's telemetry-
@@ -817,6 +830,59 @@ mod tests {
     }
 
     #[test]
+    fn codex_continuation_route_tracks_pinned_account_without_tracking_tokens() {
+        fn service(path: std::path::PathBuf, account: &str, token_marker: &str) -> LlmServiceImpl {
+            let jwt = format!(
+                "e30.{}.sig",
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    format!(r#"{{"exp":9999999999,"marker":"{token_marker}"}}"#)
+                )
+            );
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{jwt}","refresh_token":"refresh-{token_marker}","account_id":"{account}"}}}}"#
+                ),
+            )
+            .unwrap();
+            let (credential, account_id) = crate::CodexCredential::load(path).unwrap();
+            let bound = Arc::new(AccountBoundCodexCredential::new(
+                credential,
+                account_id.unwrap(),
+            ));
+            let spec = all_models()
+                .into_iter()
+                .find(|spec| spec.id == "gpt-6-astra")
+                .unwrap();
+            let auth = LlmAuth::new(
+                Arc::clone(&bound) as Arc<dyn CredentialSource>,
+                AuthStyle::PlainBearer,
+            );
+            LlmServiceImpl::new_with_codex_backend(spec, auth, Vec::new(), bound)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let first = service(dir.path().join("first.json"), "account-a", "first-secret");
+        let refreshed = service(dir.path().join("refreshed.json"), "account-a", "new-secret");
+        let switched = service(
+            dir.path().join("switched.json"),
+            "account-b",
+            "other-secret",
+        );
+        assert_eq!(
+            first.continuation_route_key(),
+            refreshed.continuation_route_key()
+        );
+        assert_ne!(
+            first.continuation_route_key(),
+            switched.continuation_route_key()
+        );
+        assert!(first.continuation_route_key().contains("account-a"));
+        assert!(!first.continuation_route_key().contains("first-secret"));
+        assert!(!refreshed.continuation_route_key().contains("new-secret"));
+    }
+
+    #[test]
     fn codex_bound_account_header_replaces_custom_override() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
@@ -831,7 +897,10 @@ mod tests {
         )
         .unwrap();
         let (credential, account_id) = crate::CodexCredential::load(path).unwrap();
-        let bound = Arc::new(AccountBoundCodexCredential::new(credential, account_id));
+        let bound = Arc::new(AccountBoundCodexCredential::new(
+            credential,
+            account_id.unwrap(),
+        ));
         let mut spec = all_models()
             .into_iter()
             .find(|spec| spec.id == "gpt-6-astra")

@@ -207,12 +207,17 @@ value TokenChunk {
 -- One request's tool policy. Definitions describe tools for provider history
 -- and rendering; callable_names authorizes new execution. They have different
 -- consumers and may differ when a phase ends or a service becomes unavailable.
+-- Each name retains its latest authentic declaration when absent from the live
+-- catalog. Native continuation separately owns immutable initial declarations
+-- and the complete ordered definition changes used for its historical prefix.
 entity ToolAvailability {
     declarations: List<ToolDeclaration>
     callable_names: List<String>
 }
 
--- A route identifies the concrete provider endpoint and execution protocol.
+-- A route identifies the concrete provider endpoint and execution protocol,
+-- including the selected account ID for account-bound Codex execution. An
+-- ordinary token refresh for that account does not change the route identity.
 -- The continuation identity changes when a provider switch settles.
 entity ConversationProviderContext {
     conversation_id: String
@@ -340,7 +345,9 @@ contract ProviderRequestProjection {
         -- Private replay, native tool-change events, and server/transport
         -- continuation handles are bound to their originating route and
         -- continuation identity. Retry/restart of the same context retains
-        -- required data and positions. A settled provider switch atomically
+        -- required data and positions under the same account. Switching Codex
+        -- accounts changes the route identity and retires the old context before
+        -- provider I/O. A settled provider switch atomically
         -- retires that context with the settings/handoff transition and starts
         -- a fresh identity; it leaves no suspended provider context to resume.
         -- Returning to a route establishes current policy afresh, without

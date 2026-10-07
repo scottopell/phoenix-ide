@@ -73,7 +73,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [059](059_anthropic-private-replay-uses-active-opaque-state.md) | Anthropic private replay uses active opaque state | Accepted | REQ-LLM-004, REQ-LLM-005, REQ-LLM-006 |
 | [060](060_model-qualified-parallel-work-admission.md) | Parallel Work admission is explicitly model-qualified | Accepted | REQ-SA-001/003–005, REQ-PROJ-008, REQ-BED-008/018, REQ-LLM-003 |
 | [061](061_gpt-6-sol-is-manually-qualified-for-parallel-work.md) | GPT-6 Sol is manually qualified for parallel Work | Accepted | REQ-SA-001, REQ-PROJ-008 |
-| [062](062_codex-catalog-discovery-is-advisory-for-builtins.md) | Codex catalog discovery is advisory for supported built-ins | Accepted | REQ-LLM-003, REQ-LLM-004h |
+| [062](062_codex-catalog-discovery-is-advisory-for-builtins.md) | Codex catalog discovery is advisory for supported built-ins | Superseded by ADR-085 | REQ-LLM-003, REQ-LLM-004h |
 | [063](063_direct-distribution-uses-protected-signing-and-private-drafts.md) | Direct distribution uses protected signing and private draft publication | Proposed | REQ-DESKTOP-REL-003/005/007; `ArchitecturePair`, `ReleasePublication` |
 | [064](064_modern-build-identity-is-full-length-and-legacy-rollback-is-role-bound.md) | Modern build identity is full-length and legacy rollback is role-bound | Accepted | REQ-DEPLOY-002; REQ-PD-002/009/010/014; REQ-LDD-007/008/011/016; `RuntimeIdentity`, `DeployTransaction` |
 | [065](065_release-candidates-share-the-stable-artifact-path.md) | Release candidates share the stable artifact path | Accepted | REQ-DESKTOP-REL-001/003/005/007/008/009; `ReleaseIdentity`, `ReleasePublication` |
@@ -98,6 +98,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [082](082_legacy-auq-waits-retain-identity-absence.md) | Legacy AUQ waits retain identity absence | Accepted | REQ-AUQ-009, REQ-COMP-001; `QuestionRequestId`, `AwaitingUserResponse` |
 | [083](083_federation-instance-identity-and-known-credential-query-exclusions.md) | Federation establishes stable instance identity and excludes known credentials from agent SQL | Accepted | REQ-GR-011A; federation instance identity |
 | [084](084_tool-policy-is-independent-of-provider-history.md) | Tool policy is independent of provider history | Accepted | REQ-LLM-004i, REQ-LLM-005; provider continuation |
+| [085](085_codex-continuation-requires-an-identified-account.md) | Codex continuation requires an identified account | Accepted | REQ-LLM-004h, REQ-LLM-004i; account-bound route admission |
 
 ## For agents: which decisions bind your task
 
@@ -111,6 +112,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
+| Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |

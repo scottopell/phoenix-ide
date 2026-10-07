@@ -256,6 +256,10 @@ contract AnthropicToolContinuation {
         -- supports these controls; an Anthropic-compatible endpoint alone does
         -- not prove support. Unknown/unsupported routes use advisory restrictions
         -- and executor enforcement without changing historical content.
+        -- Their tools array uses the latest authentic declaration per name.
+        -- A declaration refresh can change the prompt/cache prefix; advisory
+        -- projection does not promise native prefix reuse or exempt the request
+        -- from the route's thinking-binding policy. It preserves exact owners.
 
     @invariant NewDefinitionsDoNotRewriteOldDefinitions
         -- With inline-tools-2026-09-15, tool_addition may carry tool_definition
