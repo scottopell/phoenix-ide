@@ -8131,7 +8131,6 @@ where
                 ),
             }));
         }
-        // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
             let advertised = self
                 .tool_executor
@@ -8139,9 +8138,26 @@ where
                 .await
                 .iter()
                 .any(|definition| definition.name == "spawn_agents");
-            if advertised {
-                return self.handle_spawn_agents_tool(tool).await;
+            let catalog = super::agent_execution::SpawnCatalog::resolve(
+                &self.agent_config,
+                self.llm_registry.available_execution_routes(),
+            );
+            let definition = catalog.tool_definition(
+                &self.context.model_id,
+                self.llm_registry.is_builtin_model(&self.context.model_id),
+            );
+            if !advertised || definition.input_schema != request_schema {
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id: tool.id.clone(),
+                    result: ToolResult::error(
+                        tool.id.clone(),
+                        "EUNAVAIL: spawn_agents no longer matches the originating request policy"
+                            .into(),
+                    ),
+                }));
             }
+            self.spawn_catalog = Some(catalog);
+            return self.handle_spawn_agents_tool(tool).await;
         }
 
         // REQ-WPV-002: stamp the per-tool start time into the parent
@@ -21435,6 +21451,147 @@ mod work_subagent_cwd_guard_tests {
             | ToolOutcome::TrustedInstructions { output }
             | ToolOutcome::Error { output, .. } => output.clone(),
             ToolOutcome::Cancelled { message } => message.clone(),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn resumed_spawn_dispatch_requires_the_originating_catalog_schema() {
+        use crate::runtime::traits::DatabaseStorage;
+        use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
+
+        for (changed_catalog, advertised) in [(true, true), (false, false), (false, true)] {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("pending-spawn.db");
+            let template = runtime_in_work_mode(directory.path());
+            let definition = super::super::agent_execution::SpawnCatalog::resolve(
+                &template.agent_config,
+                template.llm_registry.available_execution_routes(),
+            )
+            .tool_definition("gpt-5.6-sol", true);
+            let call = spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "implement the fix".into(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Work),
+                    execution: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            });
+            let state = ConvState::ToolExecuting {
+                current_tool: call.clone(),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message: crate::state_machine::AssistantMessage::new(
+                    "spawn-owner".into(),
+                    vec![ContentBlock::tool_use(
+                        &call.id,
+                        "spawn_agents",
+                        serde_json::json!({"tasks":[{"task":"implement the fix","mode":"work"}]}),
+                    )],
+                    None,
+                    None,
+                ),
+            };
+            let db = crate::db::Database::open(path.to_str().unwrap())
+                .await
+                .unwrap();
+            phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+            db.create_conversation("cwd-guard-conv", "spawn", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.prepare_tool_availability(
+                "cwd-guard-conv",
+                "route",
+                None,
+                &[definition],
+                &["spawn_agents".into()].into_iter().collect(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+            db.update_state_and_replay(
+                "cwd-guard-conv",
+                &state,
+                chrono::Utc::now(),
+                &ProviderReplayUpdate::Clear,
+            )
+            .await
+            .unwrap();
+            db.pool().close().await;
+            let db = crate::db::Database::open(path.to_str().unwrap())
+                .await
+                .unwrap();
+            let restored = db.get_conversation("cwd-guard-conv").await.unwrap().state;
+            assert_eq!(restored, state);
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let tools = if advertised {
+                MockToolExecutor::new()
+                    .with_tool("spawn_agents", crate::tools::ToolOutput::success(""))
+            } else {
+                MockToolExecutor::new()
+            };
+            let (spawn_tx, spawn_rx) = mpsc::channel(1);
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            let mut resumed = ConversationRuntime::new(
+                template.context,
+                restored,
+                DatabaseStorage::new(db),
+                template.llm_client,
+                Arc::new(tools),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                template.llm_registry,
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx,
+                SseBroadcaster::new(32, 0),
+            )
+            .with_spawn_channels(spawn_tx, cancel_tx);
+            if changed_catalog {
+                resumed = resumed.with_agent_catalog(&[phoenix_agents::AgentDefinition {
+                    name: "new-worker".into(),
+                    description: "Newly configured worker".into(),
+                    body: "Perform work".into(),
+                    execution: None,
+                }]);
+            }
+            let rejected = changed_catalog || !advertised;
+            let mut untouched_receiver = None;
+            let responder = if rejected {
+                untouched_receiver = Some(spawn_rx);
+                None
+            } else {
+                Some(tokio::spawn(accept_spawn_batch(spawn_rx)))
+            };
+            let mut admitted = resumed.admit_authoritative_effect().unwrap();
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                resumed.dispatch_tool_execution(call.clone(), &mut admitted),
+            )
+            .await
+            .expect("schema validation must finish before spawn admission")
+            .unwrap();
+            if rejected {
+                let Some(Event::ToolComplete {
+                    tool_use_id,
+                    result,
+                }) = event
+                else {
+                    panic!("changed or withdrawn catalog must return a matched tool result");
+                };
+                assert_eq!(tool_use_id, call.id);
+                assert!(result.is_error());
+                assert!(tool_result_text(&result).starts_with("EUNAVAIL:"));
+                assert!(untouched_receiver.as_mut().unwrap().try_recv().is_err());
+            } else {
+                assert!(matches!(event, Some(Event::SpawnAgentsComplete { .. })));
+                assert_eq!(responder.unwrap().await.unwrap().len(), 1);
+            }
         }
     }
 
