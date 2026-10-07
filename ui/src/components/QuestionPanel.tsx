@@ -27,6 +27,7 @@ import './QuestionPanel.css';
 export interface QuestionPanelProps {
   questions: UserQuestion[];
   conversationId: string;
+  requestId?: string;
   showToast: (message: string, duration?: number) => void;
   /** Called after a successful respond/dismiss POST. The parent uses this to
    *  optimistically advance the local phase out of awaiting_user_response so
@@ -54,6 +55,7 @@ export function QuestionPanel({
   questions,
   conversationId,
   showToast,
+  requestId,
   onAnswered,
   onDismissed,
   readOnly = false,
@@ -97,6 +99,13 @@ export function QuestionPanel({
   >({});
 
   const otherInputRef = useRef<HTMLTextAreaElement>(null);
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const currentQuestion = questions[currentStep];
   const isLastStep = currentStep === questions.length - 1;
@@ -240,11 +249,14 @@ export function QuestionPanel({
     try {
       await api.respondToQuestion(
         conversationId,
+        requestId,
         buildAnswerMap(),
         buildAnnotations()
       );
-      onAnswered();
-      showToast('Response sent', 3000);
+      if (mountedRef.current) {
+        onAnswered();
+        showToast('Response sent', 3000);
+      }
     } catch (err) {
       const msg =
         err instanceof Error ? err.message : 'Failed to submit response';
@@ -257,6 +269,7 @@ export function QuestionPanel({
     allAnswered,
     submitting,
     conversationId,
+    requestId,
     buildAnswerMap,
     buildAnnotations,
     onAnswered,
@@ -274,16 +287,18 @@ export function QuestionPanel({
     setSubmitting(true);
     setFeedback(null);
     try {
-      await api.dismissQuestion(conversationId);
-      onDismissed();
-      showToast('Question dismissed. Type a message to continue.', 3000);
+      await api.dismissQuestion(conversationId, requestId);
+      if (mountedRef.current) {
+        onDismissed();
+        showToast('Question dismissed. Type a message to continue.', 3000);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to dismiss';
       setFeedback({ message: msg, isError: true });
     } finally {
       setSubmitting(false);
     }
-  }, [readOnly, submitting, conversationId, onDismissed, showToast]);
+  }, [readOnly, submitting, conversationId, requestId, onDismissed, showToast]);
 
   // --- Navigation ---
   const goToStep = useCallback(

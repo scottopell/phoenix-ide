@@ -288,27 +288,33 @@ async fn drive_conversation(
     conversation_id: &str,
     started: std::time::Instant,
 ) -> Result<DriveTurnResult, DriveTurnError> {
-    let expanded = expand_prompt(&request.prompt, cwd)?;
-    let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+    let _ = expand_prompt(&request.prompt, cwd)?;
 
     let mut state_rx = manager
         .subscribe_state(conversation_id)
         .await
         .map_err(DriveTurnError::Runtime)?;
     let message_id = uuid::Uuid::new_v4().to_string();
-    manager
-        .send_event(
-            conversation_id,
-            Event::UserMessage {
-                text: expanded.display_text,
-                llm_text,
+    let outcome =
+        crate::send_chat_service::SendChatApplicationService::new(db.clone(), manager.clone())
+            .send(crate::send_chat_service::SendChatRequest {
+                conversation_id: conversation_id.to_string(),
+                origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                text: request.prompt.clone(),
+                message_id,
                 images: Vec::new(),
                 files: Vec::new(),
-                message_id,
                 user_agent: Some("drive-turn".into()),
-                skill_invocation: expanded.skill_invocation,
-            },
-        )
+                expansion_policy:
+                    crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
+            })
+            .await
+            .map_err(|error| DriveTurnError::Runtime(error.to_string()))?;
+    if let crate::send_chat_service::SendChatOutcome::Rejected { message, .. } = outcome {
+        return Err(DriveTurnError::Runtime(message));
+    }
+    manager
+        .dispatch_standalone_turn(conversation_id)
         .await
         .map_err(DriveTurnError::Runtime)?;
 
@@ -554,6 +560,7 @@ mod tests {
     fn persisted_user_input_distinguishes_completed_empty_turn_from_initial_idle() {
         assert!(!turn_has_persisted_input(&[]));
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "user-message".into(),
             conversation_id: "conversation".into(),
             sequence_id: 1,

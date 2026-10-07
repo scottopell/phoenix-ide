@@ -161,3 +161,24 @@ THE SYSTEM SHALL include the tool in the standard tool list
 like bash and patch. Deferring it via tool search reduces context token cost
 without impacting availability -- the model discovers it when it needs to ask
 a question.
+
+---
+
+### REQ-AUQ-009: Bind Actions to the Current Pending Question
+
+WHEN the system creates a pending structured-question request
+THE SYSTEM SHALL assign a Phoenix-owned identity independent of the provider tool-use identity
+AND SHALL persist that identity with the pending conversation state
+
+WHEN a client answers or dismisses an identified pending request
+THE SYSTEM SHALL require the submitted identity to exactly match the current pending identity
+AND SHALL reject a missing or stale identity with an actionable conflict response
+AND SHALL validate the identity while holding the conversation's mutation-admission lock
+
+WHERE a pending request predates question-request identities
+THE SYSTEM SHALL preserve the absent identity
+AND SHALL accept only a correspondingly identity-absent answer or dismissal
+
+WHEN a newer pending request replaces the question displayed by a client
+THE client SHALL discard local question input for the previous identity
+AND a completion from the previous request SHALL NOT close or advance the newer question panel

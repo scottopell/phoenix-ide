@@ -114,6 +114,11 @@ struct StateDetailView: View {
     }
 }
 
+private struct QuestionPresentationIdentity: Hashable {
+    let requestId: String?
+    let legacyQuestions: [UserQuestion]
+}
+
 struct StateDetailBody: View {
     let state: ConversationState
     let presentationMode: String
@@ -167,18 +172,22 @@ struct StateDetailBody: View {
                     .foregroundStyle(.secondary)
             }
 
-        case .awaitingUserResponse(let questions):
+        case .awaitingUserResponse(let questions, let requestId):
             if questions.isEmpty {
-                emptyQuestionCard
+                emptyQuestionCard(requestId: requestId)
             } else {
                 QuestionCardBody(
                     questions: questions,
                     isOnline: isOnline,
                     acceptsActions: acceptsActions,
                     busy: busy,
-                    onAnswer: { onAction(.respondToQuestions(answers: $0)) },
-                    onDismiss: { onAction(.dismissQuestion) })
-                    .id(questions)
+                    onAnswer: {
+                        onAction(.respondToQuestions(requestId: requestId, answers: $0))
+                    },
+                    onDismiss: { onAction(.dismissQuestion(requestId: requestId)) })
+                    .id(QuestionPresentationIdentity(
+                        requestId: requestId,
+                        legacyQuestions: requestId == nil ? questions : []))
             }
 
         case .awaitingTaskApproval(let title, let priority, let plan):
@@ -267,7 +276,7 @@ struct StateDetailBody: View {
     ) -> String {
         let prefix = "Model overloaded… (attempt \(attempt)/\(maxAttempts))"
         guard let retryAt,
-              let deadline = ISO8601DateFormatter().date(from: retryAt)
+              let deadline = ServerTimestamp.parse(retryAt)
         else { return prefix }
         let seconds = max(0, Int(ceil(deadline.timeIntervalSince(now))))
         return "\(prefix) — retrying in \(seconds)s"
@@ -329,7 +338,7 @@ struct StateDetailBody: View {
             onDismiss: { onAction(.dismissError) })
     }
 
-    private var emptyQuestionCard: some View {
+    private func emptyQuestionCard(requestId: String?) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("The agent is waiting for a response", systemImage: "questionmark.bubble")
                 .font(.callout.bold())
@@ -365,7 +374,7 @@ struct StateDetailBody: View {
             titleVisibility: .visible
         ) {
             Button("Dismiss question", role: .destructive) {
-                onAction(.dismissQuestion)
+                onAction(.dismissQuestion(requestId: requestId))
             }
         }
     }

@@ -31,12 +31,19 @@ pub(crate) enum MessageExpansionPolicy {
 #[derive(Debug, Clone)]
 pub(crate) struct SendChatRequest {
     pub conversation_id: String,
+    pub origin: phoenix_core::domain::db_schema::InputOrigin,
     pub text: String,
     pub message_id: String,
     pub images: Vec<ImageAttachment>,
     pub files: Vec<FileAttachment>,
     pub user_agent: Option<String>,
     pub expansion_policy: MessageExpansionPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SendChatTarget {
+    ExactTranscript(String),
+    StableProductConversation(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +97,16 @@ impl SendChatApplicationService {
     pub(crate) fn new(db: crate::db::Database, runtime: Arc<RuntimeManager>) -> Self {
         Self { db, runtime }
     }
+    pub(crate) fn db(&self) -> &crate::db::Database {
+        &self.db
+    }
+
+    pub(crate) async fn source_conversation(
+        &self,
+        id: &str,
+    ) -> Result<crate::db::Conversation, crate::db::DbError> {
+        self.db.get_conversation(id).await
+    }
 
     pub(crate) async fn rearm_exact_terminal_turn(
         &self,
@@ -115,6 +132,7 @@ impl SendChatApplicationService {
         .await?;
         let submitted = SubmittedDirectTurnIdentity {
             message_id: message_id.as_str().to_string(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             text: expanded.display_text,
             images: Vec::new(),
             files: Vec::new(),
@@ -189,10 +207,90 @@ impl SendChatApplicationService {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn send_to_target(
+        &self,
+        target: SendChatTarget,
+        mut req: SendChatRequest,
+    ) -> Result<(String, SendChatOutcome), SendChatServiceError> {
+        match target {
+            SendChatTarget::ExactTranscript(conversation_id) => {
+                req.conversation_id = conversation_id.clone();
+                self.send(req)
+                    .await
+                    .map(|outcome| (conversation_id, outcome))
+            }
+            SendChatTarget::StableProductConversation(product_conversation_id) => {
+                let _product_admission = self
+                    .runtime
+                    .lock_product_message_admission(&product_conversation_id)
+                    .await;
+                let typed_product_conversation_id =
+                    phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                        &product_conversation_id,
+                    )
+                    .expect("stable target has a non-empty typed id");
+                if let Some(conversation_id) = self
+                    .db
+                    .product_conversation_client_message_owner(
+                        &typed_product_conversation_id,
+                        &req.message_id,
+                    )
+                    .await
+                    .map_err(map_conversation_load_error)?
+                {
+                    req.conversation_id = conversation_id.clone();
+                    return self
+                        .send(req)
+                        .await
+                        .map(|outcome| (conversation_id, outcome));
+                }
+                let aggregate = self
+                    .db
+                    .get_ordinary_product_conversation(&typed_product_conversation_id)
+                    .await
+                    .map_err(map_conversation_load_error)?;
+                let conversation_id = aggregate.latest_transcript_row_id;
+                let admission_guard = self.runtime.lock_message_acceptance(&conversation_id).await;
+                let admission = self
+                    .db
+                    .message_target_admission(&conversation_id)
+                    .await
+                    .map_err(map_conversation_load_error)?;
+                let crate::db::MessageTargetAdmission::Aggregate(
+                    crate::db::ProductConversationAdmission::Accepted {
+                        product_conversation_id: admitted_product_conversation_id,
+                    },
+                ) = admission
+                else {
+                    return Ok((conversation_id, history_unavailable_outcome()));
+                };
+                if admitted_product_conversation_id.as_str() != product_conversation_id {
+                    return Err(SendChatServiceError::Internal(
+                        "stable ProductConversation target changed identity during admission"
+                            .to_string(),
+                    ));
+                }
+                req.conversation_id = conversation_id.clone();
+                return self
+                    .send_with_admission_guard(req, Some(admission_guard))
+                    .await
+                    .map(|outcome| (conversation_id, outcome));
+            }
+        }
+    }
+
     pub(crate) async fn send(
         &self,
+        req: SendChatRequest,
+    ) -> Result<SendChatOutcome, SendChatServiceError> {
+        self.send_with_admission_guard(req, None).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn send_with_admission_guard(
+        &self,
         mut req: SendChatRequest,
+        admission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
         let conversation = self
             .runtime
@@ -211,6 +309,10 @@ impl SendChatApplicationService {
                         == req.message_id
             })
         {
+            req.origin = match intent.opening_authority {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            };
             req.text = intent.handoff;
             req.user_agent = intent.user_agent;
         }
@@ -238,7 +340,10 @@ impl SendChatApplicationService {
         {
             return Ok(outcome);
         }
-        let acceptance_guard = self.runtime.lock_message_acceptance(&conversation.id).await;
+        let acceptance_guard = match admission_guard {
+            Some(guard) => guard,
+            None => self.runtime.lock_message_acceptance(&conversation.id).await,
+        };
 
         // The pre-lock lookup is only a fast path. A concurrent request with
         // this client identity may commit while this request waits for the
@@ -405,6 +510,7 @@ impl SendChatApplicationService {
 
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
+                origin: req.origin.clone(),
                 llm_text: expanded.llm_text,
                 images: map_images(req.images.clone()),
                 files: validated_files.clone(),
@@ -756,6 +862,7 @@ fn submitted_expansion_policy(
 fn submitted_identity_from_request(req: &SendChatRequest) -> SubmittedDirectTurnIdentity {
     SubmittedDirectTurnIdentity {
         text: req.text.clone(),
+        origin: req.origin.clone(),
         images: req
             .images
             .iter()
@@ -829,9 +936,11 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::ConversationAlreadyExists(_)
         | crate::db::DbError::Serialization(_)
+        | crate::db::DbError::SubAgentLifecycleConflict(_)
         | crate::db::DbError::ContinuationPrecondition(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
+        | crate::db::DbError::CloseFoundationStaleLatest { .. }
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)
@@ -879,9 +988,11 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::MessageConflict(_)
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::Serialization(_)
+        | crate::db::DbError::SubAgentLifecycleConflict(_)
         | crate::db::DbError::ContinuationPrecondition(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
+        | crate::db::DbError::CloseFoundationStaleLatest { .. }
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)
@@ -934,7 +1045,7 @@ async fn lookup_durable_steering_replay(
                 )
             })?;
         if matches!(receipt, SteeringAcceptanceFingerprint::Exact(_)) {
-            validate_steering_fingerprint(&receipt, request_fingerprint)?;
+            validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
         }
         if matches!(receipt, SteeringAcceptanceFingerprint::LegacyUnknown)
             && req.expansion_policy != MessageExpansionPolicy::ExpandReferences
@@ -951,7 +1062,7 @@ async fn lookup_durable_steering_replay(
         {
             match receipt {
                 SteeringAcceptanceFingerprint::Exact(_) => {
-                    validate_steering_fingerprint(&receipt, request_fingerprint)?;
+                    validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
                 }
                 SteeringAcceptanceFingerprint::LegacyUnknown => {
                     if req.expansion_policy != MessageExpansionPolicy::ExpandReferences {
@@ -969,7 +1080,7 @@ async fn lookup_durable_steering_replay(
     else {
         return Ok(None);
     };
-    validate_steering_fingerprint(&receipt, request_fingerprint)?;
+    validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
     Ok(Some(SendChatOutcome::Rejected {
         message: "The accepted message was cancelled or failed before delivery.".to_string(),
         code: "turn_terminal",
@@ -1001,7 +1112,10 @@ async fn lookup_persisted_message_replay(
         | phoenix_core::domain::db_schema::MessageContent::Error(_)
         | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
     };
-    if message.conversation_id != req.conversation_id || !persisted_matches {
+    if message.conversation_id != req.conversation_id
+        || !message.origin.accepts_retry_origin(&req.origin)
+        || !persisted_matches
+    {
         return Err(SendChatServiceError::IdempotencyConflict);
     }
     Ok(Some(SendChatOutcome::AlreadyPersisted))
@@ -1012,6 +1126,7 @@ fn queued_retry_matches(
     req: &SendChatRequest,
 ) -> bool {
     entry.text == req.text
+        && entry.origin.accepts_retry_origin(&req.origin)
         && entry.images.len() == req.images.len()
         && entry
             .images
@@ -1082,11 +1197,19 @@ fn persisted_skill_matches(
 }
 
 fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceError> {
+    request_fingerprint_version(req, true)
+}
+
+fn request_fingerprint_version(
+    req: &SendChatRequest,
+    with_origin: bool,
+) -> Result<String, SendChatServiceError> {
     use sha2::Digest as _;
 
-    let canonical = serde_json::to_vec(&serde_json::json!({
+    let mut value = serde_json::json!({
         "conversation_id": req.conversation_id,
         "text": req.text,
+        "origin": req.origin,
         "images": req.images.iter().map(|image| serde_json::json!({
             "data": image.data,
             "media_type": image.media_type,
@@ -1098,8 +1221,21 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
             MessageExpansionPolicy::LiteralText => "literal_text",
             MessageExpansionPolicy::GeneratedPredecessorContext => "generated_predecessor_context",
         },
-    }))
-    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+    });
+    if let Some(origin) = value
+        .get_mut("origin")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        origin.remove("source_call");
+    }
+    if !with_origin {
+        value
+            .as_object_mut()
+            .expect("object literal")
+            .remove("origin");
+    }
+    let canonical = serde_json::to_vec(&value)
+        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
     Ok(sha2::Sha256::digest(canonical).iter().fold(
         String::with_capacity(64),
         |mut output, byte| {
@@ -1112,9 +1248,16 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
 fn validate_steering_fingerprint(
     receipt: &SteeringAcceptanceFingerprint,
     request_fingerprint: &str,
+    req: &SendChatRequest,
 ) -> Result<(), SendChatServiceError> {
     match receipt {
         SteeringAcceptanceFingerprint::Exact(exact) if exact == request_fingerprint => Ok(()),
+        SteeringAcceptanceFingerprint::Exact(exact)
+            if req.origin == phoenix_core::domain::db_schema::InputOrigin::UserApi
+                && *exact == request_fingerprint_version(req, false)? =>
+        {
+            Ok(())
+        }
         SteeringAcceptanceFingerprint::Exact(_) | SteeringAcceptanceFingerprint::LegacyUnknown => {
             Err(SendChatServiceError::IdempotencyConflict)
         }
@@ -1171,6 +1314,7 @@ mod tests {
 
     fn request() -> SendChatRequest {
         SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "hello".to_string(),
             message_id: "message-1".to_string(),
@@ -1286,6 +1430,190 @@ mod tests {
         db
     }
 
+    async fn historical_manual_opening(
+        db: &crate::db::Database,
+        predecessor: &str,
+        accepted_text: Option<&str>,
+    ) -> String {
+        let handoff = "historical manual handoff";
+        db.create_conversation(predecessor, predecessor, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            &format!("{predecessor}-summary"),
+            predecessor,
+            &crate::db::MessageContent::continuation(handoff),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            predecessor,
+            &crate::db::ConvState::ContextExhausted {
+                summary: handoff.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) =
+            db.continue_conversation(predecessor).await.unwrap()
+        else {
+            panic!("expected successor");
+        };
+        let opening_key = format!("{predecessor}-opening");
+        if let Some(text) = accepted_text {
+            db.add_message(
+                &format!("{}:{opening_key}", successor.id),
+                &successor.id,
+                &crate::db::MessageContent::user(text),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        // Insert the stale intent after the message so the current insert-time
+        // trigger does not settle a fixture representing the historical raw-ID miss.
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, user_agent, opening_authority, created_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, 'user_authorized_instruction', ?5)",
+        )
+        .bind(predecessor)
+        .bind(&successor.id)
+        .bind(opening_key)
+        .bind(handoff)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        successor.id
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Three historical fixtures share one migration pass.
+    async fn historical_manual_opening_repair_unfences_service_chat_only_with_matching_evidence() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let db = &state.db;
+        let matching =
+            historical_manual_opening(db, "matching-history", Some("historical manual handoff"))
+                .await;
+        let pending = historical_manual_opening(db, "pending-history", None).await;
+        let mismatched =
+            historical_manual_opening(db, "mismatched-history", Some("different accepted text"))
+                .await;
+        let service = super::SendChatApplicationService::new(db.clone(), state.runtime.clone());
+        let ordinary_request = |successor: &str| SendChatRequest {
+            conversation_id: successor.to_string(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            text: "ordinary subsequent chat".to_string(),
+            message_id: format!("ordinary-{successor}"),
+            expansion_policy: MessageExpansionPolicy::LiteralText,
+            ..request()
+        };
+        for successor in [&matching, &pending, &mismatched] {
+            assert!(!db
+                .is_reserved_continuation_opening(
+                    successor,
+                    &ordinary_request(successor).message_id
+                )
+                .await
+                .unwrap());
+            assert!(matches!(
+                service.send(ordinary_request(successor)).await.unwrap(),
+                SendChatOutcome::Rejected {
+                    code: "continuation_opening_pending",
+                    ..
+                }
+            ));
+        }
+        let historical_messages = db.get_messages(&matching).await.unwrap();
+        assert_eq!(historical_messages.len(), 1);
+        assert_eq!(
+            historical_messages[0].message_id,
+            format!("{matching}:matching-history-opening")
+        );
+
+        // Migration 113 is data-only; unstamp it on this isolated in-memory fixture.
+        assert_eq!(
+            sqlx::query("DELETE FROM _migrations WHERE version = 113")
+                .execute(db.pool())
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            phoenix_db::run_pending_migrations(db.pool()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            phoenix_db::run_pending_migrations(db.pool()).await.unwrap(),
+            0
+        );
+        assert!(!db
+            .has_pending_continuation_opening(&matching)
+            .await
+            .unwrap());
+        let receipt: (String, String) = sqlx::query_as(
+            "SELECT continuation_message_id, accepted_successor_message_id
+             FROM completed_continuation_handoffs WHERE predecessor_conversation_id = ?1",
+        )
+        .bind("matching-history")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt,
+            (
+                "matching-history-summary".to_string(),
+                historical_messages[0].message_id.clone(),
+            )
+        );
+        let repaired_messages = db.get_messages(&matching).await.unwrap();
+        assert_eq!(repaired_messages.len(), 1);
+        assert_eq!(
+            repaired_messages[0].sequence_id,
+            historical_messages[0].sequence_id
+        );
+        assert_eq!(repaired_messages[0].content, historical_messages[0].content);
+        assert_eq!(
+            service.send(ordinary_request(&matching)).await.unwrap(),
+            SendChatOutcome::Delivered
+        );
+        assert!(db
+            .workflow_repository()
+            .load_active_runtime_turn(&ConversationAuthority(matching))
+            .await
+            .unwrap()
+            .is_some());
+        for successor in [&pending, &mismatched] {
+            assert!(db
+                .has_pending_continuation_opening(successor)
+                .await
+                .unwrap());
+            assert!(matches!(
+                service.send(ordinary_request(successor)).await.unwrap(),
+                SendChatOutcome::Rejected {
+                    code: "continuation_opening_pending",
+                    ..
+                }
+            ));
+        }
+        let mut reserved_mismatch = ordinary_request(&pending);
+        reserved_mismatch.message_id = "pending-history-opening".to_string();
+        reserved_mismatch.expansion_policy = MessageExpansionPolicy::ExpandReferences;
+        assert!(matches!(
+            service.send(reserved_mismatch).await.unwrap(),
+            SendChatOutcome::Rejected {
+                code: "continuation_opening_mismatch",
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn generated_predecessor_context_preserves_display_bytes_but_not_user_authority() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
@@ -1332,6 +1660,7 @@ mod tests {
     #[test]
     fn submitted_identity_tracks_submitted_fields_not_mutable_expansion() {
         let base = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "@file:notes.md".to_string(),
             message_id: "message-1".to_string(),
@@ -1545,6 +1874,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1586,6 +1916,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1617,6 +1948,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1637,6 +1969,12 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE messages SET origin_kind = ?1 WHERE message_id = ?2")
+            .bind(req.origin.db_parts().0)
+            .bind(&req.message_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         assert!(db
             .remove_steering_entry(&req.conversation_id, &req.message_id)
             .await
@@ -1661,11 +1999,75 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn source_call_is_not_retry_payload_identity() {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let mut req = request();
+        req.origin = InputOrigin::InternalConversation {
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse("sender")
+                    .unwrap(),
+            transcript_id: "sender-member".into(),
+            source_call: Some(Box::new(SourceToolCall {
+                message_id: "first-message".into(),
+                tool_use_id: "first-call".into(),
+            })),
+        };
+        let original = req.origin.clone();
+        let fingerprint = super::request_fingerprint(&req).unwrap();
+        if let InputOrigin::InternalConversation { source_call, .. } = &mut req.origin {
+            *source_call = Some(Box::new(SourceToolCall {
+                message_id: "retry-message".into(),
+                tool_use_id: "retry-call".into(),
+            }));
+        }
+        assert!(original.accepts_retry_origin(&req.origin));
+        assert_eq!(fingerprint, super::request_fingerprint(&req).unwrap());
+        req.text.push_str(" changed");
+        assert_ne!(fingerprint, super::request_fingerprint(&req).unwrap());
+    }
+
+    #[tokio::test]
+    async fn pre_provenance_api_retry_keeps_unknown_queued_and_persisted_origin() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+        let mut req = request();
+        let db = db_with_conversation(&req.conversation_id).await;
+        persist_drained_legacy_steering(&db, &req).await;
+        req.origin = InputOrigin::UserApi;
+        let fingerprint = super::request_fingerprint(&req).unwrap();
+        assert_eq!(
+            lookup_durable_steering_replay(&db, &req, &fingerprint)
+                .await
+                .unwrap(),
+            Some(SendChatOutcome::AlreadyPersisted)
+        );
+        assert_eq!(
+            db.get_message_by_id_in_conversation(&req.conversation_id, &req.message_id)
+                .await
+                .unwrap()
+                .origin,
+            InputOrigin::UnknownHistorical
+        );
+        let legacy = SteeringAcceptanceFingerprint::Exact(
+            super::request_fingerprint_version(&req, false).unwrap(),
+        );
+        super::validate_steering_fingerprint(&legacy, &fingerprint, &req).unwrap();
+        req.text.push_str(" changed");
+        assert!(super::validate_steering_fingerprint(
+            &legacy,
+            &super::request_fingerprint(&req).unwrap(),
+            &req
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn legacy_queued_steering_identity_replays_when_payload_matches() {
-        let req = request();
+        let mut req = request();
+        req.origin = phoenix_core::domain::db_schema::InputOrigin::UserApi;
         let db = db_with_conversation(&req.conversation_id).await;
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1688,6 +2090,7 @@ mod tests {
 
     async fn persist_drained_legacy_steering(db: &crate::db::Database, req: &SendChatRequest) {
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1714,6 +2117,12 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE messages SET origin_kind = ?1 WHERE message_id = ?2")
+            .bind(req.origin.db_parts().0)
+            .bind(&req.message_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         assert!(db
             .remove_steering_entry(&req.conversation_id, &req.message_id)
             .await
@@ -1824,6 +2233,7 @@ mod tests {
     #[test]
     fn queued_retry_compares_submitted_payload_not_mutable_expansion() {
         let request = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "@file:notes.md".to_string(),
             message_id: "message-1".to_string(),
@@ -1833,6 +2243,7 @@ mod tests {
             expansion_policy: MessageExpansionPolicy::ExpandReferences,
         };
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: request.text.clone(),
             llm_text: Some("old expanded file contents".to_string()),
             images: vec![],
@@ -1851,6 +2262,7 @@ mod tests {
     #[test]
     fn persisted_skill_retry_matches_expanded_invocation() {
         let request = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "/build now".to_string(),
             message_id: "message-1".to_string(),

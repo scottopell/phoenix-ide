@@ -85,12 +85,14 @@ function renderStateBar({
   connectionAttempt = 0,
   phaseStateUpdatedAt,
   lastSseEventAt,
+  lastSseEventAtRef,
   firstByteRequestId,
   turnRetryContext,
   onOpenFiles,
   terminalLauncher,
   availableModels,
   onUpgradeModel,
+  conversationExtension,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -102,12 +104,14 @@ function renderStateBar({
   connectionAttempt?: number;
   phaseStateUpdatedAt?: number | null;
   lastSseEventAt?: number;
+  lastSseEventAtRef?: ComponentProps<typeof StateBar>['lastSseEventAtRef'];
   firstByteRequestId?: string | null;
   turnRetryContext?: ComponentProps<typeof StateBar>['turnRetryContext'];
   onOpenFiles?: ComponentProps<typeof StateBar>['onOpenFiles'];
   terminalLauncher?: ComponentProps<typeof StateBar>['terminalLauncher'];
   availableModels?: ComponentProps<typeof StateBar>['availableModels'];
   onUpgradeModel?: ComponentProps<typeof StateBar>['onUpgradeModel'];
+  conversationExtension?: ComponentProps<typeof StateBar>['conversationExtension'];
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
@@ -130,6 +134,9 @@ function renderStateBar({
   if (onUpgradeModel !== undefined) {
     props.onUpgradeModel = onUpgradeModel;
   }
+  if (conversationExtension !== undefined) {
+    props.conversationExtension = conversationExtension;
+  }
   if (continuation) {
     props.continuation = continuation;
   }
@@ -141,6 +148,9 @@ function renderStateBar({
   }
   if (lastSseEventAt !== undefined) {
     props.lastSseEventAtRef = { current: lastSseEventAt };
+  }
+  if (lastSseEventAtRef !== undefined) {
+    props.lastSseEventAtRef = lastSseEventAtRef;
   }
   if (firstByteRequestId !== undefined) {
     props.firstByteRequestId = firstByteRequestId;
@@ -154,6 +164,130 @@ function renderStateBar({
     </MemoryRouter>,
   );
 }
+
+describe('StateBar conversation extension', () => {
+  it('reveals extension recovery details when attention is required', () => {
+    setMobileViewport(true);
+    renderStateBar({
+      conversationExtension: {
+        summary: <span>Auto On · Failed</span>,
+        details: <div>Retry automatic continuation</div>,
+        requiresAttention: true,
+      },
+    });
+
+    expect(screen.getByText('Retry automatic continuation')).toBeVisible();
+    expect(document.querySelector('.statebar-chevron')).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('uses the existing mobile expansion control for extension details', () => {
+    setMobileViewport(true);
+    renderStateBar({
+      conversationExtension: {
+        summary: <span>Watching 2 Running 1 Auto On</span>,
+        details: <div>Global activity details</div>,
+      },
+    });
+
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(screen.getByText('Watching 2 Running 1 Auto On')).not.toBeVisible();
+    expect(screen.getByText('Global activity details')).not.toBeVisible();
+
+    fireEvent.click(document.querySelector('.statebar-chevron')!);
+
+    expect(screen.getByText('Global activity details')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Collapse status bar' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(screen.getByText('Watching 2 Running 1 Auto On')).toBeVisible();
+  });
+
+  it('uses transport-owned text and dot for the Global compact indicator', () => {
+    setMobileViewport(true);
+    const { container } = renderStateBar({
+      convState: { type: 'error', message: 'failed', error_kind: 'server_error' },
+      connectionState: 'connected',
+      conversationExtension: {
+        summary: <span>Watching 3</span>,
+        details: <div>Global activity details</div>,
+      },
+    });
+
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(container.querySelector('.statebar-mobile-status .dot')).toHaveClass('idle');
+    expect(container.querySelector('.statebar-mobile-status .dot')).not.toHaveClass('error');
+    expect(container.querySelector('.statebar-mobile-status')).toHaveClass('statebar-mobile-status--transport');
+  });
+
+  it.each([
+    ['connected', 'Connected'],
+    ['reconnected', 'Reconnected'],
+    ['reconnecting', 'Reconnecting'],
+    ['offline', 'Disconnected'],
+  ] as const)('keeps %s transport status visible when collapsed and expanded', (connectionState, label) => {
+    setMobileViewport(true);
+    renderStateBar({
+      connectionState,
+      connectionAttempt: 2,
+      conversationExtension: {
+        summary: <span>Watching 3 Running 1 Auto On · Continuing</span>,
+        details: <div>Global activity details</div>,
+      },
+    });
+
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.getByText(/Watching 3/)).not.toBeVisible();
+
+    fireEvent.click(document.querySelector('.statebar-chevron')!);
+
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.getByText(/Watching 3/)).toBeVisible();
+  });
+});
+
+describe('ordinary compact conversation status', () => {
+  it.each([
+    [{ type: 'llm_requesting', attempt: 1 } as const, 'awaiting LLM response'],
+    [{ type: 'awaiting_task_approval', title: 'Approve task', priority: 'P1', plan: 'Proceed' } as const, 'awaiting approval'],
+    [{ type: 'error', message: 'failed', error_kind: 'server_error' } as const, 'error'],
+  ])('preserves the derived connected status for %j', (convState, label) => {
+    setMobileViewport(true);
+    renderStateBar({ convState });
+
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.queryByText('Connected')).not.toBeInTheDocument();
+  });
+
+  it('does not duplicate ordinary status after expansion', () => {
+    setMobileViewport(true);
+    renderStateBar({ convState: { type: 'idle' } });
+
+    fireEvent.click(document.querySelector('.statebar-chevron')!);
+
+    expect(screen.getAllByText('ready')).toHaveLength(1);
+  });
+
+  it('keeps long ordinary reconnect status bounded with actions visible', () => {
+    setMobileViewport(true);
+    const { container } = renderStateBar({
+      connectionState: 'reconnecting',
+      connectionAttempt: 12,
+      convState: { type: 'llm_requesting', attempt: 1 },
+    });
+
+    const status = container.querySelector('.statebar-mobile-status');
+    expect(status).not.toHaveClass('statebar-mobile-status--transport');
+    expect(status).toHaveTextContent('reconnecting (12)');
+    expect(document.querySelector('.statebar-chevron')).toBeVisible();
+  });
+
+  it('preserves the ordinary disconnected status', () => {
+    setMobileViewport(true);
+    renderStateBar({ connectionState: 'offline' });
+
+    expect(screen.getByText('offline')).toBeVisible();
+    expect(screen.queryByText('Disconnected')).not.toBeInTheDocument();
+  });
+});
 
 describe('mobile terminal launcher', () => {
   it('reveals terminal status only in expanded details and opens it directly', () => {
@@ -1022,6 +1156,7 @@ describe('StateBar working-phase indicators', () => {
   });
 
   it('overrides working text with "no signal from server" when watchdog stale (REQ-WPV-004)', () => {
+    vi.useFakeTimers();
     // 40s since the last observed SSE event > 35s threshold.
     renderStateBar({
       convState: { type: 'llm_requesting', attempt: 1 },
@@ -1031,6 +1166,31 @@ describe('StateBar working-phase indicators', () => {
     expect(screen.getByText(/no signal from server for 40s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/degraded/);
+  });
+
+  it('prioritizes Global watchdog degradation and clears it after a fresh event', () => {
+    vi.useFakeTimers();
+    setMobileViewport(true);
+    const lastEventRef = { current: T_NOW };
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW,
+      lastSseEventAtRef: lastEventRef,
+      conversationExtension: {
+        summary: <span>Watching 3</span>,
+        details: <div>Global activity details</div>,
+      },
+    });
+
+    expect(screen.getByText('Connected')).toBeVisible();
+    act(() => vi.advanceTimersByTime(36_000));
+    expect(screen.getByText(/no signal from server for 36s/i)).toBeVisible();
+    expect(document.querySelector('.statebar-mobile-status .dot')).toHaveClass('degraded');
+
+    lastEventRef.current = Date.now();
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(screen.queryByText(/no signal from server/i)).not.toBeInTheDocument();
   });
 
   it('does NOT trip the watchdog when not in a working phase', () => {
@@ -1115,7 +1275,7 @@ describe('StateBar working-phase indicators', () => {
     const { rerender } = render(
       <MemoryRouter><StateBar {...props} connectionState="connected" /></MemoryRouter>,
     );
-    expect(screen.getByText(/^streaming$/i)).toBeInTheDocument();
+    expect(screen.getByText(/^streaming \(retry 2\/5 after model overloaded\)$/i)).toBeInTheDocument();
 
     rerender(
       <MemoryRouter>
@@ -1161,6 +1321,16 @@ describe('StateBar working-phase indicators', () => {
       </MemoryRouter>,
     );
     expect(screen.getByText(/model overloaded — retrying in 7s.*retry 2\/5/i)).toBeInTheDocument();
+  });
+
+  it('renders persisted overload attempt bounds before retry context is reconstructed', () => {
+    renderStateBar({
+      convState: { type: 'server_overload_retrying', attempt: 4, maxAttempts: 5, retryAt: T_NOW + 8_000 },
+      phaseStateUpdatedAt: T_NOW,
+      lastSseEventAt: T_NOW,
+      turnRetryContext: null,
+    });
+    expect(screen.getByText(/model overloaded — retrying in 8s.*retry 4\/5 after model overloaded/i)).toBeInTheDocument();
   });
 
   // Disambiguation: llm_requesting and awaiting_user_response both

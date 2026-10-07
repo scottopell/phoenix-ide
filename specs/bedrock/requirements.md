@@ -143,11 +143,14 @@ THE SYSTEM SHALL configure tools to operate within the conversation's worktree d
 AND enable file-write tools within that worktree
 AND allow bash commands that read and write files within that worktree
 
-WHEN a tool with write authority attempts to write outside the worktree directory
+WHEN an attached Work sub-agent attempts to write outside the inherited worktree directory
 THE SYSTEM SHALL block the write
 AND return a descriptive error
 
-**Rationale:** Write authority is scoped to the disposable worktree, not to the whole filesystem and not to a lifecycle mode name. This preserves isolation without requiring a separate writing lifecycle label as a product concept.
+WHEN an owning WorkScope conversation requires Git common-directory, build-output, generated-output, or normal tool-cache writes to execute its approved objective
+THE SYSTEM SHALL allow those bounded external writes subject to operating-system permissions and command safety checks
+
+**Rationale:** An attached child is confined to its inherited disposable worktree. The owning conversation retains the bounded external write capabilities required to operate that worktree and its toolchain without making lifecycle mode names the authority source.
 
 ---
 
@@ -364,8 +367,17 @@ AND SHALL preserve the error's existing retry and dismissal policy
 AND SHALL NOT infer automatic continuation from the transcript tail
 
 WHEN server restarts
-THE SYSTEM SHALL restore ordinary interrupted conversations to idle state
+THE SYSTEM SHALL restore an ordinary interrupted provider request with no independently recoverable durable obligation to idle state
 AND preserve complete message history
+
+WHEN server restarts after an active materialized direct turn has durably committed a complete tool-result round but before its next model step settles
+THE SYSTEM SHALL use that exact accepted-turn identity and generation as the sole recovery baton
+AND SHALL dispatch the next model step without browser, SSE, or user-message activity
+AND SHALL transfer that one outstanding obligation through the durable continuation operation when continuation changes the transcript conversation, without creating concurrent predecessor and successor batons
+AND SHALL NOT replay an in-flight or unknown-effect tool
+AND SHALL honor a committed cancellation, terminal outcome, newer accepted input, or pending approval according to its existing durable authority before dispatch
+AND after the bounded number of restart recoveries within the same user turn, SHALL settle the exact accepted turn as an explicit persisted failure and release its conversation ownership
+AND a transcript shape, assistant promise, or system prompt without that durable owner SHALL NOT create recovery work
 
 WHEN server restarts after an accepted steering batch has committed its user or skill messages and awaiting-LLM state but before the first response settles
 THE SYSTEM SHALL preserve the awaiting-LLM state
@@ -388,6 +400,8 @@ THE SYSTEM SHALL expire it without provider dispatch
 AND SHALL settle it as ordinary error or recoverable continuation failure according to its persisted target
 
 **Rationale:** Users expect their conversation history to survive server restarts. Ordinary interrupted turns resume from idle so users can re-send their last message. An already-accepted steering turn cannot safely be resent after its queue row has been atomically consumed, so its immutable acceptance and transcript evidence provide a narrow restart owner until the first response settles. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
+**Rationale:** Users expect their conversation history and accepted obligations to survive server restarts. A provider request without an independently recoverable durable effect resumes from idle because its external outcome is unknown. A materialized accepted turn with safely persisted tool results still owes a model step, so its exact durable identity—not transcript prose—authorizes bounded recovery. An already-accepted steering turn cannot safely be resent after its queue row has been atomically consumed, so its immutable acceptance and transcript evidence provide a narrow restart owner until the first response settles. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
+
 
 ---
 
@@ -395,7 +409,7 @@ AND SHALL settle it as ordinary error or recoverable continuation failure accord
 
 WHEN the owning execution boundary determines under REQ-DWF-043 that the durable
 fact needed to continue cannot be established
-THE SYSTEM SHALL stop admission and semantic publication
+THE SYSTEM SHALL stop admission and semantic publication before publishing any capability derived from the unclassified operation
 AND SHALL NOT perform database-backed cleanup that depends on the suspect
 persistence path
 AND SHALL attempt only bounded best-effort shutdown work
@@ -444,9 +458,15 @@ WHEN sub-agent completes its task
 THE SYSTEM SHALL require it to call a dedicated result submission tool
 AND capture the submitted result
 
-WHEN all sub-agents have submitted results
+WHEN an admitted sub-agent terminal outcome is delivered
+THE SYSTEM SHALL accept it only for the exact pending child identity
+AND atomically move that child from pending to completed
+AND treat duplicate delivery for an already accepted child as idempotent success
+
+WHEN all admitted sub-agents have parent-accepted terminal outcomes
 THE SYSTEM SHALL aggregate results
 AND return them to parent conversation
+AND SHALL NOT settle or resume the parent while any admitted child remains pending
 
 WHEN any sub-agent fails or times out without submitting
 THE SYSTEM SHALL include failure information in aggregated results
@@ -618,6 +638,10 @@ AND set the working directory to the target directory (not a Phoenix-owned workt
 AND SHALL NOT include `propose_task`
 AND NOT create worktrees, branches, or task files for the Direct conversation itself
 
+WHEN a database upgrade encounters a Direct conversation whose attached `WorkScope` has Restricted Explore authority
+THE SYSTEM SHALL transform that `WorkScope` to Direct authority
+AND SHALL NOT change authority on a `WorkScope` attached only to non-Direct conversations
+
 THE SYSTEM SHALL visually distinguish Direct mode from Git-backed worktree conversations in the UI
 
 WHEN a Direct conversation targets a Git repository
@@ -631,27 +655,34 @@ AND SHALL NOT treat that association as ownership of a Phoenix worktree lifecycl
 
 ### REQ-BED-018: Sub-Agent Mode Enforcement
 
-WHEN sub-agent is spawned by an Explore conversation
-THE SYSTEM SHALL always create the sub-agent in Explore mode
-AND configure its working directory as the parent's main branch checkout
+WHEN a sub-agent is spawned by a parent without approved write authority
+THE SYSTEM SHALL create only Explore-mode sub-agents
+AND configure their working directory from the parent's read-only context
+
+WHEN a Git-backed parent requests a Work sub-agent
+THE SYSTEM SHALL require approved parent Work authority
+AND SHALL create a non-owning Work child attached to the parent's exact WorkScope and existing worktree
+AND SHALL use ordinary unsandboxed write-capable tools for that child
+AND SHALL retain task approval, parent lifecycle, and worktree ownership in the parent
 
 WHEN sub-agent is spawned by a Work conversation with Explore mode requested
 THE SYSTEM SHALL create the sub-agent in Explore mode (read-only)
 AND configure its working directory as the parent's worktree path
 
-WHEN sub-agent is spawned by a write-capable parent conversation with write capability requested
+WHEN sub-agent is spawned by a Direct parent conversation with write capability requested
 THE SYSTEM SHALL create the sub-agent with write capability against the parent's attached `WorkScope`
-AND configure its working directory as the parent's worktree path
-AND enforce that only one Work sub-agent exists per parent at a time
+AND configure its working directory as the parent's working directory
+AND enforce the fail-closed parent-model Work admission policy defined by REQ-PROJ-008 in [`../subagents/requirements.md`](../subagents/requirements.md)
 
 WHEN sub-agent is running
 THE SYSTEM SHALL NOT provide `propose_task` tool to sub-agents
 AND sub-agents SHALL NOT be able to change their own mode
 
 **Rationale:** Sub-agents operate under the parent's direction with a constrained
-tool set. Explore sub-agents are safe to run in parallel — they cannot write.
-Work sub-agents inherit the parent's worktree so they operate on the same codebase
-state; the one-at-a-time constraint maintains a single writer per worktree.
+tool set. Explore sub-agents are safe to run in parallel because they cannot write.
+Work sub-agents inherit the parent's exact environment; parallel Work is admitted
+only for explicitly qualified parent models, while every unqualified parent remains
+sequential and unknown models fail closed.
 
 ---
 
@@ -1004,6 +1035,43 @@ AND SHALL leave the conversation's mode unchanged, including when the pre-approv
 AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, lifecycle, mode, repository state beyond the
   approved task commit, `WorkScope` attachment, source/provenance records beyond the approval itself,
   or branch/worktree provenance
+
+### REQ-BED-046: Publish Approved Capabilities as One Authority Projection
+
+WHEN task approval grants Work authority to a conversation's `WorkScope`
+THE SYSTEM SHALL derive the conversation runtime's tool surface, tool execution policy, Bash isolation policy, tool context, and sub-agent admission policy from that same `WorkScope` authority before accepting post-approval work
+AND SHALL NOT use conversation mode provenance as capability authority
+
+IF the system cannot project the granted authority to every runtime capability consumer
+THEN THE SYSTEM SHALL NOT resume the conversation with a partially updated capability surface
+
+WHEN same-conversation approval adopts Work authority
+THE SYSTEM SHALL persist the approved objective, `WorkScope` authority, post-approval conversation state, and approved-plan context message in one atomic transaction before publishing the runtime capability projection
+
+IF any post-mutation approval step fails
+THEN THE SYSTEM SHALL retire the live actor for reconstruction from durable authority
+AND SHALL immediately rematerialize the retired conversation from its persisted state without relying on unfinished-turn discovery
+AND IF bounded rematerialization attempts are exhausted THE SYSTEM SHALL release the reserved event stream so clients reconnect and can initiate reconstruction
+
+WHEN same-conversation approval commits a transition to `LlmRequesting`
+THE SYSTEM SHALL persist an operation-scoped obligation bound to the complete identity of that approval message
+AND SHALL derive the approval sequence from the referenced message rather than storing a parallel sequence representation
+AND SHALL preserve the requesting state across process restart while that obligation remains pending
+AND SHALL retire the obligation when the first later agent response is durably stored or the conversation leaves `LlmRequesting`
+AND SHALL NOT treat the lifetime approved-task objective as ownership of later requests
+
+WHEN upgrading rows created before operation-scoped approval provenance exists
+THE SYSTEM SHALL NOT infer a pending approval request from lifetime objectives or message presentation text
+AND SHALL retain the ordinary interrupted-request recovery behavior for those rows
+
+WHEN approval performs Git or worktree mutation before adopting `LlmRequesting`
+THE SYSTEM SHALL capture the requesting-state timestamp after that mutation succeeds and immediately before atomic persistence and live-state adoption
+
+WHEN a runtime is reconstructed after interruption
+THE SYSTEM SHALL derive every capability consumer from persisted `WorkScope` authority rather than from conversation mode provenance
+
+WHILE an Explore-origin conversation has not received approved `WorkScope` authority
+THE SYSTEM SHALL retain its Restricted tool surface, sandboxed Bash policy, and prohibition on Work sub-agents
 
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Start in new conversation policy

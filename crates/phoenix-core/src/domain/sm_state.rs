@@ -36,6 +36,16 @@ pub struct PresentSvgInput {
     pub description: String,
 }
 
+/// Global Coordinator SVG publication input with explicit source authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorPresentSvgInput {
+    pub work_scope_id: String,
+    pub path: String,
+    pub title: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadImageInput {
     pub path: String,
@@ -104,6 +114,80 @@ pub struct ProposeTaskInput {
     pub task_file: String,
 }
 
+/// Phoenix-owned identity for one pending structured-question incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct QuestionRequestId(String);
+
+impl QuestionRequestId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for QuestionRequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for QuestionRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct QuestionRequestAuthority(Option<QuestionRequestId>);
+
+impl QuestionRequestAuthority {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Some(QuestionRequestId::new()))
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> Option<&QuestionRequestId> {
+        self.0.as_ref()
+    }
+
+    #[must_use]
+    pub fn matches_submitted(&self, submitted: Option<&QuestionRequestId>) -> bool {
+        self.request_id() == submitted
+    }
+
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl Default for QuestionRequestAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'de> Deserialize<'de> for QuestionRequestAuthority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<QuestionRequestId>::deserialize(deserializer).map(Self)
+    }
+}
+
+fn legacy_question_request_authority() -> QuestionRequestAuthority {
+    QuestionRequestAuthority(None)
+}
+
 /// A single question presented to the user (REQ-AUQ-001)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserQuestion {
@@ -141,6 +225,88 @@ pub struct AskUserQuestionInput {
     pub metadata: Option<QuestionMetadata>,
 }
 
+impl AskUserQuestionInput {
+    /// Validates and canonicalizes structured questions before they become pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an agent-actionable error when the input violates REQ-AUQ-001 or
+    /// REQ-AUQ-005.
+    pub fn validate_and_normalize(&mut self) -> Result<(), String> {
+        if self.questions.is_empty() || self.questions.len() > 4 {
+            return Err(format!(
+                "ask_user_question requires 1-4 questions; got {}",
+                self.questions.len()
+            ));
+        }
+
+        let mut question_texts = std::collections::HashSet::new();
+        for (question_index, question) in self.questions.iter_mut().enumerate() {
+            let question_number = question_index + 1;
+            let question_text = question.question.trim();
+            if question_text.is_empty() {
+                return Err(format!(
+                    "ask_user_question question {question_number} has empty question text"
+                ));
+            }
+            if question.header.trim().is_empty() {
+                return Err(format!(
+                    "ask_user_question question {question_number} has empty header"
+                ));
+            }
+            if question.header.chars().count() > 12 {
+                return Err(format!(
+                    "ask_user_question question {question_number} header exceeds 12 characters"
+                ));
+            }
+            if !question_texts.insert(question_text.to_string()) {
+                return Err(format!(
+                    "ask_user_question question {question_number} duplicates question text `{question_text}`"
+                ));
+            }
+            if !(2..=4).contains(&question.options.len()) {
+                return Err(format!(
+                    "ask_user_question question {question_number} requires 2-4 options; got {}",
+                    question.options.len()
+                ));
+            }
+
+            let mut option_labels = std::collections::HashSet::new();
+            for option in &mut question.options {
+                let label = option.label.trim();
+                if label.is_empty() {
+                    return Err(format!(
+                        "ask_user_question question {question_number} has an empty option label"
+                    ));
+                }
+                if label.split_whitespace().count() > 5 {
+                    return Err(format!(
+                        "ask_user_question question {question_number} option label `{label}` exceeds 5 words"
+                    ));
+                }
+                if matches!(label.to_ascii_lowercase().as_str(), "other" | "__other__") {
+                    return Err(format!(
+                        "ask_user_question question {question_number} uses reserved option label `{label}`"
+                    ));
+                }
+                if !option_labels.insert(label.to_string()) {
+                    return Err(format!(
+                        "ask_user_question question {question_number} duplicates option label `{label}`"
+                    ));
+                }
+                if option
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.trim().is_empty())
+                {
+                    option.description = None;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Optional metadata for an `ask_user_question` invocation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionMetadata {
@@ -158,6 +324,7 @@ pub enum ToolInput {
     KeywordSearch(KeywordSearchInput),
     ReadImage(ReadImageInput),
     PresentSvg(PresentSvgInput),
+    CoordinatorPresentSvg(CoordinatorPresentSvgInput),
     SpawnAgents(SpawnAgentsInput),
     SubmitResult(SubmitResultInput),
     SubmitError(SubmitErrorInput),
@@ -289,6 +456,9 @@ impl<'de> Deserialize<'de> for ToolInput {
             "present_svg" => {
                 parse_tool_input_or_malformed::<PresentSvgInput>("present_svg", payload)
             }
+            "coordinator_present_svg" => {
+                parse_tool_input_or_malformed::<CoordinatorPresentSvgInput>("present_svg", payload)
+            }
             "read_image" => parse_tool_input_or_malformed::<ReadImageInput>("read_image", payload),
             "spawn_agents" => {
                 parse_tool_input_or_malformed::<SpawnAgentsInput>("spawn_agents", payload)
@@ -353,6 +523,12 @@ impl From<PresentSvgInput> for ToolInput {
     }
 }
 
+impl From<CoordinatorPresentSvgInput> for ToolInput {
+    fn from(input: CoordinatorPresentSvgInput) -> Self {
+        Self::CoordinatorPresentSvg(input)
+    }
+}
+
 impl From<ReadImageInput> for ToolInput {
     fn from(input: ReadImageInput) -> Self {
         ToolInput::ReadImage(input)
@@ -400,7 +576,7 @@ impl ToolInput {
             ToolInput::Patch(_) => "patch",
             ToolInput::KeywordSearch(_) => "keyword_search",
             ToolInput::ReadImage(_) => "read_image",
-            ToolInput::PresentSvg(_) => "present_svg",
+            ToolInput::PresentSvg(_) | ToolInput::CoordinatorPresentSvg(_) => "present_svg",
             ToolInput::SpawnAgents(_) => "spawn_agents",
             ToolInput::SubmitResult(_) => "submit_result",
             ToolInput::SubmitError(_) => "submit_error",
@@ -426,6 +602,9 @@ impl ToolInput {
             ToolInput::KeywordSearch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::ReadImage(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::PresentSvg(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::CoordinatorPresentSvg(input) => {
+                serde_json::to_value(input).unwrap_or(Value::Null)
+            }
             ToolInput::SpawnAgents(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
@@ -489,6 +668,9 @@ impl ToolInput {
             "patch" => parse::<PatchInput>(name, value),
             "keyword_search" => parse::<KeywordSearchInput>(name, value),
             "read_image" => parse::<ReadImageInput>(name, value),
+            "present_svg" if matches!(contract, ToolInputContract::WorkScopeTarget) => {
+                parse::<CoordinatorPresentSvgInput>(name, value)
+            }
             "present_svg" => parse::<PresentSvgInput>(name, value),
             "spawn_agents" => parse::<SpawnAgentsInput>(name, value),
             "submit_result" => parse::<SubmitResultInput>(name, value),
@@ -506,6 +688,80 @@ impl ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn awaiting_user_response_identity_preserves_legacy_absence_and_new_value() {
+        let legacy: ConvState = serde_json::from_value(serde_json::json!({
+            "type": "awaiting_user_response",
+            "questions": [],
+            "tool_use_id": "provider-tool"
+        }))
+        .expect("legacy pending question should deserialize");
+        let ConvState::AwaitingUserResponse {
+            request_authority, ..
+        } = &legacy
+        else {
+            panic!("expected awaiting user response");
+        };
+        assert!(request_authority.is_legacy());
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("request_id").is_none());
+
+        let request_authority = QuestionRequestAuthority::new();
+        let request_id = request_authority.request_id().unwrap().clone();
+        let identified = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "provider-tool".into(),
+            request_authority,
+        };
+        let restored: ConvState =
+            serde_json::from_value(serde_json::to_value(&identified).unwrap())
+                .expect("identified pending question should roundtrip");
+        assert_eq!(restored, identified);
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["request_id"],
+            request_id.as_str()
+        );
+    }
+
+    #[test]
+    fn ask_user_question_validates_shape_and_normalizes_blank_descriptions() {
+        let option = |label: &str, description: Option<&str>| QuestionOption {
+            label: label.into(),
+            description: description.map(str::to_string),
+            preview: None,
+        };
+        let mut input = AskUserQuestionInput {
+            questions: vec![UserQuestion {
+                question: "Which implementation should we use?".into(),
+                header: "Choice".into(),
+                options: vec![
+                    option("First", Some("   ")),
+                    option("Second", Some("Preserved")),
+                ],
+                multi_select: false,
+            }],
+            metadata: None,
+        };
+        input.validate_and_normalize().unwrap();
+        assert_eq!(input.questions[0].options[0].description, None);
+        assert_eq!(
+            input.questions[0].options[1].description.as_deref(),
+            Some("Preserved")
+        );
+
+        input.questions.push(input.questions[0].clone());
+        assert!(input
+            .validate_and_normalize()
+            .unwrap_err()
+            .contains("duplicates question text"));
+        input.questions.pop();
+        input.questions[0].options[1].label = "First".into();
+        assert!(input
+            .validate_and_normalize()
+            .unwrap_err()
+            .contains("duplicates option label"));
+    }
 
     #[test]
     fn legacy_bash_tool_input_deserializes_as_modern_run() {
@@ -638,6 +894,26 @@ mod tests {
     /// task 13018: previously both cases collapsed into the same `Unknown`
     /// variant, hiding "schema drift / bad LLM output" inside "tool we don't
     /// have."
+    #[test]
+    fn work_scope_contract_parses_coordinator_present_svg_without_malformed_fallback() {
+        let input = ToolInput::from_name_and_value_with_work_scope_target(
+            "present_svg",
+            serde_json::json!({
+                "work_scope_id": "scope-1",
+                "path": "/scope/chart.svg",
+                "title": "Chart",
+                "description": "A chart"
+            }),
+        );
+        assert!(matches!(input, ToolInput::CoordinatorPresentSvg(_)));
+        assert_eq!(input.tool_name(), "present_svg");
+        assert_eq!(input.to_value()["work_scope_id"], "scope-1");
+        let persisted = serde_json::to_string(&input).unwrap();
+        let restored: ToolInput = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(restored, input);
+        assert!(matches!(restored, ToolInput::CoordinatorPresentSvg(_)));
+    }
+
     #[test]
     fn malformed_known_tool_is_distinct_from_unknown() {
         // `think` is a registered tool; `thoughts` is required as a string, but
@@ -820,6 +1096,7 @@ mod tests {
             },
             ConvState::CancellingTool {
                 tool_use_id: "t1".into(),
+                cause: crate::domain::sm_event::CancelCause::UserRequested,
                 skipped_tools: vec![],
                 completed_results: vec![],
                 assistant_message: AssistantMessage::default(),
@@ -875,6 +1152,7 @@ mod tests {
             ConvState::AwaitingUserResponse {
                 questions: vec![],
                 tool_use_id: "t1".into(),
+                request_authority: QuestionRequestAuthority::new(),
             },
             ConvState::ContextExhausted {
                 summary: "s".into(),
@@ -1232,6 +1510,9 @@ pub enum ConvState {
     CancellingTool {
         /// The tool being aborted
         tool_use_id: String,
+        // owned: pre-cause rows were created only by user cancellation.
+        #[serde(default)]
+        cause: crate::domain::sm_event::CancelCause,
         /// Tools that were skipped
         skipped_tools: Vec<ToolCall>,
         /// Tool results completed before cancellation
@@ -1352,6 +1633,13 @@ pub enum ConvState {
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
+        // owned: pre-identity pending waits deserialize into legacy authority; current code cannot construct it.
+        #[serde(
+            default = "legacy_question_request_authority",
+            rename = "request_id",
+            skip_serializing_if = "QuestionRequestAuthority::is_legacy"
+        )]
+        request_authority: QuestionRequestAuthority,
     },
 
     /// Context window exhausted - conversation is read-only
@@ -1403,6 +1691,7 @@ pub enum CoreState {
     },
     CancellingTool {
         tool_use_id: String,
+        cause: crate::domain::sm_event::CancelCause,
         skipped_tools: Vec<ToolCall>,
         completed_results: Vec<ToolResult>,
         assistant_message: AssistantMessage,
@@ -1459,6 +1748,7 @@ pub enum ParentState {
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
+        request_authority: QuestionRequestAuthority,
     },
     ContextExhausted {
         summary: String,
@@ -1517,9 +1807,11 @@ impl From<ParentState> for ConvState {
             ParentState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+                request_authority,
             } => ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+                request_authority,
             },
             ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
             ParentState::HandedOff { successor_conv_id } => {
@@ -1563,12 +1855,14 @@ impl From<CoreState> for ConvState {
             },
             CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1664,12 +1958,14 @@ impl TryFrom<ConvState> for ParentState {
             })),
             ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => Ok(ParentState::Core(CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1738,9 +2034,11 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+                request_authority,
             } => Ok(ParentState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+                request_authority,
             }),
             ConvState::ContextExhausted { summary } => {
                 Ok(ParentState::ContextExhausted { summary })
@@ -1793,12 +2091,14 @@ impl TryFrom<ConvState> for SubAgentState {
             })),
             ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => Ok(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -2277,6 +2577,9 @@ pub enum SubAgentOutcome {
     Success {
         result: String,
     },
+    ImplicitCompletion {
+        result: String,
+    },
     Failure {
         error: String,
         error_kind: ErrorKind,
@@ -2407,7 +2710,7 @@ pub struct ConvContext {
     /// Resource namespace for this runtime. Ordinary conversations carry a
     /// persisted work scope; the Coordinator occupies its disjoint namespace.
     pub resource_scope: crate::work_scope::ResourceScopeKey,
-    /// Effective authority used for same-scope runtime resources.
+    /// Runtime authority projected from the persisted `WorkScope`.
     pub resource_authority: crate::work_scope::ResourceAuthority,
     /// Persisted worktree location, if this conversation has one. This is
     /// environment context only and never participates in resource identity.

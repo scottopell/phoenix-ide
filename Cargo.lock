@@ -2951,6 +2951,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "ts-rs",
+ "url",
  "uuid",
 ]
 
@@ -2970,6 +2971,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
+ "sqlx-core",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3148,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix_ide"
-version = "0.12.0"
+version = "0.13.0-rc.1"
 dependencies = [
  "async-trait",
  "axum",

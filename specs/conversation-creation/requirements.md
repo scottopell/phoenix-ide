@@ -6,6 +6,23 @@ As a developer starting a Phoenix conversation, I need Phoenix to accept one dur
 
 ## Requirements
 
+### REQ-CCR-011: Ordinary Creation Model Default
+
+WHEN ordinary conversation creation omits a model selection
+THE SYSTEM SHALL use the available registry product default independently of repository presence or conversation workspace mode
+AND SHALL NOT substitute an auxiliary cheap-model choice
+
+WHEN creation supplies an explicit supported model selection
+THE SYSTEM SHALL preserve that selection independently of the product default
+AND SHALL preserve supported explicit reasoning-effort and request-speed selections
+
+WHEN effort or request speed is omitted
+THE SYSTEM SHALL use the selected model's native effort semantics and Standard request speed
+
+**Rationale:** Workspace provisioning is not a model preference. Ordinary coding conversations use the product default, while explicitly cheap auxiliary tasks and specialized worker selections retain their own selection contracts.
+
+---
+
 ### REQ-PROJ-000: Conversation Working Directory Root Floor
 
 WHEN a conversation is resumed with a working directory or creation names an existing directory

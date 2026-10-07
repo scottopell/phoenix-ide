@@ -101,6 +101,9 @@ impl From<SubmittedDirectTurnFileAttachment> for FileAttachment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmittedDirectTurnIdentity {
     pub text: String,
+    // owned: accepted before provenance existed; unknown is the only truthful attribution.
+    #[serde(default)]
+    pub origin: crate::domain::db_schema::InputOrigin,
     pub images: Vec<ImageData>,
     pub files: Vec<SubmittedDirectTurnFileAttachment>,
     pub message_id: String,
@@ -139,7 +142,8 @@ pub enum PreparedDirectTurnPayloadCodecError {
 }
 
 impl PreparedDirectTurnPayload {
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
+    const LEGACY_VERSION: u32 = 1;
     fn normalized_value_without_attachments(
         &self,
     ) -> Result<serde_json::Value, PreparedDirectTurnPayloadCodecError> {
@@ -149,6 +153,7 @@ impl PreparedDirectTurnPayload {
             if let Some(obj) = submitted.as_object_mut() {
                 obj.remove("images");
                 obj.remove("files");
+                obj.remove("origin");
             }
         }
         if let Some(delivery) = value.get_mut("delivery") {
@@ -242,7 +247,7 @@ impl PreparedDirectTurnPayload {
         );
         let payload: Self =
             serde_json::from_value(value).map_err(PreparedDirectTurnPayloadCodecError::Decode)?;
-        if payload.v != Self::VERSION {
+        if payload.v != Self::VERSION && payload.v != Self::LEGACY_VERSION {
             return Err(PreparedDirectTurnPayloadCodecError::UnsupportedVersion {
                 actual: payload.v,
                 expected: Self::VERSION,
@@ -270,7 +275,12 @@ impl PreparedDirectTurnPayload {
 
     #[must_use]
     pub fn submitted_identity_matches(&self, other: &SubmittedDirectTurnIdentity) -> bool {
-        &self.submitted == other
+        if !self.submitted.origin.accepts_retry_origin(&other.origin) {
+            return false;
+        }
+        let mut retry = other.clone();
+        retry.origin = self.submitted.origin.clone();
+        self.submitted == retry
     }
 
     /// Encodes the complete versioned envelope.
@@ -278,7 +288,107 @@ impl PreparedDirectTurnPayload {
     /// # Errors
     /// Returns [`PreparedDirectTurnPayloadCodecError::Encode`] if JSON encoding fails.
     pub fn to_exact_bytes(&self) -> Result<Vec<u8>, PreparedDirectTurnPayloadCodecError> {
-        serde_json::to_vec(self).map_err(PreparedDirectTurnPayloadCodecError::Encode)
+        if self.v == Self::LEGACY_VERSION {
+            #[derive(Serialize)]
+            struct LegacySubmitted<'a> {
+                text: &'a str,
+                images: &'a [ImageData],
+                files: &'a [SubmittedDirectTurnFileAttachment],
+                message_id: &'a str,
+                user_agent: &'a Option<String>,
+                skill_invocation: &'a Option<SkillInvocation>,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy,
+            }
+            #[derive(Serialize)]
+            struct LegacyPayload<'a> {
+                v: u32,
+                submitted: LegacySubmitted<'a>,
+                delivery: &'a PreparedDirectTurnDelivery,
+            }
+            let submitted = &self.submitted;
+            serde_json::to_vec(&LegacyPayload {
+                v: self.v,
+                submitted: LegacySubmitted {
+                    text: &submitted.text,
+                    images: &submitted.images,
+                    files: &submitted.files,
+                    message_id: &submitted.message_id,
+                    user_agent: &submitted.user_agent,
+                    skill_invocation: &submitted.skill_invocation,
+                    expansion_policy: submitted.expansion_policy,
+                },
+                delivery: &self.delivery,
+            })
+            .map_err(PreparedDirectTurnPayloadCodecError::Encode)
+        } else {
+            serde_json::to_vec(self).map_err(PreparedDirectTurnPayloadCodecError::Encode)
+        }
+    }
+
+    /// Reconstructs the version-2 encoding emitted before source-call locators.
+    /// Returns no candidate for other versions, origins, or recorded locators.
+    ///
+    /// # Errors
+    /// Returns an encoding error if serialization fails.
+    pub fn pre_source_call_exact_bytes(
+        &self,
+    ) -> Result<Option<Vec<u8>>, PreparedDirectTurnPayloadCodecError> {
+        use crate::domain::db_schema::InputOrigin;
+        #[derive(Serialize)]
+        struct Origin<'a> {
+            kind: &'static str,
+            product_conversation_id: &'a crate::domain::product_conversation::ProductConversationId,
+            transcript_id: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Submitted<'a> {
+            text: &'a str,
+            origin: Origin<'a>,
+            images: &'a [ImageData],
+            files: &'a [SubmittedDirectTurnFileAttachment],
+            message_id: &'a str,
+            user_agent: &'a Option<String>,
+            skill_invocation: &'a Option<SkillInvocation>,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy,
+        }
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            v: u32,
+            submitted: Submitted<'a>,
+            delivery: &'a PreparedDirectTurnDelivery,
+        }
+        let InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+            source_call: None,
+        } = &self.submitted.origin
+        else {
+            return Ok(None);
+        };
+        if self.v != 2 {
+            return Ok(None);
+        }
+        let submitted = &self.submitted;
+        serde_json::to_vec(&Payload {
+            v: self.v,
+            submitted: Submitted {
+                text: &submitted.text,
+                origin: Origin {
+                    kind: "internal_conversation",
+                    product_conversation_id,
+                    transcript_id,
+                },
+                images: &submitted.images,
+                files: &submitted.files,
+                message_id: &submitted.message_id,
+                user_agent: &submitted.user_agent,
+                skill_invocation: &submitted.skill_invocation,
+                expansion_policy: submitted.expansion_policy,
+            },
+            delivery: &self.delivery,
+        })
+        .map(Some)
+        .map_err(PreparedDirectTurnPayloadCodecError::Encode)
     }
 
     /// Decodes and version-checks a complete envelope.
@@ -289,7 +399,7 @@ impl PreparedDirectTurnPayload {
     pub fn from_exact_bytes(bytes: &[u8]) -> Result<Self, PreparedDirectTurnPayloadCodecError> {
         let payload: Self =
             serde_json::from_slice(bytes).map_err(PreparedDirectTurnPayloadCodecError::Decode)?;
-        if payload.v != Self::VERSION {
+        if payload.v != Self::VERSION && payload.v != Self::LEGACY_VERSION {
             return Err(PreparedDirectTurnPayloadCodecError::UnsupportedVersion {
                 actual: payload.v,
                 expected: Self::VERSION,
@@ -380,6 +490,9 @@ pub fn exact_payload_fingerprint(bytes: &[u8]) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerEntry {
     pub text: String,
+    // owned: pre-provenance steering rows had no reliable origin.
+    #[serde(default)]
+    pub origin: crate::domain::db_schema::InputOrigin,
     pub llm_text: Option<String>,
     pub images: Vec<ImageData>,
     #[serde(default)]
@@ -393,6 +506,7 @@ impl From<PreparedDirectTurnPayload> for SteerEntry {
     fn from(value: PreparedDirectTurnPayload) -> Self {
         Self {
             text: value.delivery.text,
+            origin: value.submitted.origin,
             llm_text: value.delivery.llm_text,
             images: value.delivery.images,
             files: value.delivery.files,
@@ -405,7 +519,7 @@ impl From<PreparedDirectTurnPayload> for SteerEntry {
 
 use crate::domain::llm_types::{ContentBlock, Usage};
 use crate::domain::sm_state::{
-    OverloadRetryGuidance, PendingSubAgent, QuestionAnnotation, SubAgentOutcome,
+    OverloadRetryGuidance, PendingSubAgent, QuestionAnnotation, QuestionRequestId, SubAgentOutcome,
     TaskApprovalOutcome, ToolCall,
 };
 use std::collections::HashMap;
@@ -434,6 +548,10 @@ pub enum Event {
         payload: PreparedDirectTurnPayload,
         authority: DirectTurnAttemptAuthority,
     },
+    /// Starts an admitted sub-agent whose initial user message is already durable.
+    PersistedSubAgentBootstrap,
+    /// Retries exact buffered child outcomes after a transient acceptance read failure.
+    RetryBufferedSubAgentResults,
     /// Internal first-turn event accepted only while the shell is provisioning.
     CreationProvisioned {
         initial_message: SteerEntry,
@@ -572,11 +690,14 @@ pub enum Event {
     // Ask user question events (REQ-AUQ-001)
     /// User answered the pending questions (POST /api/conversations/{id}/respond)
     UserQuestionResponse {
+        request_id: Option<QuestionRequestId>,
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
     /// User dismissed the structured question UI without answering it.
-    UserQuestionDismissed,
+    UserQuestionDismissed {
+        request_id: Option<QuestionRequestId>,
+    },
 
     /// User dismissed a persisted `Error` state, returning the conversation to
     /// `Idle`. Server-authoritative: the UI does not fake the idle phase
@@ -620,6 +741,7 @@ pub enum Event {
     /// `UserMessage` when the conversation next enters `Idle`.
     SteerMessage {
         /// Display text — stored in DB and shown in history.
+        origin: crate::domain::db_schema::InputOrigin,
         text: String,
         /// Expanded text delivered to the LLM when `@` references are present.
         llm_text: Option<String>,
@@ -672,6 +794,8 @@ impl Event {
         match self {
             Event::UserMessage { .. } => "UserMessage",
             Event::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            Event::PersistedSubAgentBootstrap => "PersistedSubAgentBootstrap",
+            Event::RetryBufferedSubAgentResults => "RetryBufferedSubAgentResults",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
             Event::CreationRequestResume { .. } => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
@@ -692,7 +816,7 @@ impl Event {
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
-            Event::UserQuestionDismissed => "UserQuestionDismissed",
+            Event::UserQuestionDismissed { .. } => "UserQuestionDismissed",
             Event::DismissError => "DismissError",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             Event::CredentialBecameAvailable => "CredentialBecameAvailable",
@@ -716,9 +840,10 @@ impl Event {
 /// forced teardown (task 61004). `UserRequested` is a human-initiated or
 /// parent-propagated cancel; `Timeout` is the parent's sub-agent completion
 /// timeout forcing teardown.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
+    #[default]
     UserRequested,
     Timeout,
 }
@@ -831,10 +956,13 @@ pub enum ParentOnlyEvent {
         successor_conv_id: String,
     },
     UserQuestionResponse {
+        request_id: Option<QuestionRequestId>,
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
-    UserQuestionDismissed,
+    UserQuestionDismissed {
+        request_id: Option<QuestionRequestId>,
+    },
     DismissError,
     CredentialBecameAvailable,
     CredentialHelperFailed {
@@ -850,6 +978,7 @@ pub enum ParentOnlyEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum SubAgentOnlyEvent {
+    PersistedBootstrap,
     GraceTurnExhausted { result: Option<String> },
 }
 
@@ -924,6 +1053,14 @@ impl TryFrom<Event> for ParentEvent {
                     authority,
                 }))
             }
+            Event::PersistedSubAgentBootstrap => Err(EventConversionError {
+                event_variant: "PersistedSubAgentBootstrap",
+                target_type: "ParentEvent",
+            }),
+            Event::RetryBufferedSubAgentResults => Err(EventConversionError {
+                event_variant: "RetryBufferedSubAgentResults",
+                target_type: "ParentEvent",
+            }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "ParentEvent",
@@ -1065,15 +1202,17 @@ impl TryFrom<Event> for ParentEvent {
                 }))
             }
             Event::UserQuestionResponse {
+                request_id,
                 answers,
                 annotations,
             } => Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
+                request_id,
                 answers,
                 annotations,
             })),
-            Event::UserQuestionDismissed => {
-                Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed))
-            }
+            Event::UserQuestionDismissed { request_id } => Ok(ParentEvent::Parent(
+                ParentOnlyEvent::UserQuestionDismissed { request_id },
+            )),
             Event::DismissError => Ok(ParentEvent::Parent(ParentOnlyEvent::DismissError)),
             Event::CredentialBecameAvailable => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialBecameAvailable,
@@ -1261,6 +1400,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 }))
             }
             // Sub-agent-only events
+            Event::PersistedSubAgentBootstrap => Ok(SubAgentEvent::SubAgent(
+                SubAgentOnlyEvent::PersistedBootstrap,
+            )),
+            Event::RetryBufferedSubAgentResults => Err(EventConversionError {
+                event_variant: "RetryBufferedSubAgentResults",
+                target_type: "SubAgentEvent",
+            }),
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
@@ -1273,7 +1419,7 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::TaskApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
-            | Event::UserQuestionDismissed
+            | Event::UserQuestionDismissed { .. }
             | Event::DismissError
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
@@ -1328,7 +1474,7 @@ impl ParentEvent {
                 ParentOnlyEvent::TaskApprovalDecided { .. } => "TaskApprovalDecided",
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
-                ParentOnlyEvent::UserQuestionDismissed => "UserQuestionDismissed",
+                ParentOnlyEvent::UserQuestionDismissed { .. } => "UserQuestionDismissed",
                 ParentOnlyEvent::DismissError => "DismissError",
                 ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",
@@ -1346,6 +1492,7 @@ impl SubAgentEvent {
         match self {
             SubAgentEvent::Core(e) => e.variant_name(),
             SubAgentEvent::SubAgent(e) => match e {
+                SubAgentOnlyEvent::PersistedBootstrap => "PersistedSubAgentBootstrap",
                 SubAgentOnlyEvent::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             },
         }
@@ -1393,6 +1540,7 @@ mod direct_turn_payload_tests {
         policy: SubmittedDirectTurnExpansionPolicy,
     ) -> SubmittedDirectTurnIdentity {
         SubmittedDirectTurnIdentity {
+            origin: crate::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "display @file".to_string(),
             images: Vec::new(),
             files: Vec::new(),
@@ -1432,6 +1580,29 @@ mod direct_turn_payload_tests {
             payload.exact_fingerprint().unwrap(),
             super::exact_payload_fingerprint(&bytes)
         );
+    }
+
+    #[test]
+    fn historical_admission_retry_preserves_unknown_origin_and_payload_identity() {
+        use crate::domain::db_schema::InputOrigin;
+        let identity = submitted(
+            "legacy",
+            SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+        );
+        let payload =
+            PreparedDirectTurnPayload::from_parts(identity.clone(), delivery("body", None));
+        let mut retry = identity;
+        retry.origin = InputOrigin::UserApi;
+        assert!(payload.submitted_identity_matches(&retry));
+        assert_eq!(payload.submitted.origin, InputOrigin::UnknownHistorical);
+        retry.text.push_str(" changed");
+        assert!(!payload.submitted_identity_matches(&retry));
+        retry.text = payload.submitted.text.clone();
+        retry.origin = InputOrigin::SystemGenerated;
+        assert!(!payload.submitted_identity_matches(&retry));
+        let mut attributed = payload;
+        attributed.submitted.origin = InputOrigin::UserApi;
+        assert!(!attributed.submitted_identity_matches(&retry));
     }
 
     #[test]

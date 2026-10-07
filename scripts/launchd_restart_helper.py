@@ -80,8 +80,14 @@ class Manifest:
             raise RestartError("restart manifest has an invalid previous PID")
         if not 1 <= manifest.socket_service <= 65535:
             raise RestartError("restart manifest has an invalid socket service")
-        if not manifest.expected.version or not manifest.expected.git_sha:
-            raise RestartError("restart manifest has an incomplete runtime identity")
+        if not manifest.expected.version or re.fullmatch(r"[0-9a-f]{40}", manifest.expected.git_sha) is None:
+            raise RestartError("restart manifest requires a full lowercase git SHA")
+        try:
+            deployed_sha = Path(manifest.deployed_sha_path).read_text().strip()
+        except OSError as exc:
+            raise RestartError("restart manifest deployed SHA is unavailable") from exc
+        if deployed_sha != manifest.expected.git_sha:
+            raise RestartError("restart identity does not match the deployed source commit")
         for value, description in (
             (manifest.binary_sha256, "binary"),
             (manifest.plist_sha256, "plist"),

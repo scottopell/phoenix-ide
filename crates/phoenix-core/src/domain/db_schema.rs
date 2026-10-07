@@ -207,6 +207,8 @@ pub enum ConvMode {
         /// The branch this worktree was created from (same as `branch_name` for Branch mode)
         base_branch: NonEmptyString,
     },
+    /// Trusted write-capable child borrowing the parent's worktree without owning it.
+    AttachedWorkChild,
     /// `ProductCreation` checkout detached at an immutable starting pin, with no owned branch.
     DetachedProductCreation {
         /// Absolute path to the detached worktree.
@@ -246,6 +248,7 @@ impl ConvMode {
             Self::Direct => "Direct",
             Self::Work { .. } => "Work",
             Self::Branch { .. } => "Branch",
+            Self::AttachedWorkChild => "Work Child",
             Self::DetachedProductCreation { .. } => "Product",
             Self::DetachedApprovedTask { .. } => "Approved Task",
         }
@@ -260,6 +263,7 @@ impl ConvMode {
             }
             Self::Explore { .. }
             | Self::Direct
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. }
             | Self::DetachedApprovedTask { .. } => None,
         }
@@ -280,7 +284,7 @@ impl ConvMode {
             Self::Explore { worktree_path, .. } => {
                 worktree_path.as_ref().map(NonEmptyString::as_str)
             }
-            Self::Direct => None,
+            Self::Direct | Self::AttachedWorkChild => None,
         }
     }
 
@@ -292,7 +296,7 @@ impl ConvMode {
             | Self::Branch { base_branch, .. }
             | Self::DetachedProductCreation { base_branch, .. }
             | Self::DetachedApprovedTask { base_branch, .. } => Some(base_branch.as_str()),
-            Self::Explore { .. } | Self::Direct => None,
+            Self::Explore { .. } | Self::Direct | Self::AttachedWorkChild => None,
         }
     }
 
@@ -306,6 +310,7 @@ impl ConvMode {
             Self::Explore { .. }
             | Self::Direct
             | Self::Branch { .. }
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. } => None,
         }
     }
@@ -320,6 +325,7 @@ impl ConvMode {
             Self::Explore { .. }
             | Self::Direct
             | Self::Branch { .. }
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. } => None,
         }
     }
@@ -347,6 +353,7 @@ impl ConvMode {
             }),
             Self::DetachedProductCreation { .. }
             | Self::DetachedApprovedTask { .. }
+            | Self::AttachedWorkChild
             | Self::Explore { .. }
             | Self::Direct => None,
         }
@@ -791,6 +798,14 @@ impl ErrorKind {
     #[must_use]
     pub fn is_auto_retryable(&self) -> bool {
         self.auto_retry_policy().allows_auto_retry()
+    }
+
+    /// Whether this error participates in the generic short retry loop exposed
+    /// by the wire-level `can_auto_retry` capability. Capacity overload has its
+    /// own bounded policy and is intentionally excluded.
+    #[must_use]
+    pub fn is_generic_auto_retryable(&self) -> bool {
+        matches!(self.auto_retry_policy(), AutoRetryPolicy::Generic { .. })
     }
 
     /// Policy for a persisted error state accepting a user-triggered `continue`.
@@ -1534,11 +1549,151 @@ impl RecoverySettlementReason {
     }
 }
 
+/// Server-assigned attribution of an input. `UnknownHistorical` means no reliable
+/// attribution was recorded; it does not mean the API user authored the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SourceToolCall {
+    pub message_id: String,
+    pub tool_use_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum InputOrigin {
+    #[default]
+    UnknownHistorical,
+    UserApi,
+    InternalConversation {
+        #[ts(type = "string")]
+        product_conversation_id: ProductConversationId,
+        transcript_id: String,
+        // owned: pre-locator inputs recorded no source call; absence is truthful.
+        #[serde(default)]
+        source_call: Option<Box<SourceToolCall>>,
+    },
+    SystemGenerated,
+    SubscriptionEvent {
+        event_id: String,
+    },
+}
+
+impl InputOrigin {
+    /// Compare a stored admission with a retry without reattributing historical data.
+    #[must_use]
+    pub fn accepts_retry_origin(&self, retry: &Self) -> bool {
+        match (self, retry) {
+            (
+                Self::InternalConversation {
+                    product_conversation_id: a,
+                    transcript_id: b,
+                    ..
+                },
+                Self::InternalConversation {
+                    product_conversation_id: c,
+                    transcript_id: d,
+                    ..
+                },
+            ) => a == c && b == d,
+            _ => self == retry || matches!((self, retry), (Self::UnknownHistorical, Self::UserApi)),
+        }
+    }
+
+    #[must_use]
+    pub fn source_call(&self) -> Option<&SourceToolCall> {
+        match self {
+            Self::InternalConversation { source_call, .. } => source_call.as_deref(),
+            Self::UnknownHistorical
+            | Self::UserApi
+            | Self::SystemGenerated
+            | Self::SubscriptionEvent { .. } => None,
+        }
+    }
+
+    /// # Errors
+    /// Rejects partial locator pairs and locators on non-conversation origins.
+    pub fn with_source_call_columns(
+        mut self,
+        message_id: Option<String>,
+        tool_use_id: Option<String>,
+    ) -> Result<Self, String> {
+        match (&mut self, message_id, tool_use_id) {
+            (
+                Self::InternalConversation { source_call, .. },
+                Some(message_id),
+                Some(tool_use_id),
+            ) if !message_id.is_empty() && !tool_use_id.is_empty() => {
+                *source_call = Some(Box::new(SourceToolCall {
+                    message_id,
+                    tool_use_id,
+                }));
+            }
+            (_, None, None) => {}
+            _ => return Err("invalid source tool call columns".into()),
+        }
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn db_parts(&self) -> (&'static str, Option<&str>, Option<&str>, Option<&str>) {
+        match self {
+            Self::UnknownHistorical => ("unknown_historical", None, None, None),
+            Self::UserApi => ("user_api", None, None, None),
+            Self::InternalConversation {
+                product_conversation_id,
+                transcript_id,
+                ..
+            } => (
+                "internal_conversation",
+                Some(product_conversation_id.as_str()),
+                Some(transcript_id),
+                None,
+            ),
+            Self::SystemGenerated => ("system_generated", None, None, None),
+            Self::SubscriptionEvent { event_id } => {
+                ("subscription_event", None, None, Some(event_id))
+            }
+        }
+    }
+
+    /// # Errors
+    /// Returns an error when persisted origin columns do not form a valid origin.
+    pub fn from_db_parts(
+        kind: &str,
+        product_id: Option<String>,
+        transcript_id: Option<String>,
+        event_id: Option<String>,
+    ) -> Result<Self, String> {
+        match (kind, product_id, transcript_id, event_id) {
+            ("unknown_historical", None, None, None) => Ok(Self::UnknownHistorical),
+            ("user_api", None, None, None) => Ok(Self::UserApi),
+            ("system_generated", None, None, None) => Ok(Self::SystemGenerated),
+            ("subscription_event", None, None, Some(event_id)) if !event_id.trim().is_empty() => {
+                Ok(Self::SubscriptionEvent { event_id })
+            }
+            ("internal_conversation", Some(product_id), Some(transcript_id), None)
+                if !transcript_id.trim().is_empty() =>
+            {
+                Ok(Self::InternalConversation {
+                    product_conversation_id: ProductConversationId::parse(product_id)
+                        .map_err(|e| e.to_string())?,
+                    transcript_id,
+                    source_call: None,
+                })
+            }
+            other => Err(format!("invalid input origin: {other:?}")),
+        }
+    }
+}
+
 /// Message record
 #[derive(Debug, Clone, Serialize)]
 #[allow(clippy::struct_field_names)]
 pub struct Message {
     pub message_id: String,
+    #[serde(default)]
+    pub origin: InputOrigin,
     pub conversation_id: String,
     pub sequence_id: i64,
     pub message_type: MessageType,
@@ -1694,6 +1849,7 @@ pub struct ConversationUsage {
 pub struct UsageDailyModelRow {
     pub day: String,
     pub model: String,
+    pub service_tier: crate::domain::llm_types::ServiceTier,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_creation_tokens: i64,
@@ -1709,6 +1865,7 @@ pub struct UsageDailyModelRow {
 pub struct UsageConversationModelRow {
     pub root_conversation_id: String,
     pub model: String,
+    pub service_tier: crate::domain::llm_types::ServiceTier,
     pub slug: Option<String>,
     pub title: Option<String>,
     pub project_id: Option<String>,
@@ -1738,6 +1895,7 @@ pub struct UsageTurnRow {
     pub reasoning_tokens: Option<i64>,
     pub effort_source: crate::domain::llm_types::EffortSource,
     pub effort_level: Option<crate::domain::llm_types::ModelEffort>,
+    pub service_tier: crate::domain::llm_types::ServiceTier,
     pub cache_creation_tokens: i64,
     pub cache_read_tokens: i64,
 }
@@ -1922,6 +2080,13 @@ mod conv_mode_tests {
 #[cfg(test)]
 mod error_kind_tests {
     use super::*;
+
+    #[test]
+    fn overload_is_not_exposed_as_generic_auto_retryable() {
+        assert!(ErrorKind::Network.is_generic_auto_retryable());
+        assert!(ErrorKind::ServerOverloaded.is_auto_retryable());
+        assert!(!ErrorKind::ServerOverloaded.is_generic_auto_retryable());
+    }
 
     #[test]
     fn all_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {

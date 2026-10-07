@@ -1713,7 +1713,7 @@ fn translate_to_responses_request(
             .map(platform_reasoning),
         service_tier: ProviderRequestTier::from_effective_service_tier(
             request.service_tier,
-            use_codex_backend || (official_openai_route && api_name == "gpt-6-astra"),
+            use_codex_backend || (official_openai_route && is_known_gpt_6(api_name)),
         )
         .responses_request_value()
         .map(str::to_string),
@@ -1777,16 +1777,23 @@ fn translate_to_backend_request(
     }
 }
 
-fn is_gpt_56_or_astra(api_name: &str) -> bool {
-    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-") || api_name == "gpt-6-astra"
+fn is_known_gpt_6(api_name: &str) -> bool {
+    matches!(
+        api_name,
+        "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
+    )
+}
+
+fn supports_modern_responses(api_name: &str) -> bool {
+    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-") || is_known_gpt_6(api_name)
 }
 
 pub(crate) fn supports_responses_lite(api_name: &str) -> bool {
-    is_gpt_56_or_astra(api_name)
+    supports_modern_responses(api_name)
 }
 
 fn supports_explicit_prompt_cache(api_name: &str) -> bool {
-    is_gpt_56_or_astra(api_name)
+    supports_modern_responses(api_name)
 }
 
 /// Preserve `OpenAI`'s historical read boundaries while leaving the latest
@@ -3665,7 +3672,6 @@ mod tests {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: crate::CodexAvailability::Established,
             effort_capabilities: crate::EffortCapabilities::unknown(),
             service_tier_capabilities: crate::models::ServiceTierCapabilities::Unsupported,
         }
@@ -3677,10 +3683,12 @@ mod tests {
             messages: messages
                 .iter()
                 .map(|(text, role)| LlmMessage {
+                    source_message_id: None,
                     role: *role,
                     content: vec![ContentBlock::text(*text)],
                 })
                 .collect(),
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -4555,6 +4563,7 @@ mod tests {
         LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -4628,6 +4637,85 @@ mod tests {
     }
 
     #[test]
+    fn gpt6_sol_luna_fast_tier_serializes_on_direct_and_codex_routes() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            let direct =
+                serde_json::to_value(translate_to_responses_request(model, &request, false, true))
+                    .unwrap();
+            let codex =
+                serde_json::to_value(translate_to_responses_request(model, &request, true, false))
+                    .unwrap();
+            assert_eq!(direct["service_tier"], "priority");
+            assert_eq!(codex["service_tier"], "priority");
+        }
+    }
+
+    #[test]
+    fn gpt_61_sol_uses_supported_responses_routes_and_effort() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Max);
+        let direct = serde_json::to_value(translate_to_backend_request(
+            "gpt-6.1-sol",
+            &request,
+            false,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(direct["model"], "gpt-6.1-sol");
+        assert_eq!(direct["reasoning"]["effort"], "max");
+        assert_eq!(direct["service_tier"], "priority");
+        assert!(direct.get("prompt_cache_options").is_some());
+        assert!(matches!(
+            translate_to_backend_request("gpt-6.1-sol", &request, true, false),
+            ResponsesBackendRequest::CodexLite(_)
+        ));
+        assert!(supports_responses_lite("gpt-6.1-sol"));
+        let custom = serde_json::to_value(translate_to_backend_request(
+            "gpt-6.1-sol",
+            &request,
+            false,
+            false,
+        ))
+        .unwrap();
+        assert!(custom.get("service_tier").is_none());
+        assert!(custom.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn future_gpt6_model_does_not_inherit_known_model_capabilities() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        let direct = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-future",
+            &request,
+            false,
+            true,
+        ))
+        .unwrap();
+        assert!(direct.get("service_tier").is_none());
+        assert!(!supports_responses_lite("gpt-6-future"));
+        assert!(!supports_explicit_prompt_cache("gpt-6-future"));
+    }
+
+    #[test]
+    fn gpt6_sol_luna_omit_fast_and_explicit_cache_on_custom_routes() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            let custom = serde_json::to_value(translate_to_responses_request(
+                model, &request, false, false,
+            ))
+            .unwrap();
+            assert!(custom.get("service_tier").is_none());
+            assert!(custom.get("prompt_cache_options").is_none());
+        }
+    }
+
+    #[test]
     fn astra_explicit_cache_controls_are_omitted_on_custom_routes() {
         let request = empty_request();
 
@@ -4674,6 +4762,21 @@ mod tests {
 
         assert!(matches!(codex, ResponsesBackendRequest::CodexLite(_)));
         assert!(matches!(platform, ResponsesBackendRequest::Platform(_)));
+    }
+
+    #[test]
+    fn gpt6_sol_luna_use_responses_lite_only_on_codex_route() {
+        let request = empty_request();
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            assert!(matches!(
+                translate_to_backend_request(model, &request, true, false),
+                ResponsesBackendRequest::CodexLite(_)
+            ));
+            assert!(matches!(
+                translate_to_backend_request(model, &request, false, true),
+                ResponsesBackendRequest::Platform(_)
+            ));
+        }
     }
 
     #[test]
@@ -4770,6 +4873,7 @@ mod tests {
 
         let mut req = empty_request();
         req.messages = vec![LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
@@ -4805,14 +4909,17 @@ mod tests {
         let mut req = empty_request();
         req.messages = vec![
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text("first question")],
             },
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::Assistant,
                 content: vec![ContentBlock::text("prior answer")],
             },
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text("follow-up question")],
             },
@@ -4879,11 +4986,13 @@ mod tests {
         let mut req = empty_request();
         req.messages = (0..history_cap)
             .map(|i| LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("history {i}"))],
             })
             .collect();
         req.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("prepare continuation handoff")],
         });
@@ -4907,11 +5016,13 @@ mod tests {
         let mut req = empty_request();
         req.messages = (0..history_cap)
             .map(|i| LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("history {i}"))],
             })
             .collect();
         req.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("prepare continuation handoff")],
         });
@@ -5556,11 +5667,13 @@ mod tests {
         let mut request = empty_request();
         for i in 0..5 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("stable-{i}"))],
             });
         }
         request.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call-1".into(),
@@ -5611,6 +5724,7 @@ mod tests {
         let mut request = empty_request();
         for i in 0..55 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("stable-{i}"))],
             });
@@ -5648,15 +5762,18 @@ mod tests {
         // the 50 limit), each preceded/followed by a skipped assistant turn.
         for i in 0..60 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("q-{i}"))],
             });
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::Assistant,
                 content: vec![ContentBlock::text(format!("a-{i}"))],
             });
         }
         request.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("latest")],
         });

@@ -668,6 +668,23 @@ function clearProgressForMaterializedResults(
   return Object.fromEntries(Object.entries(live).filter(([id]) => !completed.has(id)));
 }
 
+function clearStreamingBufferIfAffected(
+  atom: ConversationAtom,
+  affectedRequestId: string | null,
+): ConversationAtom {
+  if (!atom.streamingBuffer) return atom;
+  if (affectedRequestId === null) return atom;
+  if (atom.streamingBuffer.requestId !== affectedRequestId) return atom;
+  return {
+    ...atom,
+    streamingBuffer: null,
+  };
+}
+
+function currentStreamingRequestId(atom: ConversationAtom): string | null {
+  return atom.firstByteRequestId ?? atom.streamingBuffer?.requestId ?? null;
+}
+
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
@@ -754,7 +771,9 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       const terminalOverload =
         (phase.type === 'error' || phase.type === 'recoverable_continuation_failure')
         && phase.error_kind === 'server_overloaded';
-      return {
+      const leavingLlmRequesting = atom.phase.type === 'llm_requesting' && action.phase.type !== 'llm_requesting';
+      const next = {
+
         ...atom,
         phase,
         phaseLastAppliedEventSeq: action.sequenceId,
@@ -763,6 +782,9 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         turnRetryContext: terminalOverload ? null : atom.turnRetryContext,
         toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
       };
+      return leavingLlmRequesting
+        ? clearStreamingBufferIfAffected(next, currentStreamingRequestId(atom))
+        : next;
     }
     case 'sse_agent_done':
       return {
@@ -776,8 +798,8 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       };
     case 'sse_llm_first_byte':
       return { ...atom, firstByteRequestId: action.requestId };
-    case 'sse_llm_attempt':
-      return {
+    case 'sse_llm_attempt': {
+      const next = {
         ...atom,
         turnRetryContext: {
           attempt: action.attempt,
@@ -788,6 +810,10 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
           resetsAt: action.resetsAt,
         },
       };
+      return atom.phase.type === 'llm_requesting' && action.attempt > atom.phase.attempt
+        ? clearStreamingBufferIfAffected(next, currentStreamingRequestId(atom))
+        : next;
+    }
     case 'sse_sequence_consumed':
       return atom;
     case 'sse_token': {
@@ -840,8 +866,16 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       };
     case 'sse_work_scope_update':
       return { ...atom, workScope: action.inventory };
-    case 'sse_error':
-      return { ...atom, uiError: action.error, turnRetryContext: null };
+    case 'sse_error': {
+      const next = {
+        ...atom,
+        uiError: action.error,
+        turnRetryContext: null,
+      };
+      return atom.phase.type === 'llm_requesting'
+        ? clearStreamingBufferIfAffected(next, currentStreamingRequestId(atom))
+        : next;
+    }
     default:
       return atom;
   }

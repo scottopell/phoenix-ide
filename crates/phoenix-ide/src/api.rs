@@ -11,6 +11,7 @@ mod chains;
 pub mod codex_login;
 mod deployment;
 mod discovery;
+mod federation;
 mod git_handlers;
 pub(crate) mod global_read;
 pub(crate) mod handlers;
@@ -209,6 +210,11 @@ impl AppState {
         runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await?;
+        runtime.require_startup_local_authority()?;
+        runtime
+            .settle_persisted_llm_requests()
+            .await
+            .map_err(std::io::Error::other)?;
         runtime.require_startup_local_authority()?;
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();

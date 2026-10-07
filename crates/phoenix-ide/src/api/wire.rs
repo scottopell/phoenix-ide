@@ -59,6 +59,7 @@ use crate::runtime::{
     user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation, SseEvent,
 };
 use crate::state_machine::event::SteerEntry;
+use phoenix_core::domain::db_schema::InputOrigin;
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
@@ -72,7 +73,7 @@ impl ErrorPresentation {
     fn from_kind(kind: &ErrorKind) -> Self {
         Self {
             kind: kind.clone(),
-            can_auto_retry: kind.is_auto_retryable(),
+            can_auto_retry: kind.is_generic_auto_retryable(),
             can_user_resume: kind.is_user_resumable(),
         }
     }
@@ -93,6 +94,7 @@ impl ErrorPresentation {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct EnrichedMessage {
     pub message_id: String,
+    pub origin: InputOrigin,
     pub conversation_id: String,
     pub sequence_id: i64,
     pub message_type: MessageType,
@@ -109,6 +111,7 @@ impl From<&Message> for EnrichedMessage {
         let content = enrich_content(msg);
         Self {
             message_id: msg.message_id.clone(),
+            origin: msg.origin.clone(),
             conversation_id: msg.conversation_id.clone(),
             sequence_id: msg.sequence_id,
             message_type: msg.message_type,
@@ -134,6 +137,7 @@ impl From<Message> for EnrichedMessage {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct QueuedSteeringMessage {
     pub message_id: String,
+    pub origin: InputOrigin,
     pub text: String,
     #[ts(type = "Array<unknown>")]
     pub images: Vec<phoenix_core::domain::db_schema::ImageData>,
@@ -145,6 +149,7 @@ impl From<&SteerEntry> for QueuedSteeringMessage {
     fn from(entry: &SteerEntry) -> Self {
         Self {
             message_id: entry.message_id.clone(),
+            origin: entry.origin.clone(),
             text: entry.text.clone(),
             images: entry.images.clone(),
             files: entry.files.clone(),
@@ -401,6 +406,7 @@ pub enum SseWireEvent {
     ConversationHardDeleted {
         sequence_id: i64,
         conversation_id: String,
+        deleted_conversation_ids: Vec<String>,
     },
     /// Browser session liveness changed for the conversation this SSE
     /// stream represents. `active = true` is fired exactly once when a
@@ -611,9 +617,11 @@ impl From<SseEvent> for SseWireEvent {
             SseEvent::ConversationHardDeleted {
                 sequence_id,
                 conversation_id,
+                deleted_conversation_ids,
             } => SseWireEvent::ConversationHardDeleted {
                 sequence_id,
                 conversation_id,
+                deleted_conversation_ids,
             },
             SseEvent::BrowserSessionState {
                 sequence_id,

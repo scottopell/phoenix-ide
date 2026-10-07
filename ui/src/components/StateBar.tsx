@@ -7,6 +7,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type RefObject,
+  type ReactNode,
 } from "react";
 import { Link } from "react-router-dom";
 import { useLastSseEventAtRef } from "../conversation/useConversationAtom";
@@ -74,6 +75,12 @@ const CheckIcon = () => (
 export type ContinuationState =
   | { phase: "idle"; onTrigger: () => void }
   | { phase: "unavailable" };
+
+export interface StateBarConversationExtension {
+  summary: ReactNode;
+  details: ReactNode;
+  requiresAttention?: boolean;
+}
 
 interface StateBarProps {
   conversation: Conversation | null;
@@ -155,6 +162,7 @@ interface StateBarProps {
     onOpen: () => void;
     buttonRef: RefObject<HTMLButtonElement>;
   } | undefined;
+  conversationExtension?: StateBarConversationExtension | undefined;
   workActionsAvailable?: boolean;
   prStatusHandle?: ConversationPrStatusHandle;
 }
@@ -509,6 +517,7 @@ export function StateBar({
   onOpenFiles,
   terminalLauncher,
   prStatusHandle,
+  conversationExtension,
   workActionsAvailable = true,
 }: StateBarProps) {
   // `toolExecutingStartedAt` is kept on the prop type for the
@@ -528,12 +537,34 @@ export function StateBar({
   const [modelMutationError, setModelMutationError] = useState<string | null>(null);
   const usesCompactLayout = useIsCompactLayout();
   const [mobileExpanded, setMobileExpanded] = useState(false);
+  const [conversationExtensionExpanded, setConversationExtensionExpanded] = useState(false);
+  const [composerClearance, setComposerClearance] = useState(64);
   // Collapse the mobile-expanded section when the viewport widens past
   // mobile — otherwise a user who expanded on phone, rotated to landscape,
   // would see a desktop bar with a stale "expanded" affordance.
   useEffect(() => {
     if (!usesCompactLayout) setMobileExpanded(false);
   }, [usesCompactLayout]);
+
+  useEffect(() => {
+    if (!conversationExtension?.requiresAttention) return;
+    if (usesCompactLayout) {
+      setMobileExpanded(true);
+    } else {
+      setConversationExtensionExpanded(true);
+    }
+  }, [conversationExtension?.requiresAttention, usesCompactLayout]);
+
+  useLayoutEffect(() => {
+    if (!conversationExtension || usesCompactLayout) return;
+    const inputArea = document.getElementById("input-area");
+    if (!inputArea) return;
+    const update = () => setComposerClearance(inputArea.getBoundingClientRect().height + 16);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(inputArea);
+    return () => observer.disconnect();
+  }, [conversationExtension, usesCompactLayout]);
   const pickerTriggerRef = useRef<HTMLButtonElement>(null);
   const conversationIdentityRef = useRef(conversation?.id);
   const modelMutationGenerationRef = useRef(0);
@@ -690,6 +721,11 @@ export function StateBar({
     turnRetryContext != null
       ? ` (retry ${turnRetryContext.attempt}/${turnRetryContext.maxAttempts} after ${turnRetryContext.reasonText})`
       : "";
+  const retrySuffixForPhase = (phase: ConversationState): string =>
+    retrySuffix || (phase.type === 'server_overload_retrying'
+      ? ` (retry ${phase.attempt}/${phase.maxAttempts} after model overloaded)`
+      : "");
+  const effectiveRetrySuffix = retrySuffixForPhase(convState);
 
   // Format the working-phase reason as "<base> Ns <retry?>" (e.g.
   // "awaiting LLM response 4s (retry 2/3 after rate limit)",
@@ -705,7 +741,7 @@ export function StateBar({
     // carried through. Used for the frozen last-known-activity display so a
     // mid-stream disconnect doesn't regress to "awaiting LLM response Ns".
     if (streaming) {
-      return `streaming${retrySuffix}`;
+      return `streaming${retrySuffixForPhase(phase)}`;
     }
     // Strip a trailing `...` from the base label: descriptions for
     // working phases (`llm_requesting` → "awaiting LLM response...")
@@ -716,7 +752,7 @@ export function StateBar({
       elapsedSeconds > 0
         ? `${base} ... ${formatElapsed(elapsedSeconds)}`
         : base;
-    return `${withElapsed}${retrySuffix}`;
+    return `${withElapsed}${retrySuffixForPhase(phase)}`;
   };
 
   if (!conversation) {
@@ -870,9 +906,9 @@ export function StateBar({
               // is now streaming should still surface "(retry 2/3 …)"
               // so the user has the full context for "why has this
               // taken so long?".
-              stateText = `streaming${retrySuffix}`;
+              stateText = `streaming${effectiveRetrySuffix}`;
             } else if (convState.type === 'server_overload_retrying' && overloadRetrySeconds != null) {
-              stateText = `model overloaded — retrying in ${overloadRetrySeconds}s${retrySuffix}`;
+              stateText = `model overloaded — retrying in ${overloadRetrySeconds}s${effectiveRetrySuffix}`;
             } else {
               stateText = formatWorkingReason(convState, phaseElapsedSeconds);
             }
@@ -1337,6 +1373,22 @@ export function StateBar({
     }`
     : undefined;
 
+  const compactStatus = conversationExtension && !watchdogStale ? (() => {
+    switch (connectionState) {
+      case "connected":
+        return { text: "Connected", dotClass: "dot idle" };
+      case "reconnected":
+        return { text: "Reconnected", dotClass: "dot reconnected" };
+      case "reconnecting":
+        return { text: "Reconnecting", dotClass: "dot reconnecting" };
+      case "offline":
+        return { text: "Disconnected", dotClass: "dot offline" };
+      case "connecting":
+      case "disconnected":
+        return { text: "Connecting", dotClass: "dot connecting" };
+    }
+  })() : { text: stateText, dotClass };
+
   if (usesCompactLayout) {
     const toggleMobileExpanded = () => setMobileExpanded((v) => !v);
     const handleCollapsedKey = (e: ReactKeyboardEvent) => {
@@ -1372,10 +1424,13 @@ export function StateBar({
             ) : (
               <span className="statebar-slug">&mdash;</span>
             )}
-            <div className="statebar-mobile-status" title={stateText}>
-              <span className={dotClass}></span>
-              {!mobileExpanded && (
-                <span className="state-text">{stateText}</span>
+            <div
+              className={`statebar-mobile-status${conversationExtension ? " statebar-mobile-status--transport" : ""}`}
+              title={compactStatus.text}
+            >
+              <span className={compactStatus.dotClass}></span>
+              {(!mobileExpanded || conversationExtension) && (
+                <span className="state-text">{compactStatus.text}</span>
               )}
             </div>
             <div className="statebar-mobile-actions">
@@ -1397,8 +1452,21 @@ export function StateBar({
             </div>
           </div>
 
-          {mobileExpanded && conversation && (
-            <div className="statebar-mobile-details">
+          {(conversation || conversationExtension) && (
+            <div className="statebar-mobile-details" hidden={!mobileExpanded}>
+              {conversationExtension && (
+                <section
+                  className="statebar-mobile-section statebar-mobile-section--conversation-extension"
+                  aria-label="Global activity and settings"
+                >
+                  <div className="statebar-conversation-extension-summary">
+                    {conversationExtension.summary}
+                  </div>
+                  {conversationExtension.details}
+                </section>
+              )}
+              {mobileExpanded && conversation && (
+                <>
               <section
                 className="statebar-mobile-section"
                 aria-label="Working directory"
@@ -1524,6 +1592,8 @@ export function StateBar({
                   />
                 )}
               </section>
+                </>
+              )}
             </div>
           )}
         </header>
@@ -1648,21 +1718,26 @@ export function StateBar({
             </button>
           )}
         </div>
-        {usesCompactLayout && (
-          <button
-            type="button"
-            className="statebar-chevron"
-            onClick={(e) => {
-              e.stopPropagation();
-              setMobileExpanded((v) => !v);
-            }}
-            aria-label={
-              mobileExpanded ? "Collapse status bar" : "Expand status bar"
-            }
-            aria-expanded={mobileExpanded}
-          >
-            {mobileExpanded ? "▾" : "▴"}
-          </button>
+        {conversationExtension && (
+          <div className="statebar-conversation-extension">
+            <button
+              type="button"
+              className="statebar-conversation-extension-toggle"
+              aria-expanded={conversationExtensionExpanded}
+              aria-controls="statebar-conversation-extension-details"
+              onClick={() => setConversationExtensionExpanded((expanded) => !expanded)}
+            >
+              {conversationExtension.summary}
+            </button>
+            <div
+              id="statebar-conversation-extension-details"
+              className="statebar-conversation-extension-details"
+              style={{ bottom: `calc(100% + ${composerClearance}px)` }}
+              hidden={!conversationExtensionExpanded}
+            >
+              {conversationExtension.details}
+            </div>
+          </div>
         )}
       </header>
       {modelDialog}

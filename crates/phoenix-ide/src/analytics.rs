@@ -4,7 +4,7 @@
 //! `turn_usage`) and produces typed analytics facts without persisting a second
 //! transcript or tool I/O store.
 
-use crate::api::usage::{calculate_turn_cost, TurnCost};
+use crate::api::usage::{calculate_turn_cost_for_tier, TurnCost};
 use crate::db::{
     ConvMode, Conversation, Database, Message, MessageContent, UsageAnchorRow, UsageTurnRow,
 };
@@ -74,6 +74,7 @@ pub struct AnalyticsUsageTurn {
     pub model: String,
     pub effort_source: phoenix_core::domain::llm_types::EffortSource,
     pub effort_level: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    pub service_tier: phoenix_core::domain::llm_types::ServiceTier,
     pub created_at: DateTime<Utc>,
     pub first_byte_at: Option<DateTime<Utc>>,
     pub first_byte_latency_ms: Option<u64>,
@@ -233,12 +234,14 @@ fn project_usage_turns(
                 model: r.model.clone(),
                 effort_source: r.effort_source,
                 effort_level: r.effort_level,
+                service_tier: r.service_tier,
                 created_at,
                 first_byte_at,
                 first_byte_latency_ms,
                 tokens,
-                cost: calculate_turn_cost(
+                cost: calculate_turn_cost_for_tier(
                     &r.model,
+                    r.service_tier,
                     r.input_tokens,
                     r.output_tokens,
                     r.cache_creation_tokens,
@@ -398,7 +401,7 @@ fn worktree_path(conv: &Conversation) -> Option<String> {
         | ConvMode::Branch { worktree_path, .. }
         | ConvMode::DetachedProductCreation { worktree_path, .. }
         | ConvMode::DetachedApprovedTask { worktree_path, .. } => Some(worktree_path.to_string()),
-        ConvMode::Direct => None,
+        ConvMode::Direct | ConvMode::AttachedWorkChild => None,
     }
 }
 
@@ -409,6 +412,7 @@ fn branch_name(conv: &Conversation) -> Option<String> {
         }
         ConvMode::Explore { .. }
         | ConvMode::Direct
+        | ConvMode::AttachedWorkChild
         | ConvMode::DetachedProductCreation { .. }
         | ConvMode::DetachedApprovedTask { .. } => None,
     }
@@ -422,6 +426,7 @@ fn task_id(conv: &Conversation) -> Option<String> {
         ConvMode::Explore { .. }
         | ConvMode::Direct
         | ConvMode::Branch { .. }
+        | ConvMode::AttachedWorkChild
         | ConvMode::DetachedProductCreation { .. } => None,
     }
 }
@@ -434,6 +439,7 @@ fn task_title(conv: &Conversation) -> Option<String> {
         ConvMode::Explore { .. }
         | ConvMode::Direct
         | ConvMode::Branch { .. }
+        | ConvMode::AttachedWorkChild
         | ConvMode::DetachedProductCreation { .. } => None,
     }
 }
@@ -499,6 +505,7 @@ mod tests {
             MessageContent::Skill(_) => MessageType::Skill,
         };
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id: seq,

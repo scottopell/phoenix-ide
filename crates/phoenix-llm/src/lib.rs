@@ -69,15 +69,16 @@ pub use retry_guidance::RetryAfter;
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
 pub use models::{
-    all_models, merge_model_specs, parse_external_models, CodexAvailability, EffortCapabilities,
-    ModelBackend, ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
+    all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
+    ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]
 // CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
 pub use registry::{
-    AuthStyle, CredentialSource, ExecutionRoute, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth,
+    legacy_model_replacement, AuthStyle, CredentialSource, ExecutionRoute, LlmAuth, LlmConfig,
+    ModelRegistry, ResolvedAuth,
 };
 pub use service::{LlmAttemptDeadline, LlmServiceImpl};
 // `types` (ContentBlock, Usage, ImageSource, …) live in phoenix-core. Alias
@@ -196,6 +197,15 @@ pub trait LlmService: Send + Sync {
     }
 
     fn uses_official_openai_responses(&self) -> bool {
+        false
+    }
+
+    /// True when this service reaches Anthropic through the official direct
+    /// Claude API (no compatible/proxy base-URL override). Consumed by
+    /// [`crate::ModelSpec::service_tier_capabilities_for`] so Anthropic Fast
+    /// mode is advertised only on the route where it exists. Default `false`
+    /// covers non-Anthropic and proxied routes.
+    fn uses_official_anthropic(&self) -> bool {
         false
     }
 
@@ -518,6 +528,10 @@ impl LlmService for LoggingService {
 
     fn uses_official_openai_responses(&self) -> bool {
         self.inner.uses_official_openai_responses()
+    }
+
+    fn uses_official_anthropic(&self) -> bool {
+        self.inner.uses_official_anthropic()
     }
 
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {

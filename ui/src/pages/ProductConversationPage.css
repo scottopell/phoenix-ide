@@ -245,7 +245,7 @@
 @media (width <= 640px) {
   .product-conversation-page__recall-panel {
     position: fixed;
-    inset: 52px max(8px, env(safe-area-inset-right, 0)) max(112px, calc(env(safe-area-inset-bottom, 0) + 96px)) max(8px, env(safe-area-inset-left, 0));
+    inset: calc(52px + var(--app-safe-area-top)) max(8px, env(safe-area-inset-right, 0)) max(112px, calc(env(safe-area-inset-bottom, 0) + 96px)) max(8px, env(safe-area-inset-left, 0));
     width: auto;
     height: auto;
     min-height: 0;

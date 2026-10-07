@@ -33,6 +33,17 @@ enum APIError: Error, LocalizedError {
         return false
     }
 
+    var isRetryableAggregateReconciliationFailure: Bool {
+        switch self {
+        case .transport, .decoding:
+            return true
+        case .http(let status, _):
+            return status == 408 || status == 429 || status >= 500
+        case .certificatePinMismatch, .invalidURL:
+            return false
+        }
+    }
+
     var isRetryableChatDeliveryFailure: Bool {
         switch self {
         case .transport, .decoding:
@@ -45,6 +56,22 @@ enum APIError: Error, LocalizedError {
     var isNotFound: Bool {
         if case .http(status: 404, body: _) = self { return true }
         return false
+    }
+
+    var isCloseAlreadyHistory: Bool {
+        serverErrorType == "close_already_history"
+    }
+
+    var serverErrorType: String? {
+        guard case .http(_, let body) = self,
+              let data = body.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(ServerErrorPayload.self, from: data)
+        else { return nil }
+        return payload.error_type
+    }
+
+    private struct ServerErrorPayload: Decodable {
+        var error_type: String?
     }
 
     var isPermanentStreamAuthenticationFailure: Bool {
@@ -179,7 +206,12 @@ struct PhoenixAPI: Sendable {
     /// idle timeout covers gaps between events (the server keep-alives).
     private let streamSession: URLSession
 
-    init?(baseURL: URL, password: String?, allowSelfSigned: Bool) {
+    init?(
+        baseURL: URL,
+        password: String?,
+        allowSelfSigned: Bool,
+        configuration: URLSessionConfiguration = .default
+    ) {
         guard password?.isEmpty != false || baseURL.scheme?.lowercased() == "https" else {
             return nil
         }
@@ -189,7 +221,7 @@ struct PhoenixAPI: Sendable {
         let delegate = ServerTrustDelegate(allowSelfSigned: allowSelfSigned)
         self.trustDelegate = delegate
 
-        let config = URLSessionConfiguration.default
+        let config = configuration
         config.timeoutIntervalForRequest = 30
         config.waitsForConnectivity = false
         self.session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
@@ -277,6 +309,7 @@ struct PhoenixAPI: Sendable {
         return response.product_conversations.map(productConversationListRowToConversation)
     }
 
+
     func listProductConversations() async throws -> ProductConversationListResponse {
         try await get("api/product-conversations", as: ProductConversationListResponse.self)
     }
@@ -293,9 +326,11 @@ struct PhoenixAPI: Sendable {
             as: ConversationWithMessagesResponse.self)
     }
 
-    func getProductConversation(id: String, before: String? = nil, messageLimit: Int? = nil) async throws
-        -> ProductConversationSnapshot
-    {
+    func getProductConversation(
+        reference: String,
+        before: String? = nil,
+        messageLimit: Int? = nil
+    ) async throws -> ProductConversationSnapshot {
         var query: [URLQueryItem] = []
         if let before, !before.isEmpty {
             query.append(URLQueryItem(name: "before", value: before))
@@ -304,11 +339,15 @@ struct PhoenixAPI: Sendable {
             query.append(URLQueryItem(name: "message_limit", value: String(messageLimit)))
         }
         return try await get(
-            "api/product-conversations/\(id)", query: query,
+            "api/product-conversations/\(reference)", query: query,
             as: ProductConversationSnapshot.self)
     }
 
     func productConversationListRowToConversation(_ row: ProductConversationListRow) -> Conversation {
+        let closeAction: ProductConversationCloseAction? = switch row.lifecycle {
+        case .open(let closeAction): closeAction
+        case .history: nil
+        }
         let (presentationMode, requiresAction): (String?, Bool?) = switch row.presentation {
         case .needsAction:
             ("needs_action", true)
@@ -319,6 +358,9 @@ struct PhoenixAPI: Sendable {
         return Conversation(
             id: row.latest_transcript_row_id,
             product_conversation_id: row.product_conversation_id,
+            chain_root_id: row.canonical_root.transcript_row_id == row.latest_transcript_row_id
+                ? nil
+                : row.canonical_root.transcript_row_id,
             slug: row.canonical_root.slug,
             title: row.canonical_root.title,
             model: nil,
@@ -330,7 +372,8 @@ struct PhoenixAPI: Sendable {
             state_updated_at: nil,
             branch_name: nil,
             task_title: nil,
-            archived: row.ordinary_lifecycle == .history,
+            archived: row.lifecycle == .history,
+            product_close_action: closeAction,
             project_name: nil,
             conv_mode_label: nil,
             presentation_mode: presentationMode,
@@ -383,6 +426,94 @@ struct PhoenixAPI: Sendable {
             "api/conversations/\(conversationId)/cancel", body: [:], as: CancelResponse.self)
     }
 
+    func closeProductConversation(reference: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/product-conversations/\(reference)/close", body: [:], as: SuccessResponse.self)
+    }
+
+    func confirmCloseStopWork(conversationId: String, attemptId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/close/confirm-stop-work",
+            body: ["attempt_id": attemptId],
+            as: SuccessResponse.self)
+    }
+
+    func confirmCloseLossRetirement(
+        conversationId: String,
+        attemptId: String,
+        inspection: ProductConversationCloseInspection
+    ) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/close/confirm-loss-retirement",
+            body: [
+                "attempt_id": attemptId,
+                "inspection_generation": inspection.generation,
+                "inspection_fingerprint": inspection.fingerprint,
+            ],
+            as: SuccessResponse.self)
+    }
+
+    func cancelClose(conversationId: String, attemptId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/close/cancel-before-retirement",
+            body: ["attempt_id": attemptId],
+            as: SuccessResponse.self)
+    }
+
+    func retryCloseRetirement(conversationId: String, attemptId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/close/retry-retirement",
+            body: ["attempt_id": attemptId],
+            as: SuccessResponse.self)
+    }
+
+    enum ProductConversationDeleteOutcome: Decodable, Equatable {
+        case deleted(conversationIds: [String])
+        case alreadyAbsent
+
+        private enum CodingKeys: String, CodingKey {
+            case type
+            case deletedConversationIds = "deleted_conversation_ids"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            switch try container.decode(String.self, forKey: .type) {
+            case "deleted":
+                self = .deleted(conversationIds: try container.decode(
+                    [String].self,
+                    forKey: .deletedConversationIds))
+            case "already_absent":
+                self = .alreadyAbsent
+            default:
+                throw DecodingError.dataCorruptedError(
+                    forKey: .type,
+                    in: container,
+                    debugDescription: "unknown product conversation delete outcome")
+            }
+        }
+    }
+
+    struct ProductConversationDeleteResponse: Decodable, Equatable {
+        let success: Bool
+        let outcome: ProductConversationDeleteOutcome
+    }
+
+    func deleteProductConversation(
+        rootTranscriptRowId: String
+    ) async throws -> ProductConversationDeleteOutcome {
+        var request = try request(path: "api/chains/\(rootTranscriptRowId)")
+        request.httpMethod = "DELETE"
+        let (data, response) = try await session.data(for: request)
+        try validateStatus(response, data: data)
+        return try JSONDecoder().decode(ProductConversationDeleteResponse.self, from: data).outcome
+    }
+
     func archive(conversationId: String) async throws {
         struct OkResponse: Codable { var ok: Bool? }
         _ = try await post(
@@ -430,19 +561,31 @@ struct PhoenixAPI: Sendable {
     // Question response (awaiting_user_response): the server 409s when the
     // conversation isn't in that state — e.g. answered from another client.
 
-    func respondToQuestion(conversationId: String, answers: [String: String]) async throws {
+    func respondToQuestion(
+        conversationId: String,
+        requestId: String?,
+        answers: [String: String]
+    ) async throws {
         struct SuccessResponse: Codable { var success: Bool? }
+        var body: [String: Any] = ["answers": answers]
+        if let requestId { body["request_id"] = requestId }
         _ = try await post(
             "api/conversations/\(conversationId)/respond",
-            body: ["answers": answers],
+            body: body,
             as: SuccessResponse.self)
     }
 
-    func dismissQuestion(conversationId: String) async throws {
+    func dismissQuestion(conversationId: String, requestId: String?) async throws {
         struct SuccessResponse: Codable { var success: Bool? }
+        var body: [String: Any] = [:]
+        if let requestId { body["request_id"] = requestId }
         _ = try await post(
-            "api/conversations/\(conversationId)/dismiss-question", body: [:],
+            "api/conversations/\(conversationId)/dismiss-question", body: body,
             as: SuccessResponse.self)
+    }
+
+    func getCoordinatorProjection() async throws -> Conversation {
+        try await get("api/global/coordinator", as: ConversationResponse.self).conversation
     }
 
     /// Get-or-create the fleet Coordinator's writable transcript row. The
@@ -451,6 +594,17 @@ struct PhoenixAPI: Sendable {
     func ensureCoordinator() async throws -> Conversation {
         try await post("api/global/coordinator", body: [:], as: ConversationResponse.self)
             .conversation
+    }
+
+    private func validateStatus(_ response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport(underlying: URLError(.badServerResponse))
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.http(
+                status: http.statusCode,
+                body: String(data: data, encoding: .utf8) ?? "")
+        }
     }
 
     func validateCwd(path: String) async throws -> ValidateCwdResponse {
@@ -465,6 +619,26 @@ struct PhoenixAPI: Sendable {
     }
 
     // MARK: - SSE
+
+    func openProductConversationEventStream() async throws -> URLSession.AsyncBytes {
+        var req = try request(path: "api/product-conversations/events")
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 90
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+        do {
+            (bytes, response) = try await streamSession.bytes(for: req, delegate: trustDelegate)
+        } catch {
+            if hasCertificatePinMismatch { throw APIError.certificatePinMismatch }
+            throw APIError.transport(underlying: error)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport(underlying: URLError(.badServerResponse))
+        }
+        guard http.statusCode == 200 else {
+            throw APIError.http(status: http.statusCode, body: "")
+        }
+        return bytes
+    }
 
     /// Open the conversation event stream. The caller consumes raw bytes via
     /// SSEParser; each (re)connect delivers a fresh `init` snapshot including

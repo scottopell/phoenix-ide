@@ -27,6 +27,9 @@ static/dist/
 .playwright-mcp/
 .phoenix/
 dogfood-output
+
+# Private production conversation-search benchmark artifacts
+conversation-search-benchmark/
 scripts/install.sh
 
 # Local QA screenshots — generated on demand, not committed

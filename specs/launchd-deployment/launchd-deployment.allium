@@ -8,11 +8,10 @@ config {
     stale_after_seconds: Integer = 390
 }
 
-enum SourceKind { local_head | published_release }
 enum TransactionState {
     preparing | prepared | activating | committed |
     precondition_failed | activation_failed_rolled_back |
-    activation_failed_rollback_failed | rejected_concurrent
+    activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed | rejected_concurrent
 }
 enum RestartState {
     preparing | prepared | restarting | committed |
@@ -24,11 +23,44 @@ value RuntimeIdentity {
     git_sha: String
 }
 
+value PreparedArtifactProof {
+    controller_source_commit: String
+    controller_helper_hash: String
+    shared_database_path: String
+    migration_ledger_version: Integer
+}
+
+entity PreparedArtifactLifecycleObservation {
+    kind: PreparedArtifactAwaitingPreparation | PreparedArtifactPreflight | PreparedArtifactOfflineOwned
+        | PreparedArtifactSnapshotVerified
+}
+
+variant PreparedArtifactAwaitingPreparation : PreparedArtifactLifecycleObservation {}
+
+variant PreparedArtifactPreflight : PreparedArtifactLifecycleObservation {
+    prepared_artifact_proof: PreparedArtifactProof
+}
+
+variant PreparedArtifactOfflineOwned : PreparedArtifactLifecycleObservation {
+    prepared_artifact_proof: PreparedArtifactProof
+    offline_ownership_proof: String
+}
+
+variant PreparedArtifactSnapshotVerified : PreparedArtifactLifecycleObservation {
+    prepared_artifact_proof: PreparedArtifactProof
+    offline_ownership_proof: String
+    snapshot_integrity_proof: String
+}
+
+
+enum PairedRecoveryMode { snapshot_restored | unchanged_predecessor }
+
+enum FinalizationOutcome { not_committed | pending | complete }
+
 entity DeployTransaction {
     id: String
-    source_kind: SourceKind
+    kind: LocalHeadDeployment | PublishedReleaseDeployment | PreparedArtifactDeployment
     source_commit: String
-    release_tag: String?
     expected: RuntimeIdentity
     previous: RuntimeIdentity?
     state: TransactionState
@@ -36,7 +68,38 @@ entity DeployTransaction {
     updated_at: Timestamp
     failure: String?
     rollback_failure: String?
+
+    transitions state {
+        preparing -> prepared
+        preparing -> precondition_failed
+        preparing -> rejected_concurrent
+        prepared -> activating
+        prepared -> precondition_failed
+        prepared -> activation_failed_rolled_back
+        prepared -> activation_failed_rollback_failed
+        activating -> committed
+        activating -> activation_failed_rolled_back
+        activating -> activation_failed_rollback_failed
+        activating -> ordinary_activation_failed_rollback_failed
+        activation_failed_rollback_failed -> activation_failed_rolled_back
+        activation_failed_rollback_failed -> activation_failed_rollback_failed
+        terminal: committed, precondition_failed, activation_failed_rolled_back,
+                  ordinary_activation_failed_rollback_failed, rejected_concurrent
+    }
 }
+
+variant LocalHeadDeployment : DeployTransaction {}
+
+variant PublishedReleaseDeployment : DeployTransaction {
+    release_tag: String
+}
+
+variant PreparedArtifactDeployment : DeployTransaction {
+    paired_lifecycle_observation: PreparedArtifactLifecycleObservation
+    finalization: FinalizationOutcome
+    recovery_mode: PairedRecoveryMode?
+}
+
 
 entity RestartTransaction {
     id: String
@@ -75,26 +138,107 @@ external entity TargetService {
 --   Candidate binary, plist, rollback inputs, hashes, signature, manifest and
 --   embedded identity are valid and host-resident; persisted metadata contains
 --   no plist environment values.
+-- helper_capacity_reserved(transaction) -> Boolean
+--   After handoff, the helper physically reserves private snapshot and restore
+--   capacity for DB plus WAL and margin before production stop. True for
+--   ordinary sources, whose prepared runtime capacity is already held.
+-- HelperCapacityVerified(transaction)
+--   Emitted by the independent helper after successful capacity reservation.
 -- activation_claim_available() -> Boolean
 --   No active or unresolved deployment or restart owns the host-level claim.
 -- helper_is_launchd_owned(transaction) -> Boolean
 --   A distinct one-shot LaunchAgent owns activation independently of Phoenix.
 -- atomic_candidate_install(transaction) -> Boolean
---   Fsynced destination-filesystem artifacts replace targets by rename.
+--   Fsynced destination-filesystem artifacts replace the binary by rename.
+--   Ordinary plist publication is complete; paired bootstrap remains private
+--   with its atomic publication link prepared until durable commit.
 -- exact_identity_running(service, identity) -> Boolean
---   The job has a PID and /api/version equals both identity fields.
+--   The job has a PID, /api/version equals both identity fields, and the
+--   candidate git_sha is the complete 40-character source commit rather than a
+--   matching prefix.
 -- exact_previous_restored(transaction, service) -> Boolean
---   Previous artifacts are atomically restored and the previous identity runs.
+--   Previous runtime artifacts are atomically restored and the captured
+--   previous identity runs. Its git_sha may be exactly 12 or 40 lowercase
+--   hexadecimal characters only because it identifies the already-installed
+--   rollback predecessor. Database restoration is feature-scoped and is
+--   represented by paired_predecessor_start_order_is_valid.
 -- selected_source_is_valid(transaction) -> Boolean
 --   Local source is exact checked HEAD, or release source is one resolved tag
---   and commit with matching host asset, checksum and embedded git SHA.
+--   and commit with a host-architecture asset matching its checksum and version.
+--   A latest selection resolves to stable tag and metadata; an exact RC selection
+--   has matching tag, prerelease metadata, full embedded version, and commit. In
+--   either case the candidate's 40-character lowercase embedded git_sha equals
+--   source_commit. A prepared_artifact candidate is independently verified.
+-- prepared_artifact_source_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, the protected host-target
+--   candidate identity and receipt contents are valid; the operator establishes
+--   protected run/source association independently of JSON validation. Clean
+--   controller source/helper hash is independently verified, not receipt-derived.
+--   This is
+--   source-only evidence and does not assert database lifecycle observations.
+-- paired_database_preflight_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, the immutable proof has
+--   Candidate and captured predecessor configure the same canonical path; the
+--   single shared_database_path is that value. The proof includes
+--   legacy-schema eligibility, one canonical database path shared by the
+--   installed predecessor and candidate, migration ledger at most 69, and the ProductConversation
+--   upgrade mode. It does not assert that quiesce, offline ownership, or a
+--   snapshot has happened.
+-- paired_database_proof_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, after quiesce the lifecycle
+--   observation is PreparedArtifactSnapshotVerified: exclusive offline ownership
+--   and verified SQLite snapshot integrity bound to the immutable controller,
+--   predecessor and shared path. No future rollback result is required.
+-- controller_identity_is_independently_bound(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, the controller helper hash
+--   is bound to the recorded clean controller source and protocol. The controller
+--   and candidate commits may be equal when that independently bound helper is
+--   valid.
+-- PairedRecoveryVerified(transaction, service, mode)
+--   Separately requested retained-helper recovery verified matched database,
+--   runtime/configuration and predecessor identity before releasing ownership.
+-- CandidateStartupReady(transaction)
+--   Emitted after quiesce and paired snapshot proof verification, before
+--   candidate install/start; ordinary sources use their prepared inputs.
+-- candidate_startup_proof_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, paired_database_proof_is_valid
+--   holds and the verified snapshot follows exclusive offline ownership proof
+--   before candidate startup.
+-- paired_predecessor_start_order_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, the matching database is
+--   restored and integrity-checked before predecessor startup, or no snapshot
+--   exists and exclusive legacy DB plus captured binary/config hashes prove
+--   an unchanged predecessor. The latter path claims no database restoration.
+-- predecessor_start_authorized(transaction) -> Boolean
+--   Startup requires matched snapshot restoration or verified unchanged legacy
+--   database/runtime/configuration with exclusive offline ownership.
+-- candidate_teardown_attempted(transaction) -> Boolean
+--   Failed activation or recovery records an attempt to tear down the candidate;
+--   this does not claim that an operating-system failure made teardown complete.
+-- recovery_verification_unconfirmed(transaction) -> Boolean
+--   Durable status reports that recovery or teardown could not be confirmed,
+--   including when a predecessor health check failed after an attempted start.
+-- paired_transaction_retained(transaction) -> Boolean
+--   The private paired transaction directory, verified snapshot, proof files,
+--   and durable recovery status remain available for supported recovery.
+-- active_claim_retained(transaction) -> Boolean
+--   The matching deployment claim remains active until supported recovery is
+--   verified; a blind manual action cannot clear it.
+-- supported_recovery_verified(transaction) -> Boolean
+--   A supported recovery procedure has verified the restored artifacts, matching
+--   database, service health, and claim generation before claim release.
+-- previous_rollback_identity_is_valid(transaction) -> Boolean
+--   No previous runtime exists, or previous is the captured already-installed
+--   predecessor and its git_sha is exactly 12 or 40 lowercase hexadecimal
+--   characters. The 12-character form is not valid for any candidate or helper.
 -- restart_preparation_complete(restart) -> Boolean
 --   The loaded target job reports the installed plist and binary program,
 --   KeepAlive, and the sole listener service used by its health endpoint; the
 --   running process reports that it adopted the listener, its running and
---   installed binary identities match the deployed source identity, and the
---   secret-free handoff contains hashes of the installed binary, plist, and
---   deployed SHA without environment values.
+--   installed binary identities contain the same complete 40-character SHA and
+--   match the deployed source identity, and the secret-free handoff contains
+--   hashes of the installed binary, plist, and deployed SHA without environment
+--   values. A rollback-only 12-character predecessor is not restartable.
 -- restart_helper_is_launchd_owned(restart) -> Boolean
 --   A distinct one-shot LaunchAgent owns signaling and verification
 --   independently of Phoenix and the initiating shell.
@@ -105,10 +249,75 @@ external entity TargetService {
 --   Binary, plist, environment, listener definition, and deployed SHA match
 --   their preparation hashes and no installation path was replaced.
 
-rule PrepareCandidate {
+-- paired_snapshot_restored(transaction) -> Boolean
+--   A context-bound snapshot was restored and integrity-checked offline.
+-- paired_unchanged_predecessor_verified(transaction) -> Boolean
+--   No snapshot proof or candidate mutation exists; stopped service, exclusive
+--   legacy DB, and captured binary/configuration hashes authorize private resume.
+-- paired_publication_is_verified(transaction) -> Boolean
+--   Paired plists remain private during identity verification. Candidate autoload
+--   publication follows durable commit; predecessor publication follows matched
+--   DB authorization and identity verification. Publication preserves the private
+--   bootstrap inode so strict loaded-path restart verification remains valid.
+--   True for ordinary sources.
+-- pre_manifest_abandonment_verified(transaction) -> Boolean
+--   Matching preparing status preceded owned claim publication, manifest
+--   is absent or exists; preparation PID is dead and no helper was admitted,
+--   or a prepared/helper-handoff attempt ended with confirmed helper absence and
+--   helper absence is confirmed. Manifest presence does not imply handoff.
+-- PreparedAbandonmentVerified(transaction)
+--   Operator requested recovery and pre_manifest_abandonment_verified holds.
+
+-- snapshot_proof_durable(transaction) -> Boolean
+--   Matching context-bound snapshot proof is persisted and verified before bootstrap.
+-- DeploymentOwnsActivationClaim(transaction) -> Boolean
+--   This exact transaction owns the shared deploy/restart operation mutex.
+-- CandidatePreparationCompleted(transaction)
+--   Fallible staging completed under the already acquired preparation claim.
+-- PairedPreflightVerified(transaction, proof)
+--   Legacy path/schema and independent source/controller preflight was verified.
+-- PairedOfflineOwnershipVerified(transaction, ownership)
+--   Service teardown and bounded exclusive offline ownership were verified.
+-- PairedSnapshotVerified(transaction, snapshot)
+--   Context-bound SQLite snapshot integrity was verified after offline ownership.
+-- HelperCapacityFailed(transaction, failure)
+--   Initial physical allocation failed after handoff but before target stop.
+-- PairedFinalizationFinished(transaction, outcome)
+--   Both publication and cleanup succeeded durably; failures use separate
+--   PairedFinalizationFailed and retain pending.
+-- DurablePreparingStatusWritten(transaction)
+--   Matching preparation identity/PID is durable before ownership publication.
+
+-- paired_precommit_autoload_safe(transaction) -> Boolean
+--   While preparing, only captured predecessor may be auto-loaded. After helper
+--   teardown/quarantine and before candidate commit, no candidate auto-loaded
+--   plist exists; verified candidate bootstrap remains private.
+-- paired_finalization_diagnostic_is_durable(transaction) -> Boolean
+--   A pending finalization records publication/cleanup uncertainty
+--   without asserting successful publication or authorizing DB rollback.
+
+rule AcquirePreparationClaim {
     when: DeploymentRequested(transaction)
+    requires: transaction.state = preparing
     requires: activation_claim_available()
+    ensures: DurablePreparingStatusWritten(transaction)
+    ensures: DeploymentOwnsActivationClaim(transaction)
+
+    @guidance
+        -- Persist preparation owner PID/status before publishing the claim.
+}
+
+rule PrepareCandidate {
+    when: CandidatePreparationCompleted(transaction)
+    requires: DeploymentOwnsActivationClaim(transaction)
     requires: selected_source_is_valid(transaction)
+    requires: prepared_artifact_source_is_valid(transaction)
+    requires: paired_database_preflight_is_valid(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment
+        or transaction.paired_lifecycle_observation.kind = PreparedArtifactPreflight
+    requires: controller_identity_is_independently_bound(transaction)
+    requires: previous_rollback_identity_is_valid(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment or transaction.previous != null
     ensures: transaction.state = prepared
     ensures: preparation_complete(transaction)
 }
@@ -132,51 +341,353 @@ rule HandoffActivation {
         -- target LaunchAgent is stopped. The initiating process may then end.
 }
 
-rule ActivateCandidate {
-    when: ActivationHelperStarted(transaction)
+rule ObservePreparedPreflight {
+    when: PairedPreflightVerified(transaction, proof)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = preparing
+    requires: transaction.paired_lifecycle_observation.kind = PreparedArtifactAwaitingPreparation
+    ensures: transaction.paired_lifecycle_observation = PreparedArtifactPreflight.created(
+        prepared_artifact_proof: proof
+    )
+}
+
+rule ObserveOfflineOwnership {
+    when: PairedOfflineOwnershipVerified(transaction, ownership)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = activating
+    requires: transaction.paired_lifecycle_observation.kind = PreparedArtifactPreflight
+    ensures: transaction.paired_lifecycle_observation = PreparedArtifactOfflineOwned.created(
+        prepared_artifact_proof: transaction.paired_lifecycle_observation.prepared_artifact_proof,
+        offline_ownership_proof: ownership
+    )
+}
+
+rule ObserveSnapshotProof {
+    when: PairedSnapshotVerified(transaction, snapshot)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = activating
+    requires: transaction.paired_lifecycle_observation.kind = PreparedArtifactOfflineOwned
+    ensures: transaction.paired_lifecycle_observation = PreparedArtifactSnapshotVerified.created(
+        prepared_artifact_proof: transaction.paired_lifecycle_observation.prepared_artifact_proof,
+        offline_ownership_proof: transaction.paired_lifecycle_observation.offline_ownership_proof,
+        snapshot_integrity_proof: snapshot
+    )
+    ensures: PairedSnapshotProofPersisted(transaction)
+}
+
+rule ReserveHelperCapacity {
+    when: HelperCapacityVerified(transaction)
     requires: transaction.state = prepared
+    requires: helper_is_launchd_owned(transaction)
+    ensures: helper_capacity_reserved(transaction)
+    ensures: HelperCapacityReserved(transaction)
+}
+
+rule ActivateCandidate {
+    when: HelperCapacityReserved(transaction)
+    requires: transaction.state = prepared
+    requires: helper_capacity_reserved(transaction)
     requires: helper_is_launchd_owned(transaction)
     requires: preparation_complete(transaction)
     ensures: transaction.state = activating
+
+    @guidance
+        -- Revalidate hashes and acquire the host lock. Stop/quiesce the predecessor
+        -- and poll teardown; do not install/bootstrap the candidate here. Offline
+        -- ownership/snapshot observations must precede CandidateStartupPrepared.
+}
+
+rule HelperCapacityFailureBeforeStop {
+    when: HelperCapacityFailed(transaction, failure)
+    requires: transaction.state = prepared
+    requires: helper_is_launchd_owned(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: transaction.failure = failure
+    ensures: ProductionArtifactsUnchanged(transaction)
+    ensures: TargetServiceUnchanged(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+-- PairedSnapshotProofPersisted(transaction)
+--   The verified context-bound snapshot proof was atomically written and fsynced.
+
+rule CandidateStartupPrepared {
+    when: CandidateStartupReady(transaction)
+    requires: transaction.state = activating
+    requires: candidate_startup_proof_is_valid(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment
+        or transaction.paired_lifecycle_observation.kind = PreparedArtifactSnapshotVerified
+    requires: transaction.kind != PreparedArtifactDeployment or snapshot_proof_durable(transaction)
     ensures: atomic_candidate_install(transaction)
 
     @guidance
-        -- Revalidate hashes, acquire the host lock, check bootout/bootstrap
-        -- results, and poll launchd state and PID to bounded deadlines.
+        -- Only after snapshot-ready proof: install candidate binary, bootstrap
+        -- private candidate plist, check result and poll PID to bounded deadline.
 }
 
 rule CommitVerifiedCandidate {
     when: CandidateRuntimeObserved(transaction, service)
     requires: transaction.state = activating
     requires: exact_identity_running(service, transaction.expected)
+    requires: candidate_startup_proof_is_valid(transaction)
+    requires: atomic_candidate_install(transaction)
     ensures: transaction.state = committed
+    ensures: transaction.kind = PreparedArtifactDeployment implies transaction.finalization = pending
     ensures: DeployedShaWritten(transaction.source_commit)
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Persist pending publication/cleanup diagnostic with durable commit.
+        -- For paired launchd, after durable commit release only the temporary
+        -- restore reservation and fsync its parent; retain audit snapshot/proof.
+        -- Publish the prepared candidate plist last. Publication/cleanup errors
+        -- remain committed diagnostics, do not authorize rollback, and do not
+        -- establish login/reboot persistence when publication is unconfirmed.
+}
+
+rule ResumeCommittedPairedFinalization {
+    when: PairedFinalizationRequested(transaction)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = committed
+    requires: transaction.finalization = pending
+    requires: committed_finalization_context_is_valid(transaction)
+    ensures: PairedFinalizationAttemptsResumed(transaction)
+
+    @guidance
+        -- Explicit finalize-paired verifies retained byte-bound helper, matching
+        -- claim, helper absence, running exact candidate/binary/private loaded
+        -- configuration and mutual exclusion. Retry only plist publication and
+        -- temporary restore reservation cleanup; no stop/bootstrap/restart/DB IO.
+        -- Pending survives interruption; durable completion releases owned claim.
+}
+
+-- committed_finalization_context_is_valid(transaction) -> Boolean
+--   Exact retained transaction/helper/claim, absent prior helper, matching running
+--   committed binary/config/identity and exclusive operation lock; unknown rejects.
+-- PairedFinalizationRequested(transaction)
+--   Operator invoked prod finalize-paired for a retained committed transaction.
+-- PairedFinalizationAttemptsResumed(transaction)
+--   Publication/cleanup attempts resumed without any runtime/database mutation.
+
+rule PreserveFailedPairedFinalization {
+    when: PairedFinalizationFailed(transaction, diagnostic)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = committed
+    requires: transaction.finalization = pending
+    ensures: transaction.finalization = pending
+    ensures: CommittedFinalizationDiagnosticWritten(transaction, diagnostic)
     ensures: DurableStatusWritten(transaction)
 }
 
-rule RollBackFailedActivation {
+rule VerifyCompletedPairedFinalization {
+    when: PairedFinalizationRequested(transaction)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = committed
+    requires: transaction.finalization = complete
+    requires: completed_finalization_context_is_valid(transaction)
+    ensures: transaction.finalization = complete
+    ensures: IdempotentFinalizationConfirmed(transaction)
+
+    @guidance
+        -- Verify same retained candidate/binary/private configuration and published
+        -- inode with absent prior helper, no competing claim. No mutation on rerun.
+}
+
+-- completed_finalization_context_is_valid(transaction) -> Boolean
+--   Exact candidate/configuration and completed published inode, helper absent,
+--   no competing claim; does not require an already released active claim.
+
+rule RecordPairedFinalizationOutcome {
+    when: PairedFinalizationFinished(transaction, outcome)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = committed
+    requires: transaction.finalization = pending
+    requires: outcome = complete
+    ensures: transaction.finalization = outcome
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Clear pending only after both publication and cleanup succeed durably.
+        -- Errors remain committed diagnostics; interruption retains pending and claim.
+}
+
+rule RollBackFailedOrdinaryActivation {
     when: ActivationFailed(transaction, service, failure)
     requires: transaction.state = activating
+    requires: transaction.kind != PreparedArtifactDeployment
     requires: exact_previous_restored(transaction, service)
     ensures: transaction.state = activation_failed_rolled_back
     ensures: transaction.failure = failure
     ensures: DurableStatusWritten(transaction)
+    ensures: RuntimeArtifactRollbackRecorded(transaction)
+    ensures: not DatabaseRollbackClaimed(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
+}
+
+-- predecessor_publication_durable(transaction) -> Boolean
+--   Captured predecessor plist publication and deployed identity writes are
+--   durable after verified startup; failure retains running verified predecessor
+--   and retryable claim without teardown or database replay.
+
+rule CheckpointAuthorizedPredecessorStartup {
+    when: PredecessorRecoveryPrepared(transaction, mode)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state in { activating, activation_failed_rollback_failed }
+    requires: transaction.recovery_mode = null
+    requires: predecessor_start_authorized(transaction)
+    requires: mode = snapshot_restored implies paired_snapshot_restored(transaction)
+    requires: mode = unchanged_predecessor implies paired_unchanged_predecessor_verified(transaction)
+    ensures: transaction.recovery_mode = mode
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Persist typed snapshot-restored or unchanged-predecessor checkpoint
+        -- BEFORE bootstrap. Once set, any retry must not restore snapshot again.
+        -- Private predecessor startup is authorized only after durable checkpoint.
+}
+
+rule VerifyCheckpointedPredecessor {
+    when: CheckpointRecoveryRequested(transaction, service)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state in { activating, activation_failed_rollback_failed, activation_failed_rolled_back }
+    requires: active_claim_retained(transaction)
+    requires: transaction.recovery_mode != null
+    requires: checkpointed_predecessor_running_verified(transaction)
+    ensures: PairedRecoveryVerified(transaction, service, transaction.recovery_mode)
+
+    @guidance
+        -- Verify running predecessor/private loaded configuration and identity,
+        -- finalize publication/status only. Never stop or replay database snapshot.
+        -- Unknown/stopped predecessor remains fenced for operator investigation.
+}
+
+-- checkpointed_predecessor_running_verified(transaction) -> Boolean
+--   Exact captured predecessor binary/private loaded plist and runtime identity
+--   are verified after the durable startup checkpoint without database replay.
+
+rule RollBackFailedPreparedPairedActivation {
+    when: ActivationFailed(transaction, service, failure)
+    requires: transaction.state = activating
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: paired_predecessor_start_order_is_valid(transaction)
+    requires: supported_recovery_verified(transaction)
+    requires: predecessor_publication_durable(transaction)
+    requires: exact_previous_restored(transaction, service)
+    requires: transaction.recovery_mode != null
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: transaction.failure = failure
+    ensures: DurableStatusWritten(transaction)
+    ensures: RuntimeArtifactRollbackRecorded(transaction)
+    requires: paired_snapshot_restored(transaction) implies transaction.recovery_mode = snapshot_restored
+    requires: paired_unchanged_predecessor_verified(transaction) implies transaction.recovery_mode = unchanged_predecessor
+    ensures: paired_snapshot_restored(transaction) implies DatabaseRollbackCompleted(transaction)
+    ensures: paired_unchanged_predecessor_verified(transaction) implies not DatabaseRollbackClaimed(transaction)
+    ensures: not DeployedShaWritten(transaction.source_commit)
+
+    @guidance
+        -- After verified unchanged no-snapshot resume, remove only the temporary
+        -- backup seed and DB-adjacent restore allocation and fsync their parents
+        -- before durable terminal status and claim release. Apply this sequence
+        -- to activation rollback, fresh recovery, and checkpoint finalization.
+        -- Never remove a verified snapshot/proof. Cleanup failure retains the
+        -- verified running predecessor, checkpoint, diagnostic and unresolved
+        -- claim for finalization-only retry without stop/start or snapshot replay.
 }
 
 rule PreserveRollbackFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
     requires: transaction.state = activating
-    ensures: transaction.state = activation_failed_rollback_failed
+    ensures: transaction.kind = PreparedArtifactDeployment implies transaction.state = activation_failed_rollback_failed
+    ensures: transaction.kind != PreparedArtifactDeployment implies transaction.state = ordinary_activation_failed_rollback_failed
     ensures: transaction.failure = failure
     ensures: transaction.rollback_failure = rollback_failure
     ensures: DurableStatusWritten(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
 }
 
+rule RecoverRetainedPairedTransaction {
+    when: PairedRecoveryVerified(transaction, service, mode)
+    requires: transaction.state in { prepared, activating, activation_failed_rollback_failed, activation_failed_rolled_back }
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: active_claim_retained(transaction)
+    requires: paired_predecessor_start_order_is_valid(transaction)
+    requires: exact_previous_restored(transaction, service)
+    requires: supported_recovery_verified(transaction)
+    requires: predecessor_publication_durable(transaction)
+    ensures: transaction.state = activation_failed_rolled_back
+    requires: mode = snapshot_restored implies paired_snapshot_restored(transaction)
+    requires: mode = unchanged_predecessor implies paired_unchanged_predecessor_verified(transaction)
+    requires: mode = transaction.recovery_mode
+    ensures: transaction.recovery_mode = mode
+    ensures: mode = snapshot_restored implies DatabaseRollbackCompleted(transaction)
+    ensures: mode = unchanged_predecessor implies not DatabaseRollbackClaimed(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule PreservePreparedRecoveryFailure {
+    when: RollbackFailed(transaction, failure, rollback_failure)
+    requires: transaction.state in { prepared, activating, activation_failed_rollback_failed }
+    requires: transaction.kind = PreparedArtifactDeployment
+    ensures: transaction.state = activation_failed_rollback_failed
+    ensures: candidate_teardown_attempted(transaction)
+    ensures: paired_transaction_retained(transaction)
+    ensures: recovery_verification_unconfirmed(transaction)
+    ensures: active_claim_retained(transaction)
+}
+
+rule VerifyOrdinaryAbandonedPreparation {
+    when: OperatorVerifiedOrdinaryPreparationAbandoned(transaction)
+    requires: transaction.kind != PreparedArtifactDeployment
+    requires: transaction.state = preparing
+    requires: ordinary_preparation_abandonment_verified(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Existing operator/manual stale-claim disposition only: confirm recorded
+        -- preparer dead, exact claim and no admitted helper; no automated DB recovery
+        -- or new ordinary recovery command. Terminal matching release follows.
+}
+
+-- ordinary_preparation_abandonment_verified(transaction) -> Boolean
+--   Operator verified matching ordinary preparation claim, dead preparer, no
+--   activation handoff/helper, and unchanged runtime; unknown remains fenced.
+
+rule AbandonInterruptedPreparation {
+    when: PreparedAbandonmentVerified(transaction)
+    requires: transaction.state in { preparing, prepared }
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: pre_manifest_abandonment_verified(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Release only the matching claim after terminal status; runtime/database
+        -- remain untouched. Missing evidence or a live/reused PID refuses recovery.
+}
+
+rule ReleaseMatchingTerminalClaim {
+    when: TerminalStatusPersisted(transaction)
+    requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, ordinary_activation_failed_rollback_failed, rejected_concurrent }
+    requires: transaction.kind != PreparedArtifactDeployment
+        or transaction.state != committed
+        or transaction.finalization = complete
+    requires: transaction.kind != PreparedArtifactDeployment
+        or transaction.state != activation_failed_rolled_back
+        or supported_recovery_verified(transaction)
+    ensures: not DeploymentOwnsActivationClaim(transaction)
+}
+
+rule ShowUnresolvedPairedStatus {
+    when: DeploymentStatusRequested(transaction)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.state = activation_failed_rollback_failed
+    ensures: PairedRecoveryGuidanceShown(transaction)
+}
+
 rule ReportStaleTransaction {
     when: DeploymentStatusRequested(transaction)
-    requires: transaction.state = prepared or transaction.state = activating
+    requires: transaction.state in { preparing, prepared, activating }
     requires: TransactionAgeSeconds(transaction) > stale_after_seconds
     ensures: StaleRecoveryGuidanceShown(transaction)
     ensures: not transaction.state = committed
@@ -232,6 +743,86 @@ rule PreserveRestartFailure {
     ensures: not RollbackClaimed(restart)
 }
 
+invariant CandidateIdentityIsFullAndExact {
+    for transaction in DeployTransactions:
+        transaction.state in { prepared, activating, committed } implies
+            selected_source_is_valid(transaction)
+}
+
+invariant LegacyIdentityIsRollbackOnly {
+    for transaction in DeployTransactions:
+        transaction.previous != null implies
+            previous_rollback_identity_is_valid(transaction)
+}
+
+invariant OrdinaryRollbackIsRuntimeOnly {
+    for transaction in DeployTransactions:
+        transaction.kind != PreparedArtifactDeployment
+        and transaction.state = activation_failed_rolled_back implies
+            RuntimeArtifactRollbackRecorded(transaction)
+            and not DatabaseRollbackClaimed(transaction)
+}
+
+invariant PreparedArtifactIsPairedLaunchdOnly {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state not in { preparing, rejected_concurrent, precondition_failed } implies
+            prepared_artifact_source_is_valid(transaction)
+            and paired_database_preflight_is_valid(transaction)
+            and controller_identity_is_independently_bound(transaction)
+}
+
+invariant FailedPreparedRecoveryRetainsManualRecovery {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state = activation_failed_rollback_failed implies
+            candidate_teardown_attempted(transaction)
+            and paired_transaction_retained(transaction)
+            and recovery_verification_unconfirmed(transaction)
+            and active_claim_retained(transaction)
+}
+
+invariant PairedUnresolvedFailureAutoloadFence {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state = activation_failed_rollback_failed implies
+            paired_unresolved_autoload_quarantined(transaction)
+}
+
+-- paired_unresolved_autoload_quarantined(transaction) -> Boolean
+--   Unresolved target plist remains outside LaunchAgents; quarantine failures
+--   are explicit diagnostics and retain claim, never a successful fence assertion.
+
+invariant PairedPrecommitAutoloadSafety {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state in { preparing, prepared, activating } implies
+            paired_precommit_autoload_safe(transaction)
+}
+
+invariant PairedFinalizationUncertaintyIsExplicit {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state = committed
+        and transaction.finalization = pending implies
+            paired_finalization_diagnostic_is_durable(transaction)
+}
+
+invariant PairedPredecessorIsRequired {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state not in { preparing, rejected_concurrent, precondition_failed } implies
+            transaction.previous != null
+}
+
+invariant PairedPublicationRequiresVerification {
+    for transaction in DeployTransactions:
+        transaction.kind = PreparedArtifactDeployment
+        and transaction.state = committed
+        and transaction.finalization = complete implies
+            paired_publication_is_verified(transaction)
+}
+
 invariant CommitRequiresExactIdentity {
     for transaction in DeployTransactions:
         transaction.state = committed implies CandidateIdentityVerified(transaction)
@@ -250,7 +841,7 @@ invariant CommittedRestartPreservesInstalledState {
 
 invariant ProductionOperationsAreMutuallyExclusive {
     for restart in RestartTransactions:
-        RestartOwnsActivationClaim(restart) implies not DeploymentOwnsActivationClaim()
+        RestartOwnsActivationClaim(restart) implies not DeployTransactions.any(t => DeploymentOwnsActivationClaim(t))
 }
 
 invariant RestartClaimsAreMutuallyExclusive {

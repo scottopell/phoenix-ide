@@ -11,6 +11,7 @@ const TERMINAL_STATES = new Set([
   'precondition_failed',
   'activation_failed_rolled_back',
   'activation_failed_rollback_failed',
+  'ordinary_activation_failed_rollback_failed',
   'rejected_concurrent',
 ]);
 
@@ -36,8 +37,9 @@ function stateText(state: string): string {
     activating: 'Activating and verifying',
     committed: 'Update committed',
     precondition_failed: 'Preparation failed before disruption',
-    activation_failed_rolled_back: 'Activation failed; previous release restored and verified',
+    activation_failed_rolled_back: 'Activation failed; runtime changes rolled back and verified (database not restored)',
     activation_failed_rollback_failed: 'Activation and rollback failed — offline recovery required',
+    ordinary_activation_failed_rollback_failed: 'Activation and rollback failed — offline recovery required',
     rejected_concurrent: 'Another deployment already owns the host claim',
   } as Record<string, string>)[state] ?? state.replaceAll('_', ' ');
 }
@@ -74,6 +76,9 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
       {transaction.stale && <div className="release-update__recovery">Status is stale. Inspect the backend deployment log and use <code>./dev.py prod status</code> for offline recovery.</div>}
       {transaction.state === 'activation_failed_rollback_failed' && (
         <div className="release-update__recovery">The deployment claim remains retained. Do not clear it until the installed runtime and backend owner are inspected offline.</div>
+      )}
+      {transaction.state === 'ordinary_activation_failed_rollback_failed' && (
+        <div className="release-update__recovery">Inspect the installed runtime and backend owner offline before another deployment. Systemd and bare Linux retain the failed claim.</div>
       )}
     </div>
   );
@@ -263,7 +268,9 @@ export function ReleaseUpdatePanel({
   const approvalStatusSafe = !handoffPending && transactionError === null && (transaction?.kind === 'none'
     || (transaction?.kind === 'present'
       && TERMINAL_STATES.has(transaction.state)
-      && transaction.state !== 'activation_failed_rollback_failed'));
+      && transaction.state !== 'activation_failed_rollback_failed'
+      && (transaction.state !== 'ordinary_activation_failed_rollback_failed'
+        || snapshot?.installation_ownership.kind === 'launchd_managed')));
   const availablePreview = snapshot?.preview.kind === 'available' ? snapshot.preview : null;
   const committedReleaseIsPreview = transaction?.kind === 'present'
     && transaction.state === 'committed'

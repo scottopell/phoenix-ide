@@ -5,6 +5,28 @@ import { buildLadleStoryUrl, runSurfaceCapture } from './capture-ladle-surface.m
 const measurements = [];
 const journeys = [];
 
+async function assertSourceCall(page, id, viewport, outDir) {
+  await page.evaluate(() => { window.__sourcePulseSeen = false; const observer = new MutationObserver(() => { if (document.querySelector('[data-tool-id="source-send-call"].jump-highlight')) window.__sourcePulseSeen = true; }); observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["class"] }); });
+  const expectedPath = id === 'source-call-global' ? '/global/source-member' : '/product-conversations/source-product';
+  await page.getByRole('link', { name: /transcript ID .* · source call$/ }).click();
+  await page.waitForFunction(path => document.documentElement.dataset.sourceFixtureLocation?.startsWith(path), expectedPath);
+  const target = page.locator('[data-tool-id="source-send-call"]');
+  await target.waitFor({ state: 'visible' });
+  await page.waitForFunction(() => {
+    const element = document.querySelector('[data-tool-id="source-send-call"]');
+    const box = element?.getBoundingClientRect();
+    return box && box.top >= 0 && box.bottom <= innerHeight && element.textContent.includes('Source jump fixture payload');
+  });
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--source.png`, fullPage: true });
+  if (!await page.evaluate(() => window.__sourcePulseSeen)) throw new Error("Exact source tool was not highlighted");
+  const entry = await page.locator('html').getAttribute('data-source-fixture-location');
+  const url = new URL(page.url()); url.searchParams.set('fixtureEntry', entry);
+  await page.goto(url.href);
+  await page.locator('[data-tool-id="source-send-call"]').waitFor({ state: 'visible' });
+  if (await page.locator('[role="alert"]').count()) throw new Error('Source jump exposed an error alert');
+  journeys.push(`${id}/${viewport.name}: receiver click and cold reload reach expanded exact source call`);
+}
+
 async function fixtureValue(page, name) {
   return page.locator('html').getAttribute(`data-product-conversation-fixture-${name}`);
 }
@@ -316,6 +338,7 @@ runSurfaceCapture({
   },
   captureStory: async ({ page, id, outDir, viewport }) => {
     const theme = await fixtureValue(page, 'theme') ?? 'dark';
+    if (id === 'source-call-global' || id === 'source-call-ordinary') { await assertSourceCall(page, id, viewport, outDir); return false; }
     if (!['loading', 'error'].includes(id)) await assertTranscriptGeometry(page, id, viewport, theme);
     await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--${theme}--initial.png`, fullPage: true });
     if (id === 'mobile-open' && viewport.name === 'mobile-dark') {

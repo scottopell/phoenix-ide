@@ -311,14 +311,13 @@ enable-then-confirm toggle.
 
 ### REQ-WAB-009: Continuation Mute
 
-WHEN the conversation's `continued_in_conv_id` is set
+WHEN the displayed transcript has a successor
 THE SYSTEM SHALL render the bar with no RESOLVE or FINISH verbs and no primary
-AND SHALL show a muted inline note: "Continued — actions belong on the continuation."
+AND SHALL show a muted inline note: "Continued — actions are available on the current transcript."
 
-The continuation is the live execution target, but the same `ProductConversation` retains the
-attached `WorkScope`; Phoenix does not transfer WorkScope ownership to a successor row just because
-execution continued there. Any terminal decision therefore belongs on the live continuation row,
-which is the aggregate's latest executable surface. bedrock REQ-BED-031 also forbids terminal
+The current transcript is the live execution target, but the same `ProductConversation` retains the
+attached `WorkScope` and owns its lifecycle; Phoenix does not transfer either authority to a successor row.
+Any terminal lifecycle decision targets the ProductConversation through its current executable transcript surface. bedrock REQ-BED-031 also forbids terminal
 actions on a context-exhausted parent that has a continuation, so the suppressed bar matches the
 server-side legality gate.
 

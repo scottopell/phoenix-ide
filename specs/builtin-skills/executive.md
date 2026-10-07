@@ -49,7 +49,9 @@ audience-bound Skill tool enforces the same boundary during invocation.
 Filesystem skills cannot self-promote into the Coordinator catalog. Invocation
 reads embedded instructions and companion references directly and marks the
 result as trusted built-in skill content; it never trusts the mutable extraction
-cache.
+cache. The transcript and UI receive only an authenticated-delivery receipt;
+while the live runtime retains the authenticated payload, its bytes are overlaid
+into the latest matching tool result during provider-request assembly.
 
 Extraction prunes unexpected files inside built-in directories that remain
 bundled. Directories for removed or renamed built-ins may remain on disk but are
@@ -67,7 +69,8 @@ normal precedence, while an invalid or empty definition does not disable it.
 | **REQ-BS-004:** Invocation parity | ✅ Complete | Filesystem skills invoke from their readable source path; all built-ins expand immutable embedded definitions, while authenticated Coordinator invocation uses path-free embedded metadata and includes embedded companion references |
 | **REQ-BS-005:** spEARS workflow skill | ✅ Complete | `spears/SKILL.md` + workflow references extracted at startup |
 | **REQ-BS-006:** Allium with companion files | ✅ Complete | `allium/SKILL.md` + `allium/references/language-reference.md` extracted at startup |
-| **REQ-SK-008:** Runtime audience binding | ✅ Complete | `phoenix-api` is cataloged and invocable only by the Global Coordinator; authenticated delivery is limited to the current live request and persisted tool history is ordinary data |
+| **REQ-SK-008:** Runtime audience binding | ✅ Complete | `phoenix-api` is cataloged and invocable only by the Global Coordinator; visible/persisted results are an opaque receipt, while live-runtime authenticated bytes are overlaid during provider-request assembly |
+| **Coordinator API recipe** | ✅ Complete | Embedded payload provides scoped Bash creation with live auth/model/effort discovery, stable request identity, ambiguous-response reconciliation, and separate ProductConversation/transcript verification |
 
 ## Cross-Spec References
 

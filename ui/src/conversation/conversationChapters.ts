@@ -16,6 +16,7 @@
 // MessageList feeds to VirtualTranscript (followed by tail units). The nav strip
 // uses it directly as the VirtualTranscript `scrollToIndex` target.
 
+import type { InputOrigin } from '../api';
 import type { HistoricalUnit } from './renderUnits';
 import { isSignificantText } from '../hooks/useDensity';
 
@@ -33,6 +34,8 @@ export interface Chapter {
    *  scroll-spy matching against rendered `data-sequence-id` nodes. Pending
    *  user messages and skill units have no sequence id yet. */
   sequenceId: number | undefined;
+  /** Present only on input chapters; retained across render-unit rebuilding. */
+  origin?: InputOrigin;
 }
 
 const LABEL_MAX_CHARS = 40;
@@ -83,6 +86,7 @@ export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Ch
     switch (unit.kind) {
       case 'user':
       case 'pending_user': {
+        if (unit.message.origin?.kind === 'subscription_event') break;
         const text = userText(unit);
         if (text.trim().length === 0) break;
         chapters.push({
@@ -90,6 +94,10 @@ export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Ch
           kind: 'prompt',
           label: truncateLabel(text),
           sequenceId: unit.kind === 'user' ? unit.message.sequence_id : undefined,
+          // Pending units are local optimistic admissions; server-authored
+          // messages carry their own authoritative origin and never use this
+          // fallback. Steering status does not change the local API channel.
+          origin: unit.message.origin ?? (unit.kind === 'pending_user' ? { kind: 'user_api' } : { kind: 'unknown_historical' }),
         });
         break;
       }

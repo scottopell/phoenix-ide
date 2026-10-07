@@ -67,6 +67,9 @@ enum Scenario {
     ReadFileToolCall,
     ThinkThenRespond,
     MultiToolCall,
+    AskUserQuestion {
+        ordinal: usize,
+    },
     LongStreaming,
     /// Marker-only (not in hash rotation): emits a `patch` `tool_use` that
     /// overwrites `e2e-mock-patch-out.txt` in the conversation's cwd.
@@ -99,6 +102,14 @@ impl Scenario {
             // instead of spawning a fresh batch every turn.
             if matches!(s, Self::SpawnAgents) && already_spawned_agents(request) {
                 return Self::PlainText;
+            }
+            if matches!(s, Self::AskUserQuestion { .. }) {
+                let ordinal = prior_tool_call_count(request, "ask_user_question");
+                return if ordinal < 2 {
+                    Self::AskUserQuestion { ordinal }
+                } else {
+                    Self::PlainText
+                };
             }
             return s;
         }
@@ -141,25 +152,43 @@ impl Scenario {
 /// forces selection of a specific scripted response, bypassing the hash-based
 /// roulette. Symmetric with `[[perf:N]]` — both make the mock authorable for
 /// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `mermaid`, `bash`,
-/// `read_file`, `think`, `multi_tool`, `long`, `patch`, `present_svg`, `spawn_agents`,
-/// `context_window_exceeded`. Dev-only: mock is opt-in
+/// `read_file`, `think`, `multi_tool`, `ask_user_question`, `long`, `patch`, `present_svg`,
+/// `spawn_agents`, `context_window_exceeded`. Dev-only: mock is opt-in
 /// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     let text = request.messages.iter().rev().find_map(|m| {
-        if m.role == super::types::MessageRole::User {
-            Some(
-                m.content
+        (m.role == super::types::MessageRole::User).then(|| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+    })?;
+    parse_scenario_text(&text).or_else(|| {
+        request
+            .messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == super::types::MessageRole::User)
+            .filter_map(|m| {
+                let text = m
+                    .content
                     .iter()
                     .filter_map(|b| match b {
                         ContentBlock::Text { text } => Some(text.as_str()),
                         _ => None,
                     })
-                    .collect::<String>(),
-            )
-        } else {
-            None
-        }
-    })?;
+                    .collect::<String>();
+                parse_scenario_text(&text)
+            })
+            .find(|scenario| matches!(scenario, Scenario::AskUserQuestion { .. }))
+    })
+}
+
+fn parse_scenario_text(text: &str) -> Option<Scenario> {
     let start = text.find("[[scenario:")? + "[[scenario:".len();
     let rest = text.get(start..)?;
     let end = rest.find("]]")?;
@@ -172,6 +201,7 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
         "read_file" => Some(Scenario::ReadFileToolCall),
         "think" => Some(Scenario::ThinkThenRespond),
         "multi_tool" => Some(Scenario::MultiToolCall),
+        "ask_user_question" => Some(Scenario::AskUserQuestion { ordinal: 0 }),
         "long" => Some(Scenario::LongStreaming),
         "patch" => Some(Scenario::PatchToolCall),
         "present_svg" => {
@@ -196,6 +226,15 @@ fn already_spawned_agents(request: &LlmRequest) -> bool {
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "spawn_agents"))
     })
+}
+
+fn prior_tool_call_count(request: &LlmRequest, tool_name: &str) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| matches!(block, ContentBlock::ToolUse { name, .. } if name == tool_name))
+        .count()
 }
 
 const PLAIN_TEXT: &str = "I've analyzed the situation and here's what I found. \
@@ -619,6 +658,32 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
             )
         }
 
+        Scenario::AskUserQuestion { ordinal } => {
+            let question_number = ordinal + 1;
+            let text = format!("I need your answer to question {question_number}.");
+            (
+                vec![
+                    ContentBlock::Text { text: text.clone() },
+                    ContentBlock::ToolUse {
+                        id: "mock-reused-question-tool-id".to_string(),
+                        name: "ask_user_question".to_string(),
+                        input: serde_json::json!({
+                            "questions": [{
+                                "question": format!("Question {question_number}: which option?"),
+                                "header": format!("Q{question_number}"),
+                                "options": [
+                                    { "label": "First", "description": "Choose the first option" },
+                                    { "label": "Second", "description": "Choose the second option" }
+                                ],
+                                "multiSelect": false
+                            }]
+                        }),
+                    },
+                ],
+                text,
+            )
+        }
+
         Scenario::LongStreaming => (
             vec![ContentBlock::Text {
                 text: LONG_TEXT.to_string(),
@@ -831,6 +896,7 @@ impl LlmService for MockLlmService {
         }
 
         Ok(LlmResponse {
+            provider_replay: None,
             content,
             end_turn: true,
             usage: Usage {
@@ -903,6 +969,7 @@ impl LlmService for MockLlmService {
         }
 
         Ok(LlmResponse {
+            provider_replay: None,
             content,
             end_turn: true,
             usage: Usage {
@@ -931,11 +998,13 @@ mod tests {
         LlmRequest {
             system: vec![],
             messages: vec![LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::Text {
                     text: text.to_string(),
                 }],
             }],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -966,6 +1035,10 @@ mod tests {
             ("[[scenario:read_file]]", Scenario::ReadFileToolCall),
             ("[[scenario:think]]", Scenario::ThinkThenRespond),
             ("[[scenario:multi_tool]]", Scenario::MultiToolCall),
+            (
+                "[[scenario:ask_user_question]]",
+                Scenario::AskUserQuestion { ordinal: 0 },
+            ),
             ("[[scenario:long]]", Scenario::LongStreaming),
             ("[[scenario:patch]]", Scenario::PatchToolCall),
             (
@@ -990,6 +1063,62 @@ mod tests {
         }
         assert!(parse_scenario(&user_req("no marker here")).is_none());
         assert!(parse_scenario(&user_req("[[scenario:bogus]]")).is_none());
+    }
+
+    #[test]
+    fn scenario_marker_survives_synthesized_user_answer() {
+        let mut request = user_req("[[scenario:ask_user_question]]");
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "Here are my answers".into(),
+            }],
+        });
+        assert!(matches!(
+            parse_scenario(&request),
+            Some(Scenario::AskUserQuestion { ordinal: 0 })
+        ));
+    }
+
+    #[test]
+    fn non_question_scenario_does_not_survive_later_user_message() {
+        let mut request = user_req("[[scenario:think]]");
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "later message".into(),
+            }],
+        });
+        assert!(parse_scenario(&request).is_none());
+    }
+
+    #[test]
+    fn ask_user_question_scenario_reuses_provider_id_across_two_questions() {
+        let mut request = user_req("[[scenario:ask_user_question]]");
+        for expected_ordinal in 0..2 {
+            let scenario = Scenario::from_message(&request);
+            assert!(matches!(
+                scenario,
+                Scenario::AskUserQuestion { ordinal } if ordinal == expected_ordinal
+            ));
+            let (content, _) = build_response(&scenario);
+            let ContentBlock::ToolUse { id, name, .. } = &content[1] else {
+                panic!("scenario must emit ask_user_question");
+            };
+            assert_eq!(id, "mock-reused-question-tool-id");
+            assert_eq!(name, "ask_user_question");
+            request.messages.push(LlmMessage {
+                source_message_id: None,
+                role: MessageRole::Assistant,
+                content,
+            });
+        }
+        assert!(matches!(
+            Scenario::from_message(&request),
+            Scenario::PlainText
+        ));
     }
 
     #[test]

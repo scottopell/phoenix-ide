@@ -133,6 +133,7 @@ mod tests {
 
     fn msg(content: MessageContent) -> Message {
         Message {
+            origin: crate::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "m1".into(),
             conversation_id: "c1".into(),
             sequence_id: 1,

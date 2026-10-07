@@ -13,7 +13,7 @@ use phoenix_core::domain::close::{
 use phoenix_core::domain::db_schema::MessageContent;
 use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Connection, Row, Sqlite, Transaction};
+use sqlx::{Connection, Row, Sqlite, SqliteConnection, Transaction};
 use std::fmt::Write as _;
 
 use crate::{
@@ -972,10 +972,10 @@ fn validate_begin_preconditions(
         ));
     }
     if addressed_id != latest.id {
-        return Err(close_precondition(format!(
-            "addressed conversation {} is not latest {}",
-            addressed_id, latest.id
-        )));
+        return Err(DbError::CloseFoundationStaleLatest {
+            expected: addressed_id.to_string(),
+            actual: latest.id.clone(),
+        });
     }
     if matches!(latest.state, ConvState::HandedOff { .. }) {
         return Err(close_precondition(
@@ -1078,12 +1078,43 @@ impl Database {
         Ok(topology)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn begin_close_foundation(
         &self,
         product_conversation_id: &ProductConversationId,
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        self.begin_close_foundation_inner(
+            product_conversation_id,
+            expected_latest_transcript_id,
+            attempt_id,
+            false,
+        )
+        .await
+    }
+
+    pub async fn begin_direct_close_foundation(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        self.begin_close_foundation_inner(
+            product_conversation_id,
+            expected_latest_transcript_id,
+            attempt_id,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn begin_close_foundation_inner(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
+        attempt_id: &str,
+        require_idle_latest: bool,
     ) -> DbResult<CloseObligation> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
@@ -1171,6 +1202,15 @@ impl Database {
             .await?
             .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
         validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
+
+        if require_idle_latest
+            && CapturedConversationStateKind::from_db_str(conv_state_kind(&topology.latest.state))
+                .is_some_and(CapturedConversationStateKind::is_busy)
+        {
+            return Err(DbError::CloseFoundationConflict(format!(
+                "ProductConversation {product_conversation_id} latest transcript is working"
+            )));
+        }
 
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
@@ -2265,6 +2305,17 @@ impl Database {
     ) -> DbResult<Option<CloseProjection>> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.begin().await?;
+        let projection =
+            Self::get_active_close_projection_for_product_on(&mut tx, product_conversation_id)
+                .await?;
+        tx.rollback().await?;
+        Ok(projection)
+    }
+
+    pub(crate) async fn get_active_close_projection_for_product_on(
+        connection: &mut SqliteConnection,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<CloseProjection>> {
         let obligation = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase,
                     inspection_generation, inspection_fingerprint,
@@ -2273,12 +2324,11 @@ impl Database {
              WHERE product_conversation_id = ?1 AND phase <> 'completed'",
         )
         .bind(product_conversation_id.as_str())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *connection)
         .await?
         .map(parse_close_obligation_row)
         .transpose()?;
         let Some(obligation) = obligation else {
-            tx.rollback().await?;
             return Ok(None);
         };
         let inspections = sqlx::query(
@@ -2288,7 +2338,7 @@ impl Database {
              ORDER BY scope, inspected_at",
         )
         .bind(obligation.attempt_id().as_str())
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?
         .into_iter()
         .map(parse_close_inspection_row)
@@ -2305,7 +2355,7 @@ impl Database {
              ORDER BY loss.scope, loss.generation, loss.category, loss.identity_kind, loss.identity_value",
         )
         .bind(obligation.attempt_id().as_str())
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?
         .into_iter()
         .map(parse_close_inspection_loss_row)
@@ -2337,12 +2387,11 @@ impl Database {
                 .snapshot()
                 .map(CloseRetirementSnapshot::fingerprint),
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?
         .into_iter()
         .map(parse_close_retired_resource_row)
         .collect::<DbResult<Vec<_>>>()?;
-        tx.rollback().await?;
         Ok(Some(CloseProjection {
             obligation,
             inspections,
@@ -6815,7 +6864,7 @@ mod tests {
         set_state(&db, "root", approval_state()).await;
 
         let err = db
-            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
@@ -6869,6 +6918,7 @@ mod tests {
             (
                 "cancel-tool",
                 ConvState::CancellingTool {
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
                     tool_use_id: "tool-1".to_string(),
                     skipped_tools: Vec::new(),
                     completed_results: Vec::new(),
@@ -6916,6 +6966,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_close_rejects_busy_latest_without_creating_an_attempt() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        set_state(&db, "root", ConvState::LlmRequesting { attempt: 1 }).await;
+
+        let error = db
+            .begin_direct_close_foundation(
+                &product_id("root"),
+                &transcript_id("root"),
+                "attempt-direct",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DbError::CloseFoundationConflict(_)));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_obligations WHERE attempt_id = 'attempt-direct'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn close_busy_classification_uses_the_transactional_admission_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
@@ -6947,7 +7022,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
+            db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
@@ -6994,6 +7069,8 @@ mod tests {
                 ConvState::AwaitingUserResponse {
                     questions: Vec::new(),
                     tool_use_id: "question-tool".to_string(),
+                    request_authority:
+                        phoenix_core::domain::sm_state::QuestionRequestAuthority::new(),
                 },
             ),
         ];
@@ -7061,8 +7138,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             stale,
-            DbError::CloseFoundationPrecondition(message)
-                if message.contains("addressed conversation root is not latest latest")
+            DbError::CloseFoundationStaleLatest { expected, actual }
+                if expected == "root" && actual == "latest"
         ));
 
         let obligation = db

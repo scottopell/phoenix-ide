@@ -610,7 +610,9 @@ AND populate it with chapters from the available conversation history in convers
 AND extend the strip as older history becomes available
 AND assign the strip a single fixed role that does not change between cold load and streaming
 
-THE SYSTEM SHALL treat as a chapter every user prompt, and every assistant text block at or above the significance threshold (REQ-CONV-022)
+THE SYSTEM SHALL treat as a chapter every user prompt except inputs whose stored provenance is a subscription event, and every assistant text block at or above the significance threshold (REQ-CONV-022)
+AND SHALL exclude subscription-event inputs from navigation stops without removing them from the chronological transcript or changing message anchors
+AND SHALL determine this exclusion from typed provenance, not from message text, so a user prompt quoting an event label remains navigable
 AND render each chapter as a type-styled pill distinguishing a user prompt from assistant prose
 AND label each pill with human-meaningful conversation text — the truncated prompt or the first line of the prose
 AND NOT expose opaque internal display identifiers, render-unit keys, sequence numbers, or placeholder IDs as the chapter label

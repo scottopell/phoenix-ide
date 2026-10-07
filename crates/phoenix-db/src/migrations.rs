@@ -12,6 +12,7 @@ use phoenix_core::work_scope::WorkScopeId;
 use super::{DbError, DbResult, ProjectSeedId};
 
 mod retire_commission_review;
+mod settle_historical_continuation;
 
 struct Migration {
     version: u32,
@@ -532,12 +533,77 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 104,
-        name: "admit_server_overload_retrying_state",
+        name: "persist_turn_usage_service_tier",
         sql: MIGRATION_104,
+    },
+    Migration {
+        version: 105,
+        name: "create_active_provider_replay_state",
+        sql: MIGRATION_105,
+    },
+    Migration {
+        version: 106,
+        name: "create_sub_agent_lifecycle_tables",
+        sql: MIGRATION_106,
+    },
+    Migration {
+        version: 107,
+        name: "repair_direct_execution_authority",
+        sql: MIGRATION_107,
+    },
+    Migration {
+        version: 108,
+        name: "enforce_authority_timestamp_storage_class",
+        sql: MIGRATION_108,
+    },
+    Migration {
+        version: 109,
+        name: "persist_approval_request_obligation",
+        sql: MIGRATION_109,
+    },
+    Migration {
+        version: 110,
+        name: "trusted_input_origin",
+        sql: MIGRATION_110,
+    },
+    Migration {
+        version: 111,
+        name: "coordinator_conversation_watches",
+        sql: MIGRATION_111,
+    },
+    Migration {
+        version: 112,
+        name: "input_source_tool_call",
+        sql: MIGRATION_112,
+    },
+    Migration {
+        version: 113,
+        name: "settle_historical_continuation_openings",
+        sql: MIGRATION_113,
+    },
+    Migration {
+        version: 114,
+        name: "persist_instance_identity",
+        sql: MIGRATION_114,
+    },
+    Migration {
+        version: 115,
+        name: "federation_enrollments",
+        sql: MIGRATION_115,
+    },
+    Migration {
+        version: 116,
+        name: "federation_peer_connections",
+        sql: MIGRATION_116,
+    },
+    Migration {
+        version: 117,
+        name: "admit_server_overload_retrying_state",
+        sql: MIGRATION_117,
     },
 ];
 
-const MIGRATION_104: &str = r"
+const MIGRATION_117: &str = r"
 UPDATE sqlite_schema
 SET sql = replace(
     sql,
@@ -562,12 +628,12 @@ WHERE type = 'table'
 ";
 
 #[cfg(test)]
-mod migration_104_tests {
+mod migration_117_tests {
     use super::{run_pending_migrations, MIGRATIONS};
     use sqlx::{sqlite::SqlitePoolOptions, Row};
 
     #[tokio::test]
-    async fn migrates_101_schema_and_records_rollback_boundary() {
+    async fn migrates_pre_overload_schema_and_records_rollback_boundary() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -594,7 +660,7 @@ mod migration_104_tests {
         .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version <= 103)
+            .filter(|migration| migration.version <= 116)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -620,7 +686,7 @@ mod migration_104_tests {
                 .get("sql");
         assert!(close_schema.contains("'server_overload_retrying'"));
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 104")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 117")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -644,6 +710,476 @@ mod migration_104_tests {
         assert_eq!(captured, "server_overload_retrying");
     }
 }
+
+const MIGRATION_113: &str = "";
+
+const MIGRATION_114: &str = r"
+CREATE TABLE instance_identity (
+    singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+    instance_id TEXT NOT NULL UNIQUE CHECK(
+        typeof(instance_id) = 'text'
+        AND length(instance_id) = 36
+        AND instance_id = lower(instance_id)
+        AND substr(instance_id, 9, 1) = '-'
+        AND substr(instance_id, 14, 1) = '-'
+        AND substr(instance_id, 15, 1) = '4'
+        AND substr(instance_id, 19, 1) = '-'
+        AND substr(instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(instance_id, 24, 1) = '-'
+        AND length(replace(instance_id, '-', '')) = 32
+        AND replace(instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    )
+);
+";
+
+const MIGRATION_115: &str = r"
+CREATE TABLE federation_enrollments (
+    id TEXT PRIMARY KEY NOT NULL,
+    caller_instance_id TEXT NOT NULL,
+    caller_display_name TEXT NOT NULL CHECK(length(trim(caller_display_name)) > 0),
+    credential_verifier TEXT NOT NULL UNIQUE CHECK(
+        length(credential_verifier) = 64
+        AND credential_verifier = lower(credential_verifier)
+        AND credential_verifier NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    revoked_at_us INTEGER CHECK(
+        revoked_at_us IS NULL
+        OR (typeof(revoked_at_us) = 'integer' AND revoked_at_us >= created_at_us)
+    )
+);
+CREATE UNIQUE INDEX federation_enrollments_one_active_caller
+    ON federation_enrollments(caller_instance_id) WHERE revoked_at_us IS NULL;
+";
+
+const MIGRATION_116: &str = r"
+CREATE TABLE federation_peer_connections (
+    peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
+        typeof(peer_instance_id) = 'text'
+        AND length(peer_instance_id) = 36
+        AND peer_instance_id = lower(peer_instance_id)
+        AND substr(peer_instance_id, 9, 1) = '-'
+        AND substr(peer_instance_id, 14, 1) = '-'
+        AND substr(peer_instance_id, 15, 1) = '4'
+        AND substr(peer_instance_id, 19, 1) = '-'
+        AND substr(peer_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(peer_instance_id, 24, 1) = '-'
+        AND length(replace(peer_instance_id, '-', '')) = 32
+        AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
+    host TEXT NOT NULL CHECK(
+        typeof(host) = 'text'
+        AND length(host) > 0
+        AND host NOT GLOB '*[^A-Za-z0-9.-]*'
+    ),
+    port INTEGER NOT NULL CHECK(
+        typeof(port) = 'integer' AND port BETWEEN 1 AND 65535
+    ),
+    bearer_credential TEXT NOT NULL UNIQUE CHECK(
+        bearer_credential GLOB 'phx_peer_*'
+        AND length(bearer_credential) = 52
+        AND substr(bearer_credential, 10) NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    UNIQUE(host, port)
+);
+";
+
+const MIGRATION_112: &str = r"
+ALTER TABLE messages ADD COLUMN origin_source_message_id TEXT;
+ALTER TABLE messages ADD COLUMN origin_source_tool_use_id TEXT;
+CREATE TRIGGER messages_source_call_insert BEFORE INSERT ON messages
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+CREATE TRIGGER messages_source_call_update BEFORE UPDATE ON messages
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+ALTER TABLE steering_messages ADD COLUMN origin_source_message_id TEXT;
+ALTER TABLE steering_messages ADD COLUMN origin_source_tool_use_id TEXT;
+CREATE TRIGGER steering_messages_source_call_insert BEFORE INSERT ON steering_messages
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+CREATE TRIGGER steering_messages_source_call_update BEFORE UPDATE ON steering_messages
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+ALTER TABLE durable_turns ADD COLUMN origin_source_message_id TEXT;
+ALTER TABLE durable_turns ADD COLUMN origin_source_tool_use_id TEXT;
+CREATE TRIGGER durable_turns_source_call_insert BEFORE INSERT ON durable_turns
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+CREATE TRIGGER durable_turns_source_call_update BEFORE UPDATE ON durable_turns
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+";
+
+const MIGRATION_111: &str = r"
+ALTER TABLE product_creation_jobs ADD COLUMN objective_origin TEXT NOT NULL DEFAULT 'unknown_historical' CHECK(objective_origin IN ('unknown_historical', 'user_api'));
+CREATE TABLE coordinator_watches (
+    id INTEGER PRIMARY KEY,
+    source_product_conversation_id TEXT NOT NULL,
+    enrolled_at_us INTEGER NOT NULL CHECK(typeof(enrolled_at_us) = 'integer' AND enrolled_at_us >= 0),
+    ended_at_us INTEGER CHECK(ended_at_us IS NULL OR (typeof(ended_at_us) = 'integer' AND ended_at_us >= 0)),
+    UNIQUE(source_product_conversation_id, enrolled_at_us)
+);
+CREATE UNIQUE INDEX coordinator_watches_active ON coordinator_watches(source_product_conversation_id)
+    WHERE ended_at_us IS NULL;
+CREATE TRIGGER coordinator_watches_validate BEFORE INSERT ON coordinator_watches
+WHEN NOT EXISTS (SELECT 1 FROM product_conversations WHERE id = NEW.source_product_conversation_id
+                 AND kind = 'ordinary' AND ordinary_lifecycle = 'open')
+BEGIN SELECT RAISE(ABORT, 'watch requires open ordinary ProductConversation'); END;
+CREATE TABLE execution_cancel_observations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE TABLE steering_execution_occurrences (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL DEFAULT 'steering' CHECK(source_kind IN ('steering', 'wake', 'seeded_fork', 'interaction_response'))
+);
+CREATE TABLE coordinator_watch_events (
+    event_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(event_id)) > 0),
+    watch_id INTEGER NOT NULL REFERENCES coordinator_watches(id),
+    source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation', 'steering', 'wake', 'seeded_fork', 'interaction_response', 'continuation_summary')),
+    source_occurrence_id TEXT NOT NULL CHECK(length(trim(source_occurrence_id)) > 0),
+    source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
+    source_transcript_id TEXT NOT NULL,
+    terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('completed', 'failed', 'cancelled')),
+    terminal_reason TEXT,
+    occurred_at_us INTEGER NOT NULL CHECK(typeof(occurred_at_us) = 'integer' AND occurred_at_us >= 0),
+    continuation_state TEXT NOT NULL DEFAULT 'none'
+        CHECK(continuation_state IN ('none', 'awaiting', 'suppressed')),
+    delivery_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(delivery_state IN ('pending', 'accepted', 'suppressed')),
+    accepted_transcript_id TEXT,
+    CHECK ((delivery_state = 'accepted') = (accepted_transcript_id IS NOT NULL)),
+    UNIQUE(source_occurrence_kind, source_occurrence_id, source_generation, watch_id),
+    CHECK ((terminal_kind = 'failed') = (terminal_reason IS NOT NULL))
+);
+CREATE INDEX coordinator_watch_events_pending ON coordinator_watch_events(delivery_state, occurred_at_us);
+ALTER TABLE messages ADD COLUMN origin_subscription_event_id TEXT REFERENCES coordinator_watch_events(event_id);
+ALTER TABLE steering_messages ADD COLUMN origin_subscription_event_id TEXT REFERENCES coordinator_watch_events(event_id);
+ALTER TABLE durable_turns ADD COLUMN origin_subscription_event_id TEXT REFERENCES coordinator_watch_events(event_id);
+DROP TRIGGER messages_origin_insert;
+DROP TRIGGER messages_origin_update;
+DROP TRIGGER steering_origin_insert;
+DROP TRIGGER steering_origin_update;
+DROP TRIGGER durable_turn_origin_insert;
+DROP TRIGGER durable_turn_origin_update;
+CREATE TRIGGER messages_origin_insert BEFORE INSERT ON messages
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER messages_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id ON messages
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER steering_origin_insert BEFORE INSERT ON steering_messages
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER steering_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id ON steering_messages
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER durable_turn_origin_insert BEFORE INSERT ON durable_turns
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE TRIGGER durable_turn_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id ON durable_turns
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE TRIGGER watch_event_accept_turn AFTER INSERT ON durable_turns
+WHEN NEW.origin_subscription_event_id IS NOT NULL
+BEGIN
+    UPDATE coordinator_watch_events SET delivery_state = 'accepted', accepted_transcript_id = NEW.conversation_id
+    WHERE event_id = NEW.origin_subscription_event_id AND delivery_state = 'pending'
+      AND continuation_state = 'none'
+      AND EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p
+                    ON p.id = w.source_product_conversation_id
+                  WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL
+                    AND p.ordinary_lifecycle = 'open'
+                    AND NOT EXISTS (SELECT 1 FROM close_obligations o
+                                    WHERE o.product_conversation_id = p.id AND o.phase != 'completed'))
+      AND EXISTS (SELECT 1 FROM product_conversations p JOIN conversations c
+                    ON c.product_conversation_id = p.id
+                  WHERE c.id = NEW.conversation_id AND p.kind = 'coordinator');
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'watch event no longer deliverable') END;
+END;
+CREATE TRIGGER watch_event_accept_steering AFTER INSERT ON steering_messages
+WHEN NEW.origin_subscription_event_id IS NOT NULL
+BEGIN
+    UPDATE coordinator_watch_events SET delivery_state = 'accepted', accepted_transcript_id = NEW.conversation_id
+    WHERE event_id = NEW.origin_subscription_event_id AND delivery_state = 'pending'
+      AND continuation_state = 'none'
+      AND EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p
+                    ON p.id = w.source_product_conversation_id
+                  WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL
+                    AND p.ordinary_lifecycle = 'open'
+                    AND NOT EXISTS (SELECT 1 FROM close_obligations o
+                                    WHERE o.product_conversation_id = p.id AND o.phase != 'completed'))
+      AND EXISTS (SELECT 1 FROM product_conversations p JOIN conversations c
+                    ON c.product_conversation_id = p.id
+                  WHERE c.id = NEW.conversation_id AND p.kind = 'coordinator');
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'watch event no longer deliverable') END;
+END;
+CREATE TRIGGER watch_auto_continuation_admitted AFTER INSERT ON automatic_continuation_admissions
+BEGIN
+    UPDATE coordinator_watch_events SET continuation_state = 'awaiting'
+    WHERE source_transcript_id = NEW.predecessor_conversation_id
+      AND terminal_kind = 'failed' AND terminal_reason = 'context exhausted'
+      AND delivery_state = 'pending' AND continuation_state = 'none';
+END;
+CREATE TRIGGER watch_auto_continuation_failed AFTER UPDATE OF phase ON automatic_continuation_admissions
+WHEN NEW.phase = 'failed' AND OLD.phase != 'failed'
+BEGIN
+    UPDATE coordinator_watch_events SET continuation_state = 'none'
+    WHERE delivery_state = 'pending' AND continuation_state = 'awaiting'
+      AND source_transcript_id = NEW.predecessor_conversation_id;
+END;
+CREATE TRIGGER watch_auto_continuation_succeeded AFTER INSERT ON completed_continuation_handoffs
+BEGIN
+    UPDATE coordinator_watch_events SET continuation_state = 'suppressed', delivery_state = 'suppressed'
+    WHERE delivery_state = 'pending' AND continuation_state = 'awaiting'
+      AND source_transcript_id = NEW.predecessor_conversation_id;
+END;
+CREATE TRIGGER watch_source_deleted BEFORE DELETE ON conversations
+WHEN OLD.parent_conversation_id IS NULL AND OLD.continued_in_conv_id IS NULL
+BEGIN
+    UPDATE coordinator_watches SET ended_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE source_product_conversation_id = OLD.product_conversation_id AND ended_at_us IS NULL;
+    UPDATE coordinator_watch_events SET delivery_state = 'suppressed'
+    WHERE delivery_state = 'pending' AND watch_id IN
+          (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = OLD.product_conversation_id);
+END;
+CREATE TRIGGER watch_product_deleted BEFORE DELETE ON product_conversations
+BEGIN
+    UPDATE coordinator_watches SET ended_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE source_product_conversation_id = OLD.id AND ended_at_us IS NULL;
+    UPDATE coordinator_watch_events SET delivery_state = 'suppressed'
+    WHERE delivery_state = 'pending' AND watch_id IN
+          (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = OLD.id);
+END;
+CREATE TRIGGER watch_close_suppress AFTER UPDATE OF ordinary_lifecycle ON product_conversations
+WHEN NEW.ordinary_lifecycle != 'open'
+BEGIN
+    UPDATE coordinator_watches SET ended_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE source_product_conversation_id = NEW.id AND ended_at_us IS NULL;
+    UPDATE coordinator_watch_events SET delivery_state = 'suppressed'
+    WHERE delivery_state = 'pending' AND watch_id IN
+      (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = NEW.id);
+END;
+";
+
+const MIGRATION_110: &str = r"
+ALTER TABLE messages ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event'));
+ALTER TABLE messages ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE messages ADD COLUMN origin_transcript_id TEXT;
+ALTER TABLE steering_messages ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event'));
+ALTER TABLE steering_messages ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE steering_messages ADD COLUMN origin_transcript_id TEXT;
+ALTER TABLE durable_turns ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event'));
+ALTER TABLE durable_turns ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE durable_turns ADD COLUMN origin_transcript_id TEXT;
+CREATE TRIGGER messages_origin_insert BEFORE INSERT ON messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER messages_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER steering_origin_insert BEFORE INSERT ON steering_messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER steering_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON steering_messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER durable_turn_origin_insert BEFORE INSERT ON durable_turns
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE TRIGGER durable_turn_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON durable_turns
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE INDEX idx_messages_input_origin ON messages(origin_kind, origin_product_conversation_id, origin_transcript_id);
+";
+
+const MIGRATION_106: &str = r"
+CREATE TABLE sub_agent_batches (
+    batch_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(batch_id)) > 0),
+    parent_conversation_id TEXT NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    parallel_work_qualified INTEGER NOT NULL
+        CHECK(typeof(parallel_work_qualified) = 'integer' AND parallel_work_qualified IN (0, 1)),
+    admitted_at_unix_micros INTEGER NOT NULL
+        CHECK(typeof(admitted_at_unix_micros) = 'integer' AND admitted_at_unix_micros >= 0)
+);
+
+CREATE TABLE sub_agent_runs (
+    child_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    batch_id TEXT NOT NULL REFERENCES sub_agent_batches(batch_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL
+        CHECK(typeof(ordinal) = 'integer' AND ordinal >= 0),
+    execution_authority TEXT NOT NULL
+        CHECK(execution_authority IN ('read_only', 'write_capable')),
+    max_turns INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(max_turns) = 'integer' AND max_turns > 0),
+    timeout_millis INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(timeout_millis) = 'integer' AND timeout_millis > 0),
+    cancellation_requested_at_unix_micros INTEGER
+        CHECK(cancellation_requested_at_unix_micros IS NULL OR (
+            typeof(cancellation_requested_at_unix_micros) = 'integer'
+            AND cancellation_requested_at_unix_micros >= 0
+        )),
+    cancellation_cause TEXT CHECK(cancellation_cause IS NULL OR cancellation_cause IN ('timed_out', 'cancelled')),
+    initial_dispatch_claimed_at_unix_micros INTEGER
+        CHECK(initial_dispatch_claimed_at_unix_micros IS NULL OR (
+            typeof(initial_dispatch_claimed_at_unix_micros) = 'integer'
+            AND initial_dispatch_claimed_at_unix_micros >= 0
+        )),
+    terminal_cause TEXT CHECK(terminal_cause IS NULL OR terminal_cause IN (
+        'submit_result', 'submit_error', 'timed_out', 'cancelled',
+        'turn_limit', 'implicit_completion', 'runtime_failure', 'context_exhausted'
+    )),
+    terminal_at_unix_micros INTEGER
+        CHECK(terminal_at_unix_micros IS NULL OR (
+            typeof(terminal_at_unix_micros) = 'integer' AND terminal_at_unix_micros >= 0
+        )),
+    parent_accepted_at_unix_micros INTEGER
+        CHECK(parent_accepted_at_unix_micros IS NULL OR (
+            typeof(parent_accepted_at_unix_micros) = 'integer'
+            AND parent_accepted_at_unix_micros >= 0
+        )),
+    UNIQUE(batch_id, ordinal),
+    CHECK((terminal_cause IS NULL) = (terminal_at_unix_micros IS NULL)),
+    CHECK(parent_accepted_at_unix_micros IS NULL OR terminal_at_unix_micros IS NOT NULL)
+);
+
+CREATE INDEX sub_agent_runs_parent_delivery_owed
+    ON sub_agent_runs(terminal_at_unix_micros, parent_accepted_at_unix_micros, child_conversation_id);
+CREATE INDEX sub_agent_runs_batch ON sub_agent_runs(batch_id, ordinal);
+
+CREATE TRIGGER sub_agent_batches_validate_insert
+BEFORE INSERT ON sub_agent_batches
+FOR EACH ROW WHEN
+    NOT EXISTS (
+        SELECT 1 FROM conversations parent
+        JOIN product_conversations product ON product.id = parent.product_conversation_id
+        WHERE parent.id = NEW.parent_conversation_id
+          AND parent.runtime_role IN ('user', 'coordinator')
+          AND (product.kind = 'coordinator'
+               OR (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'))
+    )
+    OR EXISTS (
+        SELECT 1 FROM conversations parent
+        JOIN close_obligations obligation
+          ON obligation.product_conversation_id = parent.product_conversation_id
+        WHERE parent.id = NEW.parent_conversation_id
+          AND obligation.phase <> 'completed'
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent batch parent is not open for admission');
+END;
+
+CREATE TRIGGER sub_agent_batches_immutable
+BEFORE UPDATE ON sub_agent_batches
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent batch identity is immutable');
+END;
+
+CREATE TRIGGER sub_agent_runs_validate_insert
+BEFORE INSERT ON sub_agent_runs
+FOR EACH ROW WHEN
+    NOT EXISTS (
+        SELECT 1 FROM conversations child
+        JOIN sub_agent_batches batch ON batch.batch_id = NEW.batch_id
+        WHERE child.id = NEW.child_conversation_id
+          AND child.runtime_role = 'sub_agent'
+          AND child.parent_conversation_id = batch.parent_conversation_id
+    )
+    OR (
+        NEW.execution_authority = 'write_capable'
+        AND EXISTS (
+            SELECT 1
+            FROM sub_agent_batches incoming
+            JOIN sub_agent_batches existing_batch
+              ON existing_batch.parent_conversation_id = incoming.parent_conversation_id
+            JOIN sub_agent_runs existing_run ON existing_run.batch_id = existing_batch.batch_id
+            WHERE incoming.batch_id = NEW.batch_id
+              AND incoming.parallel_work_qualified = 0
+              AND existing_run.execution_authority = 'write_capable'
+              AND existing_run.parent_accepted_at_unix_micros IS NULL
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent run is not admissible');
+END;
+
+CREATE TRIGGER sub_agent_runs_immutable_identity
+BEFORE UPDATE OF child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis
+ON sub_agent_runs
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent run identity is immutable');
+END;
+
+CREATE TRIGGER sub_agent_runs_monotonic_lifecycle
+BEFORE UPDATE ON sub_agent_runs
+FOR EACH ROW WHEN
+    (OLD.cancellation_requested_at_unix_micros IS NOT NULL AND
+     NEW.cancellation_requested_at_unix_micros IS NOT OLD.cancellation_requested_at_unix_micros)
+    OR (OLD.initial_dispatch_claimed_at_unix_micros IS NOT NULL AND
+        NEW.initial_dispatch_claimed_at_unix_micros IS NOT OLD.initial_dispatch_claimed_at_unix_micros)
+    OR (OLD.terminal_cause IS NOT NULL AND (
+        NEW.terminal_cause IS NOT OLD.terminal_cause
+        OR NEW.terminal_at_unix_micros IS NOT OLD.terminal_at_unix_micros
+    ))
+    OR (OLD.parent_accepted_at_unix_micros IS NOT NULL AND
+        NEW.parent_accepted_at_unix_micros IS NOT OLD.parent_accepted_at_unix_micros)
+    OR (NEW.initial_dispatch_claimed_at_unix_micros IS NOT NULL
+        AND OLD.initial_dispatch_claimed_at_unix_micros IS NULL
+        AND OLD.cancellation_requested_at_unix_micros IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent lifecycle facts are monotonic');
+END;
+";
 
 const MIGRATION_101: &str = r"
 CREATE TABLE conversation_svg_artifacts (
@@ -9838,7 +10374,7 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
     restore
 }
 
-async fn run_migration_104(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+async fn run_migration_117(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
     let result = async {
         let mut tx = guard.connection().begin().await?;
@@ -9877,7 +10413,7 @@ async fn run_migration_104(pool: &SqlitePool, migration: &Migration) -> DbResult
                     .is_some_and(|schema| !schema.contains("'server_overload_retrying'"))
             {
                 return Err(DbError::Serialization(
-                    "migration 104 expected overload-compatible conversation and Close schemas"
+                    "migration 117 expected overload-compatible conversation and Close schemas"
                         .to_string(),
                 ));
             }
@@ -9900,6 +10436,26 @@ async fn run_migration_104(pool: &SqlitePool, migration: &Migration) -> DbResult
     let restore = guard.disable().await;
     result?;
     restore
+}
+
+async fn apply_migration_body(
+    tx: &mut Transaction<'_, Sqlite>,
+    migration: &Migration,
+) -> DbResult<()> {
+    if migration.version == 113 {
+        settle_historical_continuation::run(tx).await?;
+    } else {
+        sqlx::raw_sql(migration.sql).execute(&mut **tx).await?;
+        if migration.version == 114 {
+            sqlx::query(
+                "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (1, ?1)",
+            )
+            .bind(phoenix_core::domain::instance_identity::InstanceId::new().to_string())
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Run all pending migrations against the database.
@@ -9966,8 +10522,8 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             continue;
         }
 
-        if migration.version == 104 {
-            run_migration_104(pool, migration).await?;
+        if migration.version == 117 {
+            run_migration_117(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -10023,7 +10579,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             }
         }
 
-        sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+        apply_migration_body(&mut tx, migration).await?;
 
         sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
             .bind(migration.version)
@@ -10704,12 +11260,466 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
+const MIGRATION_104: &str = r"
+ALTER TABLE turn_usage ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'standard'
+    CHECK (service_tier IN ('standard', 'fast'));
+";
+
+const MIGRATION_105: &str = r"
+CREATE TABLE IF NOT EXISTS active_provider_replay_state (
+    conversation_id TEXT PRIMARY KEY
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL
+        CHECK (provider IN ('anthropic')),
+    model TEXT NOT NULL
+        CHECK (length(trim(model)) > 0),
+    response_id TEXT NOT NULL
+        CHECK (length(trim(response_id)) > 0),
+    payload TEXT NOT NULL
+);
+";
+
+/// Exposed for isolated migration tests in `provider_replay`.
+#[cfg(test)]
+pub(crate) const MIGRATION_105_FOR_TEST: &str = MIGRATION_105;
+
+const MIGRATION_107: &str = r"
+UPDATE work_scopes
+SET authority_kind = 'direct'
+WHERE id IN (
+    SELECT work_scope_id
+    FROM conversations
+    WHERE cm_kind = 'direct'
+      AND work_scope_id IS NOT NULL
+)
+  AND authority_kind = 'restricted_explore';
+";
+const MIGRATION_108: &str = r"
+UPDATE conversation_approved_task_objectives
+SET created_at_us = max(CAST(created_at_us AS INTEGER), 0)
+WHERE typeof(created_at_us) <> 'integer' OR created_at_us < 0;
+UPDATE work_scope_approved_task_authorities
+SET created_at_us = max(CAST(created_at_us AS INTEGER), 0)
+WHERE typeof(created_at_us) <> 'integer' OR created_at_us < 0;
+UPDATE product_conversation_sources
+SET created_at_us = max(CAST(created_at_us AS INTEGER), 0)
+WHERE typeof(created_at_us) <> 'integer' OR created_at_us < 0;
+
+CREATE TRIGGER conversation_approved_task_objective_timestamp_insert
+BEFORE INSERT ON conversation_approved_task_objectives
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER conversation_approved_task_objective_timestamp_update
+BEFORE UPDATE OF created_at_us ON conversation_approved_task_objectives
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER work_scope_approved_task_authority_timestamp_insert
+BEFORE INSERT ON work_scope_approved_task_authorities
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER work_scope_approved_task_authority_timestamp_update
+BEFORE UPDATE OF created_at_us ON work_scope_approved_task_authorities
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER product_conversation_source_timestamp_insert
+BEFORE INSERT ON product_conversation_sources
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER product_conversation_source_timestamp_update
+BEFORE UPDATE OF created_at_us ON product_conversation_sources
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+";
+const MIGRATION_109: &str = r"
+CREATE TABLE approval_request_obligations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    approval_message_id TEXT NOT NULL UNIQUE,
+    created_at_us INTEGER NOT NULL
+        CHECK (typeof(created_at_us) = 'integer' AND created_at_us >= 0),
+    FOREIGN KEY (conversation_id, approval_message_id)
+        REFERENCES messages(conversation_id, message_id) ON DELETE CASCADE
+);
+CREATE TRIGGER approval_request_obligation_after_agent_response
+AFTER INSERT ON messages
+WHEN NEW.message_type = 'agent'
+BEGIN
+    DELETE FROM approval_request_obligations
+    WHERE conversation_id = NEW.conversation_id;
+END;
+CREATE TRIGGER approval_request_obligation_after_state_progress
+AFTER UPDATE OF state_kind ON conversations
+WHEN NEW.state_kind <> 'llm_requesting'
+BEGIN
+    DELETE FROM approval_request_obligations WHERE conversation_id = NEW.id;
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;
+
+    async fn historical_continuation_schema() -> SqlitePool {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE product_conversations (
+                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, ordinary_lifecycle TEXT
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 product_conversation_id TEXT REFERENCES product_conversations(id),
+                 parent_conversation_id TEXT, runtime_role TEXT NOT NULL,
+                 state_kind TEXT NOT NULL,
+                 continued_in_conv_id TEXT REFERENCES conversations(id)
+             );
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                 sequence_id INTEGER NOT NULL, message_type TEXT NOT NULL, content TEXT NOT NULL
+             );
+             CREATE TABLE close_obligations (product_conversation_id TEXT NOT NULL, phase TEXT NOT NULL);
+             INSERT INTO product_conversations VALUES ('product', 'ordinary', 'open');
+             INSERT INTO conversations VALUES
+                 ('parent', 'product', NULL, 'user', 'context_exhausted', NULL),
+                 ('successor', 'product', NULL, 'user', 'idle', NULL);
+             UPDATE conversations SET continued_in_conv_id = 'successor' WHERE id = 'parent';
+             INSERT INTO messages VALUES ('summary', 'parent', 1, 'continuation', '{\"summary\":\"exact handoff\"}');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn historical_continuation_fixture(before_upgrade: &str) -> SqlitePool {
+        let pool = historical_continuation_schema().await;
+        sqlx::raw_sql(
+            "INSERT INTO messages VALUES
+             ('successor:opening', 'successor', 1, 'user',
+              '{ \"text\" : \"exact handoff\", \"user_agent\" : \"historical-client\" }');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        if !before_upgrade.is_empty() {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(before_upgrade.to_owned()))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::raw_sql(MIGRATION_045).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents VALUES
+             ('parent', 'successor', 'opening', 'exact handoff', NULL, '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_074).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
+        stamp_migrations_except(&pool, 113).await;
+        pool
+    }
+
+    #[tokio::test]
+    async fn forward_upgrade_settles_already_persisted_canonical_continuation_opening() {
+        let pool = historical_continuation_schema().await;
+        sqlx::raw_sql(MIGRATION_045).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents VALUES
+             ('parent', 'successor', 'opening', 'exact handoff', NULL, '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // #581 materializes a reserved client key as successor:client-key.
+        sqlx::query(
+            "INSERT INTO messages VALUES
+             ('successor:opening', 'successor', 1, 'user', '{\"text\":\"exact handoff\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale: i64 = sqlx::query_scalar("SELECT count(*) FROM continuation_dispatch_intents")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale, 1,
+            "historical trigger misses canonical opening identity"
+        );
+        sqlx::raw_sql(MIGRATION_074).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
+        stamp_migrations_except(&pool, 113).await;
+        run_pending_migrations(&pool).await.unwrap();
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM continuation_dispatch_intents intent
+             WHERE successor_conversation_id = 'successor' AND NOT EXISTS (
+                 SELECT 1 FROM completed_continuation_handoffs completed
+                 WHERE completed.predecessor_conversation_id = intent.parent_conversation_id))",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !pending,
+            "already persisted exact opening must not fence subsequent chat"
+        );
+        let receipt: (String, String, String) = sqlx::query_as(
+            "SELECT continuation_message_id, accepted_successor_message_id, opening_authority
+             FROM completed_continuation_handoffs WHERE predecessor_conversation_id = 'parent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt,
+            (
+                "summary".into(),
+                "successor:opening".into(),
+                "user_authorized_instruction".into()
+            )
+        );
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        let message_count: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(message_count, 2);
+    }
+
+    type HistoricalContinuationIntent = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+    );
+
+    #[derive(Debug, PartialEq)]
+    struct HistoricalContinuationSnapshot {
+        messages: Vec<(String, String, i64, String, Vec<u8>)>,
+        intents: Vec<HistoricalContinuationIntent>,
+        receipts: Vec<(String, String, String, String, String)>,
+    }
+
+    async fn historical_continuation_snapshot(pool: &SqlitePool) -> HistoricalContinuationSnapshot {
+        HistoricalContinuationSnapshot {
+            messages: sqlx::query_as(
+                "SELECT message_id, conversation_id, sequence_id, message_type,
+                        CAST(content AS BLOB) FROM messages ORDER BY message_id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+            intents: sqlx::query_as(
+                "SELECT parent_conversation_id, successor_conversation_id, message_id,
+                        handoff, user_agent, opening_authority, created_at
+                 FROM continuation_dispatch_intents ORDER BY parent_conversation_id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+            receipts: sqlx::query_as(
+                "SELECT predecessor_conversation_id, successor_conversation_id,
+                        continuation_message_id, accepted_successor_message_id, opening_authority
+                 FROM completed_continuation_handoffs ORDER BY predecessor_conversation_id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_continuation_preserves_unproven_or_ambiguous_openings() {
+        // Rows precede migration 100's consume trigger; malformed topology is negative preservation evidence.
+        let cases = [
+            ("mismatched handoff", "UPDATE messages SET content = '{\"text\":\"different handoff\"}' WHERE message_id = 'successor:opening';"),
+            ("wrong raw identity", "UPDATE messages SET message_id = 'different-opening' WHERE message_id = 'successor:opening';"),
+            ("wrong canonical identity", "UPDATE messages SET message_id = 'successor:different-opening' WHERE message_id = 'successor:opening';"),
+            ("wrong opening kind", "UPDATE messages SET message_type = 'agent', content = '{\"text\":\"exact handoff\"}' WHERE message_id = 'successor:opening';"),
+            ("wrong successor message scope", "UPDATE messages SET conversation_id = 'parent' WHERE message_id = 'successor:opening';"),
+            ("different product scope", "INSERT INTO product_conversations VALUES ('other-product', 'ordinary', 'open'); UPDATE conversations SET product_conversation_id = 'other-product' WHERE id = 'successor';"),
+            ("missing successor link", "UPDATE conversations SET continued_in_conv_id = NULL WHERE id = 'parent';"),
+            ("wrong successor link", "UPDATE conversations SET continued_in_conv_id = 'parent' WHERE id = 'parent';"),
+            ("non-root predecessor", "INSERT INTO conversations VALUES ('ancestor', 'product', NULL, 'user', 'idle', NULL); UPDATE conversations SET parent_conversation_id = 'ancestor' WHERE id = 'parent';"),
+            ("non-root successor", "INSERT INTO conversations VALUES ('ancestor', 'product', NULL, 'user', 'idle', NULL); UPDATE conversations SET parent_conversation_id = 'ancestor' WHERE id = 'successor';"),
+            ("mismatched runtime role", "UPDATE conversations SET runtime_role = 'coordinator' WHERE id = 'successor';"),
+            ("non-user runtime roles", "UPDATE conversations SET runtime_role = 'sub_agent';"),
+            ("duplicate matching identities", "INSERT INTO messages VALUES ('opening', 'successor', 2, 'user', '{\"text\":\"exact handoff\"}');"),
+            ("conflicting identity with different kind", "INSERT INTO messages VALUES ('opening', 'successor', 2, 'agent', '[]');"),
+            ("malformed accepted payload", "UPDATE messages SET content = '{\"text\":42}' WHERE message_id = 'successor:opening';"),
+            ("meta message cannot prove user authority", "UPDATE messages SET content = '{\"text\":\"exact handoff\",\"is_meta\":true}' WHERE message_id = 'successor:opening';"),
+            ("expanded payload is not literal opening", "UPDATE messages SET content = '{\"text\":\"exact handoff\",\"llm_text\":\"different model input\"}' WHERE message_id = 'successor:opening';"),
+            ("malformed predecessor summary", "UPDATE messages SET content = '{\"summary\":42}' WHERE message_id = 'summary';"),
+            ("multiple predecessor summaries", "INSERT INTO messages VALUES ('summary-two', 'parent', 2, 'continuation', '{\"summary\":\"another summary\"}');"),
+            ("missing predecessor summary", "DELETE FROM messages WHERE message_id = 'summary';"),
+            ("wrong predecessor summary kind", "UPDATE messages SET message_type = 'user', content = '{\"text\":\"exact handoff\"}' WHERE message_id = 'summary';"),
+        ];
+        for (name, historical_rows) in cases {
+            let pool = historical_continuation_fixture(historical_rows).await;
+            let before = historical_continuation_snapshot(&pool).await;
+            assert_eq!(before.intents.len(), 1, "{name}");
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1, "{name}");
+            assert_eq!(
+                historical_continuation_snapshot(&pool).await,
+                before,
+                "{name}"
+            );
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0, "{name}");
+            assert_eq!(
+                historical_continuation_snapshot(&pool).await,
+                before,
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_continuation_preserves_generated_authority() {
+        let pool = historical_continuation_fixture("").await;
+        // Identity is immutable after migration 100; insert a generated-authority intent.
+        sqlx::raw_sql(
+            "DELETE FROM continuation_dispatch_intents;
+             INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, user_agent, opening_authority, created_at
+             ) VALUES ('parent', 'successor', 'opening', 'exact handoff', NULL,
+                       'generated_predecessor_context', '2026-01-01');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before = historical_continuation_snapshot(&pool).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(historical_continuation_snapshot(&pool).await, before);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert_eq!(historical_continuation_snapshot(&pool).await, before);
+    }
+
+    #[tokio::test]
+    async fn historical_continuation_preserves_conflicting_valid_receipts() {
+        let conflicts = [
+            "INSERT INTO messages VALUES ('other-opening', 'successor', 2, 'user', '{\"text\":\"another opening\"}');
+             INSERT INTO completed_continuation_handoffs VALUES
+                 ('parent', 'successor', 'summary', 'other-opening', 'user_authorized_instruction');",
+            "INSERT INTO conversations VALUES ('other-parent', 'product', NULL, 'user', 'context_exhausted', 'successor');
+             INSERT INTO messages VALUES ('other-summary', 'other-parent', 1, 'continuation', '{\"summary\":\"another summary\"}');
+             INSERT INTO completed_continuation_handoffs VALUES
+                 ('other-parent', 'successor', 'other-summary', 'successor:opening', 'user_authorized_instruction');",
+        ];
+        for conflict in conflicts {
+            let pool = historical_continuation_fixture("").await;
+            // Keep completed_continuation_handoffs_validate_insert enabled: both receipts are valid.
+            sqlx::raw_sql(conflict).execute(&pool).await.unwrap();
+            let before = historical_continuation_snapshot(&pool).await;
+            assert_eq!(before.receipts.len(), 1);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+            assert_eq!(historical_continuation_snapshot(&pool).await, before);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+            assert_eq!(historical_continuation_snapshot(&pool).await, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_continuation_settlement_is_byte_preserving_and_idempotent() {
+        for identity in ["successor:opening", "opening"] {
+            let pool = historical_continuation_fixture(
+                &format!("UPDATE messages SET message_id = '{identity}' WHERE message_id = 'successor:opening';"),
+            )
+            .await;
+            let before = historical_continuation_snapshot(&pool).await;
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+            let settled = historical_continuation_snapshot(&pool).await;
+            assert_eq!(settled.messages, before.messages);
+            assert!(settled.intents.is_empty());
+            assert_eq!(
+                settled.receipts,
+                vec![(
+                    "parent".into(),
+                    "successor".into(),
+                    "summary".into(),
+                    identity.into(),
+                    "user_authorized_instruction".into()
+                )]
+            );
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+            assert_eq!(historical_continuation_snapshot(&pool).await, settled);
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_continuation_rolls_back_receipt_or_intent_deletion_abort_and_retries() {
+        let aborts = [
+            "CREATE TRIGGER injected_settlement_abort BEFORE INSERT ON completed_continuation_handoffs
+             WHEN (SELECT count(*) FROM completed_continuation_handoffs) = 1
+             BEGIN SELECT RAISE(ABORT, 'injected receipt abort'); END;",
+            "CREATE TRIGGER injected_settlement_abort BEFORE DELETE ON continuation_dispatch_intents
+             WHEN (SELECT count(*) FROM completed_continuation_handoffs) = 2
+             BEGIN SELECT RAISE(ABORT, 'injected deletion abort'); END;",
+        ];
+        for abort in aborts {
+            let pool = historical_continuation_fixture("").await;
+            // Messages predate their intent, so the live consume trigger does not settle them.
+            sqlx::raw_sql(
+                "INSERT INTO conversations VALUES
+                     ('parent-two', 'product', NULL, 'user', 'context_exhausted', NULL),
+                     ('successor-two', 'product', NULL, 'user', 'idle', NULL);
+                 UPDATE conversations SET continued_in_conv_id = 'successor-two' WHERE id = 'parent-two';
+                 INSERT INTO messages VALUES
+                     ('summary-two', 'parent-two', 1, 'continuation', '{\"summary\":\"second handoff\"}'),
+                     ('successor-two:opening-two', 'successor-two', 1, 'user', '{ \"text\" : \"second handoff\" }');
+                 INSERT INTO continuation_dispatch_intents (
+                     parent_conversation_id, successor_conversation_id, message_id,
+                     handoff, user_agent, opening_authority, created_at
+                 ) VALUES ('parent-two', 'successor-two', 'opening-two', 'second handoff', NULL,
+                           'user_authorized_instruction', '2026-01-02');",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let before = historical_continuation_snapshot(&pool).await;
+            assert_eq!(before.intents.len(), 2);
+            sqlx::raw_sql(abort).execute(&pool).await.unwrap();
+            let error = run_pending_migrations(&pool).await.unwrap_err();
+            assert!(error.to_string().contains("injected"), "{error}");
+            assert_eq!(historical_continuation_snapshot(&pool).await, before);
+            let stamped: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM _migrations WHERE version = 113)")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(!stamped);
+            sqlx::raw_sql("DROP TRIGGER injected_settlement_abort")
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+            let settled = historical_continuation_snapshot(&pool).await;
+            assert_eq!(settled.messages, before.messages);
+            assert!(settled.intents.is_empty());
+            assert_eq!(settled.receipts.len(), 2);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+            assert_eq!(historical_continuation_snapshot(&pool).await, settled);
+        }
+    }
 
     #[tokio::test]
     async fn migration_098_retires_shipped_empty_continuation_intent_without_losing_successor() {
@@ -11047,6 +12057,256 @@ mod tests {
         .execute(&pool)
         .await
         .is_err());
+    }
+
+    #[test]
+    fn capability_migrations_are_forward_only_and_unique() {
+        let ledger = compiled_migration_ledger();
+        assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(
+            ledger.iter().rev().take(7).copied().collect::<Vec<_>>(),
+            vec![
+                (116, "federation_peer_connections"),
+                (115, "federation_enrollments"),
+                (114, "persist_instance_identity"),
+                (113, "settle_historical_continuation_openings"),
+                (112, "input_source_tool_call"),
+                (111, "coordinator_conversation_watches"),
+                (110, "trusted_input_origin"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_107_repairs_only_stale_direct_authority() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE work_scopes (id TEXT PRIMARY KEY, authority_kind TEXT NOT NULL);
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 cm_kind TEXT,
+                 work_scope_id TEXT REFERENCES work_scopes(id)
+             );
+             INSERT INTO work_scopes VALUES ('direct', 'restricted_explore');
+             INSERT INTO work_scopes VALUES ('explore', 'restricted_explore');
+             INSERT INTO work_scopes VALUES ('work', 'work');
+             INSERT INTO conversations VALUES ('d', 'direct', 'direct');
+             INSERT INTO conversations VALUES ('e', 'explore', 'explore');
+             INSERT INTO conversations VALUES ('w', 'work', 'work');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_107).execute(&pool).await.unwrap();
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, authority_kind FROM work_scopes ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("direct".to_string(), "direct".to_string()),
+                ("explore".to_string(), "restricted_explore".to_string()),
+                ("work".to_string(), "work".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_108_repairs_and_enforces_timestamp_storage_class() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY);
+             CREATE TABLE work_scopes (id TEXT PRIMARY KEY);
+             CREATE TABLE conversation_approved_task_objectives (
+                 conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+                 task_id TEXT NOT NULL, task_title TEXT NOT NULL,
+                 approved_title TEXT NOT NULL, approved_priority TEXT NOT NULL,
+                 approved_plan TEXT NOT NULL, approved_task_file TEXT NOT NULL,
+                 approved_artifact_body TEXT NOT NULL, created_at_us INTEGER NOT NULL
+             );
+             CREATE TABLE work_scope_approved_task_authorities (
+                 work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id),
+                 objective_conversation_id TEXT NOT NULL UNIQUE
+                     REFERENCES conversation_approved_task_objectives(conversation_id),
+                 created_at_us INTEGER NOT NULL
+             );
+             CREATE TABLE product_conversation_sources (
+                 id INTEGER PRIMARY KEY,
+                 created_at_us INTEGER NOT NULL
+             );
+             INSERT INTO conversations VALUES ('c');
+             INSERT INTO work_scopes VALUES ('s');
+             INSERT INTO conversation_approved_task_objectives
+             VALUES ('c','t','T','A','\"p0\"','P','tasks/t.md','B','12');
+             INSERT INTO work_scope_approved_task_authorities VALUES ('s','c','13');
+             INSERT INTO product_conversation_sources VALUES (1, '14');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_108).execute(&pool).await.unwrap();
+        let kinds = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT typeof(o.created_at_us), typeof(a.created_at_us),
+                    typeof(s.created_at_us)
+             FROM conversation_approved_task_objectives o
+             JOIN work_scope_approved_task_authorities a
+               ON a.objective_conversation_id = o.conversation_id
+             JOIN product_conversation_sources s ON s.id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds,
+            (
+                "integer".to_string(),
+                "integer".to_string(),
+                "integer".to_string()
+            )
+        );
+        assert!(sqlx::query(
+            "UPDATE conversation_approved_task_objectives SET created_at_us = 'bad'"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(
+            sqlx::query("UPDATE product_conversation_sources SET created_at_us = 1.5")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    async fn setup_migration_109_fixture(pool: &SqlitePool) {
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 state_kind TEXT NOT NULL DEFAULT 'idle',
+                 work_scope_id TEXT
+             );
+             CREATE TABLE conversation_approved_task_objectives (
+                 conversation_id TEXT PRIMARY KEY,
+                 task_id TEXT NOT NULL,
+                 task_title TEXT NOT NULL,
+                 approved_title TEXT NOT NULL,
+                 approved_priority TEXT NOT NULL,
+                 approved_plan TEXT NOT NULL,
+                 approved_task_file TEXT NOT NULL,
+                 approved_artifact_body TEXT NOT NULL,
+                 created_at_us INTEGER NOT NULL
+             );
+             CREATE TABLE work_scope_approved_task_authorities (
+                 work_scope_id TEXT PRIMARY KEY,
+                 objective_conversation_id TEXT NOT NULL UNIQUE,
+                 created_at_us INTEGER NOT NULL
+             );
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                 message_type TEXT NOT NULL DEFAULT 'user',
+                 sequence_id INTEGER NOT NULL DEFAULT 1,
+                 content TEXT NOT NULL DEFAULT '{}',
+                 created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+             );
+             CREATE UNIQUE INDEX messages_conversation_message_id_unique
+                 ON messages(conversation_id, message_id);
+             INSERT INTO conversations (id) VALUES ('a'), ('b');
+             INSERT INTO conversations (id, state_kind, work_scope_id)
+             VALUES ('legacy', 'llm_requesting', 'scope-legacy'),
+                    ('follow-up', 'llm_requesting', 'scope-follow-up');
+             INSERT INTO conversation_approved_task_objectives
+             VALUES
+                 ('legacy','legacy-task','Legacy','Legacy','\"p1\"','plan','tasks/legacy.md','body',1),
+                 ('follow-up','follow-task','Follow','Follow','\"p1\"','plan','tasks/follow.md','body',2);
+             INSERT INTO work_scope_approved_task_authorities
+             VALUES ('scope-legacy','legacy',1), ('scope-follow-up','follow-up',2);
+             INSERT INTO messages (message_id, conversation_id) VALUES ('approval', 'b');
+             INSERT INTO messages
+                 (message_id, conversation_id, message_type, sequence_id, content, created_at)
+             VALUES
+                 ('legacy-approval', 'legacy', 'user', 7,
+                  '{\"text\":\"Task approved. Begin work.\",\"is_meta\":true}',
+                  '2025-01-01T00:00:00Z'),
+                 ('follow-up-approval', 'follow-up', 'user', 8,
+                  '{\"text\":\"Follow-up task approved. Continue.\",\"is_meta\":true}',
+                  '2025-01-01T00:00:01Z');",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_109_binds_approval_message_to_conversation() {
+        let pool = test_pool().await;
+        setup_migration_109_fixture(&pool).await;
+        sqlx::raw_sql(MIGRATION_109).execute(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM approval_request_obligations")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        assert!(sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES ('a', 'approval', 1)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES ('b', 'approval', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_110_marks_preexisting_inputs_unknown_and_rejects_incomplete_sender() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE messages (message_id TEXT PRIMARY KEY);
+             CREATE TABLE steering_messages (message_id TEXT PRIMARY KEY);
+             CREATE TABLE durable_turns (turn_id INTEGER PRIMARY KEY);
+             INSERT INTO messages VALUES ('historical-message');
+             INSERT INTO steering_messages VALUES ('historical-steer');
+             INSERT INTO durable_turns VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 110).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        for (select, invalid_update) in [
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM messages WHERE message_id = 'historical-message'",
+                "UPDATE messages SET origin_kind = 'internal_conversation' WHERE message_id = 'historical-message'",
+            ),
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM steering_messages WHERE message_id = 'historical-steer'",
+                "UPDATE steering_messages SET origin_kind = 'internal_conversation' WHERE message_id = 'historical-steer'",
+            ),
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM durable_turns WHERE turn_id = 1",
+                "UPDATE durable_turns SET origin_kind = 'internal_conversation' WHERE turn_id = 1",
+            ),
+        ] {
+            let (kind, product_id, transcript_id): (String, Option<String>, Option<String>) =
+                sqlx::query_as(select).fetch_one(&pool).await.unwrap();
+            assert_eq!(kind, "unknown_historical");
+            assert_eq!((product_id, transcript_id), (None, None));
+            assert!(sqlx::query(invalid_update).execute(&pool).await.is_err());
+        }
     }
 
     #[test]
@@ -15754,7 +17014,10 @@ mod tests {
                     (100, 'temporarily_skip_automatic_continuation_admission'),
                     (101, 'temporarily_skip_svg_artifacts'),
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
-                    (103, 'temporarily_skip_automatic_continuation_resume_phase')",
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
+                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (111, 'temporarily_skip_coordinator_watches'),
+                    (113, 'temporarily_skip_historical_continuation_settlement')",
         )
         .execute(&pool)
         .await
@@ -16650,7 +17913,10 @@ mod tests {
                     (100, 'temporarily_skip_automatic_continuation_admission'),
                     (101, 'temporarily_skip_svg_artifacts'),
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
-                    (103, 'temporarily_skip_automatic_continuation_resume_phase')",
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
+                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (111, 'temporarily_skip_coordinator_watches'),
+                    (113, 'temporarily_skip_historical_continuation_settlement')",
         )
         .execute(pool)
         .await

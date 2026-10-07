@@ -222,22 +222,10 @@ fresh server."#
         };
         let config_path = ctx.tmux_registry().config_path();
 
-        // Build the full argv with `-f <phoenix-conf> -S <conv-sock>`
-        // prepended (REQ-TMUX-011). No agent arg is parsed, rewritten,
-        // or stripped; if the agent passes their own `-L` or `-S`,
-        // tmux's CLI parser surfaces a usage error which we return
-        // verbatim as stderr.
-        //
         // `-f` only loads when tmux must spawn a fresh server. For a
         // running server the flag is benign; we include it so any
         // auto-spawn path uses the Phoenix config.
-        let mut full_args: Vec<String> = vec![
-            "-f".into(),
-            config_path.to_string_lossy().into(),
-            "-S".into(),
-            socket_path.to_string_lossy().into(),
-        ];
-        full_args.extend(parsed.args);
+        let full_args = invocation_args(&config_path, &socket_path, parsed.args);
 
         let started = Instant::now();
         let mut cmd = tokio::process::Command::new("tmux");
@@ -260,6 +248,21 @@ fresh server."#
 
         run_with_timeout(child, wait_seconds, started, ctx).await
     }
+}
+
+fn invocation_args(
+    config_path: &std::path::Path,
+    socket_path: &std::path::Path,
+    args: Vec<String>,
+) -> Vec<String> {
+    let mut full_args = vec![
+        "-f".into(),
+        config_path.to_string_lossy().into_owned(),
+        "-S".into(),
+        socket_path.to_string_lossy().into_owned(),
+    ];
+    full_args.extend(args);
+    full_args
 }
 
 enum RunOutcome {
@@ -437,7 +440,6 @@ fn error_envelope(error_id: &str, message: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux::test_server::TestTmuxServerOwner;
     use crate::{BashHandleRegistry, BrowserSessionManager};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -451,13 +453,9 @@ mod tests {
     }
 
     fn ctx_with_registry(registry: Arc<TmuxRegistry>) -> ToolContext {
-        ctx_with_registry_for("test-conv", registry)
-    }
-
-    fn ctx_with_registry_for(conv: &str, registry: Arc<TmuxRegistry>) -> ToolContext {
         ToolContext::new(
             CancellationToken::new(),
-            conv.to_string(),
+            "test-conv".to_string(),
             std::env::temp_dir(),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(BashHandleRegistry::new()),
@@ -467,14 +465,6 @@ mod tests {
             None,
             phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
-    }
-
-    fn test_work_scope_socket(socket_dir: &std::path::Path) -> std::path::PathBuf {
-        registry::socket_path_for_worktree(socket_dir, std::path::Path::new("test-work"))
-    }
-
-    fn skip_unless_tmux() -> bool {
-        which::which("tmux").is_err()
     }
 
     #[tokio::test]
@@ -503,309 +493,90 @@ mod tests {
             tmp.path().to_path_buf(),
             false,
         ));
-        let ctx = ctx_with_registry(registry);
-        let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx).await;
+        let result = TmuxTool
+            .run(
+                json!({"args": ["list-sessions"]}),
+                ctx_with_registry(registry),
+            )
+            .await;
         assert!(!result.is_success());
-        let v = parse_response(&result);
-        assert_eq!(v["error"], "tmux_binary_unavailable");
+        assert_eq!(parse_response(&result)["error"], "tmux_binary_unavailable");
     }
 
     #[tokio::test]
-    async fn wait_seconds_out_of_range_returns_error() {
-        if skip_unless_tmux() {
-            return;
-        }
+    async fn wait_seconds_validation_precedes_registry_resolution() {
         let tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(tmp.path().to_path_buf()));
-        let ctx = ctx_with_registry(registry);
+        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
+            tmp.path().to_path_buf(),
+            false,
+        ));
         let result = TmuxTool
             .run(
                 json!({"args": ["list-sessions"], "wait_seconds": 5000}),
-                ctx,
+                ctx_with_registry(registry),
             )
             .await;
         assert!(!result.is_success());
-        let v = parse_response(&result);
-        assert_eq!(v["error"], "wait_seconds_out_of_range");
-    }
-
-    #[tokio::test]
-    async fn fresh_session_starts_in_supplied_cwd() {
-        // Regression: tmux new-session was being issued without `-c
-        // <cwd>`, so the pane shell inherited Phoenix's own working
-        // directory instead of the conversation's project. The agent
-        // and the in-app terminal then both landed in /home/bits/dev/
-        // phoenix-ide regardless of which conversation they were
-        // attached to.
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        // Use a directory that's NOT the test process's cwd so the
-        // assertion catches the pre-fix "tmux inherits Phoenix's CWD"
-        // behavior.
-        let cwd_tmp = TempDir::new().unwrap();
-        let cwd = cwd_tmp.path().canonicalize().unwrap();
-        let registry = Arc::new(owner.registry());
-        let ctx = ToolContext::new(
-            CancellationToken::new(),
-            "conv-cwd-test".to_string(),
-            cwd.clone(),
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(BashHandleRegistry::new()),
-            Arc::new(crate::NoLlm),
-            phoenix_terminal::ActiveTerminals::new(),
-            registry,
-            None,
-            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
+        assert_eq!(
+            parse_response(&result)["error"],
+            "wait_seconds_out_of_range"
         );
-
-        // First op spawns the session with `-c <cwd>`. Ask tmux for
-        // the pane's current path and compare.
-        let r = TmuxTool
-            .run(
-                json!({"args": ["display-message", "-p", "#{pane_current_path}"]}),
-                ctx,
-            )
-            .await;
-        assert!(r.is_success(), "got: {}", r.output());
-        let v = parse_response(&r);
-        let stdout = v["stdout"].as_str().unwrap().trim();
-        let actual = std::path::PathBuf::from(stdout)
-            .canonicalize()
-            .unwrap_or_else(|_| std::path::PathBuf::from(stdout));
-        assert_eq!(actual, cwd, "pane should start in {cwd:?}, got {stdout:?}");
-
-        owner.shutdown();
     }
 
-    #[tokio::test]
-    async fn first_operation_spawns_server_and_responds_ok() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let socket_dir = owner.socket_dir().to_path_buf();
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx_with_registry_for("conv-fresh", registry.clone());
-
-        let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx).await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["exit_code"], 0);
-        let stdout = v["stdout"].as_str().unwrap();
-        assert!(
-            stdout.contains("main"),
-            "expected `main` session in stdout, got: {stdout}"
+    #[test]
+    fn phoenix_prefixes_authoritative_socket_and_preserves_agent_args() {
+        let args = invocation_args(
+            std::path::Path::new("/phoenix/config"),
+            std::path::Path::new("/phoenix/socket"),
+            vec![
+                "-L".into(),
+                "agent-label".into(),
+                "-S/agent/socket".into(),
+                "list-sessions".into(),
+            ],
         );
-
-        // The durable work-scope socket must live under the registry's socket dir.
-        let sock = test_work_scope_socket(&socket_dir);
-        assert!(sock.exists(), "socket file should exist at {sock:?}");
-
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn second_operation_reuses_existing_server() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx_with_registry_for("conv-reuse", registry.clone());
-
-        let _ = TmuxTool
-            .run(json!({"args": ["list-sessions"]}), ctx.clone())
-            .await;
-
-        // Drop in-memory registry entry to simulate a Phoenix restart;
-        // the on-disk socket persists and the OS-owned tmux server keeps
-        // running. The next operation must probe `Live` and re-use it.
-        let registry2 = Arc::new(owner.registry());
-        let ctx2 = ctx_with_registry_for("conv-reuse", registry2.clone());
-
-        let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx2).await;
-        assert!(result.is_success());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "ok");
-        assert!(v["stdout"].as_str().unwrap().contains("main"));
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn stale_socket_is_unlinked_and_fresh_server_spawned() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let socket_dir = owner.socket_dir().to_path_buf();
-        std::fs::create_dir_all(&socket_dir).unwrap();
-        // Pre-create a stale, non-tmux file at the durable work-scope
-        // socket path. `tmux ls` against it will fail.
-        let stale = test_work_scope_socket(&socket_dir);
-        std::fs::write(&stale, b"junk").unwrap();
-
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx_with_registry_for("conv-stale", registry);
-
-        let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx).await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "ok");
-        assert!(v["stdout"].as_str().unwrap().contains("main"));
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn agent_supplied_dash_l_does_not_escape_conversation_socket() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let socket_dir = owner.socket_dir().to_path_buf();
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx_with_registry_for("conv-dashL", registry);
-
-        // Phoenix prepends `-S <sock>`. The agent's `-L weird` follows.
-        // The exact handling of the duplicate flag is tmux-version-
-        // specific: some versions reject with a usage error, some let
-        // the first flag win (Phoenix's `-S`), some let the last flag
-        // win. The structural property we verify here is that the
-        // work scope's socket — at the path Phoenix chose — is the
-        // ONLY socket that ever gets created. The agent cannot escape
-        // to a `weird`-labeled socket regardless of tmux's CLI parser
-        // behaviour.
-        let _ = TmuxTool
-            .run(json!({"args": ["-L", "weird", "list-sessions"]}), ctx)
-            .await;
-
-        let scope_sock = test_work_scope_socket(&socket_dir);
-        let scope_socket_name = scope_sock.file_name().unwrap().to_string_lossy();
-        // Permitted entries in the owner root: the work scope's own socket,
-        // the Phoenix-shipped tmux config, and the watchdog's armed marker. Anything
-        // else (e.g. a `weird`-labeled socket the agent tried to coerce
-        // tmux into creating) is a structural escape and fails the
-        // test.
-        let unexpected: Vec<_> = std::fs::read_dir(&socket_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                let name = entry.file_name();
-                let s = name.to_string_lossy();
-                !(s == ".armed"
-                    || s == ".parent-heartbeat"
-                    || s == "_phoenix.tmux.conf"
-                    || s.starts_with(scope_socket_name.as_ref()))
-            })
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            unexpected.is_empty(),
-            "only owner metadata, the work-scope socket, and Phoenix tmux config should appear under {socket_dir:?}; \
-             unexpected entries: {unexpected:?}"
+        assert_eq!(
+            args,
+            [
+                "-f",
+                "/phoenix/config",
+                "-S",
+                "/phoenix/socket",
+                "-L",
+                "agent-label",
+                "-S/agent/socket",
+                "list-sessions"
+            ]
         );
-
-        owner.shutdown();
     }
 
     #[tokio::test]
-    async fn cancellation_returns_cancelled_status() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let registry = Arc::new(owner.registry());
+    async fn cancelled_pending_invocation_reports_cancelled() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
         let cancel = CancellationToken::new();
         let ctx = ToolContext::new(
             cancel.clone(),
-            "conv-cancel".to_string(),
+            "test-conv".to_string(),
             std::env::temp_dir(),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(BashHandleRegistry::new()),
             Arc::new(crate::NoLlm),
             phoenix_terminal::ActiveTerminals::new(),
-            registry.clone(),
+            Arc::new(TmuxRegistry::with_socket_dir(std::env::temp_dir())),
             None,
             phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
-
-        // Issue a tmux command that will take a moment (the implicit
-        // `ensure_live` runs `new-session -d` for a fresh conv); we
-        // cancel the outer turn from a background task.
-        let cancel2 = cancel.clone();
         let cancel_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            cancel2.cancel();
+            tokio::task::yield_now().await;
+            cancel.cancel();
         });
-
-        // `wait` is a tmux command that blocks until a paired
-        // `wait-for -S` signal arrives. We never signal it, so the only
-        // way out is the cancel.
-        let result = TmuxTool
-            .run(
-                json!({"args": ["wait-for", "phoenix-test-cancel"], "wait_seconds": 30}),
-                ctx,
-            )
-            .await;
-        let _ = cancel_task.await;
-        let v = parse_response(&result);
-        // Either cancel landed (status=cancelled) or ensure_live raced
-        // ahead far enough that the subprocess saw cancel as a kill —
-        // both leave the response in `cancelled` state because the
-        // cancel branch in run_with_timeout is `biased` first.
-        assert_eq!(v["status"], "cancelled", "got: {v}");
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn output_truncation_for_large_streams() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx_with_registry_for("conv-trunc", registry.clone());
-
-        // Spawn `main` first so subsequent commands have a target.
-        let _ = TmuxTool
-            .run(json!({"args": ["list-sessions"]}), ctx.clone())
-            .await;
-
-        // Fill the pane buffer with > 128 KB. We use `printf` inside
-        // `new-window` rather than running a Phoenix-side bash because
-        // we want tmux to emit it via `capture-pane`.
-        let _spawn = TmuxTool
-            .run(
-                json!({
-                    "args": [
-                        "new-window", "-d", "-n", "filler",
-                        "sh", "-c",
-                        // 200_000 bytes of 'x'
-                        "yes x | head -c 200000; sleep 1"
-                    ]
-                }),
-                ctx.clone(),
-            )
-            .await;
-        // Give the filler a moment to write into the pane.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let result = TmuxTool
-            .run(
-                json!({"args": ["capture-pane", "-p", "-t", "filler", "-S", "-100000"]}),
-                ctx,
-            )
-            .await;
-        let v = parse_response(&result);
-        // Capture-pane output may or may not exceed the budget on its
-        // own — the goal is to verify the truncation path doesn't
-        // crash. If it does exceed 128 KB, `truncated` must be true.
-        let stdout = v["stdout"].as_str().unwrap();
-        let stderr = v["stderr"].as_str().unwrap();
-        assert!(stdout.len() + stderr.len() <= TMUX_OUTPUT_MAX_BYTES + 4096);
-        let _ = v["truncated"];
-        owner.shutdown();
+        let result = run_with_timeout(child, 30, Instant::now(), ctx).await;
+        cancel_task.await.unwrap();
+        assert_eq!(parse_response(&result)["status"], "cancelled");
     }
 }

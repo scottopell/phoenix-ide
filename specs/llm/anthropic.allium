@@ -36,10 +36,10 @@
 --   specs/llm/design.md        — Anthropic provider, translation tables
 --
 -- Cross-references:
---   crates/phoenix-ide/src/llm/anthropic.rs — translate_request,
+--   crates/phoenix-llm/src/anthropic.rs — translate_request,
 --       translate_message, normalize_response, StreamAccumulator,
 --       parse_anthropic_sse_error, resolve_anthropic_url
---   crates/phoenix-ide/src/llm/error.rs     — from_http_status
+--   crates/phoenix-llm/src/error.rs     — from_http_status
 
 use "./llm.allium" as llm
 
@@ -256,14 +256,16 @@ rule AnthropicCacheBreakpointsPlaced {
 -- Rules — response normalization
 ------------------------------------------------------------
 
--- Normalize a non-streaming Anthropic response. Three outcomes:
---   1. A response-position image or tool_result block — a wire-shape we
+-- Normalize a non-streaming Anthropic response. Four outcomes:
+--   1. A terminal refusal yields a non-retryable prompt_rejected error and
+--      discards all partial content.
+--   2. A response-position image or tool_result block — a wire-shape we
 --      cannot represent — yields a RETRYABLE invalid_response error (the
 --      request was accepted; the response is at fault).
---   2. No client content (text or tool_use) and stop_reason is not
+--   3. No client content (text or tool_use) and stop_reason is not
 --      end_turn — most likely a gateway returning an empty stream —
 --      yields a RETRYABLE server_error.
---   3. Otherwise a normalized llm/LlmResponse. Empty content WITH
+--   4. Otherwise a normalized llm/LlmResponse. Empty content WITH
 --      end_turn is valid: the model finished a tool loop with nothing
 --      to add, and the response is content: [].
 rule AnthropicResponseNormalized {
@@ -272,26 +274,39 @@ rule AnthropicResponseNormalized {
     let end_turn = raw.stop_reason = "end_turn"
 
     ensures:
-        if raw.has_response_position_image_or_tool_result:
+        if raw.stop_reason = "refusal":
             llm/LlmError.created(
-                kind: invalid_response,
-                message: "Unexpected image or tool_result block in Anthropic response",
+                kind: prompt_rejected,
+                message: "Anthropic refused the request under its safety policy.",
                 recovery_in_progress: false,
                 has_quota: false
             )
         else:
-            if not raw.has_client_content and not end_turn:
+            if raw.has_response_position_image_or_tool_result:
                 llm/LlmError.created(
-                    kind: server_error,
-                    message: "Anthropic returned empty response",
+                    kind: invalid_response,
+                    message: "Unexpected image or tool_result block in Anthropic response",
                     recovery_in_progress: false,
                     has_quota: false
                 )
             else:
-                llm/LlmResponse.created(end_turn: end_turn, usage: raw.usage)
+                if not raw.has_client_content and not end_turn:
+                    llm/LlmError.created(
+                        kind: server_error,
+                        message: "Anthropic returned empty response",
+                        recovery_in_progress: false,
+                        has_quota: false
+                    )
+                else:
+                    llm/LlmResponse.created(end_turn: end_turn, usage: raw.usage)
 
     @guidance
         -- has_client_content counts only text and tool_use blocks.
+        -- Signed/encrypted thinking is removed from public normalized content
+        -- and returned through private replay state only when tool_use makes
+        -- replay necessary. Public wire/message types cannot represent it.
+        -- Supported Opus requests use prefix_mismatch_behavior=drop_block;
+        -- bounded input-transformation counts may be logged without content.
         -- Anthropic server blocks (server_tool_use, *_tool_result,
         -- mcp_*) are preserved verbatim in the normalized content for
         -- multi-turn history fidelity but do NOT satisfy the non-empty

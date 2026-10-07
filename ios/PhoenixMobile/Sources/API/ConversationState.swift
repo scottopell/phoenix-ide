@@ -53,10 +53,10 @@ enum ConversationState: Equatable {
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
-    case awaitingUserResponse(questions: [UserQuestion])
+    case awaitingUserResponse(questions: [UserQuestion], requestId: String?)
     case awaitingTaskApproval(title: String, priority: String, plan: String)
     case awaitingRecovery(message: String)
-    case provisioning
+    case provisioning(jobId: String)
     case error(message: String, kind: ConversationErrorKind)
     case creationFailed(message: String)
     case contextExhausted(summary: String?)
@@ -104,7 +104,9 @@ enum ConversationState: Equatable {
         case "awaiting_user_response":
             let questions = (json["questions"]?.arrayValue ?? [])
                 .compactMap(UserQuestion.parse)
-            return .awaitingUserResponse(questions: questions)
+            return .awaitingUserResponse(
+                questions: questions,
+                requestId: json["request_id"]?.stringValue)
         case "awaiting_task_approval":
             guard let title = json["title"]?.stringValue,
                   let priority = json["priority"]?.stringValue,
@@ -116,7 +118,10 @@ enum ConversationState: Equatable {
             return .awaitingRecovery(
                 message: json["message"]?.stringValue ?? "Recovery in progress")
         case "provisioning":
-            return .provisioning
+            guard let jobId = json["job_id"]?.stringValue, !jobId.isEmpty else {
+                return .other(type: type)
+            }
+            return .provisioning(jobId: jobId)
         case "error":
             let errorKind = json["error_kind"]?.stringValue
                 .flatMap(ConversationErrorKind.init(rawValue:)) ?? .unknown
@@ -175,6 +180,11 @@ enum ConversationState: Equatable {
              .other, .unknown:
             return false
         }
+    }
+
+    var isProvisioningCreationShell: Bool {
+        if case .provisioning = self { return true }
+        return false
     }
 
     var isKnownWorkingState: Bool {

@@ -123,7 +123,7 @@ impl ContinuationHistory {
             "\n\nInput selection: {baseline} The remaining history is a bounded newest suffix; \
              intervening details may be omitted. Do not infer completion or authorization from \
              omissions. Preserve this transcript reference for retrieving missing details when \
-             relevant: @conv:{conversation_id}."
+             relevant: @transcript:{conversation_id}."
         )
     }
 }
@@ -177,6 +177,7 @@ mod tests {
 
     fn user(text: &str) -> LlmMessage {
         LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(text)],
         }
@@ -184,6 +185,7 @@ mod tests {
 
     fn persisted(id: &str, text: &str) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: id.to_string(),
             conversation_id: "current".to_string(),
             sequence_id: 1,
@@ -234,7 +236,10 @@ mod tests {
         )
         .unwrap();
         let handoff = history.handoff.unwrap();
-        assert_eq!(handoff.message.content, user("edited").content);
+        assert_eq!(
+            handoff.message.content,
+            user("[Input of unknown historical origin]\nedited").content
+        );
         assert_eq!(handoff.message_id, "accepted");
     }
 
@@ -292,6 +297,7 @@ mod tests {
     #[test]
     fn assistant_work_after_opening_handoff_is_not_discarded() {
         let assistant = LlmMessage {
+            source_message_id: None,
             role: MessageRole::Assistant,
             content: vec![ContentBlock::text(
                 "Implemented the fix; tests passed; review is pending.",

@@ -10,6 +10,12 @@ export function formatShortcut(shortcut: string): string {
   return shortcut.replace(/Ctrl/g, isMac ? 'Cmd' : 'Ctrl');
 }
 
+export function formatGitShaForDisplay(gitSha: string): string {
+  const match = /^([0-9a-f]{40})(-dirty)?$/.exec(gitSha);
+  if (!match) return gitSha;
+  return `${match[1]!.slice(0, 12)}${match[2] ?? ''}`;
+}
+
 export function escapeHtml(str: string): string {
   if (!str) return '';
   return str
@@ -270,11 +276,14 @@ export function parseConversationState(raw: unknown): ConversationState {
         priority: (obj['priority'] as string) ?? '',
         plan: (obj['plan'] as string) ?? '',
       };
-    case 'awaiting_user_response':
+    case 'awaiting_user_response': {
+      const requestId = obj['request_id'];
       return {
         type: 'awaiting_user_response',
         questions: (obj['questions'] as UserQuestion[]) ?? [],
+        ...(typeof requestId === 'string' ? { request_id: requestId } : {}),
       };
+    }
     case 'context_exhausted':
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };
     case 'recoverable_continuation_failure': {

@@ -432,6 +432,16 @@ rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
         -- directory and object identities. Post-crash or external ambiguity preserves
         -- a safe leftover for repair. Concurrent malicious mutation inside that private
         -- namespace and mutation outside Phoenix ownership are unsupported.
+        --
+        -- Immediately before moving the confirmed worktree into quarantine,
+        -- Phoenix stops every Git fsmonitor daemon bound to that worktree or to
+        -- an initialized submodule beneath it, and waits a bounded time for each
+        -- to exit. The open-descriptor scan after quarantine therefore sees only
+        -- processes that are not Git's own filesystem watcher. A worktree with no
+        -- running daemon treats the stop as a silent no-op. A stop that misses its
+        -- deadline is abandoned, and any daemon still holding the tree is reported
+        -- by the scan as typed residual state. Phoenix never changes the user's
+        -- fsmonitor configuration or index state in this step.
 }
 
 rule RetirementStepSuccessRecordsTypedEvidence {

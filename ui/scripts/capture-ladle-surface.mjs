@@ -1,6 +1,7 @@
 import { chromium, webkit } from 'playwright';
 import { spawn } from 'node:child_process';
-import { mkdir } from 'node:fs/promises';
+import { access, mkdir } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
@@ -18,11 +19,11 @@ import process from 'node:process';
  * @property {string} readyAttribute       data-* attribute the fixture sets to the scenario id when settled.
  * @property {string} outDir               Output directory for PNGs (resolved against cwd).
  * @property {{width:number,height:number}} [viewport]   Capture viewport; defaults to 960x900.
- * @property {{name:string,width:number,height:number}[]} [viewportMatrix]  Optional named viewport set; captures each story once per viewport.
+ * @property {{name:string,width:number,height:number,hasTouch?:boolean,isMobile?:boolean}[]} [viewportMatrix]  Optional named viewport set; captures each story once per viewport.
  * @property {Map<string,string[]>} [expectedConsoleErrors]  scenario id → console-error substrings to tolerate.
  * @property {(context:{page:import('playwright').Page}) => Promise<void>} [preparePage] Optional request setup before navigation.
- * @property {(context:{page:import('playwright').Page,id:string,outDir:string,viewport:{name?:string,width:number,height:number}}) => Promise<boolean>} [captureStory] Optional event-driven capture; return true when it produced artifacts.
- * @property {(context:{storyKey:string,id:string,viewport:{name?:string,width:number,height:number}}) => string} [urlForStory] Optional route/query/hash builder for deterministic fixture journeys.
+ * @property {(context:{page:import('playwright').Page,id:string,outDir:string,viewport:{name?:string,width:number,height:number,hasTouch?:boolean,isMobile?:boolean}}) => Promise<boolean>} [captureStory] Optional event-driven capture; return true when it produced artifacts.
+ * @property {(context:{storyKey:string,id:string,viewport:{name?:string,width:number,height:number,hasTouch?:boolean,isMobile?:boolean}}) => string} [urlForStory] Optional route/query/hash builder for deterministic fixture journeys.
  * @property {(outDir:string) => Promise<void>} [onComplete] Optional report writer after every scenario succeeds.
  */
 
@@ -79,7 +80,13 @@ function normalizeViewportMatrix(viewportMatrix, viewport) {
     if (!Number.isFinite(item.width) || !Number.isFinite(item.height)) {
       throw new Error(`viewportMatrix[${index}] must include finite width and height`);
     }
-    return { name: item.name, width: item.width, height: item.height };
+    return {
+      name: item.name,
+      width: item.width,
+      height: item.height,
+      ...(item.hasTouch === undefined ? {} : { hasTouch: Boolean(item.hasTouch) }),
+      ...(item.isMobile === undefined ? {} : { isMobile: Boolean(item.isMobile) }),
+    };
   });
 }
 
@@ -135,6 +142,19 @@ async function discoverStories(storyPrefix) {
  *
  * @param {SurfaceConfig} config
  */
+export function selectCaptureEntries(entries, requested, key, label) {
+  if (requested === undefined) return entries;
+  const names = requested.split(',');
+  if (names.some((name) => !entries.some((entry) => entry[key] === name))) {
+    throw new Error(`${label} contains an unknown selection`);
+  }
+  return entries.filter((entry) => names.includes(entry[key]));
+}
+
+export async function verifyInstalledBrowser(executable) {
+  await access(executable, constants.X_OK);
+}
+
 export async function captureSurface(config) {
   const {
     surface,
@@ -152,8 +172,13 @@ export async function captureSurface(config) {
   const resolvedOut = path.resolve(outDir);
   await mkdir(resolvedOut, { recursive: true });
 
-  const captureViewports = normalizeViewportMatrix(viewportMatrix, viewport);
-  await run('pnpm', playwrightInstallArgs(browserName));
+  const captureViewports = selectCaptureEntries(normalizeViewportMatrix(viewportMatrix, viewport), process.env.CAPTURE_VIEWPORT, 'name', 'CAPTURE_VIEWPORT');
+  if (process.env.PLAYWRIGHT_INSTALLED_ONLY === '1') {
+    await verifyInstalledBrowser(browserType.executablePath());
+    console.log(`Using installed ${browserName}: ${browserType.executablePath()}`);
+  } else {
+    await run('pnpm', playwrightInstallArgs(browserName));
+  }
 
   const ladle = process.env.LADLE_URL ? null : spawn('pnpm', ['exec', 'ladle', 'serve', '--port', String(port), '--host', '127.0.0.1'], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -178,49 +203,60 @@ export async function captureSurface(config) {
   process.on('SIGTERM', () => { stopLadle(); process.exit(143); });
 
   await waitForLadle();
-  const stories = await discoverStories(storyPrefix);
+  let stories;
+  try {
+    stories = selectCaptureEntries(await discoverStories(storyPrefix), process.env.CAPTURE_STORIES, 'id', 'CAPTURE_STORIES');
+  } catch (error) {
+    stopLadle();
+    throw error;
+  }
   console.log(`Capturing ${stories.length} ${surface} stories`);
   const browser = await browserType.launch();
-  const page = await browser.newPage({
-    viewport: { width: captureViewports[0].width, height: captureViewports[0].height },
-    deviceScaleFactor: 1,
-  });
-  const consoleErrors = [];
-  page.on('console', (message) => {
-    if (message.type() === 'error') consoleErrors.push(message.text());
-  });
-  page.on('pageerror', (error) => consoleErrors.push(error.message));
-  page.on('requestfailed', (request) => {
-    const errorText = request.failure()?.errorText ?? 'unknown';
-    if (request.resourceType() === 'font' && errorText === 'net::ERR_ABORTED') return;
-    consoleErrors.push(`Network request failed: ${request.url()} (${errorText})`);
-  });
-  page.on('response', (response) => {
-    if (response.status() >= 400) consoleErrors.push(`Network response ${response.status()}: ${response.url()}`);
-  });
 
   try {
-    await preparePage?.({ page });
     for (const { storyKey, id } of stories) {
       for (const currentViewport of captureViewports) {
-        consoleErrors.length = 0;
-        await page.setViewportSize({ width: currentViewport.width, height: currentViewport.height });
-        const url = urlForStory?.({ storyKey, id, viewport: currentViewport })
-          ?? buildLadleStoryUrl(baseUrl, storyKey);
-        await page.goto(url, { waitUntil: 'networkidle' });
-        await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
-        const captured = await captureStory?.({ page, id, outDir: resolvedOut, viewport: currentViewport }) ?? false;
-        if (!captured) {
-          await page.screenshot({ path: path.join(resolvedOut, screenshotFileName(id, currentViewport)), fullPage: true });
-        }
-        const unexpectedErrors = consoleErrors.filter((error) => {
-          const expected = expectedConsoleErrors.get(id) ?? [];
-          return !expected.some((item) => error.includes(item));
+        const context = await browser.newContext({
+          viewport: { width: currentViewport.width, height: currentViewport.height },
+          deviceScaleFactor: 1,
+          hasTouch: currentViewport.hasTouch ?? false,
+          isMobile: currentViewport.isMobile ?? false,
         });
-        if (unexpectedErrors.length > 0) {
-          throw new Error(`Console errors while capturing ${id}${currentViewport.name ? ` (${currentViewport.name})` : ''}:\n${unexpectedErrors.join('\n')}`);
+        const page = await context.newPage();
+        await preparePage?.({ page });
+        const consoleErrors = [];
+        page.on('console', (message) => {
+          if (message.type() === 'error') consoleErrors.push(message.text());
+        });
+        page.on('pageerror', (error) => consoleErrors.push(error.message));
+        page.on('requestfailed', (request) => {
+          const errorText = request.failure()?.errorText ?? 'unknown';
+          if (request.resourceType() === 'font' && errorText === 'net::ERR_ABORTED') return;
+          consoleErrors.push(`Network request failed: ${request.url()} (${errorText})`);
+        });
+        page.on('response', (response) => {
+          if (response.status() >= 400) consoleErrors.push(`Network response ${response.status()}: ${response.url()}`);
+        });
+        try {
+          const url = urlForStory?.({ storyKey, id, viewport: currentViewport })
+            ?? buildLadleStoryUrl(baseUrl, storyKey);
+          await page.goto(url, { waitUntil: 'networkidle' });
+          await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
+          const captured = await captureStory?.({ page, id, outDir: resolvedOut, viewport: currentViewport }) ?? false;
+          if (!captured) {
+            await page.screenshot({ path: path.join(resolvedOut, screenshotFileName(id, currentViewport)), fullPage: true });
+          }
+          const unexpectedErrors = consoleErrors.filter((error) => {
+            const expected = expectedConsoleErrors.get(id) ?? [];
+            return !expected.some((item) => error.includes(item));
+          });
+          if (unexpectedErrors.length > 0) {
+            throw new Error(`Console errors while capturing ${id}${currentViewport.name ? ` (${currentViewport.name})` : ''}:\n${unexpectedErrors.join('\n')}`);
+          }
+          console.log(`✓ captured ${id}${currentViewport.name ? ` [${currentViewport.name}]` : ''}`);
+        } finally {
+          await context.close();
         }
-        console.log(`✓ captured ${id}${currentViewport.name ? ` [${currentViewport.name}]` : ''}`);
       }
     }
     await onComplete?.(resolvedOut);
