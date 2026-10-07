@@ -1,6 +1,7 @@
 import { chromium, webkit } from 'playwright';
 import { spawn } from 'node:child_process';
-import { mkdir } from 'node:fs/promises';
+import { access, mkdir } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
@@ -141,6 +142,19 @@ async function discoverStories(storyPrefix) {
  *
  * @param {SurfaceConfig} config
  */
+export function selectCaptureEntries(entries, requested, key, label) {
+  if (requested === undefined) return entries;
+  const names = requested.split(',');
+  if (names.some((name) => !entries.some((entry) => entry[key] === name))) {
+    throw new Error(`${label} contains an unknown selection`);
+  }
+  return entries.filter((entry) => names.includes(entry[key]));
+}
+
+export async function verifyInstalledBrowser(executable) {
+  await access(executable, constants.X_OK);
+}
+
 export async function captureSurface(config) {
   const {
     surface,
@@ -158,8 +172,13 @@ export async function captureSurface(config) {
   const resolvedOut = path.resolve(outDir);
   await mkdir(resolvedOut, { recursive: true });
 
-  const captureViewports = normalizeViewportMatrix(viewportMatrix, viewport);
-  await run('pnpm', playwrightInstallArgs(browserName));
+  const captureViewports = selectCaptureEntries(normalizeViewportMatrix(viewportMatrix, viewport), process.env.CAPTURE_VIEWPORT, 'name', 'CAPTURE_VIEWPORT');
+  if (process.env.PLAYWRIGHT_INSTALLED_ONLY === '1') {
+    await verifyInstalledBrowser(browserType.executablePath());
+    console.log(`Using installed ${browserName}: ${browserType.executablePath()}`);
+  } else {
+    await run('pnpm', playwrightInstallArgs(browserName));
+  }
 
   const ladle = process.env.LADLE_URL ? null : spawn('pnpm', ['exec', 'ladle', 'serve', '--port', String(port), '--host', '127.0.0.1'], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -184,7 +203,13 @@ export async function captureSurface(config) {
   process.on('SIGTERM', () => { stopLadle(); process.exit(143); });
 
   await waitForLadle();
-  const stories = await discoverStories(storyPrefix);
+  let stories;
+  try {
+    stories = selectCaptureEntries(await discoverStories(storyPrefix), process.env.CAPTURE_STORIES, 'id', 'CAPTURE_STORIES');
+  } catch (error) {
+    stopLadle();
+    throw error;
+  }
   console.log(`Capturing ${stories.length} ${surface} stories`);
   const browser = await browserType.launch();
 

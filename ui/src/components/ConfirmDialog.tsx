@@ -30,6 +30,15 @@ export function ConfirmDialog({
   useRegisterFocusScope(visible ? 'confirm-dialog' : null);
 
   useEffect(() => {
+    if (!visible) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialogRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
+  }, [visible]);
+
+  useEffect(() => {
     if (visible) {
       const handleEscape = (e: KeyboardEvent) => {
         if (e.key === 'Escape' && !submitting) onCancel();

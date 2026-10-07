@@ -12,6 +12,7 @@ import {
 } from '../utils/chains';
 
 import { useKeyboardNav } from '../hooks';
+import { useFocusScope } from '../hooks/useFocusScope';
 import {
   getConversationDisplayTitle,
   getConversationProjectLabel,
@@ -185,7 +186,15 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   onProductConversationClose,
   onProductConversationDelete,
   onProductConversationRename,
+  isMenuOpen,
+  onToggleMenu,
+  onCloseMenu,
+  menuRef,
 }: {
+  isMenuOpen: boolean;
+  onToggleMenu: (event: React.MouseEvent, id: string) => void;
+  onCloseMenu: () => void;
+  menuRef?: React.RefObject<HTMLDivElement> | undefined;
   row: ProductConversationListRow;
   isActive: boolean;
   isKeyboardSelected: boolean;
@@ -214,6 +223,10 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
         handed_off_without_continuation: 'Complete the continuation handoff before closing',
       } as const)[closeAction.reason]
     : undefined;
+  const canRename = !!onProductConversationRename && row.lifecycle.state === 'open'
+    && !(closeAction?.availability === 'unavailable' && closeAction.reason === 'active_close_attempt');
+  const canDelete = !!onProductConversationDelete && row.lifecycle.state === 'history';
+  const canClose = !!onProductConversationClose && closeAction !== null;
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
@@ -246,41 +259,43 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
-      {(onProductConversationRename || onProductConversationClose || onProductConversationDelete) && (
-        <div className="conv-actions">
-          {onProductConversationRename && row.lifecycle.state === 'open'
-            && !(row.lifecycle.close_action.availability === 'unavailable'
-              && row.lifecycle.close_action.reason === 'active_close_attempt') && (
+      {(canRename || canDelete || canClose) && (
+        <div ref={menuRef} className="conv-item-menu-container product-conversation-actions">
+          <button type="button" className="conv-item-menu-btn conv-action-btn"
+            aria-label={`Actions for conversation ${displayTitle}`} aria-expanded={isMenuOpen}
+            onClick={(event) => onToggleMenu(event, row.product_conversation_id)}>⋮</button>
+          {isMenuOpen && <div className="conv-item-actions" aria-label={`Actions for ${displayTitle}`}>
+          {canRename && onProductConversationRename && (
             <button
               type="button"
               className="conv-action-btn"
-              onClick={(event) => { event.stopPropagation(); onProductConversationRename(row); }}
+              onClick={(event) => { event.stopPropagation(); onCloseMenu(); onProductConversationRename(row); }}
               aria-label={`Rename conversation ${displayTitle}`}
               title="Rename"
             >
-              ✎
+              Rename
             </button>
           )}
-          {onProductConversationDelete && row.lifecycle.state === 'history' && (
+          {canDelete && onProductConversationDelete && (
             <button
               type="button"
               className="conv-action-btn danger"
-              onClick={(event) => { event.stopPropagation(); onProductConversationDelete(row); }}
+              onClick={(event) => { event.stopPropagation(); onCloseMenu(); onProductConversationDelete(row); }}
               aria-label={`Delete conversation ${displayTitle}`}
               title="Delete permanently"
             >
-              ×
+              Delete permanently
             </button>
           )}
           {onProductConversationClose && closeAction?.availability === 'available' && (
             <button
               type="button"
               className="conv-action-btn danger"
-              onClick={(event) => { event.stopPropagation(); onProductConversationClose(row); }}
+              onClick={(event) => { event.stopPropagation(); onCloseMenu(); onProductConversationClose(row); }}
               aria-label={`Close conversation ${displayTitle}`}
               title="Close"
             >
-              ×
+              Close conversation
             </button>
           )}
           {onProductConversationClose && closeAction?.availability === 'unavailable' && (
@@ -291,9 +306,10 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               aria-label={`Close conversation ${displayTitle}. ${closeUnavailableReason}`}
               title={closeUnavailableReason}
             >
-              ×
+              Close conversation — {closeUnavailableReason}
             </button>
           )}
+          </div>}
         </div>
       )}
     </li>
@@ -680,6 +696,7 @@ export function ConversationList({
   footer,
 }: ConversationListProps) {
   const navigate = useNavigate();
+  const { hasActiveScope } = useFocusScope();
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
@@ -697,13 +714,29 @@ export function ConversationList({
         setExpandedId(null);
       }
     };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || hasActiveScope) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const trigger = menuRef.current?.querySelector<HTMLButtonElement>('.conv-item-menu-btn');
+      setExpandedId(null);
+      trigger?.focus();
+    };
     document.addEventListener('mousedown', handleMouseDown);
-    return () => document.removeEventListener('mousedown', handleMouseDown);
-  }, [expandedId]);
+    document.addEventListener('keydown', handleEscape, true);
+    return () => {
+      document.removeEventListener('mousedown', handleMouseDown);
+      document.removeEventListener('keydown', handleEscape, true);
+    };
+  }, [expandedId, hasActiveScope]);
 
   const displayList = showArchived ? archivedConversations : conversations;
   const displayProductList = showArchived ? archivedProductConversations : productConversations;
   const usingProductRows = productRowsAuthoritative || displayProductList.length > 0 || productConversations.length > 0 || archivedProductConversations.length > 0;
+
+  useLayoutEffect(() => {
+    if (expandedId && !menuRef.current) setExpandedId(null);
+  }, [expandedId, displayList, displayProductList, usingProductRows, onProductConversationRename, onProductConversationClose, onProductConversationDelete]);
 
   const groupedItems: SidebarItem[] = useMemo(() => {
     const roots = computeChainRoots(displayList);
@@ -741,6 +774,7 @@ export function ConversationList({
   }, [displayProductList, effectiveListDensity, groupedItems, isChainCollapsed, usingProductRows]);
 
   const { selectedId } = useKeyboardNav({
+    enabled: expandedId === null,
     items: keyboardItems,
     ...(usingProductRows
       ? {
@@ -831,7 +865,10 @@ export function ConversationList({
     }
   }, [activeSlug, displayProductList, groupedItems, collapsedChains, effectiveListDensity]);
 
-  const closeRowMenu = useCallback(() => setExpandedId(null), []);
+  const closeRowMenu = useCallback(() => {
+    menuRef.current?.querySelector<HTMLButtonElement>('.conv-item-menu-btn')?.focus();
+    setExpandedId(null);
+  }, []);
 
   const isEmpty = usingProductRows ? displayProductList.length === 0 : displayList.length === 0;
 
@@ -910,6 +947,10 @@ export function ConversationList({
             <ProductConversationListRowView
               key={row.product_conversation_id}
               row={row}
+              isMenuOpen={expandedId === row.product_conversation_id}
+              onToggleMenu={toggleActions}
+              onCloseMenu={closeRowMenu}
+              menuRef={expandedId === row.product_conversation_id ? menuRef : undefined}
               isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
               isKeyboardSelected={selectedId === row.product_conversation_id}
               effectiveCwd={[...conversations, ...archivedConversations].find((conversation) => (
