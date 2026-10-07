@@ -832,12 +832,12 @@ mod codex_request_shape {
     }
 
     #[test]
-    fn encrypted_reasoning_is_requested_on_verified_platform_route() {
+    fn encrypted_reasoning_is_requested_on_verified_routes() {
         let req = make_llm_request(vec![user_msg("hi")]);
         let p = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
         assert_eq!(p.include, vec!["reasoning.encrypted_content"]);
         let c = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
-        assert!(c.include.is_empty());
+        assert_eq!(c.include, vec!["reasoning.encrypted_content"]);
     }
 
     /// `tool_choice` and `parallel_tool_calls` are sent when tools are
