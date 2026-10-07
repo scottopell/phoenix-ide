@@ -23,17 +23,13 @@
 --           module only fixes the taxonomy the classifiers must target.
 --           Gateway routing, model registry, model discovery.
 --
--- Self-contained: no `use` imports. The two per-provider specs import
+-- Self-contained: no `use` imports. The per-provider specs import
 --           this file as `llm` and create llm/LlmError and
 --           llm/LlmResponse instances through their own rules.
 --
--- Rationale: a 2026-05 production incident (a tool-result image fed back
---            to an OpenAI model produced HTTP 400 "Invalid value: 'text'")
---            showed the request-translation layer had no normative
---            contract. The wire discriminant a content block serializes
---            to is provider-specific; naming the internal vocabulary once
---            here lets each provider spec state its own discriminant
---            contract against a shared anchor.
+-- Wire discriminants and native tool restrictions are provider-specific.
+-- Shared vocabulary must preserve the distinction between a retained tool
+-- declaration, eligibility for a new invocation, and evidence of a past call.
 --
 -- Normative companions:
 --   specs/llm/requirements.md  — REQ-LLM-001..009
@@ -57,6 +53,10 @@
 -- provider places it in its own format (Anthropic top-level `system`,
 -- Responses API `instructions`).
 enum MessageRole { user | assistant }
+
+-- A compatible endpoint's wire format alone does not prove feature support.
+enum NativeToolRestrictionSupport { supported | unsupported | unknown }
+enum ToolAdmissionStatus { admitted | unavailable }
 
 -- The discriminant of an internal ContentBlock. The string values are
 -- exactly ContentBlock::type_tag() in types.rs — the serde `type` tag of
@@ -148,8 +148,7 @@ value Usage {
 --
 -- `tool_result_images` is the load-bearing field for the wire
 -- discriminant contract: a tool_result with a non-empty image list
--- forces a structured (multi-part) wire encoding, and that is exactly
--- the path the 2026-05 OpenAI 400 incident exercised. The list is empty
+-- forces a structured (multi-part) wire encoding. The list is empty
 -- for every kind other than tool_result.
 value ContentBlock {
     kind: ContentKind
@@ -159,6 +158,7 @@ value ContentBlock {
 
 -- One conversation message handed to a provider.
 value LlmMessage {
+    source_message_id: String?
     role: MessageRole
     content: List<ContentBlock>
 }
@@ -170,15 +170,22 @@ value EffectiveEffort {
     explicit_level: String?
 }
 
--- A provider-agnostic completion request. `tool_count` abstracts the
--- ToolDefinition list (the spec cares whether tools are present, not
--- their schemas). `cache_key` is the caller-chosen prompt-cache cohort
+value ToolDeclaration {
+    name: String
+    description: String
+    input_schema: Any
+}
+
+-- A provider-agnostic completion request. `tool_count` is derived from
+-- retained declarations, not from the subset eligible for new execution.
+-- `cache_key` is the caller-chosen prompt-cache cohort
 -- id (PromptCacheKey) — mandatory on the typed request; consumed by the
 -- Responses API as `prompt_cache_key`, ignored by Anthropic.
 value LlmRequest {
     system: List<SystemContent>
     messages: List<LlmMessage>
-    tool_count: Integer
+    tool_availability: ToolAvailability
+    tool_count: tool_availability.declarations.count
     max_tokens: Integer?
     effective_effort: EffectiveEffort
     cache_key: String
@@ -196,6 +203,28 @@ value TokenChunk {
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
+
+-- One request's tool policy. Definitions describe tools for provider history
+-- and rendering; callable_names authorizes new execution. They have different
+-- consumers and may differ when a phase ends or a service becomes unavailable.
+entity ToolAvailability {
+    declarations: List<ToolDeclaration>
+    callable_names: List<String>
+}
+
+-- A route identifies the concrete provider endpoint and execution protocol.
+-- The continuation identity changes when a provider switch settles.
+entity ConversationProviderContext {
+    conversation_id: String
+    route_id: String
+    continuation_id: String
+    tool_availability: ToolAvailability
+}
+
+entity ToolAdmission {
+    tool_name: String
+    status: ToolAdmissionStatus
+}
 
 -- A provider-agnostic completion response. Created by each provider's
 -- normalizer. `end_turn` means the model has nothing further to do (no
@@ -241,8 +270,128 @@ entity LlmError {
 }
 
 ------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract ToolHistoryIntegrity {
+    project_history: (messages: List<LlmMessage>, availability: ToolAvailability) -> List<LlmMessage>
+    admit_tool: (availability: ToolAvailability, tool_name: String) -> ToolAdmission
+
+    @invariant AvailabilityDoesNotEraseEvidence
+        -- A declaration or callability change does not delete, flatten, or
+        -- rewrite historical tool calls, arguments, results, error status,
+        -- attachments, tool-search references, or provider replay owners.
+        -- Explicit context-management transformations and logged cross-provider
+        -- capability gaps have their own contracts; tool unavailability is not
+        -- a context-management or unsupported-content transformation.
+
+    @invariant ExecutionRequiresCurrentAuthority
+        -- Every new invocation is checked against current callable_names,
+        -- including calls issued before a policy change and calls admitted
+        -- through advisory-only provider restrictions. Retained declarations
+        -- grant no execution authority. An unavailable invocation receives one
+        -- explicit error result paired with its original call ID, without
+        -- executing it or removing the assistant turn.
+
+    @invariant PrivateReplaySurvivesProjection
+        -- Provider-private continuation data belongs to its originating
+        -- provider and exact assistant owner, outside public transcript data.
+        -- Preserve required opaque items and positions through retry/restart;
+        -- clear them only at an authoritative settlement/abandonment boundary.
+        -- Never repair a mismatch by replacing the saved owner snapshot with
+        -- transformed content or by silently omitting required private data.
+        -- Provider contracts distinguish signed Anthropic blocks from opaque
+        -- Responses reasoning items; neither is generic visible text.
+
+    @invariant ProviderCapabilitiesAreExplicit
+        -- Native restrictions are selected by the exact route/model capability,
+        -- not inferred from an OpenAI-compatible URL or provider family name.
+        -- Without verified native support, retain required definitions/history,
+        -- communicate current restrictions, and enforce them in the executor.
+        -- Never silently serialize an unsupported native control.
+}
+
+-- REQ-LLM-004i: policy, history integrity, and provider-context boundaries.
+contract ProviderRequestProjection {
+    render_request: (request: LlmRequest, context: ConversationProviderContext) -> Any
+
+    @invariant PolicyBelongsToConversation
+        -- Render every request for its selected route from the conversation's
+        -- current tool policy. A provider switch preserves retained declarations,
+        -- current callable names, and public call/result history. Request policy
+        -- is a snapshot of that authority, not a second mutable authority.
+
+    @invariant WireControlsBelongToTarget
+        -- Only the selected adapter emits native controls supported by its exact
+        -- route/model. Anthropic tool-change events never enter Responses or
+        -- Chat requests; OpenAI allowed_tools never enters Anthropic requests.
+        -- Provider-specific events live outside portable public messages.
+        -- Omitting a foreign wire control does not remove its conversation policy.
+
+    @invariant ContinuationBelongsToContext
+        -- Private replay, native tool-change events, and server/transport
+        -- continuation handles are bound to their originating route and
+        -- continuation identity. Retry/restart of the same context retains
+        -- required data and positions. A settled provider switch atomically
+        -- retires that context with the settings/handoff transition and starts
+        -- a fresh identity; it leaves no suspended provider context to resume.
+        -- Returning to a route establishes current policy afresh, without
+        -- reviving retired private data, native events, or transport handles.
+        -- Stale outcomes from the retired identity cannot restore them.
+        -- An explicit context-management history projection that removes native
+        -- tool-change anchors retires the whole native prefix/event context and
+        -- establishes current policy at a legal visible anchor. It does not
+        -- relocate or selectively filter old events, rewrite private owners,
+        -- or retire required private replay within an unsettled exchange.
+        -- Switching does not execute pending tools again or orphan their results;
+        -- settlement follows the authoritative exchange boundary in REQ-LLM-005.
+}
+
+------------------------------------------------------------
+-- Rules — current execution eligibility
+------------------------------------------------------------
+
+rule ProviderSwitchSettled {
+    when: SettleProviderSwitch(context, expected_continuation_id, target_route_id, fresh_continuation_id)
+    requires: context.continuation_id = expected_continuation_id
+    requires: target_route_id != context.route_id
+    requires: fresh_continuation_id != expected_continuation_id
+    ensures: context.route_id = target_route_id
+    ensures: context.continuation_id = fresh_continuation_id
+    @guidance
+        -- Apply only at an admitted settlement/abandonment boundary. Commit the
+        -- route selection and context retirement atomically, preserving the
+        -- conversation's tool authority and public history. The fresh identity
+        -- is newly allocated, never a previously retired identity.
+}
+
+rule CurrentToolAdmitted {
+    when: EvaluateToolAdmission(availability, tool_name)
+    requires: tool_name in availability.callable_names
+    ensures: ToolAdmission.created(tool_name: tool_name, status: admitted)
+}
+
+rule UnavailableToolNotAdmitted {
+    when: EvaluateToolAdmission(availability, tool_name)
+    requires: not (tool_name in availability.callable_names)
+    ensures: ToolAdmission.created(tool_name: tool_name, status: unavailable)
+}
+
+------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
+
+invariant CallableToolsHaveDeclarations {
+    for availability in ToolAvailabilities:
+        for name in availability.callable_names:
+            availability.declarations.any(tool => tool.name = name)
+}
+
+invariant ToolDeclarationNamesUnique {
+    for availability in ToolAvailabilities:
+        availability.declarations.name.unique.count = availability.declarations.count
+        availability.callable_names.unique.count = availability.callable_names.count
+}
 
 -- Structured quota detail is attached to an error if and only if the
 -- error is a usage-limit exhaustion. The `usage_limit_reached`
@@ -284,4 +433,24 @@ invariant UsageNonNegative {
         r.usage.cache_read_tokens >= 0
 }
 
--- No open questions.
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface LlmToolPolicyBoundary {
+    facing: PhoenixRuntime
+    context availability: ToolAvailability
+    contracts:
+        fulfils ToolHistoryIntegrity
+    provides:
+        EvaluateToolAdmission(availability, tool_name)
+}
+
+surface ConversationProviderBoundary {
+    facing: PhoenixRuntime
+    context context: ConversationProviderContext
+    contracts:
+        fulfils ProviderRequestProjection
+    provides:
+        SettleProviderSwitch(context, expected_continuation_id, target_route_id, fresh_continuation_id)
+}

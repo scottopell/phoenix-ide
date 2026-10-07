@@ -328,8 +328,8 @@ impl ChainQa {
     /// chain), then runs **planning turns** that may call the scope-bound
     /// search/read tools. Planning turns run non-streamed, so intermediate
     /// "I'll search…" narration never reaches the user. When the model stops
-    /// calling tools (or the turn cap is hit), a dedicated final turn with no
-    /// tools streams the answer token-by-token over the chain broadcaster.
+    /// calling tools (or the turn cap is hit), a dedicated final turn with new
+    /// tool calls disabled streams the answer over the chain broadcaster.
     #[allow(clippy::too_many_lines)] // bounded agent loop keeps replay/tool sequencing visible
     async fn run_answer_invocation(
         &self,
@@ -356,8 +356,9 @@ impl ChainQa {
         let mut provider_replay: Option<
             phoenix_core::domain::provider_replay::AnthropicReplayPayload,
         > = None;
+        let mut responses_replay = Vec::new();
         let mut messages = vec![LlmMessage {
-            source_message_id: None,
+            source_message_id: Some("chain-qa-question".into()),
             role: MessageRole::User,
             content: vec![ContentBlock::text(format!(
                 "Conversation transcripts (in order):\n{}\n---\nQuestion: {}{}",
@@ -383,6 +384,7 @@ impl ChainQa {
             );
             let mut request = request;
             request.provider_replay = provider_replay.clone();
+            request.responses_replay = responses_replay.clone();
             let resp = prep
                 .service
                 .complete(&request)
@@ -392,12 +394,23 @@ impl ChainQa {
                     partial_answer: None,
                 })?;
 
+            let tool_calls: Vec<(String, String, serde_json::Value)> = resp
+                .tool_uses()
+                .into_iter()
+                .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
+                .collect();
+
+            // No tool call → the agent is ready; stream the final answer.
+            if tool_calls.is_empty() {
+                break;
+            }
+
             if let Some(update) = resp.provider_replay.clone() {
                 use phoenix_core::domain::provider_replay::{
-                    AnthropicReplayPayload, AnthropicReplayUpdate,
+                    AnthropicReplayPayload, ProviderReplayUpdate,
                 };
                 match update {
-                    AnthropicReplayUpdate::Append(response) => {
+                    ProviderReplayUpdate::Anthropic(response) => {
                         let mut sets = provider_replay
                             .take()
                             .map_or_else(Vec::new, |p| p.response_sets);
@@ -410,19 +423,15 @@ impl ChainQa {
                                 }
                             })?);
                     }
-                    AnthropicReplayUpdate::Clear => provider_replay = None,
+                    ProviderReplayUpdate::Responses(response) => {
+                        responses_replay
+                            .push(response.with_owner_message_id(format!("chain-qa-{turn}")));
+                    }
+                    ProviderReplayUpdate::Clear => {
+                        provider_replay = None;
+                        responses_replay.clear();
+                    }
                 }
-            }
-
-            let tool_calls: Vec<(String, String, serde_json::Value)> = resp
-                .tool_uses()
-                .into_iter()
-                .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
-                .collect();
-
-            // No tool call → the agent is ready; stream the final answer.
-            if tool_calls.is_empty() {
-                break;
             }
 
             // Execute the tools and feed results back. Re-resolve the chain's
@@ -449,7 +458,9 @@ impl ChainQa {
                 // Cap the executed calls so a batched response can't blow past
                 // the per-page budget; still answer every tool_use so the next
                 // request stays valid.
-                let (content, is_error) = if idx < MAX_TOOL_CALLS_PER_TURN {
+                let (content, is_error) = if !request.tool_availability.is_callable(name) {
+                    (format!("EUNAVAIL: tool {name} is unavailable"), true)
+                } else if idx < MAX_TOOL_CALLS_PER_TURN {
                     self.execute_tool(name, input, &members).await
                 } else {
                     (
@@ -468,7 +479,7 @@ impl ChainQa {
                 });
             }
             messages.push(LlmMessage {
-                source_message_id: None,
+                source_message_id: Some(format!("chain-qa-results-{turn}")),
                 role: MessageRole::User,
                 content: results,
             });
@@ -486,12 +497,15 @@ impl ChainQa {
             .live_snapshot(&prep.root_id)
             .await
             .unwrap_or(prep.snapshot);
-        // The forced-answer request changes the tool surface. Settle private
-        // Anthropic replay before that boundary rather than carrying signed
-        // planning blocks into a different prefix.
-        provider_replay = None;
         let answer = self
-            .stream_final_answer(&messages, provider_replay, prep, runtime)
+            .stream_final_answer(
+                &messages,
+                provider_replay,
+                responses_replay,
+                index_fresh,
+                prep,
+                runtime,
+            )
             .await?;
         Ok(AnswerOutcome { answer, snapshot })
     }
@@ -508,7 +522,7 @@ impl ChainQa {
         Some(compute_chain_snapshot(&members))
     }
 
-    /// Final turn: a no-tools invocation whose tokens stream live onto the
+    /// Final turn: an invocation with new tool calls disabled that streams onto the
     /// chain broadcaster as they arrive (REQ-CHN-004). Only this turn is
     /// published — planning turns ran non-streamed — so the user sees a working
     /// indicator, then the answer streaming in.
@@ -516,21 +530,22 @@ impl ChainQa {
         &self,
         messages: &[LlmMessage],
         provider_replay: Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
+        responses_replay: Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>,
+        search_enabled: bool,
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
     ) -> Result<String, RunInvocationError> {
-        // Final turn forces an answer with an empty tool set; search gating is
-        // irrelevant here.
         let request = build_agent_request(
             messages,
             prep.language,
             true,
-            false,
+            search_enabled,
             prep.effective_effort,
             prep.max_output_tokens,
         );
         let mut request = request;
         request.provider_replay = provider_replay;
+        request.responses_replay = responses_replay;
         let (chunk_tx, mut chunk_rx) = mpsc::channel::<TokenChunk>(256);
         let qa_id = prep.row_id.clone();
         let runtime_handle = Arc::clone(runtime);
@@ -798,10 +813,7 @@ struct RunInvocationError {
     partial_answer: Option<String>,
 }
 
-/// Build one turn's `LlmRequest`. Offers the Q&A tools unless `force_answer`
-/// (the final allowed turn), where an empty tool set forces the model to answer
-/// with what it has. `search_enabled` gates the `search_conversations` tool on
-/// index freshness (see [`qa_tools`]).
+/// Build a Q&A request with retained declarations and current execution permission.
 fn build_agent_request(
     messages: &[LlmMessage],
     language: crate::llm_language::LlmLanguage,
@@ -810,10 +822,31 @@ fn build_agent_request(
     effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
     max_output_tokens: Option<u32>,
 ) -> LlmRequest {
-    let tools = if force_answer {
-        vec![]
+    let tools = qa_tools(search_enabled);
+    let tool_availability = if force_answer {
+        use phoenix_core::domain::tool_availability::{
+            PositionedToolChange, ToolAvailability, ToolChange,
+        };
+        let changes = messages
+            .last()
+            .and_then(|message| message.source_message_id.as_ref())
+            .map_or_else(Vec::new, |anchor| {
+                tools
+                    .iter()
+                    .map(|tool| PositionedToolChange {
+                        after_message_id: anchor.clone(),
+                        change: ToolChange::Removal {
+                            name: tool.name.clone(),
+                        },
+                    })
+                    .collect()
+            });
+        ToolAvailability::new(tools.clone(), Default::default())
+            .expect("QA tool declarations are unique")
+            .with_anthropic_context(tools, changes)
+            .expect("QA withdrawals reference retained declarations")
     } else {
-        qa_tools(search_enabled)
+        phoenix_core::domain::tool_availability::ToolAvailability::all(tools)
     };
     LlmRequest {
         system: vec![SystemContent::new(
@@ -821,7 +854,8 @@ fn build_agent_request(
         )],
         messages: messages.to_vec(),
         provider_replay: None,
-        tools,
+        responses_replay: Vec::new(),
+        tool_availability,
         max_tokens: Some(
             max_output_tokens.map_or(ANSWER_MAX_TOKENS, |limit| limit.min(ANSWER_MAX_TOKENS)),
         ),
@@ -1071,3 +1105,203 @@ fn trailing_continuation_summary(messages: &[Message]) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tool_policy_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct ResponsesQaLlm {
+        rounds: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmService for ResponsesQaLlm {
+        async fn complete(
+            &self,
+            request: &LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, LlmError> {
+            use phoenix_core::domain::{
+                provider_replay::ProviderReplayUpdate, responses_replay::ResponsesResponseSet,
+            };
+            let round = self
+                .rounds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(request.responses_replay.len(), round);
+            for set in &request.responses_replay {
+                let owner = request
+                    .messages
+                    .iter()
+                    .find(|message| {
+                        message.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                    })
+                    .unwrap();
+                assert_eq!(owner.content, set.public_content);
+            }
+            let mut response = phoenix_llm::LlmResponse::non_streaming(
+                vec![ContentBlock::text("ready")],
+                true,
+                Default::default(),
+            );
+            response.provider_replay = Some(ProviderReplayUpdate::Clear);
+            if round < 2 {
+                let call_id = format!("read-{round}");
+                response.content = vec![ContentBlock::ToolUse {
+                    id: call_id.clone(),
+                    name: "read_conversation".into(),
+                    input: serde_json::json!({"conversation_id":"qa-replay-root"}),
+                }];
+                response.end_turn = false;
+                response.provider_replay = Some(ProviderReplayUpdate::Responses(
+                    ResponsesResponseSet {
+                        response_id: format!("response-{round}"),
+                        model: "test-model".into(),
+                        owner_message_id: String::new(),
+                        public_content: response.content.clone(),
+                        output_items: vec![
+                            serde_json::json!({"type":"reasoning","id":format!("reasoning-{round}"),"encrypted_content":"private"}),
+                            serde_json::json!({"type":"function_call","id":format!("function-{round}"),"call_id":call_id,"name":"read_conversation","arguments":serde_json::json!({"conversation_id":"qa-replay-root"}).to_string()}),
+                        ],
+                    },
+                ));
+            }
+            Ok(response)
+        }
+
+        async fn complete_streaming(
+            &self,
+            request: &LlmRequest,
+            tx: &mpsc::Sender<TokenChunk>,
+        ) -> Result<phoenix_llm::LlmResponse, LlmError> {
+            assert_eq!(
+                request.responses_replay.len(),
+                2,
+                "discarded planning terminal must not settle adopted tool history"
+            );
+            assert!(request.tool_availability.callable_names().is_empty());
+            assert!(!request.tool_availability.declarations().is_empty());
+            for (round, set) in request.responses_replay.iter().enumerate() {
+                assert_eq!(set.owner_message_id, format!("chain-qa-{round}"));
+                assert_eq!(set.output_items[0]["encrypted_content"], "private");
+                let owner = request
+                    .messages
+                    .iter()
+                    .find(|message| {
+                        message.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                    })
+                    .unwrap();
+                assert_eq!(owner.content, set.public_content);
+            }
+            tx.send(TokenChunk::Text("final answer".into()))
+                .await
+                .unwrap();
+            Ok(phoenix_llm::LlmResponse::non_streaming(
+                vec![ContentBlock::text("final answer")],
+                true,
+                Default::default(),
+            ))
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    #[tokio::test]
+    async fn qa_replays_two_responses_tool_rounds_into_final_streamed_answer() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("qa-replay-root", "qa-replay", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let llm = Arc::new(ResponsesQaLlm {
+            rounds: Default::default(),
+        });
+        let registry = Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone()));
+        let qa = ChainQa::new(db.clone(), registry, Arc::new(db.fts_retriever()));
+        let prep = PreparedInvocation {
+            row_id: "qa-replay-row".into(),
+            question: "What changed?".into(),
+            skeleton: "#qa-replay-root".into(),
+            root_id: "qa-replay-root".into(),
+            snapshot: ChainSnapshot {
+                member_count: 1,
+                total_messages: 0,
+            },
+            service: llm.clone(),
+            model_id: "test-model".into(),
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            max_output_tokens: None,
+            language: crate::llm_language::LlmLanguage::PhoenixNative,
+        };
+        let runtime = qa.runtime_registry.get_or_create(&prep.root_id).await;
+        let outcome = qa
+            .run_answer_invocation(&prep, &runtime)
+            .await
+            .unwrap_or_else(|failure| panic!("QA failed: {}", failure.error));
+        assert_eq!(outcome.answer, "final answer");
+        assert_eq!(llm.rounds.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn forced_answer_retains_planning_declarations_and_withdraws_new_calls() {
+        let messages = vec![
+            LlmMessage {
+                source_message_id: Some("chain-qa-question".into()),
+                role: MessageRole::User,
+                content: vec![ContentBlock::text("What changed?")],
+            },
+            LlmMessage {
+                source_message_id: Some("chain-qa-1".into()),
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "read-1".into(),
+                    name: "read_conversation".into(),
+                    input: serde_json::json!({"conversation_id":"root"}),
+                }],
+            },
+            LlmMessage {
+                source_message_id: Some("chain-qa-results-1".into()),
+                role: MessageRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "read-1".into(),
+                    content: "transcript".into(),
+                    images: vec![],
+                    is_error: false,
+                }],
+            },
+        ];
+        for search_enabled in [false, true] {
+            let planning = build_agent_request(
+                &messages,
+                crate::llm_language::LlmLanguage::PhoenixNative,
+                false,
+                search_enabled,
+                phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+                None,
+            );
+            let final_request = build_agent_request(
+                &messages,
+                crate::llm_language::LlmLanguage::PhoenixNative,
+                true,
+                search_enabled,
+                phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+                None,
+            );
+            assert_eq!(
+                planning.tool_availability.declarations(),
+                final_request.tool_availability.declarations()
+            );
+            assert!(final_request.tool_availability.callable_names().is_empty());
+            assert_eq!(
+                final_request.tool_availability.anthropic_changes().len(),
+                planning.tool_availability.declarations().len()
+            );
+            assert!(final_request
+                .tool_availability
+                .anthropic_changes()
+                .iter()
+                .all(|change| change.after_message_id == "chain-qa-results-1"));
+        }
+    }
+}

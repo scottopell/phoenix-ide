@@ -43,6 +43,13 @@
 
 use "./llm.allium" as llm
 
+-- Provider obligations below describe the Messages API, independently of
+-- Phoenix's adapter implementation. API sources:
+-- https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+-- https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls
+-- https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+-- https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -61,6 +68,7 @@ enum AnthropicStreamStatus { accumulating | done | failed }
 -- (server_tool_use results, mcp results) arrive whole inside the
 -- content_block_start event and need no deltas.
 enum AnthropicBlockShape { text | tool | server }
+enum AnthropicWithdrawalEncoding { native_reference | advisory }
 
 ------------------------------------------------------------
 -- Value Types
@@ -83,6 +91,12 @@ value AnthropicRawResponse {
     has_response_position_image_or_tool_result: Boolean
     stop_reason: String?
     usage: llm/Usage
+}
+
+value AnthropicClientToolResult {
+    tool_use_id: String
+    content: Any
+    is_error: Boolean
 }
 
 ------------------------------------------------------------
@@ -163,6 +177,115 @@ entity AnthropicWireToolResult {
 entity AnthropicWireToolResultPart {
     result: AnthropicWireToolResult
     wire_type: String
+}
+
+entity AnthropicWithdrawal {
+    tool_name: String
+    encoding: AnthropicWithdrawalEncoding
+}
+
+------------------------------------------------------------
+-- Contracts — provider continuation and tool availability
+------------------------------------------------------------
+
+contract AnthropicToolContinuation {
+    continue_exchange: (assistant_turn: Any, results: List<AnthropicClientToolResult>, declarations: List<llm/ToolDeclaration>) -> Any
+    withdraw_tool: (request: llm/LlmRequest, tool_name: String, support: llm/NativeToolRestrictionSupport) -> AnthropicWithdrawal
+
+    @invariant ToolPolicyIsRenderedForAnthropic
+        -- Never serialize OpenAI allowed_tools. Establish current conversation
+        -- policy using this route's supported controls. Native tool-change
+        -- events are scoped to the Anthropic continuation identity: replay
+        -- them at their original positions within that context, including
+        -- retry/restart, but do not revive events from a retired context.
+        -- A fresh context uses retained definitions and establishes current
+        -- restrictions at a legal tool-change position before generation.
+        -- Unsupported controls use advisory restrictions and local admission.
+
+    @invariant AssistantTurnRoundTrips
+        -- Send an unsettled assistant turn back unchanged and append a user
+        -- tool_result for every client tool_use, preserving each tool-use ID.
+        -- Tool-result blocks precede any text in that user message. A failed
+        -- execution uses is_error=true; failure does not erase its call.
+        -- Anthropic server_tool_use IDs receive no client tool_result.
+        -- Preserve server_tool_use and tool_search_tool_result blocks as emitted.
+
+    @invariant ToolSearchReferencesResolve
+        -- Tool-search continuation carries the same search tool and complete
+        -- deferred definitions. Every historical tool_reference must resolve
+        -- to a supplied definition; references are expanded throughout history.
+        -- defer_loading affects context loading, not whether a full definition
+        -- is sent. Missing definitions cause invalid_request before generation.
+        -- Filtering references against live MCP health violates continuation.
+        -- This tool-search rule is not evidence that every ordinary historical
+        -- tool_use on every Messages model requires its definition forever.
+
+    @invariant PrivateBlocksStayBoundToTheirOwner
+        -- Replay signed thinking and encrypted redacted_thinking unchanged in
+        -- their original positions inside the exact owning assistant turn.
+        -- Phoenix keeps these outside public content and validates owner identity,
+        -- public content, signatures, and ordinals before provider I/O.
+        -- Altering earlier system/tools/messages can invalidate prefix binding.
+        -- A native tool withdrawal does not authorize editing an earlier turn.
+        -- An incompatible target model may drop unreadable blocks server-side;
+        -- account/model readability and prefix enforcement are provider-specific.
+
+    @invariant PrefixMismatchPolicyIsExplicit
+        -- With thinking-binding-controls-2026-08-01, prefix_mismatch_behavior
+        -- selects error or drop_block. Accounts with default binding enforcement
+        -- and older accounts explicitly opting in must both be supported.
+        -- drop_block permits provider-side invalid-thinking removal, not client
+        -- deletion of public tool calls/results or rewriting signed blocks.
+        -- Record bounded content-free input_transformation diagnostics.
+
+    @invariant WithdrawalIsAppendOnly
+        -- On a route/model supporting native tool changes, keep declarations
+        -- and append role=system with tool_removal referencing the tool by name.
+        -- A reference must resolve to a declared tool. Offer it again with
+        -- tool_addition; availability is not monotonic. Persist and resend every
+        -- accepted change in its original position on retry and later requests.
+        -- A content-bearing system message follows a user turn (including tool
+        -- results), precedes an assistant turn or ends the input, and is never
+        -- inserted between a client call and its result. Tool changes cannot
+        -- immediately follow a paused assistant/server-result turn; resume first.
+
+    @invariant ToolChangeCapabilityAndHeadersAreRequired
+        -- Native tool changes require verified model/platform support plus
+        -- inline-tools-2026-09-15 on the Claude API, or the reference-only
+        -- mid-conversation-tool-changes-2026-07-01 where supported. Opus 5.5
+        -- supports these controls; an Anthropic-compatible endpoint alone does
+        -- not prove support. Unknown/unsupported routes use advisory restrictions
+        -- and executor enforcement without changing historical content.
+
+    @invariant NewDefinitionsDoNotRewriteOldDefinitions
+        -- With inline-tools-2026-09-15, tool_addition may carry tool_definition
+        -- with the complete definition. A changed definition under the same
+        -- name takes effect from its appended position onward; an identical
+        -- definition is idempotent. Conflicting tool types are rejected.
+        -- Definitions unknown at session start may be introduced this way.
+        -- Keep the original top-level tools and earlier messages intact.
+        -- The reference-only header cannot carry inline definitions. Deferred
+        -- definitions not yet offered may be appended under that header because
+        -- prefix binding ignores them until referenced by tool_addition.
+        -- Absence of an initial non-deferred tool can cost a full cache miss on
+        -- the first inline definition. Deferred tools alone do not imply that
+        -- a tool-search request with all tools deferred is valid.
+}
+
+rule AnthropicNativeWithdrawalSelected {
+    when: WithdrawAnthropicTool(request, tool_name, support)
+    requires: support = supported
+    requires: request.tool_availability.declarations.any(tool => tool.name = tool_name)
+    requires: not (tool_name in request.tool_availability.callable_names)
+    ensures: AnthropicWithdrawal.created(tool_name: tool_name, encoding: native_reference)
+}
+
+rule AnthropicAdvisoryWithdrawalSelected {
+    when: WithdrawAnthropicTool(request, tool_name, support)
+    requires: support in { unsupported, unknown }
+    requires: request.tool_availability.declarations.any(tool => tool.name = tool_name)
+    requires: not (tool_name in request.tool_availability.callable_names)
+    ensures: AnthropicWithdrawal.created(tool_name: tool_name, encoding: advisory)
 }
 
 ------------------------------------------------------------
@@ -318,7 +441,7 @@ rule AnthropicResponseNormalized {
         -- block type and AnthropicContentBlock needs a new variant. It
         -- does not by itself fail normalization. Because such a block
         -- never reaches an llm/LlmResponse it is intentionally absent
-        -- from llm/ContentKind; see Open Question Q2.
+        -- from llm/ContentKind.
 }
 
 ------------------------------------------------------------
@@ -374,7 +497,7 @@ rule AnthropicTextDeltaForwarded {
         -- token stream with no UI subscriber is normal, not an error.
         -- input_json_delta fragments (tool-call arguments) are NOT
         -- forwarded — they are appended to an internal buffer and only
-        -- parsed when the block commits. See Open Question Q1.
+        -- parsed when the block commits.
 }
 
 -- content_block_stop commits the currently open block.
@@ -538,32 +661,11 @@ invariant AnthropicNoOpenBlockSurvivesDone {
 }
 
 ------------------------------------------------------------
--- Open Questions
+-- Scope Notes
 ------------------------------------------------------------
--- All resolved 2026-05-22. Kept as prose so the file stays parseable.
---
--- Q1. RESOLVED — accept as shipped behaviour. Tool-call argument
---     fragments (input_json_delta) are accumulated silently and never
---     forwarded as a TokenChunk, so the UI shows no progress while a
---     large tool call is constructed. Matches llm.allium Q1 (TokenChunk
---     is text-only). The spec models the shipped code; streamed
---     tool-call construction is separate future work.
---
--- Q2. RESOLVED — accept as shipped behaviour. An Unknown response block
---     (serde `other`) is logged loudly and dropped; it is deliberately
---     absent from llm/ContentKind because by construction it never
---     reaches an llm/LlmResponse. If Anthropic ships a block type
---     Phoenix must preserve for history, AnthropicContentBlock needs a
---     real variant and llm/ContentKind a matching kind — at which point
---     a translation rule replaces this note.
---
--- Q3. RESOLVED — keep as-is. The `failed` terminal state can be reached
---     by an SSE `error` event mid-stream after some blocks already
---     committed; the committed blocks are discarded and the whole turn
---     becomes the classified error. Accepted: both providers behave
---     this way, it is consistent and simple, and surfacing partial
---     content on a hard error would touch the executor's error path for
---     marginal benefit.
+-- Tool-call argument fragments are accumulated rather than forwarded as
+-- text TokenChunks. Failed SSE streams discard partial assembled responses;
+-- committed blocks from such a stream do not become an accepted assistant turn.
 --
 -- Note (text-part ordering): AnthropicToolResultTranslated always
 --     creates the text part before the image parts, so the text part is
@@ -571,3 +673,14 @@ invariant AnthropicNoOpenBlockSurvivesDone {
 --     structural invariant in this dialect (no list-index primitive); it
 --     is guaranteed by the rule's construction order and mirrors
 --     translate_message.
+
+surface AnthropicToolContinuationBoundary {
+    facing: PhoenixRuntime
+    context request: llm/LlmRequest
+    contracts:
+        fulfils AnthropicToolContinuation
+        fulfils llm/ToolHistoryIntegrity
+        demands llm/ProviderRequestProjection
+    provides:
+        WithdrawAnthropicTool(request, tool_name, support)
+}

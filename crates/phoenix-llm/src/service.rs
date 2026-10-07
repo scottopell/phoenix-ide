@@ -231,6 +231,31 @@ impl LlmService for LlmServiceImpl {
         &self.spec.id
     }
 
+    fn continuation_route_key(&self) -> String {
+        let endpoint = match self.spec.backend.api_format() {
+            ApiFormat::Anthropic => self
+                .anthropic_base_url
+                .as_deref()
+                .unwrap_or("https://api.anthropic.com/v1/messages"),
+            ApiFormat::OpenAIResponses if self.use_codex_backend => {
+                "https://chatgpt.com/backend-api/codex/responses"
+            }
+            ApiFormat::OpenAIResponses => self
+                .openai_responses_base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com/v1/responses"),
+            ApiFormat::OpenAIChatCompletions => self
+                .openai_chat_completions_base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com/v1/chat/completions"),
+        };
+        format!(
+            "{}:{}:{endpoint}",
+            self.spec.backend.header_value(),
+            self.spec.api_name
+        )
+    }
+
     fn uses_codex_bridge(&self) -> bool {
         self.use_codex_backend
     }
@@ -482,7 +507,10 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            tools: vec![],
+            responses_replay: Vec::new(),
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,

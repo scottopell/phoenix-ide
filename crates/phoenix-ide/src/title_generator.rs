@@ -49,7 +49,8 @@ pub async fn generate_title(
             content: vec![ContentBlock::text(prompt)],
         }],
         provider_replay: None,
-        tools: vec![],
+        responses_replay: Vec::new(),
+        tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
         max_tokens: Some(max_output_tokens.map_or(50, |limit| limit.min(50))), // Title should be very short
         effective_effort,
         service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
@@ -135,7 +136,8 @@ pub async fn generate_chain_name(
             content: vec![ContentBlock::text(prompt)],
         }],
         provider_replay: None,
-        tools: vec![],
+        responses_replay: Vec::new(),
+        tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
         max_tokens: Some(max_output_tokens.map_or(50, |limit| limit.min(50))), // Name should be very short
         effective_effort,
         service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,

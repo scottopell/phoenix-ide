@@ -285,6 +285,35 @@ THE SYSTEM SHALL distinguish consumed context from reserved output headroom rath
 
 ---
 
+### REQ-LLM-004i: Tool Availability and Provider Continuation
+
+WHEN tool execution eligibility changes during a conversation
+THE SYSTEM SHALL preserve historical calls, arguments, results, errors, and required provider references
+AND SHALL retain authentic tool declarations independently of current execution eligibility
+AND SHALL check current execution authority before dispatching every new invocation
+AND SHALL return one matching unavailable error result without execution when authority is absent
+
+WHEN preparing a provider request
+THE SYSTEM SHALL render the current conversation policy using only controls supported by the selected route and model
+AND SHALL preserve required provider-private continuation through retry and restart
+AND SHALL keep provider-specific controls and private data outside portable public messages
+
+WHEN a provider switch settles or authoritatively abandons an exchange
+THE SYSTEM SHALL atomically retire its native continuation context with the selected-model settings
+AND SHALL preserve conversation tool policy and public history
+AND SHALL establish current policy afresh when returning to a provider
+AND SHALL NOT revive retired private data, native events, or transport continuation handles
+
+WHEN explicit context management removes a native tool-change anchor
+THE SYSTEM SHALL establish a fresh native tool prefix and current policy at a legal visible position
+AND SHALL NOT relocate individual historical native events or rewrite active private replay owners
+
+WHEN a historical tool reference lacks an authentic retained declaration
+THE SYSTEM SHALL report the missing declaration and preserve the exchange for retry
+AND SHALL NOT fabricate a schema from historical arguments or assume that uncaptured declarations can be recovered
+
+---
+
 ### REQ-LLM-005: Response Handling
 
 WHEN LLM responds

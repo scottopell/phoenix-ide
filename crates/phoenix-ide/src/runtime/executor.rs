@@ -46,6 +46,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod continuation;
+#[cfg(test)]
+mod provider_tool_policy_tests;
 use continuation::{plan_with_handoff, CompactionPolicy, ContinuationHistory};
 
 enum AuthoritativeEffect {
@@ -788,6 +790,7 @@ async fn execute_tool_to_outcome<S, T>(
     root_conv_id: String,
     tool_name: String,
     tool_use_id: String,
+    tool_surface: LlmToolSurface,
 ) -> ToolExecOutcome
 where
     S: Storage + Clone + 'static,
@@ -814,6 +817,16 @@ where
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
+    let callable = tool_surface.callable_tools(tool_executor.definitions().await);
+    if !callable
+        .iter()
+        .any(|definition| definition.name == tool_name)
+    {
+        return ToolExecOutcome::Failed {
+            tool_use_id,
+            error: "EUNAVAIL: tool is unavailable under the current conversation policy".into(),
+        };
+    }
     let output = tool_executor
         .execute(checked, tool_ctx)
         .instrument(span.clone())
@@ -1882,7 +1895,7 @@ where
     /// Accepted provider-private replay mutation waiting for the reducer's
     /// authoritative persistence effect. Consumed by `PersistState`.
     pending_provider_replay_update:
-        Option<phoenix_core::domain::provider_replay::AnthropicReplayUpdate>,
+        Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     pending_sub_agent_acceptance: Option<String>,
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
     pending_sub_agent_activation: Option<PendingSubAgentActivation>,
@@ -3116,13 +3129,8 @@ where
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => {
                 self.pending_provider_replay_update =
-                    replay_update.map(|(update, owner_message_id)| match update {
-                        phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(
-                            response,
-                        ) => phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(
-                            response.with_owner_message_id(owner_message_id),
-                        ),
-                        clear @ phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Clear => clear,
+                    replay_update.map(|(update, owner_message_id)| {
+                        update.with_owner_message_id(owner_message_id)
                     });
                 r
             }
@@ -3657,7 +3665,7 @@ where
                 && provider_replay_should_clear(&old_state, &result.new_state)
             {
                 self.pending_provider_replay_update =
-                    Some(phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Clear);
+                    Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear);
             }
             let retry_has_durable_fact = matches!(
                 self.terminal_settlement_attempt,
@@ -5959,7 +5967,7 @@ where
                 let seq = self.broadcast_tx.next_seq();
                 let msg = if matches!(
                     self.pending_provider_replay_update,
-                    Some(phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Clear)
+                    Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear)
                 ) {
                     let message = self
                         .storage
@@ -7684,21 +7692,61 @@ where
                 "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
             );
         }
-        let tools = request_tool_surface.callable_tools(available_tools);
-        let callable_tool_names: std::collections::HashSet<&str> =
-            tools.iter().map(|tool| tool.name.as_str()).collect();
-        let messages = strip_unavailable_tool_blocks(
-            frozen_messages,
-            &callable_tool_names,
-            request_tool_surface == LlmToolSurface::SubAgentTerminal,
-        );
+        let callable_names = request_tool_surface
+            .callable_tools(available_tools.clone())
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let anchor = frozen_messages
+            .last()
+            .filter(|message| message.role == MessageRole::User)
+            .and_then(|message| message.source_message_id.as_deref());
+        let historical_tool_references = frozen_messages
+            .iter()
+            .flat_map(|message| {
+                message.content.iter().flat_map(move |block| {
+                    if let ContentBlock::ToolSearchToolResult { content, .. } = block {
+                        content
+                            .tool_references
+                            .iter()
+                            .filter_map(|reference| {
+                                message
+                                    .source_message_id
+                                    .as_ref()
+                                    .map(|id| (id.clone(), reference.tool_name.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let tool_availability = self
+            .storage
+            .prepare_tool_availability(
+                &conv_id,
+                &llm_client.continuation_route_key(),
+                anchor,
+                &available_tools,
+                &callable_names,
+                &frozen_messages
+                    .iter()
+                    .filter_map(|message| message.source_message_id.clone())
+                    .collect::<Vec<_>>(),
+                &historical_tool_references,
+            )
+            .await?;
+        let messages = frozen_messages;
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
+        let responses_replay = self.storage.load_responses_replay_state(&conv_id).await?;
         let request = LlmRequest {
             system: vec![SystemContent::cached(&system_prompt)],
             messages,
             provider_replay,
-            tools,
+            responses_replay,
+            tool_availability,
             max_tokens: Some(request_output_tokens),
             effective_effort,
             service_tier: effective_service_tier,
@@ -8040,6 +8088,23 @@ where
         tool: ToolCall,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        let surface = if self.context.is_sub_agent && self.grace_turn_granted {
+            LlmToolSurface::SubAgentTerminal
+        } else {
+            LlmToolSurface::Full
+        };
+        if surface == LlmToolSurface::SubAgentTerminal
+            && !matches!(tool.name(), "submit_result" | "submit_error")
+        {
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id: tool.id.clone(),
+                result: ToolResult::error(
+                    tool.id.clone(),
+                    "EUNAVAIL: tool is unavailable under the current conversation policy"
+                        .to_owned(),
+                ),
+            }));
+        }
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
             let advertised = self
@@ -8211,6 +8276,7 @@ where
                 root_conv_id,
                 tool_name,
                 tool_use_id,
+                surface,
             )
             .await;
             let _ = tool_tx.send(tool_outcome);
@@ -8978,7 +9044,10 @@ where
             messages,
             system: vec![SystemContent::new(system_prompt)],
             provider_replay: None,
-            tools: vec![], // No tools for continuation
+            responses_replay: Vec::new(),
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ), // No tools for continuation
             // Handoff quality favors completeness; cap high enough that a
             // thorough summary is not truncated mid-thought.
             max_tokens: Some(u32::try_from(continuation_output_reserve).unwrap_or(u32::MAX)),
@@ -10571,126 +10640,6 @@ fn normalize_task_file_repo_relative(
     }
 }
 
-/// Remove `tool_use` and `tool_result` blocks that reference tools not in the current set.
-///
-/// Handles mode transitions (e.g., Explore -> Work) where the tool set changes
-/// but the conversation history contains `tool_use` blocks for the old set.
-/// Anthropic's API rejects requests where `tool_use` blocks reference unavailable tools.
-///
-/// The DB history is not modified -- this operates on the in-memory message Vec only.
-#[allow(clippy::too_many_lines)] // one exhaustive provider-history capability projection
-fn strip_unavailable_tool_blocks(
-    messages: Vec<LlmMessage>,
-    available_tools: &std::collections::HashSet<&str>,
-    flatten_results: bool,
-) -> Vec<LlmMessage> {
-    use phoenix_llm::ContentBlock;
-
-    #[derive(Clone)]
-    enum StrippedToolUse {
-        Drop,
-        Flatten {
-            name: String,
-            input: serde_json::Value,
-        },
-    }
-
-    let mut stripped_count = 0usize;
-    let mut pending_results = std::collections::HashMap::<String, StrippedToolUse>::new();
-    let mut normalized = Vec::with_capacity(messages.len());
-    for msg in messages {
-        let mut next_results = std::collections::HashMap::<String, StrippedToolUse>::new();
-        let carries_tool_results = msg
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
-        if !carries_tool_results {
-            pending_results.clear();
-        }
-        let mut filtered = Vec::with_capacity(msg.content.len());
-        for block in msg.content {
-            match block {
-                ContentBlock::ToolUse { id, name, input }
-                    if !available_tools.contains(name.as_str()) =>
-                {
-                    stripped_count += 1;
-                    let disposition = if flatten_results || name == "commission_review" {
-                        StrippedToolUse::Flatten { name, input }
-                    } else {
-                        StrippedToolUse::Drop
-                    };
-                    next_results.insert(id, disposition);
-                }
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    images,
-                    is_error,
-                } => match pending_results.remove(&tool_use_id) {
-                    Some(StrippedToolUse::Flatten { name, input }) => {
-                        filtered.push(ContentBlock::Text {
-                            text: format!(
-                                "[historical tool result]\ntool: {name}\ninput: {input}\nstatus: {}\noutput:\n{content}",
-                                if is_error { "error" } else { "success" }
-                            ),
-                        });
-                        filtered.extend(
-                            images
-                                .into_iter()
-                                .map(|source| ContentBlock::Image { source }),
-                        );
-                    }
-                    Some(StrippedToolUse::Drop) => {}
-                    None => filtered.push(ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        images,
-                        is_error,
-                    }),
-                },
-                ContentBlock::ToolSearchToolResult {
-                    tool_use_id,
-                    mut content,
-                } => {
-                    content
-                        .tool_references
-                        .retain(|reference| available_tools.contains(reference.tool_name.as_str()));
-                    filtered.push(ContentBlock::ToolSearchToolResult {
-                        tool_use_id,
-                        content,
-                    });
-                }
-                block => filtered.push(block),
-            }
-        }
-        if !next_results.is_empty() {
-            pending_results = next_results;
-        } else if !carries_tool_results {
-            pending_results.clear();
-        }
-        if !filtered.is_empty() {
-            normalized.push(LlmMessage {
-                source_message_id: msg.source_message_id,
-                role: msg.role,
-                content: filtered,
-            });
-        }
-    }
-
-    if stripped_count > 0 {
-        tracing::debug!(
-            count = stripped_count,
-            "Stripping tool_use/tool_result blocks for unavailable tools"
-        );
-    }
-
-    if flatten_results {
-        flatten_tool_blocks(normalized)
-    } else {
-        normalized
-    }
-}
-
 #[cfg(test)]
 mod strip_tool_blocks_tests {
     use super::*;
@@ -11238,326 +11187,6 @@ mod strip_tool_blocks_tests {
             "sub-ratio text costs >= 1 token"
         );
         assert_eq!(estimate_text_tokens(&"x".repeat(5)), 2);
-    }
-
-    // ----- strip_unavailable_tool_blocks -----
-
-    #[test]
-    fn strip_unavailable_preserves_replay_owner_identity() {
-        let messages = vec![LlmMessage {
-            source_message_id: Some("accepted-request".into()),
-            role: MessageRole::Assistant,
-            content: vec![tool_use("tool-1", "bash")],
-        }];
-        let available = std::collections::HashSet::from(["bash"]);
-        let projected = strip_unavailable_tool_blocks(messages, &available, false);
-        assert_eq!(
-            projected[0].source_message_id.as_deref(),
-            Some("accepted-request")
-        );
-    }
-
-    #[test]
-    fn strip_unavailable_noop_when_all_tools_available() {
-        let available: std::collections::HashSet<&str> = ["bash", "patch"].into_iter().collect();
-        let msgs = vec![
-            assistant(vec![ContentBlock::text("x"), tool_use("t1", "bash")]),
-            user(vec![tool_result("t1")]),
-        ];
-        let out = strip_unavailable_tool_blocks(msgs.clone(), &available, false);
-        assert_eq!(out.len(), msgs.len());
-        assert_eq!(out[0].content.len(), 2);
-        assert_eq!(out[1].content.len(), 1);
-    }
-
-    #[test]
-    fn strip_unavailable_removes_tool_use_and_paired_result() {
-        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
-        let msgs = vec![
-            assistant(vec![
-                ContentBlock::text("mixed"),
-                tool_use("keep", "bash"),
-                tool_use("drop", "propose_task"),
-            ]),
-            user(vec![tool_result("keep"), tool_result("drop")]),
-        ];
-        let out = strip_unavailable_tool_blocks(msgs, &available, false);
-        // Assistant: text + the bash tool_use survive; propose_task tool_use is gone
-        assert_eq!(out[0].content.len(), 2);
-        assert!(out[0]
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "keep")));
-        // User message: only the tool_result for the surviving tool_use remains
-        assert_eq!(out[1].content.len(), 1);
-        assert!(
-            matches!(&out[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "keep")
-        );
-    }
-
-    #[test]
-    fn stripped_round_spans_consecutive_result_messages_before_id_reuse() {
-        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
-        let messages = vec![
-            assistant(vec![
-                tool_use("kept", "bash"),
-                tool_use("reused", "commission_review"),
-            ]),
-            user(vec![ContentBlock::ToolResult {
-                tool_use_id: "kept".to_string(),
-                content: "historical bash output".to_string(),
-                images: Vec::new(),
-                is_error: false,
-            }]),
-            user(vec![ContentBlock::ToolResult {
-                tool_use_id: "reused".to_string(),
-                content: "historical review".to_string(),
-                images: Vec::new(),
-                is_error: false,
-            }]),
-            assistant(vec![tool_use("reused", "bash")]),
-            user(vec![ContentBlock::ToolResult {
-                tool_use_id: "reused".to_string(),
-                content: "current bash output".to_string(),
-                images: Vec::new(),
-                is_error: false,
-            }]),
-        ];
-
-        let out = strip_unavailable_tool_blocks(messages, &available, false);
-
-        assert_eq!(out.len(), 5);
-        assert!(matches!(
-            &out[2].content[0],
-            ContentBlock::Text { text }
-                if text.contains("historical review") && text.contains("commission_review")
-        ));
-        assert!(matches!(
-            &out[3].content[0],
-            ContentBlock::ToolUse { id, name, .. } if id == "reused" && name == "bash"
-        ));
-        assert!(matches!(
-            &out[4].content[0],
-            ContentBlock::ToolResult { tool_use_id, content, .. }
-                if tool_use_id == "reused" && content == "current bash output"
-        ));
-    }
-
-    #[test]
-    fn repeated_tool_id_in_later_available_turn_is_not_flattened() {
-        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
-        let messages = vec![
-            assistant(vec![tool_use("reused", "commission_review")]),
-            user(vec![ContentBlock::ToolResult {
-                tool_use_id: "reused".to_string(),
-                content: "historical review".to_string(),
-                images: Vec::new(),
-                is_error: false,
-            }]),
-            assistant(vec![tool_use("reused", "bash")]),
-            user(vec![ContentBlock::ToolResult {
-                tool_use_id: "reused".to_string(),
-                content: "current bash output".to_string(),
-                images: Vec::new(),
-                is_error: false,
-            }]),
-        ];
-
-        let out = strip_unavailable_tool_blocks(messages, &available, false);
-
-        assert_eq!(out.len(), 3);
-        assert!(matches!(
-            &out[0].content[0],
-            ContentBlock::Text { text }
-                if text.contains("historical review") && text.contains("commission_review")
-        ));
-        assert!(matches!(
-            &out[1].content[0],
-            ContentBlock::ToolUse { id, name, .. } if id == "reused" && name == "bash"
-        ));
-        assert!(matches!(
-            &out[2].content[0],
-            ContentBlock::ToolResult { tool_use_id, content, .. }
-                if tool_use_id == "reused" && content == "current bash output"
-        ));
-    }
-
-    #[test]
-    fn strip_unavailable_flattens_hidden_commission_review_result() {
-        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
-        let msgs = vec![
-            assistant(vec![tool_use("review", "commission_review")]),
-            user(vec![ContentBlock::ToolResult {
-                tool_use_id: "review".to_string(),
-                content: "review finding summary".to_string(),
-                images: Vec::new(),
-                is_error: false,
-            }]),
-        ];
-
-        let out = strip_unavailable_tool_blocks(msgs, &available, false);
-
-        assert_eq!(out.len(), 1);
-        assert!(matches!(
-            &out[0].content[0],
-            ContentBlock::Text { text }
-                if text.contains("historical tool result")
-                    && text.contains("review finding summary")
-        ));
-    }
-
-    #[test]
-    fn grace_normalization_flattens_all_unavailable_tool_results() {
-        let terminal: std::collections::HashSet<&str> =
-            ["submit_result", "submit_error"].into_iter().collect();
-        let msgs = vec![
-            assistant(vec![ContentBlock::ToolUse {
-                id: "search-1".to_string(),
-                name: "search".to_string(),
-                input: serde_json::json!({ "pattern": "needle", "path": "src" }),
-            }]),
-            user(vec![ContentBlock::ToolResult {
-                tool_use_id: "search-1".to_string(),
-                content: "important finding".to_string(),
-                images: Vec::new(),
-                is_error: true,
-            }]),
-        ];
-
-        let out = strip_unavailable_tool_blocks(msgs, &terminal, true);
-
-        assert_eq!(out.len(), 1);
-        let ContentBlock::Text { text } = &out[0].content[0] else {
-            panic!("expected flattened text, got {:?}", out[0].content[0]);
-        };
-        assert!(text.contains("historical tool result"), "got: {text}");
-        assert!(text.contains("tool: search"), "got: {text}");
-        assert!(
-            text.contains(r#"input: {"pattern":"needle","path":"src"}"#),
-            "got: {text}"
-        );
-        assert!(text.contains("status: error"), "got: {text}");
-        assert!(text.contains("important finding"), "got: {text}");
-        assert!(!out
-            .iter()
-            .flat_map(|message| &message.content)
-            .any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
-                )
-            }));
-    }
-
-    #[test]
-    fn grace_normalization_preserves_tool_result_images_after_context_text() {
-        let terminal: std::collections::HashSet<&str> =
-            ["submit_result", "submit_error"].into_iter().collect();
-        let image = ImageSource::Base64 {
-            media_type: "image/png".to_string(),
-            data: "visual-evidence".to_string(),
-        };
-        let msgs = vec![
-            assistant(vec![tool_use("image-1", "read_image")]),
-            user(vec![ContentBlock::ToolResult {
-                tool_use_id: "image-1".to_string(),
-                content: "screenshot details".to_string(),
-                images: vec![image.clone()],
-                is_error: false,
-            }]),
-        ];
-
-        let out = strip_unavailable_tool_blocks(msgs, &terminal, true);
-
-        assert_eq!(out.len(), 1);
-        assert!(matches!(
-            &out[0].content[0],
-            ContentBlock::Text { text }
-                if text.contains("tool: read_image") && text.contains("screenshot details")
-        ));
-        assert_eq!(
-            out[0].content.get(1),
-            Some(&ContentBlock::Image { source: image }),
-            "visual evidence follows its flattened result context"
-        );
-    }
-
-    #[test]
-    fn grace_normalization_filters_server_tool_only_references() {
-        let terminal: std::collections::HashSet<&str> =
-            ["submit_result", "submit_error"].into_iter().collect();
-        let msgs = vec![assistant(vec![
-            server_tool_use("srv1", "tool_search_tool_regex"),
-            tool_search_result("srv1", &["search", "read_file"]),
-        ])];
-
-        let out = strip_unavailable_tool_blocks(msgs, &terminal, true);
-
-        assert_no_tool_blocks(&out);
-        let flattened = out[0]
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(flattened.contains("server tool call"), "got: {flattened}");
-        assert!(flattened.contains("tool search result"), "got: {flattened}");
-    }
-
-    #[test]
-    fn strip_unavailable_filters_tool_search_references_in_place() {
-        // Mode transition mid-conversation: some referenced tools are gone.
-        // The ToolSearchToolResult block must survive (paired with its
-        // ServerToolUse) but its tool_references list is filtered.
-        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
-        let msgs = vec![assistant(vec![
-            tool_use("ghost", "removed_tool"), // forces stripped_ids non-empty path
-            server_tool_use("srv1", "tool_search_tool_regex"),
-            tool_search_result("srv1", &["bash", "removed_tool", "other"]),
-        ])];
-        let out = strip_unavailable_tool_blocks(msgs, &available, false);
-        assert_eq!(out.len(), 1);
-
-        let ts_block = out[0]
-            .content
-            .iter()
-            .find_map(|b| {
-                if let ContentBlock::ToolSearchToolResult { content, .. } = b {
-                    Some(content)
-                } else {
-                    None
-                }
-            })
-            .expect("tool_search block should survive");
-        assert_eq!(
-            ts_block.tool_references.len(),
-            1,
-            "only references to available tools should remain"
-        );
-        assert_eq!(ts_block.tool_references[0].tool_name, "bash");
-
-        // ServerToolUse must NOT be stripped — it pairs with the tool_search
-        // result and orphaning it would 400 the request.
-        assert!(out[0]
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ServerToolUse { id, .. } if id == "srv1")));
-    }
-
-    #[test]
-    fn strip_unavailable_drops_messages_that_become_empty() {
-        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
-        let msgs = vec![
-            assistant(vec![tool_use("t1", "removed_tool")]),
-            user(vec![tool_result("t1")]),
-            assistant(vec![ContentBlock::text("survives")]),
-        ];
-        let out = strip_unavailable_tool_blocks(msgs, &available, false);
-        assert_eq!(out.len(), 1);
-        assert!(matches!(&out[0].content[0], ContentBlock::Text { text } if text == "survives"));
     }
 }
 
@@ -14040,7 +13669,7 @@ mod authoritative_user_message_effect_tests {
             rt.llm_task_handle.take().unwrap().await.unwrap();
             let requests = rt.llm_client.recorded_requests();
             let request = requests.last().unwrap();
-            assert!(request.tools.is_empty());
+            assert!(request.tool_availability.callable_names().is_empty());
             let attributed_seed = format!("[Input of unknown historical origin]\n{seed}");
             assert_eq!(
                 request.messages[0].content[0].render_text(),
@@ -20576,8 +20205,7 @@ mod steer_drain_detector_tests {
         .expect("checkpoint tool round");
         let messages = storage.get_all_messages("conv-replay-owner");
         let rendered = render_messages(&messages, &std::collections::HashSet::new());
-        let available = std::collections::HashSet::from(["bash"]);
-        let projected = strip_unavailable_tool_blocks(rendered, &available, false);
+        let projected = rendered;
         assert_eq!(
             projected
                 .iter()
@@ -21501,11 +21129,12 @@ mod subagent_grace_tool_surface_tests {
         }
         let request = llm.recorded_requests().remove(0);
         let names: Vec<&str> = request
-            .tools
+            .tool_availability
+            .callable_names()
             .iter()
-            .map(|tool| tool.name.as_str())
+            .map(String::as_str)
             .collect();
-        assert_eq!(names, vec!["submit_result", "submit_error"]);
+        assert_eq!(names, vec!["submit_error", "submit_result"]);
         assert!(request.messages.iter().any(|message| {
             format!("{message:?}").contains("Only submit_result or submit_error")
         }));
@@ -21566,9 +21195,10 @@ mod subagent_grace_tool_surface_tests {
         }
         let request = llm.recorded_requests().remove(0);
         let names: Vec<&str> = request
-            .tools
+            .tool_availability
+            .callable_names()
             .iter()
-            .map(|tool| tool.name.as_str())
+            .map(String::as_str)
             .collect();
         assert!(
             names.contains(&"search"),
@@ -21638,11 +21268,12 @@ mod subagent_grace_tool_surface_tests {
         }
         let request = llm.recorded_requests().remove(0);
         let names: Vec<&str> = request
-            .tools
+            .tool_availability
+            .callable_names()
             .iter()
-            .map(|tool| tool.name.as_str())
+            .map(String::as_str)
             .collect();
-        assert_eq!(names, vec!["submit_result", "submit_error"]);
+        assert_eq!(names, vec!["submit_error", "submit_result"]);
         assert_eq!(
             runtime.llm_turn_count, 2,
             "retry must not spend another turn"

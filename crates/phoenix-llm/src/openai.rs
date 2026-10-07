@@ -12,6 +12,8 @@ use super::LlmError;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use phoenix_core::domain::llm_types::ProviderRequestTier;
+use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
+use phoenix_core::domain::responses_replay::ResponsesResponseSet;
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -61,6 +63,7 @@ pub async fn complete(
     request: &LlmRequest,
     use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
+    validate_responses_replay(request, &spec.api_name)?;
     if use_codex_backend {
         // Non-streaming callers do not consume deltas. Close the receiver so
         // awaited provider sends fail immediately instead of filling a bounded
@@ -136,7 +139,10 @@ pub async fn complete(
         LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
     })?;
 
-    normalize_responses_api_response(responses_response)
+    bind_responses_model(
+        normalize_responses_api_response(responses_response)?,
+        &spec.api_name,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +265,9 @@ struct ResponsesStreamAccumulator {
     /// Cache-write subset of `input_tokens` on GPT-5.6-era models.
     cache_write_tokens: u32,
     /// Completed output items collected from `response.output_item.done` events.
-    output_items: Vec<ResponsesApiOutput>,
+    output_items: BTreeMap<usize, ResponsesApiOutput>,
+    response_id: String,
+    model: String,
     /// Set true when `response.done` is received.
     pub done: bool,
     /// Logged-once flag: first empty-`dispatch_type` event per stream gets a
@@ -279,7 +287,9 @@ impl ResponsesStreamAccumulator {
             reasoning_tokens: None,
             cached_tokens: 0,
             cache_write_tokens: 0,
-            output_items: Vec::new(),
+            output_items: BTreeMap::new(),
+            response_id: String::new(),
+            model: String::new(),
             done: false,
             logged_empty_dispatch: false,
             telemetry: StreamTelemetryRecorder::new(
@@ -362,10 +372,10 @@ impl ResponsesStreamAccumulator {
                     match serde_json::from_value::<ResponsesApiOutput>(item.clone()) {
                         Ok(output) => {
                             tracing::debug!(
-                                output_type = %output.r#type,
+                                output_type = %output.output_type(),
                                 "responses_api output item collected"
                             );
-                            match output.r#type.as_str() {
+                            match output.output_type() {
                                 "function_call" => self
                                     .telemetry
                                     .record_generation_event_at(now, GenerationKind::Tool),
@@ -377,7 +387,12 @@ impl ResponsesStreamAccumulator {
                                     .record_generation_event_at(now, GenerationKind::Structured),
                                 _ => {}
                             }
-                            self.output_items.push(output);
+                            let index = v
+                                .get("output_index")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|index| usize::try_from(index).ok())
+                                .unwrap_or(self.output_items.len());
+                            self.output_items.insert(index, output);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -454,6 +469,18 @@ impl ResponsesStreamAccumulator {
             // OpenAI Responses API terminal event. Task 583 spec incorrectly named
             // this "response.done" — the actual OpenAI spec uses "response.completed".
             "response.completed" => {
+                if let Some(id) = v
+                    .pointer("/response/id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.response_id = id.to_string();
+                }
+                if let Some(model) = v
+                    .pointer("/response/model")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.model = model.to_string();
+                }
                 if let Some(usage) = v.pointer("/response/usage") {
                     tracing::debug!(usage = %usage, "responses_api usage extracted");
                     self.input_tokens = u32::try_from(
@@ -494,26 +521,17 @@ impl ResponsesStreamAccumulator {
                         "responses_api terminal event had no /response/usage"
                     );
                 }
-                // Fallback: recover the assembled output from the terminal
-                // event's `/response/output` array when no per-item.done
-                // events arrived. Observed against the AI gateway path on
-                // 2026-05-11: stream emitted `response.output_item.added` +
-                // `response.content_part.added` + several events with no
-                // SSE `event:` line and no JSON `type` field, then
-                // `response.completed` — no `response.output_item.done`.
-                // Per-item events captured nothing, the terminal payload
-                // contained the full assembled message, and Phoenix
-                // persisted an empty agent message ("end_turn with empty
-                // content"). Reading /response/output as authoritative
-                // here removes the single-event dependency.
-                if self.output_items.is_empty() {
+                {
                     if let Some(arr) = v
                         .pointer("/response/output")
                         .and_then(serde_json::Value::as_array)
                     {
-                        for item in arr {
+                        self.output_items.clear();
+                        for (index, item) in arr.iter().enumerate() {
                             match serde_json::from_value::<ResponsesApiOutput>(item.clone()) {
-                                Ok(output) => self.output_items.push(output),
+                                Ok(output) => {
+                                    self.output_items.insert(index, output);
+                                }
                                 Err(e) => tracing::warn!(
                                     error = %e,
                                     item_type = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
@@ -525,8 +543,7 @@ impl ResponsesStreamAccumulator {
                         if !self.output_items.is_empty() {
                             tracing::info!(
                                 n = self.output_items.len(),
-                                "responses_api recovered output from response.completed \
-                                 (no per-item.done events seen on stream)"
+                                "responses_api accepted authoritative response.completed output"
                             );
                         }
                     }
@@ -552,8 +569,8 @@ impl ResponsesStreamAccumulator {
 
     fn output_items_as_values(&self) -> Vec<serde_json::Value> {
         self.output_items
-            .iter()
-            .filter_map(|item| serde_json::to_value(item).ok())
+            .values()
+            .map(|item| item.0.clone())
             .collect()
     }
 
@@ -566,8 +583,10 @@ impl ResponsesStreamAccumulator {
         );
         let telemetry = self.telemetry;
         let mut response = normalize_responses_api_response(ResponsesApiResponse {
+            id: self.response_id,
+            model: self.model,
             status: "completed".to_string(),
-            output: self.output_items,
+            output: self.output_items.into_values().collect(),
             usage: ResponsesApiUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -1182,7 +1201,13 @@ async fn complete_codex_websocket(
                 "WebSocket completed without response id",
             ))
         })?;
-        let response = acc.into_response().map_err(CodexWsError::backend)?;
+        let model = match full_request {
+            ResponsesBackendRequest::Platform(request) => &request.model,
+            ResponsesBackendRequest::CodexLite(request) => &request.model,
+        };
+        let response =
+            bind_responses_model(acc.into_response().map_err(CodexWsError::backend)?, model)
+                .map_err(CodexWsError::backend)?;
         Ok::<_, CodexWsError>((response, id, server_output))
     }
     .await;
@@ -1268,6 +1293,7 @@ pub async fn complete_streaming(
     use_codex_backend: bool,
     ws_sessions: Option<&Arc<Mutex<CodexWsSessions>>>,
 ) -> Result<LlmResponse, LlmError> {
+    validate_responses_replay(request, &spec.api_name)?;
     let url = resolve_endpoint(base_url_override);
     let mut responses_request = translate_to_backend_request(
         &spec.api_name,
@@ -1441,7 +1467,7 @@ pub async fn complete_streaming(
             .await?;
     }
 
-    acc.into_response()
+    bind_responses_model(acc.into_response()?, &spec.api_name)
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
@@ -1462,7 +1488,7 @@ fn translate_to_responses_request(
 
     let mut input_items = Vec::new();
 
-    let instructions = if request.system.is_empty() {
+    let mut instructions = if request.system.is_empty() {
         if use_codex_backend {
             Some("You are a helpful assistant.".to_string())
         } else {
@@ -1479,8 +1505,26 @@ fn translate_to_responses_request(
         )
     };
 
+    if !official_openai_route || use_codex_backend {
+        append_advisory(&mut instructions, request);
+    }
+
     // Process each message as a unit to allow grouping text + images
     for msg in &request.messages {
+        if let Some(replay) = request.responses_replay.iter().find(|set| {
+            msg.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                && msg.content == set.public_content
+                && set.model == api_name
+        }) {
+            input_items.extend(
+                replay
+                    .output_items
+                    .iter()
+                    .cloned()
+                    .map(ResponsesApiInputItem::Replay),
+            );
+            continue;
+        }
         let role = match msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
@@ -1626,22 +1670,24 @@ fn translate_to_responses_request(
         }
     }
 
-    let tools: Option<Vec<ResponsesApiTool>> = if request.tools.is_empty() {
-        None
-    } else {
-        Some(
-            request
-                .tools
-                .iter()
-                .map(|t| ResponsesApiTool {
-                    r#type: "function".to_string(),
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    parameters: t.input_schema.clone(),
-                })
-                .collect(),
-        )
-    };
+    let tools: Option<Vec<ResponsesApiTool>> =
+        if request.tool_availability.declarations().is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .tool_availability
+                    .declarations()
+                    .iter()
+                    .map(|t| ResponsesApiTool {
+                        r#type: "function".to_string(),
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.input_schema.clone(),
+                    })
+                    .collect(),
+            )
+        };
 
     let explicit_cache_supported =
         !use_codex_backend && official_openai_route && supports_explicit_prompt_cache(api_name);
@@ -1649,7 +1695,7 @@ fn translate_to_responses_request(
         place_explicit_cache_breakpoints(&mut input_items);
     }
 
-    let has_tools = !request.tools.is_empty();
+    let has_tools = !request.tool_availability.declarations().is_empty();
     ResponsesApiRequest {
         model: api_name.to_string(),
         input: input_items,
@@ -1665,7 +1711,11 @@ fn translate_to_responses_request(
             )
         },
         stream: None,
-        store: if use_codex_backend { Some(false) } else { None },
+        store: if use_codex_backend || official_openai_route {
+            Some(false)
+        } else {
+            None
+        },
         prompt_cache_key: Some(request.cache_key.as_str().to_string()),
         prompt_cache_options: explicit_cache_supported.then_some(PromptCacheOptions {
             mode: PromptCacheMode::Implicit,
@@ -1681,15 +1731,7 @@ fn translate_to_responses_request(
         )
         .responses_request_value()
         .map(str::to_string),
-        // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
-        // mirrors the server-side default but stabilises the wire shape so
-        // non-default strategies become a smaller change later. Omitted when
-        // no tools are sent (the API rejects "auto" without a tools array).
-        tool_choice: if has_tools {
-            Some("auto".to_string())
-        } else {
-            None
-        },
+        tool_choice: responses_tool_choice(request, official_openai_route && !use_codex_backend),
         // `parallel_tool_calls: true` lets the model emit multiple ToolUse
         // blocks in one assistant message. Phoenix's executor runs tools
         // serially (state.rs `ToolExecuting { current_tool, remaining_tools }`),
@@ -1702,9 +1744,199 @@ fn translate_to_responses_request(
         // a parallel executor (then this becomes a true no-brainer) or if we
         // see the model batching too aggressively in practice.
         parallel_tool_calls: if has_tools { Some(true) } else { None },
-        include: Vec::new(),
+        include: if official_openai_route || use_codex_backend {
+            vec!["reasoning.encrypted_content".to_string()]
+        } else {
+            Vec::new()
+        },
         tags: None,
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ResponsesToolChoice {
+    Mode(ToolChoiceMode),
+    Allowed {
+        r#type: AllowedToolsType,
+        mode: AutoToolMode,
+        tools: Vec<ResponsesAllowedTool>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatToolChoice {
+    Mode(ToolChoiceMode),
+    Allowed {
+        r#type: AllowedToolsType,
+        allowed_tools: ChatAllowedTools,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolChoiceMode {
+    Auto,
+    None,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AutoToolMode {
+    Auto,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AllowedToolsType {
+    AllowedTools,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct ResponsesAllowedTool {
+    r#type: FunctionToolType,
+    name: String,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FunctionToolType {
+    Function,
+}
+#[derive(Debug, Serialize)]
+struct ChatAllowedTools {
+    mode: AutoToolMode,
+    tools: Vec<ChatAllowedTool>,
+}
+#[derive(Debug, Serialize)]
+struct ChatAllowedTool {
+    r#type: FunctionToolType,
+    function: ChatAllowedFunction,
+}
+#[derive(Debug, Serialize)]
+struct ChatAllowedFunction {
+    name: String,
+}
+
+fn responses_tool_choice(request: &LlmRequest, supported: bool) -> Option<ResponsesToolChoice> {
+    let policy = &request.tool_availability;
+    if policy.declarations().is_empty() {
+        return None;
+    }
+    if supported && policy.callable_names().is_empty() {
+        Some(ResponsesToolChoice::Mode(ToolChoiceMode::None))
+    } else if supported && policy.callable_names().len() < policy.declarations().len() {
+        Some(ResponsesToolChoice::Allowed {
+            r#type: AllowedToolsType::AllowedTools,
+            mode: AutoToolMode::Auto,
+            tools: policy
+                .callable_names()
+                .iter()
+                .map(|name| ResponsesAllowedTool {
+                    r#type: FunctionToolType::Function,
+                    name: name.clone(),
+                })
+                .collect(),
+        })
+    } else {
+        Some(ResponsesToolChoice::Mode(ToolChoiceMode::Auto))
+    }
+}
+
+fn chat_tool_choice(request: &LlmRequest, supported: bool) -> Option<ChatToolChoice> {
+    let policy = &request.tool_availability;
+    if policy.declarations().is_empty() {
+        return None;
+    }
+    if supported && policy.callable_names().is_empty() {
+        Some(ChatToolChoice::Mode(ToolChoiceMode::None))
+    } else if supported && policy.callable_names().len() < policy.declarations().len() {
+        Some(ChatToolChoice::Allowed {
+            r#type: AllowedToolsType::AllowedTools,
+            allowed_tools: ChatAllowedTools {
+                mode: AutoToolMode::Auto,
+                tools: policy
+                    .callable_names()
+                    .iter()
+                    .map(|name| ChatAllowedTool {
+                        r#type: FunctionToolType::Function,
+                        function: ChatAllowedFunction { name: name.clone() },
+                    })
+                    .collect(),
+            },
+        })
+    } else {
+        Some(ChatToolChoice::Mode(ToolChoiceMode::Auto))
+    }
+}
+
+fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
+    let unavailable: Vec<_> = request
+        .tool_availability
+        .declarations()
+        .iter()
+        .filter(|tool| !request.tool_availability.is_callable(&tool.name))
+        .map(|tool| tool.name.as_str())
+        .collect();
+    if unavailable.is_empty() {
+        return;
+    }
+    let text = instructions.get_or_insert_with(String::new);
+    text.push_str("\n\nThese tools are unavailable for new calls: ");
+    text.push_str(&unavailable.join(", "));
+    text.push_str(
+        ". Their definitions are retained for historical context. Choose available tools instead.",
+    );
+    tracing::debug!(
+        provider = "openai",
+        n = unavailable.len(),
+        "using advisory tool restriction on route without native support"
+    );
+}
+
+fn bind_responses_model(
+    mut response: LlmResponse,
+    api_name: &str,
+) -> Result<LlmResponse, LlmError> {
+    if let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay.as_mut() {
+        if set.response_id.is_empty() {
+            return Err(LlmError::invalid_response(
+                "Responses continuation response has no id",
+            ));
+        }
+        set.model = api_name.to_string();
+    }
+    Ok(response)
+}
+
+fn validate_responses_replay(request: &LlmRequest, api_name: &str) -> Result<(), LlmError> {
+    let mut owners_seen = std::collections::BTreeSet::new();
+    for set in &request.responses_replay {
+        if !owners_seen.insert(&set.owner_message_id) {
+            return Err(LlmError::invalid_request(
+                "duplicate Responses replay owner",
+            ));
+        }
+        set.validate().map_err(LlmError::invalid_request)?;
+        if set.model != api_name {
+            return Err(LlmError::invalid_request(
+                "Responses replay belongs to another model",
+            ));
+        }
+        let owners: Vec<_> = request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+            })
+            .collect();
+        if owners.len() != 1
+            || owners[0].role != MessageRole::Assistant
+            || owners[0].content != set.public_content
+        {
+            return Err(LlmError::invalid_request(
+                "Responses replay owner was removed or rewritten",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
@@ -1792,7 +2024,8 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
             ResponsesApiInputItem::AssistantMessage { .. }
             | ResponsesApiInputItem::AdditionalTools { .. }
             | ResponsesApiInputItem::FunctionCall { .. }
-            | ResponsesApiInputItem::FunctionCallOutput { .. } => None,
+            | ResponsesApiInputItem::FunctionCallOutput { .. }
+            | ResponsesApiInputItem::Replay(_) => None,
         })
         .take(READ_BREAKPOINT_LIMIT)
         .for_each(InputMessageContent::mark_last_block);
@@ -1800,9 +2033,16 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
 
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
 fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
+    let output_items = resp.output.iter().map(|item| item.0.clone()).collect();
+    let has_reasoning = resp
+        .output
+        .iter()
+        .any(|item| item.output_type() == "reasoning");
     let mut content = Vec::new();
 
     for output in resp.output {
+        let output: ResponsesOutputView = serde_json::from_value(output.0)
+            .map_err(|error| LlmError::invalid_response(error.to_string()))?;
         match output.r#type.as_str() {
             "message" => {
                 if let Some(output_content) = output.content {
@@ -1878,7 +2118,7 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
         )));
     }
 
-    Ok(LlmResponse::non_streaming(content, end_turn, {
+    let mut response = LlmResponse::non_streaming(content, end_turn, {
         // Both detail buckets are subsets of OpenAI's inclusive
         // `input_tokens`. Split them out so Phoenix's additive Usage shape
         // preserves the provider-reported context total.
@@ -1896,7 +2136,21 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
             cache_creation_tokens: written,
             cache_read_tokens: cached,
         }
-    }))
+    });
+    response.provider_replay = if has_tool_calls && has_reasoning {
+        Some(ProviderReplayUpdate::Responses(ResponsesResponseSet {
+            response_id: resp.id,
+            model: resp.model,
+            owner_message_id: String::new(),
+            public_content: response.content.clone(),
+            output_items,
+        }))
+    } else if end_turn {
+        Some(ProviderReplayUpdate::Clear)
+    } else {
+        None
+    };
+    Ok(response)
 }
 
 // ===========================================================================
@@ -2145,15 +2399,12 @@ pub(crate) struct ResponsesApiRequest {
     /// explicitly to stabilise the wire shape and to make non-default
     /// strategies a smaller change later. Omitted when no tools are sent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tool_choice: Option<String>,
+    pub(crate) tool_choice: Option<ResponsesToolChoice>,
     /// Allow the model to emit multiple tool calls in one response. The
     /// server-side default is `true`; sent explicitly to stabilise wire
     /// shape. Omitted when no tools are sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parallel_tool_calls: Option<bool>,
-    /// Output items the server should include in the response. Keep empty
-    /// until Phoenix has a durable transcript representation for additional
-    /// output item types such as encrypted reasoning.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) include: Vec<String>,
     /// Free-form metadata forwarded to the gateway/proxy in front of the
@@ -2247,6 +2498,8 @@ pub(crate) enum ResponsesApiInputItem {
         call_id: String,
         output: ResponsesApiFunctionOutput,
     },
+    #[serde(untagged)]
+    Replay(serde_json::Value),
 }
 
 /// Roles whose message content is model input. `input_text`/`input_image` parts
@@ -2354,13 +2607,30 @@ pub(crate) struct ResponsesApiTool {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiResponse {
+    #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) model: String,
     pub(crate) status: String,
     pub(crate) output: Vec<ResponsesApiOutput>,
     pub(crate) usage: ResponsesApiUsage,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ResponsesApiOutput {
+#[serde(transparent)]
+pub(crate) struct ResponsesApiOutput(serde_json::Value);
+
+impl ResponsesApiOutput {
+    fn output_type(&self) -> &str {
+        self.0
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesOutputView {
     pub(crate) r#type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<Vec<ResponsesApiContent>>,
@@ -2425,7 +2695,11 @@ pub async fn complete_chat(
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
     let url = resolve_chat_endpoint(base_url_override);
-    let mut chat_request = translate_to_chat_request(&spec.api_name, request);
+    let mut chat_request = translate_to_chat_request_with_route(
+        &spec.api_name,
+        request,
+        base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions"),
+    );
     if !request_tags.is_empty() {
         chat_request.tags = Some(request_tags.clone());
     }
@@ -2482,7 +2756,11 @@ pub async fn complete_streaming_chat(
     use futures::StreamExt;
 
     let url = resolve_chat_endpoint(base_url_override);
-    let mut chat_request = translate_to_chat_request(&spec.api_name, request);
+    let mut chat_request = translate_to_chat_request_with_route(
+        &spec.api_name,
+        request,
+        base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions"),
+    );
     chat_request.stream = Some(true);
     chat_request.stream_options = Some(ChatStreamOptions {
         include_usage: true,
@@ -2551,8 +2829,17 @@ pub async fn complete_streaming_chat(
 }
 
 /// Translate `LlmRequest` to `ChatCompletionsRequest`.
-#[allow(clippy::too_many_lines)] // single-pass message translation
+#[cfg(test)]
 fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatCompletionsRequest {
+    translate_to_chat_request_with_route(api_name, request, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn translate_to_chat_request_with_route(
+    api_name: &str,
+    request: &LlmRequest,
+    official_route: bool,
+) -> ChatCompletionsRequest {
     use super::types::ImageSource;
 
     let mut messages = Vec::new();
@@ -2571,6 +2858,19 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
             tool_calls: None,
             tool_call_id: None,
         });
+    }
+
+    if !official_route {
+        let mut advisory = None;
+        append_advisory(&mut advisory, request);
+        if let Some(text) = advisory {
+            messages.push(ChatMessage {
+                role: "system".into(),
+                content: Some(ChatContent::Text(text)),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
     }
 
     for msg in &request.messages {
@@ -2699,12 +2999,13 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
         }
     }
 
-    let tools = if request.tools.is_empty() {
+    let tools = if request.tool_availability.declarations().is_empty() {
         None
     } else {
         Some(
             request
-                .tools
+                .tool_availability
+                .declarations()
                 .iter()
                 .map(|tool| ChatTool {
                     r#type: "function".to_string(),
@@ -2718,7 +3019,7 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
         )
     };
 
-    let has_tools = !request.tools.is_empty();
+    let has_tools = !request.tool_availability.declarations().is_empty();
     ChatCompletionsRequest {
         model: api_name.to_string(),
         messages,
@@ -2727,11 +3028,7 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
         reasoning_effort: request.effective_effort.explicit_level(),
         stream: None,
         stream_options: None,
-        tool_choice: if has_tools {
-            Some("auto".to_string())
-        } else {
-            None
-        },
+        tool_choice: chat_tool_choice(request, official_route),
         parallel_tool_calls: if has_tools { Some(true) } else { None },
         tags: None,
     }
@@ -3190,7 +3487,7 @@ struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ChatStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
+    tool_choice: Option<ChatToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3626,7 +3923,10 @@ mod tests {
                 })
                 .collect(),
             provider_replay: None,
-            tools: vec![],
+            responses_replay: vec![],
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
@@ -4443,13 +4743,190 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            tools: vec![],
+            responses_replay: vec![],
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::stable("test"),
         }
+    }
+
+    fn restricted_request(callable: &[&str]) -> LlmRequest {
+        let mut request = empty_request();
+        request.tool_availability = phoenix_core::domain::tool_availability::ToolAvailability::new(
+            ["bash", "propose_plan"]
+                .into_iter()
+                .map(|name| super::super::types::ToolDefinition {
+                    name: name.into(),
+                    description: name.into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    defer_loading: false,
+                })
+                .collect(),
+            callable.iter().map(|name| (*name).to_string()).collect(),
+        )
+        .unwrap();
+        request
+    }
+
+    #[test]
+    fn tool_policy_uses_distinct_native_shapes_and_advisory_on_unknown_routes() {
+        let request = restricted_request(&["bash"]);
+        let responses = serde_json::to_value(translate_to_responses_request(
+            "gpt-6", &request, false, true,
+        ))
+        .unwrap();
+        assert_eq!(
+            responses["tool_choice"],
+            serde_json::json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"bash"}]})
+        );
+        assert_eq!(responses["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(responses["store"], false);
+        assert_eq!(
+            responses["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        let chat = serde_json::to_value(translate_to_chat_request_with_route(
+            "gpt-6", &request, true,
+        ))
+        .unwrap();
+        assert_eq!(
+            chat["tool_choice"],
+            serde_json::json!({"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"function","function":{"name":"bash"}}]}})
+        );
+        let unknown = serde_json::to_value(translate_to_responses_request(
+            "proxy", &request, false, false,
+        ))
+        .unwrap();
+        assert_eq!(unknown["tool_choice"], "auto");
+        assert!(unknown["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("propose_plan"));
+        let unknown_chat = serde_json::to_value(translate_to_chat_request_with_route(
+            "proxy", &request, false,
+        ))
+        .unwrap();
+        assert_eq!(unknown_chat["tool_choice"], "auto");
+        assert!(unknown_chat["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("propose_plan"));
+        let none = restricted_request(&[]);
+        assert_eq!(
+            serde_json::to_value(responses_tool_choice(&none, true)).unwrap(),
+            "none"
+        );
+        assert_eq!(
+            serde_json::to_value(chat_tool_choice(&none, true)).unwrap(),
+            "none"
+        );
+    }
+
+    fn reasoning_response(id: &str, call: &str) -> serde_json::Value {
+        serde_json::json!({"id":id,"model":"gpt-6","status":"completed","usage":{"input_tokens":1,"output_tokens":2},"output":[
+            {"type":"reasoning","id":format!("reasoning-{id}"),"summary":[],"encrypted_content":"opaque","unexpected":null},
+            {"type":"message","id":format!("message-{id}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":"Checking","annotations":[]}]},
+            {"type":"function_call","id":format!("item-{call}"),"call_id":call,"name":"bash","arguments":"{}","status":"completed"}
+        ]})
+    }
+
+    #[test]
+    fn responses_replay_preserves_full_envelopes_across_multiple_tool_rounds() {
+        let mut request = restricted_request(&["bash"]);
+        let mut expected = Vec::new();
+        for (id, call) in [("r1", "c1"), ("r2", "c2")] {
+            let wire = reasoning_response(id, call);
+            let response =
+                normalize_responses_api_response(serde_json::from_value(wire.clone()).unwrap())
+                    .unwrap();
+            assert_eq!(
+                response.content.len(),
+                2,
+                "private reasoning never becomes public content"
+            );
+            let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay else {
+                panic!("missing private continuation");
+            };
+            let set = set.with_owner_message_id(id.into());
+            assert_eq!(set.output_items, wire["output"].as_array().unwrap().clone());
+            expected.extend(set.output_items.clone());
+            request.messages.push(super::super::types::LlmMessage {
+                source_message_id: Some(id.into()),
+                role: MessageRole::Assistant,
+                content: set.public_content.clone(),
+            });
+            request.responses_replay.push(set);
+            request.messages.push(super::super::types::LlmMessage {
+                source_message_id: None,
+                role: MessageRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: call.into(),
+                    content: "unavailable".into(),
+                    is_error: true,
+                    images: vec![],
+                }],
+            });
+            expected.push(serde_json::json!({"type":"function_call_output","call_id":call,"output":"Error: unavailable"}));
+        }
+        validate_responses_replay(&request, "gpt-6").unwrap();
+        let translated = serde_json::to_value(translate_to_responses_request(
+            "gpt-6", &request, false, true,
+        ))
+        .unwrap();
+        assert_eq!(translated["input"], serde_json::Value::Array(expected));
+        request.messages[0].content.clear();
+        assert!(validate_responses_replay(&request, "gpt-6").is_err());
+    }
+
+    #[test]
+    fn tool_round_without_reasoning_retains_existing_private_context() {
+        let mut wire = reasoning_response("r1", "c1");
+        wire["output"].as_array_mut().unwrap().remove(0);
+        let response =
+            normalize_responses_api_response(serde_json::from_value(wire.clone()).unwrap())
+                .unwrap();
+        assert!(!response.end_turn);
+        assert!(response.provider_replay.is_none());
+        wire["output"].as_array_mut().unwrap().pop();
+        let response =
+            normalize_responses_api_response(serde_json::from_value(wire).unwrap()).unwrap();
+        assert!(response.end_turn);
+        assert!(matches!(
+            response.provider_replay,
+            Some(ProviderReplayUpdate::Clear)
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_replay_retains_terminal_encrypted_reasoning_and_output_order() {
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let wire = reasoning_response("r1", "c1");
+        for index in [2, 0, 1] {
+            let mut item = wire["output"][index].clone();
+            if index == 0 {
+                item.as_object_mut().unwrap().remove("encrypted_content");
+            }
+            let event = serde_json::json!({"type":"response.output_item.done","output_index":index,"item":item});
+            acc.process_event("response.output_item.done", &event.to_string(), &tx)
+                .await
+                .unwrap();
+        }
+        let complete = serde_json::json!({"type":"response.completed","response":wire});
+        acc.process_event("response.completed", &complete.to_string(), &tx)
+            .await
+            .unwrap();
+        let response = acc.into_response().unwrap();
+        let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay else {
+            panic!("missing private continuation");
+        };
+        assert_eq!(set.output_items, wire["output"].as_array().unwrap().clone());
+        assert_eq!(response.content.len(), 2);
     }
 
     #[test]
@@ -5500,8 +5977,10 @@ mod tests {
         assert_eq!(acc.cache_write_tokens, 200);
 
         let resp = normalize_responses_api_response(ResponsesApiResponse {
+            id: String::new(),
+            model: String::new(),
             status: "completed".to_string(),
-            output: acc.output_items,
+            output: acc.output_items.into_values().collect(),
             usage: ResponsesApiUsage {
                 input_tokens: acc.input_tokens,
                 output_tokens: acc.output_tokens,
@@ -5663,6 +6142,8 @@ mod tests {
             serde_json::from_str(r#"{"input_tokens":10,"output_tokens":0}"#).unwrap();
         assert_eq!(usage.input_tokens_details.cached_tokens, 0);
         let resp = normalize_responses_api_response(ResponsesApiResponse {
+            id: String::new(),
+            model: String::new(),
             status: "completed".to_string(),
             output: vec![],
             usage,
@@ -5680,6 +6161,8 @@ mod tests {
     #[tokio::test]
     async fn responses_api_empty_content_with_billed_tokens_is_retryable_error() {
         let err = normalize_responses_api_response(ResponsesApiResponse {
+            id: String::new(),
+            model: String::new(),
             status: "completed".to_string(),
             output: vec![],
             usage: ResponsesApiUsage {
@@ -5706,18 +6189,9 @@ mod tests {
     #[tokio::test]
     async fn responses_api_refusal_message_surfaces_as_text_not_retried() {
         let resp = normalize_responses_api_response(ResponsesApiResponse {
+            id: String::new(), model: String::new(),
             status: "completed".to_string(),
-            output: vec![ResponsesApiOutput {
-                r#type: "message".to_string(),
-                content: Some(vec![ResponsesApiContent {
-                    r#type: "refusal".to_string(),
-                    text: None,
-                    refusal: Some("I can't help with that.".to_string()),
-                }]),
-                name: None,
-                arguments: None,
-                call_id: None,
-            }],
+            output: vec![ResponsesApiOutput(serde_json::json!({"type":"message", "content":[{"type":"refusal", "refusal":"I can't help with that."}]}))],
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
                 output_tokens: 7,
@@ -5740,11 +6214,8 @@ mod tests {
         }
     }
 
-    /// If both `response.output_item.done` and `response.completed` carry
-    /// output, the per-item events win — don't double-count by appending the
-    /// terminal-event payload on top.
     #[tokio::test]
-    async fn process_event_fallback_skips_when_output_items_already_captured() {
+    async fn process_event_terminal_output_replaces_items_without_duplication() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let item_done = r#"{
@@ -5773,7 +6244,7 @@ mod tests {
         assert_eq!(
             acc.output_items.len(),
             1,
-            "fallback must not duplicate items already captured via item.done"
+            "terminal output must replace, rather than append to, item.done output"
         );
     }
 

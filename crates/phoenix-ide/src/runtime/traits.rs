@@ -558,6 +558,21 @@ pub trait StateStore: Send + Sync {
     /// The clearing pressure signal (specs/stale-tool-results, REQ-STR-001).
     async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String>;
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_tool_availability(
+        &self,
+        conversation_id: &str,
+        route_key: &str,
+        anchor_message_id: Option<&str>,
+        live_definitions: &[phoenix_llm::ToolDefinition],
+        callable_names: &std::collections::BTreeSet<String>,
+        visible_message_ids: &[String],
+        historical_tool_references: &[(String, String)],
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
+    async fn load_responses_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String>;
     async fn load_provider_replay_state(
         &self,
         conversation_id: &str,
@@ -567,7 +582,7 @@ pub trait StateStore: Send + Sync {
         conversation_id: &str,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String>;
     #[allow(clippy::too_many_arguments)]
     async fn persist_tool_round_state_and_provider_replay(
@@ -577,7 +592,7 @@ pub trait StateStore: Send + Sync {
         tool_results: &[Message],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String>;
 
     #[allow(clippy::too_many_arguments)]
@@ -634,6 +649,10 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    fn continuation_route_key(&self) -> String {
+        self.model_id().to_owned()
+    }
+
     /// Complete an LLM request (non-streaming)
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
 
@@ -1247,6 +1266,35 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).get_last_turn_prompt_tokens(conv_id).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_tool_availability(
+        &self,
+        conversation_id: &str,
+        route_key: &str,
+        anchor_message_id: Option<&str>,
+        live_definitions: &[phoenix_llm::ToolDefinition],
+        callable_names: &std::collections::BTreeSet<String>,
+        visible_message_ids: &[String],
+        historical_tool_references: &[(String, String)],
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        (**self)
+            .prepare_tool_availability(
+                conversation_id,
+                route_key,
+                anchor_message_id,
+                live_definitions,
+                callable_names,
+                visible_message_ids,
+                historical_tool_references,
+            )
+            .await
+    }
+    async fn load_responses_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+        (**self).load_responses_replay_state(conversation_id).await
+    }
     async fn load_provider_replay_state(
         &self,
         conversation_id: &str,
@@ -1258,7 +1306,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         conversation_id: &str,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         (**self)
             .update_state_and_provider_replay(conversation_id, state, state_updated_at, update)
@@ -1272,7 +1320,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         tool_results: &[Message],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         (**self)
             .persist_tool_round_state_and_provider_replay(
@@ -1367,6 +1415,10 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
 #[async_trait]
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    fn continuation_route_key(&self) -> String {
+        (**self).continuation_route_key()
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         (**self).complete(request).await
     }
@@ -2497,6 +2549,39 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_tool_availability(
+        &self,
+        conversation_id: &str,
+        route_key: &str,
+        anchor_message_id: Option<&str>,
+        live_definitions: &[phoenix_llm::ToolDefinition],
+        callable_names: &std::collections::BTreeSet<String>,
+        visible_message_ids: &[String],
+        historical_tool_references: &[(String, String)],
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        self.db
+            .prepare_tool_availability(
+                conversation_id,
+                route_key,
+                anchor_message_id,
+                live_definitions,
+                callable_names,
+                visible_message_ids,
+                historical_tool_references,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn load_responses_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+        self.db
+            .load_responses_replay_state(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
     async fn load_provider_replay_state(
         &self,
         conversation_id: &str,
@@ -2511,10 +2596,10 @@ impl StateStore for DatabaseStorage {
         conversation_id: &str,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         self.db
-            .update_state_and_provider_replay(conversation_id, state, state_updated_at, update)
+            .update_state_and_replay(conversation_id, state, state_updated_at, update)
             .await
             .map_err(|error| error.to_string())
     }
@@ -2526,10 +2611,10 @@ impl StateStore for DatabaseStorage {
         tool_results: &[Message],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         self.db
-            .persist_tool_round_state_and_provider_replay(
+            .persist_tool_round_state_and_replay(
                 conversation_id,
                 assistant,
                 tool_results,
@@ -2672,6 +2757,13 @@ impl RegistryLlmClient {
 
 #[async_trait]
 impl LlmClient for RegistryLlmClient {
+    fn continuation_route_key(&self) -> String {
+        self.registry.get(&self.model_id).map_or_else(
+            || self.model_id.clone(),
+            |service| service.continuation_route_key(),
+        )
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let llm = self.service()?;
         llm.complete(request).await

@@ -330,7 +330,8 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
         system: vec![],
         messages,
         provider_replay: None,
-        tools: vec![],
+        responses_replay: Vec::new(),
+        tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
         max_tokens: None,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
         service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
@@ -745,12 +746,14 @@ mod codex_request_shape {
         let mut req = make_llm_request(vec![user_msg("first turn")]);
         req.system = vec![SystemContent::new("be exact")];
         req.cache_key = PromptCacheKey::stable("conversation-1");
-        req.tools = vec![ToolDefinition {
-            name: "bash".into(),
-            description: "Run a command".into(),
-            input_schema: serde_json::json!({"type":"object","properties":{"cmd":{"type":"string"}}}),
-            defer_loading: false,
-        }];
+        req.tool_availability = phoenix_core::domain::tool_availability::ToolAvailability::all(
+            vec![ToolDefinition {
+                name: "bash".into(),
+                description: "Run a command".into(),
+                input_schema: serde_json::json!({"type":"object","properties":{"cmd":{"type":"string"}}}),
+                defer_loading: false,
+            }],
+        );
 
         let first =
             openai::test_helpers::translate_to_backend_request_wire("gpt-5.6-sol", &req, true);
@@ -792,12 +795,13 @@ mod codex_request_shape {
         use crate::types::{SystemContent, ToolDefinition};
         let mut req = make_llm_request(vec![user_msg("hi")]);
         req.system = vec![SystemContent::new("be exact")];
-        req.tools = vec![ToolDefinition {
-            name: "bash".into(),
-            description: "Run".into(),
-            input_schema: serde_json::json!({"type":"object"}),
-            defer_loading: false,
-        }];
+        req.tool_availability =
+            phoenix_core::domain::tool_availability::ToolAvailability::all(vec![ToolDefinition {
+                name: "bash".into(),
+                description: "Run".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                defer_loading: false,
+            }]);
         let platform =
             openai::test_helpers::translate_to_backend_request_wire("gpt-5.6-sol", &req, false);
         assert_eq!(platform["instructions"], "be exact");
@@ -849,19 +853,23 @@ mod codex_request_shape {
         // No tools → both fields omitted
         let no_tools = make_llm_request(vec![user_msg("hi")]);
         let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &no_tools);
-        assert_eq!(r.tool_choice, None);
+        assert!(r.tool_choice.is_none());
         assert_eq!(r.parallel_tool_calls, None);
 
         // With tools → both fields present with their explicit defaults
         let mut with_tools = make_llm_request(vec![user_msg("hi")]);
-        with_tools.tools = vec![ToolDefinition {
-            name: "bash".into(),
-            description: "Run a bash command".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-            defer_loading: false,
-        }];
+        with_tools.tool_availability =
+            phoenix_core::domain::tool_availability::ToolAvailability::all(vec![ToolDefinition {
+                name: "bash".into(),
+                description: "Run a bash command".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                defer_loading: false,
+            }]);
         let r = openai::test_helpers::translate_to_responses_request("gpt-5.5", &with_tools);
-        assert_eq!(r.tool_choice.as_deref(), Some("auto"));
+        assert_eq!(
+            serde_json::to_value(&r.tool_choice).unwrap(),
+            serde_json::json!("auto")
+        );
         assert_eq!(r.parallel_tool_calls, Some(true));
     }
 }

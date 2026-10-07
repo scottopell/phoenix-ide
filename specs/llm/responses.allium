@@ -39,13 +39,19 @@
 --   specs/llm/design.md        — OpenAI provider, codex 429 parsing
 --
 -- Cross-references:
---   crates/phoenix-ide/src/llm/openai.rs — translate_to_responses_request,
+--   crates/phoenix-llm/src/openai.rs — translate_to_responses_request,
 --       normalize_responses_api_response, ResponsesStreamAccumulator,
 --       classify_responses_error, parse_codex_error, resolve_endpoint
---   crates/phoenix-ide/src/llm/rate_limit.rs — QuotaDetails, header parse
---   crates/phoenix-ide/src/llm/error.rs      — from_http_status
+--   crates/phoenix-llm/src/rate_limit.rs — QuotaDetails, header parse
+--   crates/phoenix-llm/src/error.rs      — from_http_status
 
 use "./llm.allium" as llm
+
+-- First-party platform obligations; do not infer them for the Codex Responses
+-- Lite route or third-party Responses-compatible endpoints without evidence.
+-- https://developers.openai.com/api/docs/guides/function-calling
+-- https://developers.openai.com/api/docs/guides/reasoning
+-- https://developers.openai.com/api/reference/cli/resources/responses/methods/create
 
 ------------------------------------------------------------
 -- Enumerations
@@ -62,8 +68,7 @@ enum ResponsesStreamStatus { accumulating | done | failed }
 enum CodexWebSocketDisposition { full | incremental | http_fallback | backend_error }
 
 -- Where a translated wire content part sits. Both surfaces draw from the
--- same accepted-discriminant set — that shared set is exactly what the
--- 2026-05 incident violated for `function_call_output`.
+-- same accepted-discriminant set for input to the API.
 --   message_content       — the `content` array of an input message item
 --   function_call_output  — the `output` array of a function_call_output
 --                           item (a tool result fed back to the model)
@@ -72,7 +77,7 @@ enum ResponsesPartSurface { message_content | function_call_output }
 -- Discriminant of an output item in a Responses API response.
 --   message       — assistant text, carried as `output_text` parts
 --   function_call — a tool call the model wants Phoenix to run
---   reasoning     — internal model thinking; intentionally discarded
+--   reasoning     — provider-private continuation item, never public answer text
 --   other         — any unrecognised item type; ignored with a debug log
 enum ResponsesOutputKind { message | function_call | reasoning | other }
 
@@ -87,7 +92,7 @@ enum ResponsesOutputKind { message | function_call | reasoning | other }
 -- `has_output_content` is true iff at least one content block resulted
 -- (non-empty message text — an output_text or a refusal part — or a
 -- function_call). It is false when every output item was discarded
--- (reasoning) or empty — the condition the billed-but-empty guard
+-- (private-only items) or empty — the condition the billed-but-empty guard
 -- pairs with raw_output_tokens.
 value ResponsesRawResponse {
     status: String
@@ -99,6 +104,11 @@ value ResponsesRawResponse {
     has_output_content: Boolean
 }
 
+value ResponsesFunctionResult {
+    call_id: String
+    output: Any
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -108,13 +118,32 @@ entity ResponsesEndpoint {
     source: ResponsesEndpointSource
 }
 
+entity ResponsesToolChoice {
+    availability: llm/ToolAvailability
+    kind: ResponsesAutoTools | ResponsesNoTools | ResponsesAllowedTools | ResponsesAdvisoryTools
+}
+
+variant ResponsesAutoTools : ResponsesToolChoice {}
+variant ResponsesNoTools : ResponsesToolChoice {}
+variant ResponsesAdvisoryTools : ResponsesToolChoice {}
+variant ResponsesAllowedTools : ResponsesToolChoice {
+    allowed_names: List<String>
+}
+
+-- Opaque whole provider item, owned privately by its accepted assistant turn.
+-- It is not a public ContentBlock and cannot become visible reasoning text.
+entity ResponsesPrivateReasoningItem {
+    owner_message_id: String
+    item: Any
+}
+
 -- A streaming SSE accumulation in progress against the Responses API.
 -- Created when the streaming HTTP response returns success.
 --
 -- `recovered_from_completed` records that the output items were salvaged
 -- from the response.completed terminal payload because no per-item
 -- `response.output_item.done` events arrived — a real gateway behaviour
--- (observed 2026-05-11) that otherwise persisted an empty agent message.
+-- that otherwise could persist an empty agent message.
 --
 -- `input_tokens` is the raw count OpenAI reports; it is inclusive of
 -- `cached_tokens`. The cached subset is split out only at normalization.
@@ -149,10 +178,8 @@ entity ResponsesOutputItem {
 -- array. `wire_type` is the serialized `type` discriminant.
 --
 -- This entity exists so ResponsesContentPartTypeValid can range over
--- every emitted part. Before the 2026-05 fix the function_call_output
--- path produced parts with wire_type `text` / `image_url`; the message
--- path correctly produced `input_text` / `input_image`. The two paths
--- now share one part type, so they cannot diverge again.
+-- every emitted part. Message and function-call output surfaces each use
+-- input_text / input_image rather than Chat Completions discriminants.
 entity ResponsesWireContentPart {
     surface: ResponsesPartSurface
     wire_type: String
@@ -207,6 +234,101 @@ entity CodexWebSocketAttempt {
     disposition: CodexWebSocketDisposition
     emitted_before_success: Boolean
     beta_header: String
+}
+
+------------------------------------------------------------
+-- Contracts — first-party tool selection and continuation
+------------------------------------------------------------
+
+contract ResponsesToolContinuation {
+    continue_exchange: (returned_output: List<Any>, results: List<ResponsesFunctionResult>) -> List<Any>
+    select_tools: (availability: llm/ToolAvailability, support: llm/NativeToolRestrictionSupport) -> ResponsesToolChoice
+
+    @invariant ToolPolicyIsRenderedForResponses
+        -- Derive this request's selection from current conversation policy;
+        -- never serialize Anthropic tool_removal/tool_addition events or signed
+        -- private blocks. A fresh continuation renders portable public history
+        -- and current policy without retired previous_response_id/conversation
+        -- handles, private reasoning, or incremental transport state.
+        -- Retry/restart within the same context retains required reasoning.
+
+    @invariant CurrentSelectionIsSeparateFromHistory
+        -- tools declares functions the model may call on this request;
+        -- tool_choice controls generation independently of historical input.
+        -- Retain definitions and use allowed_tools to restrict the callable
+        -- subset without changing the declaration list. Use none for no calls.
+        -- There is no documented requirement that the callable set grows
+        -- monotonically, nor a requirement to delete history when it shrinks.
+        -- This contract does not assert that every historical tool name may
+        -- be omitted from declarations on every route without validation.
+
+    @invariant AllowedToolsWireShape
+        -- A restricted nonempty subset uses tool_choice =
+        -- {type:"allowed_tools", mode:"auto", tools:[{type:"function",name:N}]}.
+        -- Entries select declared tools; they are not replacement schemas.
+        -- mode=required forces at least one call and is not Phoenix's default.
+        -- Full eligibility uses auto; empty eligibility uses none.
+        -- This shape differs from Chat Completions' nested allowed_tools field.
+
+    @invariant FunctionResultsStayPaired
+        -- Preserve model-issued function_call IDs, names, and arguments;
+        -- append function_call_output with the matching call_id for each call.
+        -- A failure/unavailable outcome is conveyed through output (error JSON,
+        -- codes, or text), not an Anthropic is_error field. Never erase a failed
+        -- invocation or replay its side effect merely to rebuild the input.
+
+    @invariant ReasoningItemsContinuePrivately
+        -- For reasoning models, reasoning items returned with function calls
+        -- are passed back with the function outputs. Preserve the opaque items
+        -- and their order; do not replace them with visible text or a summary.
+        -- Stateful previous_response_id/conversation continuation may carry
+        -- these items server-side. Stateless/store=false and zero-data-retention
+        -- requests request include=["reasoning.encrypted_content"] and return
+        -- the resulting encrypted reasoning items unchanged with subsequent
+        -- input. Retention is a provider-private continuation obligation, not
+        -- permission to publish reasoning or include Anthropic signatures.
+
+    @invariant RouteCapabilityIsNotWireFamily
+        -- First-party platform allowed_tools support does not prove that the
+        -- Codex backend, Responses Lite, or a compatible proxy accepts it.
+        -- Unknown/unsupported restriction support uses retained declarations,
+        -- advisory instructions, and independent execution-time admission.
+        -- Changing tool_choice can change the non-input compatibility fingerprint
+        -- and require a full request rather than incremental WebSocket reuse;
+        -- that transport decision does not authorize deleting call history.
+}
+
+------------------------------------------------------------
+-- Rules — private continuation and current tool selection
+------------------------------------------------------------
+
+rule ResponsesReasoningItemRetained {
+    when: AcceptResponsesReasoningItem(owner_message_id, item)
+    ensures: ResponsesPrivateReasoningItem.created(owner_message_id: owner_message_id, item: item)
+    @guidance
+        -- Admission refers to an accepted, non-stale response. The item retains
+        -- its full provider envelope, including encrypted_content when returned;
+        -- its source order is retained by the continuation contract. It cannot
+        -- be reconstructed from a public reasoning summary after restart.
+}
+
+rule ResponsesToolChoiceSelected {
+    when: SelectResponsesTools(availability, support)
+    requires: support = supported
+    ensures:
+        if availability.callable_names.count = 0:
+            ResponsesNoTools.created(availability: availability)
+        else:
+            if availability.callable_names.count = availability.declarations.count:
+                ResponsesAutoTools.created(availability: availability)
+            else:
+                ResponsesAllowedTools.created(availability: availability, allowed_names: availability.callable_names)
+}
+
+rule ResponsesAdvisoryToolChoiceSelected {
+    when: SelectResponsesTools(availability, support)
+    requires: support in { unsupported, unknown }
+    ensures: ResponsesAdvisoryTools.created(availability: availability)
 }
 
 ------------------------------------------------------------
@@ -385,11 +507,9 @@ rule ResponsesMessageContentTranslated {
 -- one input_text part, then one input_image part per image. A tool_result
 -- with no images collapses to a plain-string `output` and emits no parts.
 --
--- The discriminants MUST be input_text / input_image. The 2026-05
--- incident emitted `text` / `image_url` here — the Chat Completions
--- shape — and every OpenAI conversation that fed an image back through a
--- tool result became unrecoverable (the bad item stays in history, so a
--- retry re-sends it and re-fails).
+-- The discriminants MUST be input_text / input_image. An incompatible
+-- tool-result part can make every subsequent request fail while it is
+-- retained in history.
 rule ResponsesToolResultOutputTranslated {
     when: TranslateResponsesToolResult(block)
 
@@ -477,7 +597,7 @@ rule ResponsesServerBlockDropped {
 --      rather than a silently-empty agent turn the user was billed for.
 --   2. Otherwise a normalized llm/LlmResponse. Output items map:
 --      message -> text content (both output_text and refusal parts),
---      function_call -> tool_use, reasoning -> discarded, other ->
+--      function_call -> tool_use, reasoning -> private continuation, other ->
 --      ignored. end_turn holds iff the status is "completed" AND no
 --      tool call is pending.
 --
@@ -524,8 +644,10 @@ rule ResponsesResponseNormalized {
         -- to zero. saturating_sub floors at 0; OpenAI guarantees the combined
         -- cache detail subsets do not exceed raw_input_tokens
         -- (ResponsesCachedSubsetOfInput), so the floor is defensive.
-        -- A "reasoning" item is dropped silently (internal thinking,
-        -- not transcript). A message's "refusal" part surfaces as text
+        -- A reasoning item is consumed by the private continuation channel
+        -- governed by ResponsesToolContinuation, never silently discarded
+        -- because it is absent from public normalized text. A message's
+        -- "refusal" part surfaces as text
         -- content — a declined turn is a real final answer, not a
         -- lost message to retry.
 }
@@ -590,7 +712,7 @@ rule ResponsesStreamCompleted {
 
     @guidance
         -- response.completed handler. The fallback exists because a
-        -- gateway path (observed 2026-05-11) emitted output_item.added
+        -- gateway path emitted output_item.added
         -- and content_part.added events but no output_item.done, then
         -- response.completed carrying the full assembled message.
         -- Without recovery the accumulator finalized empty and Phoenix
@@ -802,12 +924,17 @@ rule ResponsesCodex503Classified {
 -- Invariants
 ------------------------------------------------------------
 
+invariant ResponsesAllowedSelectionMatchesCurrentEligibility {
+    for choice in ResponsesToolChoices where choice.kind = ResponsesAllowedTools:
+        choice.allowed_names = choice.availability.callable_names
+        choice.allowed_names.count > 0
+        choice.allowed_names.count < choice.availability.declarations.count
+}
+
 -- LOAD-BEARING. Every content part emitted into a Responses API request
 -- — message content OR function_call_output — carries a discriminant the
--- API accepts. This is the formal statement of the contract the 2026-05
--- incident violated. A part with wire_type `text` or `image_url` (the
--- Chat Completions shape) fails this invariant; the API failed the
--- request with HTTP 400. The accepted set is verbatim from that 400.
+-- API accepts. A part with wire_type `text` or `image_url` (the
+-- Chat Completions shape) fails this invariant and causes HTTP 400.
 invariant ResponsesContentPartTypeValid {
     for part in ResponsesWireContentParts:
         part.wire_type in {
@@ -867,10 +994,9 @@ invariant ResponsesCacheDetailsSubsetOfInput {
 -- raw_output_tokens > 0 yields a retryable server_error, while a genuinely
 -- empty turn with output_tokens = 0 remains a valid empty llm/LlmResponse.
 --
--- Responses normalization discards `reasoning` output items. Multi-turn
--- reasoning replay through the Responses API `include` field is therefore out
--- of scope for this file until Phoenix has a durable transcript shape for
--- reasoning items.
+-- Responses reasoning output is not public transcript content. Required
+-- replay is governed by ResponsesToolContinuation independently of visible
+-- response normalization and of whether continuation is stateful or stateless.
 --
 -- ResponsesCodex429Classified / ResponsesCodex503Classified govern only the
 -- codex-backend path. Platform Responses HTTP/SSE failures use
@@ -880,3 +1006,14 @@ invariant ResponsesCacheDetailsSubsetOfInput {
 -- assembles whatever it already collected. This produces no distinct
 -- observable state beyond the normalized response, so it is left as a scope
 -- note rather than a separate rule.
+
+surface ResponsesToolContinuationBoundary {
+    facing: PhoenixRuntime
+    contracts:
+        fulfils ResponsesToolContinuation
+        fulfils llm/ToolHistoryIntegrity
+        demands llm/ProviderRequestProjection
+    provides:
+        AcceptResponsesReasoningItem(owner_message_id, item)
+        SelectResponsesTools(availability, support)
+}
