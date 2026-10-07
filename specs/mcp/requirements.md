@@ -338,6 +338,12 @@ AND, when a tool call returns HTTP 403 `insufficient_scope` with a
 previously granted scopes and the newly challenged scope, then retry, rather
 than surfacing a permanent tool failure.
 
+OAuth recovery SHALL retain the old session as non-callable cleanup ownership
+without requiring authenticated session deletion before token refresh or
+re-authorization. THE SYSTEM SHALL use the recovered bearer to finish that
+cleanup before making a replacement connection callable. An unresolved cleanup
+failure SHALL retain retry ownership and block replacement.
+
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very
 first handshake or every restart degrades into a fresh browser authorization,

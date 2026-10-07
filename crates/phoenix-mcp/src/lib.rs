@@ -26,7 +26,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use supervisor::{CallOutcome, CallRecovery, RecoveryClaim, SupervisorHandle, SupervisorState};
+use supervisor::{
+    CallOutcome, CallRecovery, RecoveryClaim, RecoveryPermit, SupervisorHandle, SupervisorState,
+};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -1631,8 +1633,7 @@ fn oauth_recovery_kind_parts(
 
 /// Outcome of refreshing an authorized server's token mid-recovery.
 enum RefreshServerOutcome {
-    /// The bearer was rotated in place; the server can rejoin the map.
-    Refreshed,
+    Refreshed(String),
     /// The refresh could not be attempted/completed for a reason that says
     /// nothing about the token (network failure to the authorization
     /// server); the token and server are kept.
@@ -1930,7 +1931,7 @@ impl McpClientManager {
         self.pending_oauth_urls.write().await.remove(&name);
         let config = resolved.config;
         let owner = self
-            .restart_oauth_owner(&name, &config, resolved.owner)
+            .restart_oauth_owner(&name, &config, resolved.owner, record.access_token)
             .await?;
 
         let manager = Arc::clone(self);
@@ -1989,6 +1990,7 @@ impl McpClientManager {
         name: &str,
         config: &McpServerConfig,
         owner: Option<(SupervisorHandle, u64)>,
+        access_token: String,
     ) -> Result<Option<(SupervisorHandle, u64)>, String> {
         // The flow is resolved; stop its loopback listener (if any) so it does
         // not hold the port for the rest of its window. On exchange failure the
@@ -2000,6 +2002,9 @@ impl McpClientManager {
             return Ok(None);
         };
         if handle.snapshot().epoch != epoch {
+            return Ok(None);
+        }
+        if !handle.finish_oauth_cleanup(epoch, access_token).await? {
             return Ok(None);
         }
         let new_epoch = handle.reconfigure(config.clone()).await.map_err(|error| {
@@ -2083,7 +2088,7 @@ impl McpClientManager {
             }
         };
         match oauth_refresh(&self.oauth, name, &url, www_authenticate, &token).await {
-            Ok(_) => RefreshServerOutcome::Refreshed,
+            Ok(access_token) => RefreshServerOutcome::Refreshed(access_token),
             Err(RefreshFailure::Transient(e)) => RefreshServerOutcome::Transient(format!(
                 "MCP server '{name}': OAuth token refresh failed: {e}"
             )),
@@ -2727,7 +2732,11 @@ impl McpClientManager {
         observed_epoch: u64,
         kind: OAuthRecoveryKind,
     ) -> Result<(), McpToolCallError> {
-        let permit = match handle.claim_recovery(observed_epoch).await {
+        let claim = match kind {
+            OAuthRecoveryKind::Refresh { .. } => handle.claim_oauth_recovery(observed_epoch).await,
+            OAuthRecoveryKind::StepUp { .. } => handle.claim_recovery(observed_epoch).await,
+        };
+        let permit = match claim {
             RecoveryClaim::Leader(permit) => permit,
             RecoveryClaim::Follow(_) => {
                 return self.wait_for_ready(handle, &CancellationToken::new()).await;
@@ -2738,103 +2747,43 @@ impl McpClientManager {
 
         match kind {
             OAuthRecoveryKind::Refresh { www_authenticate } => {
-                match self
+                let outcome = self
                     .refresh_authorized_server(
                         server_name,
                         &permit.config,
                         www_authenticate.as_deref(),
                     )
-                    .await
-                {
-                    RefreshServerOutcome::Refreshed => {
-                        let result = Self::connect_one(
-                            server_name,
-                            &permit.config,
-                            Arc::clone(&self.pending_oauth_urls),
-                            Arc::clone(&self.oauth),
-                        )
-                        .await;
-                        match result {
-                            Ok(server) => {
-                                if handle.publish(permit.epoch, server).await {
-                                    Ok(())
-                                } else {
-                                    Err(McpToolCallError::Failed(
-                                        "MCP OAuth recovery was superseded".to_string(),
-                                    ))
-                                }
+                    .await;
+                if let RefreshServerOutcome::Transient(error) = outcome {
+                    let manager = Arc::clone(self);
+                    let name = server_name.to_string();
+                    let retry_handle = handle.clone();
+                    self.spawn_background(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            if retry_handle.snapshot().epoch != permit.epoch {
+                                return;
                             }
-                            Err(failure) => {
-                                let error = failure.message.clone();
-                                handle
-                                    .fail_with_teardown_retry(
-                                        permit.epoch,
-                                        failure.message,
-                                        failure.teardown_retry,
-                                    )
-                                    .await;
-                                Err(McpToolCallError::Failed(error))
-                            }
-                        }
-                    }
-                    RefreshServerOutcome::Transient(error) => {
-                        let reconnect_epoch = handle
-                            .reconfigure(permit.config.clone())
-                            .await
-                            .map_err(McpToolCallError::Failed)?;
-                        let manager = Arc::clone(self);
-                        let name = server_name.to_string();
-                        let config = permit.config.clone();
-                        let retry_handle = handle.clone();
-                        self.spawn_background(async move {
-                            loop {
-                                if retry_handle.snapshot().epoch != reconnect_epoch {
-                                    return;
-                                }
-                                match Self::connect_one(
+                            let outcome = manager
+                                .refresh_authorized_server(
                                     &name,
-                                    &config,
-                                    Arc::clone(&manager.pending_oauth_urls),
-                                    Arc::clone(&manager.oauth),
+                                    &permit.config,
+                                    www_authenticate.as_deref(),
                                 )
-                                .await
-                                {
-                                    Ok(server) => {
-                                        retry_handle.publish(reconnect_epoch, server).await;
-                                        return;
-                                    }
-                                    Err(failure) => {
-                                        if failure.teardown_retry.is_some() {
-                                            retry_handle
-                                                .fail_with_teardown_retry(
-                                                    reconnect_epoch,
-                                                    failure.message,
-                                                    failure.teardown_retry,
-                                                )
-                                                .await;
-                                            return;
-                                        }
-                                        tokio::time::sleep(Duration::from_secs(5)).await;
-                                    }
-                                }
+                                .await;
+                            if matches!(outcome, RefreshServerOutcome::Transient(_)) {
+                                continue;
                             }
-                        });
-                        Err(McpToolCallError::Failed(error))
-                    }
-                    RefreshServerOutcome::Reprompt(error) => {
-                        self.bind_pending_flow_owner(server_name, handle, permit.epoch)
-                            .map_err(McpToolCallError::Failed)?;
-                        let url = self
-                            .pending_oauth_urls
-                            .read()
-                            .await
-                            .get(server_name)
-                            .cloned()
-                            .unwrap_or_default();
-                        handle.unauthorized(permit.epoch, url, error.clone()).await;
-                        Err(McpToolCallError::Failed(error))
-                    }
+                            let _ = manager
+                                .finish_oauth_refresh(&name, &retry_handle, &permit, outcome)
+                                .await;
+                            return;
+                        }
+                    });
+                    return Err(McpToolCallError::Failed(error));
                 }
+                self.finish_oauth_refresh(server_name, handle, &permit, outcome)
+                    .await
             }
             OAuthRecoveryKind::StepUp { www_authenticate } => {
                 if let Err(error) = self
@@ -2862,6 +2811,71 @@ impl McpClientManager {
                     .await;
                 self.wait_for_ready(handle, &CancellationToken::new()).await
             }
+        }
+    }
+
+    async fn finish_oauth_refresh(
+        &self,
+        server_name: &str,
+        handle: &SupervisorHandle,
+        permit: &RecoveryPermit,
+        outcome: RefreshServerOutcome,
+    ) -> Result<(), McpToolCallError> {
+        match outcome {
+            RefreshServerOutcome::Refreshed(access_token) => {
+                if !handle
+                    .finish_oauth_cleanup(permit.epoch, access_token)
+                    .await
+                    .map_err(McpToolCallError::Failed)?
+                {
+                    return Err(McpToolCallError::Failed(
+                        "MCP OAuth recovery was superseded".to_string(),
+                    ));
+                }
+                match Self::connect_one(
+                    server_name,
+                    &permit.config,
+                    Arc::clone(&self.pending_oauth_urls),
+                    Arc::clone(&self.oauth),
+                )
+                .await
+                {
+                    Ok(server) => {
+                        if handle.publish(permit.epoch, server).await {
+                            Ok(())
+                        } else {
+                            Err(McpToolCallError::Failed(
+                                "MCP OAuth recovery was superseded".to_string(),
+                            ))
+                        }
+                    }
+                    Err(failure) => {
+                        let error = failure.message.clone();
+                        handle
+                            .fail_with_teardown_retry(
+                                permit.epoch,
+                                failure.message,
+                                failure.teardown_retry,
+                            )
+                            .await;
+                        Err(McpToolCallError::Failed(error))
+                    }
+                }
+            }
+            RefreshServerOutcome::Reprompt(error) => {
+                self.bind_pending_flow_owner(server_name, handle, permit.epoch)
+                    .map_err(McpToolCallError::Failed)?;
+                let url = self
+                    .pending_oauth_urls
+                    .read()
+                    .await
+                    .get(server_name)
+                    .cloned()
+                    .unwrap_or_default();
+                handle.await_oauth(permit.epoch, url, error.clone()).await;
+                Err(McpToolCallError::Failed(error))
+            }
+            RefreshServerOutcome::Transient(error) => Err(McpToolCallError::Failed(error)),
         }
     }
 
@@ -4357,7 +4371,12 @@ mod tests {
             .insert("retry".to_string(), listener);
 
         let result = manager
-            .restart_oauth_owner("retry", &owner.snapshot().config, Some((owner, 0)))
+            .restart_oauth_owner(
+                "retry",
+                &owner.snapshot().config,
+                Some((owner, 0)),
+                "new-token".to_string(),
+            )
             .await;
         let Err(error) = result else {
             panic!("reconfigure failure must propagate");

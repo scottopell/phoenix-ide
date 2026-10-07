@@ -212,11 +212,20 @@ impl SupervisorHandle {
 
     /// Attempt to claim recovery leadership for `observed_epoch`.
     pub(crate) async fn claim_recovery(&self, observed_epoch: u64) -> RecoveryClaim {
+        self.claim(observed_epoch, RecoveryKind::Transport).await
+    }
+
+    pub(crate) async fn claim_oauth_recovery(&self, observed_epoch: u64) -> RecoveryClaim {
+        self.claim(observed_epoch, RecoveryKind::OAuth).await
+    }
+
+    async fn claim(&self, observed_epoch: u64, kind: RecoveryKind) -> RecoveryClaim {
         let (reply, receive) = oneshot::channel();
         if self
             .mailbox
             .send(Command::Claim {
                 observed_epoch,
+                kind,
                 reply,
             })
             .await
@@ -227,6 +236,41 @@ impl SupervisorHandle {
         receive
             .await
             .unwrap_or_else(|_| RecoveryClaim::Unavailable(stopped()))
+    }
+
+    pub(crate) async fn finish_oauth_cleanup(
+        &self,
+        epoch: u64,
+        access_token: String,
+    ) -> Result<bool, String> {
+        let (reply, receive) = oneshot::channel();
+        self.mailbox
+            .send(Command::FinishOAuthCleanup {
+                epoch,
+                access_token,
+                reply,
+            })
+            .await
+            .map_err(|_| stopped())?;
+        receive.await.map_err(|_| stopped())?
+    }
+
+    pub(crate) async fn await_oauth(&self, epoch: u64, url: String, error: String) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::AwaitOAuth {
+                epoch,
+                url,
+                error,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receive.await.unwrap_or(false)
     }
 
     /// Publish a freshly connected server for `epoch`.  Returns false
@@ -345,6 +389,11 @@ pub(crate) enum RecoveryClaim {
     Unavailable(String),
 }
 
+enum RecoveryKind {
+    Transport,
+    OAuth,
+}
+
 struct QueuedCall {
     epoch: u64,
     context: CallContext,
@@ -391,7 +440,19 @@ enum Command {
     },
     Claim {
         observed_epoch: u64,
+        kind: RecoveryKind,
         reply: oneshot::Sender<RecoveryClaim>,
+    },
+    FinishOAuthCleanup {
+        epoch: u64,
+        access_token: String,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    AwaitOAuth {
+        epoch: u64,
+        url: String,
+        error: String,
+        reply: oneshot::Sender<bool>,
     },
     Publish {
         epoch: u64,
@@ -629,6 +690,7 @@ impl Actor {
             }
             Command::Claim {
                 observed_epoch,
+                kind,
                 reply,
             } => {
                 if matches!(self.state, SupervisorState::Recovering)
@@ -640,7 +702,18 @@ impl Actor {
                 } else if matches!(self.state, SupervisorState::Ready(_)) {
                     self.recovery_from = Some(observed_epoch);
                     self.epoch = self.epoch.wrapping_add(1);
-                    match self.stop_server().await {
+                    let teardown = match kind {
+                        RecoveryKind::Transport => self.stop_server().await,
+                        RecoveryKind::OAuth => {
+                            if let SupervisorState::Ready(server) =
+                                std::mem::replace(&mut self.state, SupervisorState::Recovering)
+                            {
+                                self.teardown_retry.push(server);
+                            }
+                            Ok(())
+                        }
+                    };
+                    match teardown {
                         Ok(()) => {
                             self.state = SupervisorState::Recovering;
                             self.publish_snapshot(None, None);
@@ -658,6 +731,44 @@ impl Actor {
                 } else {
                     let _ = reply.send(RecoveryClaim::Unavailable(self.not_ready_message()));
                 }
+            }
+            Command::FinishOAuthCleanup {
+                epoch,
+                access_token,
+                reply,
+            } => {
+                if epoch != self.epoch {
+                    let _ = reply.send(Ok(false));
+                    return;
+                }
+                for server in &self.teardown_retry {
+                    *server.oauth_bearer.write().unwrap() = Some(access_token.clone());
+                }
+                match self.stop_server().await {
+                    Ok(()) => {
+                        self.state = SupervisorState::Recovering;
+                        self.publish_snapshot(None, None);
+                        let _ = reply.send(Ok(true));
+                    }
+                    Err(error) => {
+                        self.recovery_from = None;
+                        self.publish_snapshot(Some(error.clone()), None);
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Command::AwaitOAuth {
+                epoch,
+                url,
+                error,
+                reply,
+            } => {
+                let current = epoch == self.epoch;
+                if current {
+                    self.state = SupervisorState::Recovering;
+                    self.publish_snapshot(Some(error), Some(url));
+                }
+                let _ = reply.send(current);
             }
             Command::Publish {
                 epoch,
@@ -1208,6 +1319,64 @@ mod epoch_tests {
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+    }
+
+    #[tokio::test]
+    async fn oauth_recovery_has_one_leader_before_authenticated_cleanup() {
+        let (serving, attempts) = retry_shutdown_server(0);
+        let bearer = Arc::clone(&serving.oauth_bearer);
+        *bearer.write().unwrap() = Some("expired".to_string());
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth recovery leads before teardown");
+        };
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert!(handle.inspect().await.is_err());
+        assert!(matches!(
+            handle.claim_oauth_recovery(0).await,
+            RecoveryClaim::Follow(_)
+        ));
+        assert!(matches!(
+            handle.claim_recovery(0).await,
+            RecoveryClaim::Follow(_)
+        ));
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".to_string())
+            .await
+            .unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(bearer.read().unwrap().as_deref(), Some("fresh"));
+        let (replacement, _, _) = server(http_config());
+        assert!(handle.publish(permit.epoch, replacement).await);
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_cleanup_failure_retains_non_callable_retry_ownership() {
+        let (serving, attempts) = retry_shutdown_server(1);
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth recovery leads before teardown");
+        };
+        let error = handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected teardown failure"));
+        assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+        assert!(handle.inspect().await.is_err());
+        let epoch = handle.reconfigure(http_config()).await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let (replacement, _, _) = server(http_config());
+        let bearer = Arc::clone(&replacement.oauth_bearer);
+        assert!(handle.publish(epoch, replacement).await);
+        assert!(!handle
+            .finish_oauth_cleanup(permit.epoch, "stale".to_string())
+            .await
+            .unwrap());
+        assert!(bearer.read().unwrap().is_none());
+        assert!(handle.snapshot().is_ready());
+        handle.remove().await.unwrap();
     }
 
     #[tokio::test]

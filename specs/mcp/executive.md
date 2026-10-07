@@ -74,6 +74,15 @@ This spec set is M0 of the native HTTP MCP build-out. The milestones:
 
 ## Allium Spec
 
+OAuth recovery claims its epoch before authenticated teardown. The supervisor
+retains the old transport privately, refreshes or awaits re-authorization, and
+uses the new bearer for cleanup before connecting a replacement. Coverage in
+`phoenix-mcp` includes `tool_call_401_refreshes_and_replays_the_call`,
+`concurrent_oauth_recovery_refreshes_once_and_cleans_up_with_fresh_bearer`,
+`transient_oauth_refresh_retries_before_session_cleanup`,
+`refresh_rejection_discards_token_and_reprompts`, and
+`oauth_refresh_keeps_failed_delete_owned_and_blocks_replacement`.
+
 Behavioral specification: `specs/mcp/mcp.allium`
 
 Models the per-server `ConnState` lifecycle

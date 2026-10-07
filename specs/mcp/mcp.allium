@@ -498,6 +498,14 @@ rule TokenRefreshNeeded {
     requires: srv.oauth_phase = authorized
 
     ensures: srv.oauth_phase = refreshing
+
+    @guidance
+        -- Reserve one recovery epoch and retain the old transport as
+        -- non-callable cleanup ownership. Do not require its session DELETE
+        -- to succeed before refreshing: the expired bearer can also be
+        -- rejected on DELETE. Concurrent recovery requests join that epoch.
+        -- A transient refresh failure retains the token and cleanup ownership
+        -- while the same epoch retries; it does not discard the session.
 }
 
 -- Refresh succeeded: update the stored token (including a rotated refresh
@@ -513,6 +521,10 @@ rule TokenRefreshed {
     ensures: srv.oauth_phase = authorized
 
     @guidance
+        -- Update the retained transport's bearer, finish its session DELETE,
+        -- then initialize and publish the replacement. Cleanup failure keeps
+        -- the old transport non-callable and retry-owned; no replacement is
+        -- published while cleanup remains unresolved.
         -- The request whose 401 triggered the refresh (a tools/call or
         -- initialize) is replayed by the executor with the refreshed bearer
         -- once authorized, so a normal token expiry never surfaces as a tool
@@ -538,6 +550,9 @@ rule TokenRefreshFailed {
         -- stale token still satisfies the token invariants and a later
         -- OAuthAuthorized would create a duplicate row for the same server
         -- (REQ-MCP-012).
+        -- Retain the old session as non-callable cleanup ownership while
+        -- browser authorization is pending. The newly authorized bearer
+        -- completes that cleanup before a replacement becomes callable.
 }
 
 -- A tool call on an authorized server returns 403 insufficient_scope: this is
