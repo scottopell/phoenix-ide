@@ -791,6 +791,7 @@ async fn execute_tool_to_outcome<S, T>(
     tool_name: String,
     tool_use_id: String,
     tool_surface: LlmToolSurface,
+    request_schema: serde_json::Value,
 ) -> ToolExecOutcome
 where
     S: Storage + Clone + 'static,
@@ -820,7 +821,7 @@ where
     let callable = tool_surface.callable_tools(tool_executor.definitions().await);
     if !callable
         .iter()
-        .any(|definition| definition.name == tool_name)
+        .any(|definition| definition.name == tool_name && definition.input_schema == request_schema)
     {
         return ToolExecOutcome::Failed {
             tool_use_id,
@@ -7722,11 +7723,14 @@ where
                 })
             })
             .collect::<Vec<_>>();
+        let continuation_route_key = llm_client
+            .continuation_route_key()
+            .map_err(|error| error.to_string())?;
         let tool_availability = self
             .storage
             .prepare_tool_availability(
                 &conv_id,
-                &llm_client.continuation_route_key(),
+                &continuation_route_key,
                 anchor,
                 &available_tools,
                 &callable_names,
@@ -8093,6 +8097,23 @@ where
         tool: ToolCall,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        let request_policy = self
+            .storage
+            .load_tool_admission_policy(&self.context.conversation_id)
+            .await?;
+        let request_definition = request_policy.declarations().iter().find(|definition| {
+            definition.name == tool.name() && request_policy.is_callable(tool.name())
+        });
+        let Some(request_definition) = request_definition else {
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id: tool.id.clone(),
+                result: ToolResult::error(
+                    tool.id.clone(),
+                    "EUNAVAIL: tool was unavailable in the originating request policy".into(),
+                ),
+            }));
+        };
+        let request_schema = request_definition.input_schema.clone();
         let surface = if self.context.is_sub_agent && self.grace_turn_granted {
             LlmToolSurface::SubAgentTerminal
         } else {
@@ -8282,6 +8303,7 @@ where
                 tool_name,
                 tool_use_id,
                 surface,
+                request_schema,
             )
             .await;
             let _ = tool_tx.send(tool_outcome);

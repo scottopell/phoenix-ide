@@ -291,6 +291,7 @@ WHEN tool execution eligibility changes during a conversation
 THE SYSTEM SHALL preserve historical calls, arguments, results, errors, and required provider references
 AND SHALL retain authentic tool declarations independently of current execution eligibility
 AND SHALL check current execution authority before dispatching every new invocation
+AND SHALL require admission under the originating request policy and its argument schema, allowing live changes only to revoke that admission
 AND SHALL return one matching unavailable error result without execution when authority is absent
 
 WHEN preparing a provider request

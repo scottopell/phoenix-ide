@@ -286,7 +286,12 @@ contract ToolHistoryIntegrity {
         -- a context-management or unsupported-content transformation.
 
     @invariant ExecutionRequiresCurrentAuthority
-        -- Every new invocation is checked against current callable_names,
+        -- Every new invocation requires its originating request's callable
+        -- snapshot and argument schema as well as live execution authority.
+        -- The request snapshot survives restart; absence grants no admission.
+        -- Live catalog changes can revoke admission, never expand it or run
+        -- arguments against a different schema. Each invocation is checked
+        -- against current callable_names,
         -- including calls issued before a policy change and calls admitted
         -- through advisory-only provider restrictions. Retained declarations
         -- grant no execution authority. An unavailable invocation receives one

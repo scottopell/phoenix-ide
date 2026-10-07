@@ -305,6 +305,36 @@ async fn append_native_changes(
 }
 
 impl Database {
+    /// Load the policy frozen for the last provider request, without refreshing it.
+    ///
+    /// # Errors
+    /// Returns database or persisted declaration validation failures.
+    pub async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<ToolAvailability> {
+        let mut tx = self.pool().begin().await?;
+        let declarations = sqlx::query("SELECT name,description,input_schema,defer_loading FROM conversation_tool_definitions WHERE conversation_id=?1 ORDER BY name")
+            .bind(conversation_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(definition)
+            .collect::<DbResult<Vec<_>>>()?;
+        let callable_names = sqlx::query_scalar(
+            "SELECT name FROM conversation_callable_tools WHERE conversation_id=?1 ORDER BY name",
+        )
+        .bind(conversation_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
+        let policy =
+            ToolAvailability::new(declarations, callable_names).map_err(DbError::Serialization)?;
+        tx.commit().await?;
+        Ok(policy)
+    }
+
     /// # Errors
     /// Rejects invalid policy, missing anchors for changes, or database failures.
     #[allow(clippy::too_many_arguments)]

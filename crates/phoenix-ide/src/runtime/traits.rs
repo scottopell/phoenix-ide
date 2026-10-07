@@ -569,6 +569,10 @@ pub trait StateStore: Send + Sync {
         visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         historical_tool_references: &[(String, String)],
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
     async fn load_responses_replay_state(
         &self,
         conversation_id: &str,
@@ -649,8 +653,8 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    fn continuation_route_key(&self) -> String {
-        self.model_id().to_owned()
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
+        Ok(self.model_id().to_owned())
     }
 
     /// Complete an LLM request (non-streaming)
@@ -1289,6 +1293,12 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
             )
             .await
     }
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        (**self).load_tool_admission_policy(conversation_id).await
+    }
     async fn load_responses_replay_state(
         &self,
         conversation_id: &str,
@@ -1415,7 +1425,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
 #[async_trait]
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
-    fn continuation_route_key(&self) -> String {
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
         (**self).continuation_route_key()
     }
 
@@ -2573,6 +2583,15 @@ impl StateStore for DatabaseStorage {
             .await
             .map_err(|error| error.to_string())
     }
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        self.db
+            .load_tool_admission_policy(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
     async fn load_responses_replay_state(
         &self,
         conversation_id: &str,
@@ -2757,11 +2776,9 @@ impl RegistryLlmClient {
 
 #[async_trait]
 impl LlmClient for RegistryLlmClient {
-    fn continuation_route_key(&self) -> String {
-        self.registry.get(&self.model_id).map_or_else(
-            || self.model_id.clone(),
-            |service| service.continuation_route_key(),
-        )
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
+        self.service()
+            .map(|service| service.continuation_route_key())
     }
 
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
@@ -3078,6 +3095,7 @@ mod registry_llm_client_tests {
             panic!("must not substitute Codex for the selected direct connection");
         };
         assert_eq!(error.kind, phoenix_llm::LlmErrorKind::InvalidRequest);
+        assert!(client.continuation_route_key().is_err());
         assert!(!error.kind.is_auto_retryable());
         assert!(error.message.contains("openai_responses"));
         assert!(
@@ -3088,6 +3106,62 @@ mod registry_llm_client_tests {
         );
         let unpinned = RegistryLlmClient::new(registry, "missing-model".to_string());
         assert!(unpinned.service().err().unwrap().kind.is_auto_retryable());
+    }
+
+    #[tokio::test]
+    async fn unavailable_pinned_route_preserves_durable_policy_and_replay_until_restored() {
+        let (directory, registry) = codex_registry();
+        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.6-sol".into())
+            .with_connection(Some("codex".into()));
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("pinned", "pinned", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let route = client.continuation_route_key().unwrap();
+        let before = db
+            .prepare_tool_availability(
+                "pinned",
+                &route,
+                None,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO active_provider_replay_state (conversation_id,provider,model,response_id,payload) VALUES ('pinned','anthropic','model','response','{}')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO active_responses_replay_sets (conversation_id,response_id,ordinal,model,owner_message_id,public_content) VALUES ('pinned','response',0,'gpt','owner','[]')").execute(db.pool()).await.unwrap();
+        registry.reload_codex_credential_with(None);
+        let error = client.continuation_route_key().unwrap_err();
+        assert_eq!(error.kind, phoenix_llm::LlmErrorKind::InvalidRequest);
+        let stored: String = sqlx::query_scalar(
+            "SELECT continuation_id FROM conversation_tool_contexts WHERE conversation_id='pinned'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(before.continuation_id(), Some(stored.as_str()));
+        let count: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM active_provider_replay_state) + (SELECT COUNT(*) FROM active_responses_replay_sets)").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(count, 2);
+        registry.reload_codex_credential_with(Some(directory.path().join("auth.json")));
+        let restored_route = client.continuation_route_key().unwrap();
+        assert_eq!(restored_route, route);
+        let restored = db
+            .prepare_tool_availability(
+                "pinned",
+                &restored_route,
+                None,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.continuation_id(), restored.continuation_id());
+        let count: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM active_provider_replay_state) + (SELECT COUNT(*) FROM active_responses_replay_sets)").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

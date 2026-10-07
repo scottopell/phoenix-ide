@@ -71,8 +71,8 @@ impl RenderingAnthropicClient {
 
 #[async_trait]
 impl LlmClient for RenderingAnthropicClient {
-    fn continuation_route_key(&self) -> String {
-        "anthropic:https://api.anthropic.com/v1/messages:claude-opus-5-5".into()
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
+        Ok("anthropic:https://api.anthropic.com/v1/messages:claude-opus-5-5".into())
     }
 
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
@@ -151,6 +151,117 @@ fn saved_message(id: &str, sequence: i64, content: MessageContent) -> Message {
         display_data: None,
         usage_data: None,
         created_at: Utc::now(),
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn dispatch_cannot_expand_or_reinterpret_the_persisted_request_policy() {
+    use phoenix_core::domain::sm_state::ToolInput;
+    for (callable, same_schema, live, expected_executions) in [
+        (false, true, true, 0),
+        (true, false, true, 0),
+        (true, true, false, 0),
+        (true, true, true, 1),
+    ] {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("admission.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation(CONVERSATION, CONVERSATION, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut definitions = DeferredMcpCatalog::new(true).definitions().await;
+        if !same_schema {
+            definitions[0].input_schema =
+                serde_json::json!({"type":"object","properties":{"thread":{"type":"integer"}}});
+        }
+        let callable_names = if callable {
+            [MCP_TOOL.to_owned()].into_iter().collect()
+        } else {
+            std::collections::BTreeSet::default()
+        };
+        db.prepare_tool_availability(
+            CONVERSATION,
+            "route",
+            None,
+            &definitions,
+            &callable_names,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        db.pool().close().await;
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let tools = Arc::new(DeferredMcpCatalog::new(live));
+        let mut rt = runtime(
+            db.clone(),
+            directory.path(),
+            Arc::new(RenderingAnthropicClient::new()),
+            tools.clone(),
+        );
+        let call = ToolCall::new(
+            "call",
+            ToolInput::Unknown {
+                name: MCP_TOOL.into(),
+                input: serde_json::json!({}),
+            },
+        );
+        rt.state = ConvState::ToolExecuting {
+            current_tool: call.clone(),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: crate::state_machine::AssistantMessage::new(
+                "owner".into(),
+                vec![ContentBlock::tool_use(
+                    "call",
+                    MCP_TOOL,
+                    serde_json::json!({}),
+                )],
+                None,
+                None,
+            ),
+        };
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        let event = rt
+            .dispatch_tool_execution(call, &mut admitted)
+            .await
+            .unwrap();
+        if callable {
+            assert!(event.is_none());
+            let (_, outcome) =
+                tokio::time::timeout(Duration::from_secs(5), rt.tool_outcome_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if expected_executions == 0 {
+                assert!(
+                    matches!(outcome, ToolExecOutcome::Failed { tool_use_id, error } if tool_use_id == "call" && error.contains("EUNAVAIL"))
+                );
+            } else {
+                assert!(matches!(outcome, ToolExecOutcome::Completed(_)));
+            }
+        } else {
+            let Some(Event::ToolComplete {
+                tool_use_id,
+                result,
+            }) = event
+            else {
+                panic!("disallowed request call must return a result")
+            };
+            assert_eq!(tool_use_id, "call");
+            assert!(format!("{result:?}").contains("EUNAVAIL"));
+        }
+        assert_eq!(tools.recorded_executions().len(), expected_executions);
+        let policy = db.load_tool_admission_policy(CONVERSATION).await.unwrap();
+        assert_eq!(policy.is_callable(MCP_TOOL), callable);
+        assert_eq!(
+            policy.declarations()[0].input_schema,
+            definitions[0].input_schema
+        );
+        db.pool().close().await;
     }
 }
 

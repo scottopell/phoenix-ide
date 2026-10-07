@@ -559,6 +559,8 @@ type StoredSvgArtifacts = HashMap<
 #[allow(dead_code)]
 pub struct InMemoryStorage {
     svg_artifacts: Mutex<StoredSvgArtifacts>,
+    tool_admission_policies:
+        Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -641,9 +643,21 @@ pub struct InMemoryStorage {
 
 #[allow(dead_code)]
 impl InMemoryStorage {
+    pub fn seed_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+        policy: phoenix_core::domain::tool_availability::ToolAvailability,
+    ) {
+        self.tool_admission_policies
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_owned(), policy);
+    }
+
     pub fn new() -> Self {
         Self {
             svg_artifacts: Mutex::new(HashMap::new()),
+            tool_admission_policies: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
@@ -2259,7 +2273,7 @@ impl StateStore for InMemoryStorage {
     #[allow(clippy::too_many_arguments)]
     async fn prepare_tool_availability(
         &self,
-        _conversation_id: &str,
+        conversation_id: &str,
         _route_key: &str,
         _anchor_message_id: Option<&str>,
         live_definitions: &[phoenix_llm::ToolDefinition],
@@ -2267,10 +2281,26 @@ impl StateStore for InMemoryStorage {
         _visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
         _historical_tool_references: &[(String, String)],
     ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
-        phoenix_core::domain::tool_availability::ToolAvailability::new(
+        let policy = phoenix_core::domain::tool_availability::ToolAvailability::new(
             live_definitions.to_vec(),
             callable_names.clone(),
-        )
+        )?;
+        self.seed_tool_admission_policy(conversation_id, policy.clone());
+        Ok(policy)
+    }
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        Ok(self
+            .tool_admission_policies
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                phoenix_core::domain::tool_availability::ToolAvailability::all(vec![])
+            }))
     }
     async fn load_responses_replay_state(
         &self,
