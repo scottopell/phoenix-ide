@@ -44,6 +44,7 @@ use phoenix_core::domain::creation_protocol::{
     CreationStage, CreationStatus, CreationWorkerId,
 };
 use phoenix_core::domain::db_schema as schema;
+use phoenix_core::domain::instance_identity::InstanceId;
 use phoenix_core::domain::product_conversation::{
     AutoContinueOnContextExhaustion, AutomaticContinuationPhase, ContinuationOpeningAuthority,
     ProductConversationId,
@@ -3272,6 +3273,21 @@ impl Database {
         // `restrict_file_permissions` again afterward.
         db.restrict_file_permissions();
         Ok(db)
+    }
+
+    /// Return the stable identity initialized for this database.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or serialization error if the singleton row is absent or malformed.
+    pub async fn instance_id(&self) -> DbResult<InstanceId> {
+        let value: String =
+            sqlx::query_scalar("SELECT instance_id FROM instance_identity WHERE singleton_key = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        InstanceId::from_str(&value).map_err(|error| {
+            DbError::Serialization(format!("invalid persisted instance id: {error}"))
+        })
     }
 
     /// Execute one bounded Coordinator read query against a separate read-only connection.
@@ -18169,6 +18185,136 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn instance_identity_is_singleton_and_stable_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("instance-identity.sqlite");
+        let db_path = db_path.to_string_lossy().into_owned();
+
+        let first = Database::open(&db_path).await.unwrap();
+        migrations::run_pending_migrations(first.pool())
+            .await
+            .unwrap();
+        let first_id = first.instance_id().await.unwrap();
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM instance_identity")
+            .fetch_one(first.pool())
+            .await
+            .unwrap();
+        assert_eq!(row_count, 1);
+        drop(first);
+
+        let reopened = Database::open(&db_path).await.unwrap();
+        migrations::run_pending_migrations(reopened.pool())
+            .await
+            .unwrap();
+        assert_eq!(reopened.instance_id().await.unwrap(), first_id);
+        assert!(sqlx::query(
+            "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (2, ?1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(reopened.pool())
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE instance_identity SET instance_id = 'not-a-uuid' WHERE singleton_key = 1",
+        )
+        .execute(reopened.pool())
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_initializers_commit_one_instance_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("concurrent-instance-identity.sqlite");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let first = Database::open(&db_path).await.unwrap();
+        let second = Database::open(&db_path).await.unwrap();
+
+        let _concurrent_results = tokio::join!(
+            migrations::run_pending_migrations(first.pool()),
+            migrations::run_pending_migrations(second.pool()),
+        );
+
+        migrations::run_pending_migrations(first.pool())
+            .await
+            .unwrap();
+        migrations::run_pending_migrations(second.pool())
+            .await
+            .unwrap();
+        let first_id = first.instance_id().await.unwrap();
+        assert_eq!(second.instance_id().await.unwrap(), first_id);
+        let identities: Vec<String> =
+            sqlx::query_scalar("SELECT instance_id FROM instance_identity")
+                .fetch_all(first.pool())
+                .await
+                .unwrap();
+        assert_eq!(identities, vec![first_id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn coordinator_query_denies_existing_credentials_before_returning_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("credential-query-policy.sqlite");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let db = Database::open(&db_path).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation(
+            "credential-policy-conversation",
+            "credential-policy-conversation",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO auth_sessions (token, password_fingerprint, created_at, expires_at)
+             VALUES ('owner-session-secret', 'owner-password-fingerprint', datetime('now'), datetime('now', '+1 day'));
+             INSERT INTO share_tokens (id, conversation_id, token, created_at)
+             VALUES ('share-id', 'credential-policy-conversation', 'share-secret', datetime('now'));
+             INSERT INTO mcp_oauth_registrations (auth_server, client_id, client_secret, token_endpoint_auth_method)
+             VALUES ('https://issuer.invalid', 'client-id', 'client-secret', 'client_secret_post');
+             INSERT INTO mcp_oauth_tokens (server_name, resource_uri, scopes, access_token, refresh_token, expires_at)
+             VALUES ('server', 'https://resource.invalid', 'read', 'access-secret', 'refresh-secret', 1);
+             CREATE VIEW auth_session_view AS SELECT token AS aliased_token, created_at FROM auth_sessions;",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        for sql in [
+            "SELECT token FROM auth_sessions",
+            "SELECT password_fingerprint FROM auth_sessions",
+            "SELECT a.token AS aliased_token FROM auth_sessions AS a",
+            "SELECT * FROM auth_sessions",
+            "SELECT token FROM share_tokens",
+            "SELECT client_secret FROM mcp_oauth_registrations",
+            "SELECT access_token FROM mcp_oauth_tokens",
+            "SELECT refresh_token FROM mcp_oauth_tokens",
+            "SELECT aliased_token FROM auth_session_view",
+            "SELECT (SELECT token FROM auth_sessions) AS nested_token",
+        ] {
+            assert!(
+                matches!(
+                    db.coordinator_query(sql).await,
+                    Err(CoordinatorQueryError::Denied(_))
+                ),
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            "SELECT created_at, expires_at FROM auth_sessions",
+            "SELECT id, conversation_id, created_at FROM share_tokens",
+            "SELECT auth_server, client_id, token_endpoint_auth_method FROM mcp_oauth_registrations",
+            "SELECT server_name, resource_uri, scopes, expires_at FROM mcp_oauth_tokens",
+        ] {
+            assert!(!db.coordinator_query(sql).await.unwrap().rows.is_empty(), "{sql}");
+        }
     }
 
     async fn open_test_db_pair() -> (tempfile::TempDir, Database, Database) {

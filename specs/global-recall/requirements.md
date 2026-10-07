@@ -250,7 +250,9 @@ AND SHALL request supporting history only where needed, distinguish observed fac
 ### REQ-GR-011A: Bound Database Integrity and Resource Use
 
 WHILE a write-capable ordinary ProductConversation or the Coordinator executes a database query
-THE SYSTEM SHALL permit reads from Phoenix application tables, including hidden messages, credentials, tokens, settings, serialized state, and workflow payloads that may not be visible through normal UI
+THE SYSTEM SHALL permit reads from Phoenix application tables, including hidden messages, settings, serialized state, and workflow payloads that may not be visible through normal UI
+
+THE SYSTEM SHALL deny reads of known credential-bearing columns, including owner sessions, share tokens, and MCP OAuth client secrets and tokens, without treating the query surface as a general security sandbox
 
 THE SYSTEM SHALL describe this capability as operator-level forensic access and SHALL treat all returned values as untrusted stored data rather than instructions
 

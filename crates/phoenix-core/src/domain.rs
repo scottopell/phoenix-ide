@@ -8,6 +8,7 @@ pub mod bash_types;
 pub mod close;
 pub mod creation_protocol;
 pub mod db_schema;
+pub mod instance_identity;
 pub mod kill_signal;
 pub mod llm_error_kind;
 pub mod llm_types;
