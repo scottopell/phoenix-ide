@@ -91,16 +91,30 @@ pub async fn query_remote_database(
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_RESPONSE_BYTES {
-            return Err(FederationClientError::ResponseTooLarge(
-                MAX_REMOTE_RESPONSE_BYTES,
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
     }
+    decode_remote_query_response(status, &bytes, peer_instance_id)
+}
+
+fn append_bounded_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), FederationClientError> {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(FederationClientError::ResponseTooLarge(max_bytes));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn decode_remote_query_response(
+    status: StatusCode,
+    bytes: &[u8],
+    expected_destination: InstanceId,
+) -> Result<RemoteQueryDatabaseResponse, FederationClientError> {
     if !status.is_success() {
-        let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+        let detail = serde_json::from_slice::<serde_json::Value>(bytes)
             .ok()
             .and_then(|body| {
                 body.get("error")
@@ -110,8 +124,8 @@ pub async fn query_remote_database(
             .unwrap_or_else(|| format!("HTTP {status}"));
         return Err(FederationClientError::RemoteRejected(detail));
     }
-    let response: RemoteQueryDatabaseResponse = serde_json::from_slice(&bytes)?;
-    if response.destination_instance_id != peer_instance_id {
+    let response: RemoteQueryDatabaseResponse = serde_json::from_slice(bytes)?;
+    if response.destination_instance_id != expected_destination {
         return Err(FederationClientError::DestinationMismatch);
     }
     Ok(response)
@@ -131,6 +145,15 @@ pub async fn query_database(
     State(state): State<AppState>,
     Json(request): Json<RemoteQueryDatabaseRequest>,
 ) -> Response {
+    query_database_with_admission(peer, state, request, &QUERY_ADMISSION).await
+}
+
+async fn query_database_with_admission(
+    peer: PeerAuthenticated,
+    state: AppState,
+    request: RemoteQueryDatabaseRequest,
+    admission: &tokio::sync::Semaphore,
+) -> Response {
     let destination_instance_id = match state.db.instance_id().await {
         Ok(id) => id,
         Err(error) => {
@@ -145,7 +168,7 @@ pub async fn query_database(
         )
             .into_response();
     }
-    let Ok(_permit) = QUERY_ADMISSION.try_acquire() else {
+    let Ok(_permit) = admission.try_acquire() else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({ "error": "remote query admission limit reached" })),
@@ -244,5 +267,82 @@ mod tests {
         assert!(first.starts_with("phx_peer_"));
         assert_ne!(first, second);
         assert_eq!(first.len(), "phx_peer_".len() + 43);
+    }
+
+    #[test]
+    fn remote_response_limit_applies_across_streamed_chunks() {
+        let mut body = Vec::new();
+        append_bounded_response_chunk(&mut body, &[0; 4], 8).unwrap();
+        append_bounded_response_chunk(&mut body, &[0; 4], 8).unwrap();
+        let error = append_bounded_response_chunk(&mut body, &[0], 8).unwrap_err();
+
+        assert!(matches!(error, FederationClientError::ResponseTooLarge(8)));
+        assert_eq!(body.len(), 8);
+    }
+
+    #[test]
+    fn remote_rejection_preserves_server_error_detail() {
+        let expected_destination = InstanceId::new();
+        let result = decode_remote_query_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            br#"{"error":"specific SQL diagnostic"}"#,
+            expected_destination,
+        );
+
+        assert!(matches!(
+            result,
+            Err(FederationClientError::RemoteRejected(detail))
+                if detail == "specific SQL diagnostic"
+        ));
+    }
+
+    #[test]
+    fn remote_query_request_uses_shared_wire_shape() {
+        let destination_instance_id = InstanceId::new();
+        let request = RemoteQueryDatabaseRequest {
+            destination_instance_id,
+            sql: "SELECT 1".to_string(),
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "destination_instance_id": destination_instance_id,
+                "sql": "SELECT 1",
+            })
+        );
+        let decoded: RemoteQueryDatabaseRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.destination_instance_id, destination_instance_id);
+        assert_eq!(decoded.sql, "SELECT 1");
+    }
+
+    #[tokio::test]
+    async fn query_database_rejects_exhausted_admission_before_sql_execution() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let destination_instance_id = state.db.instance_id().await.unwrap();
+        let admission = tokio::sync::Semaphore::new(0);
+        let response = query_database_with_admission(
+            PeerAuthenticated {
+                caller_instance_id: InstanceId::new(),
+                caller_display_name: "peer".to_string(),
+            },
+            state,
+            RemoteQueryDatabaseRequest {
+                destination_instance_id,
+                sql: "not valid SQL".to_string(),
+            },
+            &admission,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "error": "remote query admission limit reached" })
+        );
     }
 }
