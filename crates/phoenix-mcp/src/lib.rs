@@ -2001,15 +2001,15 @@ impl McpClientManager {
         let Some((handle, epoch)) = owner else {
             return Ok(None);
         };
-        if handle.snapshot().epoch != epoch {
-            return Ok(None);
-        }
-        if !handle.finish_oauth_cleanup(epoch, access_token).await? {
-            return Ok(None);
-        }
-        let new_epoch = handle.reconfigure(config.clone()).await.map_err(|error| {
-            format!("MCP server '{name}': failed to restart after authorization: {error}")
-        })?;
+        let new_epoch = handle
+            .restart_after_oauth(epoch, access_token, config.clone())
+            .await
+            .map_err(|error| {
+                format!("MCP server '{name}': failed to restart after authorization: {error}")
+            })?
+            .ok_or_else(|| {
+                format!("MCP server '{name}': authorization was superseded before restart")
+            })?;
         Ok(Some((handle, new_epoch)))
     }
 
@@ -2732,11 +2732,7 @@ impl McpClientManager {
         observed_epoch: u64,
         kind: OAuthRecoveryKind,
     ) -> Result<(), McpToolCallError> {
-        let claim = match kind {
-            OAuthRecoveryKind::Refresh { .. } => handle.claim_oauth_recovery(observed_epoch).await,
-            OAuthRecoveryKind::StepUp { .. } => handle.claim_recovery(observed_epoch).await,
-        };
-        let permit = match claim {
+        let permit = match handle.claim_oauth_recovery(observed_epoch).await {
             RecoveryClaim::Leader(permit) => permit,
             RecoveryClaim::Follow(_) => {
                 return self.wait_for_ready(handle, &CancellationToken::new()).await;
@@ -2803,7 +2799,7 @@ impl McpClientManager {
                     .cloned()
                     .unwrap_or_default();
                 handle
-                    .unauthorized(
+                    .await_oauth(
                         permit.epoch,
                         url,
                         "additional OAuth scopes required".to_string(),

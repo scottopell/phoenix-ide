@@ -3434,10 +3434,11 @@ mod tests {
             .await
             .insert("remote".to_string(), server_handle(mcp));
 
+        *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-up".to_string());
         install_oauth_discovery(&server, true);
         // The 403 step-up challenge names the missing scope -- delivered
         // behind a Basic challenge, which must not mask the step-up
-        // classification. The old session is DELETEd during the teardown.
+        // classification.
         server.push_responses(vec![
             status_response(
                 403,

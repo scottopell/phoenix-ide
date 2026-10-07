@@ -81,7 +81,11 @@ uses the new bearer for cleanup before connecting a replacement. Coverage in
 `concurrent_oauth_recovery_refreshes_once_and_cleans_up_with_fresh_bearer`,
 `transient_oauth_refresh_retries_before_session_cleanup`,
 `refresh_rejection_discards_token_and_reprompts`, and
-`oauth_refresh_keeps_failed_delete_owned_and_blocks_replacement`.
+`oauth_refresh_keeps_failed_delete_owned_and_blocks_replacement`. Scope step-up
+uses the same retained ownership; its end-to-end regression requires the
+upgraded bearer on DELETE. The gated supervisor test
+`oauth_callback_cleanup_and_restart_cannot_supersede_queued_reload` covers a
+reload queued while callback cleanup is blocked.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

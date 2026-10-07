@@ -487,6 +487,9 @@ rule OAuthAuthorized {
         -- the resource URI, clear the pending URL, and re-enter connecting so
         -- HttpConnected drives the now-authorized handshake to ready
         -- (REQ-MCP-011, REQ-MCP-012).
+        -- Callback cleanup and restart are one epoch-checked supervisor
+        -- operation. A config reload supersedes the callback rather than
+        -- allowing its old config to overwrite the reload after cleanup.
 }
 
 -- A 401 on a previously authorized server: the access token expired or was
@@ -571,6 +574,10 @@ rule InsufficientScopeStepUp {
     ensures: srv.pending_auth_url = authorization_url(srv)
 
     @guidance
+        -- Claim exclusive OAuth recovery without requiring DELETE with the
+        -- narrow bearer. Retain the old session as non-callable cleanup
+        -- ownership until authorization supplies the upgraded bearer, then
+        -- complete cleanup before publishing a replacement.
         -- 403 insufficient_scope + WWW-Authenticate carries the required
         -- scope. The authorization URL requests the UNION of the existing
         -- token's persisted `scopes` and the challenged scope (read before the
