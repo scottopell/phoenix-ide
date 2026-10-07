@@ -1052,12 +1052,10 @@ mod tests {
         let mut request = user_req("[[scenario:ask_user_question]]");
         for expected_ordinal in 0..2 {
             let scenario = Scenario::from_message(&request);
-            assert_eq!(
+            assert!(matches!(
                 scenario,
-                Scenario::AskUserQuestion {
-                    ordinal: expected_ordinal
-                }
-            );
+                Scenario::AskUserQuestion { ordinal } if ordinal == expected_ordinal
+            ));
             let (content, _) = build_response(&scenario);
             let ContentBlock::ToolUse { id, name, .. } = &content[1] else {
                 panic!("scenario must emit ask_user_question");
@@ -1070,7 +1068,10 @@ mod tests {
                 content,
             });
         }
-        assert_eq!(Scenario::from_message(&request), Scenario::PlainText);
+        assert!(matches!(
+            Scenario::from_message(&request),
+            Scenario::PlainText
+        ));
     }
 
     #[test]
