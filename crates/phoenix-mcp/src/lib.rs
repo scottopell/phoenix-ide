@@ -2064,10 +2064,13 @@ impl McpClientManager {
             error = %error,
             "MCP OAuth authorization failed at the authorization server"
         );
+        let scopes = flow
+            .as_ref()
+            .map_or_else(Vec::new, |flow| flow.scopes.clone());
         match flow.and_then(|flow| flow.owner) {
             Some(OAuthFlowOwner::Reconnect(handle, epoch)) => {
                 handle
-                    .fail(epoch, format!("authorization failed: {error}"))
+                    .deny_oauth(epoch, format!("authorization failed: {error}"), scopes)
                     .await;
             }
             Some(OAuthFlowOwner::Remove(handle, epoch)) if handle.snapshot().epoch == epoch => {
@@ -2389,6 +2392,39 @@ impl McpClientManager {
         config: McpServerConfig,
         handle: SupervisorHandle,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
+        if handle.snapshot().config == config {
+            if let Some((permit, scopes)) = handle.retry_oauth().await {
+                let result = begin_oauth_flow(
+                    &self.oauth,
+                    &self.pending_oauth_urls,
+                    &name,
+                    &config,
+                    None,
+                    scopes.clone(),
+                )
+                .await;
+                let error = match result {
+                    Ok(url) => {
+                        let error = format!("authorization required: {url}");
+                        match self
+                            .await_owned_oauth_flow(&name, &handle, permit.epoch, error.clone())
+                            .await
+                        {
+                            Ok(()) => error,
+                            Err(error) => {
+                                handle.deny_oauth(permit.epoch, error.clone(), scopes).await;
+                                error
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        handle.deny_oauth(permit.epoch, error.clone(), scopes).await;
+                        error
+                    }
+                };
+                return Err(error);
+            }
+        }
         let epoch = handle.reconfigure(config.clone()).await?;
         Ok(self.begin_actor_connect_at_epoch(name, &config, handle, epoch))
     }

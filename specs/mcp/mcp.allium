@@ -283,6 +283,11 @@ rule OAuthFlowFailed {
         -- Cancelling the pending flow clears any surfaced authorization URL, so
         -- PendingUrlOnlyWhileUnauthorized holds once the server is `failed` and
         -- status/UI consumers do not see a stale authorize link for a dead flow.
+        -- A denied reconnect authorization retains its session cleanup owner
+        -- and requested scopes. An explicit unchanged-configuration reload
+        -- reserves a new epoch and requests those scopes before session DELETE.
+        -- Failure to quiesce an owned stream settles the supervisor as failed,
+        -- retaining teardown ownership without a pending authorization URL.
 }
 
 rule RemovedServerAuthorizationDenied {
@@ -785,8 +790,25 @@ rule ReloadRetriesFailedServer {
     when: ReloadServerUnchanged(srv)
 
     requires: srv.state = failed
+    requires: not retry_requires_authorization(srv)
 
     ensures: srv.state = connecting
+}
+
+rule ReloadRetriesDeniedAuthorization {
+    when: ReloadServerUnchanged(srv)
+
+    requires: srv.state = failed
+    requires: retry_requires_authorization(srv)
+
+    ensures: srv.state = unauthorized
+    ensures: srv.oauth_phase = awaiting_user
+    ensures: srv.pending_auth_url = authorization_url(srv)
+
+    @guidance
+        -- Retain the old session and scope union, reserve a new epoch, and bind
+        -- a fresh authorization flow before DELETE. Discovery failure follows
+        -- OAuthFlowFailed and preserves the same explicit-retry plan.
 }
 
 -- Reload found a server gone from config: disconnect and forget it, including
@@ -926,6 +948,9 @@ invariant OneTokenPerServer {
 ------------------------------------------------------------
 
 -- authorization_removes_server(srv): Bool
+-- retry_requires_authorization(srv): Bool
+--   True when retained OAuth session cleanup owns a denied authorization's
+--   requested scopes, requiring fresh authorization before session deletion.
 --   True iff the pending authorization owns cleanup for a removed configuration,
 --   rather than reconnection. Re-adding that configuration restores reconnect intent.
 --

@@ -349,6 +349,12 @@ A recovered bearer SHALL reach the retained session before configuration
 supersession can discard its stored token or retry cleanup with old credentials.
 Authorization retained solely to finish removal SHALL complete cleanup and
 forget the removed server and token without republishing its tools.
+A denied reconnect authorization SHALL clear its pending URL and settle as
+failed while retaining the session cleanup owner and requested scopes. An
+explicit unchanged-configuration reload SHALL request authorization again
+with those scopes before attempting authenticated session deletion.
+Stream-quiescence failure SHALL settle as failed with teardown ownership
+retained, rather than remaining in recovery without an authorization URL.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very

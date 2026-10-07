@@ -332,6 +332,32 @@ impl SupervisorHandle {
         self.fail_with_teardown_retry(epoch, error, None).await
     }
 
+    pub(crate) async fn deny_oauth(&self, epoch: u64, error: String, scopes: Vec<String>) {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::DenyOAuth {
+                epoch,
+                error,
+                scopes,
+                reply,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = receive.await;
+        }
+    }
+
+    pub(crate) async fn retry_oauth(&self) -> Option<(RecoveryPermit, Vec<String>)> {
+        let (reply, receive) = oneshot::channel();
+        self.mailbox
+            .send(Command::RetryOAuth { reply })
+            .await
+            .ok()?;
+        receive.await.ok().flatten()
+    }
+
     pub(crate) async fn fail_with_teardown_retry(
         &self,
         epoch: u64,
@@ -445,6 +471,15 @@ struct QueuedCall {
 }
 
 enum Command {
+    DenyOAuth {
+        epoch: u64,
+        error: String,
+        scopes: Vec<String>,
+        reply: oneshot::Sender<()>,
+    },
+    RetryOAuth {
+        reply: oneshot::Sender<Option<(RecoveryPermit, Vec<String>)>>,
+    },
     Status {
         reply: oneshot::Sender<Snapshot>,
     },
@@ -521,14 +556,17 @@ enum Command {
 }
 
 enum RetainedTransport {
-    OAuthRecovery(Arc<McpServer>),
+    OAuthRecovery {
+        server: Arc<McpServer>,
+        retry_scopes: Option<Vec<String>>,
+    },
     Other(Arc<McpServer>),
 }
 
 impl RetainedTransport {
     fn server(&self) -> &McpServer {
         match self {
-            Self::OAuthRecovery(server) | Self::Other(server) => server,
+            Self::OAuthRecovery { server, .. } | Self::Other(server) => server,
         }
     }
 }
@@ -567,6 +605,58 @@ impl Actor {
     #[allow(clippy::too_many_lines)]
     async fn handle(&mut self, command: Command) {
         match command {
+            Command::DenyOAuth {
+                epoch,
+                error,
+                scopes,
+                reply,
+            } => {
+                if epoch == self.epoch {
+                    let mut retained_oauth = false;
+                    for retained in &mut self.teardown_retry {
+                        if let RetainedTransport::OAuthRecovery { retry_scopes, .. } = retained {
+                            *retry_scopes = Some(scopes.clone());
+                            retained_oauth = true;
+                        }
+                    }
+                    let error = if retained_oauth {
+                        error
+                    } else {
+                        compose_teardown_error(error, self.stop_server().await)
+                    };
+                    self.state = SupervisorState::Failed;
+                    self.recovery_from = None;
+                    self.publish_snapshot(Some(error), None);
+                }
+                let _ = reply.send(());
+            }
+            Command::RetryOAuth { reply } => {
+                let scopes = if matches!(self.state, SupervisorState::Failed) {
+                    self.teardown_retry
+                        .iter_mut()
+                        .find_map(|retained| match retained {
+                            RetainedTransport::OAuthRecovery { retry_scopes, .. } => {
+                                retry_scopes.take()
+                            }
+                            RetainedTransport::Other(_) => None,
+                        })
+                } else {
+                    None
+                };
+                let permit = scopes.map(|scopes| {
+                    self.epoch = self.epoch.wrapping_add(1);
+                    self.state = SupervisorState::Recovering;
+                    self.publish_snapshot(None, None);
+                    (
+                        RecoveryPermit {
+                            epoch: self.epoch,
+                            config: self.snapshot.config.clone(),
+                        },
+                        scopes,
+                    )
+                });
+                let _ = reply.send(permit);
+            }
             Command::Status { reply } => {
                 let _ = reply.send(self.snapshot.clone());
             }
@@ -765,8 +855,10 @@ impl Actor {
                             if let SupervisorState::Ready(server) =
                                 std::mem::replace(&mut self.state, SupervisorState::Recovering)
                             {
-                                self.teardown_retry
-                                    .push(RetainedTransport::OAuthRecovery(Arc::clone(&server)));
+                                self.teardown_retry.push(RetainedTransport::OAuthRecovery {
+                                    server: Arc::clone(&server),
+                                    retry_scopes: None,
+                                });
                                 server
                                     .transport
                                     .quiesce()
@@ -787,6 +879,7 @@ impl Actor {
                             }));
                         }
                         Err(error) => {
+                            self.state = SupervisorState::Failed;
                             self.recovery_from = None;
                             self.publish_snapshot(Some(error.clone()), None);
                             let _ = reply.send(RecoveryClaim::Unavailable(error));
@@ -807,7 +900,7 @@ impl Actor {
                     return;
                 }
                 for retained in &self.teardown_retry {
-                    if let RetainedTransport::OAuthRecovery(server) = retained {
+                    if let RetainedTransport::OAuthRecovery { server, .. } = retained {
                         *server.oauth_bearer.write().unwrap() = Some(access_token.clone());
                     }
                 }
@@ -1091,12 +1184,22 @@ mod epoch_tests {
 
     struct RetryShutdownTransport {
         attempts: Arc<AtomicUsize>,
+        fail_quiesce: bool,
         failures_remaining: AtomicUsize,
         shutdown_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
     }
 
     #[async_trait]
     impl McpTransport for RetryShutdownTransport {
+        async fn quiesce(&self) -> Result<(), TransportError> {
+            if self.fail_quiesce {
+                Err(TransportError::Disconnected(
+                    "injected quiescence failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
         async fn request(
             &self,
             _method: &str,
@@ -1148,6 +1251,7 @@ mod epoch_tests {
                 name: "retry".to_string(),
                 transport: Arc::new(RetryShutdownTransport {
                     attempts: Arc::clone(&attempts),
+                    fail_quiesce: false,
                     failures_remaining: AtomicUsize::new(failures),
                     shutdown_gate: None,
                 }),
@@ -1546,12 +1650,35 @@ mod epoch_tests {
     }
 
     #[tokio::test]
+    async fn oauth_quiescence_failure_settles_failed_and_retains_cleanup() {
+        let (mut serving, attempts) = retry_shutdown_server(0);
+        serving.transport = Arc::new(RetryShutdownTransport {
+            attempts: Arc::clone(&attempts),
+            fail_quiesce: true,
+            failures_remaining: AtomicUsize::new(0),
+            shutdown_gate: None,
+        });
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Unavailable(error) = handle.claim_oauth_recovery(0).await else {
+            panic!("quiescence should fail");
+        };
+        assert!(error.contains("injected quiescence failure"));
+        assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+        assert!(handle.snapshot().pending_oauth_url.is_none());
+        assert!(handle.inspect().await.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        handle.remove().await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn oauth_callback_cleanup_and_restart_cannot_supersede_queued_reload() {
         let (mut serving, attempts) = retry_shutdown_server(0);
         let (started, mut started_rx) = mpsc::unbounded_channel();
         let releases = Arc::new(Semaphore::new(0));
         serving.transport = Arc::new(RetryShutdownTransport {
             attempts,
+            fail_quiesce: false,
             failures_remaining: AtomicUsize::new(0),
             shutdown_gate: Some((started, Arc::clone(&releases))),
         });

@@ -109,6 +109,11 @@ with successful and failed removal cleanup.
 re-addition after a token-store deletion error.
 `oauth_claim_quiesces_http_stream_without_deleting_the_session` verifies that
 retained sessions stop their server-initiated stream before credential recovery.
+`denied_step_up_can_reauthorize_on_unchanged_reload` covers a denied scope
+upgrade, preserved scopes on explicit reload, stale callback rejection, and
+authenticated cleanup before replacement publication.
+`oauth_quiescence_failure_settles_failed_and_retains_cleanup` covers a visible
+failed state and retained teardown ownership when stream quiescence fails.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

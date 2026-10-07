@@ -3867,6 +3867,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denied_step_up_can_reauthorize_on_unchanged_reload() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        let crate::supervisor::RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await
+        else {
+            panic!("OAuth recovery owner");
+        };
+        manager
+            .step_up_authorization(
+                "remote",
+                &handle,
+                &permit,
+                "Bearer error=\"insufficient_scope\", scope=\"write\"",
+            )
+            .await
+            .unwrap();
+        let old_url = pending_auth_url(&manager).await.unwrap();
+        let old = query_params(&old_url);
+        manager
+            .fail_oauth_authorization(&old["state"], "access_denied")
+            .await
+            .unwrap();
+        assert!(matches!(
+            handle.snapshot().state,
+            crate::supervisor::SupervisorState::Failed
+        ));
+        assert!(pending_auth_url(&manager).await.is_none());
+        manager
+            .reload_from_configs(vec![("remote".into(), permit.config)])
+            .await;
+        let new = query_params(&pending_auth_url(&manager).await.unwrap());
+        let scope_set = |scopes: &str| {
+            scopes
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(scope_set(&new["scope"]), scope_set(&old["scope"]));
+        assert!(!server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.request_line.starts_with("DELETE ")));
+        assert!(new["scope"]
+            .split_whitespace()
+            .any(|scope| scope == "write"));
+        assert_ne!(new["state"], old["state"]);
+        assert!(manager
+            .complete_oauth_authorization(&old["state"], "old", Some(&server.base()))
+            .await
+            .is_err());
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-2"));
+        manager
+            .complete_oauth_authorization(&new["state"], "code", Some(&server.base()))
+            .await
+            .unwrap();
+        handle.wait_for_settled().await;
+        assert!(handle.snapshot().is_ready());
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn removed_oauth_owner_is_forgotten_after_denial_cleanup_succeeds() {
         for cleanup_succeeds in [false, true] {
             let server = TestServer::start(handshake_responses("sess-1")).await;
