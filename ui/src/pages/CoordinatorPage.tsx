@@ -164,7 +164,6 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     setLoading(true);
     setResolvedCoordinatorId(null);
     let cancelled = false;
-    setResolvedCoordinatorId(null);
     setError(null);
     api.ensureGlobalCoordinator()
       .then(async (coordinator) => {
@@ -183,12 +182,13 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
             setError('Original source conversation unavailable');
             return;
           }
-          const [owner, selected] = await Promise.all([
+          const [owner, selected, exact] = await Promise.all([
             api.resolveCoordinatorRoute(slug ?? coordinator.conversation.id),
             api.resolveCoordinatorRoute(pin),
+            api.getConversation(pin),
           ]);
           if (cancelled) return;
-          if (!owner.coordinator_id || owner.coordinator_id !== selected.coordinator_id) {
+          if (exact.conversation.id !== pin || !owner.coordinator_id || owner.coordinator_id !== selected.coordinator_id) {
             setError('Original source conversation unavailable');
             return;
           }

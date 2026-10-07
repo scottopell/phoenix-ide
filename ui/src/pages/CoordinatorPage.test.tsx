@@ -8,6 +8,7 @@ import type { Conversation } from '../api';
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     ensureGlobalCoordinator: vi.fn(),
+    getConversation: vi.fn(),
     resolveCoordinatorRoute: vi.fn(),
     getCoordinatorAutomaticContinuation: vi.fn(),
     updateCoordinatorAutomaticContinuation: vi.fn(),
@@ -83,6 +84,7 @@ describe('CoordinatorPage', () => {
     vi.clearAllMocks();
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
+    apiMock.getConversation.mockImplementation(async (id: string) => ({ conversation: { id } }));
     apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([]);
     apiMock.listActiveCoordinatorWatches.mockResolvedValue([]);
     apiMock.stopLiveCoordinatorBashHandle.mockResolvedValue(undefined);
@@ -252,6 +254,13 @@ describe('CoordinatorPage', () => {
     await screen.findByText('Shared conversation runtime /global');
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(pin);
     expect(screen.getByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
+  });
+
+  it('rejects a slug pin even when it belongs to the Global domain', async () => {
+    apiMock.getConversation.mockResolvedValue({ conversation: { id: 'actual-transcript-id' } });
+    renderPage('/global/conv-coordinator?source_transcript=friendly-slug');
+    await screen.findByText('Original source conversation unavailable');
+    expect(screen.queryByText('Shared conversation runtime /global')).toBeNull();
   });
 
   it.each(['', 'foreign', 'old&source_transcript=other'])('fails closed on invalid direct Global pin %s', async (pin) => {

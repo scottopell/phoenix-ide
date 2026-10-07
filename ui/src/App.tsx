@@ -153,8 +153,8 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
         if (cancelled) return null;
         if (coordinator_id) {
           if (pinned !== undefined) {
-            const source = await api.resolveCoordinatorRoute(pinned);
-            if (source.coordinator_id !== coordinator_id) throw new Error('Transcript is not a member of this Global conversation');
+            const [source, exact] = await Promise.all([api.resolveCoordinatorRoute(pinned), api.getConversation(pinned)]);
+            if (exact.conversation.id !== pinned || source.coordinator_id !== coordinator_id) throw new Error('Transcript is not a member of this Global conversation');
           }
           if (!cancelled) navigate({ pathname: `/global/${pinned ?? reference}`, search: location.search, hash: location.hash }, { replace: true });
           return null;

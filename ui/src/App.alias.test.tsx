@@ -50,6 +50,7 @@ describe('ProductConversationAliasRedirect', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: null });
+  vi.spyOn(api, 'getConversation').mockImplementation(async (id) => ({ conversation: { id } } as never));
   });
 
   it('routes a historical Global member before ordinary snapshot lookup and retains its anchor', async () => {
