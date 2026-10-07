@@ -9,7 +9,7 @@ use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, Inst
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use super::auth::OwnerAuthenticated;
+use super::auth::{OwnerAuthenticated, PeerAuthenticated};
 use super::AppState;
 
 #[derive(Deserialize)]
@@ -30,6 +30,19 @@ pub struct RevokeEnrollmentResponse {
     pub revoked: bool,
 }
 
+#[derive(Deserialize)]
+pub struct RemoteQueryDatabaseRequest {
+    pub destination_instance_id: InstanceId,
+    pub sql: String,
+}
+
+#[derive(Serialize)]
+pub struct RemoteQueryDatabaseResponse {
+    pub destination_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+    pub result: phoenix_db::CoordinatorQueryResult,
+}
+
 fn random_peer_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -37,6 +50,46 @@ fn random_peer_token() -> String {
         "phx_peer_{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     )
+}
+
+pub async fn query_database(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteQueryDatabaseRequest>,
+) -> Response {
+    let destination_instance_id = match state.db.instance_id().await {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read destination instance identity");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if request.destination_instance_id != destination_instance_id {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "destination instance mismatch" })),
+        )
+            .into_response();
+    }
+    let service = super::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match service.query_database(&request.sql).await {
+        Ok(result) => Json(RemoteQueryDatabaseResponse {
+            destination_instance_id,
+            caller_instance_id: peer.caller_instance_id,
+            result,
+        })
+        .into_response(),
+        Err(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": error,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn issue_enrollment(

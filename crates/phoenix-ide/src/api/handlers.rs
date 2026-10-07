@@ -639,9 +639,19 @@ pub fn create_router(state: AppState) -> Router {
     // Register every SPA client route to serve the index.html shell, from the
     // single source of truth. These must be added before the auth layer below
     // so the middleware (which exempts them via the same SPA_ROUTES) wraps them.
+    let peer_router = Router::new()
+        .route(
+            "/api/federation/peer/query-database",
+            post(super::federation::query_database),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::auth::peer_auth_middleware,
+        ));
+
     let router = super::spa_routes::SPA_ROUTES
         .iter()
-        .fold(router, |router, route| {
+        .fold(router.merge(peer_router), |router, route| {
             router.route(route.pattern(), get(serve_spa))
         });
 
@@ -17970,6 +17980,87 @@ mod wake_handler_tests {
             )
             .await
             .expect("router response")
+    }
+
+    #[tokio::test]
+    async fn peer_query_database_requires_peer_auth_and_destination_identity() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        state.password = Some("owner-password".to_string());
+        let destination = state.db.instance_id().await.unwrap();
+        let caller = phoenix_core::domain::instance_identity::InstanceId::new();
+        let token = format!("phx_peer_{}", "a".repeat(43));
+        state
+            .db
+            .replace_federation_enrollment(
+                caller,
+                "peer",
+                &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    token.as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+        let request_body = serde_json::json!({
+            "destination_instance_id": destination,
+            "sql": "SELECT 1"
+        })
+        .to_string();
+
+        let unauthenticated = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let mismatch = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "destination_instance_id": phoenix_core::domain::instance_identity::InstanceId::new(),
+                            "sql": "SELECT 1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+
+        let success = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(success.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(success.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["destination_instance_id"], destination.to_string());
+        assert_eq!(body["caller_instance_id"], caller.to_string());
+        assert_eq!(body["result"]["rows"][0][0]["value"], 1);
     }
 
     #[tokio::test]

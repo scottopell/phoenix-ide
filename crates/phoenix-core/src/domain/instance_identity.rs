@@ -122,6 +122,16 @@ impl fmt::Display for PeerBaseUrl {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationQueryDatabaseEndpoint(url::Url);
+
+impl FederationQueryDatabaseEndpoint {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
 impl PeerBaseUrl {
     /// Return the normalized ASCII hostname.
     ///
@@ -143,6 +153,19 @@ impl PeerBaseUrl {
         self.0
             .port_or_known_default()
             .expect("HTTPS always has a known default port")
+    }
+
+    /// Return the closed endpoint for the bounded remote database query operation.
+    ///
+    /// # Panics
+    /// Panics only if the fixed compile-time route is not a valid URL path.
+    #[must_use]
+    pub fn query_database_endpoint(&self) -> FederationQueryDatabaseEndpoint {
+        FederationQueryDatabaseEndpoint(
+            self.0
+                .join("/api/federation/peer/query-database")
+                .expect("fixed federation route is a valid URL path"),
+        )
     }
 
     /// Reconstruct a peer origin from normalized relational columns.
@@ -213,6 +236,13 @@ mod tests {
     #[test]
     fn peer_base_url_requires_a_bare_https_origin() {
         assert!(PeerBaseUrl::from_str("https://peer.example").is_ok());
+        let endpoint = PeerBaseUrl::from_str("https://peer.example:8443")
+            .unwrap()
+            .query_database_endpoint();
+        assert_eq!(
+            endpoint.as_url().as_str(),
+            "https://peer.example:8443/api/federation/peer/query-database"
+        );
         for value in [
             "http://peer.example",
             "https://user@peer.example",

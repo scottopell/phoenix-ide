@@ -26,6 +26,32 @@ use serde::{Deserialize, Serialize};
 
 use super::assets::public_root_asset;
 use super::AppState;
+use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAuthenticated {
+    pub caller_instance_id: InstanceId,
+    pub caller_display_name: String,
+}
+
+#[async_trait::async_trait]
+impl<S> FromRequestParts<S> for PeerAuthenticated
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .ok_or(StatusCode::UNAUTHORIZED)
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub struct OwnerAuthenticated;
 
@@ -400,6 +426,10 @@ fn is_exempt_path(path: &str) -> bool {
         return true;
     }
 
+    if path.starts_with("/api/federation/peer/") {
+        return true;
+    }
+
     // Command suggestion is gated by its own scoped capability token
     // (PHOENIX_SUGGEST_TOKEN), checked inside the handler — not the master
     // password. Exempt it from the password middleware so the in-terminal
@@ -464,6 +494,40 @@ pub async fn auth_middleware(
             Json(serde_json::json!({ "error": "Authentication required" })),
         )
             .into_response(),
+    }
+}
+
+pub async fn peer_auth_middleware(
+    State(state): State<AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let authenticated = bearer_token(&req)
+        .filter(|token| token.starts_with("phx_peer_"))
+        .map(|token| FederationCredentialVerifier::from_bearer(token.as_bytes()));
+    let enrollment = match authenticated {
+        Some(verifier) => match state.db.authenticate_federation_verifier(&verifier).await {
+            Ok(enrollment) => enrollment,
+            Err(error) => {
+                tracing::warn!(%error, "federation credential lookup failed closed");
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(enrollment) = enrollment {
+        req.extensions_mut().insert(PeerAuthenticated {
+            caller_instance_id: enrollment.caller_instance_id,
+            caller_display_name: enrollment.caller_display_name,
+        });
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Peer authentication required" })),
+        )
+            .into_response()
     }
 }
 
