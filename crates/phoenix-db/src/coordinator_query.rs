@@ -86,9 +86,32 @@ pub struct CoordinatorQueryResult {
 pub enum CoordinatorCell {
     Null,
     Integer(i64),
-    Real(f64),
+    Real(CoordinatorReal),
     Text(String),
     Blob { bytes: usize },
+}
+
+#[derive(Debug, serde::Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum CoordinatorReal {
+    Finite(f64),
+    PositiveInfinity,
+    NegativeInfinity,
+    Nan,
+}
+
+impl From<f64> for CoordinatorReal {
+    fn from(value: f64) -> Self {
+        if value.is_nan() {
+            Self::Nan
+        } else if value == f64::INFINITY {
+            Self::PositiveInfinity
+        } else if value == f64::NEG_INFINITY {
+            Self::NegativeInfinity
+        } else {
+            Self::Finite(value)
+        }
+    }
 }
 
 struct AuthorizerState {
@@ -555,7 +578,7 @@ fn read_cell(statement: *mut ffi::sqlite3_stmt, index: c_int) -> CoordinatorCell
             CoordinatorCell::Integer(unsafe { ffi::sqlite3_column_int64(statement, index) })
         }
         ffi::SQLITE_FLOAT => {
-            CoordinatorCell::Real(unsafe { ffi::sqlite3_column_double(statement, index) })
+            CoordinatorCell::Real(unsafe { ffi::sqlite3_column_double(statement, index) }.into())
         }
         ffi::SQLITE_TEXT => {
             let value = unsafe { ffi::sqlite3_column_text(statement, index) };
@@ -581,7 +604,12 @@ fn cell_size(cell: &CoordinatorCell) -> usize {
     match cell {
         CoordinatorCell::Null => 4,
         CoordinatorCell::Integer(value) => value.to_string().len(),
-        CoordinatorCell::Real(value) => value.to_string().len(),
+        CoordinatorCell::Real(CoordinatorReal::Finite(value)) => value.to_string().len(),
+        CoordinatorCell::Real(
+            CoordinatorReal::PositiveInfinity
+            | CoordinatorReal::NegativeInfinity
+            | CoordinatorReal::Nan,
+        ) => 8,
         CoordinatorCell::Text(value) => value.len(),
         CoordinatorCell::Blob { .. } => 16,
     }
@@ -698,6 +726,23 @@ mod tests {
         assert!(read_allowed("unrelated", "token"));
         assert!(read_allowed("auth_sessions", "created_at"));
         assert!(read_allowed("future_secret_store", "secret"));
+    }
+
+    #[test]
+    fn non_finite_real_cells_have_total_json_round_trip() {
+        let (_dir, path) = fixture();
+        let result =
+            execute_coordinator_query(path.to_str().unwrap(), "SELECT 1e999, -1e999").unwrap();
+        let json = serde_json::to_vec(&result).unwrap();
+        let decoded: CoordinatorQueryResult = serde_json::from_slice(&json).unwrap();
+        assert!(matches!(
+            decoded.rows[0][0],
+            CoordinatorCell::Real(CoordinatorReal::PositiveInfinity)
+        ));
+        assert!(matches!(
+            decoded.rows[0][1],
+            CoordinatorCell::Real(CoordinatorReal::NegativeInfinity)
+        ));
     }
 
     #[test]

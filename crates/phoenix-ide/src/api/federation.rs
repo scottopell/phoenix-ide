@@ -5,12 +5,17 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use futures::StreamExt as _;
 use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use super::auth::{OwnerAuthenticated, PeerAuthenticated};
 use super::AppState;
+
+static QUERY_ADMISSION: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
+const MAX_REMOTE_RESPONSE_BYTES: usize = 65 * 1024;
 
 #[derive(Deserialize)]
 pub struct IssueEnrollmentRequest {
@@ -30,7 +35,7 @@ pub struct RevokeEnrollmentResponse {
     pub revoked: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct RemoteQueryDatabaseRequest {
     pub destination_instance_id: InstanceId,
     pub sql: String,
@@ -51,6 +56,12 @@ pub enum FederationClientError {
     Database(#[from] phoenix_db::DbError),
     #[error("federation request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("remote response exceeded {0} bytes")]
+    ResponseTooLarge(usize),
+    #[error("remote query rejected: {0}")]
+    RemoteRejected(String),
+    #[error("invalid federation response: {0}")]
+    InvalidResponse(#[from] serde_json::Error),
     #[error("destination identity mismatch")]
     DestinationMismatch,
 }
@@ -70,15 +81,36 @@ pub async fn query_remote_database(
     let response = client
         .post(endpoint.as_url().clone())
         .bearer_auth(peer.bearer_credential.expose())
-        .json(&serde_json::json!({
-            "destination_instance_id": peer_instance_id,
-            "sql": sql,
-        }))
+        .json(&RemoteQueryDatabaseRequest {
+            destination_instance_id: peer_instance_id,
+            sql: sql.to_owned(),
+        })
         .send()
-        .await?
-        .error_for_status()?
-        .json::<RemoteQueryDatabaseResponse>()
         .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_RESPONSE_BYTES {
+            return Err(FederationClientError::ResponseTooLarge(
+                MAX_REMOTE_RESPONSE_BYTES,
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|body| {
+                body.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        return Err(FederationClientError::RemoteRejected(detail));
+    }
+    let response: RemoteQueryDatabaseResponse = serde_json::from_slice(&bytes)?;
     if response.destination_instance_id != peer_instance_id {
         return Err(FederationClientError::DestinationMismatch);
     }
@@ -113,6 +145,13 @@ pub async fn query_database(
         )
             .into_response();
     }
+    let Ok(_permit) = QUERY_ADMISSION.try_acquire() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "remote query admission limit reached" })),
+        )
+            .into_response();
+    };
     let service = super::global_read::GlobalReadService::new(
         state.db.clone(),
         state.message_retriever.clone(),
