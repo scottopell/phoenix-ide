@@ -521,32 +521,11 @@ impl ResponsesStreamAccumulator {
                         "responses_api terminal event had no /response/usage"
                     );
                 }
+                if let Some(items) = v
+                    .pointer("/response/output")
+                    .and_then(serde_json::Value::as_array)
                 {
-                    if let Some(arr) = v
-                        .pointer("/response/output")
-                        .and_then(serde_json::Value::as_array)
-                    {
-                        self.output_items.clear();
-                        for (index, item) in arr.iter().enumerate() {
-                            match serde_json::from_value::<ResponsesApiOutput>(item.clone()) {
-                                Ok(output) => {
-                                    self.output_items.insert(index, output);
-                                }
-                                Err(e) => tracing::warn!(
-                                    error = %e,
-                                    item_type = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                                    item_bytes = item.to_string().len(),
-                                    "responses_api response.completed fallback: output item deserialize failed"
-                                ),
-                            }
-                        }
-                        if !self.output_items.is_empty() {
-                            tracing::info!(
-                                n = self.output_items.len(),
-                                "responses_api accepted authoritative response.completed output"
-                            );
-                        }
-                    }
+                    self.complete_output_items(items);
                 }
                 self.done = true;
             }
@@ -565,6 +544,44 @@ impl ResponsesStreamAccumulator {
             }
         }
         Ok(())
+    }
+
+    fn complete_output_items(&mut self, terminal: &[serde_json::Value]) {
+        if self.output_items.is_empty() {
+            self.output_items.extend(
+                terminal
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, item)| (ordinal, ResponsesApiOutput(item.clone()))),
+            );
+            return;
+        }
+        for (ordinal, item) in terminal.iter().enumerate() {
+            let index = if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                self.output_items.iter().find_map(|(index, collected)| {
+                    (collected.0.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                        .then_some(*index)
+                })
+            } else if terminal.len() == self.output_items.len() {
+                self.output_items
+                    .get(&ordinal)
+                    .filter(|collected| collected.0.get("id").is_none())
+                    .map(|_| ordinal)
+            } else {
+                None
+            };
+            if let Some(collected) = index.and_then(|index| self.output_items.get_mut(&index)) {
+                if preserves_completed_output(&collected.0, item) {
+                    collected.0 = item.clone();
+                } else {
+                    tracing::debug!("retaining completed stream item over conflicting or incomplete terminal output");
+                }
+            } else {
+                tracing::debug!(
+                    "ignoring terminal enrichment without a matching completed stream item"
+                );
+            }
+        }
     }
 
     fn output_items_as_values(&self) -> Vec<serde_json::Value> {
@@ -603,6 +620,26 @@ impl ResponsesStreamAccumulator {
         })?;
         telemetry.attach_success(&mut response);
         Ok(response)
+    }
+}
+
+fn preserves_completed_output(collected: &serde_json::Value, terminal: &serde_json::Value) -> bool {
+    match (collected, terminal) {
+        (serde_json::Value::Object(collected), serde_json::Value::Object(terminal)) => {
+            collected.iter().all(|(key, value)| {
+                terminal
+                    .get(key)
+                    .is_some_and(|terminal| preserves_completed_output(value, terminal))
+            })
+        }
+        (serde_json::Value::Array(collected), serde_json::Value::Array(terminal)) => {
+            collected.len() == terminal.len()
+                && collected
+                    .iter()
+                    .zip(terminal)
+                    .all(|(collected, terminal)| preserves_completed_output(collected, terminal))
+        }
+        _ => collected == terminal,
     }
 }
 
@@ -5002,6 +5039,81 @@ mod tests {
         ));
     }
 
+    async fn collect_completed_output(wire: &serde_json::Value) -> ResponsesStreamAccumulator {
+        let mut accumulator = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        for index in [2, 0, 1] {
+            let event = serde_json::json!({"type":"response.output_item.done","output_index":index,"item":wire["output"][index]});
+            accumulator
+                .process_event("response.output_item.done", &event.to_string(), &tx)
+                .await
+                .unwrap();
+        }
+        accumulator
+    }
+
+    async fn finish_with_terminal_output(
+        mut accumulator: ResponsesStreamAccumulator,
+        wire: &serde_json::Value,
+        terminal_output: serde_json::Value,
+    ) -> LlmResponse {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut terminal = wire.clone();
+        terminal["output"] = terminal_output;
+        let event = serde_json::json!({"type":"response.completed","response":terminal});
+        accumulator
+            .process_event("response.completed", &event.to_string(), &tx)
+            .await
+            .unwrap();
+        accumulator.into_response().unwrap()
+    }
+
+    fn assert_exact_completed_replay(response: &LlmResponse, wire: &serde_json::Value) {
+        assert!(!response.end_turn);
+        assert_eq!(response.content.len(), 2);
+        let Some(ProviderReplayUpdate::Responses(set)) = &response.provider_replay else {
+            panic!("completed function call and reasoning must remain replayable");
+        };
+        assert_eq!(set.output_items, wire["output"].as_array().unwrap().clone());
+    }
+
+    #[tokio::test]
+    async fn empty_terminal_output_preserves_completed_text_tool_and_reasoning() {
+        let wire = reasoning_response("r1", "c1");
+        let accumulator = collect_completed_output(&wire).await;
+        let response = finish_with_terminal_output(accumulator, &wire, serde_json::json!([])).await;
+        assert_exact_completed_replay(&response, &wire);
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_output_preserves_completed_envelopes_at_original_ordinals() {
+        let wire = reasoning_response("r1", "c1");
+        for terminal in [
+            serde_json::json!([wire["output"][2]]),
+            serde_json::json!([wire["output"][1]]),
+            serde_json::json!([{"type":"function_call","id":"item-c1","call_id":"c1"}]),
+        ] {
+            let accumulator = collect_completed_output(&wire).await;
+            let response = finish_with_terminal_output(accumulator, &wire, terminal).await;
+            assert_exact_completed_replay(&response, &wire);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_enrichment_adds_encryption_without_erasing_other_items() {
+        let wire = reasoning_response("r1", "c1");
+        let mut collected = wire.clone();
+        collected["output"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("encrypted_content");
+        let accumulator = collect_completed_output(&collected).await;
+        let response =
+            finish_with_terminal_output(accumulator, &wire, serde_json::json!([wire["output"][0]]))
+                .await;
+        assert_exact_completed_replay(&response, &wire);
+    }
+
     #[tokio::test]
     async fn streaming_replay_retains_terminal_encrypted_reasoning_and_output_order() {
         let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
@@ -6315,7 +6427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_event_terminal_output_replaces_items_without_duplication() {
+    async fn process_event_terminal_output_preserves_items_without_duplication() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let item_done = r#"{
@@ -6344,7 +6456,7 @@ mod tests {
         assert_eq!(
             acc.output_items.len(),
             1,
-            "terminal output must replace, rather than append to, item.done output"
+            "terminal output must not duplicate completed items"
         );
     }
 
