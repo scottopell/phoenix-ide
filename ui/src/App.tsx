@@ -128,6 +128,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
   } | null>(null);
   const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
   const [exactMember, setExactMember] = useState<{ reference: string; transcript: string; open: boolean } | null>(null);
+  const [pinError, setPinError] = useState<string | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
 
@@ -138,21 +139,40 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     }
     setExactMember(null);
     setResolvedProduct(null);
+    setFallbackSnapshot(null);
+    setPinError(null);
+    const pins = new URLSearchParams(location.search).getAll('source_transcript');
+    const pinned = pins[0];
+    if (pins.length > 1 || (pinned !== undefined && (!pinned || pinned.trim() !== pinned))) {
+      setPinError('Invalid exact transcript reference.');
+      return;
+    }
     let cancelled = false;
     api.resolveCoordinatorRoute(reference)
       .then(async ({ coordinator_id }) => {
         if (cancelled) return null;
         if (coordinator_id) {
-          navigate({ pathname: `/global/${reference}`, search: location.search, hash: location.hash }, { replace: true });
+          if (pinned !== undefined) {
+            const source = await api.resolveCoordinatorRoute(pinned);
+            if (source.coordinator_id !== coordinator_id) throw new Error('Transcript is not a member of this Global conversation');
+          }
+          if (!cancelled) navigate({ pathname: `/global/${pinned ?? reference}`, search: location.search, hash: location.hash }, { replace: true });
           return null;
         }
         return api.getProductConversationSnapshot(reference, { message_limit: 1 });
       })
-      .then((snapshot) => {
+      .then(async (snapshot) => {
         if (!snapshot) return;
         if (!cancelled) {
-          const pinned = new URLSearchParams(location.search).get('source_transcript');
-          if (pinned === reference || (snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id)) {
+          if (pinned !== undefined) {
+            const source = await api.getProductConversationSnapshot(pinned, { message_limit: 1 });
+            if (source.product_conversation_id !== snapshot.product_conversation_id || source.requested_transcript_row_id !== pinned) {
+              throw new Error('Transcript is not a member of this conversation');
+            }
+            if (!cancelled) setExactMember({ reference, transcript: pinned, open: snapshot.ordinary_lifecycle === 'open' });
+            return;
+          }
+          if (snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
             setExactMember({ reference, transcript: reference, open: snapshot.ordinary_lifecycle === 'open' });
             return;
           }
@@ -168,6 +188,10 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       })
       .catch((error: unknown) => {
         if (!cancelled) {
+          if (pinned !== undefined) {
+            setPinError('Exact transcript unavailable or not a member of this conversation.');
+            return;
+          }
           setFallbackSnapshot({
             reference,
             rowSlug: reference,
@@ -177,6 +201,8 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       });
     return () => { cancelled = true; };
   }, [location.hash, location.pathname, location.search, navigate, reference, retryToken]);
+
+  if (pinError) return <main><div role="alert">{pinError}</div></main>;
 
   if (exactMember && exactMember.reference === reference) {
     return <EmbeddedConversationPage slug={exactMember.transcript} suppressCanonicalization routePrefix="/c"

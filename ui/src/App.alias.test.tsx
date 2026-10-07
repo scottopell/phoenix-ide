@@ -34,11 +34,12 @@ function Location() {
 function renderAlias(reference: string, entry = `/c/${reference}`) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
+      <Location />
       <Suspense fallback={null}>
         <Routes>
           <Route path="/c/:slug" element={<ProductConversationAliasRedirect reference={reference} />} />
-          <Route path="/product-conversations/:id" element={<Location />} />
-          <Route path="/global/:slug" element={<Location />} />
+          <Route path="/product-conversations/:id" element={entry.startsWith('/product-conversations/') ? <ProductConversationAliasRedirect reference={reference} /> : null} />
+          <Route path="/global/:slug" element={null} />
         </Routes>
       </Suspense>
     </MemoryRouter>,
@@ -95,6 +96,28 @@ describe('ProductConversationAliasRedirect', () => {
     renderAlias('historical', '/c/historical?source_transcript=historical&source_tool=send#message-source');
     await screen.findByTestId('embedded-fallback');
     expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'historical', suppressCanonicalization: true }));
+    expect(screen.queryByTestId('product-page')).toBeNull();
+  });
+
+  it.each(['/c/product-1', '/product-conversations/product-1', '/c/legacy-slug'])('honors an encoded predecessor pin on %s', async (path) => {
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async (reference) => ({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      requested_transcript_row_id: reference === 'old:member' ? 'old:member' : 'root', latest_transcript_row_id: 'successor',
+    } as never));
+    renderAlias(path.split('/').at(-1)!, `${path}?source_transcript=old%3Amember&viewer=inspect#message-old%3Amsg`);
+    await screen.findByTestId('embedded-fallback');
+    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'old:member' }));
+    expect(screen.getByTestId('location')).toHaveTextContent('source_transcript=old%3Amember&viewer=inspect#message-old%3Amsg');
+  });
+
+  it.each(['', 'alien', 'old&source_transcript=other'])('rejects invalid or nonmember pin %s without opening latest', async (pin) => {
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async (reference) => ({
+      product_conversation_id: reference === 'product-1' ? 'product-1' : 'another-product',
+      canonical_route: '/c/product-1', ordinary_lifecycle: 'open', requested_transcript_row_id: reference,
+    } as never));
+    renderAlias('product-1', `/c/product-1?source_transcript=${pin}`);
+    await screen.findByRole('alert');
+    expect(embeddedSpy).not.toHaveBeenCalled();
     expect(screen.queryByTestId('product-page')).toBeNull();
   });
 
