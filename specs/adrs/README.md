@@ -97,6 +97,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [081](081_global-coordinator-borrows-workscope-svg-source-authority.md) | Global Coordinator borrows WorkScope SVG source authority | Accepted | REQ-SVG-001, REQ-GR-007 |
 | [082](082_legacy-auq-waits-retain-identity-absence.md) | Legacy AUQ waits retain identity absence | Accepted | REQ-AUQ-009, REQ-COMP-001; `QuestionRequestId`, `AwaitingUserResponse` |
 | [083](083_federation-instance-identity-and-known-credential-query-exclusions.md) | Federation establishes stable instance identity and excludes known credentials from agent SQL | Accepted | REQ-GR-011A; federation instance identity |
+| [084](084_canonical-short-product-navigation.md) | Canonical short ProductConversation navigation with exact evidence selectors | Accepted | REQ-GR-009 |
 
 ## For agents: which decisions bind your task
 
