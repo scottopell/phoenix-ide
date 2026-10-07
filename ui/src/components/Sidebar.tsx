@@ -234,7 +234,7 @@ export function Sidebar({
     setProductConversations((rows) => projectProductConversationHistory(rows, productConversationId));
   }), []);
   useEffect(() => {
-    if (!activeSlug || !location.pathname.startsWith('/product-conversations/')) {
+    if (!activeSlug || !(location.pathname.startsWith('/product-conversations/') || location.pathname.startsWith('/c/'))) {
       setActiveProductSnapshot(null);
       return;
     }

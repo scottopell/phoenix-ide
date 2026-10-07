@@ -762,7 +762,7 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
 }
 
 fn conversation_href(conv: &Conversation) -> String {
-    format!("/c/{}", conv.slug.as_deref().unwrap_or(&conv.id))
+    format!("/c/{}?source_transcript={}", conv.id, conv.id)
 }
 
 fn conversation_message_href(conv: &Conversation, message: Option<(&str, MessageType)>) -> String {
@@ -2232,6 +2232,16 @@ mod tests {
                 path_semantics: ServerPathSemantics::ServerFilesystem,
             }
         );
+        for reference in [
+            format!("/c/{product_id}"),
+            format!("/c/{product_id}?viewer=inspect"),
+            format!("/product-conversations/{product_id}"),
+        ] {
+            let canonical = service.resolve_reference(&reference).await.unwrap();
+            assert_eq!(canonical.id, stable.id);
+            assert_eq!(canonical.work_scope, stable.work_scope);
+            assert_eq!(canonical.href, Some(format!("/c/{product_id}")));
+        }
         let stable_json = serde_json::to_value(&stable).unwrap();
         assert_eq!(stable_json["work_scope"]["status"], "available");
         assert_eq!(
@@ -2243,6 +2253,10 @@ mod tests {
             .resolve_reference("@transcript:root-scope")
             .await
             .unwrap();
+        assert_eq!(exact.href.as_deref(), Some("/c/root-scope?source_transcript=root-scope"));
+        let pinned = service.resolve_reference(exact.href.as_deref().unwrap()).await.unwrap();
+        assert_eq!(pinned.id, exact.id);
+        assert_eq!(pinned.work_scope, exact.work_scope);
         assert_eq!(
             exact.work_scope,
             ResolvedWorkScope::Available {

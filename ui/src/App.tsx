@@ -152,8 +152,8 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
         if (!snapshot) return;
         if (!cancelled) {
           const pinned = new URLSearchParams(location.search).get('source_transcript');
-          if (pinned === reference) {
-            setExactMember({ reference, transcript: pinned, open: snapshot.ordinary_lifecycle === 'open' });
+          if (pinned === reference || (snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id)) {
+            setExactMember({ reference, transcript: reference, open: snapshot.ordinary_lifecycle === 'open' });
             return;
           }
           setResolvedProduct({ reference, id: snapshot.product_conversation_id });

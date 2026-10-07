@@ -25,7 +25,7 @@ describe('Global coordinator tool results', () => {
       </MemoryRouter>,
     );
     expect(screen.getByText('Queued as steering')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/product-conversations/product-1');
+    expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/c/product-1');
     expect(screen.getByRole('link', { name: 'Open receiving transcript' })).toHaveAttribute('href', '/c/transcript-1');
     expect(screen.getByText('@conv:product-1')).toBeInTheDocument();
     expect(screen.getByText(/recipient understanding or completion is not implied/i)).toBeInTheDocument();
@@ -76,7 +76,7 @@ describe('Global coordinator tool results', () => {
         />
       </MemoryRouter>,
     );
-    expect(screen.getByRole('link', { name: 'Readable owner' })).toHaveAttribute('href', '/product-conversations/product-owner');
+    expect(screen.getByRole('link', { name: 'Readable owner' })).toHaveAttribute('href', '/c/product-owner');
     expect(screen.getByRole('link', { name: 'Readable owner' })).toHaveAttribute('title', 'Owning conversation: Readable owner');
     expect(screen.getByText('scope-owner')).not.toBeVisible();
   });
@@ -89,7 +89,7 @@ describe('Global coordinator tool results', () => {
         }]} />
       </MemoryRouter>,
     );
-    expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/product-conversations/product-3');
+    expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/c/product-3');
     expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/transcript-3');
     expect(screen.getByText('product-3')).toBeInTheDocument();
     expect(screen.getByText('Idle')).toBeInTheDocument();
@@ -303,7 +303,7 @@ describe('user message provenance rendering', () => {
     render(<MemoryRouter><UserMessage message={userMessage('received', 'From another conversation', {
       origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-product', transcript_id: 'source-row' },
     })} /></MemoryRouter>);
-    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' })).toHaveAttribute('href', '/c/source-row?source_transcript=source-row');
     expect(screen.getByText(/From conversation ID source-product/).closest('.message')).toHaveClass('meta');
     expect(screen.queryByRole('link', { name: /source-product/ })).not.toBeInTheDocument();
     expect(screen.queryByText('You')).not.toBeInTheDocument();
@@ -325,7 +325,7 @@ describe('user message provenance rendering', () => {
       } }} onRetry={() => {}} />
       <QueuedUserMessage message={{ localId: 'local', text: 'local', images: [], status: 'pending' }} onRetry={() => {}} />
     </></MemoryRouter>);
-    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' })).toHaveAttribute('href', '/c/source-row?source_transcript=source-row');
     expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' }).closest('.message')).toHaveClass('meta', 'steering-queued');
     expect(screen.getByText('User · API').closest('.message')).toHaveClass('user');
     expect(screen.queryByText('You')).not.toBeInTheDocument();
