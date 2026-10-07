@@ -646,6 +646,8 @@ rule InsufficientScopeStepUp {
         -- complete cleanup before publishing a replacement. Bind the flow
         -- to the recovery epoch and publish awaiting-authorization under the
         -- same mutation fence before admitting its callback.
+        -- If flow setup fails, settle failed and retain the requested scope
+        -- union with cleanup ownership for an explicit unchanged-config retry.
         -- 403 insufficient_scope + WWW-Authenticate carries the required
         -- scope. The authorization URL requests the UNION of the existing
         -- token's persisted `scopes` and the challenged scope (read before the

@@ -3939,6 +3939,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unstartable_step_up_preserves_scope_union_for_explicit_retry() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        *manager.oauth.redirect_base.lock().unwrap() = None;
+        let error = manager
+            .recover_oauth(
+                "remote",
+                &handle,
+                0,
+                crate::OAuthRecoveryKind::StepUp {
+                    www_authenticate: "Bearer error=\"insufficient_scope\", scope=\"write\"".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("re-authorization could not start"));
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Failed);
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        manager
+            .reload_from_configs(vec![("remote".into(), handle.snapshot().config)])
+            .await;
+        let params = query_params(&pending_auth_url(&manager).await.unwrap());
+        let scopes = params["scope"]
+            .split_whitespace()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(scopes, ["mcp.read", "write"].into_iter().collect());
+        assert!(!server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.request_line.starts_with("DELETE ")));
+        *server.routes.delete_bearer.lock().unwrap() = None;
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn denied_step_up_can_reauthorize_on_unchanged_reload() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = ready_refreshable_manager(&server).await;

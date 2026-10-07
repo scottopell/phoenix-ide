@@ -2271,7 +2271,7 @@ impl McpClientManager {
         let config = &permit.config;
         // Prior grants are read BEFORE the token is discarded; persisting
         // scopes on the token makes them available even across a restart.
-        let prior_scopes = match self.oauth.store().token(name).await {
+        let mut prior_scopes = match self.oauth.store().token(name).await {
             Ok(Some(token)) => token.scopes,
             Ok(None) => Vec::new(),
             Err(e) => {
@@ -2279,6 +2279,10 @@ impl McpClientManager {
                 Vec::new()
             }
         };
+        let challenge = oauth::parse_bearer_challenge(www_authenticate);
+        if let Some(scopes) = challenge.get("scope") {
+            extend_unique(&mut prior_scopes, scopes.split_whitespace());
+        }
         if let Err(e) = self.oauth.store().delete_token(name).await {
             tracing::warn!(server = %name, "Failed to delete narrow OAuth token: {e}");
         }
@@ -2288,7 +2292,7 @@ impl McpClientManager {
             name,
             config,
             Some(www_authenticate),
-            prior_scopes,
+            prior_scopes.clone(),
         )
         .await
         {
@@ -2298,18 +2302,28 @@ impl McpClientManager {
                     url = %auth_url,
                     "Tool call needs additional scopes; awaiting re-authorization"
                 );
-                self.await_owned_oauth_flow(
-                    name,
-                    handle,
-                    permit.epoch,
-                    "additional OAuth scopes required".to_string(),
-                )
-                .await
+                let result = self
+                    .await_owned_oauth_flow(
+                        name,
+                        handle,
+                        permit.epoch,
+                        "additional OAuth scopes required".to_string(),
+                    )
+                    .await;
+                if let Err(error) = &result {
+                    handle
+                        .deny_oauth(permit.epoch, error.clone(), prior_scopes)
+                        .await;
+                }
+                result
             }
-            Err(e) => Err(format!(
-                "MCP server '{name}': insufficient scope and re-authorization could not \
-                 start: {e}"
-            )),
+            Err(e) => {
+                let error = format!("MCP server '{name}': insufficient scope and re-authorization could not start: {e}");
+                handle
+                    .deny_oauth(permit.epoch, error.clone(), prior_scopes)
+                    .await;
+                Err(error)
+            }
         }
     }
 
@@ -2893,7 +2907,6 @@ impl McpClientManager {
                     .step_up_authorization(server_name, handle, &permit, &www_authenticate)
                     .await
                 {
-                    handle.fail(permit.epoch, error.clone()).await;
                     return Err(McpToolCallError::Failed(error));
                 }
                 self.wait_for_ready(handle, &CancellationToken::new()).await

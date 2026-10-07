@@ -119,6 +119,8 @@ transport recovery winning leadership before OAuth recovery, with expired
 DELETE followed by refreshed DELETE and a ready replacement.
 `rejected_refresh_with_unstartable_authorization_settles_failed` verifies
 visible failure without an endless retry, followed by explicit authorization retry.
+`unstartable_step_up_preserves_scope_union_for_explicit_retry` covers the
+equivalent scope-upgrade setup failure without losing the requested grants.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 
