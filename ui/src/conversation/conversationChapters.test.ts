@@ -129,6 +129,28 @@ describe('buildConversationChapters', () => {
     ]);
   });
 
+  it('excludes typed watch events without displacing human prompts or transcript indices after reload', () => {
+    const human = userUnit('human', 'Conversation event is text I want to discuss');
+    if (human.kind === 'user') human.message.origin = { kind: 'user_api' };
+    const events = [1, 2, 3].map((n) => {
+      const unit = userUnit(`event-${n}`, `Notification ${n}`, n + 1);
+      if (unit.kind === 'user') unit.message.origin = { kind: 'subscription_event', event_id: `event-${n}` };
+      return unit;
+    });
+    const reply = agentTurnUnit('reply', [{ type: 'text', text: LONG_PROSE }], 5);
+    const next = userUnit('successor:human', 'Next real prompt', 6);
+    if (next.kind === 'user') {
+      next.message.origin = { kind: 'user_api' };
+      next.message.conversation_id = 'successor';
+    }
+    const units = [human, ...events, reply, next];
+    expect(buildConversationChapters(units.slice(0, 4)).map((c) => c.unitIndex)).toEqual([0]);
+    expect(buildConversationChapters(units).map((c) => c.unitIndex)).toEqual([0, 4, 5]);
+    expect(buildConversationChapters(JSON.parse(JSON.stringify(units)))).toEqual(buildConversationChapters(units));
+    expect(units).toHaveLength(6);
+    expect(buildConversationChapters(units)[0]?.label).toContain('Conversation event');
+  });
+
   it('skips whitespace-only user prompts', () => {
     const units = [userUnit('u1', '   \n\t  ')];
     expect(buildConversationChapters(units)).toEqual([]);
