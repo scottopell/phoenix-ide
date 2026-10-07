@@ -343,6 +343,8 @@ without requiring authenticated session deletion before token refresh or
 re-authorization. THE SYSTEM SHALL use the recovered bearer to finish that
 cleanup before making a replacement connection callable. An unresolved cleanup
 failure SHALL retain retry ownership and block replacement.
+Configuration supersession SHALL fence token persistence, token invalidation,
+and authorization-flow publication, including background refresh retries.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very

@@ -1030,6 +1030,12 @@ mod tests {
     struct ResponseRoutes {
         paths: Mutex<HashMap<String, VecDeque<CannedResponse>>>,
         delete_bearer: Mutex<Option<String>>,
+        token_gate: Mutex<
+            Option<(
+                tokio::sync::mpsc::UnboundedSender<()>,
+                Arc<tokio::sync::Semaphore>,
+            )>,
+        >,
     }
 
     type RouteMap = Arc<ResponseRoutes>;
@@ -1317,6 +1323,15 @@ mod tests {
                 &request_count,
                 &get_responses,
             );
+            let token_gate = if path == "/token" {
+                routes.token_gate.lock().unwrap().take()
+            } else {
+                None
+            };
+            if let Some((started, release)) = token_gate {
+                started.send(()).unwrap();
+                release.acquire().await.unwrap().forget();
+            }
             if response.delay_ms > 0 {
                 // test-timing-allow: scripted HTTP response latency drives recovery/timeout behavior
                 tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
@@ -3245,6 +3260,116 @@ mod tests {
         }
         server.push_responses(vec![delete_ack()]);
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn oauth_refresh_mutations_are_serialized_with_reload_for_success_and_rejection() {
+        for (rejected, background_retry) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let server = TestServer::start(handshake_responses("sess-1")).await;
+            let manager = ready_refreshable_manager(&server).await;
+            *server.routes.delete_bearer.lock().unwrap() = None;
+            let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+            let response = if rejected {
+                let mut response = json_doc(&serde_json::json!({"error": "invalid_grant"}));
+                response.status = 400;
+                response
+            } else {
+                token_response("at-2", Some("rt-2"), None)
+            };
+            let responses = if background_retry {
+                vec![status_response(503, &[]), response]
+            } else {
+                vec![response]
+            };
+            server.route_seq("/token", responses);
+            server.push_responses(vec![unauthorized(&server), delete_ack()]);
+            server.push_responses(handshake_responses("sess-2"));
+            server.push_responses(vec![delete_ack()]);
+            let call = if background_retry {
+                let error = manager
+                    .call_tool("remote", "report", serde_json::json!({}))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("refresh failed"), "{error}");
+                *server.routes.token_gate.lock().unwrap() = Some((started, Arc::clone(&release)));
+                tokio::spawn({
+                    let manager = Arc::clone(&manager);
+                    async move {
+                        manager.await_background_tasks().await;
+                    }
+                })
+            } else {
+                *server.routes.token_gate.lock().unwrap() = Some((started, Arc::clone(&release)));
+                tokio::spawn({
+                    let manager = Arc::clone(&manager);
+                    async move {
+                        let _ = manager
+                            .call_tool("remote", "report", serde_json::json!({}))
+                            .await;
+                    }
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(15), started_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let handle = manager.servers.read().await.get("remote").unwrap().clone();
+            let new_token = stored_token(
+                &server,
+                "new-config-token",
+                Some("new-config-refresh"),
+                &["mcp.read"],
+                far_future(),
+            );
+            let reload = tokio::spawn({
+                let manager = Arc::clone(&manager);
+                let config = http_config(&server.url, HttpAuth::None);
+                let handle = handle.clone();
+                async move {
+                    let _serial = manager.reload_serial.lock().await;
+                    manager.cancel_pending_oauth_flow("remote").await;
+                    handle.reconfigure(config).await.unwrap();
+                    manager
+                        .oauth
+                        .store()
+                        .upsert_token(&new_token)
+                        .await
+                        .unwrap();
+                }
+            });
+            assert!(
+                manager.reload_serial.try_lock().is_err(),
+                "in-flight recovery owns the mutation fence"
+            );
+            release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), reload)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                manager
+                    .oauth
+                    .store()
+                    .token("remote")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .access_token,
+                "new-config-token"
+            );
+            assert!(pending_auth_url(&manager).await.is_none());
+            assert!(!manager.oauth.pending.lock().unwrap().contains_key("remote"));
+            manager.shutdown().await;
+        }
     }
 
     #[tokio::test]

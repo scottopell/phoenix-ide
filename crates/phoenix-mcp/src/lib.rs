@@ -1634,6 +1634,7 @@ fn oauth_recovery_kind_parts(
 /// Outcome of refreshing an authorized server's token mid-recovery.
 enum RefreshServerOutcome {
     Refreshed(String),
+    Superseded,
     /// The refresh could not be attempted/completed for a reason that says
     /// nothing about the token (network failure to the authorization
     /// server); the token and server are kept.
@@ -1898,6 +1899,7 @@ impl McpClientManager {
         // the new config), or a newer flow may already have persisted its own
         // token (which a stale exchange must not overwrite or delete). A dead
         // flow's exchange result is simply discarded.
+        let _serial = self.reload_serial.lock().await;
         let resolved = {
             let mut pending = self.oauth.pending.lock().unwrap();
             match pending.get(&name) {
@@ -2059,9 +2061,17 @@ impl McpClientManager {
     async fn refresh_authorized_server(
         &self,
         name: &str,
-        config: &McpServerConfig,
+        handle: &SupervisorHandle,
+        permit: &RecoveryPermit,
         www_authenticate: Option<&str>,
     ) -> RefreshServerOutcome {
+        let _serial = self.reload_serial.lock().await;
+        let snapshot = handle.snapshot();
+        if snapshot.epoch != permit.epoch || !matches!(snapshot.state, SupervisorState::Recovering)
+        {
+            return RefreshServerOutcome::Superseded;
+        }
+        let config = &permit.config;
         let Some(url) = oauth_resource_url(config).map(str::to_string) else {
             return RefreshServerOutcome::Transient(format!(
                 "MCP server '{name}': not OAuth-eligible"
@@ -2160,9 +2170,17 @@ impl McpClientManager {
     async fn step_up_authorization(
         &self,
         name: &str,
-        config: &McpServerConfig,
+        handle: &SupervisorHandle,
+        permit: &RecoveryPermit,
         www_authenticate: &str,
     ) -> Result<(), String> {
+        let _serial = self.reload_serial.lock().await;
+        let snapshot = handle.snapshot();
+        if snapshot.epoch != permit.epoch || !matches!(snapshot.state, SupervisorState::Recovering)
+        {
+            return Err("MCP OAuth recovery was superseded".to_string());
+        }
+        let config = &permit.config;
         // Prior grants are read BEFORE the token is discarded; persisting
         // scopes on the token makes them available even across a restart.
         let prior_scopes = match self.oauth.store().token(name).await {
@@ -2293,7 +2311,11 @@ impl McpClientManager {
         config: McpServerConfig,
         handle: SupervisorHandle,
     ) {
-        match self.begin_actor_connect(name, config, handle).await {
+        let connect = {
+            let _serial = self.reload_serial.lock().await;
+            self.begin_actor_connect(name, config, handle).await
+        };
+        match connect {
             Ok(task) => {
                 if let Err(error) = task.await {
                     tracing::warn!(error = %error, "MCP connect task failed");
@@ -2746,7 +2768,8 @@ impl McpClientManager {
                 let outcome = self
                     .refresh_authorized_server(
                         server_name,
-                        &permit.config,
+                        handle,
+                        &permit,
                         www_authenticate.as_deref(),
                     )
                     .await;
@@ -2763,7 +2786,8 @@ impl McpClientManager {
                             let outcome = manager
                                 .refresh_authorized_server(
                                     &name,
-                                    &permit.config,
+                                    &retry_handle,
+                                    &permit,
                                     www_authenticate.as_deref(),
                                 )
                                 .await;
@@ -2783,7 +2807,7 @@ impl McpClientManager {
             }
             OAuthRecoveryKind::StepUp { www_authenticate } => {
                 if let Err(error) = self
-                    .step_up_authorization(server_name, &permit.config, &www_authenticate)
+                    .step_up_authorization(server_name, handle, &permit, &www_authenticate)
                     .await
                 {
                     handle.fail(permit.epoch, error.clone()).await;
@@ -2872,6 +2896,9 @@ impl McpClientManager {
                 Err(McpToolCallError::Failed(error))
             }
             RefreshServerOutcome::Transient(error) => Err(McpToolCallError::Failed(error)),
+            RefreshServerOutcome::Superseded => Err(McpToolCallError::Failed(
+                "MCP OAuth recovery was superseded".to_string(),
+            )),
         }
     }
 

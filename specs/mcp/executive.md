@@ -86,6 +86,9 @@ uses the same retained ownership; its end-to-end regression requires the
 upgraded bearer on DELETE. The gated supervisor test
 `oauth_callback_cleanup_and_restart_cannot_supersede_queued_reload` covers a
 reload queued while callback cleanup is blocked.
+`oauth_refresh_mutations_are_serialized_with_reload_for_success_and_rejection`
+gates token responses and covers both initial refresh and background retry,
+ensuring newer credentials and cancelled flows survive the old recovery.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

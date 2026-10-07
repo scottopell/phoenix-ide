@@ -509,6 +509,10 @@ rule TokenRefreshNeeded {
         -- rejected on DELETE. Concurrent recovery requests join that epoch.
         -- A transient refresh failure retains the token and cleanup ownership
         -- while the same epoch retries; it does not discard the session.
+        -- Token persistence, invalidation, and re-prompt publication share the
+        -- config-reconciliation mutation fence. Check the recovery epoch after
+        -- acquiring that fence, so a superseded retry cannot mutate credentials
+        -- or create a flow for its old config.
 }
 
 -- Refresh succeeded: update the stored token (including a rotated refresh
