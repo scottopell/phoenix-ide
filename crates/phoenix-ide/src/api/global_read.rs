@@ -1205,6 +1205,11 @@ async fn resolve_reference_impl(
         }
         let global = reference.starts_with("/global/");
         let product = service.db.resolve_ordinary_product_conversation(&id).await;
+        if let Err(error) = &product {
+            if !matches!(error, DbError::ConversationNotFound(_)) {
+                return Err(AppError::Internal(error.to_string()));
+            }
+        }
         if pins.is_empty() && fragment.is_none() && !global {
             if let Ok(product) = &product {
                 if product.product_conversation_id.as_str() == id
@@ -1217,6 +1222,14 @@ async fn resolve_reference_impl(
         if canonical_product.is_none() {
             let selected = pins.first().unwrap_or(&id);
             let conv = load_conversation_by_slug_or_id(service, selected).await?;
+            let coordinator = service.db.product_conversation_kind(&conv.product_conversation_id)
+                .await.map_err(map_db_not_found)? == Some(phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator);
+            if global && !coordinator {
+                return Err(AppError::BadRequest(
+                    "Global route requires a Coordinator conversation".into(),
+                ));
+            }
+            let global = coordinator;
             if let Some(pin) = pins.first() {
                 if conv.id != *pin {
                     return Err(AppError::BadRequest(
