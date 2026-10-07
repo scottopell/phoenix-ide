@@ -287,7 +287,8 @@ contract ToolHistoryIntegrity {
 
     @invariant ExecutionRequiresCurrentAuthority
         -- Every new invocation requires its originating request's callable
-        -- snapshot and argument schema as well as live execution authority.
+        -- snapshot as well as live execution authority. The dispatched tool's
+        -- input schema must equal its authentic originating declaration.
         -- The request snapshot survives restart; absence grants no admission.
         -- Live catalog changes can revoke admission, never expand it or run
         -- arguments against a different schema. Each invocation is checked
@@ -297,6 +298,8 @@ contract ToolHistoryIntegrity {
         -- grant no execution authority. An unavailable invocation receives one
         -- explicit error result paired with its original call ID, without
         -- executing it or removing the assistant turn.
+        -- Tool implementations and MCP servers own argument-value validation;
+        -- this admission contract binds a call to its declared tool schema.
 
     @invariant PrivateReplaySurvivesProjection
         -- Provider-private continuation data belongs to its originating
