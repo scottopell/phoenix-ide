@@ -345,25 +345,28 @@ mod tests {
         let permit = std::sync::Arc::clone(&admission)
             .try_acquire_owned()
             .unwrap();
-        let started = std::sync::Arc::new(tokio::sync::Notify::new());
-        let finish = std::sync::Arc::new(tokio::sync::Notify::new());
-        let task = spawn_with_admission_permit(permit, {
-            let started = std::sync::Arc::clone(&started);
-            let finish = std::sync::Arc::clone(&finish);
-            async move {
-                started.notify_one();
-                finish.notified().await;
-            }
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let task = spawn_with_admission_permit(permit, async move {
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
         });
-        started.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
 
         let mut caller = Box::pin(task);
         assert!(futures::poll!(&mut caller).is_pending());
         drop(caller);
         assert!(admission.clone().try_acquire_owned().is_err());
 
-        finish.notify_one();
-        admission.acquire().await.unwrap().forget();
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), admission.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
     }
 
     #[tokio::test]
