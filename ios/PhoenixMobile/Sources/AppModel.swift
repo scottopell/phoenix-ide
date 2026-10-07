@@ -372,6 +372,10 @@ final class AppModel {
     private var aggregateRecoveryStartupTask: Task<Void, Never>?
     private var aggregateRecoveryStartupGeneration = 0
     private var aggregateRecoveryAllowedGeneration: Int?
+
+    #if DEBUG
+    var historyRemovalOverrideForTesting: ((VersionedDiskWriter) async -> Void)?
+    #endif
     private var aggregateReconciliationTask: Task<Bool, Never>?
     private(set) var aggregateReconciliationId: UUID?
     private var isForeground = true
@@ -442,20 +446,22 @@ final class AppModel {
         guard let rebuiltAPI else { return }
         for session in sessions.values { session.replaceAPI(rebuiltAPI, credentialGeneration: credential?.generation) }
         for session in drainSessions.values { session.replaceAPI(rebuiltAPI, credentialGeneration: credential?.generation) }
-        if isForeground {
-            let generation = apiGeneration
-            aggregateRecoveryStartupTask = Task { [weak self] in
-                defer { self?.aggregateRecoveryStartupTask = nil }
-                guard let self,
-                      await self.recoverProductHistoryDeletionFences(
-                        persistenceScope: self.persistenceScope, generation: generation),
-                      self.apiGeneration == generation,
-                      let api = self.api
-                else { return }
-                self.startAggregateEventStream(api: api, generation: generation)
-                self.aggregateRecoveryStartupGeneration &+= 1
-                self.startAggregateReconciliation()
-            }
+        startAggregateRecoveryIfForeground()
+    }
+
+    private func startAggregateRecoveryIfForeground() {
+        guard isForeground, let api else { return }
+        let generation = apiGeneration
+        aggregateRecoveryStartupTask = Task { [weak self] in
+            defer { self?.aggregateRecoveryStartupTask = nil }
+            guard let self,
+                  await self.recoverProductHistoryDeletionFences(
+                    persistenceScope: self.persistenceScope, generation: generation),
+                  self.apiGeneration == generation
+            else { return }
+            self.startAggregateEventStream(api: api, generation: generation)
+            self.aggregateRecoveryStartupGeneration &+= 1
+            self.startAggregateReconciliation()
         }
     }
 
@@ -1614,8 +1620,18 @@ final class AppModel {
         let historyWriter = ProductHistorySnapshotStore.writer(
             productConversationId: productConversationId)
         let revision = historyWriter.reserveRevision()
+        #if DEBUG
+        if let historyRemovalOverrideForTesting {
+            await historyRemovalOverrideForTesting(historyWriter)
+        } else {
+            await historyWriter.remove(revision: revision)
+        }
+        #else
         await historyWriter.remove(revision: revision)
-        guard apiGeneration == startedGeneration else { return false }
+        #endif
+        guard verifiedRemoval(writer: historyWriter),
+              apiGeneration == startedGeneration
+        else { return false }
 
         for transcriptId in fencedTranscriptIds {
             guard apiGeneration == startedGeneration else { return false }
@@ -1835,6 +1851,11 @@ final class AppModel {
             PersistedProductHistoryDeletionFence.self,
             name: ProductHistoryDeletionFenceStore.name(productConversationId: productConversationId),
             version: ProductHistoryDeletionFenceStore.schemaVersion)
+    }
+
+    func clearCacheAndAwaitRecoveryForTesting() async {
+        await clearCache()
+        await aggregateRecoveryStartupTask?.value
     }
 
     func foregroundAfterRecoveryForTesting() async -> Bool {
@@ -2264,6 +2285,9 @@ final class AppModel {
 
     func clearCache() async {
         apiGeneration += 1
+        aggregateRecoveryAllowedGeneration = nil
+        aggregateRecoveryStartupTask?.cancel()
+        aggregateRecoveryStartupTask = nil
         cancelAggregateReconciliation()
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
@@ -2289,6 +2313,7 @@ final class AppModel {
         attention.reset()
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
         coordinatorConversationId = nil
+        startAggregateRecoveryIfForeground()
     }
 
     #if DEBUG

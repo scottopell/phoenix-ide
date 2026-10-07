@@ -221,6 +221,19 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(completedGeneration, startupGeneration + 1)
     }
 
+    func testClearCacheReclassifiesNewGenerationBeforeForegroundRecovery() async {
+        let model = model()
+        model.serverURLString = "http://127.0.0.1:1"
+        _ = await model.awaitAggregateRecoveryStartupForTesting()
+        let startupGeneration = model.aggregateRecoveryStartupGenerationForTesting
+
+        await model.clearCacheAndAwaitRecoveryForTesting()
+
+        XCTAssertEqual(
+            model.aggregateRecoveryStartupGenerationForTesting,
+            startupGeneration + 1)
+    }
+
     func testInstallAPIForTestingInvalidatesInheritedAPIWorkBeforeReplacement() {
         let model = model()
         let inheritedGeneration = model.apiGenerationForTesting
@@ -519,6 +532,35 @@ final class AppModelProductConversationTests: XCTestCase {
             page: historySnapshot(aggregateId: "different", segments: []))) {
             XCTAssertEqual($0 as? ProductHistoryLoadError, .aggregateIdentityChanged)
         }
+    }
+
+    func testFailedHistoryRemovalRetainsFenceUntilRestartRetry() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-history-removal-failure-\(UUID().uuidString)")
+        let aggregateId = "pc-history-failure"
+        let row = conversation(id: "row-history-failure", aggregateId: aggregateId)
+        let history = historySnapshot(aggregateId: aggregateId, segments: [])
+        let writer = ProductHistorySnapshotStore.writer(productConversationId: aggregateId)
+        let historySaved = await writer.save(
+            CachedProductHistory(snapshot: history, fetchedAt: Date()),
+            revision: writer.reserveRevision())
+        XCTAssertTrue(historySaved)
+        let model = model()
+        model.listStore.upsert(row)
+        model.historyRemovalOverrideForTesting = { _ in }
+
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId, transcriptIds: [row.id])
+
+        XCTAssertFalse(removed)
+        XCTAssertNotNil(model.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+        XCTAssertNotNil(ProductHistorySnapshotStore.load(productConversationId: aggregateId))
+
+        let restarted = self.model()
+        let recovered = await restarted.recoverProductHistoryDeletionFencesForTesting()
+        XCTAssertTrue(recovered)
+        XCTAssertNil(restarted.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+        XCTAssertNil(ProductHistorySnapshotStore.load(productConversationId: aggregateId))
     }
 
     func testAuthoritativeProductHistoryRemovalCleansAggregateState() async throws {
