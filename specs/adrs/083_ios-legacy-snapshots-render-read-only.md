@@ -1,4 +1,4 @@
-# ADR-082: Proven same-installation legacy iOS snapshots render read-only
+# ADR-083: Proven same-installation legacy iOS snapshots render read-only
 
 - **Status:** Accepted
 - **Date:** 2026-09-05

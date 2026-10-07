@@ -550,13 +550,14 @@ final class ConversationSession {
     /// Execute a session-scoped action per its declared delivery policy
     /// (ConversationAction). Online-only actions fail fast with a toast
     /// when offline — deliberately not queued, see the policy doc.
-    func perform(_ action: ConversationAction) {
-        guard acceptsConversationActions, actionAttempt == nil else { return }
+    @discardableResult
+    func perform(_ action: ConversationAction) -> Task<Void, Never>? {
+        guard acceptsConversationActions, actionAttempt == nil else { return nil }
         switch ClientOperation.conversationAction(action).policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
                 lastErrorToast = "This action needs a connection — it can't be queued."
-                return
+                return nil
             }
         case .outboxed:
             break  // never blocked on connectivity by definition
@@ -566,7 +567,7 @@ final class ConversationSession {
             action: action,
             originState: typedState,
             token: token)
-        Task {
+        return Task {
             do {
                 switch action {
                 case .cancel:
@@ -581,11 +582,15 @@ final class ConversationSession {
                 case .provideTaskFeedback(let feedback):
                     try await api.sendTaskFeedback(
                         conversationId: conversationId, annotations: feedback.text)
-                case .respondToQuestions(let answers):
+                case .respondToQuestions(let requestId, let answers):
                     try await api.respondToQuestion(
-                        conversationId: conversationId, answers: answers)
-                case .dismissQuestion:
-                    try await api.dismissQuestion(conversationId: conversationId)
+                        conversationId: conversationId,
+                        requestId: requestId,
+                        answers: answers)
+                case .dismissQuestion(let requestId):
+                    try await api.dismissQuestion(
+                        conversationId: conversationId,
+                        requestId: requestId)
                 }
             } catch {
                 guard actionAttempt?.token == token else { return }

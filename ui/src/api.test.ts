@@ -7,6 +7,48 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, canChangeModelInState, ConflictError, type ConversationState } from './api';
 import { canCancelConversationState } from './utils';
 
+describe('question response API identity', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    }));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('includes the pending identity in answer and dismiss bodies', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+
+    await api.respondToQuestion('conversation', 'request-q2', { Question: 'Answer' });
+    await api.dismissQuestion('conversation', 'request-q2');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/conversations/conversation/respond',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          request_id: 'request-q2',
+          answers: { Question: 'Answer' },
+          annotations: undefined,
+        }),
+      },
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/conversations/conversation/dismiss-question',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ request_id: 'request-q2' }),
+      },
+    );
+  });
+});
+
 describe('api.continueConversation', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());

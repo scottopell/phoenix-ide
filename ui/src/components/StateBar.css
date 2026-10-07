@@ -702,6 +702,11 @@
     max-width: 34vw;
   }
 
+  .statebar-mobile-status--transport {
+    flex: 0 0 auto;
+    max-width: none;
+  }
+
   .statebar-mobile-status .state-text,
   .statebar-mobile-runtime .state-text {
     font-size: 12px;
@@ -723,21 +728,15 @@
     flex: 0 1 auto;
   }
 
-  .statebar-mobile-primary:has(.statebar-conversation-extension-summary) .statebar-mobile-slug {
-    flex: 0 1 120px;
+  .statebar-mobile-section--conversation-extension > .statebar-conversation-extension-summary {
+    margin-bottom: 8px;
   }
 
-  .statebar-mobile-primary:has(.statebar-conversation-extension-summary) .statebar-mobile-status {
-    max-width: 20px;
-  }
-
-  .statebar-mobile-primary:has(.statebar-conversation-extension-summary) .statebar-mobile-status .state-text {
-    display: none;
-  }
-
-  .statebar-mobile-section--conversation-extension {
-    display: block;
+  .statebar-mobile-section.statebar-mobile-section--conversation-extension {
+    display: flex;
     max-height: min(52dvh, 440px);
+    flex-direction: column;
+    align-items: stretch;
     overflow-y: auto;
   }
 

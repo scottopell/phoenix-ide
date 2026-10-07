@@ -253,6 +253,7 @@ fn arb_awaiting_user_response_state() -> impl Strategy<Value = ConvState> {
         .prop_map(|(questions, tool_use_id)| ConvState::AwaitingUserResponse {
             questions,
             tool_use_id,
+            request_authority: QuestionRequestAuthority::new(),
         })
 }
 
@@ -368,6 +369,12 @@ fn arb_user_question_response_event() -> impl Strategy<Value = Event> {
             .into_iter()
             .collect::<std::collections::HashMap<String, String>>();
         Event::UserQuestionResponse {
+            request_id: Some(
+                QuestionRequestAuthority::new()
+                    .request_id()
+                    .unwrap()
+                    .clone(),
+            ),
             answers,
             annotations: None,
         }
@@ -396,7 +403,14 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
         }),
         arb_task_approval_event(),
         arb_user_question_response_event(),
-        Just(Event::UserQuestionDismissed),
+        Just(Event::UserQuestionDismissed {
+            request_id: Some(
+                QuestionRequestAuthority::new()
+                    .request_id()
+                    .unwrap()
+                    .clone()
+            ),
+        }),
         arb_grace_turn_exhausted_event(),
     ]
 }

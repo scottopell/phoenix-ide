@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import type { Conversation, ImageData } from '../../api';
 import { InputArea } from '../../components/InputArea';
@@ -40,7 +40,7 @@ export function CoordinatorFixture({ scenario }: Props) {
             <CoordinatorPage
               fixtureData={{
                 coordinatorId,
-                conversation: <FixtureConversation working={scenario.working} />,
+                conversation: <FixtureConversation scenario={scenario} />,
               }}
             />
           )}
@@ -51,15 +51,23 @@ export function CoordinatorFixture({ scenario }: Props) {
   );
 }
 
-function FixtureConversation({ working }: { working: boolean }) {
+function FixtureConversation({ scenario }: { scenario: CoordinatorScenario }) {
   const [draft, setDraft] = useState('');
   const [images, setImages] = useState<ImageData[]>([]);
+  const [fixtureConnectionState, setFixtureConnectionState] = useState(scenario.connectionState);
+  const fixturePhaseStartedAt = useMemo(() => Date.now() - 12_000, []);
+  const fixtureLastEventAtRef = useRef(Date.now() - (scenario.staleWatchdog ? 36_000 : 0));
   const store = useMemo(() => new ConversationStore(), []);
   const transcript = useMemo(
     () => messageListFixtureData(getMessageListScenario('compact-latest-expanded')),
     [],
   );
-  const convState = working ? { type: 'llm_requesting', attempt: 1 } as const : { type: 'idle' } as const;
+  const convState = scenario.working ? { type: 'llm_requesting', attempt: 1 } as const : { type: 'idle' } as const;
+  useEffect(() => {
+    if (!scenario.freezeReconnectAfterMount) return;
+    const timer = window.setTimeout(() => setFixtureConnectionState('reconnecting'), 0);
+    return () => window.clearTimeout(timer);
+  }, [scenario.freezeReconnectAfterMount]);
   const conversation: Conversation = {
     id: transcript.conversationId,
     slug: transcript.slug,
@@ -100,7 +108,7 @@ function FixtureConversation({ working }: { working: boolean }) {
               convState={convState}
               images={images}
               setImages={setImages}
-              isOffline={false}
+              isOffline={fixtureConnectionState !== 'connected'}
               failedMessages={[]}
               convModeLabel="Explore"
               draft={draft}
@@ -113,12 +121,43 @@ function FixtureConversation({ working }: { working: boolean }) {
             <StateBar
               conversation={conversation}
               convState={convState}
-              connectionState="connected"
-              connectionAttempt={0}
-              nextRetryIn={null}
+              connectionState={fixtureConnectionState}
+              connectionAttempt={fixtureConnectionState === 'reconnecting' ? 12 : 0}
+              nextRetryIn={fixtureConnectionState === 'offline' ? 4 : null}
               contextWindowUsed={16_000}
               modelContextWindow={200_000}
-              phaseStateUpdatedAt={null}
+              phaseStateUpdatedAt={scenario.working ? fixturePhaseStartedAt : null}
+              lastSseEventAtRef={fixtureLastEventAtRef}
+              conversationExtension={scenario.globalActivity ? {
+                summary: (
+                  <span className="global-statebar-summary">
+                    <span>Watching 3</span>
+                    <span>Running 1</span>
+                    <span className="global-statebar-summary__auto">Auto On · Continuing</span>
+                  </span>
+                ),
+                details: (
+                  <div className="global-statebar-activity__details">
+                    <section className="global-active-watches" aria-label="Active watches">
+                      <strong>Watching</strong>
+                      {['Review release readiness', 'Fix mobile transcript', 'Verify reconnect recovery'].map((title) => (
+                        <div className="global-active-watch" key={title}>
+                          <div><a href="#fixture-watch">{title}</a><span>Working</span></div>
+                          <a href="#fixture-transcript">current transcript</a>
+                          <details className="global-activity-metadata"><summary>Details</summary></details>
+                        </div>
+                      ))}
+                    </section>
+                    <section className="global-live-commands" aria-label="Running commands">
+                      <strong>Running</strong>
+                      <div className="global-live-command">
+                        <div><strong>Global visual QA</strong><code>pnpm test</code><span>Started just now</span></div>
+                        <div className="global-live-command-actions"><a href="#fixture-output">output →</a></div>
+                      </div>
+                    </section>
+                  </div>
+                ),
+              } : undefined}
             />
           </div>
         </div>
