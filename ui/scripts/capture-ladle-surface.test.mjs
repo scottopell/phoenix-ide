@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import packageJson from '../package.json';
 import { __testables, buildLadleStoryUrl, selectCaptureEntries, verifyInstalledBrowser } from './capture-ladle-surface.mjs';
 
 const { normalizeViewportMatrix, playwrightInstallArgs, screenshotFileName } = __testables;
@@ -82,7 +82,7 @@ describe('bounded installed-browser capture', () => {
 });
 
 it('standard sidebar and mobile entrypoints delegate browser installation to the guarded runner', () => {
-  const scripts = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).scripts;
+  const scripts = packageJson.scripts;
   for (const name of ['qa:sidebar', 'qa:mobile-conversation-list']) {
     expect(scripts[name]).toMatch(/^PHOENIX_LADLE=1 node scripts\/capture-/);
     expect(scripts[name]).not.toContain('playwright install');
