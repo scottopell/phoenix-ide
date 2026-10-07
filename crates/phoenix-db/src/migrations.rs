@@ -657,20 +657,13 @@ CREATE TABLE federation_peer_connections (
         AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
     ),
     peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
-    base_url TEXT NOT NULL UNIQUE CHECK(
-        typeof(base_url) = 'text'
-        AND base_url GLOB 'https://?*/'
-        AND length(base_url) > length('https:///')
-        AND base_url NOT LIKE '%@%'
-        AND base_url NOT LIKE '%?%'
-        AND base_url NOT LIKE '%#%'
-        AND instr(base_url, '%') = 0
-        AND instr(base_url, char(9)) = 0
-        AND instr(base_url, char(10)) = 0
-        AND instr(base_url, char(13)) = 0
-        AND instr(base_url, ' ') = 0
-        AND substr(base_url, -1) = '/'
-        AND instr(substr(base_url, 9), '/') = length(substr(base_url, 9))
+    host TEXT NOT NULL CHECK(
+        typeof(host) = 'text'
+        AND length(host) > 0
+        AND host NOT GLOB '*[^A-Za-z0-9.-]*'
+    ),
+    port INTEGER NOT NULL CHECK(
+        typeof(port) = 'integer' AND port BETWEEN 1 AND 65535
     ),
     bearer_credential TEXT NOT NULL UNIQUE CHECK(
         bearer_credential GLOB 'phx_peer_*'
@@ -679,7 +672,8 @@ CREATE TABLE federation_peer_connections (
     ),
     created_at_us INTEGER NOT NULL CHECK(
         typeof(created_at_us) = 'integer' AND created_at_us >= 0
-    )
+    ),
+    UNIQUE(host, port)
 );
 ";
 

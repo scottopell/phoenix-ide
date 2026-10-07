@@ -11,6 +11,7 @@ pub struct FederationPeerConnection {
     pub peer_display_name: String,
     pub base_url: PeerBaseUrl,
     pub bearer_credential: PeerBearerCredential,
+    pub created_at: chrono::DateTime<Utc>,
 }
 
 impl Database {
@@ -29,17 +30,19 @@ impl Database {
         let now = Utc::now().timestamp_micros();
         sqlx::query(
             "INSERT INTO federation_peer_connections
-                 (peer_instance_id, peer_display_name, base_url, bearer_credential, created_at_us)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                 (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(peer_instance_id) DO UPDATE SET
                  peer_display_name = excluded.peer_display_name,
-                 base_url = excluded.base_url,
+                 host = excluded.host,
+                 port = excluded.port,
                  bearer_credential = excluded.bearer_credential,
                  created_at_us = excluded.created_at_us",
         )
         .bind(peer_instance_id.to_string())
         .bind(peer_display_name)
-        .bind(base_url.to_string())
+        .bind(base_url.host())
+        .bind(i64::from(base_url.port()))
         .bind(bearer_credential.expose())
         .bind(now)
         .execute(&mut *tx)
@@ -57,7 +60,7 @@ impl Database {
         peer_instance_id: InstanceId,
     ) -> DbResult<Option<FederationPeerConnection>> {
         let row = sqlx::query(
-            "SELECT peer_instance_id, peer_display_name, base_url, bearer_credential
+            "SELECT peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us
              FROM federation_peer_connections WHERE peer_instance_id = ?1",
         )
         .bind(peer_instance_id.to_string())
@@ -65,16 +68,25 @@ impl Database {
         .await?;
         row.map(|row| {
             let id: String = row.try_get("peer_instance_id")?;
-            let base_url: String = row.try_get("base_url")?;
+            let host: String = row.try_get("host")?;
+            let port: i64 = row.try_get("port")?;
             let bearer: String = row.try_get("bearer_credential")?;
+            let created_at_us: i64 = row.try_get("created_at_us")?;
             Ok(FederationPeerConnection {
                 peer_instance_id: InstanceId::from_str(&id)
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
                 peer_display_name: row.try_get("peer_display_name")?,
-                base_url: PeerBaseUrl::from_str(&base_url)
-                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                base_url: PeerBaseUrl::from_host_port(
+                    &host,
+                    u16::try_from(port)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                )
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
                 bearer_credential: PeerBearerCredential::parse(bearer)
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
+                created_at: chrono::DateTime::from_timestamp_micros(created_at_us).ok_or_else(
+                    || DbError::Serialization("peer creation timestamp is out of range".into()),
+                )?,
             })
         })
         .transpose()
@@ -116,8 +128,8 @@ mod tests {
         ] {
             assert!(sqlx::query(
                 "INSERT INTO federation_peer_connections
-                     (peer_instance_id, peer_display_name, base_url, bearer_credential, created_at_us)
-                 VALUES (?1, 'peer', 'https://peer.example/', ?2, 1)",
+                     (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
+                 VALUES (?1, 'peer', 'peer.example', 443, ?2, 1)",
             )
             .bind(id)
             .bind(&bearer)
@@ -125,23 +137,18 @@ mod tests {
             .await
             .is_err(), "{id}");
         }
-        for origin in [
-            "https:///",
-            "https://%2F/",
-            "https://peer.example /",
-            "https://peer.example\n/",
-        ] {
+        for host in ["", "[", "%2F", "peer example", "peer.example\n"] {
             assert!(sqlx::query(
                 "INSERT INTO federation_peer_connections
-                     (peer_instance_id, peer_display_name, base_url, bearer_credential, created_at_us)
-                 VALUES (?1, 'peer', ?2, ?3, 1)",
+                     (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
+                 VALUES (?1, 'peer', ?2, 443, ?3, 1)",
             )
             .bind(InstanceId::new().to_string())
-            .bind(origin)
+            .bind(host)
             .bind(&bearer)
             .execute(db.pool())
             .await
-            .is_err(), "{origin:?}");
+            .is_err(), "{host:?}");
         }
     }
 
@@ -170,6 +177,7 @@ mod tests {
         assert_eq!(saved.peer_display_name, "renamed");
         assert_eq!(saved.base_url, second_url);
         assert_eq!(saved.bearer_credential.expose(), second_token.expose());
+        assert!(saved.created_at.timestamp_micros() >= 0);
         assert!(db.remove_federation_peer_connection(peer).await.unwrap());
         assert!(db.federation_peer_connection(peer).await.unwrap().is_none());
     }

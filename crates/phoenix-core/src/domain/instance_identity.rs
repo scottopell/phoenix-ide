@@ -90,6 +90,15 @@ impl FromStr for PeerBaseUrl {
         if url.scheme() != "https" {
             return Err(PeerBaseUrlError::NotHttps);
         }
+        let Some(host) = url.host_str() else {
+            return Err(PeerBaseUrlError::ContainsAmbientData);
+        };
+        if !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        {
+            return Err(PeerBaseUrlError::ContainsAmbientData);
+        }
         if !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -111,12 +120,34 @@ impl fmt::Display for PeerBaseUrl {
 }
 
 impl PeerBaseUrl {
-    /// Resolve one fixed federation API path against this peer origin.
+    /// Return the normalized ASCII hostname.
+    ///
+    /// # Panics
+    /// Panics only if this value bypassed `PeerBaseUrl` construction.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        self.0
+            .host_str()
+            .expect("validated HTTPS origin always has a host")
+    }
+
+    /// Return the explicit or HTTPS-default port.
+    ///
+    /// # Panics
+    /// Panics only if this value bypassed `PeerBaseUrl` construction.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.0
+            .port_or_known_default()
+            .expect("HTTPS always has a known default port")
+    }
+
+    /// Reconstruct a peer origin from normalized relational columns.
     ///
     /// # Errors
-    /// Returns a URL parse error if the supplied path is not a valid relative reference.
-    pub fn endpoint(&self, path: &str) -> Result<url::Url, url::ParseError> {
-        self.0.join(path)
+    /// Returns an error if the persisted host and port do not form a bare HTTPS origin.
+    pub fn from_host_port(host: &str, port: u16) -> Result<Self, PeerBaseUrlError> {
+        Self::from_str(&format!("https://{host}:{port}"))
     }
 }
 
