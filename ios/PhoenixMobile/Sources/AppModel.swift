@@ -909,7 +909,9 @@ final class AppModel {
         guard let aggregateId else { return latestTranscriptRowId }
         return listStore.cachedNavigationTranscriptRowId(
             forAggregateId: aggregateId,
-            latestTranscriptRowId: latestTranscriptRowId)
+            latestTranscriptRowId: latestTranscriptRowId,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
     }
 
     func cachedProductHistory(productConversationId: String) -> CachedProductHistory? {
@@ -1147,7 +1149,10 @@ final class AppModel {
 
     var coordinatorAvailableOffline: Bool {
         guard let id = coordinatorConversationId else { return false }
-        return ConversationSession.hasCachedSnapshot(conversationId: id)
+        return ConversationSession.hasCachedSnapshot(
+            conversationId: id,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
     }
 
 
@@ -1173,7 +1178,11 @@ final class AppModel {
                 if let apiError = error as? APIError,
                    apiError.isTransport,
                    let cached = coordinatorConversationId,
-                   ConversationSession.hasCachedSnapshot(conversationId: cached) {
+                   ConversationSession.hasCachedSnapshot(
+                    conversationId: cached,
+                    persistenceScope: persistenceScope,
+                    legacyPersistenceScope: legacySnapshotPersistenceScope)
+                {
                     return cached
                 }
                 lastActionError = (error as? APIError)?.errorDescription
@@ -1182,7 +1191,11 @@ final class AppModel {
             }
         }
         if let cached = coordinatorConversationId,
-           ConversationSession.hasCachedSnapshot(conversationId: cached) {
+           ConversationSession.hasCachedSnapshot(
+            conversationId: cached,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
+        {
             return cached
         }
         lastActionError = "Opening the Coordinator offline needs a cached conversation."

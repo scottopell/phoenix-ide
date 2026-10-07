@@ -1491,7 +1491,7 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(model.navigationConversationId(for: aggregateConversation), "row-1")
     }
 
-    func testOfflineNavigationUsesCachedAggregateMemberAfterRestart() {
+    func testOfflineNavigationUsesCacheWithMatchingTestingScopeAfterRestart() {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-appmodel-tests-\(UUID().uuidString)")
         let predecessor = conversation(id: "row-1", aggregateId: "pc-1", slug: "root", title: "Root")
@@ -1503,6 +1503,7 @@ final class AppModelProductConversationTests: XCTestCase {
             startedAt: first.listStore.externalRefreshToken())
 
         let reloaded = AppModel()
+        reloaded.installAPIForTesting(baseURL: URL(string: "http://127.0.0.1:1")!)
         reloaded.connectivity.setOnlineForTesting(false)
         let aggregateConversation = reloaded.listStore.conversations.first!
 

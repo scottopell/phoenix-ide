@@ -211,7 +211,7 @@ final class ConversationListStore {
                 aggregateExists(aggregateId)
             else { continue }
             transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateId
-            if ConversationSession.hasCachedSnapshot(conversationId: conversation.transcriptRowIdentity) {
+            if ConversationSession.hasAnyCachedSnapshot(conversationId: conversation.transcriptRowIdentity) {
                 aggregateToCachedTranscript[aggregateId] = conversation.transcriptRowIdentity
             }
         }
@@ -268,7 +268,7 @@ final class ConversationListStore {
             transcriptToAggregate[transcriptId] = aggregateId
         }
         for (aggregateId, cachedTranscriptId) in priorCached where aggregateExists(aggregateId) {
-            if ConversationSession.hasCachedSnapshot(conversationId: cachedTranscriptId) {
+            if ConversationSession.hasAnyCachedSnapshot(conversationId: cachedTranscriptId) {
                 aggregateToCachedTranscript[aggregateId] = cachedTranscriptId
             }
         }
@@ -318,7 +318,7 @@ final class ConversationListStore {
             upsertsDuringRefresh[aggregateIdentity] = conversation
         }
         transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateIdentity
-        if ConversationSession.hasCachedSnapshot(conversationId: conversation.transcriptRowIdentity)
+        if ConversationSession.hasAnyCachedSnapshot(conversationId: conversation.transcriptRowIdentity)
             || aggregateToCachedTranscript[aggregateIdentity] == nil
         {
             aggregateToCachedTranscript[aggregateIdentity] = conversation.transcriptRowIdentity
@@ -400,17 +400,33 @@ final class ConversationListStore {
         aggregateToCachedTranscript[aggregateId]
     }
 
-    func cachedNavigationTranscriptRowId(forAggregateId aggregateId: String, latestTranscriptRowId: String) -> String {
-        if ConversationSession.hasCachedSnapshot(conversationId: latestTranscriptRowId) {
+    func cachedNavigationTranscriptRowId(
+        forAggregateId aggregateId: String,
+        latestTranscriptRowId: String,
+        persistenceScope: String?,
+        legacyPersistenceScope: String?
+    ) -> String {
+        if ConversationSession.hasCachedSnapshot(
+            conversationId: latestTranscriptRowId,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacyPersistenceScope)
+        {
             return latestTranscriptRowId
         }
         if let cached = aggregateToCachedTranscript[aggregateId],
-           ConversationSession.hasCachedSnapshot(conversationId: cached)
+           ConversationSession.hasCachedSnapshot(
+            conversationId: cached,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacyPersistenceScope)
         {
             return cached
         }
         for (transcriptId, mappedAggregateId) in transcriptToAggregate where mappedAggregateId == aggregateId {
-            if ConversationSession.hasCachedSnapshot(conversationId: transcriptId) {
+            if ConversationSession.hasCachedSnapshot(
+                conversationId: transcriptId,
+                persistenceScope: persistenceScope,
+                legacyPersistenceScope: legacyPersistenceScope)
+            {
                 return transcriptId
             }
         }

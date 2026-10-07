@@ -107,8 +107,22 @@ final class ConversationSession {
         var syncedAt: Date?
     }
 
-    static func hasCachedSnapshot(conversationId: String) -> Bool {
-        cachedConversation(conversationId: conversationId) != nil
+    static func hasAnyCachedSnapshot(conversationId: String) -> Bool {
+        DiskStore.loadVersioned(
+            Snapshot.self, name: "conv-\(conversationId)", version: snapshotSchemaVersion)?.syncedAt != nil
+            || DiskStore.loadVersioned(
+                LegacySnapshot.self, name: "conv-\(conversationId)", version: 1)?.syncedAt != nil
+    }
+
+    static func hasCachedSnapshot(
+        conversationId: String,
+        persistenceScope: String? = nil,
+        legacyPersistenceScope: String? = nil
+    ) -> Bool {
+        cachedConversation(
+            conversationId: conversationId,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacyPersistenceScope) != nil
     }
 
     static func cachedConversation(
@@ -116,10 +130,11 @@ final class ConversationSession {
         persistenceScope: String? = nil,
         legacyPersistenceScope: String? = nil
     ) -> Conversation? {
-        if let snapshot = DiskStore.loadVersioned(
+        if let persistenceScope,
+           let snapshot = DiskStore.loadVersioned(
             Snapshot.self, name: "conv-\(conversationId)", version: snapshotSchemaVersion),
            snapshot.syncedAt != nil,
-           persistenceScope == nil || snapshot.persistenceScope == persistenceScope
+           snapshot.persistenceScope == persistenceScope
         {
             return snapshot.conversation
         }
@@ -722,6 +737,7 @@ final class ConversationSession {
         guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
+            guard snap.conversation.id == conversationId else { return }
             snapshotLoadError = nil
             snapshotPersistenceEnabled = true
             retryDelay = 1

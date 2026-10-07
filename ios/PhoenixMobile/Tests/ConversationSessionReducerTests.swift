@@ -82,6 +82,43 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
+    func testWrongConversationInitCannotClearAuthorityFence() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-wrong-init-\(UUID().uuidString)")
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        struct ForeignSnapshot: Codable {
+            let persistenceScope: String
+            let conversation: Conversation?
+            let messages: [Message]
+            let lastSequenceId: Int64
+            let transcriptGeneration: Int64?
+            let syncedAt: Date?
+        }
+        XCTAssertTrue(DiskStore.saveVersioned(
+            ForeignSnapshot(
+                persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: UUID()),
+                conversation: try conversation(), messages: [], lastSequenceId: 0,
+                transcriptGeneration: nil, syncedAt: Date()),
+            name: "conv-c1", version: 2))
+        let session = ConversationSession(
+            conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
+            credentialGeneration: UUID())
+
+        let wrongConversation = try JSONDecoder().decode(
+            Conversation.self, from: Data("{\"id\":\"c2\",\"slug\":\"c2\",\"state\":{\"type\":\"idle\"}}".utf8))
+        session.receive(.initSnapshot(.init(
+            conversation: wrongConversation, messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+
+        XCTAssertFalse(session.acceptsConversationActions)
+        let persisted = await session.flushSnapshotPersistence()
+        XCTAssertFalse(persisted)
+        XCTAssertNil(session.conversation)
+    }
+
+    @MainActor
     func testForeignVersionTwoSnapshotFencesPersistedOutboxDelivery() async throws {
         struct ScopedSnapshot: Codable {
             let persistenceScope: String
@@ -146,7 +183,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         }
         XCTAssertNotNil(ConversationSession.cachedConversation(
             conversationId: "c1", persistenceScope: scope, legacyPersistenceScope: scope))
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertTrue(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor
@@ -247,7 +284,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
         let initialSnapshotSaved = await session.flushSnapshotPersistence()
         XCTAssertTrue(initialSnapshotSaved)
-        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertTrue(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
         await session.awaitSnapshotRemovalForTesting()
@@ -257,7 +294,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertNil(session.conversation)
         XCTAssertTrue(session.outbox.entries.isEmpty)
         XCTAssertEqual(deletedId, "c1")
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertFalse(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor
@@ -266,7 +303,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         session.pauseForBackground()
         let emptySnapshotSaved = await session.flushSnapshotPersistence()
         XCTAssertTrue(emptySnapshotSaved)
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertFalse(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
 
         session.receive(.initSnapshot(.init(
             conversation: try conversation(), messages: [], agentWorking: false,
@@ -274,7 +311,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
         let authoritativeSnapshotSaved = await session.flushSnapshotPersistence()
         XCTAssertTrue(authoritativeSnapshotSaved)
-        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertTrue(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor
@@ -288,7 +325,7 @@ final class ConversationSessionReducerTests: XCTestCase {
 
         await session.clearCachedSnapshotAndWait()
 
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertFalse(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor
