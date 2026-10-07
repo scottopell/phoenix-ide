@@ -21,6 +21,45 @@ struct RenderingAnthropicClient {
     wires: Mutex<Vec<serde_json::Value>>,
 }
 
+struct DeferredMcpCatalog(MockToolExecutor);
+
+impl DeferredMcpCatalog {
+    fn new(available: bool) -> Self {
+        Self(if available {
+            MockToolExecutor::new().with_tool(MCP_TOOL, ToolOutput::error("Session expired"))
+        } else {
+            MockToolExecutor::new()
+        })
+    }
+
+    fn recorded_executions(&self) -> Vec<(String, serde_json::Value)> {
+        self.0.recorded_executions()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for DeferredMcpCatalog {
+    async fn execute(
+        &self,
+        call: crate::runtime::deny_gate::CheckedToolCall,
+        ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        self.0.execute(call, ctx).await
+    }
+
+    async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
+        self.0
+            .definitions()
+            .await
+            .into_iter()
+            .map(|mut definition| {
+                definition.defer_loading = true;
+                definition
+            })
+            .collect()
+    }
+}
+
 impl RenderingAnthropicClient {
     fn new() -> Self {
         Self {
@@ -55,13 +94,13 @@ impl LlmClient for RenderingAnthropicClient {
 }
 
 type TestRuntime =
-    ConversationRuntime<DatabaseStorage, Arc<RenderingAnthropicClient>, Arc<MockToolExecutor>>;
+    ConversationRuntime<DatabaseStorage, Arc<RenderingAnthropicClient>, Arc<DeferredMcpCatalog>>;
 
 fn runtime(
     db: Database,
     directory: &Path,
     client: Arc<RenderingAnthropicClient>,
-    tools: Arc<MockToolExecutor>,
+    tools: Arc<DeferredMcpCatalog>,
 ) -> TestRuntime {
     let context = ConvContext::new(
         CONVERSATION,
@@ -141,8 +180,7 @@ async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reo
     .await
     .unwrap();
     let client = Arc::new(RenderingAnthropicClient::new());
-    let live_tools =
-        Arc::new(MockToolExecutor::new().with_tool(MCP_TOOL, ToolOutput::error("Session expired")));
+    let live_tools = Arc::new(DeferredMcpCatalog::new(true));
     let mut first = runtime(
         db.clone(),
         directory.path(),
@@ -218,7 +256,7 @@ async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reo
     drop(db);
 
     let db = Database::open(path.to_str().unwrap()).await.unwrap();
-    let absent_tools = Arc::new(MockToolExecutor::new());
+    let absent_tools = Arc::new(DeferredMcpCatalog::new(false));
     let mut resumed = runtime(
         db.clone(),
         directory.path(),
