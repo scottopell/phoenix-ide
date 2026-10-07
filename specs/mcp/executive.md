@@ -116,6 +116,8 @@ authenticated cleanup before replacement publication.
 `oauth_refresh_persistence_retry_does_not_repeat_rotating_grant` covers repeated
 store-write failures after rotation, one grant exchange, and fresh authenticated
 cleanup after the response is persisted.
+`configuration_invalidates_unpersisted_refresh_even_when_store_lookup_fails`
+verifies that local lookup errors cannot retain a response invalidated by config.
 `oauth_quiescence_failure_settles_failed_and_retains_cleanup` covers a visible
 failed state and retained teardown ownership when stream quiescence fails.
 `oauth_failure_takes_over_failed_transport_cleanup_from_same_epoch` covers

@@ -1844,6 +1844,22 @@ impl McpClientManager {
         old_config: &McpServerConfig,
         new_config: &McpServerConfig,
     ) {
+        let client_id_changed =
+            preconfigured_client_id(old_config) != preconfigured_client_id(new_config);
+        let configured_scopes_changed =
+            configured_oauth_scopes(old_config) != configured_oauth_scopes(new_config);
+        {
+            let mut unpersisted = self.oauth.unpersisted_refresh_tokens.lock().unwrap();
+            if client_id_changed
+                || configured_scopes_changed
+                || unpersisted.get(name).is_some_and(|record| {
+                    oauth_resource_url(new_config)
+                        .is_none_or(|url| oauth::canonical_resource(url) != record.resource)
+                })
+            {
+                unpersisted.remove(name);
+            }
+        }
         let token = match self.oauth.store().token(name).await {
             Ok(Some(token)) => token,
             Ok(None) => return,
@@ -1860,10 +1876,6 @@ impl McpClientManager {
         // one. A dynamically discovered issuer that changed server-side is
         // caught at use instead: the resource 401s, the refresh fails, and the
         // failure path discards the token and re-prompts.
-        let client_id_changed =
-            preconfigured_client_id(old_config) != preconfigured_client_id(new_config);
-        let configured_scopes_changed =
-            configured_oauth_scopes(old_config) != configured_oauth_scopes(new_config);
         if !resource_matches || client_id_changed || configured_scopes_changed {
             tracing::info!(
                 server = %name,

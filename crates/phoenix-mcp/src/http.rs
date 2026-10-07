@@ -3978,6 +3978,7 @@ mod tests {
     struct FailingRefreshStore {
         inner: Arc<dyn crate::OAuthStore>,
         failures_remaining: std::sync::atomic::AtomicUsize,
+        fail_lookup: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -3995,6 +3996,9 @@ mod tests {
             self.inner.upsert_registration(record).await
         }
         async fn token(&self, name: &str) -> Result<Option<OAuthTokenRecord>, String> {
+            if self.fail_lookup.load(Ordering::SeqCst) {
+                return Err("injected token lookup failure".into());
+            }
             self.inner.token(name).await
         }
         async fn upsert_token(&self, record: &OAuthTokenRecord) -> Result<(), String> {
@@ -4021,6 +4025,7 @@ mod tests {
         manager.set_oauth_store(Arc::new(FailingRefreshStore {
             inner: manager.oauth.store(),
             failures_remaining: std::sync::atomic::AtomicUsize::new(2),
+            fail_lookup: std::sync::atomic::AtomicBool::new(false),
         }));
         let handle = manager.servers.read().await.get("remote").unwrap().clone();
         let crate::supervisor::RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await
@@ -4095,6 +4100,39 @@ mod tests {
         );
         server.push_responses(vec![delete_ack()]);
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn configuration_invalidates_unpersisted_refresh_even_when_store_lookup_fails() {
+        let server = TestServer::start(vec![]).await;
+        let manager = McpClientManager::new();
+        let token = stored_token(&server, "at-2", Some("rt-2"), &["read"], far_future());
+        manager
+            .oauth
+            .unpersisted_refresh_tokens
+            .lock()
+            .unwrap()
+            .insert("remote".into(), token);
+        manager.set_oauth_store(Arc::new(FailingRefreshStore {
+            inner: manager.oauth.store(),
+            failures_remaining: std::sync::atomic::AtomicUsize::new(0),
+            fail_lookup: std::sync::atomic::AtomicBool::new(true),
+        }));
+        let old = http_config(&server.url, HttpAuth::None);
+        let new = http_config(
+            &server.url,
+            HttpAuth::Static(crate::StaticCred::Bearer("configured".into())),
+        );
+        manager
+            .invalidate_oauth_on_config_change("remote", &old, &new)
+            .await;
+        assert!(manager
+            .oauth
+            .unpersisted_refresh_tokens
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(server.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
