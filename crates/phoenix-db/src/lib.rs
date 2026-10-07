@@ -237,6 +237,12 @@ pub enum DbError {
     SteeringQueueFull,
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
+    #[error("Close evidence invariant {invariant} failed in {relation}: {detail}")]
+    CloseEvidenceInvariant {
+        invariant: &'static str,
+        relation: &'static str,
+        detail: String,
+    },
     #[error("Close foundation latest transcript changed: expected {expected}, found {actual}")]
     CloseFoundationStaleLatest { expected: String, actual: String },
     #[error("Close foundation repair required: {0:?}")]

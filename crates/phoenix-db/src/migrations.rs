@@ -606,12 +606,126 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_mcp_token_removals",
         sql: "CREATE TABLE mcp_oauth_removals (server_name TEXT PRIMARY KEY NOT NULL);",
     },
+    Migration {
+        version: 119,
+        name: "adopt_close_worktree_cleanup_plans",
+        sql: MIGRATION_118,
+    },
 ];
 
 const MIGRATION_117: &str = concat!(
     include_str!("tool_availability.sql"),
     include_str!("responses_replay.sql")
 );
+
+const MIGRATION_118: &str = r"
+CREATE UNIQUE INDEX close_worktree_cleanup_plans_exact_identity
+ON close_worktree_cleanup_plans (
+    attempt_id, scope, inspection_generation, inspection_fingerprint,
+    resource_kind, identity_kind, identity_codec, identity_value
+);
+
+CREATE TABLE close_worktree_cleanup_adoptions (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    source_inspection_generation TEXT NOT NULL,
+    source_inspection_fingerprint TEXT NOT NULL,
+    target_inspection_generation TEXT NOT NULL,
+    target_inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    adopted_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(adopted_at_unix_micros) = 'integer' AND adopted_at_unix_micros >= 0),
+    CHECK (
+        source_inspection_generation <> target_inspection_generation
+        OR source_inspection_fingerprint <> target_inspection_fingerprint
+    ),
+    PRIMARY KEY (
+        attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ),
+    UNIQUE (
+        attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ) REFERENCES close_worktree_cleanup_plans (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ) REFERENCES close_worktree_cleanup_plans (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER close_worktree_cleanup_plan_reject_adopted_update
+BEFORE UPDATE ON close_worktree_cleanup_plans
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_adoptions adoption
+    WHERE adoption.attempt_id = OLD.attempt_id
+      AND adoption.scope = OLD.scope
+      AND adoption.source_inspection_generation = OLD.inspection_generation
+      AND adoption.source_inspection_fingerprint = OLD.inspection_fingerprint
+      AND adoption.resource_kind = OLD.resource_kind
+      AND adoption.identity_kind = OLD.identity_kind
+      AND adoption.identity_codec = OLD.identity_codec
+      AND adoption.identity_value = OLD.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'adopted cleanup-plan payload is immutable');
+END;
+
+CREATE TRIGGER close_worktree_cleanup_adoption_requires_identical_payload
+BEFORE INSERT ON close_worktree_cleanup_adoptions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM close_worktree_cleanup_plans source
+    JOIN close_worktree_cleanup_plans target
+      ON target.attempt_id = source.attempt_id
+     AND target.scope = source.scope
+     AND target.resource_kind = source.resource_kind
+     AND target.identity_kind = source.identity_kind
+     AND target.identity_codec = source.identity_codec
+     AND target.identity_value = source.identity_value
+    WHERE source.attempt_id = NEW.attempt_id
+      AND source.scope = NEW.scope
+      AND source.inspection_generation = NEW.source_inspection_generation
+      AND source.inspection_fingerprint = NEW.source_inspection_fingerprint
+      AND target.inspection_generation = NEW.target_inspection_generation
+      AND target.inspection_fingerprint = NEW.target_inspection_fingerprint
+      AND source.administrative_dir_codec = target.administrative_dir_codec
+      AND source.administrative_dir_value = target.administrative_dir_value
+      AND source.administrative_dir_incarnation = target.administrative_dir_incarnation
+      AND source.final_tombstone_root_codec IS target.final_tombstone_root_codec
+      AND source.final_tombstone_root_value IS target.final_tombstone_root_value
+      AND source.final_tombstone_root_device IS target.final_tombstone_root_device
+      AND source.final_tombstone_root_inode IS target.final_tombstone_root_inode
+      AND source.final_tombstone_object_device IS target.final_tombstone_object_device
+      AND source.final_tombstone_object_inode IS target.final_tombstone_object_inode
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup adoption requires identical cleanup-plan payloads');
+END;
+CREATE TRIGGER close_worktree_cleanup_adoptions_reject_update
+BEFORE UPDATE ON close_worktree_cleanup_adoptions
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup adoption lineage is immutable');
+END;
+
+CREATE TRIGGER close_worktree_cleanup_adoptions_reject_delete
+BEFORE DELETE ON close_worktree_cleanup_adoptions
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup adoption lineage is immutable');
+END;
+";
 
 const MIGRATION_113: &str = "";
 
@@ -11897,6 +12011,7 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
             vec![
+                (119, "adopt_close_worktree_cleanup_plans"),
                 (118, "persist_mcp_token_removals"),
                 (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
@@ -18525,5 +18640,79 @@ mod tests {
             Some("claude-sonnet-4-6"),
             "non-Opus rows must not be touched"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_118_preserves_plans_and_enforces_exact_immutable_adoption() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE close_worktree_cleanup_plans (
+                 attempt_id TEXT, scope TEXT, inspection_generation TEXT,
+                 inspection_fingerprint TEXT, resource_kind TEXT, identity_kind TEXT,
+                 identity_codec TEXT, identity_value TEXT,
+                 administrative_dir_codec TEXT, administrative_dir_value TEXT,
+                 administrative_dir_incarnation TEXT,
+                 final_tombstone_root_codec TEXT, final_tombstone_root_value TEXT,
+                 final_tombstone_root_device TEXT, final_tombstone_root_inode TEXT,
+                 final_tombstone_object_device TEXT, final_tombstone_object_inode TEXT
+             );
+             INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 administrative_dir_codec, administrative_dir_value,
+                 administrative_dir_incarnation
+             ) VALUES
+                 ('attempt', 'scope', 'source', 'fp', 'worktree', 'worktree',
+                  'worktree_id_v1', 'identity', 'hex_path_v1', '00', ''),
+                 ('attempt', 'scope', 'target', 'fp', 'worktree', 'worktree',
+                  'worktree_id_v1', 'identity', 'hex_path_v1', '00', 'different');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let old_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT inspection_generation, administrative_dir_incarnation
+             FROM close_worktree_cleanup_plans ORDER BY inspection_generation",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_118).execute(&pool).await.unwrap();
+        let migrated_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT inspection_generation, administrative_dir_incarnation
+             FROM close_worktree_cleanup_plans ORDER BY inspection_generation",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(migrated_rows, old_rows);
+        let adopt = "INSERT INTO close_worktree_cleanup_adoptions VALUES (
+            'attempt', 'scope', 'source', 'fp', 'target', 'fp',
+            'worktree', 'worktree', 'worktree_id_v1', 'identity', 1)";
+        assert!(sqlx::query(adopt).execute(&pool).await.is_err());
+        sqlx::query(
+            "UPDATE close_worktree_cleanup_plans SET administrative_dir_incarnation = ''
+             WHERE inspection_generation = 'target'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(adopt).execute(&pool).await.unwrap();
+        for forbidden in [
+            "UPDATE close_worktree_cleanup_plans SET administrative_dir_value = '01'
+             WHERE inspection_generation = 'source'",
+            "UPDATE close_worktree_cleanup_adoptions SET adopted_at_unix_micros = 2",
+            "DELETE FROM close_worktree_cleanup_adoptions",
+            "DELETE FROM close_worktree_cleanup_plans WHERE inspection_generation = 'source'",
+            "DELETE FROM close_worktree_cleanup_plans WHERE inspection_generation = 'target'",
+        ] {
+            assert!(sqlx::query(forbidden).execute(&pool).await.is_err());
+        }
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
     }
 }
