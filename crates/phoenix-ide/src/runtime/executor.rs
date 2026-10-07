@@ -1879,6 +1879,10 @@ where
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
+    previous_transcripts: Option<(
+        crate::api::global_read::GlobalReadService,
+        crate::api::global_read::PreviousTranscriptsBinding,
+    )>,
     /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
     /// Static for the conversation's tool set, so it is computed once and only
     /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
@@ -2200,6 +2204,7 @@ where
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
+            previous_transcripts: None,
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
@@ -2392,6 +2397,15 @@ where
         let _owner = self.live_state_owner()?;
         self.publish_live_state_admitted();
         Ok(())
+    }
+
+    pub(crate) fn with_previous_transcripts(
+        mut self,
+        service: crate::api::global_read::GlobalReadService,
+        binding: crate::api::global_read::PreviousTranscriptsBinding,
+    ) -> Self {
+        self.previous_transcripts = Some((service, binding));
+        self
     }
 
     pub fn with_credential_helper(
@@ -7696,6 +7710,12 @@ where
             system_prompt.push_str(
                 "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
             );
+        }
+        if let Some((service, binding)) = &self.previous_transcripts {
+            if let Some(orientation) = service.previous_transcripts_orientation(binding).await {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&orientation);
+            }
         }
         let callable_names = request_tool_surface
             .callable_tools(available_tools.clone())
