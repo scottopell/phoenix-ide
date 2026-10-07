@@ -99,6 +99,9 @@ impl FromStr for PeerBaseUrl {
         {
             return Err(PeerBaseUrlError::ContainsAmbientData);
         }
+        if url.port() == Some(0) {
+            return Err(PeerBaseUrlError::ContainsAmbientData);
+        }
         if !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -216,6 +219,7 @@ mod tests {
             "https://peer.example/path",
             "https://peer.example/?query=yes",
             "https://peer.example/#fragment",
+            "https://peer.example:0",
         ] {
             assert!(PeerBaseUrl::from_str(value).is_err(), "{value}");
         }
