@@ -25,6 +25,8 @@ runSurfaceCapture({
     const dotCount = await row.locator('.conv-state-dot').count();
     if (dotCount !== 1) throw new Error(`Expected one product indicator, found ${dotCount}`);
     await page.getByLabel('Working').waitFor();
+    const trigger = row.getByRole('button', { name: /Actions for conversation/ });
+    await trigger.click();
     const rename = page.getByRole('button', { name: /Rename conversation Fixture Product Root/ });
     const close = page.getByRole('button', { name: /Close conversation Fixture Product Root/ });
     for (const [name, locator] of [['rename', rename], ['close', close]]) {
@@ -38,14 +40,15 @@ runSurfaceCapture({
     await rename.click();
     await page.getByRole('textbox').waitFor();
     await page.getByRole('button', { name: 'Cancel' }).click();
+    await trigger.click();
     await close.focus();
     if (!(await close.evaluate((el) => el === document.activeElement))) throw new Error('Close action did not receive keyboard focus');
     await close.click();
     await page.getByText(/Close \"Fixture Product Root\"/).waitFor();
     await page.getByRole('button', { name: 'Cancel' }).click();
     const titleBox = await row.locator('.conv-item-title').boundingBox();
-    const actionsBox = await row.locator('.conv-actions').boundingBox();
-    if (!titleBox || titleBox.width < 24 || !actionsBox || actionsBox.width < 64) {
+    const actionsBox = await trigger.boundingBox();
+    if (!titleBox || titleBox.width < 24 || !actionsBox || actionsBox.width < 44) {
       throw new Error(`Product row title/actions are not visibly laid out at ${viewport.name ?? 'default'}`);
     }
     await page.screenshot({ path: `${outDir}/product-actions-continued--${viewport.name ?? 'default'}-verified.png`, fullPage: true });
