@@ -1,6 +1,7 @@
 import { chromium, webkit } from 'playwright';
 import { spawn } from 'node:child_process';
-import { mkdir } from 'node:fs/promises';
+import { access, mkdir } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
@@ -158,8 +159,15 @@ export async function captureSurface(config) {
   const resolvedOut = path.resolve(outDir);
   await mkdir(resolvedOut, { recursive: true });
 
-  const captureViewports = normalizeViewportMatrix(viewportMatrix, viewport);
-  await run('pnpm', playwrightInstallArgs(browserName));
+  const captureViewports = normalizeViewportMatrix(viewportMatrix, viewport)
+    .filter((item) => !process.env.CAPTURE_VIEWPORT || item.name === process.env.CAPTURE_VIEWPORT);
+  if (captureViewports.length === 0) throw new Error('CAPTURE_VIEWPORT matched no configured viewport');
+  if (process.env.PLAYWRIGHT_INSTALLED_ONLY === '1') {
+    await access(browserType.executablePath(), constants.X_OK);
+    console.log(`Using installed ${browserName}: ${browserType.executablePath()}`);
+  } else {
+    await run('pnpm', playwrightInstallArgs(browserName));
+  }
 
   const ladle = process.env.LADLE_URL ? null : spawn('pnpm', ['exec', 'ladle', 'serve', '--port', String(port), '--host', '127.0.0.1'], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -184,7 +192,13 @@ export async function captureSurface(config) {
   process.on('SIGTERM', () => { stopLadle(); process.exit(143); });
 
   await waitForLadle();
-  const stories = await discoverStories(storyPrefix);
+  const selectedStories = process.env.CAPTURE_STORIES?.split(',');
+  const stories = (await discoverStories(storyPrefix))
+    .filter(({ id }) => !selectedStories || selectedStories.includes(id));
+  if (selectedStories && selectedStories.some((id) => !stories.some((story) => story.id === id))) {
+    stopLadle();
+    throw new Error('CAPTURE_STORIES contains an unknown scenario');
+  }
   console.log(`Capturing ${stories.length} ${surface} stories`);
   const browser = await browserType.launch();
 

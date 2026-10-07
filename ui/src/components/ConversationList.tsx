@@ -12,6 +12,7 @@ import {
 } from '../utils/chains';
 
 import { useKeyboardNav } from '../hooks';
+import { useFocusScope } from '../hooks/useFocusScope';
 import {
   getConversationDisplayTitle,
   getConversationProjectLabel,
@@ -695,6 +696,7 @@ export function ConversationList({
   footer,
 }: ConversationListProps) {
   const navigate = useNavigate();
+  const { hasActiveScope } = useFocusScope();
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
@@ -713,7 +715,7 @@ export function ConversationList({
       }
     };
     const handleEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
+      if (event.key !== 'Escape' || hasActiveScope) return;
       event.preventDefault();
       event.stopPropagation();
       const trigger = menuRef.current?.querySelector<HTMLButtonElement>('.conv-item-menu-btn');
@@ -726,7 +728,7 @@ export function ConversationList({
       document.removeEventListener('mousedown', handleMouseDown);
       document.removeEventListener('keydown', handleEscape, true);
     };
-  }, [expandedId]);
+  }, [expandedId, hasActiveScope]);
 
   const displayList = showArchived ? archivedConversations : conversations;
   const displayProductList = showArchived ? archivedProductConversations : productConversations;

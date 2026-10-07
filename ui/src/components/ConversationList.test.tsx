@@ -8,6 +8,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import type { Conversation, ProductConversationListRow } from '../api';
+import { FocusScopeProvider } from '../hooks/useFocusScope';
+import { ShortcutHelpPanel } from './ShortcutHelpPanel';
 
 // Spy on a util that the row body calls during render. Counting these calls
 // is a reliable proxy for component-body executions: when React.memo bails
@@ -225,6 +227,25 @@ describe('ProductConversation presentation transitions', () => {
 });
 
 describe('ProductConversation row actions', () => {
+  it('leaves Escape to the actual topmost shortcut help panel', () => {
+    const closeHelp = vi.fn();
+    const content = (visible: boolean) => <FocusScopeProvider><MemoryRouter>
+      <ConversationList {...defaultProps} productConversations={[makeProductConversation('under-panel')]} onProductConversationRename={vi.fn()} />
+      <ShortcutHelpPanel visible={visible} onClose={closeHelp} />
+    </MemoryRouter></FocusScopeProvider>;
+    const view = render(content(false));
+    const trigger = view.getByRole('button', { name: 'Actions for conversation Root under-panel' });
+    fireEvent.click(trigger);
+    view.rerender(content(true));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(closeHelp).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    view.rerender(content(false));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    expect(trigger).toHaveFocus();
+  });
+
   it('does not offer empty actions for offline History or mismatched callbacks', () => {
     const view = render(<MemoryRouter><ConversationList {...defaultProps} showArchived archivedProductConversations={[makeProductConversation('empty', { lifecycle: { state: 'history' } })]} onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} /></MemoryRouter>);
     expect(view.queryByRole('button', { name: /^Actions for conversation/ })).toBeNull();
