@@ -507,6 +507,8 @@ rule TokenRefreshNeeded {
         -- non-callable cleanup ownership. Do not require its session DELETE
         -- to succeed before refreshing: the expired bearer can also be
         -- rejected on DELETE. Concurrent recovery requests join that epoch.
+        -- Cancel active calls before retaining the old session for cleanup;
+        -- cancellation does not authorize replay of those other calls.
         -- A transient refresh failure retains the token and cleanup ownership
         -- while the same epoch retries; it does not discard the session.
         -- Token persistence, invalidation, and re-prompt publication share the
@@ -532,6 +534,12 @@ rule TokenRefreshed {
         -- then initialize and publish the replacement. Cleanup failure keeps
         -- the old transport non-callable and retry-owned; no replacement is
         -- published while cleanup remains unresolved.
+        -- The replacement handshake shares the credential mutation fence with
+        -- configuration changes. Check its epoch after acquiring the fence;
+        -- any connect-side refresh, token deletion, or authorization prompt
+        -- must finish before a newer configuration becomes authoritative.
+        -- Only transports retained by this OAuth recovery receive its new
+        -- bearer; unrelated stale teardown retries retain their credentials.
         -- The request whose 401 triggered the refresh (a tools/call or
         -- initialize) is replayed by the executor with the refreshed bearer
         -- once authorized, so a normal token expiry never surfaces as a tool

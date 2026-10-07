@@ -509,6 +509,19 @@ enum Command {
     },
 }
 
+enum RetainedTransport {
+    OAuthRecovery(Arc<McpServer>),
+    Other(Arc<McpServer>),
+}
+
+impl RetainedTransport {
+    fn server(&self) -> &McpServer {
+        match self {
+            Self::OAuthRecovery(server) | Self::Other(server) => server,
+        }
+    }
+}
+
 struct Actor {
     mailbox: mpsc::WeakSender<Command>,
     commands: mpsc::Receiver<Command>,
@@ -521,7 +534,7 @@ struct Actor {
     stdio_active: bool,
     stdio_queue: VecDeque<QueuedCall>,
     active_calls: HashMap<u64, CancellationToken>,
-    teardown_retry: Vec<Arc<McpServer>>,
+    teardown_retry: Vec<RetainedTransport>,
 }
 
 impl Actor {
@@ -734,10 +747,15 @@ impl Actor {
                     let teardown = match kind {
                         RecoveryKind::Transport => self.stop_server().await,
                         RecoveryKind::OAuth => {
+                            for cancellation in self.active_calls.values() {
+                                cancellation.cancel();
+                            }
+                            self.active_calls.clear();
                             if let SupervisorState::Ready(server) =
                                 std::mem::replace(&mut self.state, SupervisorState::Recovering)
                             {
-                                self.teardown_retry.push(server);
+                                self.teardown_retry
+                                    .push(RetainedTransport::OAuthRecovery(server));
                             }
                             Ok(())
                         }
@@ -767,12 +785,14 @@ impl Actor {
                 next,
                 reply,
             } => {
-                if epoch != self.epoch {
+                if epoch != self.epoch || !matches!(self.state, SupervisorState::Recovering) {
                     let _ = reply.send(Ok(None));
                     return;
                 }
-                for server in &self.teardown_retry {
-                    *server.oauth_bearer.write().unwrap() = Some(access_token.clone());
+                for retained in &self.teardown_retry {
+                    if let RetainedTransport::OAuthRecovery(server) = retained {
+                        *server.oauth_bearer.write().unwrap() = Some(access_token.clone());
+                    }
                 }
                 match self.stop_server().await {
                     Ok(()) => {
@@ -854,7 +874,8 @@ impl Actor {
                 if current {
                     self.recovery_from = None;
                     if let Some(server) = teardown_retry {
-                        self.teardown_retry.push(Arc::new(server));
+                        self.teardown_retry
+                            .push(RetainedTransport::Other(Arc::new(server)));
                     }
                     let error = compose_teardown_error(error, self.stop_server().await);
                     self.state = SupervisorState::Failed;
@@ -876,7 +897,8 @@ impl Actor {
                 if current {
                     self.recovery_from = None;
                     if let Some(server) = teardown_retry {
-                        self.teardown_retry.push(Arc::new(server));
+                        self.teardown_retry
+                            .push(RetainedTransport::Other(Arc::new(server)));
                     }
                     let error = compose_teardown_error(error, self.stop_server().await);
                     if self.teardown_retry.is_empty() {
@@ -969,7 +991,7 @@ impl Actor {
     }
 
     async fn retain_unresolved_stale_teardown(&mut self, stale: Arc<McpServer>, primary: String) {
-        self.teardown_retry.push(stale);
+        self.teardown_retry.push(RetainedTransport::Other(stale));
         let current = match std::mem::replace(&mut self.state, SupervisorState::Failed) {
             SupervisorState::Ready(server) => Some(server),
             SupervisorState::Connecting
@@ -981,7 +1003,7 @@ impl Actor {
         if let Some(current) = current {
             if let Err(teardown) = current.terminate().await {
                 error = format!("{error}; current transport teardown also failed: {teardown}");
-                self.teardown_retry.push(current);
+                self.teardown_retry.push(RetainedTransport::Other(current));
             }
         }
         self.recovery_from = None;
@@ -992,15 +1014,15 @@ impl Actor {
         if let SupervisorState::Ready(server) =
             std::mem::replace(&mut self.state, SupervisorState::Removed)
         {
-            self.teardown_retry.push(server);
+            self.teardown_retry.push(RetainedTransport::Other(server));
         }
 
         let mut failed = Vec::new();
         let mut errors = Vec::new();
-        for server in std::mem::take(&mut self.teardown_retry) {
-            if let Err(error) = server.terminate().await {
+        for retained in std::mem::take(&mut self.teardown_retry) {
+            if let Err(error) = retained.server().terminate().await {
                 errors.push(error.to_string());
-                failed.push(server);
+                failed.push(retained);
             }
         }
         self.teardown_retry = failed;
@@ -1398,6 +1420,78 @@ mod epoch_tests {
         assert_eq!(bearer.read().unwrap().as_deref(), Some("fresh"));
         let (replacement, _, _) = server(http_config());
         assert!(handle.publish(permit.epoch, replacement).await);
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_recovery_cancels_active_calls_before_session_cleanup() {
+        let (serving, mut started, _) = server(http_config());
+        let handle = SupervisorHandle::connected(serving);
+        let call = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .call(
+                        "report".into(),
+                        serde_json::json!({}),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth recovery owner");
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome.result, Err(McpRequestError::Cancelled)));
+        assert!(matches!(outcome.recovery, CallRecovery::None));
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .unwrap());
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_cleanup_never_rotates_a_stale_transport_bearer() {
+        let (serving, _) = retry_shutdown_server(0);
+        let current_bearer = Arc::clone(&serving.oauth_bearer);
+        *current_bearer.write().unwrap() = Some("expired".into());
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth recovery owner");
+        };
+        let (stale, _) = retry_shutdown_server(2);
+        let stale_bearer = Arc::clone(&stale.oauth_bearer);
+        *stale_bearer.write().unwrap() = Some("old-resource-token".into());
+        assert!(!handle.publish(0, stale).await);
+        assert!(!handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .unwrap());
+        assert_eq!(current_bearer.read().unwrap().as_deref(), Some("expired"));
+        assert!(
+            handle
+                .await_oauth(permit.epoch, "https://auth.test".into(), "retry".into())
+                .await
+        );
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .is_err());
+        assert_eq!(current_bearer.read().unwrap().as_deref(), Some("fresh"));
+        assert_eq!(
+            stale_bearer.read().unwrap().as_deref(),
+            Some("old-resource-token")
+        );
         handle.remove().await.unwrap();
     }
 

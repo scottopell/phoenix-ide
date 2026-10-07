@@ -1036,6 +1036,12 @@ mod tests {
                 Arc<tokio::sync::Semaphore>,
             )>,
         >,
+        initialize_gate: Mutex<
+            Option<(
+                tokio::sync::mpsc::UnboundedSender<()>,
+                Arc<tokio::sync::Semaphore>,
+            )>,
+        >,
     }
 
     type RouteMap = Arc<ResponseRoutes>;
@@ -1312,6 +1318,7 @@ mod tests {
                 body,
             };
 
+            let initializing = recorded.rpc_method() == "initialize";
             let response = select_response(
                 &method,
                 &path,
@@ -1323,12 +1330,14 @@ mod tests {
                 &request_count,
                 &get_responses,
             );
-            let token_gate = if path == "/token" {
+            let gate = if path == "/token" {
                 routes.token_gate.lock().unwrap().take()
+            } else if initializing {
+                routes.initialize_gate.lock().unwrap().take()
             } else {
                 None
             };
-            if let Some((started, release)) = token_gate {
+            if let Some((started, release)) = gate {
                 started.send(()).unwrap();
                 release.acquire().await.unwrap().forget();
             }
@@ -3263,6 +3272,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_oauth_connection_cannot_publish_a_flow_after_reload() {
+        let old = TestServer::start(handshake_responses("old-session")).await;
+        let manager = ready_refreshable_manager(&old).await;
+        old.route("/token", token_response("at-2", Some("rt-2"), None));
+        old.push_responses(vec![unauthorized(&old), delete_ack(), unauthorized(&old)]);
+        let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *old.routes.initialize_gate.lock().unwrap() = Some((started, Arc::clone(&release)));
+        let call = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .call_tool("remote", "report", serde_json::json!({}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            manager.oauth.mutations.try_lock().is_err(),
+            "replacement initialize must retain credential mutation ownership"
+        );
+
+        let replacement = TestServer::start(handshake_responses("new-session")).await;
+        let config = http_config(
+            &replacement.url,
+            HttpAuth::Static(StaticCred::Bearer("static-token".into())),
+        );
+        let reload = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .reload_from_configs(vec![("remote".into(), config)])
+                    .await
+            }
+        });
+        release.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(5), reload)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let _ = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(pending_auth_url(&manager).await.is_none());
+        assert!(!manager.oauth.pending.lock().unwrap().contains_key("remote"));
+        let statuses = manager.status().await;
+        assert_eq!(statuses[0].state, crate::McpConnState::Ready);
+        replacement.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn oauth_refresh_mutations_are_serialized_with_reload_for_success_and_rejection() {
         for (rejected, background_retry) in
@@ -3331,7 +3404,7 @@ mod tests {
                 let config = http_config(&server.url, HttpAuth::None);
                 let handle = handle.clone();
                 async move {
-                    let _serial = manager.reload_serial.lock().await;
+                    let _serial = manager.oauth.mutations.lock().await;
                     manager.cancel_pending_oauth_flow("remote").await;
                     handle.reconfigure(config).await.unwrap();
                     manager
@@ -3343,7 +3416,7 @@ mod tests {
                 }
             });
             assert!(
-                manager.reload_serial.try_lock().is_err(),
+                manager.oauth.mutations.try_lock().is_err(),
                 "in-flight recovery owns the mutation fence"
             );
             release.add_permits(1);
@@ -3515,6 +3588,59 @@ mod tests {
         assert_eq!(deletes, vec![Some("Bearer at-2".to_string())]);
         server.push_responses(vec![delete_ack()]);
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_removal_preserves_oauth_cleanup_owner_for_callback() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let mut rejected = json_doc(&serde_json::json!({"error": "invalid_grant"}));
+        rejected.status = 400;
+        server.route("/token", rejected);
+        server.push_responses(vec![unauthorized(&server), delete_ack()]);
+        assert!(manager
+            .call_tool("remote", "report", serde_json::json!({}))
+            .await
+            .is_err());
+        let auth_url = pending_auth_url(&manager).await.unwrap();
+        let state = query_params(&auth_url).remove("state").unwrap();
+        let result = manager.reload_from_configs(vec![]).await;
+        assert_eq!(result.failed.len(), 1);
+        assert!(result.failed[0].error.contains("HTTP 401"));
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        server.push_responses(handshake_responses("sess-2"));
+        manager
+            .complete_oauth_authorization(&state, "code", Some(&server.base()))
+            .await
+            .unwrap();
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_for_settled())
+            .await
+            .unwrap();
+        assert!(handle.snapshot().is_ready());
+        let deletes: Vec<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.http_method() == "DELETE")
+            .map(|request| request.header("authorization").map(str::to_string))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![Some("Bearer at-1".into()), Some("Bearer at-2".into())]
+        );
+        server.push_responses(vec![delete_ack()]);
+        let result = manager.reload_from_configs(vec![]).await;
+        assert!(result.failed.is_empty());
+        assert_eq!(result.removed, vec!["remote"]);
+        assert!(manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // One end-to-end lifecycle: trigger step-up, inspect the union, complete

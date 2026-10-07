@@ -1047,6 +1047,7 @@ impl PendingAuthFlow {
 /// listener is bound.
 struct OAuthRuntime {
     store: std::sync::RwLock<Arc<dyn OAuthStore>>,
+    mutations: tokio::sync::Mutex<()>,
     redirect_base: std::sync::Mutex<Option<String>>,
     /// A diagnostic surfaced on `unauthorized` status entries when the resolved
     /// redirect base is unreachable from another machine (a loopback redirect
@@ -1070,6 +1071,7 @@ impl Default for OAuthRuntime {
     fn default() -> Self {
         Self {
             store: std::sync::RwLock::new(Arc::new(oauth::MemoryOAuthStore::default())),
+            mutations: tokio::sync::Mutex::new(()),
             redirect_base: std::sync::Mutex::new(None),
             redirect_warning: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1899,7 +1901,7 @@ impl McpClientManager {
         // the new config), or a newer flow may already have persisted its own
         // token (which a stale exchange must not overwrite or delete). A dead
         // flow's exchange result is simply discarded.
-        let _serial = self.reload_serial.lock().await;
+        let _serial = self.oauth.mutations.lock().await;
         let resolved = {
             let mut pending = self.oauth.pending.lock().unwrap();
             match pending.get(&name) {
@@ -1935,54 +1937,25 @@ impl McpClientManager {
         let owner = self
             .restart_oauth_owner(&name, &config, resolved.owner, record.access_token)
             .await?;
-
-        let manager = Arc::clone(self);
-        let reconnect_name = name.clone();
-        self.spawn_background(async move {
-            if let Some((handle, epoch)) = owner {
-                if handle.snapshot().epoch != epoch {
-                    return;
-                }
-                match Self::connect_one(
-                    &reconnect_name,
-                    &config,
-                    Arc::clone(&manager.pending_oauth_urls),
-                    Arc::clone(&manager.oauth),
-                )
-                .await
-                {
-                    Ok(server) => {
-                        if handle.publish(epoch, server).await {
-                            manager
-                                .pending_oauth_urls
-                                .write()
-                                .await
-                                .remove(&reconnect_name);
-                        }
-                    }
-                    Err(failure) => {
-                        handle
-                            .fail_with_teardown_retry(
-                                epoch,
-                                failure.message,
-                                failure.teardown_retry,
-                            )
-                            .await;
-                    }
-                }
-            } else {
-                let handle = {
-                    let mut servers = manager.servers.write().await;
-                    servers
-                        .entry(reconnect_name.clone())
-                        .or_insert_with(|| SupervisorHandle::connecting(config.clone()))
-                        .clone()
-                };
-                manager
-                    .configure_actor(reconnect_name, config, handle)
-                    .await;
-            }
-        });
+        let (handle, epoch) = if let Some(owner) = owner {
+            owner
+        } else {
+            let handle = {
+                let mut servers = self.servers.write().await;
+                servers
+                    .entry(name.clone())
+                    .or_insert_with(|| SupervisorHandle::connecting(config.clone()))
+                    .clone()
+            };
+            let epoch = handle.reconfigure(config.clone()).await?;
+            (handle, epoch)
+        };
+        self.track_background_task(self.begin_actor_connect_at_epoch(
+            name.clone(),
+            &config,
+            handle,
+            epoch,
+        ));
 
         Ok(name)
     }
@@ -2065,7 +2038,7 @@ impl McpClientManager {
         permit: &RecoveryPermit,
         www_authenticate: Option<&str>,
     ) -> RefreshServerOutcome {
-        let _serial = self.reload_serial.lock().await;
+        let _serial = self.oauth.mutations.lock().await;
         let snapshot = handle.snapshot();
         if snapshot.epoch != permit.epoch || !matches!(snapshot.state, SupervisorState::Recovering)
         {
@@ -2174,7 +2147,7 @@ impl McpClientManager {
         permit: &RecoveryPermit,
         www_authenticate: &str,
     ) -> Result<(), String> {
-        let _serial = self.reload_serial.lock().await;
+        let _serial = self.oauth.mutations.lock().await;
         let snapshot = handle.snapshot();
         if snapshot.epoch != permit.epoch || !matches!(snapshot.state, SupervisorState::Recovering)
         {
@@ -2252,6 +2225,10 @@ impl McpClientManager {
         let pending = Arc::clone(&self.pending_oauth_urls);
         let oauth = Arc::clone(&self.oauth);
         tokio::spawn(async move {
+            let _mutations = oauth.mutations.lock().await;
+            if handle.snapshot().epoch != epoch {
+                return;
+            }
             match Self::connect_one(
                 &connect_name,
                 &connect_config,
@@ -2303,26 +2280,6 @@ impl McpClientManager {
     ) -> Result<tokio::task::JoinHandle<()>, String> {
         let epoch = handle.reconfigure(config.clone()).await?;
         Ok(self.begin_actor_connect_at_epoch(name, &config, handle, epoch))
-    }
-
-    async fn configure_actor(
-        &self,
-        name: String,
-        config: McpServerConfig,
-        handle: SupervisorHandle,
-    ) {
-        let connect = {
-            let _serial = self.reload_serial.lock().await;
-            self.begin_actor_connect(name, config, handle).await
-        };
-        match connect {
-            Ok(task) => {
-                if let Err(error) = task.await {
-                    tracing::warn!(error = %error, "MCP connect task failed");
-                }
-            }
-            Err(error) => tracing::warn!(%error, "MCP server reconfiguration failed"),
-        }
     }
 
     #[must_use = "await the handle when MCP tools must be ready before continuing"]
@@ -2660,41 +2617,12 @@ impl McpClientManager {
         }
         match handle.claim_recovery(observed_epoch).await {
             RecoveryClaim::Leader(permit) => {
-                let pending = Arc::clone(&self.pending_oauth_urls);
-                let oauth = Arc::clone(&self.oauth);
-                let name = server_name.to_string();
-                let leader = handle.clone();
-                let mut task = tokio::spawn(async move {
-                    let result =
-                        Self::connect_one(&name, &permit.config, Arc::clone(&pending), oauth).await;
-                    match result {
-                        Ok(server) => {
-                            if leader.publish(permit.epoch, server).await {
-                                pending.write().await.remove(&name);
-                            }
-                        }
-                        Err(failure) => {
-                            if let Some(url) = pending.read().await.get(&name).cloned() {
-                                leader
-                                    .unauthorized_with_teardown_retry(
-                                        permit.epoch,
-                                        url,
-                                        failure.message,
-                                        failure.teardown_retry,
-                                    )
-                                    .await;
-                            } else {
-                                leader
-                                    .fail_with_teardown_retry(
-                                        permit.epoch,
-                                        failure.message,
-                                        failure.teardown_retry,
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
-                });
+                let mut task = self.begin_actor_connect_at_epoch(
+                    server_name.to_string(),
+                    &permit.config,
+                    handle.clone(),
+                    permit.epoch,
+                );
                 if let Some(cancel) = cancel {
                     tokio::select! {
                         biased;
@@ -2813,6 +2741,7 @@ impl McpClientManager {
                     handle.fail(permit.epoch, error.clone()).await;
                     return Err(McpToolCallError::Failed(error));
                 }
+                let mutations = self.oauth.mutations.lock().await;
                 self.bind_pending_flow_owner(server_name, handle, permit.epoch)
                     .map_err(McpToolCallError::Failed)?;
                 let url = self
@@ -2829,6 +2758,7 @@ impl McpClientManager {
                         "additional OAuth scopes required".to_string(),
                     )
                     .await;
+                drop(mutations);
                 self.wait_for_ready(handle, &CancellationToken::new()).await
             }
         }
@@ -2841,6 +2771,12 @@ impl McpClientManager {
         permit: &RecoveryPermit,
         outcome: RefreshServerOutcome,
     ) -> Result<(), McpToolCallError> {
+        let _mutations = self.oauth.mutations.lock().await;
+        if handle.snapshot().epoch != permit.epoch {
+            return Err(McpToolCallError::Failed(
+                "MCP OAuth recovery was superseded".to_string(),
+            ));
+        }
         match outcome {
             RefreshServerOutcome::Refreshed(access_token) => {
                 if !handle
@@ -2956,6 +2892,7 @@ impl McpClientManager {
         let mut failed = Vec::new();
         let mut removed = Vec::new();
         for name in removed_names {
+            let _mutations = self.oauth.mutations.lock().await;
             let handle = { self.servers.read().await.get(&name).cloned() };
             if let Some(handle) = handle {
                 let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
@@ -2975,12 +2912,18 @@ impl McpClientManager {
                         removed.push(name);
                     }
                     Err(error) => {
-                        if let Some(flow) = pending_flow {
+                        if let Some(mut flow) = pending_flow {
+                            let epoch = handle.snapshot().epoch;
+                            flow.owner = Some((handle.clone(), epoch));
                             self.oauth
                                 .pending
                                 .lock()
                                 .unwrap()
                                 .insert(name.clone(), flow);
+                            let url = self.pending_oauth_urls.read().await.get(&name).cloned();
+                            if let Some(url) = url {
+                                handle.await_oauth(epoch, url, error.clone()).await;
+                            }
                         }
                         tracing::warn!(server = %name, %error, "MCP server removal failed; handle retained for teardown retry");
                         failed.push(McpReloadFailure {
@@ -2997,6 +2940,7 @@ impl McpClientManager {
         let mut restarted = Vec::new();
         let mut unchanged = Vec::new();
         for (name, config) in desired {
+            let mutations = self.oauth.mutations.lock().await;
             let existing = self.servers.read().await.get(&name).cloned();
             if existing.is_none() {
                 let stale_flow = self.oauth.pending.lock().unwrap().remove(&name);
@@ -3049,6 +2993,7 @@ impl McpClientManager {
                     continue;
                 }
             };
+            drop(mutations);
             if is_restart {
                 let mut task = task;
                 if tokio::time::timeout(RELOAD_RESTART_TIMEOUT, &mut task)
@@ -3114,6 +3059,7 @@ impl McpClientManager {
 
     pub async fn shutdown(&self) {
         let _serial = self.reload_serial.lock().await;
+        let _mutations = self.oauth.mutations.lock().await;
         let handles: Vec<(String, SupervisorHandle)> = self
             .servers
             .read()
@@ -4385,6 +4331,9 @@ mod tests {
         let manager = McpClientManager::new();
         let (server, _) = retry_shutdown_server(1);
         let owner = server_handle(server);
+        let RecoveryClaim::Leader(permit) = owner.claim_oauth_recovery(0).await else {
+            panic!("OAuth cleanup owner");
+        };
         let listener = tokio::spawn(std::future::pending::<()>());
         manager
             .oauth
@@ -4397,7 +4346,7 @@ mod tests {
             .restart_oauth_owner(
                 "retry",
                 &owner.snapshot().config,
-                Some((owner, 0)),
+                Some((owner, permit.epoch)),
                 "new-token".to_string(),
             )
             .await;

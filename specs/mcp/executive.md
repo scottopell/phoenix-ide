@@ -89,6 +89,12 @@ reload queued while callback cleanup is blocked.
 `oauth_refresh_mutations_are_serialized_with_reload_for_success_and_rejection`
 gates token responses and covers both initial refresh and background retry,
 ensuring newer credentials and cancelled flows survive the old recovery.
+`replacement_oauth_connection_cannot_publish_a_flow_after_reload` gates the
+replacement handshake while a configuration reload is queued, then verifies
+that the new endpoint is ready without an obsolete OAuth token or prompt.
+`failed_removal_preserves_oauth_cleanup_owner_for_callback` covers a callback
+after failed removal. Supervisor regressions cover cancellation before cleanup
+and preservation of unrelated stale transport credentials.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 
