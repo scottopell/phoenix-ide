@@ -78,6 +78,36 @@ describe('ProductConversationAliasRedirect', () => {
     expect(embeddedSpy).not.toHaveBeenCalled();
   });
 
+  it.each(['root-global', 'historical-global', 'current-global'])('pins Global member %s instead of ordinary navigation', async (pin) => {
+    vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: 'current-global' });
+    renderAlias('global-alias', `/c/global-alias?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`);
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`));
+    expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('rejects a foreign Global pin rather than opening latest or an ordinary page', async () => {
+    vi.mocked(api.resolveCoordinatorRoute).mockImplementation(async (reference) => ({ coordinator_id: reference === 'global-alias' ? 'current-global' : null }));
+    renderAlias('global-alias', '/c/global-alias?source_transcript=ordinary-row');
+    await screen.findByRole('alert');
+    expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
+    expect(embeddedSpy).not.toHaveBeenCalled();
+  });
+
+  it('revalidates a copied historical URL on remount instead of retaining latest state', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async (reference) => ({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      requested_transcript_row_id: reference, latest_transcript_row_id: 'successor',
+    } as never));
+    const entry = '/c/product-1?source_transcript=old-member#message-old%3Amessage';
+    const first = renderAlias('product-1', entry);
+    await screen.findByTestId('embedded-fallback');
+    first.unmount();
+    renderAlias('product-1', entry);
+    await screen.findByTestId('embedded-fallback');
+    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'old-member' }));
+    expect(screen.getByTestId('location')).toHaveTextContent(entry);
+  });
+
   it('renders a bare canonical product route without redirecting to a historical row', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
       product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
