@@ -126,6 +126,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     rowSlug: string;
     aggregateResolutionUnavailable: boolean;
   } | null>(null);
+  const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
 
@@ -147,11 +148,14 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       .then((snapshot) => {
         if (!snapshot) return;
         if (!cancelled) {
-          navigate({
-            pathname: snapshot.canonical_route,
-            search: location.search,
-            hash: location.hash,
-          }, { replace: true });
+          setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+          if (location.pathname !== snapshot.canonical_route) {
+            navigate({
+              pathname: snapshot.canonical_route,
+              search: location.search,
+              hash: location.hash,
+            }, { replace: true });
+          }
         }
       })
       .catch((error: unknown) => {
@@ -165,6 +169,10 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       });
     return () => { cancelled = true; };
   }, [location.hash, location.pathname, location.search, navigate, reference, retryToken]);
+
+  if (resolvedProduct?.reference === reference && !activeFallback) {
+    return <ProductConversationPage productId={resolvedProduct.id} />;
+  }
 
   if (activeFallback) {
     return (

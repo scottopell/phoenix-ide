@@ -742,12 +742,13 @@ function ProductConversationHeader({
   );
 }
 
-export function ProductConversationPage() {
-  return <ProductConversationPageInner />;
+export function ProductConversationPage({ productId }: { productId?: string | undefined } = {}) {
+  return <ProductConversationPageInner productId={productId} />;
 }
 
-function ProductConversationPageInner() {
-  const { productConversationId } = useParams<{ productConversationId: string }>();
+function ProductConversationPageInner({ productId }: { productId?: string | undefined }) {
+  const params = useParams<{ productConversationId: string }>();
+  const productConversationId = productId ?? params.productConversationId;
   const viewerSlot = useViewerSlot();
   const location = useLocation();
   const hashTargetMessageId = decodeMessageHash(location.hash);
