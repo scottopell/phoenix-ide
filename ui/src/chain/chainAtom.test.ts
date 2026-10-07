@@ -10,6 +10,7 @@ import type { ChainView } from '../api';
 function makeView(overrides: Partial<ChainView> = {}): ChainView {
   return {
     root_conv_id: 'root-1',
+    product_conversation_id: 'pc-1',
     chain_name: null,
     display_name: 'My chain',
     archived: false,

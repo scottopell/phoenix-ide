@@ -40,6 +40,7 @@ const TERMINAL_STATUS_STATES: &[&str] = &[
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
+    "ordinary_activation_failed_rollback_failed",
     "rejected_concurrent",
 ];
 #[derive(Clone)]
@@ -246,14 +247,59 @@ async fn response_text(response: reqwest::Response, description: &str) -> Result
     Ok(text)
 }
 
-fn version_triplet(version: &str) -> Option<(u64, u64, u64)> {
-    let mut fields = version.trim_start_matches('v').split('.');
-    let triplet = (
-        fields.next()?.parse().ok()?,
-        fields.next()?.parse().ok()?,
-        fields.next()?.parse().ok()?,
-    );
-    fields.next().is_none().then_some(triplet)
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ReleaseStage {
+    Rc(u8),
+    Stable,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReleaseVersion {
+    core: (u16, u16, u16),
+    stage: ReleaseStage,
+}
+
+impl ReleaseVersion {
+    fn parse(version: &str) -> Option<Self> {
+        fn component(text: &str, maximum: u16) -> Option<u16> {
+            if text.is_empty()
+                || !text.bytes().all(|byte| byte.is_ascii_digit())
+                || (text.len() > 1 && text.starts_with('0'))
+            {
+                return None;
+            }
+            let value = text.parse::<u16>().ok()?;
+            (value <= maximum).then_some(value)
+        }
+        let version = version.strip_prefix('v').unwrap_or(version);
+        let (core, stage) = match version.split_once("-rc.") {
+            Some((core, rc)) => {
+                let rc = component(rc, 99)?;
+                if rc == 0 {
+                    return None;
+                }
+                (core, ReleaseStage::Rc(u8::try_from(rc).ok()?))
+            }
+            None => (version, ReleaseStage::Stable),
+        };
+        let mut fields = core.split('.');
+        let core = (
+            component(fields.next()?, 9999)?,
+            component(fields.next()?, 9999)?,
+            component(fields.next()?, 9999)?,
+        );
+        fields.next().is_none().then_some(Self { core, stage })
+    }
+}
+
+fn stable_release_is_newer(current: &str, released: &str) -> Result<bool, String> {
+    let current = ReleaseVersion::parse(current).ok_or_else(|| {
+        "running Phoenix version is not supported x.y.z or x.y.z-rc.N".to_string()
+    })?;
+    let released = ReleaseVersion::parse(released)
+        .filter(|version| matches!(version.stage, ReleaseStage::Stable))
+        .ok_or_else(|| format!("release {released} is not a supported stable x.y.z version"))?;
+    Ok(released > current)
 }
 
 async fn discover_release() -> Result<ReleasePreview, String> {
@@ -321,13 +367,14 @@ async fn discover_release() -> Result<ReleasePreview, String> {
             release.tag_name
         ));
     }
-    let current = version_triplet(env!("CARGO_PKG_VERSION"))
-        .ok_or_else(|| "running Phoenix version is not semantic x.y.z".to_string())?;
-    let version = release.tag_name.trim_start_matches('v').to_string();
-    let released = version_triplet(&version)
-        .ok_or_else(|| format!("release {} is not semantic x.y.z", release.tag_name))?;
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name)
+        .to_string();
+    let newer_than_current = stable_release_is_newer(env!("CARGO_PKG_VERSION"), &version)?;
     Ok(ReleasePreview::Available {
-        newer_than_current: released > current,
+        newer_than_current,
         version,
         tag: release.tag_name,
         commit: commit.sha.to_ascii_lowercase(),
@@ -479,14 +526,7 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
             .map(|timestamp| timestamp.to_rfc3339())
     });
-    let terminal = matches!(
-        state.as_str(),
-        "committed"
-            | "precondition_failed"
-            | "activation_failed_rolled_back"
-            | "activation_failed_rollback_failed"
-            | "rejected_concurrent"
-    );
+    let terminal = TERMINAL_STATUS_STATES.contains(&state.as_str());
     let status_is_stale = !terminal
         && updated_at
             .as_deref()
@@ -920,6 +960,60 @@ pub async fn approve(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn rollback_failures_hydrate_as_terminal_with_both_diagnostics() {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        app.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
+        let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for durable_state in [
+            "ordinary_activation_failed_rollback_failed",
+            "activation_failed_rollback_failed",
+        ] {
+            assert!(TERMINAL_STATUS_STATES.contains(&durable_state));
+            fs::write(
+                &path,
+                serde_json::json!({
+                    "transaction_id": "tx-rollback",
+                    "source_kind": "published_release",
+                    "state": durable_state,
+                    "source_commit": "a".repeat(40),
+                    "release_tag": "v1.2.3",
+                    "updated_at": "2020-01-01T00:00:00Z",
+                    "failure": "candidate unhealthy",
+                    "rollback_failure": "predecessor unhealthy",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ReleaseTransactionStatus::Present {
+                transaction_id,
+                state,
+                source_commit,
+                release_tag,
+                failure,
+                rollback_failure,
+                stale,
+                ..
+            } = read_status(&app, ReleaseUpdateBackend::BareLinux)
+            else {
+                panic!("rollback failure must remain visible after reconnect");
+            };
+            assert_eq!(transaction_id, "tx-rollback");
+            assert_eq!(state, durable_state);
+            assert_eq!(source_commit, Some("a".repeat(40)));
+            assert_eq!(release_tag.as_deref(), Some("v1.2.3"));
+            assert_eq!(failure.as_deref(), Some("candidate unhealthy"));
+            assert_eq!(rollback_failure.as_deref(), Some("predecessor unhealthy"));
+            assert!(
+                !stale,
+                "terminal failure must not be marked in-progress stale"
+            );
+        }
+    }
+
     #[test]
     fn cached_preview_preserves_discovery_sample_time() {
         let sampled_at = Utc::now() - chrono::Duration::minutes(2);
@@ -980,9 +1074,52 @@ mod tests {
 
     #[test]
     fn semantic_version_ordering_does_not_treat_older_as_newer() {
-        assert!(version_triplet("v2.0.0") > version_triplet("1.99.99"));
-        assert!(version_triplet("1.9.0") < version_triplet("1.10.0"));
-        assert_eq!(None, version_triplet("latest"));
+        assert!(stable_release_is_newer("1.99.99", "v2.0.0").unwrap());
+        assert!(stable_release_is_newer("1.9.0", "1.10.0").unwrap());
+        assert!(!stable_release_is_newer("1.10.0", "1.9.0").unwrap());
+        assert!(!stable_release_is_newer("1.10.0", "1.10.0").unwrap());
+    }
+
+    #[test]
+    fn rc_runtime_can_discover_same_core_stable_without_offering_prereleases() {
+        for rc in [1, 2, 10, 99] {
+            assert!(stable_release_is_newer(&format!("0.13.0-rc.{rc}"), "v0.13.0").unwrap());
+            assert!(!stable_release_is_newer(&format!("0.13.0-rc.{rc}"), "v0.12.0").unwrap());
+            assert!(stable_release_is_newer(&format!("0.13.0-rc.{rc}"), "v0.14.0").unwrap());
+        }
+        assert!(ReleaseVersion::parse("0.13.0-rc.10") > ReleaseVersion::parse("0.13.0-rc.2"));
+        assert!(stable_release_is_newer(env!("CARGO_PKG_VERSION"), "9999.9999.9999").unwrap());
+        for candidate in ["0.13.0-rc.1", "0.13.0-beta.1", "latest"] {
+            assert!(stable_release_is_newer("0.12.0", candidate)
+                .unwrap_err()
+                .contains("supported stable"));
+        }
+    }
+
+    #[test]
+    fn unsupported_running_versions_remain_actionable_errors() {
+        for current in [
+            "latest",
+            "vv0.13.0",
+            "0.13",
+            "0.13.0.1",
+            "0.13.0-rc.0",
+            "0.13.0-rc.100",
+            "0.13.0-rc.01",
+            "0.13.0-rc.x",
+            "0.13.0-beta.1",
+            "0.13.0+build",
+            "00.13.0",
+            "+0.13.0",
+            "10000.0.0",
+        ] {
+            assert!(
+                stable_release_is_newer(current, "0.13.0")
+                    .unwrap_err()
+                    .contains("running Phoenix version"),
+                "{current}"
+            );
+        }
     }
 
     #[test]

@@ -70,22 +70,16 @@ ios/             # Native iOS client (SwiftUI, offline-first; spec: specs/ios_cl
 
 ### Delivery Roadmap
 
-GitHub Issue [#651](https://github.com/scottopell/phoenix-ide/issues/651) is the central cross-machine orientation view for active delivery. At the start of development work, read its generated body before relying on local task or PR context alone. If GitHub is unavailable, continue from the domain authorities below and report that roadmap context could not be verified.
+GitHub Issue [#806](https://github.com/scottopell/phoenix-ide/issues/806) is the phoenix-ide delivery roadmap: a milestone-first view of committed outcomes, their owners, open gates, delivery per surface, and freshness. At the start of development work, read its generated body before relying on local task or PR context alone. If GitHub is unavailable, continue from the domain authorities below and report that roadmap context could not be verified.
 
-The roadmap is a coordination authority only: it answers what is active, owned, blocked, and next. It does not replace the authorities for requirements (specs/Allium), decisions (ADRs), repository task status (taskmd filenames), review state (PRs), or shipped behavior (`main`). When the roadmap conflicts with one of those authorities, the domain authority wins and the owning agent must append a replacement roadmap update.
+The roadmap is harness-neutral: any harness (each Phoenix instance, Codex, Claude Code) contributes the same way, by posting structured records as Issue comments. Its protocol is [`specs/roadmap/requirements.md`](specs/roadmap/requirements.md); read it before posting. In short:
 
-When you own a workstream represented on the roadmap:
+- the primary Phoenix instance is the coordinator: it alone curates outcomes, milestones, priority, and ownership;
+- workers post `evidence`, `status`, and technical `gate`s for outcomes they work on; record user scope calls as `decision`s quoting the user;
+- evidence must be checkable through GitHub (PR, commit, check run, release, or a deploy record naming a commit); links that only resolve on one machine belong in `status` pointers, labelled with their harness;
+- never edit the generated body or a posted record; post a new record instead.
 
-- report only facts about your workstream; do not rewrite another owner's entry or independently reorder the portfolio;
-- use one stable `workstream` identifier across replacement updates;
-- append a new structured update when its material state, blocker, owner, or next step changes;
-- append a retirement record when the workstream completes or is abandoned, removing it from the current projection;
-- link detailed evidence instead of copying plans into the roadmap;
-- for a newly created structured record, poll bot-authored reactions: 👀 means processing, 🚀 means accepted, and 😕 means rejected; reactions do not track later edits or deletions;
-- terminal reactions take precedence over a leftover 👀; if 🚀 and 😕 both appear, inspect the reducer Actions log instead of inferring an outcome;
-- on 🚀, verify that the generated Issue body reflects the exact source comment; on 😕, inspect the reducer Actions log; if no bot reaction appears within the bounded wait, inspect the workflow run because setup may have failed before lifecycle processing began.
-
-The reducer owns the Issue body; never edit it manually. The first Issue comment owns the current comment schema and limits. Use the `phoenix-development` skill for the posting procedure.
+The roadmap is a coordination authority only. It does not replace the authorities for requirements (specs/Allium), decisions (ADRs), repository task status (taskmd filenames), review state (PRs), or shipped behavior (`main`). When the roadmap conflicts with one of those authorities, the domain authority wins and the owning agent posts a correcting record.
 
 ### Task Tracking
 

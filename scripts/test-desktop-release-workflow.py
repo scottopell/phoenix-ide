@@ -7,8 +7,20 @@ from pathlib import Path
 workflow = Path('.github/workflows/release.yml').read_text()
 required_fragments = [
     "if: github.ref == 'refs/heads/main'",
-    'permissions:\n      contents: write',
+    'permissions:\n      contents: read',
+    'tag-release:',
+    "if: needs.gate.outputs.create_tag == 'true'",
+    'echo "create_tag=false" >> "$GITHUB_OUTPUT"',
+    'operation:',
+    'default: retry-release',
+    '- prepare-main',
+    '- retry-release',
+    'OPERATION: ${{ inputs.operation }}',
     'RETRY_TAG: ${{ inputs.tag }}',
+    'Preparing protected desktop artifacts from exact main commit $GITHUB_SHA without a tag or release.',
+    'echo "preparation=true" >> "$GITHUB_OUTPUT"',
+    'echo "release=false" >> "$GITHUB_OUTPUT"',
+    "needs.gate.outputs.preparation == 'true' || (needs.gate.outputs.release == 'true'",
     'Retrying $TAG from its immutable main commit $TAG_COMMIT.',
     'git merge-base --is-ancestor "$TAG_COMMIT" origin/main',
     'VERSION=$(python3 scripts/release_version.py validate-tag "$TAG")',
@@ -45,6 +57,13 @@ required_fragments = [
     'sha256sum "${required[@]}" > SHA256SUMS',
     'assets=("${required[@]}" SHA256SUMS)',
     'bash scripts/publish-release-assets.sh',
+    'if: needs.gate.outputs.release == \'true\'',
+    'PREPARATION-RECEIPT-${{ matrix.target }}.json',
+    'PREPARATION-SHA256SUMS-${{ matrix.target }}',
+    '"$RUNNER_TEMP/release-assets/PREPARATION-RECEIPT-${{ matrix.target }}.json"',
+    'shasum -a 256 -c',
+    'desktop-preparation-${{ matrix.target }}-${{ needs.gate.outputs.commit }}',
+    'retention-days: 14',
 ]
 for fragment in required_fragments:
     if fragment not in workflow:
@@ -78,17 +97,40 @@ build_macos_job = workflow.split('\n  build-macos:\n', 1)[1].split('\n  publish:
 publish_job = workflow.split('\n  publish:\n', 1)[1]
 if not build_macos_job.startswith('    environment: macos-release-signing\n'):
     raise SystemExit('macOS signing must use the protected macos-release-signing environment')
-if not publish_job.startswith('    needs: [gate, build-linux, build-macos]\n    environment: macos-release-signing\n'):
-    raise SystemExit('release publication must use the protected macos-release-signing environment')
+if not publish_job.startswith("    needs: [gate, build-linux, build-macos]\n    if: needs.gate.outputs.release == 'true'\n    environment: macos-release-signing\n"):
+    raise SystemExit('release-only publication must use the protected macos-release-signing environment')
 workflow_header = workflow.split('\njobs:\n', 1)[0]
-if 'concurrency:\n  group: release-main\n  cancel-in-progress: false' not in workflow_header:
-    raise SystemExit('the whole release workflow must use one non-cancelling sole-writer group')
+if "inputs.operation == 'prepare-main' && 'preparation' || 'release'" not in workflow_header or 'cancel-in-progress: false' not in workflow_header:
+    raise SystemExit('preparation must not replace a pending release workflow')
 if workflow.count('concurrency:') != 1:
     raise SystemExit('job-local concurrency can break whole-workflow tag/publication serialization')
 if 'Wait for earlier release workflows' in workflow or 'actions/workflows/release.yml/runs' in workflow:
     raise SystemExit('release serialization must not claim an application-managed lossless queue')
 if 'ref: ${{ needs.gate.outputs.commit }}' not in build_macos_job:
-    raise SystemExit('macOS artifacts must be built from the immutable tagged commit')
+    raise SystemExit('macOS artifacts must be built from the exact gated commit')
+if "if: needs.gate.outputs.release == 'true'" not in publish_job:
+    raise SystemExit('preparation must not reach release publication')
+if 'needs.gate.outputs.preparation' in publish_job:
+    raise SystemExit('preparation authority must not enter the publication job')
+if 'contents: write' in build_macos_job or 'GH_TOKEN:' in build_macos_job or 'GITHUB_TOKEN' in build_macos_job:
+    raise SystemExit('preparation-reachable macOS jobs must not have repository mutation authority')
+job_matches = list(re.finditer(r'^  ([a-z][a-z0-9-]*):\n', workflow, re.MULTILINE))
+job_sections = {
+    match.group(1): workflow[match.end():job_matches[index + 1].start() if index + 1 < len(job_matches) else len(workflow)]
+    for index, match in enumerate(job_matches)
+}
+write_jobs = {name for name, body in job_sections.items() if 'contents: write' in body}
+if write_jobs != {'tag-release', 'publish'}:
+    raise SystemExit(f'unexpected repository write-capable jobs: {sorted(write_jobs)}')
+if "if: needs.gate.outputs.create_tag == 'true'" not in job_sections['tag-release']:
+    raise SystemExit('tag writer must be release-only')
+if "if: needs.gate.outputs.release == 'true'" not in job_sections['publish']:
+    raise SystemExit('publisher must be release-only')
+for forbidden in ['prod deploy', '/api/files/reveal', 'gh release', 'gh api --method POST']:
+    if forbidden in build_macos_job:
+        raise SystemExit(f'preparation-reachable macOS job has a forbidden side effect: {forbidden}')
+if '!cancelled()' not in build_macos_job or "needs.gate.result == 'success'" not in build_macos_job:
+    raise SystemExit('protected signing must not start after cancellation or failed gate')
 if 'ref: ${{ github.sha }}' not in publish_job:
     raise SystemExit('publication retries must use current protected workflow tooling')
 
@@ -104,6 +146,22 @@ expected_secrets = {
 }
 if secret_names != expected_secrets:
     raise SystemExit(f'release workflow secret allowlist mismatch: {sorted(secret_names)}')
+
+gate_job = workflow.split('\n  gate:\n', 1)[1].split('\n  tag-release:', 1)[0]
+tag_job = workflow.split('\n  tag-release:\n', 1)[1].split('\n  build-linux:', 1)[0]
+if 'contents: write' in gate_job:
+    raise SystemExit('prepare-main gate must not hold repository mutation authority')
+if "if: needs.gate.outputs.create_tag == 'true'" not in tag_job or 'contents: write' not in tag_job:
+    raise SystemExit('tag mutation authority must be isolated in the release-only tag job')
+if 'git tag -a "$TAG"' not in tag_job or 'git push origin "$TAG"' not in tag_job:
+    raise SystemExit('release-only tag job must own exact tag creation')
+prepare_branch = gate_job.split('prepare-main)', 1)[1].split('retry-release)', 1)[0]
+for forbidden in ['git tag ', 'git push origin', 'release=true', 'TAG=$RETRY_TAG']:
+    if forbidden in prepare_branch:
+        raise SystemExit(f'prepare-main can mutate release state: {forbidden}')
+for required in ['preparation=true', 'release=false', 'create_tag=false', 'tag=', 'commit=$GITHUB_SHA']:
+    if required not in prepare_branch:
+        raise SystemExit(f'prepare-main boundary missing: {required}')
 
 version_helper = Path('scripts/release_version.py')
 stale_retry = subprocess.run(
@@ -174,6 +232,14 @@ for forbidden in ['MINOR + 1', '^[0-9]+\\.[0-9]+\\.[0-9]+$']:
         raise SystemExit(f'tag release script bypasses shared version contract: {forbidden}')
 
 package_script = Path('macos/Phoenix/scripts/package-desktop-release.sh').read_text()
+for fragment in [
+    '"operation": "prepare-main"',
+    '"notarization_submission_id": submission_id',
+    '"notarization": status.lower()',
+    '"gatekeeper": "accepted"',
+]:
+    if fragment not in package_script:
+        raise SystemExit(f'missing preparation receipt contract: {fragment}')
 for fragment in [
     'TeamIdentifier=$APPLE_TEAM_ID',
     '--output-format json',

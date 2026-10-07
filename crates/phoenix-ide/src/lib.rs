@@ -10,6 +10,7 @@ mod chain_runtime;
 mod continuation_service;
 mod conversation_cwd;
 mod coordinator_tools;
+mod coordinator_watch_delivery;
 mod discovery;
 pub mod drive_turn;
 pub(crate) mod git_ops;
@@ -1103,10 +1104,36 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             // The server task ends on its own only via a fatal accept error.
             joined = &mut server => joined??,
             () = hot_restart::shutdown_signal() => {
+                runtime_for_fatal.begin_process_shutdown();
                 let _ = drain_tx.send(());
-                match tls::bounded_post_shutdown_drain(&mut server, "HTTP").await {
-                    Some(joined) => joined??,
-                    None => server_abort.abort(),
+                let deadline = runtime_for_fatal
+                    .fatal_local_authority_deadline()
+                    .expect("process shutdown deadline must be set before HTTP drain");
+                let shutdown = tls::bounded_post_shutdown_drain_until(
+                    deadline,
+                    tls::drain_concurrently(runtime_for_fatal.drain_process_shutdown(), &mut server),
+                    "HTTP",
+                );
+                tokio::pin!(shutdown);
+                tokio::select! {
+                    result = &mut shutdown => match result {
+                        Some(joined) => joined??,
+                        None => server_abort.abort(),
+                    },
+                    boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
+                        tracing::error!(?boundary, "fatal local SQLite authority loss during HTTP drain");
+                        let fatal_tail = async {
+                            runtime_for_fatal.fence_fatal_local_authority().await;
+                            crate::tools::bash::shutdown_kill_tree_until(deadline, &bash_handles_for_shutdown).await;
+                        };
+                        let _ = tls::bounded_post_shutdown_drain_until(
+                            deadline,
+                            fatal_tail,
+                            "HTTP fatal authority during drain",
+                        ).await;
+                        tracing_handles.shutdown_tracer_until(deadline);
+                        return Err(FatalLocalAuthorityExit.into());
+                    }
                 }
             }
             boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
@@ -1116,7 +1143,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     .fatal_local_authority_deadline()
                     .expect("fatal authority deadline must be set before HTTP drain");
                 let fatal_tail = async {
-                    tls::drain_concurrently(
+                    let _ = tls::drain_concurrently(
                         runtime_for_fatal.fence_fatal_local_authority(),
                         &mut server,
                     )

@@ -7,15 +7,20 @@ import {
   DEFAULT_NOTIFICATION_SETTINGS,
   closeNotificationsForConversation,
   getProductConversationListRevision,
+  getProductConversationDeleteSequence,
   notifyCatchUp,
   notifyConversationStateChange,
   notifyConversationSnapshotChange,
   notifyArchiveCloseConflict,
   notifyProductConversationListMayHaveChanged,
+  notifyProductConversationDeleted,
+  productConversationDeletedSince,
+  notifyProductConversationSnapshotChanged,
   registerCoordinatorForNotifications,
   resetNotificationRuntimeForTest,
   subscribeCloseSnapshotChanged,
   subscribeProductConversationListRevision,
+  subscribeProductConversationSnapshotChanged,
 } from './notifications';
 
 const notifications: MockNotification[] = [];
@@ -80,6 +85,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('product conversation deletion replay', () => {
+  it('records aliases for events emitted before a subscriber resolves them', () => {
+    const sequence = getProductConversationDeleteSequence();
+    notifyProductConversationDeleted('pc-1', ['root-1', 'agent-1']);
+
+    expect(productConversationDeletedSince(['agent-1'], sequence)).toBe(true);
+    expect(productConversationDeletedSince(['other'], sequence)).toBe(false);
+  });
+});
+
 describe('Coordinator notification routing', () => {
   it('uses global routes for registered Coordinator ids', () => {
     registerCoordinatorForNotifications('coordinator-id');
@@ -106,6 +121,22 @@ describe('product conversation list revision notifications', () => {
     expect(listener).toHaveBeenCalledTimes(1);
     expect(getProductConversationListRevision()).toBe(startRevision + 1);
     unsubscribe();
+  });
+});
+
+describe('product conversation snapshot notifications', () => {
+  it('invalidates only the addressed aggregate snapshot', () => {
+    const addressed = vi.fn();
+    const other = vi.fn();
+    const unsubscribeAddressed = subscribeProductConversationSnapshotChanged('pc-1', addressed);
+    const unsubscribeOther = subscribeProductConversationSnapshotChanged('pc-2', other);
+
+    notifyProductConversationSnapshotChanged('pc-1');
+
+    expect(addressed).toHaveBeenCalledTimes(1);
+    expect(other).not.toHaveBeenCalled();
+    unsubscribeAddressed();
+    unsubscribeOther();
   });
 });
 
@@ -146,6 +177,10 @@ describe('archive close conflict notifications', () => {
       }))).toBe(true);
     }
     expect(closeListener).toHaveBeenCalledTimes(6);
+    expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
+      error: 'close could not start',
+      error_type: 'close_start_failed',
+    }))).toBe(false);
 
     vi.runAllTimers();
 

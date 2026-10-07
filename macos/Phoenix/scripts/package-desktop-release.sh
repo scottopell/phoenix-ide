@@ -15,7 +15,7 @@ GIT=${GIT:-/usr/bin/git}
 
 usage() {
   cat >&2 <<'EOF'
-usage: package-desktop-release.sh [--unsigned-test] SIDE_CAR TARGET TAG COMMIT OUTPUT_DIR
+usage: package-desktop-release.sh [--unsigned-test] SIDE_CAR TARGET TAG COMMIT OUTPUT_DIR [RECEIPT_PATH]
 
 Builds Phoenix.app with the supplied same-commit phoenix_ide sidecar and writes
 Phoenix-macos-TARGET-TAG.zip. Normal mode requires Developer ID signing and
@@ -45,13 +45,14 @@ if [[ "${1:-}" == "--unsigned-test" ]]; then
   unsigned_test=1
   shift
 fi
-[[ $# -eq 5 ]] || usage
+[[ $# -eq 5 || $# -eq 6 ]] || usage
 
 sidecar=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 target=$2
 tag=$3
 expected_commit=$4
 output_dir=$(mkdir -p "$5" && cd "$5" && pwd)
+receipt_path=${6:-}
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 project="$repo_root/macos/Phoenix/Phoenix.xcodeproj"
 version_helper="$repo_root/scripts/release_version.py"
@@ -219,6 +220,33 @@ PY
     echo "error: app signing changed the embedded standalone helper bytes" >&2
     exit 1
   }
+  if [[ -n "$receipt_path" ]]; then
+    [[ "$receipt_path" == /* ]] || receipt_path="$repo_root/$receipt_path"
+    mkdir -p "$(dirname "$receipt_path")"
+    "$PYTHON3" - "$receipt_path" "$target" "$release_version" "$expected_commit" "$submission_id" "$notary_status" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+receipt_path, target, version, commit, submission_id, status = sys.argv[1:]
+Path(receipt_path).write_text(json.dumps({
+    "schema": 1,
+    "operation": "prepare-main",
+    "target": target,
+    "version": version,
+    "commit": commit,
+    "checks": {
+        "developer_id_signature": "verified",
+        "hardened_runtime": "verified",
+        "notarization": status.lower(),
+        "notarization_submission_id": submission_id,
+        "stapled_ticket": "validated",
+        "gatekeeper": "accepted",
+        "embedded_helper_bytes": "identical",
+    },
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  fi
 fi
 
 asset="Phoenix-macos-$target-$tag.zip"

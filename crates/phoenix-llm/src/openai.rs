@@ -1742,7 +1742,10 @@ fn translate_to_backend_request(
 }
 
 fn is_known_gpt_6(api_name: &str) -> bool {
-    matches!(api_name, "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna")
+    matches!(
+        api_name,
+        "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
+    )
 }
 
 fn supports_modern_responses(api_name: &str) -> bool {
@@ -4526,6 +4529,39 @@ mod tests {
             assert_eq!(direct["service_tier"], "priority");
             assert_eq!(codex["service_tier"], "priority");
         }
+    }
+
+    #[test]
+    fn gpt_61_sol_uses_supported_responses_routes_and_effort() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Max);
+        let direct = serde_json::to_value(translate_to_backend_request(
+            "gpt-6.1-sol",
+            &request,
+            false,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(direct["model"], "gpt-6.1-sol");
+        assert_eq!(direct["reasoning"]["effort"], "max");
+        assert_eq!(direct["service_tier"], "priority");
+        assert!(direct.get("prompt_cache_options").is_some());
+        assert!(matches!(
+            translate_to_backend_request("gpt-6.1-sol", &request, true, false),
+            ResponsesBackendRequest::CodexLite(_)
+        ));
+        assert!(supports_responses_lite("gpt-6.1-sol"));
+        let custom = serde_json::to_value(translate_to_backend_request(
+            "gpt-6.1-sol",
+            &request,
+            false,
+            false,
+        ))
+        .unwrap();
+        assert!(custom.get("service_tier").is_none());
+        assert!(custom.get("prompt_cache_options").is_none());
     }
 
     #[test]

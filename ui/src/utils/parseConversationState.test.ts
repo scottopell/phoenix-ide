@@ -3,6 +3,30 @@ import { canChangeModelInState } from '../api';
 import { parseConversationState, canCancelConversationState, isAgentWorking } from '../utils';
 
 describe('parseConversationState recovery', () => {
+  it.each([
+    [{ type: 'awaiting_user_response', questions: [] }],
+    [{ type: 'awaiting_user_response', questions: [], request_id: null }],
+  ])('normalizes a legacy question request identity to absence', (raw) => {
+    const parsed = parseConversationState(raw);
+    expect(parsed).toEqual({
+      type: 'awaiting_user_response',
+      questions: [],
+    });
+    expect('request_id' in parsed).toBe(false);
+  });
+
+  it('preserves an identified question request identity', () => {
+    expect(parseConversationState({
+      type: 'awaiting_user_response',
+      questions: [],
+      request_id: 'request-q2',
+    })).toEqual({
+      type: 'awaiting_user_response',
+      questions: [],
+      request_id: 'request-q2',
+    });
+  });
+
   it('allows manual recovery of a persisted invalid-request error', () => {
     const state = parseConversationState({
       type: 'error',

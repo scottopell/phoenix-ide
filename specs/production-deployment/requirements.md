@@ -2,7 +2,7 @@
 
 ## Scope
 
-Safe replacement and operation of native Phoenix production runtimes on macOS launchd, Linux systemd, and Linux hosts without systemd. The deployment source is either exact checked local `HEAD` or an immutable published release. This specification owns shared cross-platform guarantees and the release assets required to satisfy them. `specs/launchd-deployment/requirements.md` cumulatively refines launchd-specific mechanics; it does not redefine the shared guarantees.
+Safe replacement and operation of native Phoenix production runtimes on macOS launchd, Linux systemd, and Linux hosts without systemd. The deployment source is exact checked local `HEAD`, an immutable published release, or the explicit launchd-only prepared-artifact paired source under REQ-PD-018. This specification owns shared cross-platform guarantees and the release assets required to satisfy them. `specs/launchd-deployment/requirements.md` cumulatively refines launchd-specific mechanics; it does not redefine the shared guarantees.
 
 ## Requirements
 
@@ -14,6 +14,8 @@ When an operator invokes a production command, the system shall select launchd o
 
 The local deployment command shall run required checks, build exact local `HEAD`, require the candidate to embed that complete 40-character lowercase commit SHA, and stage the resulting binary. The release deployment command shall resolve `latest` at most once or use the requested tag, bind the tag to one immutable commit, select the host target asset, verify the published checksum, and require the candidate's complete 40-character lowercase embedded SHA to equal the selected commit exactly; it shall not run repository checks, install dependencies, mutate the worktree, or compile.
 
+The prepared-artifact source SHALL be admitted only on macOS launchd under REQ-PD-018, using exact protected prepared bytes and an independently verified clean controller without rebuilding or ad-hoc resigning.
+
 WHEN `latest` is requested,
 THE release deployment command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
 
@@ -21,6 +23,8 @@ WHEN an exact release-candidate tag is requested,
 THE release deployment command SHALL require the tag, GitHub prerelease metadata, full embedded version, and exact commit identity to agree.
 
 ### REQ-PD-003 — Complete preparation before disruption
+
+For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to local/published sources.
 
 Before disrupting a running runtime, the system shall stage and validate the candidate, backend configuration, exact `.phoenix-ide.env` snapshot, rollback inputs, runtime identities and endpoints, destination-space reservations, artifact hashes, backend activation program, immutable handoff, and initial durable transaction status.
 
@@ -50,17 +54,21 @@ A deployment shall commit only after observing a new backend-owned runtime proce
 
 ### REQ-PD-010 — Verified rollback
 
+For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. The unconditional artifact-rollback attempt below applies to ordinary sources.
+
 If activation fails after disruption, the activation owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment snapshot, and service state, verify the captured previous runtime identity at its previous endpoint, restore the previous deployed SHA, and durably distinguish successful runtime-artifact rollback from rollback failure.
 
 Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit a 12-character identity for a candidate, controller, release asset, newly installed runtime, or general downgrade path, and shall not establish cross-version deployment compatibility.
 
-Automated rollback shall restore runtime artifacts only. It shall not restore a database or guarantee that the restored binary can use a database changed by the failed candidate; database rollback remains governed by `specs/compatibility/requirements.md`.
+Ordinary deployment rollback shall restore runtime artifacts only and shall not guarantee that the predecessor can use a database changed by the candidate. The explicit prepared-artifact ProductConversation upgrade shall restore its verified predecessor database, binary, and configuration before restarting the predecessor; its boundary is defined by REQ-PD-018 and `specs/launchd-deployment/requirements.md`.
 
 ### REQ-PD-011 — Truthful durable status and recovery
 
 After exact verification, the system shall write `deployed.sha` from the selected candidate's embedded source commit and durably persist `committed` before releasing the claim. A nonterminal or interrupted transaction shall remain visible and actionable and shall never be inferred as successful solely from a PID, active unit, responsive port, or installed file.
 
 ### REQ-PD-012 — Configuration source of truth
+
+For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to local/published sources.
 
 Modern deployment shall load `.phoenix-ide.env` once and use that exact snapshot for preflight, installation, and candidate endpoint selection. Runtime status shall inspect installed configuration, rollback shall use the previous installed snapshot, and modern operation shall ignore rather than migrate or consult a legacy launchd override store, systemd drop-in, or inferred detached-daemon environment.
 
@@ -90,3 +98,19 @@ Integration harnesses shall use randomized virtual machines or containers, units
 ### REQ-PD-017 — Supported published Linux assets
 
 Published releases shall provide checksummed `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` binaries in addition to supported macOS assets, and release candidate selection shall reject an asset whose target, checksum, version, or embedded commit does not match the selected release.
+
+### REQ-PD-018 — Prepared-artifact paired launchd boundary
+
+WHEN the explicit prepared-artifact ProductConversation upgrade is selected
+THE SYSTEM SHALL bind the protected candidate provenance to a clean controller helper and private transaction proof
+AND SHALL fail closed when database ownership, legacy ledger/table shape, snapshot integrity, configuration identity, or rollback proof cannot be established
+
+THE SYSTEM SHALL NOT generalize this feature-scoped pair into automatic database rollback for other deployment sources or backends.
+
+### REQ-PD-019 — Feature-scoped prepared paired upgrade
+
+THE shared production deployment contract SHALL treat the macOS launchd prepared-artifact/ProductConversation database upgrade as an explicit feature-scoped guarantee, not as a general snapshot or downgrade facility. Other backends and ordinary runtime-only deployment retain their existing database behavior.
+
+### REQ-PD-020 — Narrow committed paired finalization
+
+The shared command surface SHALL expose `prod finalize-paired TXN` only for the launchd paired contract under `specs/launchd-deployment/requirements.md` REQ-LDD-018. This operation SHALL be publication/reservation-only and SHALL NOT reuse runtime activation or database rollback. Unknown ownership, helper absence, committed identity or captured configuration SHALL retain the fence and refuse.

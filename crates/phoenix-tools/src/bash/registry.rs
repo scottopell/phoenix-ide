@@ -29,7 +29,7 @@ use phoenix_core::work_scope::ResourceScopeKey;
 use thiserror::Error;
 use tokio::sync::{Notify, RwLock};
 
-use super::handle::{BashLaunchIdentity, Handle, HandleId};
+use super::handle::{BashLaunchIdentity, Handle, HandleId, HandleState};
 use super::ring::RING_BUFFER_BYTES;
 
 /// Per-`ResourceScopeKey` cap on `running` handles (REQ-BASH-005:
@@ -656,8 +656,49 @@ impl BashHandleRegistry {
         }
     }
 
+    /// Snapshots process-local live handles controlled by the Global Coordinator.
+    pub async fn live_coordinator_handles(&self) -> Vec<Arc<Handle>> {
+        let by_id = self.handles_by_id.read().await;
+        let mut live = Vec::new();
+        for entry in by_id.values() {
+            if entry.handle.controller_scope != ResourceScopeKey::Coordinator {
+                continue;
+            }
+            if matches!(&*entry.handle.state().await, HandleState::Live(_)) {
+                live.push(entry.handle.clone());
+            }
+        }
+        live.sort_by(|left, right| left.handle_id.0.cmp(&right.handle_id.0));
+        live
+    }
+
     pub async fn get_by_id(&self, handle_id: &HandleId) -> Option<RegisteredHandle> {
         self.handles_by_id.read().await.get(handle_id).cloned()
+    }
+
+    /// Signals only while the handle remains registered under the same controller scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the incarnation-bound signaling error from the handle.
+    pub async fn signal_exact_registered_handle(
+        &self,
+        handle_id: &HandleId,
+        controller_scope: &ResourceScopeKey,
+        signal: i32,
+    ) -> Result<bool, std::io::Error> {
+        let by_id = self.handles_by_id.read().await;
+        let Some(registered) = by_id.get(handle_id) else {
+            return Ok(false);
+        };
+        if registered.handle.controller_scope != *controller_scope {
+            return Ok(false);
+        }
+        Ok(registered
+            .handle
+            .signal_live_incarnation(signal)
+            .await?
+            .is_some())
     }
 
     #[doc(hidden)]
@@ -1207,6 +1248,7 @@ mod tests {
             HandleId::new(id),
             format!("cmd for {id}"),
             None,
+            std::path::PathBuf::from("/tmp"),
             12345,
             12345,
             ring_bytes_cap,
@@ -1239,6 +1281,7 @@ mod tests {
             phoenix_core::work_scope::ResourceAuthority::Work,
             format!("cmd for {id}"),
             None,
+            std::path::PathBuf::from("."),
             process_group_id,
             process_id,
             ring_bytes_cap,
@@ -1322,6 +1365,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_coordinator_handles_excludes_work_and_terminal_entries() {
+        let registry = BashHandleRegistry::new();
+        let coordinator = Handle::new_live_for_actor_with_owner_and_launch_identity(
+            ResourceScopeKey::Coordinator,
+            HandleId::new("b-coordinator"),
+            launch_identity(31, "coordinator-live"),
+            "global".to_string(),
+            phoenix_core::work_scope::ResourceAuthority::Work,
+            "sleep 60".to_string(),
+            Some("global command".to_string()),
+            std::path::PathBuf::from("/repo"),
+            31,
+            31,
+            RING_BUFFER_BYTES,
+        );
+        registry
+            .register_existing_handle(&scope("environment"), coordinator.clone())
+            .await;
+        registry
+            .register_existing_handle(
+                &scope("work"),
+                make_handle("work", "b-work", RING_BUFFER_BYTES),
+            )
+            .await;
+
+        let live = registry.live_coordinator_handles().await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].handle_id.0, "b-coordinator");
+        assert_eq!(live[0].working_dir, std::path::PathBuf::from("/repo"));
+
+        coordinator
+            .transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(0) },
+                std::time::Duration::ZERO,
+                std::time::SystemTime::now(),
+                20,
+            )
+            .await;
+        assert!(registry.live_coordinator_handles().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn handle_ids_are_globally_unique_across_owners() {
         let registry = BashHandleRegistry::new();
         let a = registry
@@ -1388,6 +1473,7 @@ mod tests {
                     committed_id.clone(),
                     "pwd".into(),
                     None,
+                    std::path::PathBuf::from("/tmp"),
                     12345,
                     12345,
                     RING_BUFFER_BYTES,
@@ -1764,6 +1850,7 @@ mod tests {
             phoenix_core::work_scope::ResourceAuthority::Work,
             "pwd".to_string(),
             None,
+            std::path::PathBuf::from("/tmp"),
             12345,
             12345,
             RING_BUFFER_BYTES,
@@ -1843,6 +1930,7 @@ mod tests {
                 HandleId::new("b-1"),
                 "cmd for b-1".to_string(),
                 None,
+                std::path::PathBuf::from("/tmp"),
                 12345,
                 12345,
                 RING_BUFFER_BYTES,
@@ -2055,6 +2143,7 @@ mod tests {
                     HandleId::new("b-stale"),
                     "sleep 60".to_string(),
                     None,
+                    std::path::PathBuf::from("/tmp"),
                     stale_pgid,
                     stale_pid,
                     RING_BUFFER_BYTES,
@@ -2081,6 +2170,7 @@ mod tests {
                     HandleId::new("b-replacement"),
                     "sleep 60".to_string(),
                     None,
+                    std::path::PathBuf::from("/tmp"),
                     replacement_pgid,
                     replacement_pid,
                     RING_BUFFER_BYTES,
@@ -2205,6 +2295,7 @@ mod tests {
                 phoenix_core::work_scope::ResourceAuthority::Work,
                 "sleep 60".to_string(),
                 None,
+                std::path::PathBuf::from("."),
                 pgid,
                 pid,
                 RING_BUFFER_BYTES,

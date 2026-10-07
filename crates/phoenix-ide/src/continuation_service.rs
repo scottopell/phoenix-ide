@@ -152,6 +152,10 @@ impl ContinuationApplicationService {
             let MessageContent::Continuation(summary_content) = summary.content else {
                 return Err("automatic continuation summary has the wrong message type".to_string());
             };
+            let _product_admission = self
+                .runtime
+                .lock_product_message_admission(admission.product_conversation_id.as_str())
+                .await;
             match self
                 .runtime
                 .db()
@@ -244,6 +248,7 @@ impl ContinuationApplicationService {
             let outcome =
                 SendChatApplicationService::new(self.runtime.db().clone(), self.runtime.clone())
                     .send(SendChatRequest {
+                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                         conversation_id: successor.id,
                         text: intent.handoff,
                         message_id: intent.message_id.as_str().to_string(),
@@ -270,6 +275,7 @@ impl ContinuationApplicationService {
             let outcome =
                 SendChatApplicationService::new(self.runtime.db().clone(), self.runtime.clone())
                     .send(SendChatRequest {
+                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                         conversation_id: successor.id,
                         text: intent.handoff,
                         message_id: intent.message_id.as_str().to_string(),

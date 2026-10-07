@@ -51,9 +51,13 @@ AND SHALL require each migration's owning feature requirements to define whether
 
 THE SYSTEM SHALL NOT provide a general automatic database rollback subsystem
 
-WHEN an operator rolls Phoenix back to an older binary version
+WHEN an operator rolls Phoenix back to an older binary version after candidate database mutation
 THE SYSTEM SHALL require Phoenix to be stopped
 AND SHALL require the database backup paired with that binary version to be restored before the binary starts
+
+WHEN the feature-scoped paired launchd transaction fails before candidate mutation and no snapshot proof exists,
+THE SYSTEM MAY resume only the verified unchanged predecessor under `specs/launchd-deployment/requirements.md` REQ-LDD-017 exclusive legacy database and captured binary/configuration proof
+AND SHALL NOT describe this as a database downgrade or snapshot restoration.
 
 WHEN an automated deployment restores a previous binary without restoring its matching previous database
 THE SYSTEM SHALL describe the outcome as runtime-artifact rollback
@@ -62,6 +66,11 @@ AND SHALL NOT guarantee that the restored binary can use a database changed by t
 WHEN a feature requires additional automated recovery of matching runtime and database state
 THE SYSTEM SHALL require that feature's normative requirements to define the recovery boundary and guarantees
 AND SHALL implement only the feature-scoped recovery mechanism required by that contract
+
+WHEN the supported macOS launchd ProductConversation upgrade is selected explicitly,
+THE SYSTEM MAY provide an automated paired SQLite snapshot and rollback only within `specs/launchd-deployment/requirements.md` REQ-LDD-017 and `specs/production-deployment/requirements.md` REQ-PD-018
+AND SHALL preserve the project-wide prohibition on a generic automatic database rollback subsystem
+AND SHALL fail closed when exclusive ownership, snapshot integrity, or restoration proof is unavailable.
 
 **Rationale:** Manual offline paired restore supports version rollback without a generic snapshot-management subsystem. Any additional automation would impose recovery and verification complexity and must be justified by the feature that needs it.
 
@@ -98,7 +107,6 @@ THE SYSTEM SHALL format that integer as a human-readable date and time only at a
 
 **Rationale:** SQLite has no native date-time storage class. New or structurally changed columns use one integer representation without forcing a project-wide migration of unchanged historical timestamp storage. The integer preserves ordering and precision without embedding a duplicate date parser or formatter contract in the schema.
 
-
 ---
 
 ### REQ-COMP-006 — Legacy Direct Authority Repair Is Forward-Only
@@ -109,3 +117,44 @@ AND SHALL leave WorkScopes classified as Work unchanged
 AND SHALL NOT infer a downgrade or rollback guarantee from this forward repair
 
 **Rationale:** Direct conversations are write-authorized by contract. Repairing legacy rows restores that contract without expanding project-wide rollback guarantees.
+
+### REQ-COMP-007 — Accepted source-locator upgrade preserves fingerprints
+
+WHEN an accepted version-2 direct-turn payload predates source-call locators
+THE SYSTEM SHALL reconstruct its original locator-absent encoding and verify its original stored fingerprint before recovery or replay.
+
+THE SYSTEM SHALL retain the accepted payload, origin, and fingerprint without rewriting them or substituting a later invocation locator.
+
+THE SYSTEM SHALL reject any payload whose fingerprint matches neither its current encoding nor the specifically supported historical encoding.
+
+---
+
+### REQ-COMP-008 — Qualified Compiler-Cache Compatibility
+
+WHEN Phoenix automatically selects a compiler cache
+THE SYSTEM SHALL select an sccache executable that passes its version probe or no compiler cache
+AND SHALL report the fallback reason and backend actually selected
+AND SHALL NOT automatically select Kache v0.26.0
+
+WHEN an operator explicitly selects Kache
+THE SYSTEM SHALL require a macOS arm64 host
+AND SHALL require the executable to report exactly version `0.26.0`
+AND SHALL require its local daemon to report readiness on the configured socket
+AND SHALL report that debug-symbol fidelity remains unqualified
+
+WHEN an operator explicitly selects Kache or sccache
+THE SYSTEM SHALL fail actionably if that backend is unusable
+AND SHALL NOT silently substitute another backend
+
+WHEN a caller supplies `RUSTC_WRAPPER`
+OR explicitly selects no compiler cache
+THE SYSTEM SHALL preserve that choice
+AND SHALL report it
+
+THE SYSTEM SHALL scope automatically generated compiler-cache environment variables to direct Cargo subprocesses and explicitly identified wrappers that own Cargo builds
+AND SHALL NOT propagate them into the Phoenix server or agent-executed commands
+
+THE SYSTEM SHALL guarantee this contract only for selection and local subprocess setup
+AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or restored-archive source-level debug fidelity
+
+**Rationale:** Compiler caching is an optional development optimization. Exact qualification, explicit opt-in for unqualified fidelity, and subprocess scoping prevent an accelerator from becoming an implicit correctness or compatibility promise.

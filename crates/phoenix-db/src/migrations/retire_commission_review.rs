@@ -236,6 +236,7 @@ async fn replace_carried_tool_round(
     insert_message(
         tx,
         &Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: assistant_message.message_id,
             conversation_id: conversation_id.to_string(),
             sequence_id: next_sequence,
@@ -251,6 +252,7 @@ async fn replace_carried_tool_round(
     insert_message(
         tx,
         &Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: result_message_id.clone(),
             conversation_id: conversation_id.to_string(),
             sequence_id: next_sequence + 1,

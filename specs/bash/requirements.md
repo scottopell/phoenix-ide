@@ -144,6 +144,24 @@ it needs to choose which handle to retire.
 
 ---
 
+### REQ-BASH-016: Coordinator Live-Handle Surface
+
+WHEN the Global Coordinator launches a Bash handle in the live Phoenix process
+THE SYSTEM SHALL retain the validated spawn working directory as immutable handle metadata
+AND SHALL expose that handle to the Coordinator UI only while its process-local registry state is live
+
+THE Coordinator live-handle surface SHALL include the exact handle identifier, command, optional label, validated spawn working directory, and start time
+AND SHALL NOT reconstruct handles from persisted messages, process identifiers, process groups, working directories, or a previous Phoenix process epoch
+
+WHEN the Coordinator requests stop for an exact listed handle
+THE SYSTEM SHALL verify Coordinator controller scope and current live state before sending one TERM signal to the process group
+AND SHALL leave final output draining and terminal-state transition to the existing handle lifecycle owner
+
+WHEN Phoenix restarts
+THE Coordinator live-handle surface SHALL be empty until the new process launches Coordinator-owned handles
+
+---
+
 ### REQ-BASH-003: Handle Operations (Peek, Wait, Kill)
 
 WHEN agent calls `bash(peek=<handle>, ...)`
@@ -776,10 +794,10 @@ AND SHALL include the process in the owning WorkScope's inventory, lifecycle bro
 AND SHALL preserve the same command, wait, label, output, process-count, handle-control, cancellation, teardown, and audit bounds as other Bash execution
 AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
 
-WHEN conversation bash is authorized with write capability
+WHEN conversation bash, including Work-subagent bash, is authorized with write capability
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
-AND bash commands SHALL retain their writable behavior inside the attached
-  `WorkScope` or chat-only working directory, as applicable
+AND bash commands SHALL retain normal host filesystem write access
+AND the attached `WorkScope` or chat-only working directory SHALL identify the execution environment without constituting a filesystem confinement boundary
 
 **Rationale:** Explore bash is useful for local code investigation (`git log`,
 `git blame`, `rg`, `cat`) only if the read-only promise is enforced below the

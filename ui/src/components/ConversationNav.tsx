@@ -2,11 +2,9 @@ import { useMemo } from 'react';
 import { PillStrip } from './PillStrip';
 import type { PillItem } from './PillStrip';
 import type { Chapter } from '../conversation/conversationChapters';
+import { inputOriginPresentation } from '../conversation/inputOriginPresentation';
 
-const CHAPTER_TITLES: Record<Chapter['kind'], string> = {
-  prompt: 'Your message',
-  prose: 'Assistant',
-};
+const PROSE_TITLE = 'Assistant';
 
 interface ConversationNavProps {
   /** Whole-conversation chapters (prompts + significant prose), in render
@@ -38,12 +36,13 @@ export function ConversationNav({ chapters, activeUnitIndex, onJump }: Conversat
     () =>
       chapters.map((chapter) => {
         const isActive = chapter.unitIndex === activeUnitIndex;
+        const origin = chapter.kind === 'prompt' ? inputOriginPresentation(chapter.origin) : null;
         return {
           key: `chapter-${chapter.unitIndex}`,
-          label: chapter.label,
+          label: origin && origin.className === 'meta' ? `${origin.label} · ${chapter.label}` : chapter.label,
           active: isActive,
-          className: chapter.kind === 'prose' ? 'assistant' : 'user',
-          ariaLabel: `${CHAPTER_TITLES[chapter.kind]}: ${chapter.label}`,
+          className: chapter.kind === 'prose' ? 'assistant' : origin?.className,
+          ariaLabel: `${origin?.title ?? PROSE_TITLE}: ${chapter.label}`,
           onClick: () => onJump(chapter.unitIndex),
         };
       }),

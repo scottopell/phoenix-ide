@@ -10,6 +10,7 @@ import { ChainProvider } from './chain';
 import { api, ApiResponseError } from './api';
 import { ConversationReadinessProvider } from './contexts/ConversationReadinessContext';
 import './index.css';
+import './ConversationAliasFallback.css';
 
 // Routes are code-split so the initial bundle only contains what the user
 // actually needs to view the current page. Heavy dependencies that live in
@@ -134,8 +135,17 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       return;
     }
     let cancelled = false;
-    api.getProductConversationSnapshot(reference, { message_limit: 1 })
+    api.resolveCoordinatorRoute(reference)
+      .then(async ({ coordinator_id }) => {
+        if (cancelled) return null;
+        if (coordinator_id) {
+          navigate({ pathname: `/global/${reference}`, search: location.search, hash: location.hash }, { replace: true });
+          return null;
+        }
+        return api.getProductConversationSnapshot(reference, { message_limit: 1 });
+      })
       .then((snapshot) => {
+        if (!snapshot) return;
         if (!cancelled) {
           navigate({
             pathname: snapshot.canonical_route,
@@ -158,7 +168,11 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
 
   if (activeFallback) {
     return (
-      <main>
+      <main className="conversation-alias-fallback">
+        <div role="alert" className="conversation-alias-fallback__status">
+          Conversation route unavailable.
+          <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
+        </div>
         <EmbeddedConversationPage
           slug={activeFallback.rowSlug}
           suppressCanonicalization
@@ -168,8 +182,6 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             ? { aggregateLifecycleOpen: false }
             : {})}
         />
-        <div role="alert">Showing cached conversation while live snapshot is unavailable.</div>
-        <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
       </main>
     );
   }

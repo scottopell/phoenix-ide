@@ -139,7 +139,7 @@ export interface WorkDispositionInput {
   canSendMessage: boolean;
 }
 
-const NOTE_CONTINUED = 'Continued — actions belong on the continuation.';
+const NOTE_CONTINUED = 'Continued — actions are available on the current transcript.';
 const NOTE_CHECKING = 'Checking PR…';
 const NOTE_GH_UNAVAILABLE = 'gh unavailable — manual cleanup.';
 

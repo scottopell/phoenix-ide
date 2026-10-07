@@ -41,5 +41,13 @@ Error.storyName = 'error';
 export const LatestRowAlignedPrefixTail = storyFor('latest-row-aligned-prefix-tail');
 LatestRowAlignedPrefixTail.storyName = 'latest-row-aligned-prefix-tail';
 
+export const InputProvenanceContinuation = storyFor('input-provenance-continuation');
+InputProvenanceContinuation.storyName = 'input-provenance-continuation';
+
 export const LongHistory110Messages = storyFor('long-history-110-messages');
 LongHistory110Messages.storyName = 'long-history-110-messages';
+
+export const SourceCallGlobal = storyFor('source-call-global');
+SourceCallGlobal.storyName = 'source-call-global';
+export const SourceCallOrdinary = storyFor('source-call-ordinary');
+SourceCallOrdinary.storyName = 'source-call-ordinary';

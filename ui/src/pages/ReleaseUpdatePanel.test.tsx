@@ -540,7 +540,12 @@ describe('ReleaseUpdatePanel', () => {
     expect(await screen.findByRole('button', { name: /install v1.1.0/i })).toBeInTheDocument();
   });
 
-  it('distinguishes verified rollback from rollback failure', async () => {
+  it.each([
+    ['activation_failed_rollback_failed', 'launchd_managed'],
+    ['ordinary_activation_failed_rollback_failed', 'launchd_managed'],
+    ['ordinary_activation_failed_rollback_failed', 'systemd_managed'],
+    ['ordinary_activation_failed_rollback_failed', 'bare_supervisor_managed'],
+  ] as const)('distinguishes verified rollback from %s on %s', async (failedState, backend) => {
     const rolledBack = {
       ...snapshot,
       transaction: {
@@ -556,14 +561,24 @@ describe('ReleaseUpdatePanel', () => {
 
     vi.mocked(fetch).mockImplementation(() => json({
       ...rolledBack,
-      transaction: { ...rolledBack.transaction, state: 'activation_failed_rollback_failed', rollback_failure: 'old runtime unhealthy' },
+      installation_ownership: backend === 'bare_supervisor_managed' ? { kind: backend, supervisor_pid: 123 } : { kind: backend },
+      transaction: { ...rolledBack.transaction, state: failedState, rollback_failure: 'old runtime unhealthy' },
     }));
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
     });
     expect(await screen.findByText(/activation and rollback failed/i)).toBeInTheDocument();
-    expect(screen.getByText(/claim remains retained/i)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
+    if (failedState === 'activation_failed_rollback_failed') {
+      expect(screen.getByText(/claim remains retained/i)).toBeInTheDocument();
+    } else {
+      expect(screen.queryByText(/claim remains retained/i)).not.toBeInTheDocument();
+      expect(screen.getByText(/inspect the installed runtime and backend owner offline/i)).toBeInTheDocument();
+    }
+    if (failedState === 'ordinary_activation_failed_rollback_failed' && backend === 'launchd_managed') {
+      expect(screen.getByRole('button', { name: /install v1.1.0/i })).toBeInTheDocument();
+    } else {
+      expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
+    }
     view.unmount();
   });
 });

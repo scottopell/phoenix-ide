@@ -616,12 +616,12 @@ impl ModelRegistry {
     }
 
     /// Pick the default model from available services.
-    /// Prefers claude-sonnet-5 > claude-sonnet-4-6 > any available > hardcoded fallback.
     fn pick_default_model(
         services: &HashMap<String, Arc<dyn LlmService>>,
         config: &LlmConfig,
     ) -> String {
         const PREFERRED: &[&str] = &[
+            "gpt-6.1-sol",
             "claude-sonnet-5",
             "claude-sonnet-4-6",
             "claude-sonnet-4-5",
@@ -1824,7 +1824,7 @@ mod tests {
             ModelRegistry::new_with_codex_catalog(&config, None),
             ModelRegistry::new_with_codex_catalog(&config, Some(&unrelated)),
         ] {
-            for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
                 assert!(
                     registry.get(id).is_some(),
                     "missing supported built-in {id}"
@@ -1968,6 +1968,56 @@ mod tests {
     }
 
     #[test]
+    fn gpt_61_sol_uses_route_native_effort_and_context() {
+        let direct = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        });
+        let info = direct
+            .available_model_info()
+            .into_iter()
+            .find(|m| m.id == "gpt-6.1-sol")
+            .unwrap();
+        assert_eq!(info.context_window, 1_050_000);
+        assert_eq!(
+            info.service_tier_capabilities,
+            ServiceTierCapabilities::Supported
+        );
+        assert!(
+            matches!(&info.effort_capabilities, EffortCapabilities::Supported(caps)
+            if caps.native_default() == NativeDefault::Known(ModelEffort::Medium)
+                && !caps.levels().contains(&ModelEffort::None)
+                && caps.levels().contains(&ModelEffort::Max))
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        for catalog in [None, Some(HashSet::new())] {
+            let codex = ModelRegistry::new_with_codex_catalog(&config, catalog.as_ref());
+            let info = codex
+                .available_model_info()
+                .into_iter()
+                .find(|m| m.id == "gpt-6.1-sol")
+                .unwrap();
+            assert_eq!(info.context_window, 272_000);
+            assert_eq!(
+                info.service_tier_capabilities,
+                ServiceTierCapabilities::Supported
+            );
+            assert!(
+                matches!(&info.effort_capabilities, EffortCapabilities::Supported(caps)
+                if caps.native_default() == NativeDefault::Known(ModelEffort::Medium)
+                    && !caps.levels().contains(&ModelEffort::None)
+                    && caps.levels().contains(&ModelEffort::Max))
+            );
+        }
+    }
+
+    #[test]
     fn codex_default_order_is_independent_of_advisory_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let config = LlmConfig {
@@ -1979,11 +2029,11 @@ mod tests {
         let both = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&only_luna)).default_model_id(),
-            "gpt-6-astra"
+            "gpt-6.1-sol"
         );
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&both)).default_model_id(),
-            "gpt-6-astra"
+            "gpt-6.1-sol"
         );
     }
 
@@ -2277,6 +2327,31 @@ mod tests {
         let registry = ModelRegistry::new(&config);
 
         assert_eq!(registry.default_model_id(), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn product_default_prefers_gpt_61_sol_without_overriding_explicit_defaults() {
+        let mut config = LlmConfig {
+            anthropic_api_key: Some("test-key".into()),
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert_eq!(registry.default_model_id(), "gpt-6.1-sol");
+        assert_eq!(
+            registry.effective_effort("gpt-6.1-sol", None),
+            phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::Medium)
+        );
+        assert_eq!(
+            registry.effective_effort("gpt-6.1-sol", Some(ModelEffort::High)),
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::High)
+        );
+
+        config.default_model = Some("claude-opus-4-6".into());
+        assert_eq!(
+            ModelRegistry::new(&config).default_model_id(),
+            "claude-opus-4-6"
+        );
     }
 
     #[test]
@@ -2727,7 +2802,13 @@ mod tests {
                 .as_deref(),
             Some("acc-1")
         );
-        for id in ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        for id in [
+            "gpt-5.6-sol",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
             assert!(
                 registry.get(id).is_some(),
                 "reload must register supported Codex built-in {id} without catalog discovery"
@@ -2762,7 +2843,7 @@ mod tests {
         );
 
         assert!(outcome.credential_loaded);
-        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
             assert!(
                 registry.get(id).is_some(),
                 "missing supported built-in {id}"
@@ -2936,7 +3017,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert_eq!(registry.default_model_id(), "gpt-6-astra");
+        assert_eq!(registry.default_model_id(), "gpt-6.1-sol");
     }
 
     /// `pick_default_model` must not pin to a configured `DEFAULT_MODEL` that
@@ -2988,6 +3069,21 @@ mod tests {
             &opus_55.effort_capabilities,
             EffortCapabilities::Supported(capabilities)
                 if capabilities.native_default() == NativeDefault::Known(ModelEffort::Medium)
+        ));
+
+        let sonnet_55 = model_infos
+            .iter()
+            .find(|model| model.id == "claude-sonnet-5-5")
+            .expect("Sonnet 5.5 must be available on direct Anthropic auth");
+        assert_eq!(sonnet_55.context_window, 1_000_000);
+        assert_eq!(
+            sonnet_55.service_tier_capabilities,
+            ServiceTierCapabilities::Unsupported
+        );
+        assert!(matches!(
+            &sonnet_55.effort_capabilities,
+            EffortCapabilities::Supported(capabilities)
+                if capabilities.native_default() == NativeDefault::Known(ModelEffort::High)
         ));
 
         // Check specific model

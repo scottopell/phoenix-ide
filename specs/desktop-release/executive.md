@@ -1,6 +1,6 @@
 # Phoenix macOS Desktop Release
 
-Phoenix release source contains a direct-distribution path for architecture-specific Phoenix.app ZIP archives alongside the six standalone server/debug artifacts. The source is under qualification; real Developer ID signing, Apple notarization, environment configuration, and clean-host acceptance remain external readiness gates.
+Phoenix release source contains a direct-distribution path for architecture-specific Phoenix.app ZIP archives alongside the six standalone server/debug artifacts. Protected preparation run 37220027105 qualified both architectures at source `f5f98d7b2e51b112157e12c2b23d62c1a3c58d71`: Developer ID signatures and hardened runtime verified, Apple notarization Accepted, staples validated, and Gatekeeper accepted. RC publication and clean-host desktop user acceptance remain separate gates.
 
 ## Requirement mapping
 
@@ -8,19 +8,20 @@ Phoenix release source contains a direct-distribution path for architecture-spec
 |---|---|
 | REQ-DESKTOP-REL-001 | The macOS release matrix builds the standalone helper and app from one immutable checkout. `package-desktop-release.sh` resolves the unchanged clean embedded Git identity to the full gate commit and compares helper bytes before and after outer-app signing. |
 | REQ-DESKTOP-REL-002 | Linux and macOS standalone names remain unchanged. The two desktop ZIPs are additions produced by the existing macOS architecture matrix. |
-| REQ-DESKTOP-REL-003 | The protected macOS job imports a Developer ID certificate, verifies configured certificate authority, signs the helper once, packages and signs the app with hardened runtime, then submits, staples, verifies, and assesses it. Real signing/notarization evidence is not yet available. |
+| REQ-DESKTOP-REL-003 | The protected macOS job imports a Developer ID certificate, verifies configured certificate authority, signs the helper once, packages and signs the app with hardened runtime, then submits, staples, verifies, and assesses it. Real evidence is available from [preparation run 37220027105](https://github.com/scottopell/phoenix-ide/actions/runs/37220027105): Apple Silicon submission `57792d41-55ce-4302-911a-dd1479842f97` and Intel submission `9ec7336a-84d9-4f54-b2da-779350fd94f8` were Accepted; both staples and Gatekeeper assessments passed. |
 | REQ-DESKTOP-REL-004 | The release matrix uses matching Apple Silicon and Intel runners; packaging verifies the helper architecture. |
 | REQ-DESKTOP-REL-005 | Publish enumerates eight payload assets, creates `SHA256SUMS`, and verifies exact draft and public names plus GitHub-reported SHA-256 digests. |
 | REQ-DESKTOP-REL-006 | `test-package-desktop-release.sh` covers unsigned shell orchestration with tool doubles. The `macos-app` hosted workflow also builds a real unsigned Release app, packages it through `package-desktop-release.sh`, and verifies the resulting archive on macOS. |
 | REQ-DESKTOP-REL-007 | Every retry rebuilds and validates both architecture pairs from the immutable tagged commit before `publish-release-assets.sh` compares them with any public release. The publisher creates or resumes a private exact-tag draft, verifies it remains private before each mutation, replaces timestamp-dependent draft assets, verifies the complete exact set, and only then makes it public. It never deletes the release itself; an exact public release is unchanged and an inexact public release fails closed without replacement. |
 | REQ-DESKTOP-REL-008 | The shared release-version parser derives numeric Apple marketing/build versions for stable and bounded RC SemVer; the gate rejects unrepresentable versions before tag creation, and packaging verifies both exact plist values while preserving complete SemVer in helper identity. |
 | REQ-DESKTOP-REL-009 | The shared release-version parser accepts only stable or bounded `rc.N` SemVer, drives workflow/publisher channel metadata, keeps RCs non-latest, and fails closed on stable/RC metadata disagreement. RCs use the same protected signing, notarization, exact-asset, and private-draft path as stable releases. |
+| REQ-DESKTOP-REL-010 | The protected `prepare-main` workflow operation binds both production macOS signing/notarization jobs to exact current `main`, retains prepared artifacts plus sanitized receipts as GitHub Actions artifacts without attaching them to a GitHub Release, and structurally excludes tag creation, GitHub release mutation, publication, deployment, and installation. |
 
-## Proposed protected configuration
+## Qualified protected configuration
 
-ADR-063 is Proposed. Its reuse of the Paperclip-proven TeamIdentifier/API-key mechanics and its Phoenix-specific private-draft publication choice require normative review before release activation.
+ADR-063 records the protected TeamIdentifier/API-key and private-draft architecture. The deployed preparation path has passed both real macOS jobs; release publication is not inferred from preparation success.
 
-The proposed `macos-release-signing` GitHub Environment configuration is:
+The `macos-release-signing` GitHub Environment was exercised successfully by the protected preparation run. Its configuration contract is:
 
 Secrets:
 
@@ -31,7 +32,7 @@ Secrets:
 - `APP_STORE_CONNECT_KEY_ID`
 - `APP_STORE_CONNECT_API_KEY` (raw PEM text)
 
-No release-specific GitHub variables are required by the proposed source.
+No release-specific GitHub variables are required by this path.
 
 The environment policy, values, and approval rules are external configuration. Source presence does not establish that they are configured or authorize access to them.
 

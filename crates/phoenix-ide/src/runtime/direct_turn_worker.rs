@@ -55,6 +55,23 @@ fn fresh_process_incarnation() -> ProcessIncarnation {
     ProcessIncarnation(u64::from_le_bytes(bytes))
 }
 
+pub(crate) async fn dispatch_standalone(
+    manager: Arc<RuntimeManager>,
+    conversation_id: &str,
+) -> Result<(), String> {
+    DirectTurnWorker::new(
+        manager.db().workflow_repository(),
+        Arc::new(ProductionDirectTurnDispatcher {
+            addressed: AddressedConversationEventDispatcher::new(manager.clone()),
+        }),
+        Arc::new(SystemClock),
+        fresh_process_incarnation(),
+    )
+    .dispatch_conversation_once(conversation_id)
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn run(
     manager: Arc<RuntimeManager>,
     kick_rx: watch::Receiver<u64>,
@@ -63,11 +80,12 @@ pub(crate) async fn run(
     let worker = DirectTurnWorker::new(
         manager.db().workflow_repository(),
         Arc::new(ProductionDirectTurnDispatcher {
-            addressed: AddressedConversationEventDispatcher::new(manager),
+            addressed: AddressedConversationEventDispatcher::new(manager.clone()),
         }),
         Arc::new(SystemClock),
         fresh_process_incarnation(),
-    );
+    )
+    .with_watch_delivery(manager);
     if let Err(error) = worker.run_loop(kick_rx, ready_tx).await {
         match error {
             StartupReconciliationError::Retryable(error) => {
@@ -124,6 +142,7 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
+    watch_delivery: Option<Arc<RuntimeManager>>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -147,8 +166,20 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             dispatcher,
             clock,
             process_incarnation,
+            watch_delivery: None,
             #[cfg(test)]
             pre_dispatch_hook: None,
+        }
+    }
+
+    fn with_watch_delivery(mut self, manager: Arc<RuntimeManager>) -> Self {
+        self.watch_delivery = Some(manager);
+        self
+    }
+
+    async fn deliver_watch_events(&self) {
+        if let Some(manager) = &self.watch_delivery {
+            crate::coordinator_watch_delivery::deliver_pass(manager).await;
         }
     }
 
@@ -189,7 +220,8 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         }
         let _ = ready_tx.send(());
 
-        let mut wait = match self.dispatch_accepted_turns().await {
+        let initial_discovery = self.dispatch_accepted_turns().await;
+        let mut wait = match initial_discovery {
             Ok(wait) => wait,
             Err(error) => match StartupReconciliationError::from(error) {
                 StartupReconciliationError::Retryable(error) => {
@@ -199,6 +231,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
             },
         };
+        self.deliver_watch_events().await;
         loop {
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
@@ -210,7 +243,8 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     }
                 }
             }
-            wait = match self.run_once().await {
+            let discovery = self.run_once().await;
+            wait = match discovery {
                 Ok(wait) => wait,
                 Err(error) => match StartupReconciliationError::from(error) {
                     StartupReconciliationError::Retryable(error) => {
@@ -220,6 +254,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
                 },
             };
+            self.deliver_watch_events().await;
         }
     }
 
@@ -267,6 +302,30 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
     ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
         self.settle_terminal_obligations().await?;
         self.dispatch_accepted_turns().await
+    }
+
+    pub(crate) async fn dispatch_conversation_once(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+        let mut cursor = None;
+        loop {
+            let page = self
+                .terminal_discovery
+                .list_accepted(cursor, DISCOVERY_BATCH_LIMIT)
+                .await
+                .map_err(crate::runtime::DatabaseTerminalRecoveryError::Retryable)?;
+            for candidate in page.candidates {
+                if candidate.conversation.0 == conversation_id {
+                    self.dispatch_candidate(candidate, self.clock.now()).await?;
+                }
+            }
+            if page.next_cursor.is_none() || page.next_cursor == cursor {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        Ok(())
     }
 
     async fn dispatch_accepted_turns(
@@ -1039,6 +1098,7 @@ mod tests {
     fn prepared_payload(message_id: &str) -> PreparedDirectTurnPayload {
         PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: format!("text-{message_id}"),
                 images: Vec::new(),
                 files: Vec::new(),

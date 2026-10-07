@@ -48,7 +48,12 @@ AND fall back per backend to the configured model list if model listing is unava
 WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
-THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-luna`, and `gpt-6-sol`
+WHEN selecting a product default without an available explicit `DEFAULT_MODEL` override
+THE SYSTEM SHALL prefer exact `gpt-6.1-sol` when registered
+AND SHALL retain available provider fallback choices when that model is unavailable
+AND SHALL NOT replace explicit conversation, task, or specialized worker choices
+
+THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-6-sol`
 AND SHALL NOT contain `gpt-5.4-mini`, `gpt-5.4`, or `gpt-5.5`
 AND provider discovery SHALL NOT introduce a model that is absent from both the built-in and operator-configured catalogs
 

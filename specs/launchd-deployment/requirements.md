@@ -2,7 +2,7 @@
 
 ## Scope
 
-Safe replacement of Phoenix's native macOS production LaunchAgent from a local checkout or a published GitHub release. Linux deployment modes are outside this specification.
+Safe replacement of Phoenix's native macOS production LaunchAgent from exact checked local `HEAD`, an immutable published GitHub release, or the explicitly selected protected prepared-artifact paired upgrade under REQ-LDD-017. Linux deployment modes are outside this specification.
 
 ## Requirements
 
@@ -20,7 +20,7 @@ While an activation or unresolved transaction owns the host deployment claim, th
 
 ### REQ-LDD-004 — Immutable, secret-safe handoff
 
-The activation helper shall be sourced from the selected immutable commit and consume only stable host-resident files and a manifest containing source identity, candidate and previous runtime identities and endpoints, artifact hashes, target paths, and rollback paths; the manifest and durable diagnostics shall not contain plist environment values.
+For ordinary sources, the activation helper shall be sourced from the selected immutable commit. For prepared-artifact paired sources, it shall be sourced from the separately recorded verified clean controller commit, which may differ from the candidate commit. The helper shall consume only stable host-resident files and a manifest containing source identity, candidate and previous runtime identities and endpoints, artifact hashes, target paths, and rollback paths; the manifest and durable diagnostics shall not contain plist environment values.
 
 ### REQ-LDD-005 — Atomic artifact replacement
 
@@ -36,11 +36,13 @@ A deployment shall succeed only when the target job is running with a new PID an
 
 ### REQ-LDD-008 — Verified rollback
 
+For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. The unconditional artifact-rollback attempt below applies to ordinary sources.
+
 If activation fails after disruption, the system shall atomically restore and bootstrap the previous binary and plist, verify the captured previous runtime identity at the previous service endpoint, and durably distinguish successful runtime-artifact rollback from rollback failure.
 
 Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit shortened identity for a candidate, release asset, helper, or general downgrade path and shall not establish cross-version compatibility.
 
-Automated rollback shall not restore a database or guarantee that the restored binary can use a database changed by the candidate; database rollback remains governed by `specs/compatibility/requirements.md`.
+Ordinary runtime-only rollback shall not restore a database or guarantee predecessor compatibility with candidate-mutated data. The explicit paired ProductConversation upgrade shall restore the verified matching database and runtime before predecessor startup under REQ-LDD-017; other rollback behavior remains governed by `specs/compatibility/requirements.md`.
 
 ### REQ-LDD-009 — Truthful durable result
 
@@ -54,6 +56,8 @@ When status or deployment encounters a stale nonterminal transaction, the system
 
 The local command shall deploy exact local `HEAD` after checks and compilation and require the candidate to embed that complete 40-character lowercase commit SHA. The release command shall resolve one immutable published tag and its exact commit, select the host-architecture macOS asset, verify its `SHA256SUMS` entry, and require its complete 40-character lowercase embedded git SHA to equal that commit exactly; it shall not run repository checks, dependency installation, worktree mutation, or compilation.
 
+The explicitly selected prepared-artifact source SHALL be admitted only under REQ-LDD-017, without local rebuild or ad-hoc resigning; it SHALL NOT expand ordinary local/release rollback guarantees.
+
 WHEN `latest` is requested,
 THE release command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
 
@@ -62,7 +66,7 @@ THE release command SHALL require the tag, GitHub prerelease metadata, full embe
 
 ### REQ-LDD-012 — Unambiguous command surface
 
-The deployment command shall accept `prod deploy` for local `HEAD` and `prod deploy --release TAG|latest` for published releases, and shall reject positional versions with migration guidance rather than building a local source tag.
+The deployment command shall accept `prod deploy` for local `HEAD`, `prod deploy --release TAG|latest` for published releases, and the complete three-option prepared-artifact paired command under REQ-LDD-017, and shall reject positional versions with migration guidance rather than building a local source tag.
 
 ### REQ-LDD-013 — Disposable integration safety
 
@@ -79,3 +83,33 @@ Before signaling Phoenix, the system shall validate that the running process rep
 ### REQ-LDD-016 — Exact, truthful restart result
 
 A restart shall require the already-installed runtime to report a complete 40-character lowercase embedded git SHA and shall commit only after launchd reports a new target PID and `/api/version` reports the same exact runtime identity, with the installed artifact hashes unchanged. The rollback-only legacy identity allowance in REQ-LDD-008 shall not authorize restart of a shortened-identity installation. The system shall durably distinguish preparation failure, concurrent rejection, verified success, and failure after signaling; it shall not claim rollback when no installation artifact changed.
+
+### REQ-LDD-017 — Supported prepared-artifact paired deployment
+
+After helper handoff and before quiescing production, the paired helper shall physically reserve private database-plus-WAL snapshot and atomic-restore capacity. Initial reservation failure shall be reported before disruption. After quiesce required size shall be checked against the held reservation: a growth shortfall shall resume only a verified unchanged predecessor under the offline legacy/exclusivity and captured binary/configuration proofs below; otherwise the service shall remain stopped with its recovery claim retained.
+
+Failed paired claims shall not advise marker removal based solely on helper absence. Unresolved paired recovery shall remove the target plist from the auto-loaded LaunchAgents directory into its private transaction quarantine and fsync both directories, preventing later login from automatically starting an unverified runtime. Candidate and predecessor verification shall bootstrap private transaction plists rather than publishing an unverified auto-loaded plist. The candidate plist shall be published only after exact identity verification and durable commit; the predecessor plist shall be published only after matched database authorization and predecessor verification. Publication or reservation-cleanup failure after durable commit shall remain a committed diagnostic and shall not trigger rollback or imply reboot persistence; a pending publication/cleanup diagnostic shall be persisted with the commit and its owned claim retained until both attempts have durably completed; quarantine failure shall be explicit. Reservation creation shall fsync its parent directory. Explicit retained-helper recovery shall verify offline ownership, snapshot/context, matching restoration and predecessor identity before releasing the claim; failed verification shall attempt teardown, preserve the claim, and report unconfirmed teardown.
+
+WHEN an operator supplies `prod deploy --prepared-artifact DIR --expected-full-commit SHA --paired-database-upgrade`
+THE SYSTEM SHALL require macOS launchd, require all three options together, reject `--release`, first install, and any database path change, and preserve the installed plist's environment and PATH without changing credential or model defaults.
+
+THE SYSTEM SHALL accept only a protected `prepare-main` receipt for the host architecture whose exact full commit, version, Developer ID signature, hardened runtime, accepted notarization, stapled ticket, Gatekeeper result, embedded-helper equivalence, and standalone SHA-256 bytes all verify. The candidate source kind SHALL be `prepared_artifact`, distinct from the clean controller HEAD source commit. The system SHALL never ad-hoc resign the prepared binary.
+
+THE handoff manifest SHALL structurally record the paired ProductConversation database-upgrade mode, exact controller source commit, helper bytes, captured predecessor binary/plist identities, database path, fixed private backup/proof destinations, and transaction identity. The snapshot proof and evolving rollback/status observations SHALL be separate durable records bound to that immutable manifest; they SHALL NOT be fabricated or added by mutating the handoff. The helper SHALL reject missing or inconsistent fields and SHALL require the controller helper bytes to match the recorded clean controller source and protocol.
+
+After backend-managed quiesce confirms the predecessor stopped, THE helper SHALL prove no other process has the database, WAL, or SHM open using bounded macOS `lsof`, take a SQLite backup-API snapshot into a private mode-700 transaction directory with a mode-600 database, validate integrity, and durably verify the snapshot before candidate startup. It SHALL never raw-copy a live database.
+
+IF candidate activation or health verification fails, THE helper SHALL stop the candidate first, re-prove exclusive offline ownership, restore and integrity-check the matching snapshot while removing stale WAL/SHM only under that proof, atomically restore the predecessor binary/plist, and start the predecessor only after database restoration. If any proof fails it SHALL leave the service stopped, persist actionable recovery status, and retain the active claim. Existing runtime-only rollback remains unchanged. Before a snapshot proof exists, a failure MAY resume the predecessor only after confirmed teardown, exclusive offline ownership, legacy ledger/table eligibility, and captured binary/configuration checksum equality prove that candidate mutation has not occurred. This path SHALL NOT claim database restoration. An interrupted pre-handoff preparation, whether or not its immutable manifest has already been persisted, SHALL release only its matching claim after durable terminal status, a dead recorded preparation PID, and confirmed target helper absence; live, reused, missing, or unproven process identity SHALL retain ownership. Successful commit SHALL remove only the temporary database-adjacent restore reservation and fsync its parent, retaining the audit snapshot/proof.
+
+Before a recovered predecessor can serve requests, THE paired helper SHALL persist a post-restore startup checkpoint and typed snapshot-restored versus unchanged-predecessor outcome. Any retry after that checkpoint SHALL verify/finalize the running predecessor without restoring the snapshot again; absent or unverified predecessor state SHALL fail closed rather than discard subsequently accepted writes.
+
+A failure limited to plist publication or deployed-identity durability after predecessor identity verification SHALL retain the verified running predecessor and unresolved claim for finalization-only retry. This SHALL NOT authorize leaving any unverified candidate/predecessor running; unknown identity/database/start proof SHALL still attempt teardown. Prepared/helper-handoff interruption with dead recorded preparer and confirmed helper absence SHALL terminalize without runtime disruption; manifest presence SHALL NOT authorize rollback.
+
+### REQ-LDD-018 — Committed paired finalization without runtime or database mutation
+
+WHEN the operator invokes `prod finalize-paired TXN` for interrupted committed paired finalization,
+THE SYSTEM SHALL use only the retained byte-bound helper and immutable transaction under mutual exclusion, require its matching ownership claim and confirmed activation-helper absence, and verify the currently running exact committed candidate binary, identity and private loaded configuration before any mutation.
+
+THE SYSTEM SHALL retry only atomic publication of that captured candidate plist and removal/fsync of the transaction-owned temporary restore reservation, retain authoritative audit backup/proof, and persist pending status/claim through interruption or error. It SHALL clear pending and release only the owned claim after durable completion. An already completed rerun SHALL verify that same candidate/configuration and produce an idempotent result without applying ambient configuration.
+
+THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an older runtime, or generalize this operation into downgrade or cross-version recovery. Unknown, stale, mismatched, or absent evidence SHALL refuse without releasing ownership.

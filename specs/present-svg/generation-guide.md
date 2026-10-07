@@ -1,8 +1,8 @@
 # Generate and publish static SVG
 
-`present_svg` is available in Direct/Work and Work subagents. It reads a file on the Phoenix server, using the host process's read permissions. It does not expand variables or `~`. Explore is excluded: its command scratch and temporary-directory fallback can disappear when a command finishes.
+`present_svg` is available in Direct/Work, Work subagents, and the singleton Global Coordinator. Direct/Work publication reads a file on the Phoenix server using the host process's read permissions. Global publication additionally requires the same authoritative active `work_scope_id` used to stage the file through Coordinator Bash; the server re-resolves that WorkScope and reads only a regular file contained beneath its canonical root without following symlinks. The selected WorkScope authorizes this source read only—the durable artifact remains owned by the executing Global transcript. The tool does not expand variables or `~`. Explore is excluded: its command scratch and temporary-directory fallback can disappear when a command finishes.
 
-Generate with code or a chart library; do not transcribe a large SVG into tool arguments. Create a platform-temp staging directory:
+Generate with code or a chart library; do not transcribe a large SVG into tool arguments. Direct/Work may create a platform-temp staging directory:
 
 ```sh
 artifact_dir=$(mktemp -d "${TMPDIR:-/tmp}/phoenix-svg.XXXXXX")
@@ -10,10 +10,24 @@ artifact_dir=$(mktemp -d "${TMPDIR:-/tmp}/phoenix-svg.XXXXXX")
 printf '%s\n' "$artifact_dir/disk-usage.svg"
 ```
 
+The Global Coordinator must instead use targeted Bash to stage beneath the selected WorkScope root, for example from that command's WorkScope-local cwd:
+
+```sh
+artifact_dir=$(mktemp -d "./.phoenix-svg.XXXXXX")
+# Generate "$artifact_dir/disk-usage.svg" with code or a chart library.
+printf '%s\n' "$(cd "$artifact_dir" && pwd)/disk-usage.svg"
+```
+
 Pass the printed, resolved absolute filename in a subsequent call:
 
 ```text
 present_svg(path="<printed absolute filename>",
+            title="Largest storage consumers",
+            description="Horizontal bars compare measured directory sizes in GiB; free space is shown separately.")
+
+# Global Coordinator only: also pass the active WorkScope used by Bash.
+present_svg(work_scope_id="<active WorkScope id>",
+            path="<printed absolute filename beneath that WorkScope root>",
             title="Largest storage consumers",
             description="Horizontal bars compare measured directory sizes in GiB; free space is shown separately.")
 ```

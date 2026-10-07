@@ -619,6 +619,7 @@ async fn deliver_product_creation_objective(
             manager,
             &conversation_id,
             Event::SteerMessage {
+                origin: job.intent.origin.input_origin(),
                 text: expanded.display_text,
                 llm_text: expanded.llm_text,
                 images,
@@ -1201,21 +1202,12 @@ fn materialize_approved_task_snapshot(
 pub(crate) fn resolve_creation_model(
     registry: &ModelRegistry,
     explicit_model: Option<&str>,
-    requested_mode: &str,
-    repo_present: bool,
 ) -> Result<String, String> {
     if let Some(model) = explicit_model {
         return registry.resolve_model_id(model);
     }
 
-    let registry_default = registry.default_model_id();
-    Ok(
-        if requested_mode == "managed" || (requested_mode == "auto" && repo_present) {
-            registry.cheap_model_id_for_provider(&registry_default)
-        } else {
-            registry_default
-        },
-    )
+    Ok(registry.default_model_id())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1753,13 +1745,8 @@ async fn provision_conversation(
     let requested_mode = intent.mode.as_deref().unwrap_or("direct");
     let approved_task_creation = requested_mode == "approved_task";
 
-    let mut resolved_model = resolve_creation_model(
-        &manager.llm_registry,
-        intent.model.as_deref(),
-        requested_mode,
-        repo_root.is_some(),
-    )
-    .map_err(|error| (error, ErrorKind::InvalidRequest))?;
+    let mut resolved_model = resolve_creation_model(&manager.llm_registry, intent.model.as_deref())
+        .map_err(|error| (error, ErrorKind::InvalidRequest))?;
 
     let mut conv_mode = ConvMode::Direct;
     let mut effective_cwd = initial_cwd.clone();
@@ -2126,13 +2113,8 @@ async fn provision_conversation(
                 next_taskmd_id_hint,
             };
 
-            resolved_model = resolve_creation_model(
-                &manager.llm_registry,
-                intent.model.as_deref(),
-                requested_mode,
-                true,
-            )
-            .map_err(|error| (error, ErrorKind::InvalidRequest))?;
+            resolved_model = resolve_creation_model(&manager.llm_registry, intent.model.as_deref())
+                .map_err(|error| (error, ErrorKind::InvalidRequest))?;
         }
         other => {
             return Err((
@@ -2407,6 +2389,7 @@ async fn provision_conversation(
         job_id: job.id.clone(),
         claim: claim.clone(),
         initial_message: phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             text: display_text,
             llm_text,
             images,
@@ -2825,6 +2808,7 @@ mod product_creation_delivery_replay_tests {
         chrono::DateTime<chrono::Utc>,
     ) {
         let intent = ProductCreationIntent {
+            origin: phoenix_db::ProductCreationOrigin::UserApi,
             cwd: cwd.to_string(),
             objective: "deliver objective".to_string(),
             model: None,
@@ -3075,6 +3059,7 @@ mod product_creation_delivery_replay_tests {
             .enqueue_steer_message(
                 other_conversation_id,
                 Event::SteerMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     text: "non-target".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -3116,6 +3101,8 @@ mod product_creation_delivery_replay_tests {
             accepted_product_id.to_string()
         );
         assert_eq!(published.transcript_row_id, conversation_id);
+        let origin: String = sqlx::query_scalar("SELECT origin_kind FROM steering_messages WHERE message_id = ?1 UNION ALL SELECT origin_kind FROM messages WHERE message_id = ?1 LIMIT 1").bind(request_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(origin, "user_api");
 
         let completed = db
             .get_product_creation_job(request_id)
@@ -3185,6 +3172,7 @@ mod product_creation_delivery_replay_tests {
     async fn exact_fingerprint_replay_with_stale_delivery_claim_remains_pending() {
         let db = Database::open_in_memory().await.unwrap();
         let intent = ProductCreationIntent {
+            origin: phoenix_db::ProductCreationOrigin::UserApi,
             cwd: "/repo/a".to_string(),
             objective: "deliver objective".to_string(),
             model: None,
@@ -3231,6 +3219,7 @@ mod product_creation_delivery_replay_tests {
         db.append_steering_entry(
             conversation_id,
             &phoenix_core::domain::sm_event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: intent.objective.clone(),
                 llm_text: None,
                 images: Vec::new(),
@@ -4377,11 +4366,18 @@ mod model_resolution_tests {
     }
 
     #[test]
-    fn managed_creation_defaults_to_cheap_model() {
-        let registry = registry();
+    fn ordinary_creation_uses_product_default_not_auxiliary_cheap_model() {
+        let registry = ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        });
         assert_eq!(
-            resolve_creation_model(&registry, None, "managed", true).unwrap(),
-            registry.cheap_model_id_for_provider(&registry.default_model_id())
+            resolve_creation_model(&registry, None).unwrap(),
+            "gpt-6.1-sol"
+        );
+        assert_ne!(
+            registry.cheap_model_id_for_provider("gpt-6.1-sol"),
+            "gpt-6.1-sol"
         );
     }
 
@@ -4389,7 +4385,7 @@ mod model_resolution_tests {
     fn auto_creation_uses_direct_default_without_repository() {
         let registry = registry();
         assert_eq!(
-            resolve_creation_model(&registry, None, "auto", false).unwrap(),
+            resolve_creation_model(&registry, None).unwrap(),
             registry.default_model_id()
         );
     }
@@ -4401,7 +4397,7 @@ mod model_resolution_tests {
             ..Default::default()
         });
         assert_eq!(
-            resolve_creation_model(&registry, Some("gpt-5.3-codex"), "direct", false).unwrap(),
+            resolve_creation_model(&registry, Some("gpt-5.3-codex")).unwrap(),
             "gpt-5.6-sol"
         );
     }
@@ -4410,7 +4406,7 @@ mod model_resolution_tests {
     fn explicit_model_wins_over_mode_defaults() {
         let registry = registry();
         assert_eq!(
-            resolve_creation_model(&registry, Some("mock"), "managed", true).unwrap(),
+            resolve_creation_model(&registry, Some("mock")).unwrap(),
             "mock"
         );
     }

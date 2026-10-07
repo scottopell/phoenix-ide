@@ -46,6 +46,7 @@ pub enum PersistError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SteeringDrainMessage {
     pub content: MessageContent,
+    pub origin: phoenix_core::domain::db_schema::InputOrigin,
     pub display_data: Option<Value>,
     pub usage_data: Option<UsageData>,
     pub message_id: String,
@@ -117,6 +118,11 @@ pub enum Effect {
         /// re-drain). Default `false` for normal write paths to avoid the
         /// extra `message_exists` query.
         idempotent: bool,
+    },
+    /// User input accepted by a parent interaction (approval feedback or question response).
+    PersistUserInputMessage {
+        content: MessageContent,
+        message_id: String,
     },
     PersistAuthoritativeUserMessage {
         payload: PreparedDirectTurnPayload,
@@ -318,6 +324,7 @@ impl Effect {
     ) -> Self {
         let text = text.into();
         let submitted = SubmittedDirectTurnIdentity {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: text.clone(),
             images: images.clone(),
             files: files.clone().into_iter().map(Into::into).collect(),

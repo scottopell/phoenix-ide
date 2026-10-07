@@ -22,32 +22,13 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { api, NotFoundError } from '../api';
+import { accumulateOutputEntries, type OutputEntry } from './ProcessInspectorPanel.output';
 import type { BashHandleInspection, BashHandleState } from '../api';
 import './ProcessInspectorPanel.css';
 
 /** Polling cadence while open on a live handle (REQ-PINSP-006). */
 const POLL_INTERVAL_MS = 1000;
 
-/** UI scrollback bound on accumulated output entries (REQ-PINSP-003): the
- *  inspector appends every observed line, so a long-lived chatty handle would
- *  otherwise grow this array without limit. We keep at most this many entries,
- *  dropping the OLDEST as new snapshots arrive (a sliding window) so the
- *  browser retains roughly what the backend ring does rather than unbounded
- *  scrollback. This is a *client-side* retention cap, distinct from the ring's
- *  `truncated_before` flag — that signals backend eviction; this caps what the
- *  UI holds regardless. Gap markers count as entries too, so a flood of
- *  truncation events can't accumulate unbounded either. The backend live ring
- *  is 4 MB and its tombstone tail is ~2000 lines; a few thousand lines here is
- *  a comparable order of magnitude. */
-const MAX_OUTPUT_ENTRIES = 5000;
-
-/** A rendered output entry: either a real ring line or a synthetic gap marker
- *  inserted when a poll reports `truncated_before` (output evicted between
- *  polls, REQ-PINSP-008). The marker is structurally distinct from a line so it
- *  can never be confused for process output. */
-type OutputEntry =
-  | { kind: 'line'; offset: number; text: string }
-  | { kind: 'gap'; id: number };
 
 // Liveness vs outcome, matching the Work scope panel: a running handle is a
 // green live dot (alive, not a success check); a terminal handle shows its
@@ -180,15 +161,7 @@ function useHandleInspection(handleId: string, conversationId: string | undefine
     }
     sinceRef.current = window.end_offset;
     if (newEntries.length > 0) {
-      setEntries((prev) => {
-        const merged = prev.length === 0 ? newEntries : [...prev, ...newEntries];
-        // Sliding-window scrollback cap: keep only the newest MAX_OUTPUT_ENTRIES,
-        // dropping from the front. Autoscroll follows the tail, so trimming the
-        // head is invisible to a following viewer.
-        return merged.length > MAX_OUTPUT_ENTRIES
-          ? merged.slice(merged.length - MAX_OUTPUT_ENTRIES)
-          : merged;
-      });
+      setEntries((prev) => accumulateOutputEntries(prev, newEntries));
     }
   }, []);
 

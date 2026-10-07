@@ -58,6 +58,14 @@ def _state_error_message(state: object, fallback: str) -> str:
     return message if isinstance(message, str) else fallback
 
 
+def _question_request_identity(request_id: str | None) -> dict:
+    if request_id is None:
+        return {}
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise click.UsageError("Pending question request_id must be a non-empty string.")
+    return {"request_id": request_id}
+
+
 def _detect_api_url() -> str:
     """Detect API URL from environment or dev.py conventions.
 
@@ -234,19 +242,24 @@ class PhoenixClient:
         return resp.json().get('hits', [])
 
 
-    def respond_to_question(self, conv_id: str, answers: dict[str, str]) -> dict:
+    def respond_to_question(
+        self, conv_id: str, answers: dict[str, str], request_id: str | None = None
+    ) -> dict:
         """Answer a pending user question (AwaitingUserResponse state)."""
+        payload = {"answers": answers, **_question_request_identity(request_id)}
         resp = self.http.post(
             f"{self.base_url}/api/conversations/{conv_id}/respond",
-            json={"answers": answers},
+            json=payload,
         )
         resp.raise_for_status()
         return resp.json()
 
-    def dismiss_question(self, conv_id: str) -> dict:
+    def dismiss_question(self, conv_id: str, request_id: str | None = None) -> dict:
         """Dismiss a pending user question without answering."""
+        payload = _question_request_identity(request_id)
         resp = self.http.post(
-            f"{self.base_url}/api/conversations/{conv_id}/dismiss-question"
+            f"{self.base_url}/api/conversations/{conv_id}/dismiss-question",
+            **({"json": payload} if payload else {}),
         )
         resp.raise_for_status()
         return resp.json()
@@ -1334,11 +1347,14 @@ def main(message, conversation, directory, images, model, list_models, list_proj
                         f"left unanswered: {', '.join(repr(q) for q in sorted(unanswered))}. "
                         f"The server irreversibly skips unanswered questions."
                     )
-            client.respond_to_question(conv['id'], answers)
+            request_id = state.get('request_id') if isinstance(state, dict) else None
+            client.respond_to_question(conv['id'], answers, request_id=request_id)
             click.echo(f"Responded to question for {conv.get('slug', conv['id'])}.")
             return
         if dismiss_question:
-            client.dismiss_question(conv['id'])
+            state = conv.get('state')
+            request_id = state.get('request_id') if isinstance(state, dict) else None
+            client.dismiss_question(conv['id'], request_id=request_id)
             click.echo(f"Dismissed question for {conv.get('slug', conv['id'])}.")
             return
         if dismiss_error:

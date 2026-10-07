@@ -28,6 +28,27 @@ external entity TrustedBuiltinSkillResult {
     content: String
 }
 
+value TrustedDelivery {
+    visible_result_is_receipt: Boolean
+    persisted_result_is_receipt: Boolean
+    live_request_audience_is_global_coordinator: Boolean
+    live_request_content_matches_result: Boolean
+}
+
+value PhoenixApiRecipe {
+    requested_objective_is_nonblank: Boolean
+    requested_objective_fits_scoped_bash: Boolean
+    discovers_auth: Boolean
+    discovers_model_and_effort: Boolean
+    generates_request_uuid_once: Boolean
+    requires_work_scope_origin: Boolean
+    posts_supported_creation_fields: Boolean
+    reconciles_ambiguity_by_same_intent: Boolean
+    verifies_creation_separately_from_activity: Boolean
+    distinguishes_product_root_and_current_transcript: Boolean
+    performs_no_database_lifecycle_write: Boolean
+}
+
 ------------------------------------------------------------
 -- Config
 ------------------------------------------------------------
@@ -146,6 +167,50 @@ rule InvokeCoordinatorBuiltin {
         -- Invocation reads the immutable asset embedded in the binary, not the
         -- mutable extraction cache, identifies its base as an embedded resource,
         -- and includes companion references in the authenticated result.
+}
+
+rule DeliverCoordinatorBuiltinToModel {
+    when: TrustedBuiltinSkillResultCreated(result, tool_use_id, delivery)
+
+    requires: result.audience = "global-coordinator"
+
+    ensures: delivery.visible_result_is_receipt = true
+    ensures: delivery.persisted_result_is_receipt = true
+    ensures: delivery.live_request_audience_is_global_coordinator = true
+    ensures: delivery.live_request_content_matches_result = true
+
+    @guidance
+        -- The trusted payload stays opaque to transcript/UI surfaces. The live
+        -- runtime retains it across provider retries and credential recovery;
+        -- its bytes replace the latest matching tool result for each provider
+        -- request until that live request sequence reaches a terminal outcome.
+        -- Recovery after process loss is governed separately.
+}
+
+rule PhoenixApiCreationRecipe {
+    when: CoordinatorCreationAuthorized(recipe, origin, work_scope_id, objective)
+
+    requires: ActiveWorkScope(work_scope_id)
+    requires: recipe.requested_objective_is_nonblank = true
+    requires: recipe.requested_objective_fits_scoped_bash = true
+
+    ensures: recipe.discovers_auth = true
+    ensures: recipe.discovers_model_and_effort = true
+    ensures: recipe.generates_request_uuid_once = true
+    ensures: recipe.requires_work_scope_origin = true
+    ensures: recipe.posts_supported_creation_fields = true
+    ensures: recipe.reconciles_ambiguity_by_same_intent = true
+    ensures: recipe.verifies_creation_separately_from_activity = true
+    ensures: recipe.distinguishes_product_root_and_current_transcript = true
+    ensures: recipe.performs_no_database_lifecycle_write = true
+
+    @guidance
+        -- Global retains the immutable request identity and exact intent across
+        -- staged active scoped Bash calls for discovery, UUID generation, POST,
+        -- ambiguity reconciliation, and independent verification. Each shell
+        -- call receives data through encoded literals; credentials stay out of
+        -- argv/output. Source inspection is a version-mismatch diagnostic, not
+        -- a normal API workflow.
 }
 
 ------------------------------------------------------------

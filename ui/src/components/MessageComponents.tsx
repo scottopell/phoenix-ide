@@ -16,16 +16,17 @@ import { svgArtifactFromResult } from './svgArtifact';
  */
 
 import React, { memo, useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { MessageReviewAction } from './MessageReviewAction';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { api } from '../api';
-import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
+import type { Message, InputOrigin, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { BashToolInput } from '../generated/sse';
 import { agentTurnsInHistoricalUnit, buildHistoricalUnits, type AgentTurnUnit } from '../conversation/renderUnits';
+import { inputOriginPresentation } from '../conversation/inputOriginPresentation';
 import { cacheDB } from '../cache';
 import type { PendingUserMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
@@ -44,6 +45,8 @@ import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildMarkd
 import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, skillResultVisibleText, truncateToolInputValue as truncateValue } from './toolInputDisplay';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
+import { ConversationMarkdownTable } from './conversationMarkdownTable';
+import { inlineCodeTokenKind } from './conversationMarkdownTableSemantics';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
@@ -120,17 +123,6 @@ function DeferredSyntaxHighlighter({ language, syntaxStyle, children, ...props }
     >
       {code}
     </SyntaxHighlighter>
-  );
-}
-
-type MarkdownTableProps = React.ComponentPropsWithoutRef<'table'> & { node?: unknown };
-
-function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
-  void node;
-  return (
-    <div className="markdown-table-scroll">
-      <table {...props}>{children}</table>
-    </div>
   );
 }
 
@@ -387,6 +379,17 @@ function FileChips({
   );
 }
 
+function InputSender({ origin }: { origin: InputOrigin | undefined }) {
+  if (origin?.kind !== 'internal_conversation') {
+    return <span className="message-sender">{inputOriginPresentation(origin).label}</span>;
+  }
+  return (
+    <span className="message-sender">
+      From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}${origin.source_call ? `?source_transcript=${encodeURIComponent(origin.transcript_id)}&source_tool=${encodeURIComponent(origin.source_call.tool_use_id)}#message-${encodeURIComponent(origin.source_call.message_id)}` : ''}`} title={origin.source_call ? "Open originating send call" : "Original send call unavailable (not recorded)"}>{origin.source_call ? `transcript ID ${origin.transcript_id} · source call` : `transcript ID ${origin.transcript_id} · source call unavailable`}</ConversationMarkdownAnchor>
+    </span>
+  );
+}
+
 export const UserMessage = memo(UserMessageImpl);
 
 function UserMessageImpl({ message, activeHighlight = null }: { message: Message; activeHighlight?: ConversationHighlight | null }) {
@@ -396,7 +399,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const files = content.files || [];
   const displayData = message.display_data as { type?: string } | null;
   const isWakeMeta = displayData?.type === 'wake_result' && content.is_meta === true;
-  const isMeta = content.is_meta === true;
+  const isMeta = content.is_meta === true || inputOriginPresentation(message.origin).className === 'meta';
   const timestamp = message.created_at;
 
   if (isWakeMeta) {
@@ -415,7 +418,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
     <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
         <span className="message-header-meta">
-          {!isMeta && <span className="message-sender">You</span>}
+          <InputSender origin={message.origin} />
           {timestamp && (
             <span className="message-time" title={new Date(timestamp).toLocaleString()}>
               {formatMessageTime(timestamp)}
@@ -424,7 +427,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
         </span>
         <span className="message-header-actions">
-          <MessageCopyButton message={message} title={isMeta ? 'Copy system observation' : 'Copy your message'} />
+          <MessageCopyButton message={message} title={message.origin?.kind === 'system_generated' ? 'Copy system observation' : 'Copy input message'} />
         </span>
       </div>
       <div className="message-content">
@@ -467,10 +470,11 @@ function QueuedUserMessageImpl({
   activeHighlight?: ConversationHighlight | null;
 }) {
   const isSteeringQueued = message.status === 'steering_queued';
+  const isMeta = message.origin ? inputOriginPresentation(message.origin).className === 'meta' : false;
   return (
-    <div className={`message user${isSteeringQueued ? ' steering-queued' : ''}`}>
+    <div className={`message ${isMeta ? 'meta' : 'user'}${isSteeringQueued ? ' steering-queued' : ''}`}>
       <div className="message-header">
-        <span className="message-sender">You</span>
+        {message.origin ? <InputSender origin={message.origin} /> : <span className="message-sender">User · API</span>}
         {isSteeringQueued ? (
           <span className="message-status queued" title="Queued — will send when conversation is free">
             <span className="queued-label">⏳ Queued</span>
@@ -1196,7 +1200,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           return <>{linkified}</>;
         }
         return (
-          <code className={className} {...props}>
+          <code className={className} data-token-kind={inlineCodeTokenKind(children)} {...props}>
             {children}
           </code>
         );
@@ -1212,7 +1216,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           filePathCopyContext={filePathCopyContext}
         />
       ),
-      table: MarkdownTable,
+      table: ConversationMarkdownTable,
       img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
         <ConversationMarkdownImage
           {...props}
@@ -1705,6 +1709,107 @@ function BashOutputView({
       {partial && <div className="bash-partial-affordance">[final line still streaming — no newline yet]</div>}
     </div>
   );
+}
+
+type SendConversationOutcome = {
+  outcome: 'delivered' | 'queued_as_steering' | 'rejected';
+  target?: string;
+  conversation_id?: string;
+  message_id: string;
+  display_name?: string;
+  transcript_slug?: string;
+  reason_code?: string;
+  message?: string;
+};
+
+type WatchSnapshot = {
+  product_conversation_id: string;
+  current_transcript_id: string;
+  current_state: { type?: string };
+  display_name?: string;
+  transcript_slug?: string;
+  project_path?: string;
+};
+
+function canonicalTargetLink(target: string | undefined, conversationId: string | undefined) {
+  if (!conversationId) return null;
+  if (target?.startsWith('@conv:')) {
+    return `/product-conversations/${encodeURIComponent(target.slice('@conv:'.length))}`;
+  }
+  const transcript = target?.startsWith('@transcript:') ? target.slice('@transcript:'.length) : conversationId;
+  return transcript ? `/c/${encodeURIComponent(transcript)}` : null;
+}
+
+export function SendConversationMessageView({ response }: { response: SendConversationOutcome }) {
+  const link = canonicalTargetLink(response.target, response.conversation_id);
+  const label = response.outcome === 'queued_as_steering'
+    ? 'Queued as steering'
+    : response.outcome === 'delivered'
+      ? 'Delivered'
+      : 'Rejected';
+  return (
+    <div className={`coordinator-result-card coordinator-send-${response.outcome}`}>
+      <div className="coordinator-result-heading"><strong>{label}</strong></div>
+      <div className="coordinator-result-row">
+        <span>Recipient</span>
+        {link ? <Link to={link}>{response.display_name ?? 'Open conversation'}</Link> : <code>{response.target ?? 'Unresolved'}</code>}
+      </div>
+      {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/c/${encodeURIComponent(response.transcript_slug ?? response.conversation_id)}`}>{response.outcome === 'rejected' ? 'Open target transcript' : 'Open receiving transcript'}</Link></div>}
+      <details><summary>IDs</summary><code>{response.target ?? 'Unresolved'}</code>{response.conversation_id && <code>{response.conversation_id}</code>}<code>{response.message_id}</code>{response.reason_code && <code>{response.reason_code}</code>}</details>
+      {response.outcome !== 'rejected' && <p className="coordinator-result-note">Accepted by Phoenix; recipient understanding or completion is not implied.</p>}
+      {response.outcome === 'rejected' && <p className="coordinator-result-error">{response.message ?? response.reason_code ?? 'Message rejected'}</p>}
+    </div>
+  );
+}
+
+function WatchLink({ watch }: { watch: WatchSnapshot }) {
+  return (
+    <li className="coordinator-watch-row">
+      <Link to={`/product-conversations/${encodeURIComponent(watch.product_conversation_id)}`}>{watch.display_name ?? 'Open conversation'}</Link>
+      <Link to={`/c/${encodeURIComponent(watch.transcript_slug ?? watch.current_transcript_id)}`}>current transcript</Link>
+      <span>{watch.current_state?.type ?? 'active'}</span>
+      {watch.project_path && <code>{watch.project_path}</code>}
+      <details><summary>IDs</summary><code>{watch.product_conversation_id}</code><code>{watch.current_transcript_id}</code></details>
+    </li>
+  );
+}
+
+type UnwatchOutcome = { product_conversation_id: string; ended: boolean };
+
+export function UnwatchResultView({ response }: { response: UnwatchOutcome }) {
+  return (
+    <div className="coordinator-result-card">
+      <strong>{response.ended ? 'Watch ended' : 'Watch not found'}</strong>
+      <Link to={`/product-conversations/${encodeURIComponent(response.product_conversation_id)}`}>@conv:{response.product_conversation_id}</Link>
+    </div>
+  );
+}
+
+export function WatchingResultView({ response }: { response: unknown }) {
+  const watches = Array.isArray(response) ? response : [response];
+  const valid = watches.filter((value): value is WatchSnapshot => {
+    if (!value || typeof value !== 'object') return false;
+    const row = value as Record<string, unknown>;
+    return typeof row['product_conversation_id'] === 'string' && typeof row['current_transcript_id'] === 'string';
+  });
+  if (valid.length === 0) return <div className="coordinator-result-card">No active watches.</div>;
+  return <div className="coordinator-result-card"><strong>Watching</strong><ul className="coordinator-watch-list">{valid.map((watch) => <WatchLink key={watch.product_conversation_id} watch={watch} />)}</ul></div>;
+}
+
+function CoordinatorEnvironment({ displayData }: { displayData: Record<string, unknown> | null | undefined }) {
+  const environment = displayData?.['coordinator_environment'];
+  if (!environment || typeof environment !== 'object') return null;
+  const value = environment as Record<string, unknown>;
+  const scope = typeof value['work_scope_id'] === 'string' ? value['work_scope_id'] : null;
+  const cwd = typeof value['cwd'] === 'string' ? value['cwd'] : null;
+  const ownerName = typeof value['owner_name'] === 'string' ? value['owner_name'] : null;
+  const ownerProductConversationId = typeof value['owner_product_conversation_id'] === 'string' ? value['owner_product_conversation_id'] : null;
+  const projectPath = typeof value['project_path'] === 'string' ? value['project_path'] : null;
+  if (!scope && !cwd) return null;
+  const ownerIdentity = ownerName && ownerProductConversationId
+    ? <Link to={`/product-conversations/${encodeURIComponent(ownerProductConversationId)}`} title={`Owning conversation: ${ownerName}`}>{ownerName}</Link>
+    : ownerName ? <span title="Historical environment owner; stable conversation unavailable">{ownerName}</span> : null;
+  return <div className="coordinator-environment"><strong>Environment</strong>{ownerIdentity}{projectPath && <code title={projectPath}>{projectPath}</code>}{cwd && <code title={cwd}>{cwd}</code>}{(scope || ownerProductConversationId) && <details><summary>IDs</summary>{scope && <code>{scope}</code>}{ownerProductConversationId && <code>{ownerProductConversationId}</code>}</details>}</div>;
 }
 
 function BashResponseView({ response }: { response: Record<string, unknown> }) {
@@ -2884,6 +2989,30 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
 
 
   const svgArtifact = svgArtifactFromResult(name, result);
+  const watchTool = name === 'list_watched_conversations'
+    || name === 'watch_conversation'
+    || name === 'unwatch_conversation';
+  let watchJson: unknown = null;
+  if (!isError && watchTool) {
+    try { watchJson = JSON.parse(resultText); } catch { watchJson = null; }
+  }
+  const structuredResult = !isError ? tryParseJson(resultText) : null;
+  const recipientIdentity = result?.display_data && typeof result.display_data === 'object'
+    ? (result.display_data as Record<string, unknown>)['recipient_identity']
+    : null;
+  const sendOutcome = name === 'send_conversation_message' && structuredResult && !Array.isArray(structuredResult)
+    && typeof structuredResult === 'object' && 'outcome' in structuredResult
+    ? {
+        ...structuredResult as SendConversationOutcome,
+        ...(recipientIdentity && typeof recipientIdentity === 'object' ? recipientIdentity as Record<string, string> : {}),
+      } as SendConversationOutcome
+    : null;
+  const watchingResult = name !== 'unwatch_conversation' && watchJson !== null ? watchJson : null;
+  const unwatchOutcome = name === 'unwatch_conversation' && watchJson && typeof watchJson === 'object'
+    && typeof (watchJson as Record<string, unknown>)['product_conversation_id'] === 'string'
+    && typeof (watchJson as Record<string, unknown>)['ended'] === 'boolean'
+    ? watchJson as UnwatchOutcome
+    : null;
   return (
     <>
     {svgArtifact && <SvgArtifactCard artifact={svgArtifact} />}
@@ -2934,8 +3063,14 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
                 className="message-image"
               />
             </div>
+          ) : sendOutcome ? (
+            <SendConversationMessageView response={sendOutcome} />
+          ) : unwatchOutcome ? (
+            <UnwatchResultView response={unwatchOutcome} />
+          ) : watchingResult ? (
+            <WatchingResultView response={watchingResult} />
           ) : bashResponse ? (
-            <BashResponseView response={bashResponse} />
+            <><CoordinatorEnvironment displayData={result?.display_data as Record<string, unknown> | undefined} /><BashResponseView response={bashResponse} /></>
           ) : tmuxResponse ? (
             <TmuxResponseView response={tmuxResponse} />
           ) : name === 'browser_profile' &&

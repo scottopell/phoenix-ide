@@ -101,7 +101,7 @@
 @media (width <= 640px) {
   .automatic-continuation__panel {
     position: fixed;
-    top: 52px;
+    top: calc(52px + var(--app-safe-area-top));
     right: 8px;
     left: 8px;
     width: auto;

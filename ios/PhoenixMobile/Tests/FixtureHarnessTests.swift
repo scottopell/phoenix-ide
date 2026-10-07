@@ -32,6 +32,34 @@ final class FixtureHarnessTests: XCTestCase {
         let types = Set(FixtureScenario.scenario(for: .normal).screen.messages.map(\.message_type))
 
         XCTAssertTrue(["user", "agent", "tool", "skill", "system", "continuation"].allSatisfy(types.contains))
+        let sequences = FixtureScenario.scenario(for: .normal).screen.messages.map(\.sequence_id)
+        XCTAssertEqual(sequences, Array(1...Int64(sequences.count)))
+    }
+
+    func testNormalFixtureShowsVerifiedAndUnverifiedInputWithoutInferringSenderFromRole() {
+        let messages = FixtureScenario.scenario(for: .normal).screen.messages
+        let byId = Dictionary(uniqueKeysWithValues: messages.map { ($0.message_id, $0) })
+        XCTAssertEqual(byId["m-user-1"]?.inputOrigin, .userApi)
+        XCTAssertEqual(
+            byId["m-internal-input"]?.inputOrigin,
+            .internalConversation(productConversationId: "pc-parent", transcriptId: "parent-row"))
+        XCTAssertEqual(byId["m-historical-input"]?.inputOrigin, .unknownHistorical)
+        XCTAssertEqual(byId["m-skill"]?.inputOrigin, byId["m-internal-input"]?.inputOrigin)
+        XCTAssertFalse(byId["m-skill"]?.inputOrigin.isUserApiInput ?? true)
+        XCTAssertEqual(byId["m-skill"]?.content["trigger"]?.stringValue, "/phoenix-development")
+    }
+
+    func testQueuedFixtureEntriesRemainLocalAndUnattributedUntilAuthoritativeHistory() {
+        let entries = FixtureScenario.outboxEntries
+        XCTAssertEqual(Set(entries.map(\.status)), [
+            .pending, .steeringQueued, .failed, .recoverableInconsistency,
+        ])
+        XCTAssertTrue(entries.allSatisfy { $0.isVisible && $0.conversationId == "fixture-conv" })
+        XCTAssertTrue(entries.allSatisfy { entry in
+            !FixtureScenario.scenario(for: .normal).screen.messages.contains {
+                $0.message_id == entry.localId
+            }
+        })
     }
 
     func testNormalFixtureCoversValidAndMalformedImages() {
