@@ -142,6 +142,19 @@ async function discoverStories(storyPrefix) {
  *
  * @param {SurfaceConfig} config
  */
+export function selectCaptureEntries(entries, requested, key, label) {
+  if (requested === undefined) return entries;
+  const names = requested.split(',');
+  if (names.some((name) => !entries.some((entry) => entry[key] === name))) {
+    throw new Error(`${label} contains an unknown selection`);
+  }
+  return entries.filter((entry) => names.includes(entry[key]));
+}
+
+export async function verifyInstalledBrowser(executable) {
+  await access(executable, constants.X_OK);
+}
+
 export async function captureSurface(config) {
   const {
     surface,
@@ -159,11 +172,9 @@ export async function captureSurface(config) {
   const resolvedOut = path.resolve(outDir);
   await mkdir(resolvedOut, { recursive: true });
 
-  const captureViewports = normalizeViewportMatrix(viewportMatrix, viewport)
-    .filter((item) => !process.env.CAPTURE_VIEWPORT || item.name === process.env.CAPTURE_VIEWPORT);
-  if (captureViewports.length === 0) throw new Error('CAPTURE_VIEWPORT matched no configured viewport');
+  const captureViewports = selectCaptureEntries(normalizeViewportMatrix(viewportMatrix, viewport), process.env.CAPTURE_VIEWPORT, 'name', 'CAPTURE_VIEWPORT');
   if (process.env.PLAYWRIGHT_INSTALLED_ONLY === '1') {
-    await access(browserType.executablePath(), constants.X_OK);
+    await verifyInstalledBrowser(browserType.executablePath());
     console.log(`Using installed ${browserName}: ${browserType.executablePath()}`);
   } else {
     await run('pnpm', playwrightInstallArgs(browserName));
@@ -192,12 +203,12 @@ export async function captureSurface(config) {
   process.on('SIGTERM', () => { stopLadle(); process.exit(143); });
 
   await waitForLadle();
-  const selectedStories = process.env.CAPTURE_STORIES?.split(',');
-  const stories = (await discoverStories(storyPrefix))
-    .filter(({ id }) => !selectedStories || selectedStories.includes(id));
-  if (selectedStories && selectedStories.some((id) => !stories.some((story) => story.id === id))) {
+  let stories;
+  try {
+    stories = selectCaptureEntries(await discoverStories(storyPrefix), process.env.CAPTURE_STORIES, 'id', 'CAPTURE_STORIES');
+  } catch (error) {
     stopLadle();
-    throw new Error('CAPTURE_STORIES contains an unknown scenario');
+    throw error;
   }
   console.log(`Capturing ${stories.length} ${surface} stories`);
   const browser = await browserType.launch();
