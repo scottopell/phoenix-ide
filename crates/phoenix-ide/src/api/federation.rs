@@ -9,12 +9,13 @@ use futures::StreamExt as _;
 use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 use super::auth::{OwnerAuthenticated, PeerAuthenticated};
 use super::AppState;
 
-static QUERY_ADMISSION: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
+static QUERY_ADMISSION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
 const MAX_REMOTE_RESPONSE_BYTES: usize = 65 * 1024;
 
 #[derive(Deserialize)]
@@ -152,7 +153,7 @@ async fn query_database_with_admission(
     peer: PeerAuthenticated,
     state: AppState,
     request: RemoteQueryDatabaseRequest,
-    admission: &tokio::sync::Semaphore,
+    admission: &std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Response {
     let destination_instance_id = match state.db.instance_id().await {
         Ok(id) => id,
@@ -168,7 +169,7 @@ async fn query_database_with_admission(
         )
             .into_response();
     }
-    let Ok(_permit) = admission.try_acquire() else {
+    let Ok(permit) = std::sync::Arc::clone(admission).try_acquire_owned() else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({ "error": "remote query admission limit reached" })),
@@ -179,21 +180,42 @@ async fn query_database_with_admission(
         state.db.clone(),
         state.message_retriever.clone(),
     );
-    match service.query_database(&request.sql).await {
-        Ok(result) => Json(RemoteQueryDatabaseResponse {
+    let sql = request.sql;
+    match spawn_with_admission_permit(permit, async move { service.query_database(&sql).await })
+        .await
+    {
+        Ok(Ok(result)) => Json(RemoteQueryDatabaseResponse {
             destination_instance_id,
             caller_instance_id: peer.caller_instance_id,
             result,
         })
         .into_response(),
-        Err(error) => (
+        Ok(Err(error)) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "error": error,
             })),
         )
             .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "remote query task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
+}
+
+fn spawn_with_admission_permit<T, F>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: F,
+) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _permit = permit;
+        work.await
+    })
 }
 
 pub async fn issue_enrollment(
@@ -318,10 +340,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_caller_does_not_release_admission_before_work_finishes() {
+        let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = std::sync::Arc::clone(&admission)
+            .try_acquire_owned()
+            .unwrap();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finish = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task = spawn_with_admission_permit(permit, {
+            let started = std::sync::Arc::clone(&started);
+            let finish = std::sync::Arc::clone(&finish);
+            async move {
+                started.notify_one();
+                finish.notified().await;
+            }
+        });
+        started.notified().await;
+
+        let mut caller = Box::pin(task);
+        assert!(futures::poll!(&mut caller).is_pending());
+        drop(caller);
+        assert!(admission.clone().try_acquire_owned().is_err());
+
+        finish.notify_one();
+        admission.acquire().await.unwrap().forget();
+    }
+
+    #[tokio::test]
     async fn query_database_rejects_exhausted_admission_before_sql_execution() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let destination_instance_id = state.db.instance_id().await.unwrap();
-        let admission = tokio::sync::Semaphore::new(0);
+        let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let response = query_database_with_admission(
             PeerAuthenticated {
                 caller_instance_id: InstanceId::new(),
