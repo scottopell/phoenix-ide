@@ -347,6 +347,35 @@ impl SupervisorHandle {
         self.fail_with_teardown_retry(epoch, error, None).await
     }
 
+    pub(crate) async fn retain_oauth_handshake_failure(
+        &self,
+        epoch: u64,
+        error: String,
+        server: McpServer,
+        plan: OAuthRetryPlan,
+    ) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if let Err(error) = self
+            .mailbox
+            .send(Command::RetainOAuthHandshakeFailure {
+                epoch,
+                error,
+                server,
+                plan,
+                reply,
+            })
+            .await
+        {
+            if let Command::RetainOAuthHandshakeFailure { server, .. } = error.0 {
+                if let Err(error) = server.terminate().await {
+                    tracing::warn!(%error, "MCP OAuth handshake cleanup failed after supervisor stopped");
+                }
+            }
+            return false;
+        }
+        receive.await.unwrap_or(false)
+    }
+
     pub(crate) async fn deny_oauth(&self, epoch: u64, error: String, plan: OAuthRetryPlan) {
         let (reply, receive) = oneshot::channel();
         if self
@@ -521,6 +550,13 @@ struct QueuedCall {
 }
 
 enum Command {
+    RetainOAuthHandshakeFailure {
+        epoch: u64,
+        error: String,
+        server: McpServer,
+        plan: OAuthRetryPlan,
+        reply: oneshot::Sender<bool>,
+    },
     DeferOAuthTransition {
         target: RecoveryTarget,
         reply: oneshot::Sender<bool>,
@@ -706,6 +742,32 @@ impl Actor {
                     self.snapshot.pending_oauth_url.clone(),
                 );
                 let _ = reply.send(());
+            }
+            Command::RetainOAuthHandshakeFailure {
+                epoch,
+                error,
+                server,
+                plan,
+                reply,
+            } => {
+                let current = epoch == self.epoch;
+                if current {
+                    self.recovery_from = None;
+                    if let SupervisorState::Ready(server) =
+                        std::mem::replace(&mut self.state, SupervisorState::Recovering)
+                    {
+                        self.teardown_retry.push(RetainedTransport::Other(server));
+                    }
+                    self.teardown_retry.push(RetainedTransport::OAuthRecovery {
+                        server: Arc::new(server),
+                        retry_plan: Some(plan),
+                    });
+                    self.publish_snapshot(Some(error), None);
+                } else {
+                    self.retain_unresolved_stale_teardown(Arc::new(server), error)
+                        .await;
+                }
+                let _ = reply.send(current);
             }
             Command::DenyOAuth {
                 epoch,

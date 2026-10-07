@@ -333,7 +333,7 @@ AND, on expiry or a post-authorization 401, refresh using the refresh token,
 persisting any rotated refresh token the server returns; a successful grant
 whose local store write fails SHALL retain its response and retry persistence
 without repeating the grant with the replaced refresh token
-AND, when refresh fails, discard the stored token and return the server to an
+AND, when refresh is definitively rejected, discard the stored token and return the server to an
 unauthorized state requiring a new authorization
 AND, when a tool call returns HTTP 403 `insufficient_scope` with a
 `WWW-Authenticate` challenge, re-authorize requesting the **union** of the
@@ -376,6 +376,10 @@ and applying the queued configuration. Pending authorization SHALL be replaced
 with a fresh nonce while preserving the cleanup discovery challenge and scopes.
 A replacement connection that requires authorization SHALL expose its owned
 pending authorization as unauthorized, including after successful token refresh.
+A handshake's authorization failure SHALL retain its challenge and OAuth cleanup
+ownership when session teardown also fails. A restored token SHALL still take
+the silent refresh path before reauthorization; a handshake rejected after that
+refresh SHALL request owned reauthorization without repeating the grant.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very
@@ -386,7 +390,7 @@ it merely because the config kept the same display name -- after the URL changed
 conditional on the resource matching. A rotating server may issue a replacement
 refresh token on each refresh; dropping it forces a needless re-authorization.
 The access token must ride every request or protected servers reject calls
-despite a successful authorization. A failed refresh must discard the stale
+despite a successful authorization. A rejected refresh must discard the stale
 token so it cannot be reused or duplicated, and is the condition that re-prompts
 the user. A `403 insufficient_scope` is a step-up request, not a terminal error;
 it must request the union of prior and challenged scopes, or fixing one

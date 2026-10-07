@@ -138,6 +138,13 @@ success and rejected-grant authorization before applying a new resource.
 nonce and preserved scopes when a pending or denied flow is reconfigured.
 `replacement_handshake_reauthorization_is_owned_and_visible` verifies owned,
 visible authorization when replacement initialization rejects the refreshed grant.
+`replacement_tools_list_401_and_failed_delete_can_reauthorize` covers a
+session-bearing replacement's tools/list 401, failed DELETE, denial, explicit
+retry, and fresh authenticated cleanup. `startup_tools_list_401_and_failed_delete_refresh_silently`
+covers the same handshake failure with successful and transient startup refresh.
+`refreshed_handshake_cleanup_preserves_auth_cause_without_repeating_grant`
+covers a rejected tools/list after one silent grant and preserved authorization
+provenance through fresh-recovery teardown failure.
 
 Behavioral specification: `specs/mcp/mcp.allium`
 

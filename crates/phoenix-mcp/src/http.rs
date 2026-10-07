@@ -4354,6 +4354,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_tools_list_401_and_failed_delete_can_reauthorize() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        let crate::supervisor::RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await
+        else {
+            panic!("OAuth recovery owner")
+        };
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        server.push_responses(vec![delete_ack()]);
+        let outcome = manager
+            .refresh_authorized_server("remote", &handle, &permit, None)
+            .await;
+        assert!(matches!(outcome, crate::RefreshServerOutcome::Refreshed));
+        let mut rejected = json_doc(&serde_json::json!({"error": "invalid_grant"}));
+        rejected.status = 400;
+        server.route("/token", rejected);
+        *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-3".into());
+        let mut replacement = handshake_responses("sess-2");
+        replacement[2] = unauthorized(&server);
+        server.push_responses(replacement);
+        assert!(manager
+            .finish_oauth_refresh("remote", &handle, &permit, outcome)
+            .await
+            .is_err());
+        assert_eq!(
+            manager.status().await[0].state,
+            crate::McpConnState::Unauthorized
+        );
+        let params = query_params(&pending_auth_url(&manager).await.unwrap());
+        assert!(params["scope"]
+            .split_whitespace()
+            .any(|scope| scope == "mcp.read"));
+        manager
+            .fail_oauth_authorization(&params["state"], "access_denied")
+            .await
+            .unwrap();
+        manager
+            .reload_from_configs(vec![("remote".into(), permit.config)])
+            .await;
+        let next = query_params(&pending_auth_url(&manager).await.unwrap());
+        assert_ne!(next["state"], params["state"]);
+        server.route("/token", token_response("at-3", Some("rt-3"), None));
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-3"));
+        manager
+            .complete_oauth_authorization(&next["state"], "code", Some(&server.base()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+            .await
+            .unwrap();
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+        let deletes: Vec<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.http_method() == "DELETE")
+            .map(|request| request.header("authorization").map(str::to_owned))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![
+                Some("Bearer at-2".into()),
+                Some("Bearer at-2".into()),
+                Some("Bearer at-3".into())
+            ]
+        );
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_tools_list_401_and_failed_delete_refresh_silently() {
+        for transient in [false, true] {
+            let server = TestServer::start(vec![]).await;
+            let mut initial = handshake_responses("sess-1");
+            initial[2] = unauthorized(&server);
+            server.push_responses(initial);
+            server.push_responses(vec![delete_ack()]);
+            server.push_responses(handshake_responses("sess-2"));
+            install_oauth_discovery(&server, true);
+            if transient {
+                server.route_seq(
+                    "/token",
+                    vec![
+                        status_response(503, &[]),
+                        token_response("at-2", Some("rt-2"), None),
+                    ],
+                );
+            } else {
+                server.route("/token", token_response("at-2", Some("rt-2"), None));
+            }
+            *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-2".into());
+            let manager = McpClientManager::new();
+            manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+            manager
+                .oauth
+                .store()
+                .upsert_registration(&none_registration(&server.base()))
+                .await
+                .unwrap();
+            manager
+                .oauth
+                .store()
+                .upsert_token(&stored_token(
+                    &server,
+                    "at-1",
+                    Some("rt-1"),
+                    &["mcp.read"],
+                    1,
+                ))
+                .await
+                .unwrap();
+            let result = manager
+                .reload_from_configs(vec![(
+                    "remote".into(),
+                    http_config(&server.url, HttpAuth::None),
+                )])
+                .await;
+            assert_eq!(result.added, vec!["remote"]);
+            tokio::time::timeout(Duration::from_secs(15), manager.await_background_tasks())
+                .await
+                .unwrap();
+            assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+            assert!(pending_auth_url(&manager).await.is_none());
+            let token = manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(token.access_token, "at-2");
+            assert_eq!(token.refresh_token.as_deref(), Some("rt-2"));
+            let deletes: Vec<_> = server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.http_method() == "DELETE")
+                .map(|request| request.header("authorization").map(str::to_owned))
+                .collect();
+            assert_eq!(
+                deletes,
+                vec![Some("Bearer at-1".into()), Some("Bearer at-2".into())]
+            );
+            server.push_responses(vec![delete_ack()]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refreshed_handshake_cleanup_preserves_auth_cause_without_repeating_grant() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        let mut replacement = handshake_responses("sess-2");
+        replacement[2] = unauthorized(&server);
+        server.push_responses(replacement);
+        install_oauth_discovery(&server, true);
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-3".into());
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&none_registration(&server.base()))
+            .await
+            .unwrap();
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-1",
+                Some("rt-1"),
+                &["mcp.read"],
+                1,
+            ))
+            .await
+            .unwrap();
+        manager
+            .reload_from_configs(vec![(
+                "remote".into(),
+                http_config(&server.url, HttpAuth::None),
+            )])
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.status().await[0].state,
+            crate::McpConnState::Unauthorized
+        );
+        assert_eq!(server.recorded_for_path("/token").len(), 1);
+        let params = query_params(&pending_auth_url(&manager).await.unwrap());
+        server.route("/token", token_response("at-3", Some("rt-3"), None));
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-3"));
+        manager
+            .complete_oauth_authorization(&params["state"], "code", Some(&server.base()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+            .await
+            .unwrap();
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+        let deletes: Vec<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.http_method() == "DELETE")
+            .map(|request| request.header("authorization").map(str::to_owned))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![Some("Bearer at-2".into()), Some("Bearer at-3".into())]
+        );
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn changed_configuration_waits_for_transient_oauth_cleanup() {
         for reject_retry in [false, true] {
             let server = TestServer::start(handshake_responses("sess-1")).await;

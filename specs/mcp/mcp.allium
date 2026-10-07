@@ -555,6 +555,13 @@ rule TokenRefreshNeeded {
         -- failure observed on the same original epoch upgrades that retained
         -- cleanup owner and reserves a fresh recovery epoch. Config supersession
         -- clears this provenance, so unrelated cleanup cannot receive a bearer.
+        -- A handshake whose tools/list rejects authorization after initialize
+        -- retains that typed challenge even if its session DELETE also fails.
+        -- Admit the failed handshake transport as OAuth cleanup ownership before
+        -- silently refreshing its restored token. Startup and replacement
+        -- recovery share the refresh, retry, authorization, and cleanup paths.
+        -- A handshake rejected after its silent refresh requests owned browser
+        -- authorization instead of repeating the grant indefinitely.
         -- Cancel active calls before retaining the old session for cleanup;
         -- cancellation does not authorize replay of those other calls.
         -- Quiesce the server-initiated HTTP stream without deleting the session,
