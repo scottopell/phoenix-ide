@@ -586,6 +586,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_instance_identity",
         sql: MIGRATION_114,
     },
+    Migration {
+        version: 115,
+        name: "federation_enrollments",
+        sql: MIGRATION_115,
+    },
 ];
 
 const MIGRATION_113: &str = "";
@@ -607,6 +612,28 @@ CREATE TABLE instance_identity (
         AND replace(instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
     )
 );
+";
+
+const MIGRATION_115: &str = r"
+CREATE TABLE federation_enrollments (
+    id TEXT PRIMARY KEY NOT NULL,
+    caller_instance_id TEXT NOT NULL,
+    caller_display_name TEXT NOT NULL CHECK(length(trim(caller_display_name)) > 0),
+    credential_verifier TEXT NOT NULL UNIQUE CHECK(
+        length(credential_verifier) = 64
+        AND credential_verifier = lower(credential_verifier)
+        AND credential_verifier NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    revoked_at_us INTEGER CHECK(
+        revoked_at_us IS NULL
+        OR (typeof(revoked_at_us) = 'integer' AND revoked_at_us >= created_at_us)
+    )
+);
+CREATE UNIQUE INDEX federation_enrollments_one_active_caller
+    ON federation_enrollments(caller_instance_id) WHERE revoked_at_us IS NULL;
 ";
 
 const MIGRATION_112: &str = r"
@@ -11812,8 +11839,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(5).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(6).copied().collect::<Vec<_>>(),
             vec![
+                (115, "federation_enrollments"),
                 (114, "persist_instance_identity"),
                 (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
