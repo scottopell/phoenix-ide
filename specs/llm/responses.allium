@@ -132,7 +132,7 @@ variant ResponsesAllowedTools : ResponsesToolChoice {
 
 -- Opaque whole provider item, owned privately by its accepted assistant turn.
 -- It is not a public ContentBlock and cannot become visible reasoning text.
-entity ResponsesPrivateReasoningItem {
+entity ResponsesPrivateOutputItem {
     owner_message_id: String
     item: Any
 }
@@ -277,6 +277,16 @@ contract ResponsesToolContinuation {
         -- codes, or text), not an Anthropic is_error field. Never erase a failed
         -- invocation or replay its side effect merely to rebuild the input.
 
+    @invariant AcceptedToolRoundEnvelopesStayWhole
+        -- Every accepted response containing client tool calls retains its
+        -- complete output envelopes in provider order, whether or not it
+        -- contains a reasoning item. Retry/restart replay those envelopes
+        -- against the exact accepted public owner. Preserve each returned
+        -- assistant phase (including commentary and final_answer) unchanged;
+        -- omitting phase can turn commentary into an apparent final answer.
+        -- Do not synthesize phase or reconstruct envelopes from visible text.
+        -- Final settlement clears this active-exchange private continuation.
+
     @invariant ReasoningItemsContinuePrivately
         -- For reasoning models, reasoning items returned with function calls
         -- are passed back with the function outputs. Preserve the opaque items
@@ -302,12 +312,13 @@ contract ResponsesToolContinuation {
 -- Rules — private continuation and current tool selection
 ------------------------------------------------------------
 
-rule ResponsesReasoningItemRetained {
-    when: AcceptResponsesReasoningItem(owner_message_id, item)
-    ensures: ResponsesPrivateReasoningItem.created(owner_message_id: owner_message_id, item: item)
+rule ResponsesToolRoundOutputItemRetained {
+    when: AcceptResponsesToolRoundOutputItem(owner_message_id, item)
+    ensures: ResponsesPrivateOutputItem.created(owner_message_id: owner_message_id, item: item)
     @guidance
-        -- Admission refers to an accepted, non-stale response. The item retains
-        -- its full provider envelope, including encrypted_content when returned;
+        -- Admission refers to an accepted, non-stale response containing client
+        -- tool calls. Every output item retains its full provider envelope,
+        -- including phase and encrypted_content when returned;
         -- its source order is retained by the continuation contract. It cannot
         -- be reconstructed from a public reasoning summary after restart.
 }
@@ -1014,6 +1025,6 @@ surface ResponsesToolContinuationBoundary {
         fulfils llm/ToolHistoryIntegrity
         demands llm/ProviderRequestProjection
     provides:
-        AcceptResponsesReasoningItem(owner_message_id, item)
+        AcceptResponsesToolRoundOutputItem(owner_message_id, item)
         SelectResponsesTools(availability, support)
 }

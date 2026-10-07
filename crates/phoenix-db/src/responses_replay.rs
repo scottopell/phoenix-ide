@@ -123,6 +123,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_tool_round_envelopes_survive_reopen_retry_and_settlement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replay.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("replay", "replay", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut first = response("first");
+        first
+            .public_content
+            .insert(0, ContentBlock::text("Checking the workspace."));
+        first.output_items.remove(0);
+        first.output_items.insert(0,serde_json::json!({
+            "type":"message", "id":"commentary-first", "role":"assistant", "phase":"commentary",
+            "content":[{"type":"output_text", "text":"Checking the workspace.", "annotations":[], "extension":null}],
+            "provider_extension":{"nullable":null,"ordered":[1,2]}
+        }));
+        let mut second = response("second");
+        second
+            .public_content
+            .insert(0, ContentBlock::text("Checking the result."));
+        second.output_items.insert(1,serde_json::json!({
+            "type":"message", "id":"commentary-second", "role":"assistant", "phase":"commentary",
+            "content":[{"type":"output_text", "text":"Checking the result.", "annotations":[]}],
+            "provider_extension":null
+        }));
+        let expected = vec![first, second];
+        for set in &expected {
+            db.update_state_and_replay(
+                "replay",
+                &ConvState::LlmRequesting { attempt: 1 },
+                chrono::Utc::now(),
+                &ProviderReplayUpdate::Responses(set.clone()),
+            )
+            .await
+            .unwrap();
+        }
+        db.pool().close().await;
+        let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+        let loaded = reopened
+            .load_responses_replay_state("replay")
+            .await
+            .unwrap();
+        assert_eq!(loaded, expected);
+        assert!(loaded[0]
+            .output_items
+            .iter()
+            .all(|item| item["type"] != "reasoning"));
+        for set in &expected {
+            reopened
+                .update_state_and_replay(
+                    "replay",
+                    &ConvState::LlmRequesting { attempt: 2 },
+                    chrono::Utc::now(),
+                    &ProviderReplayUpdate::Responses(set.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            reopened
+                .load_responses_replay_state("replay")
+                .await
+                .unwrap(),
+            expected
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_responses_replay_items")
+            .fetch_one(reopened.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 5);
+        reopened
+            .update_state_and_replay(
+                "replay",
+                &ConvState::Idle,
+                chrono::Utc::now(),
+                &ProviderReplayUpdate::Clear,
+            )
+            .await
+            .unwrap();
+        reopened.pool().close().await;
+        let settled = Database::open(path.to_str().unwrap()).await.unwrap();
+        assert!(settled
+            .load_responses_replay_state("replay")
+            .await
+            .unwrap()
+            .is_empty());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_responses_replay_items")
+            .fetch_one(settled.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(
+            settled.get_conversation("replay").await.unwrap().state,
+            ConvState::Idle
+        );
+        settled.pool().close().await;
+    }
+
+    #[tokio::test]
     async fn responses_replay_is_ordered_idempotent_and_atomic_with_state() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("replay", "replay", "/tmp", true, None, None)

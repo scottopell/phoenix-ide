@@ -296,6 +296,7 @@ AND SHALL return one matching unavailable error result without execution when au
 WHEN preparing a provider request
 THE SYSTEM SHALL render the current conversation policy using only controls supported by the selected route and model
 AND SHALL preserve required provider-private continuation through retry and restart
+AND SHALL retain complete Responses tool-round output envelopes, including returned assistant phase, until exchange settlement
 AND SHALL keep provider-specific controls and private data outside portable public messages
 
 WHEN a provider switch settles or authoritatively abandons an exchange

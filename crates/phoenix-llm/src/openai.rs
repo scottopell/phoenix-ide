@@ -2042,10 +2042,6 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
 fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
     let output_items = resp.output.iter().map(|item| item.0.clone()).collect();
-    let has_reasoning = resp
-        .output
-        .iter()
-        .any(|item| item.output_type() == "reasoning");
     let mut content = Vec::new();
 
     for output in resp.output {
@@ -2145,7 +2141,7 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
             cache_read_tokens: cached,
         }
     });
-    response.provider_replay = if has_tool_calls && has_reasoning {
+    response.provider_replay = if has_tool_calls {
         Some(ProviderReplayUpdate::Responses(ResponsesResponseSet {
             response_id: resp.id,
             model: resp.model,
@@ -4933,11 +4929,15 @@ mod tests {
     }
 
     #[test]
-    fn responses_replay_preserves_full_envelopes_across_multiple_tool_rounds() {
+    fn commentary_without_reasoning_then_reasoning_round_replays_full_envelopes() {
         let mut request = restricted_request(&["bash"]);
         let mut expected = Vec::new();
         for (id, call) in [("r1", "c1"), ("r2", "c2")] {
-            let wire = reasoning_response(id, call);
+            let mut wire = reasoning_response(id, call);
+            if id == "r1" {
+                wire["output"].as_array_mut().unwrap().remove(0);
+                wire["output"][0]["phase"] = serde_json::json!("commentary");
+            }
             let response =
                 normalize_responses_api_response(serde_json::from_value(wire.clone()).unwrap())
                     .unwrap();
@@ -4981,14 +4981,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_round_without_reasoning_retains_existing_private_context() {
+    fn tool_round_without_reasoning_appends_its_full_output_then_terminal_clears() {
         let mut wire = reasoning_response("r1", "c1");
         wire["output"].as_array_mut().unwrap().remove(0);
         let response =
             normalize_responses_api_response(serde_json::from_value(wire.clone()).unwrap())
                 .unwrap();
         assert!(!response.end_turn);
-        assert!(response.provider_replay.is_none());
+        let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay else {
+            panic!("tool continuation must retain original output envelopes");
+        };
+        assert_eq!(set.output_items, wire["output"].as_array().unwrap().clone());
         wire["output"].as_array_mut().unwrap().pop();
         let response =
             normalize_responses_api_response(serde_json::from_value(wire).unwrap()).unwrap();

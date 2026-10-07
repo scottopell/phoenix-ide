@@ -17,3 +17,6 @@ Risks: retaining historical declarations must not authorize unavailable executio
 
 ## Implementation scope
 Separate durable retained declarations from current callable names. Persist anchored Anthropic native changes and exact owner-bound Responses output envelopes. Render restrictions for the selected route only, enforce withdrawals at dispatch, and atomically retire continuation state on settled provider changes. Restore missing legacy schemas only from authentic catalogs, with chronology-aware native rebaselining. Preserve private continuation through the chain QA consumer as well as the conversation runtime.
+
+## Completion and verification
+Implemented durable tool policy, lossless historical projection, route-specific wire controls, dispatch-time EUNAVAIL, private Responses envelopes, atomic switch settlement, and continuation incarnation checks. Regression coverage includes the original failed-MCP/private-Anthropic-owner journey through retry and restart, native anchor legality after new user input, phase-bearing Responses rounds without reasoning, and fresh Codex WebSocket contexts after provider switching. All 53 Allium models validate. Full CI passed on the implementation revision; final envelope coverage is gated on the PR checks. Independent adversarial review findings were repaired and covered with regressions.
