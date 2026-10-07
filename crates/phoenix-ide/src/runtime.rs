@@ -12194,6 +12194,14 @@ mod scope_liveness_tests {
         let conversation_id = "single-flight-one-error";
         let broadcaster = mgr.conversation_broadcaster(conversation_id).await;
         let mut receiver = broadcaster.subscribe();
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        mgr.runtime_materialization_panics
+            .lock()
+            .await
+            .insert(conversation_id.to_string());
 
         let first = {
             let mgr = Arc::clone(&mgr);
@@ -12206,7 +12214,11 @@ mod scope_liveness_tests {
         assert!(first.await.expect("first caller joins").is_err());
         assert!(second.await.expect("second caller joins").is_err());
 
-        assert!(matches!(receiver.try_recv(), Ok(SseEvent::Error { .. })));
+        let first_event = receiver.try_recv();
+        assert!(
+            matches!(first_event, Ok(SseEvent::Error { .. })),
+            "expected one materialization error event, got {first_event:?}"
+        );
         assert!(matches!(
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
