@@ -1,10 +1,10 @@
 # ADR-084: Canonical short ProductConversation navigation
 
-Status: Accepted
+- **Status:** Accepted
 
-Date: 2026-10-07
+- **Date:** 2026-10-07
 
-Affects: ProductConversation browser navigation and compatibility reference resolution.
+- **Affects:** REQ-GR-009 — ProductConversation browser navigation and compatibility reference resolution.
 
 ## Context
 
