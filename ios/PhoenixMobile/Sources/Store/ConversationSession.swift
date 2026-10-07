@@ -191,6 +191,8 @@ final class ConversationSession {
         self.snapshotWriter = DiskStore.versionedWriter(
             name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)
 
+        let hasVisibleLegacyOutbox = Outbox.hasVisibleLegacyEntries(conversationId: conversationId)
+
         switch DiskStore.loadVersionedResult(
             Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion)
         {
@@ -203,7 +205,12 @@ final class ConversationSession {
         case .missing, .incompatible, .unreadable:
             guard let legacy = DiskStore.loadVersioned(
                 LegacySnapshot.self, name: snapshotName, version: 1)
-            else { return }
+            else {
+                if hasVisibleLegacyOutbox {
+                    fenceSnapshotAuthority(.unprovenLegacyScope)
+                }
+                return
+            }
             legacySnapshotReadOnly = true
             deliveryAllowed = false
             snapshotPersistenceEnabled = false

@@ -758,6 +758,38 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(Outbox(conversationId: "unrelated-owner").visibleEntries.map(\.text), ["retain me"])
     }
 
+    func testLegacyOutboxWithoutReadableSnapshotIsNotAdmittedByPersistedSweep() async throws {
+        for snapshot in ["missing", "unreadable", "newer"] {
+            DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("phoenix-legacy-outbox-\(snapshot)-\(UUID().uuidString)")
+            let conversationId = "legacy-\(snapshot)"
+            let legacy = OutboxEntry(
+                localId: "legacy-entry", conversationId: conversationId, text: "must not post",
+                images: [], status: .pending, acceptedByServer: false, createdAt: Date(),
+                acceptedAt: nil, lastError: nil, attemptCount: 0)
+            XCTAssertTrue(DiskStore.saveVersioned(
+                [legacy], name: "outbox-\(conversationId)", version: 1))
+            switch snapshot {
+            case "unreadable":
+                try Data("not a snapshot".utf8).write(to: DiskStore.url(for: "conv-\(conversationId)"))
+            case "newer":
+                XCTAssertTrue(DiskStore.saveVersioned(
+                    ["newer"], name: "conv-\(conversationId)", version: 3))
+            default: break
+            }
+
+            let model = self.model()
+            model.installAPIForTesting(baseURL: URL(string: "http://127.0.0.1:1")!)
+            model.drainPersistedOutboxesForTesting()
+
+            XCTAssertNil(model.drainSessionForTesting(conversationId: conversationId))
+            XCTAssertTrue(DiskStore.loadVersioned(
+                [OutboxEntry].self, name: "outbox-\(conversationId)", version: 1)?.contains {
+                    $0.localId == legacy.localId
+                } == true)
+        }
+    }
+
     func testPersistedOutboxIsEnumeratedAndReloadedByItsOwner() async throws {
         let conversationId = "c1"
         let writer = Outbox(conversationId: conversationId)

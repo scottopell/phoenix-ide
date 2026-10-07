@@ -76,8 +76,9 @@ final class Outbox {
     private let writer: VersionedDiskWriter
     private var latestPersistenceRevision = 0
 
-    /// v1 stores visible OutboxEntry values in a versioned envelope.
-    static let schemaVersion = 1
+    /// v2 identifies entries written after persistence-scope authority was introduced.
+    static let schemaVersion = 2
+    private static let legacySchemaVersion = 1
 
     private var storeName: String { "outbox-\(conversationId)" }
 
@@ -108,6 +109,19 @@ final class Outbox {
 
     var hasSendableEntries: Bool {
         entries.contains { $0.status == .pending && !$0.acceptedByServer }
+    }
+
+    static func hasVisibleLegacyEntries(conversationId: String) -> Bool {
+        switch DiskStore.loadVersionedResult(
+            [OutboxEntry].self,
+            name: "outbox-\(conversationId)",
+            version: legacySchemaVersion)
+        {
+        case let .value(entries):
+            entries.contains { $0.conversationId == conversationId && $0.isVisible }
+        case .missing, .incompatible, .unreadable:
+            false
+        }
     }
 
     static func storedContents(conversationId: String) -> StoredContents {
