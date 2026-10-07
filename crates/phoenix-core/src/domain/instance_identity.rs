@@ -7,6 +7,8 @@ pub enum InstanceIdParseError {
     InvalidUuid(#[from] uuid::Error),
     #[error("instance identity must be UUIDv4")]
     NotVersionFour,
+    #[error("instance identity must use the RFC 4122 variant")]
+    NotRfc4122,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,6 +38,9 @@ impl FromStr for InstanceId {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let uuid = uuid::Uuid::parse_str(value)?;
+        if uuid.get_variant() != uuid::Variant::RFC4122 {
+            return Err(InstanceIdParseError::NotRfc4122);
+        }
         if uuid.get_version_num() != 4 {
             return Err(InstanceIdParseError::NotVersionFour);
         }
@@ -89,13 +94,21 @@ mod tests {
     #[test]
     fn instance_identity_rejects_non_v4_uuids() {
         for value in [
-            "00000000-0000-0000-0000-000000000000",
             "d9428888-122b-11e1-b85c-61cd3cbb3210",
             "21f7f8de-8051-5b89-8680-0195ef798b6a",
         ] {
             assert!(matches!(
                 InstanceId::from_str(value),
                 Err(InstanceIdParseError::NotVersionFour)
+            ));
+        }
+        for value in [
+            "00000000-0000-0000-0000-000000000000",
+            "00000000-0000-4000-0000-000000000000",
+        ] {
+            assert!(matches!(
+                InstanceId::from_str(value),
+                Err(InstanceIdParseError::NotRfc4122)
             ));
         }
         assert!(InstanceId::from_str(&InstanceId::new().to_string()).is_ok());
