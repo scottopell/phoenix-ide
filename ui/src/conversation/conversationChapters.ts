@@ -86,6 +86,7 @@ export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Ch
     switch (unit.kind) {
       case 'user':
       case 'pending_user': {
+        if (unit.message.origin?.kind === 'subscription_event') break;
         const text = userText(unit);
         if (text.trim().length === 0) break;
         chapters.push({
