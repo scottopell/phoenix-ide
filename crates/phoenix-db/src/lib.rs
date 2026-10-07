@@ -10,6 +10,7 @@ mod close_foundation;
 mod coordinator_query;
 mod coordinator_watches;
 mod federation_enrollment;
+mod federation_peers;
 pub use coordinator_watches::{PendingWatchEvent, WatchSnapshot};
 mod ddl;
 mod git_repository_reconciliation;
