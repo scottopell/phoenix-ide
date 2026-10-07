@@ -29,9 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Maximum number of tool-using turns the Q&A agent may take before it must
-/// answer (REQ-CHN-009). Bounds cost/latency so the loop terminates; the
-/// agent typically searches once or twice and reads a member or two.
+/// Maximum provider requests per Q&A invocation, including final answer retries.
 const MAX_QA_TURNS: usize = 6;
 
 /// Maximum tool calls actually executed in one planning turn. Providers may
@@ -366,6 +364,7 @@ impl ChainQa {
             ))],
         }];
 
+        let mut planning_requests = 0;
         for turn in 0..MAX_QA_TURNS {
             // Final allowed turn: answer directly (streamed, no tools).
             if turn + 1 == MAX_QA_TURNS {
@@ -385,6 +384,7 @@ impl ChainQa {
             let mut request = request;
             request.provider_replay = provider_replay.clone();
             request.responses_replay = responses_replay.clone();
+            planning_requests += 1;
             let resp = prep
                 .service
                 .complete(&request)
@@ -405,34 +405,17 @@ impl ChainQa {
                 break;
             }
 
-            if let Some(update) = resp.provider_replay.clone() {
-                use phoenix_core::domain::provider_replay::{
-                    AnthropicReplayPayload, ProviderReplayUpdate,
-                };
-                match update {
-                    ProviderReplayUpdate::Anthropic(response) => {
-                        let mut sets = provider_replay
-                            .take()
-                            .map_or_else(Vec::new, |p| p.response_sets);
-                        sets.push(response.with_owner_message_id(format!("chain-qa-{turn}")));
-                        provider_replay =
-                            Some(AnthropicReplayPayload::new(sets).map_err(|error| {
-                                RunInvocationError {
-                                    error: ChainQaError::Llm(error.to_string()),
-                                    partial_answer: None,
-                                }
-                            })?);
-                    }
-                    ProviderReplayUpdate::Responses(response) => {
-                        responses_replay
-                            .push(response.with_owner_message_id(format!("chain-qa-{turn}")));
-                    }
-                    ProviderReplayUpdate::Clear => {
-                        provider_replay = None;
-                        responses_replay.clear();
-                    }
-                }
-            }
+            adopt_qa_replay(
+                &mut request,
+                resp.provider_replay.clone(),
+                format!("chain-qa-{turn}"),
+            )
+            .map_err(|error| RunInvocationError {
+                error: ChainQaError::Llm(error),
+                partial_answer: None,
+            })?;
+            provider_replay = request.provider_replay.take();
+            responses_replay = std::mem::take(&mut request.responses_replay);
 
             // Execute the tools and feed results back. Re-resolve the chain's
             // members live so a continuation added mid-run is in scope
@@ -503,6 +486,7 @@ impl ChainQa {
                 provider_replay,
                 responses_replay,
                 index_fresh,
+                MAX_QA_TURNS - planning_requests,
                 prep,
                 runtime,
             )
@@ -522,16 +506,15 @@ impl ChainQa {
         Some(compute_chain_snapshot(&members))
     }
 
-    /// Final turn: an invocation with new tool calls disabled that streams onto the
-    /// chain broadcaster as they arrive (REQ-CHN-004). Only this turn is
-    /// published — planning turns ran non-streamed — so the user sees a working
-    /// indicator, then the answer streaming in.
+    /// Stream the final answer phase onto the chain broadcaster (REQ-CHN-004).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn stream_final_answer(
         &self,
         messages: &[LlmMessage],
         provider_replay: Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
         responses_replay: Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>,
         search_enabled: bool,
+        remaining_turns: usize,
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
     ) -> Result<String, RunInvocationError> {
@@ -546,38 +529,76 @@ impl ChainQa {
         let mut request = request;
         request.provider_replay = provider_replay;
         request.responses_replay = responses_replay;
-        let (chunk_tx, mut chunk_rx) = mpsc::channel::<TokenChunk>(256);
-        let qa_id = prep.row_id.clone();
-        let runtime_handle = Arc::clone(runtime);
-        let forwarder = tokio::spawn(async move {
-            let mut partial = String::new();
-            loop {
-                match chunk_rx.recv().await {
-                    Some(TokenChunk::Text(delta)) => {
+        let mut partial = String::new();
+        for turn in 0..remaining_turns {
+            let (chunk_tx, mut chunk_rx) = mpsc::channel::<TokenChunk>(256);
+            let qa_id = prep.row_id.clone();
+            let runtime_handle = Arc::clone(runtime);
+            let forwarder = tokio::spawn(async move {
+                let mut partial = String::new();
+                while let Some(chunk) = chunk_rx.recv().await {
+                    if let TokenChunk::Text(delta) = chunk {
                         partial.push_str(&delta);
                         runtime_handle.publish(ChainSseEvent::Token {
                             chain_qa_id: qa_id.clone(),
                             delta,
                         });
                     }
-                    Some(TokenChunk::RateLimitSnapshot(_)) => {}
-                    None => break,
                 }
+                partial
+            });
+            let response = prep.service.complete_streaming(&request, &chunk_tx).await;
+            drop(chunk_tx);
+            partial.push_str(&forwarder.await.unwrap_or_default());
+            let response = response.map_err(|error| RunInvocationError {
+                error: ChainQaError::from(error),
+                partial_answer: (!partial.is_empty()).then(|| partial.clone()),
+            })?;
+            let tool_calls = response.tool_uses();
+            if tool_calls.is_empty() {
+                return if response.end_turn {
+                    Ok(response.text())
+                } else {
+                    Err(RunInvocationError {
+                        error: ChainQaError::Llm("final answer response did not terminate".into()),
+                        partial_answer: (!partial.is_empty()).then_some(partial),
+                    })
+                };
             }
-            partial
-        });
-
-        let response = prep.service.complete_streaming(&request, &chunk_tx).await;
-        drop(chunk_tx);
-        let partial = forwarder.await.unwrap_or_default();
-
-        match response {
-            Ok(resp) => Ok(resp.text()),
-            Err(e) => Err(RunInvocationError {
-                error: ChainQaError::from(e),
-                partial_answer: (!partial.is_empty()).then_some(partial),
-            }),
+            let owner_id = format!("chain-qa-final-{turn}");
+            adopt_qa_replay(
+                &mut request,
+                response.provider_replay.clone(),
+                owner_id.clone(),
+            )
+            .map_err(|error| RunInvocationError {
+                error: ChainQaError::Llm(error),
+                partial_answer: (!partial.is_empty()).then(|| partial.clone()),
+            })?;
+            let results = tool_calls
+                .into_iter()
+                .map(|(id, name, _)| ContentBlock::ToolResult {
+                    tool_use_id: id.to_owned(),
+                    content: format!("EUNAVAIL: tool {name} is unavailable; answer without tools"),
+                    images: Vec::new(),
+                    is_error: true,
+                })
+                .collect();
+            request.messages.push(LlmMessage {
+                source_message_id: Some(owner_id),
+                role: MessageRole::Assistant,
+                content: response.content,
+            });
+            request.messages.push(LlmMessage {
+                source_message_id: Some(format!("chain-qa-final-results-{turn}")),
+                role: MessageRole::User,
+                content: results,
+            });
         }
+        Err(RunInvocationError {
+            error: ChainQaError::Llm("Q&A request limit reached before a terminal answer".into()),
+            partial_answer: (!partial.is_empty()).then_some(partial),
+        })
     }
 
     /// Block until the chain's index is fresh for its members, or the wait
@@ -1103,6 +1124,36 @@ fn trailing_continuation_summary(messages: &[Message]) -> Option<String> {
     })
 }
 
+fn adopt_qa_replay(
+    request: &mut LlmRequest,
+    update: Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    owner_id: String,
+) -> Result<(), String> {
+    use phoenix_core::domain::provider_replay::{AnthropicReplayPayload, ProviderReplayUpdate};
+    match update {
+        Some(ProviderReplayUpdate::Anthropic(response)) => {
+            let mut sets = request
+                .provider_replay
+                .take()
+                .map_or_else(Vec::new, |p| p.response_sets);
+            sets.push(response.with_owner_message_id(owner_id));
+            request.provider_replay =
+                Some(AnthropicReplayPayload::new(sets).map_err(|e| e.to_string())?);
+        }
+        Some(ProviderReplayUpdate::Responses(response)) => {
+            request
+                .responses_replay
+                .push(response.with_owner_message_id(owner_id));
+        }
+        Some(ProviderReplayUpdate::Clear) => {
+            request.provider_replay = None;
+            request.responses_replay.clear();
+        }
+        None => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1241,6 +1292,198 @@ mod tool_policy_tests {
             .unwrap_or_else(|failure| panic!("QA failed: {}", failure.error));
         assert_eq!(outcome.answer, "final answer");
         assert_eq!(llm.rounds.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[derive(Debug)]
+    struct DeniedFinalQaLlm {
+        final_requests: std::sync::atomic::AtomicUsize,
+        denied_rounds: usize,
+        terminal: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmService for DeniedFinalQaLlm {
+        async fn complete(&self, _: &LlmRequest) -> Result<phoenix_llm::LlmResponse, LlmError> {
+            Ok(phoenix_llm::LlmResponse::non_streaming(
+                vec![ContentBlock::text("ready")],
+                true,
+                phoenix_llm::Usage::default(),
+            ))
+        }
+
+        async fn complete_streaming(
+            &self,
+            request: &LlmRequest,
+            tx: &mpsc::Sender<TokenChunk>,
+        ) -> Result<phoenix_llm::LlmResponse, LlmError> {
+            use phoenix_core::domain::{
+                provider_replay::ProviderReplayUpdate, responses_replay::ResponsesResponseSet,
+            };
+            let turn = self
+                .final_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(request.tool_availability.callable_names().is_empty());
+            assert!(request
+                .tool_availability
+                .anthropic_changes()
+                .iter()
+                .all(|change| change.after_message_id == "chain-qa-question"));
+            assert_eq!(request.responses_replay.len(), turn);
+            for prior in 0..turn {
+                let set = &request.responses_replay[prior];
+                assert_eq!(set.owner_message_id, format!("chain-qa-final-{prior}"));
+                assert_eq!(set.output_items[0]["encrypted_content"], "private-final");
+                let owner = request
+                    .messages
+                    .iter()
+                    .find(|message| {
+                        message.source_message_id.as_deref() == Some(set.owner_message_id.as_str())
+                    })
+                    .unwrap();
+                assert_eq!(owner.content, set.public_content);
+                let results: Vec<_> = request
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                            ..
+                        } if tool_use_id == &format!("denied-{prior}") => Some((content, is_error)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(results.len(), 1);
+                assert!(*results[0].1);
+                assert_eq!(
+                    results[0].0,
+                    "EUNAVAIL: tool read_conversation is unavailable; answer without tools"
+                );
+            }
+            if turn >= self.denied_rounds {
+                tx.send(TokenChunk::Text("terminal answer".into()))
+                    .await
+                    .unwrap();
+                return Ok(phoenix_llm::LlmResponse::non_streaming(
+                    vec![ContentBlock::text("terminal answer")],
+                    self.terminal,
+                    phoenix_llm::Usage::default(),
+                ));
+            }
+            tx.send(TokenChunk::Text("unfinished narration".into()))
+                .await
+                .unwrap();
+            let content = vec![
+                ContentBlock::text("unfinished narration"),
+                ContentBlock::ToolUse {
+                    id: format!("denied-{turn}"),
+                    name: "read_conversation".into(),
+                    input: serde_json::json!({"conversation_id":"qa-denied-root"}),
+                },
+            ];
+            let mut response = phoenix_llm::LlmResponse::non_streaming(
+                content.clone(),
+                false,
+                phoenix_llm::Usage::default(),
+            );
+            response.provider_replay =
+                Some(ProviderReplayUpdate::Responses(ResponsesResponseSet {
+                    response_id: format!("denied-response-{turn}"),
+                    model: "test-model".into(),
+                    owner_message_id: String::new(),
+                    public_content: content,
+                    output_items: vec![
+                        serde_json::json!({"type":"reasoning","encrypted_content":"private-final"}),
+                    ],
+                }));
+            Ok(response)
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    async fn run_denied_final(
+        denied_rounds: usize,
+        terminal: bool,
+    ) -> (
+        Result<AnswerOutcome, RunInvocationError>,
+        Arc<DeniedFinalQaLlm>,
+    ) {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("qa-denied-root", "qa-denied", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let llm = Arc::new(DeniedFinalQaLlm {
+            final_requests: std::sync::atomic::AtomicUsize::default(),
+            denied_rounds,
+            terminal,
+        });
+        let registry = Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone()));
+        let qa = ChainQa::new(db.clone(), registry, Arc::new(db.fts_retriever()));
+        let prep = PreparedInvocation {
+            row_id: "qa-denied-row".into(),
+            question: "What changed?".into(),
+            skeleton: "#qa-denied-root".into(),
+            root_id: "qa-denied-root".into(),
+            snapshot: ChainSnapshot {
+                member_count: 1,
+                total_messages: 0,
+            },
+            service: llm.clone(),
+            model_id: "test-model".into(),
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            max_output_tokens: None,
+            language: crate::llm_language::LlmLanguage::PhoenixNative,
+        };
+        let runtime = qa.runtime_registry.get_or_create(&prep.root_id).await;
+        (qa.run_answer_invocation(&prep, &runtime).await, llm)
+    }
+
+    #[tokio::test]
+    async fn final_tool_call_gets_one_unavailable_result_and_replay_before_terminal_answer() {
+        let (outcome, llm) = run_denied_final(1, true).await;
+        assert_eq!(
+            outcome
+                .unwrap_or_else(|failure| panic!("{}", failure.error))
+                .answer,
+            "terminal answer"
+        );
+        assert_eq!(
+            llm.final_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn final_tool_calls_exhaust_existing_request_budget_without_false_success() {
+        let (outcome, llm) = run_denied_final(usize::MAX, true).await;
+        let Err(failure) = outcome else {
+            panic!("tool calls cannot complete an answer")
+        };
+        assert!(failure.error.to_string().contains("request limit"));
+        assert!(failure
+            .partial_answer
+            .unwrap()
+            .contains("unfinished narration"));
+        assert_eq!(
+            llm.final_requests.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_QA_TURNS - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn nonterminal_final_text_is_failed_with_partial_answer() {
+        let (outcome, _) = run_denied_final(0, false).await;
+        let Err(failure) = outcome else {
+            panic!("nonterminal text cannot complete an answer")
+        };
+        assert!(failure.error.to_string().contains("did not terminate"));
+        assert_eq!(failure.partial_answer.as_deref(), Some("terminal answer"));
     }
 
     #[test]
