@@ -157,21 +157,20 @@ impl Scenario {
 /// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     let text = request.messages.iter().rev().find_map(|m| {
-        if m.role == super::types::MessageRole::User {
-            Some(
-                m.content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<String>(),
-            )
-        } else {
-            None
+        if m.role != super::types::MessageRole::User {
+            return None;
         }
+        let text = m
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        text.contains("[[scenario:").then_some(text)
     })?;
-    let start = text.find("[[scenario:")? + "[[scenario:".len();
+    let start = text.find("[[scenario:").expect("filtered above") + "[[scenario:".len();
     let rest = text.get(start..)?;
     let end = rest.find("]]")?;
     let name = rest.get(..end)?.trim();
@@ -1045,6 +1044,22 @@ mod tests {
         }
         assert!(parse_scenario(&user_req("no marker here")).is_none());
         assert!(parse_scenario(&user_req("[[scenario:bogus]]")).is_none());
+    }
+
+    #[test]
+    fn scenario_marker_survives_synthesized_user_answer() {
+        let mut request = user_req("[[scenario:ask_user_question]]");
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "Here are my answers".into(),
+            }],
+        });
+        assert!(matches!(
+            parse_scenario(&request),
+            Some(Scenario::AskUserQuestion { ordinal: 0 })
+        ));
     }
 
     #[test]
