@@ -3141,7 +3141,7 @@ impl Database {
                          AND residual.identity_value=target.captured_worktree_identity
                          AND residual.proof_kind='residual'
                          AND residual.residual_reason='manual_repair_required'
-                         AND instr(residual.detail, '(code: 787) FOREIGN KEY constraint failed') > 0
+                         AND residual.detail = 'cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed'
                    )
              )
              AND NOT EXISTS (
@@ -10897,6 +10897,76 @@ mod tests {
         assert_eq!(retried.snapshot(), Some(&snapshot));
     }
 
+    async fn capture_legacy_test_inventory(
+        db: &Database,
+        attempt: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+        extra_resources: &[(WorkScopeId, RetiredResourceIdentity)],
+    ) {
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO close_retirement_inventories (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint, sealed, captured_at
+             ) SELECT attempt_id, scope, ?2, ?3, 0, ?4
+               FROM close_attempt_scopes WHERE attempt_id = ?1",
+        )
+        .bind(attempt.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_expected_retirement_resources (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value
+             ) SELECT attempt_id, scope, ?2, ?3, 'work_scope', 'opaque', 'opaque_string_v1', scope
+               FROM close_attempt_scopes WHERE attempt_id = ?1
+               UNION ALL
+               SELECT attempt_id, scope, ?2, ?3, 'worktree', 'worktree', 'worktree_id_v1',
+                      captured_worktree_identity
+               FROM close_attempt_scopes
+               WHERE attempt_id = ?1 AND captured_worktree_identity IS NOT NULL",
+        )
+        .bind(attempt.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        for (scope, resource) in extra_resources {
+            sqlx::query(
+                "INSERT INTO close_expected_retirement_resources (
+                     attempt_id, scope, inspection_generation, inspection_fingerprint,
+                     resource_kind, identity_kind, identity_codec, identity_value
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .bind(attempt.as_str())
+            .bind(scope.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .bind(resource.kind().as_str())
+            .bind(resource.identity().identity_kind())
+            .bind(resource.identity().codec())
+            .bind(resource.identity().value())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE close_retirement_inventories SET sealed = 1
+             WHERE attempt_id = ?1 AND inspection_generation = ?2 AND inspection_fingerprint = ?3",
+        )
+        .bind(attempt.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn legacy_fk787_fixture(
         residual_shape: &str,
@@ -10910,12 +10980,15 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        let leaf_scope = db
-            .get_conversation("leaf")
-            .await
-            .unwrap()
-            .attached_work_scope_id
-            .unwrap();
+        let leaf_scope = if residual_shape == "wrong scope" {
+            allocate_scope_worktree(&db, "leaf").await
+        } else {
+            db.get_conversation("leaf")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .unwrap()
+        };
         let attempt = CloseAttemptId::parse("attempt-legacy-fk787").unwrap();
         db.begin_close_foundation(
             &product_id("root"),
@@ -10967,26 +11040,26 @@ mod tests {
         .await
         .unwrap();
         db.retry_close_retirement(&attempt).await.unwrap();
+        let inspection_scopes = if residual_shape == "wrong scope" {
+            vec![scope.clone(), leaf_scope.clone()]
+        } else {
+            vec![scope.clone()]
+        };
         db.replace_close_inspection(ReplaceCloseInspectionRequest {
             attempt_id: attempt.clone(),
-            scopes: vec![ReplaceCloseInspectionScopeRequest {
-                scope: scope.clone(),
-                snapshot: CloseRetirementSnapshot::parse("legacy-retry", "legacy-retry-fp")
-                    .unwrap(),
-                losses: Vec::new(),
-            }],
+            scopes: inspection_scopes
+                .into_iter()
+                .map(|scope| ReplaceCloseInspectionScopeRequest {
+                    scope,
+                    snapshot: CloseRetirementSnapshot::parse("legacy-retry", "legacy-retry-fp")
+                        .unwrap(),
+                    losses: Vec::new(),
+                })
+                .collect(),
         })
         .await
         .unwrap();
         let target = current_test_snapshot(&db, attempt.as_str()).await;
-        capture_test_inventory(
-            &db,
-            attempt.as_str(),
-            &scope,
-            &target,
-            vec![resource.clone()],
-        )
-        .await;
         let residual = if residual_shape == "wrong identity" {
             RetiredResourceIdentity::parse(
                 RetiredResourceKind::Worktree,
@@ -11001,20 +11074,71 @@ mod tests {
         } else {
             resource
         };
+        let residual_scope = if residual_shape == "wrong scope" {
+            leaf_scope
+        } else {
+            scope.clone()
+        };
+        if matches!(
+            residual_shape,
+            "wrong identity" | "wrong scope" | "extra residual"
+        ) {
+            let malformed_resources = matches!(residual_shape, "wrong identity" | "wrong scope")
+                .then(|| (residual_scope.clone(), residual.clone()))
+                .into_iter()
+                .collect::<Vec<_>>();
+            capture_legacy_test_inventory(&db, &attempt, &target, &malformed_resources).await;
+        } else {
+            capture_test_inventory(
+                &db,
+                attempt.as_str(),
+                &scope,
+                &target,
+                vec![residual.clone()],
+            )
+            .await;
+        }
         db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
             attempt_id: attempt.clone(),
-            scope: if residual_shape == "wrong scope" {
-                leaf_scope
-            } else {
-                scope.clone()
-            },
-            residual,
+            scope: residual_scope,
+            residual: residual.clone(),
             reason: RetirementFailureReason::ManualRepairRequired,
-            detail: "cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed"
-                .to_string(),
+            detail: if residual_shape == "unrelated generic 787" {
+                "unrelated persistence: (code: 787) FOREIGN KEY constraint failed"
+            } else {
+                "cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed"
+            }
+            .to_string(),
         })
         .await
         .unwrap();
+        if residual_shape == "wrong scope" {
+            db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt.clone(),
+                scope: scope.clone(),
+                residual,
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: "cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed"
+                    .to_string(),
+            })
+            .await
+            .unwrap();
+        }
+        if residual_shape == "extra residual" {
+            db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt.clone(),
+                scope: scope.clone(),
+                residual: RetiredResourceIdentity::parse(
+                    RetiredResourceKind::WorkScope,
+                    LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.as_str()).unwrap()),
+                )
+                .unwrap(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: "unrelated manual repair".to_string(),
+            })
+            .await
+            .unwrap();
+        }
         db.retry_close_retirement(&attempt).await.unwrap();
         (db, attempt, scope, target)
     }
@@ -11109,21 +11233,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_fk787_resume_rejects_extra_residual() {
-        let (db, attempt, scope, _) = legacy_fk787_fixture("exact").await;
-        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
-            attempt_id: attempt.clone(),
-            scope: scope.clone(),
-            residual: RetiredResourceIdentity::parse(
-                RetiredResourceKind::WorkScope,
-                LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.as_str()).unwrap()),
-            )
-            .unwrap(),
-            reason: RetirementFailureReason::ManualRepairRequired,
-            detail: "unrelated manual repair".to_string(),
-        })
-        .await
-        .unwrap();
-        db.retry_close_retirement(&attempt).await.unwrap();
+        let (db, attempt, _, _) = legacy_fk787_fixture("extra residual").await;
         let rows = legacy_fk787_retained_rows(&db).await;
         assert!(db
             .resume_legacy_fk787_close_retirement_generation(&attempt)
@@ -11138,6 +11248,23 @@ mod tests {
                 .phase(),
             ClosePhase::AwaitingRetirementInspection
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_fk787_resume_rejects_unrelated_generic_787() {
+        let (db, attempt, _, _) = legacy_fk787_fixture("unrelated generic 787").await;
+        let before = db.get_close_obligation(attempt.as_str()).await.unwrap();
+        let rows = legacy_fk787_retained_rows(&db).await;
+        assert!(db
+            .resume_legacy_fk787_close_retirement_generation(&attempt)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.get_close_obligation(attempt.as_str()).await.unwrap(),
+            before
+        );
+        assert_eq!(legacy_fk787_retained_rows(&db).await, rows);
     }
 
     #[tokio::test]
@@ -11192,6 +11319,121 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    async fn adopted_cleanup_test_fixture() -> (Database, CloseAttemptId, CloseRetirementSnapshot) {
+        let (db, attempt, scope, snapshot) = legacy_fk787_fixture("exact").await;
+        db.resume_legacy_fk787_close_retirement_generation(&attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        db.adopt_close_worktree_cleanup_plan(AdoptCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt.clone(),
+            scope: scope.clone(),
+            target_snapshot: snapshot.clone(),
+            resource: RetiredResourceIdentity::parse(
+                RetiredResourceKind::Worktree,
+                LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+            )
+            .unwrap(),
+            observed_administrative_dir: std::path::PathBuf::from(
+                "/tmp/git/worktrees/legacy-fk787",
+            ),
+            observed_administrative_dir_incarnation: "legacy-admin-v1".to_string(),
+        })
+        .await
+        .unwrap();
+        (db, attempt, snapshot)
+    }
+
+    #[tokio::test]
+    async fn active_close_cleanup_adoption_rejects_direct_delete() {
+        let (db, attempt, _) = adopted_cleanup_test_fixture().await;
+        let rows = legacy_fk787_retained_rows(&db).await;
+        let error =
+            sqlx::query("DELETE FROM close_worktree_cleanup_adoptions WHERE attempt_id = ?1")
+                .bind(attempt.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cleanup adoption lineage is immutable"));
+        assert_eq!(legacy_fk787_retained_rows(&db).await, rows);
+        assert!(db.delete_conversation("root").await.is_err());
+        assert_eq!(legacy_fk787_retained_rows(&db).await, rows);
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_adopted_close_hard_delete_removes_last_member_and_is_fk_clean() {
+        let (db, attempt, snapshot) = adopted_cleanup_test_fixture().await;
+        for expected in db
+            .list_close_expected_retirement_resources(attempt.as_str())
+            .await
+            .unwrap()
+        {
+            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: attempt.clone(),
+                snapshot: snapshot.clone(),
+                scope: expected.scope,
+                resource: expected.resource,
+                outcome: RetirementOutcome::Retired,
+                detail: None,
+            })
+            .await
+            .unwrap();
+        }
+        db.complete_close_retirement(&attempt).await.unwrap();
+        let rows = legacy_fk787_retained_rows(&db).await;
+        let error =
+            sqlx::query("DELETE FROM close_worktree_cleanup_adoptions WHERE attempt_id = ?1")
+                .bind(attempt.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cleanup adoption lineage is immutable"));
+        assert_eq!(legacy_fk787_retained_rows(&db).await, rows);
+        db.delete_conversation("root").await.unwrap();
+        let retained: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_worktree_cleanup_adoptions")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, 1);
+        assert!(matches!(
+            db.delete_conversation_with_aggregate_result("leaf").await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(true))
+        ));
+        for table in [
+            "product_conversations",
+            "close_obligations",
+            "close_attempt_members",
+            "close_attempt_scopes",
+            "close_worktree_cleanup_adoptions",
+            "close_worktree_cleanup_plans",
+            "close_retirement_resource_dispatches",
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
     }
 
     #[allow(clippy::too_many_lines)]
@@ -11761,6 +12003,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatched_absence_retry_resumes_retirement_with_retained_snapshot() {
+        dispatched_absence_retry_resumes_retirement_with_retained_snapshot_fixture().await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn dispatched_absence_retry_resumes_retirement_with_retained_snapshot_fixture() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;

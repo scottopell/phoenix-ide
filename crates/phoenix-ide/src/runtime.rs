@@ -564,6 +564,10 @@ impl From<String> for SteeringAdmissionError {
     }
 }
 
+#[cfg(test)]
+pub(crate) type TestAmbientWriterObserver =
+    Arc<dyn Fn(&std::path::Path) -> Result<bool, String> + Send + Sync>;
+
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
@@ -587,6 +591,8 @@ pub struct RuntimeManager {
     pub(crate) close_retirement_leases:
         AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
     close_retirement_execution: ConversationMutexGates,
+    #[cfg(test)]
+    pub(crate) test_ambient_writer_observer: Option<TestAmbientWriterObserver>,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
@@ -2362,6 +2368,8 @@ impl RuntimeManager {
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             close_retirement_leases: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_ambient_writer_observer: None,
             close_retirement_execution: ConversationMutexGates::default(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
@@ -3413,38 +3421,11 @@ impl RuntimeManager {
                 if !matches!(
                     obligation.phase(),
                     phoenix_core::domain::close::ClosePhase::RetirementRequested
-                        | phoenix_core::domain::close::ClosePhase::NeedsRepair
                 ) {
                     return Ok(false);
                 }
-                let retried = if obligation.phase()
-                    == phoenix_core::domain::close::ClosePhase::NeedsRepair
-                {
-                    manager
-                        .db
-                        .retry_close_retirement(obligation.attempt_id())
-                        .await
-                        .map_err(|error| error.to_string())?
-                } else {
-                    obligation.clone()
-                };
-                if retried.phase()
-                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                {
-                    return match manager
-                        .inspect_close_retirement(retried.attempt_id().clone())
-                        .await
-                    {
-                        Ok(_) => Ok(true),
-                        Err(error) => {
-                            tracing::warn!(attempt_id = %retried.attempt_id(), %error,
-                                "Close retirement inspection could not be rebuilt during repair recovery");
-                            Ok(false)
-                        }
-                    };
-                }
                 match manager
-                    .retire_close_runtime_resources(retried.attempt_id().clone())
+                    .retire_close_runtime_resources(obligation.attempt_id().clone())
                     .await
                 {
                     Ok(()) => Ok(true),
@@ -8870,6 +8851,478 @@ mod scope_liveness_tests {
             .await
             .expect("capture retirement inventory");
         attempt_id
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn prepare_legacy_fk787_runtime_fixture(
+        manager: &RuntimeManager,
+    ) -> (tempfile::TempDir, CloseAttemptId, WorkScopeId, String) {
+        let repository = tempfile::tempdir().unwrap();
+        let git = |arguments: &[&str]| {
+            let output = phoenix_core::git::command()
+                .args(arguments)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "Close Test")
+                .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Close Test")
+                .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {arguments:?}: {output:?}");
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repository.path().join("tracked"), "initial\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        let worktree = repository.path().join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "retained-generation-retry",
+            worktree.to_str().unwrap(),
+        ]);
+        let conversation_id = "retained-generation-retry";
+        let ResourceScopeKey::Work(scope) =
+            create_handleless_work_conv(manager, conversation_id, worktree.to_str().unwrap(), None)
+                .await
+        else {
+            unreachable!()
+        };
+        let subordinate_id = "retained-generation-archived-descendant";
+        manager
+            .db()
+            .create_conversation_with_project(
+                subordinate_id,
+                subordinate_id,
+                repository.path().to_str().unwrap(),
+                false,
+                Some(conversation_id),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
+                id: format!("{subordinate_id}-creation"),
+                conversation_id: subordinate_id.to_string(),
+                message_id: None,
+                intent: crate::db::ConversationCreationIntent {
+                    cwd: worktree.to_string_lossy().into_owned(),
+                    model: None,
+                    effort: None,
+                    text: String::new(),
+                    expansion_preflighted: true,
+                    llm_text: None,
+                    skill_invocation: None,
+                    message_id: String::new(),
+                    images: vec![],
+                    files: vec![],
+                    mode: Some("branch".to_string()),
+                    base_branch: None,
+                    checkout_ref: None,
+                    seed_parent_id: None,
+                    seed_label: None,
+                    approved_task: None,
+                },
+            })
+            .await
+            .unwrap();
+        manager
+            .db()
+            .request_conversation_creation_deletion(subordinate_id, Utc::now())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET archived=1, user_initiated=1 WHERE id=?1")
+            .bind(conversation_id)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+        let conversation = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        let attempt_id = prepare_existing_close_attempt_ready_for_completion(
+            manager,
+            &conversation,
+            "retained-generation-attempt",
+        )
+        .await;
+        (repository, attempt_id, scope, subordinate_id.to_string())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn retry_resumes_legacy_fk787_generation_from_prior_cleanup_authority() {
+        use phoenix_core::domain::close::{
+            CapturedWorktreeIdentity, ClosePhase, LossItemIdentity, RetiredResourceIdentity,
+            RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
+        };
+        use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+        use phoenix_db::{
+            RecordCloseRetirementDispatchRequest, RecordCloseWorktreeCleanupPlanRequest,
+            RouteCloseAttemptToRepairRequest,
+        };
+
+        let mut manager = test_manager().await;
+        let writer_observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observations = Arc::clone(&writer_observations);
+        manager.test_ambient_writer_observer = Some(Arc::new(move |_| {
+            observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(false)
+        }));
+        let (repository, attempt_id, scope, subordinate_id) =
+            prepare_legacy_fk787_runtime_fixture(&manager).await;
+        let worktree = repository.path().join("worktree");
+        let source_snapshot = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .cloned()
+            .unwrap();
+        let captured = manager
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.scope == scope)
+            .unwrap();
+        let CapturedWorktreeIdentity::Resolved(worktree_identity) =
+            captured.captured_worktree.unwrap()
+        else {
+            panic!("test worktree identity must resolve");
+        };
+        let retained_worktree =
+            close_retirement::worktree_quarantine_path(&worktree_identity).unwrap();
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree_identity),
+        )
+        .unwrap();
+        manager
+            .db()
+            .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+            })
+            .await
+            .unwrap();
+        let admin_dir = close_retirement::exact_worktree_administrative_dir(
+            &worktree,
+            &repository.path().join(".git"),
+        )
+        .unwrap();
+        let admin_incarnation =
+            close_retirement::observe_administrative_dir_incarnation(&admin_dir).unwrap();
+        manager
+            .db()
+            .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+                administrative_dir: admin_dir.clone(),
+                administrative_dir_incarnation: admin_incarnation,
+            })
+            .await
+            .unwrap();
+        std::fs::rename(&worktree, &retained_worktree).unwrap();
+        manager
+            .db()
+            .route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual: resource.clone(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: "retained source authority".to_string(),
+            })
+            .await
+            .unwrap();
+        manager
+            .db()
+            .retry_close_retirement(&attempt_id)
+            .await
+            .unwrap();
+        let target_snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), target_snapshot.clone())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual: resource.clone(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: "error returned from database: (code: 787) FOREIGN KEY constraint failed"
+                    .to_string(),
+            })
+            .await
+            .unwrap();
+        assert_ne!(source_snapshot, target_snapshot);
+        assert_eq!(source_snapshot.fingerprint(), target_snapshot.fingerprint());
+        let target_shape: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM close_retirement_inspections
+                  WHERE attempt_id=?1 AND generation LIKE 'server_git_status_v2_retry_%'),
+                 (SELECT COUNT(*) FROM close_retirement_resources
+                  WHERE attempt_id=?1 AND inspection_generation=?2 AND proof_kind='residual'
+                    AND residual_reason='manual_repair_required'
+                    AND detail LIKE '%(code: 787) FOREIGN KEY constraint failed%'),
+                 (SELECT COUNT(*) FROM close_retirement_inventories
+                  WHERE attempt_id=?1 AND inspection_generation=?2 AND sealed=1),
+                 (SELECT COUNT(*) FROM close_retirement_resource_dispatches
+                  WHERE attempt_id=?1 AND inspection_generation=?2),
+                 (SELECT COUNT(*) FROM close_worktree_cleanup_plans
+                  WHERE attempt_id=?1 AND inspection_generation=?2)",
+        )
+        .bind(attempt_id.as_str())
+        .bind(target_snapshot.generation())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(target_shape, (1, 1, 1, 0, 0));
+        let source_plan = manager
+            .db()
+            .close_worktree_cleanup_plan(&attempt_id, &scope, &source_snapshot, &resource)
+            .await
+            .unwrap()
+            .unwrap();
+        let bypass_error = sqlx::query("DELETE FROM conversations WHERE id=?1")
+            .bind(&subordinate_id)
+            .execute(manager.db().pool())
+            .await
+            .expect_err("captured participant bypass deletion must fail");
+        assert!(bypass_error
+            .to_string()
+            .contains("active Close rejects sealed participant deletion"));
+        let cleanup_now = Utc::now();
+        let cleanup = manager
+            .db()
+            .claim_next_conversation_creation_cleanup(
+                "retained-generation-worker",
+                "retained-generation-token",
+                cleanup_now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .db()
+            .finish_conversation_creation_cleanup(&cleanup, cleanup_now)
+            .await
+            .unwrap();
+        assert!(!worktree.exists());
+        assert!(retained_worktree.exists());
+
+        let retried = manager
+            .db()
+            .retry_close_retirement(&attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
+        let resumed = manager
+            .inspect_close_retirement(attempt_id.clone())
+            .await
+            .expect(
+                "explicit retry must adopt prior authority and complete the retained generation",
+            );
+
+        assert_eq!(resumed, target_snapshot);
+        let completed = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(completed.phase(), ClosePhase::Completed);
+        assert_eq!(completed.snapshot(), Some(&target_snapshot));
+        assert!(!worktree.exists());
+        assert!(!retained_worktree.exists());
+        assert!(!admin_dir.exists());
+        assert!(writer_observations.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert!(manager
+            .db()
+            .get_conversation(&subordinate_id)
+            .await
+            .is_err());
+        let conversation = manager
+            .db()
+            .get_conversation("retained-generation-retry")
+            .await
+            .unwrap();
+        assert!(conversation.archived);
+        let aggregate = manager
+            .db()
+            .get_ordinary_product_conversation(&conversation.product_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            aggregate.product_conversation.ordinary_lifecycle(),
+            Some(OrdinaryProductConversationLifecycle::History)
+        );
+        let lineage: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(source_inspection_generation=?2
+                 AND target_inspection_generation=?3), 0)
+             FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1",
+        )
+        .bind(attempt_id.as_str())
+        .bind(source_snapshot.generation())
+        .bind(target_snapshot.generation())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(lineage, (1, 1));
+        assert!(manager
+            .db()
+            .close_retirement_resource_was_dispatched(
+                &attempt_id,
+                &scope,
+                &source_snapshot,
+                &resource,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            manager
+                .db()
+                .close_worktree_cleanup_plan(&attempt_id, &scope, &source_snapshot, &resource)
+                .await
+                .unwrap(),
+            Some(source_plan)
+        );
+        let retained_source_residuals: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resource_history
+             WHERE attempt_id=?1 AND inspection_generation=?2 AND proof_kind='residual'
+               AND detail='retained source authority'",
+        )
+        .bind(attempt_id.as_str())
+        .bind(source_snapshot.generation())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(retained_source_residuals, 1);
+        assert!(manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap()
+            .iter()
+            .all(|evidence| !matches!(evidence.outcome, RetirementOutcome::Residual { .. })));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(manager.db().pool())
+                .await
+                .unwrap();
+        assert!(
+            violations.is_empty(),
+            "foreign key violations: {violations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_runtime_retirement_does_not_retry_needs_repair() {
+        use phoenix_core::domain::close::{
+            ClosePhase, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+            RetiredResourceKind, RetirementFailureReason,
+        };
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "startup-needs-repair";
+        let attempt_id = prepare_close_attempt_ready_for_completion(
+            &manager,
+            conversation_id,
+            "startup-needs-repair-attempt",
+        )
+        .await;
+        let scope = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap()
+            .attached_work_scope_id
+            .unwrap();
+        manager
+            .db()
+            .route_close_attempt_to_repair(phoenix_db::RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual: RetiredResourceIdentity::parse(
+                    RetiredResourceKind::WorkScope,
+                    LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.as_str()).unwrap()),
+                )
+                .unwrap(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: "explicit retry required".to_string(),
+            })
+            .await
+            .unwrap();
+        let before = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(before.phase(), ClosePhase::NeedsRepair);
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                manager
+                    .resume_pending_close_runtime_retirements()
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                manager
+                    .db()
+                    .get_close_obligation(attempt_id.as_str())
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                manager
+                    .db()
+                    .list_close_retirement_evidence(attempt_id.as_str())
+                    .await
+                    .unwrap(),
+                evidence
+            );
+            assert!(
+                !manager
+                    .db()
+                    .get_conversation(conversation_id)
+                    .await
+                    .unwrap()
+                    .archived
+            );
+        }
     }
 
     #[tokio::test]

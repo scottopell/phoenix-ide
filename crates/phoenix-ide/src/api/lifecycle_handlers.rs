@@ -707,22 +707,20 @@ pub(crate) async fn retry_close_retirement(
             .get_close_obligation(retried.attempt_id().as_str())
             .await
             .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?;
-        if authoritative.phase() == phoenix_core::domain::close::ClosePhase::RetirementRequested {
-            let scope = if let Some(scope) = error.scope() {
-                scope.clone()
-            } else {
-                state
-                    .db
-                    .list_close_attempt_scopes(retried.attempt_id().as_str())
-                    .await
-                    .map_err(|route_error| AppError::Internal(route_error.to_string()))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        AppError::Internal("Close retry has no captured scope".to_string())
-                    })?
-                    .scope
-            };
+        if matches!(
+            authoritative.phase(),
+            phoenix_core::domain::close::ClosePhase::RetirementRequested
+                | phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+        ) {
+            let scopes = state
+                .db
+                .list_close_attempt_scopes(retried.attempt_id().as_str())
+                .await
+                .map_err(|route_error| AppError::Internal(route_error.to_string()))?;
+            let scope = close_error_repair_scope(
+                &error,
+                scopes.into_iter().map(|captured| captured.scope),
+            )?;
             state
                 .runtime
                 .persist_close_error_repair(retried.attempt_id(), &scope, &error)
@@ -746,6 +744,23 @@ pub(crate) async fn retry_close_retirement(
         ))));
     }
     Ok(Json(SuccessResponse { success: true }))
+}
+
+fn close_error_repair_scope(
+    error: &crate::runtime::close_retirement::CloseRetirementError,
+    scopes: impl IntoIterator<Item = phoenix_core::work_scope::WorkScopeId>,
+) -> Result<phoenix_core::work_scope::WorkScopeId, AppError> {
+    if let Some(scope) = error.scope() {
+        return Ok(scope.clone());
+    }
+    let mut scopes = scopes.into_iter();
+    let scope = scopes
+        .next()
+        .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?;
+    if scopes.next().is_some() {
+        return Err(AppError::Internal("Close failure has no exact scope; refusing to attribute it to an arbitrary captured scope".to_string()));
+    }
+    Ok(scope)
 }
 
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
@@ -1058,6 +1073,26 @@ mod tests {
     use crate::db::{ConvMode, Conversation, NonEmptyString};
     use crate::state_machine::state::ConvState;
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn repair_scope_selects_b_from_scoped_error_not_first_captured_scope() {
+        use crate::runtime::close_retirement::CloseRetirementError;
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let a = WorkScopeId::parse("scope-a").unwrap();
+        let b = WorkScopeId::parse("scope-b").unwrap();
+        let error = CloseRetirementError::ScopedMessage {
+            scope: b.clone(),
+            message: "scope B tombstone inspection failed".to_string(),
+        };
+        assert_eq!(
+            close_error_repair_scope(&error, [a.clone(), b.clone()]).unwrap(),
+            b
+        );
+        let unscoped = CloseRetirementError::Message("aggregate failure".to_string());
+        assert!(close_error_repair_scope(&unscoped, [a.clone(), b]).is_err());
+        assert_eq!(close_error_repair_scope(&unscoped, [a.clone()]).unwrap(), a);
+    }
 
     fn fixture(id: &str, continued_in_conv_id: Option<String>) -> Conversation {
         let ts = Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap();

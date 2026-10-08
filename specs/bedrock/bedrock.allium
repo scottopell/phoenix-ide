@@ -2049,9 +2049,9 @@ rule CloseNeedsRepairRetriesThroughReinspection {
     @guidance
         -- Retry preserves exact-attempt retirement and dispatch evidence while reinspection
         -- refreshes the worktree snapshot and reseals resources admitted during repair.
-        -- User retry and startup recovery use this same exact-attempt branch. Recovery
-        -- dispatches inspection immediately after reopening the attempt; it does not wait
-        -- for another restart or synthesize a replacement Close attempt.
+        -- NeedsRepair remains inert until this explicit retry trigger occurs. Startup may resume
+        -- only an already-admitted RetirementRequested obligation; it never synthesizes a retry
+        -- or replacement Close attempt.
 }
 
 ------------------------------------------------------------

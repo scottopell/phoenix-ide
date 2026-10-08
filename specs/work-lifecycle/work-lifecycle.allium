@@ -46,6 +46,27 @@ value RetirementInspection {
     fingerprint: String
 }
 
+value CleanupResourceIdentity {
+    resource_kind: RetiredResourceKind
+    identity_kind: String
+    identity_codec: String
+    identity_value: String
+}
+
+value CleanupPlanPayload {
+    administrative_directory: String
+    administrative_incarnation: String
+    final_tombstone: FinalTombstoneBinding?
+}
+
+value FinalTombstoneBinding {
+    root: String
+    root_device: Integer
+    root_inode: Integer
+    object_device: Integer?
+    object_inode: Integer?
+}
+
 value RetirementResidual {
     resource_kind: RetiredResourceKind
     resource_identity: String
@@ -164,6 +185,25 @@ external entity RestartRepairEvidenceAdoption {
     restart_repair_evidence: gitrep/RestartRepairEvidence
 }
 
+external entity WorktreeCleanupDispatch {
+    attempt: RetirementAttempt
+    inspection: RetirementInspection
+    resource: CleanupResourceIdentity
+}
+
+external entity WorktreeCleanupPlan {
+    attempt: RetirementAttempt
+    inspection: RetirementInspection
+    resource: CleanupResourceIdentity
+    payload: CleanupPlanPayload
+}
+
+external entity WorktreeCleanupAdoption {
+    source: WorktreeCleanupPlan
+    target: WorktreeCleanupPlan
+    adopted_at_unix_micros: Integer
+}
+
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
@@ -187,6 +227,7 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
 
 rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
     when: RetirementInspectionRequested(product_conversation, attempt_id)
+    requires: not exact_fk787_partial_generation(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     ensures:
         for scope_binding in attached_worktree_scopes(product_conversation):
@@ -233,10 +274,7 @@ rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
 rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: not exists AttachedWorkScope{product_conversation: product_conversation}
     ensures: ResourceRetirementCompleted(product_conversation, attempt_id)
@@ -249,6 +287,7 @@ rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
 
 rule GitBackedInspectionWithoutLossRequestsRetirement {
     when: RetirementInspectionRequested(product_conversation, attempt_id)
+    requires: not exact_fk787_partial_generation(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     requires:
         for scope_binding in attached_worktree_scopes(product_conversation):
@@ -278,6 +317,7 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
 
 rule GitBackedInspectionWithLossRequiresConfirmation {
     when: RetirementInspectionRequested(product_conversation, attempt_id)
+    requires: not exact_fk787_partial_generation(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     requires:
         for scope_binding in attached_worktree_scopes(product_conversation):
@@ -349,10 +389,7 @@ rule LossConfirmationDetectsChangedInspection {
 rule RetirementRequestedRetiresOwnedResources {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires:
@@ -372,10 +409,7 @@ rule RetirementRequestedRetiresOwnedResources {
 rule RetirementRequestedCreatesPerResourceEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     ensures:
@@ -401,10 +435,7 @@ rule RetirementRequestedCreatesPerResourceEvidence {
 rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
@@ -447,10 +478,7 @@ rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
 rule RetirementStepSuccessRecordsTypedEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
@@ -472,10 +500,7 @@ rule RetirementStepSuccessRecordsTypedEvidence {
 rule RetirementAlreadyRetiredIsIdempotentNoOp {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
@@ -497,8 +522,7 @@ rule RetirementAlreadyRetiredIsIdempotentNoOp {
 rule RetirementProgressTriggersNextExactAttemptStep {
     when: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
@@ -513,8 +537,7 @@ rule RetirementProgressTriggersNextExactAttemptStep {
 rule RetirementProgressReevaluatesCompletionForExactAttempt {
     when: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
@@ -530,10 +553,7 @@ rule RetirementProgressReevaluatesCompletionForExactAttempt {
 rule ResourceRetirementFailureProducesResidualRepairState {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     let scope_binding = failing_retirement_scope(product_conversation, attempt_id)
     let resource_identity = residual_resource_identity_for_attempt(product_conversation, scope_binding.scope)
@@ -560,8 +580,7 @@ rule ResourceRetirementFailureProducesResidualRepairState {
 rule RestartRetirementLeavesProcessEpochResourcesUntouched {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: process_epoch_resource_has_no_live_retirement_permit(product_conversation, attempt_id)
     ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
@@ -588,10 +607,7 @@ rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
     let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
     let repair_evidence = exact_restart_repair_evidence(product_conversation, attempt_id, scope_binding.scope)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists scope_binding
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
@@ -631,10 +647,7 @@ rule RestartRepairConflictRoutesTypedRepair {
     let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
     let repair_evidence = latest_restart_repair_evidence(product_conversation, scope_binding.scope)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists scope_binding
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
@@ -659,10 +672,7 @@ rule RestartRepairConflictRoutesTypedRepair {
 rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
     requires: exists scope_binding
@@ -685,10 +695,7 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
 rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
     requires: exists scope_binding
@@ -704,6 +711,177 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
         -- for that same exact attempt.
 }
 
+
+-- REQ-WL-002c: repair admission is explicit; startup recovery is not retry.
+rule ExplicitRepairRetryReturnsSameAttemptToInspection {
+    when: CloseRetirementRetryRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
+    ensures: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
+    ensures: RetirementInspectionRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- Retain the attempt and all prior evidence. Ordinary inspection uses a
+        -- fresh generation; only the enumerated partial-generation recognizer may
+        -- resume its retained pair. Repair performed outside Phoenix is not retry.
+}
+
+rule StartupPreservesNeedsRepairWithoutDispatch {
+    when: CloseRetirementStartupObserved(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
+    ensures: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
+    ensures: retirement_dispatch_suppressed(product_conversation, attempt_id)
+}
+
+rule StartupRecoversAlreadyRequestedRetirement {
+    when: CloseRetirementStartupObserved(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
+    requires: exact_scope_leases_reacquired(product_conversation, attempt_id)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- Recovery keeps committed attempt authority. Every destructive step still
+        -- validates live identity and writer safety. Startup cannot promote repair.
+}
+
+-- REQ-WL-004: the three adoption rows are one atomic commit.
+rule FreshGenerationAtomicallyAdoptsDispatchPlanAndLineage {
+    when: WorktreeCleanupAdoptionRequested(attempt, target_inspection, resource, observed_directory, observed_incarnation)
+    requires: bedrock/CloseObligation{product_conversation: attempt.product_conversation, attempt_id: attempt.attempt_id}.phase = retirement_requested
+    requires: exact_target_inventory_sealed(attempt, target_inspection, resource)
+    requires: not exists WorktreeCleanupAdoption{target: WorktreeCleanupPlan{attempt: attempt, inspection: target_inspection, resource: resource}}
+    let source = newest_compatible_cleanup_source(attempt, target_inspection, resource, observed_directory, observed_incarnation)
+    requires: exists source
+    requires: cleanup_adoption_target_matches_or_is_absent(attempt, target_inspection, resource, source)
+    ensures: WorktreeCleanupDispatch.created(attempt: attempt, inspection: target_inspection, resource: resource)
+    ensures: WorktreeCleanupPlan.created(attempt: attempt, inspection: target_inspection, resource: resource, payload: source.payload)
+    ensures: WorktreeCleanupAdoption.created(
+        source: source,
+        target: WorktreeCleanupPlan{attempt: attempt, inspection: target_inspection, resource: resource},
+        adopted_at_unix_micros: current_unix_micros()
+    )
+    ensures: CleanupPlanAvailable(attempt, target_inspection, resource)
+
+    @guidance
+        -- BEGIN IMMEDIATE binds selection and writes to one active attempt and
+        -- generation/fingerprint. Copy every payload field, including null tombstone
+        -- bindings; retain source evidence. A conflict rolls the whole transaction
+        -- back. Adoption performs no filesystem deletion.
+}
+
+rule RepeatedAdoptionRevalidatesAndReturnsExistingPlan {
+    when: WorktreeCleanupAdoptionRequested(attempt, target_inspection, resource, observed_directory, observed_incarnation)
+    requires: bedrock/CloseObligation{product_conversation: attempt.product_conversation, attempt_id: attempt.attempt_id}.phase = retirement_requested
+    requires: exact_target_inventory_sealed(attempt, target_inspection, resource)
+    let lineage = WorktreeCleanupAdoption{target: WorktreeCleanupPlan{attempt: attempt, inspection: target_inspection, resource: resource}}
+    requires: exists lineage
+    requires: cleanup_lineage_matches_fresh_observation(lineage, observed_directory, observed_incarnation)
+    ensures: cleanup_adoption_rows_unchanged(attempt, target_inspection, resource)
+    ensures: CleanupPlanAvailable(attempt, target_inspection, resource)
+}
+
+rule CleanupAdoptionConflictRollsBack {
+    when: WorktreeCleanupAdoptionRequested(attempt, target_inspection, resource, observed_directory, observed_incarnation)
+    requires: cleanup_adoption_conflicts(attempt, target_inspection, resource, observed_directory, observed_incarnation)
+    ensures: cleanup_adoption_rows_unchanged(attempt, target_inspection, resource)
+    ensures: CleanupEvidenceInvariantFailed(attempt.product_conversation, attempt.attempt_id, attempt.scope)
+
+    @guidance
+        -- Covers absent source, stale authority, unsealed/missing expected identity,
+        -- fresh directory mismatch, conflicting target rows and mismatched
+        -- lineage/payload. Rollback includes a dispatch inserted before a later plan
+        -- or lineage failure. Never continue deletion after this result.
+}
+
+-- REQ-WL-005: compatibility is the full conjunction, not the error alone.
+rule ExactPartialGenerationResumesWithoutRewritingEvidence {
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
+    requires: exact_fk787_partial_generation(product_conversation, attempt_id)
+    ensures: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
+    ensures: retained_close_evidence_unchanged(product_conversation, attempt_id)
+    ensures: ExactScopeLeaseReacquisitionRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- Recognition and phase change are atomic. Reacquire all captured scope
+        -- leases before dispatch. Adoption and live administrative/worktree/quarantine/
+        -- tombstone validation remain mandatory. This rule cannot leave needs_repair.
+}
+
+rule ExactScopeLeaseReacquisitionAllowsResumedDispatch {
+    when: ExactScopeLeasesReacquired(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
+    requires: exact_scope_leases_reacquired(product_conversation, attempt_id)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+}
+
+-- REQ-WL-006, REQ-WL-007: inspection is at the actual deletion location.
+rule TombstoneRecoveryReinspectsWritersBeforeDeletion {
+    when: FinalTombstoneRecoveryRequested(attempt, plan)
+    requires: bedrock/CloseObligation{product_conversation: attempt.product_conversation, attempt_id: attempt.attempt_id}.phase = retirement_requested
+    requires: exact_active_cleanup_plan(attempt, plan)
+    requires: tombstone_recovery_identity_proven(attempt, plan)
+    requires: fresh_tombstone_writer_inventory_is_clean(plan)
+    requires: tombstone_identity_revalidated_after_scan(attempt, plan)
+    ensures: VerifiedTombstoneDeletionRequested(attempt, plan)
+
+    @guidance
+        -- Open the owner-only root without links; check descriptor-relative object
+        -- device/inode and captured fingerprint. Scan cwd and open descriptors at
+        -- the actual object. Recheck identities/fingerprint before deletion.
+}
+
+rule TombstoneRecoveryAmbiguityPreservesExactScope {
+    when: FinalTombstoneRecoveryRequested(attempt, plan)
+    requires: tombstone_recovery_is_ambiguous(attempt, plan)
+    ensures: safe_retirement_leftover_is_preserved(attempt.product_conversation, attempt.attempt_id)
+    ensures: ExactScopeRetirementRepairRecorded(attempt.product_conversation, attempt.attempt_id, attempt.scope)
+    ensures: bedrock/CloseObligation{product_conversation: attempt.product_conversation, attempt_id: attempt.attempt_id}.phase = needs_repair
+
+    @guidance
+        -- Persist the typed worktree residual and phase together, retaining the
+        -- exact failing scope even when observation fails before loading a plan.
+}
+
+rule TombstoneCrashBeforeRenameResumesIdentityCheckedCleanup {
+    when: FinalTombstoneRecoveryRequested(attempt, plan)
+    requires: bedrock/CloseObligation{product_conversation: attempt.product_conversation, attempt_id: attempt.attempt_id}.phase = retirement_requested
+    requires: exact_active_cleanup_plan(attempt, plan)
+    requires: bound_root_without_moved_object_has_exact_source(attempt, plan)
+    ensures: NormalIdentityCheckedWorktreeCleanupRequested(attempt, plan)
+
+    @guidance
+        -- Exactly one captured/quarantine source exists and matches the retained
+        -- fingerprint. Reinspect writers and revalidate it before rename. An already-
+        -- moved object without a durable object binding stays in repair.
+}
+
+rule TombstoneDeletionCrashAdoptsOnlyProvenAbsence {
+    when: FinalTombstoneRecoveryRequested(attempt, plan)
+    requires: bedrock/CloseObligation{product_conversation: attempt.product_conversation, attempt_id: attempt.attempt_id}.phase = retirement_requested
+    requires: exact_active_cleanup_plan(attempt, plan)
+    requires: exact_tombstone_completion_absence(attempt, plan)
+    ensures: ResourceRetirementProgressRecorded(attempt.product_conversation, attempt.attempt_id)
+
+    @guidance
+        -- Captured and quarantine paths must be proven missing. A bound object's
+        -- absence under a verified root, an empty root before object binding, or
+        -- the root's proven absence completes the same plan. Inaccessible/replaced
+        -- paths do not prove absence.
+}
+
+-- REQ-WL-008: schema installation executes no lifecycle operation.
+rule CleanupLineageMigrationPreservesExistingRows {
+    when: CleanupLineageMigration118Requested(database)
+    requires: existing_cleanup_plan_keys_are_unique(database)
+    ensures: retained_close_database_rows_unchanged(database)
+    ensures: cleanup_lineage_storage_installed_empty(database)
+    ensures: retirement_filesystem_actions_suppressed(database)
+
+    @guidance
+        -- Install exact keys, relational constraints and immutability triggers.
+        -- No phase change, retry, adoption backfill or deletion. Violating existing
+        -- rows fail the migration rather than being rewritten.
+}
 
 rule PrStatusObservedAsAdvisoryCloseGuidance {
     when: PrStatusQueried(product_conversation)
@@ -721,6 +899,114 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --
 -- Allium has no formal helper-function declaration; this block defines the
 -- complete semantics of each bare helper used above.
+--
+-- Cleanup adoption, recovery and upgrade helpers:
+--
+--   retirement_dispatch_suppressed(product_conversation, attempt_id) -> Boolean
+--       No inspection, lease reacquisition, resource dispatch, or automatic retry
+--       is scheduled by this startup observation. Retained evidence is unchanged.
+--   exact_scope_leases_reacquired(product_conversation, attempt_id) -> Boolean
+--       Every scope captured by the same active attempt has its admission gate
+--       sealed and exact runtime lease reacquired; no different owner is substituted.
+--   exact_target_inventory_sealed(attempt, inspection, resource) -> Boolean
+--       The active Close obligation's pair equals inspection, the scope belongs
+--       to attempt, and its sealed target inventory expects exactly this worktree
+--       resource kind, identity kind/codec/value. Neither path nor branch is a key.
+--   newest_compatible_cleanup_source(attempt, inspection, resource,
+--       observed_directory, observed_incarnation) -> WorktreeCleanupPlan?
+--       Select only the same attempt/scope/exact worktree identity in a different
+--       generation/fingerprint, with a matching dispatch and inventory, identical
+--       fresh administrative locator/incarnation, and no existing outgoing adoption.
+--       Order inventory capture time descending then plan row order descending.
+--       Return absent if no eligible source exists. Never rewrite a consumed source.
+--   cleanup_adoption_target_matches_or_is_absent(attempt, inspection, resource,
+--       source) -> Boolean
+--       Any existing target dispatch names the identical key and any existing plan
+--       has the complete identical source payload; absent rows may be inserted.
+--   cleanup_lineage_matches_fresh_observation(lineage, directory, incarnation)
+--       -> Boolean
+--       Exact source/target keys and full payload equality hold; target dispatch
+--       exists and administrative locator/incarnation equal this fresh observation.
+--   cleanup_adoption_conflicts(attempt, inspection, resource, directory,
+--       incarnation) -> Boolean
+--       The negation of the new-adoption or repeated-adoption eligibility above,
+--       including stale phase, missing expected identity and transaction constraint
+--       failure. An identical target row alone is not a conflict.
+--   cleanup_adoption_rows_unchanged(attempt, inspection, resource) -> Boolean
+--       Dispatch, plan and lineage rows equal their pre-request state: either a
+--       validated idempotent return or rollback of every attempted adoption write.
+--   current_unix_micros() -> Integer
+--       Nonnegative clock observation stored as integer microseconds since epoch.
+--   exact_fk787_partial_generation(product_conversation, attempt_id) -> Boolean
+--       True only in awaiting_retirement_inspection with a retained pair, at least
+--       one captured worktree scope, total inspection count equal to worktree scope
+--       count, and exactly one sealed active-pair inventory per captured scope.
+--       Active-pair residual count equals worktree scope count; each is the exact
+--       captured worktree resource (kind and identity kind worktree, worktree_id_v1
+--       codec, captured value), manual_repair_required reason, and detail containing
+--       '(code: 787) FOREIGN KEY constraint failed'. No active-pair dispatch or plan
+--       exists. Each worktree scope has an exact plan plus matching dispatch in a
+--       different pair of the same attempt. Every conjunct is required; arbitrary
+--       manual repair or SQLite errors do not satisfy it. This predicate is false
+--       in needs_repair, including startup before an explicit retry.
+--   retained_close_evidence_unchanged(product_conversation, attempt_id) -> Boolean
+--       All retained row payloads, bindings and generation/fingerprint pairs are
+--       unchanged, except the recognized obligation's phase promotion.
+--   exact_active_cleanup_plan(attempt, plan) -> Boolean
+--       Plan matches the active attempt/scope/worktree and generation/fingerprint,
+--       with its dispatch and sealed expected-resource inventory. Fresh administrative
+--       incarnation matches the plan; adoption has not replaced any captured identity.
+--   tombstone_recovery_identity_proven(attempt, plan) -> Boolean
+--       A no-follow descriptor proves the owner-only root's retained device/inode;
+--       the descriptor-relative object has its bound device/inode and captured
+--       worktree fingerprint. Missing, replaced or unbound objects are not proven.
+--   fresh_tombstone_writer_inventory_is_clean(plan) -> Boolean
+--       Fresh cwd and open-descriptor scan at the actual deletion location, never
+--       reuse of a scan at the original/quarantine pathname. On Linux cwd scanning
+--       enumerates every numeric process in the visible namespace without UID or
+--       Phoenix ownership filtering and every numeric task, including non-leaders.
+--       Clean requires all cwd reads outside the object and stable process/task
+--       sets and incarnations on revalidation. Incarnation includes proc-directory
+--       device/inode, parsed ID, start time, start-code/end-code and start-stack.
+--       Access denial, vanished entries, malformed stat/task names, empty task sets,
+--       PID reuse, exec or inventory churn produce indeterminate. A matching cwd
+--       yields writer_present; either non-clean result returns false and blocks
+--       deletion, not signals to ambient processes. Writer-inspection errors also
+--       block deletion; observational descriptor scans do not promise universal
+--       detection of unreadable ambient descriptors.
+--   tombstone_identity_revalidated_after_scan(attempt, plan) -> Boolean
+--       Root and descriptor-relative object device/inode and captured worktree
+--       fingerprint still match after scanning and immediately before deletion.
+--   bound_root_without_moved_object_has_exact_source(attempt, plan) -> Boolean
+--       Verified root has no object and no object identity binding; exactly one
+--       captured/quarantine source exists with the retained fingerprint. Revalidate
+--       source identity after writer inspection before normal cleanup resumes.
+--   exact_tombstone_completion_absence(attempt, plan) -> Boolean
+--       Captured and quarantine paths are positively missing, not inaccessible.
+--       Either the recorded root is positively missing or its identity is proven
+--       and its object is missing with either a complete object binding or no
+--       object binding. A partial binding is repair. No replacement appears.
+--   tombstone_recovery_is_ambiguous(attempt, plan) -> Boolean
+--       Any stale authority, incomplete/replaced identity, moved unbound object,
+--       inaccessible observation, writer_present/indeterminate scan, or failed
+--       post-scan identity revalidation; no proven normal-resume or absence case.
+--   existing_cleanup_plan_keys_are_unique(database) -> Boolean
+--       Existing plans satisfy exact attempt/scope/pair/resource identity uniqueness;
+--       false causes migration failure without row rewriting or deletion.
+--   retained_close_database_rows_unchanged(database) -> Boolean
+--       All existing obligations/phases, members/scopes, inspections, inventories,
+--       outcomes/history, dispatches, plans and tombstone bindings survive unchanged.
+--   cleanup_lineage_storage_installed_empty(database) -> Boolean
+--       Migration 118 installs exact keys, source/target FKs, one incoming/outgoing
+--       edge constraints, immutable lineage and adopted-source payload triggers,
+--       and integer adoption timestamps. Existing plans get no fabricated lineage.
+--   retirement_filesystem_actions_suppressed(database) -> Boolean
+--       Migration schedules no retry or retirement and performs no rename/deletion.
+--   cleanup_lineage_is_immutable(lineage) -> Boolean
+--       Source/target relation and adopted-source payload cannot change or be
+--       deleted during runtime repair/retry. Only explicit completed aggregate hard
+--       deletion after every transcript member is removed may erase history, with
+--       lineage dependencies removed before referenced plans/obligation.
 --
 --   attempt_bound_scope_inspections(
 --       product_conversation: bedrock/ProductConversation,
@@ -872,4 +1158,13 @@ invariant NoAutomaticRecoveryArtifactFromRetirement {
     for a in AttachedWorkScope:
         exists CloseRetirementAuthority{product_conversation: a.product_conversation, scope: a.scope}
         implies not AutomaticRetirementSnapshotCreated(a.product_conversation)
+}
+
+
+invariant CleanupAdoptionIsExactAndImmutable {
+    for lineage in WorktreeCleanupAdoption:
+        lineage.source.attempt = lineage.target.attempt
+        and lineage.source.resource = lineage.target.resource
+        and lineage.source.inspection != lineage.target.inspection
+        and cleanup_lineage_is_immutable(lineage)
 }

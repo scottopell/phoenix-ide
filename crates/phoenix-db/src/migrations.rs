@@ -722,8 +722,41 @@ END;
 
 CREATE TRIGGER close_worktree_cleanup_adoptions_reject_delete
 BEFORE DELETE ON close_worktree_cleanup_adoptions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN product_conversations product ON product.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase = 'completed'
+      AND NOT EXISTS (
+          SELECT 1 FROM conversations member
+          WHERE member.product_conversation_id = product.id
+      )
+)
 BEGIN
     SELECT RAISE(ABORT, 'cleanup adoption lineage is immutable');
+END;
+
+DROP TRIGGER close_obligations_require_member_cleanup_before_delete;
+CREATE TRIGGER close_obligations_require_member_cleanup_before_delete
+BEFORE DELETE ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase = 'completed'
+  AND EXISTS (
+      SELECT 1 FROM product_conversations WHERE id = OLD.product_conversation_id
+  )
+  AND (
+      EXISTS (
+          SELECT 1 FROM close_attempt_members member
+          WHERE member.attempt_id = OLD.attempt_id
+      )
+      OR EXISTS (
+          SELECT 1 FROM close_attempt_scopes scope
+          WHERE scope.attempt_id = OLD.attempt_id
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'completed Close history must remove member snapshots before obligation deletion');
 END;
 ";
 
@@ -18642,11 +18675,24 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn migration_118_preserves_plans_and_enforces_exact_immutable_adoption() {
         let pool = test_pool().await;
         sqlx::raw_sql(
-            "CREATE TABLE close_worktree_cleanup_plans (
+            "CREATE TABLE product_conversations (id TEXT PRIMARY KEY);
+             CREATE TABLE conversations (id TEXT PRIMARY KEY, product_conversation_id TEXT);
+             CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY, product_conversation_id TEXT, phase TEXT
+             );
+             CREATE TABLE close_attempt_members (attempt_id TEXT);
+             CREATE TABLE close_attempt_scopes (attempt_id TEXT);
+             CREATE TRIGGER close_obligations_require_member_cleanup_before_delete
+             BEFORE DELETE ON close_obligations BEGIN SELECT 1; END;
+             INSERT INTO product_conversations VALUES ('product');
+             INSERT INTO conversations VALUES ('member', 'product');
+             INSERT INTO close_obligations VALUES ('attempt', 'product', 'retirement_requested');
+             CREATE TABLE close_worktree_cleanup_plans (
                  attempt_id TEXT, scope TEXT, inspection_generation TEXT,
                  inspection_fingerprint TEXT, resource_kind TEXT, identity_kind TEXT,
                  identity_codec TEXT, identity_value TEXT,
@@ -18708,6 +18754,46 @@ mod tests {
         ] {
             assert!(sqlx::query(forbidden).execute(&pool).await.is_err());
         }
+        let mut deletion = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id = 'member'")
+            .execute(&mut *deletion)
+            .await
+            .unwrap();
+        let error = sqlx::query("DELETE FROM close_worktree_cleanup_adoptions")
+            .execute(&mut *deletion)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cleanup adoption lineage is immutable"));
+        deletion.rollback().await.unwrap();
+
+        sqlx::query("UPDATE close_obligations SET phase = 'completed'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = sqlx::query("DELETE FROM close_worktree_cleanup_adoptions")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cleanup adoption lineage is immutable"));
+
+        let mut deletion = pool.begin().await.unwrap();
+        for statement in [
+            "DELETE FROM conversations WHERE id = 'member'",
+            "DELETE FROM close_worktree_cleanup_adoptions",
+            "DELETE FROM close_worktree_cleanup_plans",
+            "DELETE FROM close_obligations",
+            "DELETE FROM product_conversations",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *deletion)
+                .await
+                .unwrap();
+        }
+        deletion.commit().await.unwrap();
         let violations: Vec<(String, i64, String, i64)> =
             sqlx::query_as("PRAGMA foreign_key_check")
                 .fetch_all(&pool)
