@@ -1,4 +1,4 @@
-# ADR-086: Close retry adopts exact cleanup lineage without automatic repair dispatch
+# ADR-087: Close retry adopts exact cleanup lineage without automatic repair dispatch
 
 - **Status:** Accepted
 - **Date:** 2026-10-07
@@ -24,7 +24,7 @@ Support only the partial-generation conjunction in REQ-WL-005: retained pair in 
 
 Adoption uses the exact attempt/scope/pair/resource identity and fresh administrative locator/incarnation. Select the newest eligible unconsumed source by inventory capture time then plan row order. Commit target dispatch, full target plan and source-to-target lineage atomically. Identical replay revalidates and returns existing authority; conflict rolls every write back. Each source has at most one outgoing edge and each target one incoming edge. Lineage and adopted-source payloads are immutable during repair/retry. Completed aggregate hard deletion is a separate authority, allowed to erase dependencies only after all transcript members are removed.
 
-Migration 118 installs relational constraints without changing existing Close rows or phases, fabricating lineage, retrying or deleting anything. Invalid existing keys fail rather than being silently rewritten. The guarantee is forward-only and specific to this evidence shape; no generic SQLite repair, downgrade, mixed-version or production-execution authority is granted.
+Migration 119 installs relational constraints without changing existing Close rows or phases, fabricating lineage, retrying or deleting anything. Invalid existing keys fail rather than being silently rewritten. The guarantee is forward-only and specific to this evidence shape; no generic SQLite repair, downgrade, mixed-version or production-execution authority is granted.
 
 ## Consequences
 
@@ -42,4 +42,4 @@ Migration 118 installs relational constraints without changing existing Close ro
 - ADR-034: compatibility guarantees are explicit and data-aware
 - ADR-040: Close uses WorkScope gates and tmux-only durable identity
 - ADR-042: Close directory retirement trusts its private namespace
-- `Database::adopt_close_worktree_cleanup_plan`, `Database::resume_legacy_fk787_close_retirement_generation`, `Database::retry_close_retirement`, `MIGRATION_118`
+- `Database::adopt_close_worktree_cleanup_plan`, `Database::resume_legacy_fk787_close_retirement_generation`, `Database::retry_close_retirement`, `MIGRATION_119`

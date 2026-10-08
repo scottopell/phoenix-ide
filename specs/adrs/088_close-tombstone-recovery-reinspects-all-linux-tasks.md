@@ -1,4 +1,4 @@
-# ADR-087: Close tombstone recovery reinspects writers across all Linux tasks
+# ADR-088: Close tombstone recovery reinspects writers across all Linux tasks
 
 - **Status:** Accepted
 - **Date:** 2026-10-07
@@ -22,7 +22,7 @@ Choose option 3. Recovered tombstone deletion freshly scans process cwd and open
 
 On Linux, cwd inspection includes every numeric process in the visible namespace and every task, regardless of UID or Phoenix ownership. A clean result requires stable process and task sets plus incarnations verified with proc-directory device/inode and stat ID, start time, code range and stack start. Access denial, malformed/incomplete observations, disappearance, PID/task reuse, exec or inventory churn are indeterminate, not evidence of a clean scan.
 
-Crash recovery distinguishes a recorded root before rename, a bound moved object, a moved unbound object, and exact completed absence. A root with no moved object may resume only from exactly one verified captured/quarantine source and after fresh writer inspection. An unbound moved object remains repair input. Completed absence requires same-attempt durable authority and positively missing captured/quarantine/object locations; inaccessible or replaced paths do not count. `NeedsRepair` still requires explicit retry under ADR-086.
+Crash recovery distinguishes a recorded root before rename, a bound moved object, a moved unbound object, and exact completed absence. A root with no moved object may resume only from exactly one verified captured/quarantine source and after fresh writer inspection. An unbound moved object remains repair input. Completed absence requires same-attempt durable authority and positively missing captured/quarantine/object locations; inaccessible or replaced paths do not count. `NeedsRepair` still requires explicit retry under ADR-087.
 
 ## Consequences
 
@@ -38,5 +38,5 @@ Crash recovery distinguishes a recorded root before rename, a bound moved object
 - [Work lifecycle behavior](../work-lifecycle/work-lifecycle.allium)
 - ADR-042: Close directory retirement trusts its private namespace
 - ADR-080: Close stops bound fsmonitor daemons instead of reconfiguring Git
-- ADR-086: Close retry adopts exact cleanup lineage without automatic repair dispatch
+- ADR-087: Close retry adopts exact cleanup lineage without automatic repair dispatch
 - `linux_namespace_cwd_scan`, `linux_cwd_process_incarnation`, `linux_cwd_task_inventory`, `resume_final_worktree_tombstone_with_writer_inspection`

@@ -397,7 +397,7 @@ AND SHALL NOT interpret inaccessible paths, replacements, or partial identity bi
 
 ### REQ-WL-008: Cleanup-Lineage Upgrade Preserves Evidence Without Executing Retirement
 
-WHEN migration 118 installs exact cleanup-plan adoption constraints and lineage storage
+WHEN migration 119 installs exact cleanup-plan adoption constraints and lineage storage
 THE SYSTEM SHALL preserve every existing Close obligation, phase, captured member and scope, inspection, inventory, resource outcome/history, dispatch, cleanup plan, and bound tombstone identity
 AND SHALL NOT synthesize adoption lineage for existing rows
 AND SHALL NOT automatically retry an attempt, release a repair gate, rename or delete a worktree/quarantine/tombstone, or discard residual evidence

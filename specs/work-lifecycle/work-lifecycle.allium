@@ -871,7 +871,7 @@ rule TombstoneDeletionCrashAdoptsOnlyProvenAbsence {
 
 -- REQ-WL-008: schema installation executes no lifecycle operation.
 rule CleanupLineageMigrationPreservesExistingRows {
-    when: CleanupLineageMigration118Requested(database)
+    when: CleanupLineageMigration119Requested(database)
     requires: existing_cleanup_plan_keys_are_unique(database)
     ensures: retained_close_database_rows_unchanged(database)
     ensures: cleanup_lineage_storage_installed_empty(database)
@@ -999,7 +999,7 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       All existing obligations/phases, members/scopes, inspections, inventories,
 --       outcomes/history, dispatches, plans and tombstone bindings survive unchanged.
 --   cleanup_lineage_storage_installed_empty(database) -> Boolean
---       Migration 118 installs exact keys, source/target FKs, one incoming/outgoing
+--       Migration 119 installs exact keys, source/target FKs, one incoming/outgoing
 --       edge constraints, immutable lineage and adopted-source payload triggers,
 --       and integer adoption timestamps. Existing plans get no fabricated lineage.
 --   retirement_filesystem_actions_suppressed(database) -> Boolean

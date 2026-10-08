@@ -609,21 +609,21 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 119,
         name: "adopt_close_worktree_cleanup_plans",
-        sql: MIGRATION_118,
+        sql: MIGRATION_119,
     },
     Migration {
         version: 120,
         name: "require_close_repair_reinspection",
-        sql: MIGRATION_119,
+        sql: MIGRATION_120,
     },
     Migration {
         version: 121,
         name: "retain_close_cleanup_source_inspections",
-        sql: MIGRATION_120,
+        sql: MIGRATION_121,
     },
 ];
 
-const MIGRATION_120: &str = r"
+const MIGRATION_121: &str = r"
 CREATE TABLE close_retained_retirement_inspections (
     attempt_id TEXT NOT NULL,
     inspection_generation TEXT NOT NULL CHECK (inspection_generation <> ''),
@@ -685,9 +685,9 @@ CREATE TABLE close_retained_retirement_losses (
         ON DELETE CASCADE
 );
 
-CREATE TABLE migration_120_retained_source_validation (sentinel INTEGER);
-CREATE TRIGGER migration_120_requires_retained_source
-BEFORE INSERT ON migration_120_retained_source_validation
+CREATE TABLE migration_121_retained_source_validation (sentinel INTEGER);
+CREATE TRIGGER migration_121_requires_retained_source
+BEFORE INSERT ON migration_121_retained_source_validation
 WHEN EXISTS (
     SELECT 1 FROM close_worktree_cleanup_adoptions adoption
     WHERE NOT EXISTS (
@@ -707,8 +707,8 @@ WHEN EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'cleanup adoption requires exact retained source inspection');
 END;
-INSERT INTO migration_120_retained_source_validation VALUES (1);
-DROP TABLE migration_120_retained_source_validation;
+INSERT INTO migration_121_retained_source_validation VALUES (1);
+DROP TABLE migration_121_retained_source_validation;
 
 CREATE TRIGGER close_worktree_cleanup_adoption_requires_retained_inspection
 BEFORE INSERT ON close_worktree_cleanup_adoptions
@@ -759,7 +759,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_119: &str = r"
+const MIGRATION_120: &str = r"
 DROP TRIGGER close_obligations_transition_graph;
 CREATE TRIGGER close_obligations_transition_graph
 BEFORE UPDATE OF phase ON close_obligations
@@ -784,10 +784,10 @@ const MIGRATION_117: &str = concat!(
     include_str!("responses_replay.sql")
 );
 
-const MIGRATION_118: &str = r"
-CREATE TABLE migration_118_cleanup_plan_validation (sentinel INTEGER);
-CREATE TRIGGER migration_118_cleanup_plan_requires_exact_dispatch
-BEFORE INSERT ON migration_118_cleanup_plan_validation
+const MIGRATION_119: &str = r"
+CREATE TABLE migration_119_cleanup_plan_validation (sentinel INTEGER);
+CREATE TRIGGER migration_119_cleanup_plan_requires_exact_dispatch
+BEFORE INSERT ON migration_119_cleanup_plan_validation
 WHEN EXISTS (
     SELECT 1 FROM close_worktree_cleanup_plans plan
     WHERE NOT EXISTS (
@@ -805,8 +805,8 @@ WHEN EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'cleanup plan requires exact parent dispatch identity');
 END;
-INSERT INTO migration_118_cleanup_plan_validation VALUES (1);
-DROP TABLE migration_118_cleanup_plan_validation;
+INSERT INTO migration_119_cleanup_plan_validation VALUES (1);
+DROP TABLE migration_119_cleanup_plan_validation;
 
 CREATE UNIQUE INDEX close_worktree_cleanup_plans_exact_identity
 ON close_worktree_cleanup_plans (
@@ -12231,7 +12231,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(10).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(11).copied().collect::<Vec<_>>(),
             vec![
                 (121, "retain_close_cleanup_source_inspections"),
                 (120, "require_close_repair_reinspection"),
@@ -18866,7 +18866,7 @@ mod tests {
         );
     }
 
-    async fn migration_120_fixture(pool: &SqlitePool) {
+    async fn migration_121_fixture(pool: &SqlitePool) {
         sqlx::raw_sql(
             "CREATE TABLE close_attempt_scopes (
                  attempt_id TEXT NOT NULL, scope TEXT NOT NULL, PRIMARY KEY (attempt_id, scope)
@@ -18885,13 +18885,13 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        stamp_migrations_except(pool, 120).await;
+        stamp_migrations_except(pool, 121).await;
     }
 
     #[tokio::test]
-    async fn migration_120_rejects_adoption_without_source_without_fabrication_or_stamp() {
+    async fn migration_121_rejects_adoption_without_source_without_fabrication_or_stamp() {
         let pool = test_pool().await;
-        migration_120_fixture(&pool).await;
+        migration_121_fixture(&pool).await;
         sqlx::query("INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'aggregate', 'fp')")
             .execute(&pool).await.unwrap();
         let error = run_pending_migrations(&pool).await.unwrap_err();
@@ -18899,8 +18899,8 @@ mod tests {
             .to_string()
             .contains("cleanup adoption requires exact retained source inspection"));
         for query in [
-            "SELECT COUNT(*) FROM _migrations WHERE version = 120",
-            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'close_retained_retirement_%' OR name LIKE 'migration_120_%'",
+            "SELECT COUNT(*) FROM _migrations WHERE version = 121",
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'close_retained_retirement_%' OR name LIKE 'migration_121_%'",
         ] {
             let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
             assert_eq!(count, 0);
@@ -18915,9 +18915,9 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_120_is_empty_idempotent_and_retained_rows_require_scope_cascade() {
+    async fn migration_121_is_empty_idempotent_and_retained_rows_require_scope_cascade() {
         let pool = test_pool().await;
-        migration_120_fixture(&pool).await;
+        migration_121_fixture(&pool).await;
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
         let count: i64 =
@@ -18976,7 +18976,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_119_upgrades_118_close_repair_transition_graph_idempotently() {
+    async fn migration_120_upgrades_119_close_repair_transition_graph_idempotently() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE close_obligations (phase TEXT NOT NULL);
@@ -18988,13 +18988,13 @@ mod tests {
         .await
         .unwrap();
         sqlx::raw_sql(MIGRATION_083).execute(&pool).await.unwrap();
-        stamp_migrations_except(&pool, 119).await;
+        stamp_migrations_except(&pool, 120).await;
         let newest: i64 =
             sqlx::query_scalar("SELECT MAX(version) FROM _migrations WHERE version < 120")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(newest, 118);
+        assert_eq!(newest, 119);
 
         for target in ["retirement_requested", "completed"] {
             sqlx::query("UPDATE close_obligations SET phase = ?1")
@@ -19014,7 +19014,7 @@ mod tests {
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
         let stamps: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 119")
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 120")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -19116,7 +19116,7 @@ mod tests {
         }
     }
 
-    async fn setup_migration_118_dispatch_fixture(pool: &SqlitePool, plan_codec: &str) {
+    async fn setup_migration_119_dispatch_fixture(pool: &SqlitePool, plan_codec: &str) {
         sqlx::raw_sql(
             "CREATE TABLE product_conversations (id TEXT PRIMARY KEY);
              CREATE TABLE conversations (id TEXT PRIMARY KEY, product_conversation_id TEXT);
@@ -19160,19 +19160,19 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        stamp_migrations_except(pool, 118).await;
+        stamp_migrations_except(pool, 119).await;
         let violations: Vec<(String, i64, String, i64)> =
             sqlx::query_as("PRAGMA foreign_key_check")
                 .fetch_all(pool)
                 .await
                 .unwrap();
-        assert!(violations.is_empty(), "fixture must be legal before 118");
+        assert!(violations.is_empty(), "fixture must be legal before 119");
     }
 
     #[tokio::test]
-    async fn migration_118_rejects_legacy_codec_mismatch_transactionally() {
+    async fn migration_119_rejects_legacy_codec_mismatch_transactionally() {
         let pool = test_pool().await;
-        setup_migration_118_dispatch_fixture(&pool, "legacy_other_codec").await;
+        setup_migration_119_dispatch_fixture(&pool, "legacy_other_codec").await;
         let schema_query = "SELECT type, name, sql FROM sqlite_master ORDER BY type, name";
         let old_schema: Vec<(String, String, Option<String>)> =
             sqlx::query_as(schema_query).fetch_all(&pool).await.unwrap();
@@ -19191,7 +19191,7 @@ mod tests {
             .to_string()
             .contains("cleanup plan requires exact parent dispatch identity"));
         let ledger_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 118")
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 119")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -19214,13 +19214,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_118_upgrades_exact_dispatch_plans_with_clean_foreign_keys() {
+    async fn migration_119_upgrades_exact_dispatch_plans_with_clean_foreign_keys() {
         let pool = test_pool().await;
-        setup_migration_118_dispatch_fixture(&pool, "worktree_id_v1").await;
+        setup_migration_119_dispatch_fixture(&pool, "worktree_id_v1").await;
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
         let ledger_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 118")
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 119")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -19243,7 +19243,7 @@ mod tests {
             )
         );
         let validation_artifacts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'migration_118_%'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'migration_119_%'",
         )
         .fetch_one(&pool)
         .await
@@ -19259,7 +19259,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_118_preserves_plans_and_enforces_exact_immutable_adoption() {
+    async fn migration_119_preserves_plans_and_enforces_exact_immutable_adoption() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE product_conversations (id TEXT PRIMARY KEY);
@@ -19315,7 +19315,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_118).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_119).execute(&pool).await.unwrap();
         let migrated_rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT inspection_generation, administrative_dir_incarnation
              FROM close_worktree_cleanup_plans ORDER BY inspection_generation",

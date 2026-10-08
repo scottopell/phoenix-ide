@@ -8,7 +8,7 @@ The work lifecycle spec now describes the intended user-facing **Close conversat
 
 ### Bounded Close repair candidate
 
-PR #865 adds exact same-attempt dispatch/cleanup-plan adoption, the supported FK-787 partial-generation recognizer, Linux all-process/all-task cwd inspection, and writer-safe final-tombstone recovery. These are candidate changes, not a claim that the full retirement implementation or retained production cleanup has shipped. Migration 118 preserves existing Close rows and installs lineage constraints without performing retry, adoption backfill, or filesystem deletion. No production retry, database surgery, quarantine deletion, deployment, or release is authorized by these artifacts.
+PR #865 adds exact same-attempt dispatch/cleanup-plan adoption, the supported FK-787 partial-generation recognizer, Linux all-process/all-task cwd inspection, and writer-safe final-tombstone recovery. These are candidate changes, not a claim that the full retirement implementation or retained production cleanup has shipped. Migration 119 preserves existing Close rows and installs lineage constraints without performing retry, adoption backfill, or filesystem deletion. No production retry, database surgery, quarantine deletion, deployment, or release is authorized by these artifacts.
 
 `NeedsRepair` requires explicit retry; startup recovery remains permitted for an attempt already in `RetirementRequested`. Bedrock's retry guidance preserves that boundary, and aggregate completion requires `RetirementRequested`, not `NeedsRepair`. The retained-row recognizer requires the complete diagnostic `Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed` together with every REQ-WL-005 row-shape condition. Existing broad lifecycle status below is retained rather than requalified by this candidate.
 
@@ -30,13 +30,13 @@ Durable Close retirement and ProductConversation History finalization are shippe
 | REQ-WL-005 | Only the enumerated partial-generation foreign-key failure is supported by retained-pair recognition |
 | REQ-WL-006 | Linux cwd inventory covers every process and task in the visible namespace and fails closed |
 | REQ-WL-007 | Tombstone recovery freshly inspects writers, revalidates identity and handles exact crash/absence states |
-| REQ-WL-008 | Migration 118 preserves existing evidence and performs no retirement or automatic retry |
+| REQ-WL-008 | Migration 119 preserves existing evidence and performs no retirement or automatic retry |
 | REQ-PROJ-028a | Restart retains immutable repair evidence and fail-closed adoption for missing/inaccessible worktrees |
 | REQ-WL-003 | Pull-request state guides Close but never triggers it |
 
 ## Normative Authority
 
-Current normative authority is `requirements.md`, `work-lifecycle.allium`, `specs/bedrock/bedrock.allium`, and the restart-repair evidence defined in `specs/git-repository/git-repository.allium`. ADR-026 records WorkScope resource ownership; ADR-031 records staged single authority for ProductConversation lifecycle and attachment persistence; ADR-032 records the hidden-repository identity plus retained repair-evidence adoption rules. This executive intentionally reports current implementation drift instead of treating the normative Close model as shipped. ADR-086 records the bounded same-attempt adoption and explicit retry policy; ADR-087 records all-task Linux cwd inventory and writer reinspection during tombstone crash recovery. Their compatibility boundary is feature-scoped under REQ-COMP-001/002 rather than a project-wide legacy recovery promise.
+Current normative authority is `requirements.md`, `work-lifecycle.allium`, `specs/bedrock/bedrock.allium`, and the restart-repair evidence defined in `specs/git-repository/git-repository.allium`. ADR-026 records WorkScope resource ownership; ADR-031 records staged single authority for ProductConversation lifecycle and attachment persistence; ADR-032 records the hidden-repository identity plus retained repair-evidence adoption rules. This executive intentionally reports current implementation drift instead of treating the normative Close model as shipped. ADR-087 records the bounded same-attempt adoption and explicit retry policy; ADR-088 records all-task Linux cwd inventory and writer reinspection during tombstone crash recovery. Their compatibility boundary is feature-scoped under REQ-COMP-001/002 rather than a project-wide legacy recovery promise.
 
 ## Implementation Status
 
@@ -52,7 +52,7 @@ Current normative authority is `requirements.md`, `work-lifecycle.allium`, `spec
 | REQ-WL-005 | Candidate; successor CI/review pending | `Database::resume_legacy_fk787_close_retirement_generation`; DB negative matrix covers exact-diagnostic near misses, zero captured worktrees, missing/extra inspections, missing/extra/unsealed active inventory, current dispatch/plan, wrong residuals and missing/mismatched prior authority; rejection asserts unchanged retained rows and obligation. Added matrix cases remain unexecuted pending successor CI |
 | REQ-WL-006 | Candidate; Linux execution not performed here | `linux_namespace_cwd_scan`; non-leader/cross-UID tasks, unreadability, inventory churn, PID/TID reuse and exec identity regressions required |
 | REQ-WL-007 | Candidate; not qualified by this spec edit | `resume_final_worktree_tombstone_with_writer_inspection`; persisted writer, indeterminate scan, replacement, pre-rename and unbound-object crash regressions required |
-| REQ-WL-008 | Candidate; not qualified by this spec edit | `MIGRATION_118`; preservation and relational immutability constraints require migration regression execution |
+| REQ-WL-008 | Candidate; not qualified by this spec edit | `MIGRATION_119`; preservation and relational immutability constraints require migration regression execution |
 | REQ-PROJ-028a | Not implemented | Missing/inaccessible registered worktrees are not yet preserved as immutable restart-repair evidence that later Close attempts can adopt fail-closed by exact identity |
 | REQ-WL-003 | Partially implemented | Observed PR state already guides current cleanup affordances, but it still participates in legacy mark-merged UX rather than purely advisory Close guidance |
 
