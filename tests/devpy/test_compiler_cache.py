@@ -447,7 +447,7 @@ class CompilerCacheTests(unittest.TestCase):
             ):
                 self.assertIsNone(
                     self.dev._record_kache_store_owner(
-                        store, socket_a, "remote-a-identity"
+                        store, socket_a, "remote-a-upload-identity"
                     )
                 )
                 with mock.patch.object(
@@ -456,12 +456,76 @@ class CompilerCacheTests(unittest.TestCase):
                     return_value=True,
                 ):
                     error = self.dev._admit_kache_store_owner(
-                        store, Path(root / "b.sock"), "remote-b-identity"
+                        store, Path(root / "b.sock"), "remote-b-upload-identity"
                     )
 
             self.assertIn("different Kache identity owns this local store", error or "")
             self.assertEqual('{"remote":"A"}', intent.read_text())
             self.assertFalse((root / "b.sock").exists())
+
+    def test_environment_only_s3_remote_requires_store_serialization(self):
+        with mock.patch.dict(
+            os.environ, {"KACHE_S3_BUCKET": "bucket-a"}, clear=True
+        ):
+            self.assertTrue(self.dev._kache_remote_enabled(cargo_cwd=Path("/repo")))
+
+    def test_ignore_env_uses_file_store_and_ignores_decoy_cache_dir(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configured = root / "configured-store"
+            config = root / "kache.toml"
+            config.write_text(
+                f'[cache]\nignore_env = true\nlocal_store = "{configured}"\n'
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "KACHE_CONFIG": str(config),
+                    "KACHE_CACHE_DIR": str(root / "decoy-store"),
+                },
+                clear=True,
+            ):
+                actual = self.dev._resolved_kache_store(cargo_cwd=root)
+
+        self.assertEqual(configured.resolve(), actual)
+
+    def test_unowned_nonempty_upload_queue_fails_closed(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary) / "store"
+            spool = store / "upload-queue"
+            spool.mkdir(parents=True)
+            intent = spool / "intent.json"
+            intent.write_text('{"remote":"A"}')
+            error = self.dev._admit_kache_store_owner(
+                store, Path(temporary) / "remote-b.sock", "remote-b"
+            )
+            preserved = intent.read_text()
+
+        self.assertIn("unowned durable upload intents", error or "")
+        self.assertEqual('{"remote":"A"}', preserved)
+
+    def test_upload_identity_ignores_daemon_only_settings(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "kache.toml"
+            config.write_text(
+                '[cache]\nlocal_max_size = "1 GiB"\n[cache.remote]\nbackend = "s3"\nbucket = "same"\n'
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"KACHE_CONFIG": str(config), "KACHE_LOG_FILE": "one"},
+                clear=True,
+            ):
+                first = self.dev._kache_upload_identity(cargo_cwd=root)
+                os.environ["KACHE_LOG_FILE"] = "two"
+                second = self.dev._kache_upload_identity(cargo_cwd=root)
+                config.write_text(
+                    '[cache]\nlocal_max_size = "2 GiB"\n[cache.remote]\nbackend = "s3"\nbucket = "same"\n'
+                )
+                third = self.dev._kache_upload_identity(cargo_cwd=root)
+
+        self.assertEqual(first, second)
+        self.assertEqual(second, third)
 
     def test_effective_pr_scoped_socket_drives_ownership(self):
         configured = Path("/tmp/kache.sock")
