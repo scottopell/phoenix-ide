@@ -606,7 +606,146 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_mcp_token_removals",
         sql: "CREATE TABLE mcp_oauth_removals (server_name TEXT PRIMARY KEY NOT NULL);",
     },
+    Migration {
+        version: 119,
+        name: "close_cleanup_failures",
+        sql: MIGRATION_119,
+    },
 ];
+
+const MIGRATION_119: &str = r"
+CREATE UNIQUE INDEX close_expected_retirement_resources_exact_codec
+ON close_expected_retirement_resources (
+    attempt_id, scope, inspection_generation, inspection_fingerprint,
+    resource_kind, identity_kind, identity_codec, identity_value
+);
+CREATE TABLE close_cleanup_failures (
+    failure_occurrence_id TEXT PRIMARY KEY NOT NULL CHECK (trim(failure_occurrence_id) <> ''),
+    attempt_id TEXT NOT NULL REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+    cleanup_run_ordinal INTEGER NOT NULL CHECK (typeof(cleanup_run_ordinal) = 'integer' AND cleanup_run_ordinal >= 0),
+    source_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id),
+    scope TEXT NOT NULL REFERENCES work_scopes(id),
+    inspection_generation TEXT NOT NULL,
+    inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('removal_failed', 'still_shared_by_live_owner', 'residual_process_alive', 'identity_not_proven', 'manual_repair_required')),
+    detail TEXT NOT NULL,
+    stop_certainty TEXT NOT NULL CHECK (stop_certainty IN ('conversation_and_processes_stopped', 'shutdown_uncertain')),
+    confirmed_at_us INTEGER,
+    occurred_at_us INTEGER NOT NULL CHECK (typeof(occurred_at_us) = 'integer' AND occurred_at_us >= 0),
+    UNIQUE (attempt_id, cleanup_run_ordinal),
+    CHECK ((stop_certainty = 'conversation_and_processes_stopped' AND confirmed_at_us IS NOT NULL AND typeof(confirmed_at_us) = 'integer' AND confirmed_at_us >= 0)
+        OR (stop_certainty = 'shutdown_uncertain' AND confirmed_at_us IS NULL)),
+    FOREIGN KEY (attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value)
+    REFERENCES close_expected_retirement_resources (attempt_id, scope, inspection_generation,
+        inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value)
+    ON DELETE CASCADE
+);
+CREATE TRIGGER close_cleanup_failures_require_initial_authority
+BEFORE INSERT ON close_cleanup_failures
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations product ON product.id = obligation.product_conversation_id
+    JOIN close_retirement_resources residual ON residual.attempt_id = obligation.attempt_id
+    WHERE obligation.attempt_id = NEW.attempt_id AND obligation.phase = 'retirement_requested'
+      AND obligation.product_conversation_id = NEW.source_product_conversation_id
+      AND product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'
+      AND obligation.inspection_generation = NEW.inspection_generation
+      AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
+      AND residual.scope = NEW.scope AND residual.inspection_generation = NEW.inspection_generation
+      AND residual.inspection_fingerprint = NEW.inspection_fingerprint
+      AND residual.resource_kind = NEW.resource_kind AND residual.identity_kind = NEW.identity_kind
+      AND residual.identity_codec = NEW.identity_codec AND residual.identity_value = NEW.identity_value
+      AND residual.proof_kind = 'residual' AND residual.residual_reason = NEW.reason
+      AND residual.detail = NEW.detail
+)
+BEGIN
+    SELECT RAISE(ABORT, 'initial cleanup failure requires exact active retirement residual');
+END;
+CREATE TRIGGER close_cleanup_failures_are_immutable
+BEFORE UPDATE ON close_cleanup_failures
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup failure occurrence is immutable');
+END;
+CREATE TRIGGER close_cleanup_failure_completion_requires_disposition
+BEFORE UPDATE OF phase, close_outcome ON close_obligations
+WHEN NEW.phase = 'completed' AND NEW.close_outcome IN ('archived_cleanup_attention', 'close_incomplete')
+AND (OLD.phase <> 'retirement_requested' OR NOT EXISTS (
+    SELECT 1 FROM close_cleanup_failures failure
+    JOIN product_conversations product ON product.id = failure.source_product_conversation_id
+    WHERE failure.attempt_id = NEW.attempt_id AND failure.cleanup_run_ordinal = 0
+      AND failure.source_product_conversation_id = NEW.product_conversation_id
+      AND failure.inspection_generation = NEW.inspection_generation
+      AND failure.inspection_fingerprint = NEW.inspection_fingerprint
+      AND ((NEW.close_outcome = 'archived_cleanup_attention'
+            AND failure.stop_certainty = 'conversation_and_processes_stopped'
+            AND product.ordinary_lifecycle = 'history')
+        OR (NEW.close_outcome = 'close_incomplete'
+            AND failure.stop_certainty = 'shutdown_uncertain'
+            AND product.ordinary_lifecycle = 'open'))
+      AND NOT EXISTS (
+          SELECT 1 FROM close_attempt_participants participant
+          JOIN conversations conversation ON conversation.id = participant.conversation_id
+          WHERE participant.attempt_id = NEW.attempt_id
+            AND conversation.archived <> (NEW.close_outcome = 'archived_cleanup_attention')
+      )
+      AND EXISTS (SELECT 1 FROM messages message
+          JOIN close_attempt_members member ON member.conversation_id = message.conversation_id
+          WHERE member.attempt_id = NEW.attempt_id AND member.member_role IN ('latest', 'root_latest')
+            AND message.message_id = 'close-outcome:' || NEW.attempt_id AND message.message_type = 'system')
+))
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup failure completion requires exact terminal disposition');
+END;
+";
+
+async fn run_migration_119(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        let mut tx = guard.connection().begin().await?;
+        for (object, source, target) in [
+            ("close_obligations", "close_outcome IN ('archived', 'cancelled')", "close_outcome IN ('archived', 'cancelled', 'archived_cleanup_attention', 'close_incomplete')"),
+            ("close_obligations_require_complete_retirement_proof", "AND NEW.phase = 'completed'", "AND NEW.phase = 'completed' AND NEW.close_outcome = 'archived'"),
+            ("close_obligations_require_archived_members_for_completion", "NEW.close_outcome = 'archived'", "NEW.close_outcome IN ('archived', 'archived_cleanup_attention')"),
+            (
+                "conversations_reject_member_archival_while_close_is_cancellable",
+                "AND obligation.phase <> 'completed'",
+                "AND obligation.phase <> 'completed' AND NOT EXISTS (
+                    SELECT 1 FROM close_cleanup_failures failure
+                    WHERE failure.attempt_id = obligation.attempt_id AND failure.cleanup_run_ordinal = 0
+                      AND obligation.phase = 'retirement_requested'
+                      AND failure.source_product_conversation_id = obligation.product_conversation_id
+                      AND failure.inspection_generation = obligation.inspection_generation
+                      AND failure.inspection_fingerprint = obligation.inspection_fingerprint
+                      AND failure.stop_certainty = 'conversation_and_processes_stopped'
+                )",
+            ),
+        ] {
+            let sql: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = ?1")
+                .bind(object).fetch_one(&mut *tx).await?;
+            if !sql.contains(source) {
+                return Err(DbError::Serialization(format!("migration 119 found unexpected {object} definition")));
+            }
+            sqlx::query("UPDATE sqlite_schema SET sql = ?2 WHERE name = ?1")
+                .bind(object).bind(sql.replacen(source, target, 1)).execute(&mut *tx).await?;
+        }
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version").fetch_one(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA schema_version = {}", schema_version + 1)))
+            .execute(&mut *tx).await?;
+        sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+            .bind(migration.version).bind(migration.name).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }.await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
 
 const MIGRATION_117: &str = concat!(
     include_str!("tool_availability.sql"),
@@ -10353,6 +10492,12 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             continue;
         }
 
+        if migration.version == 119 {
+            run_migration_119(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 96 {
             run_migration_096(pool, migration).await?;
             applied += 1;
@@ -11898,6 +12043,7 @@ mod tests {
             ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
             vec![
                 (118, "persist_mcp_token_removals"),
+                (119, "close_cleanup_failures"),
                 (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),

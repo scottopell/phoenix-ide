@@ -186,6 +186,8 @@ impl ClosePhase {
 pub enum CloseCompletionOutcome {
     Archived,
     Cancelled,
+    ArchivedCleanupAttention,
+    CloseIncomplete,
 }
 
 impl CloseCompletionOutcome {
@@ -194,6 +196,8 @@ impl CloseCompletionOutcome {
         match self {
             Self::Archived => "archived",
             Self::Cancelled => "cancelled",
+            Self::ArchivedCleanupAttention => "archived_cleanup_attention",
+            Self::CloseIncomplete => "close_incomplete",
         }
     }
 
@@ -202,8 +206,45 @@ impl CloseCompletionOutcome {
         Some(match value {
             "archived" => Self::Archived,
             "cancelled" => Self::Cancelled,
+            "archived_cleanup_attention" => Self::ArchivedCleanupAttention,
+            "close_incomplete" => Self::CloseIncomplete,
             _ => return None,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CloseStopCertainty {
+    ConversationAndProcessesStopped { confirmed_at_us: i64 },
+    ShutdownUncertain,
+}
+
+impl CloseStopCertainty {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConversationAndProcessesStopped { .. } => "conversation_and_processes_stopped",
+            Self::ShutdownUncertain => "shutdown_uncertain",
+        }
+    }
+
+    #[must_use]
+    pub const fn confirmed_at_us(self) -> Option<i64> {
+        match self {
+            Self::ConversationAndProcessesStopped { confirmed_at_us } => Some(confirmed_at_us),
+            Self::ShutdownUncertain => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn completion_outcome(self) -> CloseCompletionOutcome {
+        match self {
+            Self::ConversationAndProcessesStopped { .. } => {
+                CloseCompletionOutcome::ArchivedCleanupAttention
+            }
+            Self::ShutdownUncertain => CloseCompletionOutcome::CloseIncomplete,
+        }
     }
 }
 
@@ -909,7 +950,11 @@ impl CloseObligation {
             !requires_snapshot && !admits_optional_prior_snapshot && phase != ClosePhase::Completed;
         let is_completed = phase == ClosePhase::Completed;
         let completion_snapshot_disagrees = match close_outcome {
-            Some(CloseCompletionOutcome::Archived) => snapshot.is_none(),
+            Some(
+                CloseCompletionOutcome::Archived
+                | CloseCompletionOutcome::ArchivedCleanupAttention
+                | CloseCompletionOutcome::CloseIncomplete,
+            ) => snapshot.is_none(),
             Some(CloseCompletionOutcome::Cancelled) => snapshot.is_some(),
             None => false,
         };
@@ -1231,6 +1276,56 @@ mod tests {
             id
         );
         assert!(TranscriptConversationId::parse(" \t").is_err());
+    }
+
+    #[test]
+    fn cleanup_stop_certainty_requires_confirmation_and_selects_terminal_outcome() {
+        let confirmed = CloseStopCertainty::ConversationAndProcessesStopped {
+            confirmed_at_us: 42,
+        };
+        let encoded = serde_json::to_string(&confirmed).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CloseStopCertainty>(&encoded).unwrap(),
+            confirmed
+        );
+        assert!(serde_json::from_str::<CloseStopCertainty>(
+            r#"{"kind":"conversation_and_processes_stopped"}"#
+        )
+        .is_err());
+        assert_eq!(confirmed.confirmed_at_us(), Some(42));
+        assert_eq!(
+            confirmed.completion_outcome(),
+            CloseCompletionOutcome::ArchivedCleanupAttention
+        );
+        assert_eq!(
+            CloseStopCertainty::ShutdownUncertain.confirmed_at_us(),
+            None
+        );
+        assert_eq!(
+            CloseStopCertainty::ShutdownUncertain.completion_outcome(),
+            CloseCompletionOutcome::CloseIncomplete
+        );
+        for outcome in [
+            CloseCompletionOutcome::ArchivedCleanupAttention,
+            CloseCompletionOutcome::CloseIncomplete,
+        ] {
+            assert_eq!(
+                CloseCompletionOutcome::from_db_str(outcome.as_str()),
+                Some(outcome)
+            );
+            let now = Utc::now();
+            assert!(CloseObligation::parse(
+                CloseAttemptId::parse("attempt").unwrap(),
+                ProductConversationId::parse("product").unwrap(),
+                ClosePhase::Completed,
+                None,
+                now,
+                now,
+                Some(now),
+                Some(outcome),
+            )
+            .is_err());
+        }
     }
 
     #[test]

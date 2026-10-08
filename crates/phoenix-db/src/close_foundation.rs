@@ -6,9 +6,10 @@ use phoenix_core::domain::close::{
     CloseAttemptMember, CloseAttemptScope, CloseCompletionOutcome, CloseExpectedRetirementResource,
     CloseInspection, CloseInspectionLoss, CloseLossItem, CloseMemberRole, CloseObligation,
     CloseOwnedResourceInventory, ClosePhase, CloseRetiredResource, CloseRetirementSnapshot,
-    CloseRetirementTarget, GitOidIdentity, GitPathIdentity, LossCategory, LossItemIdentity,
-    OpaqueIdentity, ProductConversationId, RetiredResourceIdentity, RetiredResourceKind,
-    RetirementFailureReason, RetirementOutcome, TranscriptConversationId, WorktreeIdentity,
+    CloseRetirementTarget, CloseStopCertainty, GitOidIdentity, GitPathIdentity, LossCategory,
+    LossItemIdentity, OpaqueIdentity, ProductConversationId, RetiredResourceIdentity,
+    RetiredResourceKind, RetirementFailureReason, RetirementOutcome, TranscriptConversationId,
+    WorktreeIdentity,
 };
 use phoenix_core::domain::db_schema::MessageContent;
 use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
@@ -703,6 +704,20 @@ pub struct RecordCloseRetirementEvidenceRequest {
     pub resource: RetiredResourceIdentity,
     pub outcome: RetirementOutcome,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalizeInitialCloseCleanupFailureRequest {
+    pub failure_occurrence_id: String,
+    pub attempt_id: CloseAttemptId,
+    pub source_product_conversation_id: ProductConversationId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub reason: RetirementFailureReason,
+    pub detail: String,
+    pub stop_certainty: CloseStopCertainty,
+    pub occurred_at_us: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -4088,6 +4103,259 @@ impl Database {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Atomically records the initial cleanup failure and ends this Close attempt.
+    ///
+    /// # Errors
+    /// Returns an error for stale authority, conflicting replay, or persistence failure.
+    pub async fn terminalize_initial_close_cleanup_failure(
+        &self,
+        request: &TerminalizeInitialCloseCleanupFailureRequest,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = Self::terminalize_initial_close_cleanup_failure_tx(&mut tx, request).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Transaction seam for pairing terminalization with delivery in the caller's transaction.
+    ///
+    /// # Errors
+    /// Returns an error for stale authority, conflicting replay, or persistence failure.
+    /// The caller must roll back its transaction on error.
+    #[allow(clippy::too_many_lines)]
+    pub async fn terminalize_initial_close_cleanup_failure_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: &TerminalizeInitialCloseCleanupFailureRequest,
+    ) -> DbResult<CloseObligation> {
+        if request.occurred_at_us < 0
+            || request
+                .stop_certainty
+                .confirmed_at_us()
+                .is_some_and(|value| value < 0)
+            || request.failure_occurrence_id.trim().is_empty()
+        {
+            return Err(close_precondition("cleanup failure requires nonnegative timestamps and a nonempty occurrence identity"));
+        }
+        let occurred_at = DateTime::from_timestamp_micros(request.occurred_at_us)
+            .ok_or_else(|| {
+                close_precondition("cleanup failure occurrence timestamp is out of range")
+            })?
+            .to_rfc3339();
+        let obligation = close_obligation_for_update(tx, request.attempt_id.as_str()).await?;
+        let identity = request.resource.identity();
+        if let LossItemIdentity::Worktree(worktree) = identity {
+            let captured: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_attempt_scopes
+                 WHERE attempt_id = ?1 AND scope = ?2 AND captured_worktree_identity = ?3
+                   AND captured_worktree_fingerprint = ?4 AND captured_worktree_locator = ?5)",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(worktree.id().as_str())
+            .bind(worktree.fingerprint().as_str())
+            .bind(worktree.locator().encode())
+            .fetch_one(&mut **tx)
+            .await?;
+            if !captured {
+                return Err(close_precondition(
+                    "cleanup failure worktree differs from the complete captured identity",
+                ));
+            }
+        }
+        let existing: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_cleanup_failures
+             WHERE failure_occurrence_id = ?1 OR (attempt_id = ?2 AND cleanup_run_ordinal = 0))",
+        )
+        .bind(&request.failure_occurrence_id)
+        .bind(request.attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if existing {
+            let exact: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_cleanup_failures
+                 WHERE failure_occurrence_id = ?1 AND attempt_id = ?2 AND cleanup_run_ordinal = 0
+                   AND source_product_conversation_id = ?3 AND scope = ?4
+                   AND inspection_generation = ?5 AND inspection_fingerprint = ?6
+                   AND resource_kind = ?7 AND identity_kind = ?8 AND identity_codec = ?9
+                   AND identity_value = ?10 AND reason = ?11 AND detail = ?12
+                   AND stop_certainty = ?13 AND confirmed_at_us IS ?14 AND occurred_at_us = ?15)",
+            )
+            .bind(&request.failure_occurrence_id)
+            .bind(request.attempt_id.as_str())
+            .bind(request.source_product_conversation_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .bind(request.reason.as_str())
+            .bind(&request.detail)
+            .bind(request.stop_certainty.as_str())
+            .bind(request.stop_certainty.confirmed_at_us())
+            .bind(request.occurred_at_us)
+            .fetch_one(&mut **tx)
+            .await?;
+            if !exact
+                || obligation.phase() != ClosePhase::Completed
+                || obligation.close_outcome() != Some(request.stop_certainty.completion_outcome())
+                || obligation.snapshot() != Some(&request.snapshot)
+                || obligation.product_conversation_id() != &request.source_product_conversation_id
+            {
+                return Err(close_precondition(
+                    "cleanup failure replay conflicts with the committed occurrence",
+                ));
+            }
+            return Ok(obligation);
+        }
+        if obligation.phase() != ClosePhase::RetirementRequested
+            || obligation.snapshot() != Some(&request.snapshot)
+            || obligation.product_conversation_id() != &request.source_product_conversation_id
+        {
+            return Err(close_precondition(
+                "cleanup failure requires the exact active RetirementRequested snapshot",
+            ));
+        }
+        let expected: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_expected_retirement_resources resource
+             JOIN close_retirement_inventories inventory
+               ON inventory.attempt_id = resource.attempt_id AND inventory.scope = resource.scope
+              AND inventory.inspection_generation = resource.inspection_generation
+              AND inventory.inspection_fingerprint = resource.inspection_fingerprint
+             WHERE resource.attempt_id = ?1 AND resource.scope = ?2
+               AND resource.inspection_generation = ?3 AND resource.inspection_fingerprint = ?4
+               AND resource.resource_kind = ?5 AND resource.identity_kind = ?6
+               AND resource.identity_codec = ?7 AND resource.identity_value = ?8
+               AND inventory.sealed = 1)",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !expected {
+            return Err(close_precondition(
+                "cleanup failure resource is not in the exact sealed inventory",
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO close_retirement_resources (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value,
+                proof_kind, absence_basis, residual_reason, detail, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11, ?11)",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(request.reason.as_str())
+        .bind(&request.detail)
+        .bind(&occurred_at)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_retirement_resource_history (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value,
+                proof_kind, absence_basis, residual_reason, detail, recorded_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11)",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(request.reason.as_str())
+        .bind(&request.detail)
+        .bind(&occurred_at)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_cleanup_failures (
+                failure_occurrence_id, attempt_id, cleanup_run_ordinal,
+                source_product_conversation_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value, reason, detail,
+                stop_certainty, confirmed_at_us, occurred_at_us
+             ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        )
+        .bind(&request.failure_occurrence_id).bind(request.attempt_id.as_str())
+        .bind(request.source_product_conversation_id.as_str()).bind(request.scope.as_str())
+        .bind(request.snapshot.generation()).bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
+        .bind(identity.codec()).bind(identity.value()).bind(request.reason.as_str()).bind(&request.detail)
+        .bind(request.stop_certainty.as_str()).bind(request.stop_certainty.confirmed_at_us())
+        .bind(request.occurred_at_us).execute(&mut **tx).await?;
+        let latest: String = sqlx::query_scalar(
+            "SELECT conversation_id FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(&latest)
+        .fetch_one(&mut **tx)
+        .await?;
+        let archived = matches!(
+            request.stop_certainty,
+            CloseStopCertainty::ConversationAndProcessesStopped { .. }
+        );
+        let status = if archived {
+            "Closed — cleanup needs attention"
+        } else {
+            "Close incomplete — shutdown uncertain; cleanup needs attention"
+        };
+        let content = MessageContent::system(format!(
+            "{status}. Close attempt {}; failure {} ({}): {}. No automatic cleanup retry will run.",
+            request.attempt_id,
+            request.failure_occurrence_id,
+            request.reason.as_str(),
+            request.detail,
+        ));
+        let content = serde_json::to_string(&content.to_stored_json())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES (?1, ?2, ?3, 'system', ?4, ?5)",
+        ).bind(format!("close-outcome:{}", request.attempt_id)).bind(&latest).bind(sequence)
+        .bind(content).bind(&occurred_at).execute(&mut **tx).await?;
+        if archived {
+            sqlx::query(
+                "UPDATE conversations SET archived = 1, updated_at = ?2
+                 WHERE id IN (SELECT conversation_id FROM close_attempt_participants WHERE attempt_id = ?1)",
+            ).bind(request.attempt_id.as_str()).bind(&occurred_at).execute(&mut **tx).await?;
+            sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1 AND kind = 'ordinary'")
+                .bind(request.source_product_conversation_id.as_str()).execute(&mut **tx).await?;
+        }
+        let completed = sqlx::query(
+            "UPDATE close_obligations SET phase = 'completed', close_outcome = ?2,
+                completed_at = ?3, updated_at = ?3 WHERE attempt_id = ?1 AND phase = 'retirement_requested'",
+        ).bind(request.attempt_id.as_str()).bind(request.stop_certainty.completion_outcome().as_str())
+        .bind(&occurred_at).execute(&mut **tx).await?;
+        if completed.rows_affected() != 1 {
+            return Err(close_precondition(
+                "cleanup failure terminalization lost retirement authority",
+            ));
+        }
+        close_obligation_for_update(tx, request.attempt_id.as_str()).await
     }
 
     /// Completes one fully retired Close attempt and archives its captured members.
@@ -8833,6 +9101,373 @@ mod tests {
             obligation.close_outcome(),
             Some(CloseCompletionOutcome::Cancelled)
         );
+    }
+
+    async fn initial_cleanup_failure_fixture(
+        db: &Database,
+        stop_certainty: CloseStopCertainty,
+    ) -> TerminalizeInitialCloseCleanupFailureRequest {
+        create_root(db, "root").await;
+        let scope = allocate_scope_worktree(db, "root").await;
+        create_child(db, "latest", "root").await;
+        db.create_subagent_conversation(
+            "participant",
+            "participant",
+            "/tmp",
+            "latest",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            db.get_conversation("latest")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .as_ref(),
+            crate::SubAgentExecution {
+                connection: "mock",
+                effort: None,
+                persona: None,
+            },
+        )
+        .await
+        .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-failure",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            db,
+            "attempt-failure",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-failure").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("failure-gen", "failure-fp").unwrap(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let snapshot = current_test_snapshot(db, "attempt-failure").await;
+        capture_test_inventory(db, "attempt-failure", &scope, &snapshot, Vec::new()).await;
+        let resource = db
+            .list_close_expected_retirement_resources("attempt-failure")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap()
+            .resource;
+        TerminalizeInitialCloseCleanupFailureRequest {
+            failure_occurrence_id: "failure-occurrence".into(),
+            attempt_id: CloseAttemptId::parse("attempt-failure").unwrap(),
+            source_product_conversation_id: product_id("root"),
+            scope,
+            snapshot,
+            resource,
+            reason: RetirementFailureReason::RemovalFailed,
+            detail: "exact cleanup detail".into(),
+            stop_certainty,
+            occurred_at_us: Utc::now().timestamp_micros(),
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_cleanup_failure_terminalizes_both_certainties_and_exact_replay() {
+        for certainty in [
+            CloseStopCertainty::ConversationAndProcessesStopped {
+                confirmed_at_us: Utc::now().timestamp_micros(),
+            },
+            CloseStopCertainty::ShutdownUncertain,
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let request = initial_cleanup_failure_fixture(&db, certainty).await;
+            let completed = db
+                .terminalize_initial_close_cleanup_failure(&request)
+                .await
+                .unwrap();
+            assert_eq!(completed.phase(), ClosePhase::Completed);
+            assert_eq!(
+                completed.close_outcome(),
+                Some(certainty.completion_outcome())
+            );
+            assert_eq!(
+                db.terminalize_initial_close_cleanup_failure(&request)
+                    .await
+                    .unwrap(),
+                completed
+            );
+            let archived = certainty.confirmed_at_us().is_some();
+            for id in ["root", "latest", "participant"] {
+                assert_eq!(db.get_conversation(id).await.unwrap().archived, archived);
+            }
+            let lifecycle: String = sqlx::query_scalar(
+                "SELECT ordinary_lifecycle FROM product_conversations WHERE id = 'root'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(lifecycle, if archived { "history" } else { "open" });
+            let messages: Vec<(String, String)> = sqlx::query_as(
+                "SELECT message_id, content FROM messages WHERE conversation_id = 'latest'",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].0, "close-outcome:attempt-failure");
+            assert!(messages[0].1.contains(if archived {
+                "Closed — cleanup needs attention"
+            } else {
+                "Close incomplete — shutdown uncertain"
+            }));
+            let failure: (i64, String, Option<i64>, i64, String) = sqlx::query_as(
+                "SELECT cleanup_run_ordinal, stop_certainty, confirmed_at_us, occurred_at_us, identity_codec FROM close_cleanup_failures",
+            ).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(
+                failure,
+                (
+                    0,
+                    certainty.as_str().into(),
+                    certainty.confirmed_at_us(),
+                    request.occurred_at_us,
+                    request.resource.identity().codec().into()
+                )
+            );
+            let evidence = db
+                .list_close_retirement_evidence("attempt-failure")
+                .await
+                .unwrap();
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(
+                evidence[0].outcome,
+                RetirementOutcome::Residual {
+                    residual_reason: request.reason
+                }
+            );
+            let mut changed = request.clone();
+            changed.detail.push_str("different");
+            assert!(db
+                .terminalize_initial_close_cleanup_failure(&changed)
+                .await
+                .is_err());
+            changed = request.clone();
+            changed.failure_occurrence_id = "other-failure".into();
+            assert!(db
+                .terminalize_initial_close_cleanup_failure(&changed)
+                .await
+                .is_err());
+            changed = request.clone();
+            changed.occurred_at_us += 1;
+            assert!(db
+                .terminalize_initial_close_cleanup_failure(&changed)
+                .await
+                .is_err());
+            changed = request.clone();
+            changed.stop_certainty = if archived {
+                CloseStopCertainty::ShutdownUncertain
+            } else {
+                CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 }
+            };
+            assert!(db
+                .terminalize_initial_close_cleanup_failure(&changed)
+                .await
+                .is_err());
+            assert!(db
+                .retry_close_retirement(&request.attempt_id)
+                .await
+                .is_err());
+            let fk_errors = sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+            assert!(fk_errors.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_cleanup_failure_schema_enforces_certainty_ordinal_identity_and_immutability() {
+        let db = Database::open_in_memory().await.unwrap();
+        let request =
+            initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+        db.terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("UPDATE close_cleanup_failures SET detail = 'changed'")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::raw_sql("DROP TRIGGER close_cleanup_failures_require_initial_authority;")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for (ordinal, certainty, confirmed, occurred, codec, product) in [
+            (-1, "shutdown_uncertain", None, 1, "worktree_id_v1", "root"),
+            (
+                1,
+                "shutdown_uncertain",
+                Some(1),
+                1,
+                "worktree_id_v1",
+                "root",
+            ),
+            (
+                1,
+                "conversation_and_processes_stopped",
+                None,
+                1,
+                "worktree_id_v1",
+                "root",
+            ),
+            (
+                1,
+                "conversation_and_processes_stopped",
+                Some(-1),
+                1,
+                "worktree_id_v1",
+                "root",
+            ),
+            (1, "shutdown_uncertain", None, -1, "worktree_id_v1", "root"),
+            (1, "shutdown_uncertain", None, 1, "wrong_codec", "root"),
+            (
+                1,
+                "shutdown_uncertain",
+                None,
+                1,
+                "worktree_id_v1",
+                "missing-product",
+            ),
+            (0, "shutdown_uncertain", None, 1, "worktree_id_v1", "root"),
+        ] {
+            assert!(sqlx::query(
+                "INSERT INTO close_cleanup_failures SELECT 'schema-copy', attempt_id, ?1, ?6,
+                 scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind,
+                 ?5, identity_value, reason, detail, ?2, ?3, ?4 FROM close_cleanup_failures
+                 WHERE failure_occurrence_id = 'failure-occurrence'",
+            )
+            .bind(ordinal)
+            .bind(certainty)
+            .bind(confirmed)
+            .bind(occurred)
+            .bind(codec)
+            .bind(product)
+            .execute(&mut *tx)
+            .await
+            .is_err());
+        }
+        sqlx::query(
+            "INSERT INTO close_cleanup_failures SELECT 'schema-copy', attempt_id, 1, source_product_conversation_id,
+             scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind,
+             identity_codec, identity_value, reason, detail, 'conversation_and_processes_stopped', 1, 1
+             FROM close_cleanup_failures WHERE failure_occurrence_id = 'failure-occurrence'",
+        ).execute(&mut *tx).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_cleanup_failure_rolls_back_after_late_failure_and_caller_abort() {
+        let db = Database::open_in_memory().await.unwrap();
+        let request = initial_cleanup_failure_fixture(
+            &db,
+            CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 },
+        )
+        .await;
+        sqlx::raw_sql("CREATE TRIGGER injected_cleanup_crash BEFORE UPDATE OF phase ON close_obligations WHEN NEW.phase = 'completed' BEGIN SELECT RAISE(ABORT, 'injected crash'); END;")
+            .execute(db.pool()).await.unwrap();
+        assert!(db
+            .terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .is_err());
+        assert_initial_cleanup_unchanged(&db).await;
+        sqlx::raw_sql("DROP TRIGGER injected_cleanup_crash;")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        Database::terminalize_initial_close_cleanup_failure_tx(&mut tx, &request)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert_initial_cleanup_unchanged(&db).await;
+        db.terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_initial_cleanup_unchanged(db: &Database) {
+        assert_eq!(
+            db.get_close_obligation("attempt-failure")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::RetirementRequested
+        );
+        assert!(!db.get_conversation("latest").await.unwrap().archived);
+        assert!(!db.get_conversation("participant").await.unwrap().archived);
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM close_cleanup_failures), (SELECT COUNT(*) FROM close_retirement_resources),
+             (SELECT COUNT(*) FROM close_retirement_resource_history), (SELECT COUNT(*) FROM messages)",
+        ).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(counts, (0, 0, 0, 0));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT ordinary_lifecycle FROM product_conversations WHERE id = 'root'"
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            "open"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_cleanup_failure_rejects_stale_snapshot_resource_and_transition_without_occurrence(
+    ) {
+        let db = Database::open_in_memory().await.unwrap();
+        let request =
+            initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+        let mut changed = request.clone();
+        changed.snapshot = CloseRetirementSnapshot::parse("stale", "stale").unwrap();
+        assert!(db
+            .terminalize_initial_close_cleanup_failure(&changed)
+            .await
+            .is_err());
+        changed = request.clone();
+        changed.resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::BrowserSession,
+            LossItemIdentity::Opaque(OpaqueIdentity::parse("not-in-inventory").unwrap()),
+        )
+        .unwrap();
+        assert!(db
+            .terminalize_initial_close_cleanup_failure(&changed)
+            .await
+            .is_err());
+        for outcome in ["close_incomplete", "archived_cleanup_attention"] {
+            assert!(sqlx::query("UPDATE close_obligations SET phase = 'completed', close_outcome = ?1, completed_at = updated_at WHERE attempt_id = 'attempt-failure'")
+                .bind(outcome).execute(db.pool()).await.is_err());
+        }
+        assert_initial_cleanup_unchanged(&db).await;
     }
 
     #[tokio::test]

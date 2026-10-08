@@ -969,7 +969,16 @@ async fn run_legacy_close_compat(
             }
             ClosePhase::Completed => {
                 return match obligation.close_outcome() {
-                    Some(CloseCompletionOutcome::Archived) => Ok(()),
+                    Some(
+                        CloseCompletionOutcome::Archived
+                        | CloseCompletionOutcome::ArchivedCleanupAttention,
+                    ) => Ok(()),
+                    Some(CloseCompletionOutcome::CloseIncomplete) => {
+                        Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            "Close could not confirm that conversation and process shutdown completed",
+                            "close_incomplete",
+                        ))))
+                    }
                     Some(CloseCompletionOutcome::Cancelled) => {
                         Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                             "Close was cancelled before archival completed",
