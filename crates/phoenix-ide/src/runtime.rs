@@ -592,7 +592,7 @@ pub struct RuntimeManager {
         AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
     close_retirement_execution: ConversationMutexGates,
     #[cfg(test)]
-    pub(crate) test_ambient_writer_observer: Option<TestAmbientWriterObserver>,
+    test_ambient_writer_observer: Arc<std::sync::RwLock<TestAmbientWriterObserver>>,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
@@ -2309,6 +2309,22 @@ impl RuntimeManager {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_ambient_writer_observer(&self, observer: TestAmbientWriterObserver) {
+        *self
+            .test_ambient_writer_observer
+            .write()
+            .expect("test ambient writer observer lock poisoned") = observer;
+    }
+
+    #[cfg(test)]
+    fn test_ambient_writer_observer(&self) -> TestAmbientWriterObserver {
+        self.test_ambient_writer_observer
+            .read()
+            .expect("test ambient writer observer lock poisoned")
+            .clone()
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn new_with_message_retriever_and_runtime_env(
         db: Database,
@@ -2370,7 +2386,7 @@ impl RuntimeManager {
             terminals: crate::terminal::ActiveTerminals::new(),
             close_retirement_leases: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
-            test_ambient_writer_observer: Some(Arc::new(|_| Ok(false))),
+            test_ambient_writer_observer: Arc::new(std::sync::RwLock::new(Arc::new(|_| Ok(false)))),
             close_retirement_execution: ConversationMutexGates::default(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
@@ -9002,7 +9018,7 @@ mod scope_liveness_tests {
         let mut manager = test_manager().await;
         let writer_observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observations = Arc::clone(&writer_observations);
-        manager.test_ambient_writer_observer = Some(Arc::new(move |_| {
+        manager.set_test_ambient_writer_observer(Arc::new(move |_| {
             observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(false)
         }));
@@ -9432,7 +9448,7 @@ mod scope_liveness_tests {
         let key = ResourceScopeKey::Work(scope);
         let observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = Arc::clone(&observations);
-        manager.test_ambient_writer_observer = Some(Arc::new(move |_| {
+        manager.set_test_ambient_writer_observer(Arc::new(move |_| {
             assert!(
                 matches!(
                     terminals.reserve_spawn(&key),
@@ -9994,7 +10010,7 @@ mod scope_liveness_tests {
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
         let mut manager = test_manager().await;
         manager.tmux_registry = Arc::new(owner.registry());
-        manager.test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
+        manager.set_test_ambient_writer_observer(Arc::new(|_| Ok(false)));
         let (_repository, attempt_id, scope, socket, stale_token) =
             prepare_clean_close_with_tmux(&manager, &owner, "live-tmux-close", "live-tmux-attempt")
                 .await;
@@ -10029,7 +10045,7 @@ mod scope_liveness_tests {
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
         let mut manager = test_manager().await;
         manager.tmux_registry = Arc::new(owner.registry());
-        manager.test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
+        manager.set_test_ambient_writer_observer(Arc::new(|_| Ok(false)));
         let (_repository, attempt_id, scope, socket, stale_token) = prepare_clean_close_with_tmux(
             &manager,
             &owner,

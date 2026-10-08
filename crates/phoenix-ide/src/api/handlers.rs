@@ -15433,10 +15433,10 @@ pub(crate) mod hard_delete_cascade_tests {
     /// A first-pass Work-mode Close captures its inventory before retirement.
     #[tokio::test]
     async fn archive_chain_captures_first_pass_close_inventory() {
-        let mut state = make_test_state().await;
-        Arc::get_mut(&mut state.runtime)
-            .expect("archive fixture has sole runtime ownership")
-            .test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
+        let state = make_test_state().await;
+        state
+            .runtime
+            .set_test_ambient_writer_observer(Arc::new(|_| Ok(false)));
         let ids = ["sc-a", "sc-a2", "sc-a3"];
         let (_tmp, repo, worktree, branch) =
             build_workmode_chain_with_shared_worktree(&state, &ids).await;

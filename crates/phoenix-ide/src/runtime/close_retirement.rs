@@ -1366,7 +1366,7 @@ impl RuntimeManager {
                         let binding_resource = target.resource.clone();
                         let runtime = tokio::runtime::Handle::current();
                         #[cfg(test)]
-                        let test_writer_observer = self.test_ambient_writer_observer.clone();
+                        let test_writer_observer = self.test_ambient_writer_observer();
                         let recovery = tokio::task::spawn_blocking(move || {
                             let bind_object = |object_device, object_inode| {
                                 runtime
@@ -1656,7 +1656,7 @@ impl RuntimeManager {
                         let runtime = tokio::runtime::Handle::current();
                         let persistence_runtime = runtime.clone();
                         #[cfg(test)]
-                        let test_writer_observer = self.test_ambient_writer_observer.clone();
+                        let test_writer_observer = self.test_ambient_writer_observer();
                         let final_removal =
                             tokio::task::spawn_blocking(move || {
                                 inspect_and_remove_exact_worktree(
@@ -6398,7 +6398,7 @@ mod tests {
         );
         let temp = tempfile::tempdir().unwrap();
         if !conflicting_incarnation {
-            manager.test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
+            manager.set_test_ambient_writer_observer(Arc::new(|_| Ok(false)));
         }
         let repository = temp.path().join("repository");
         let linked = temp.path().join("linked");
@@ -6708,7 +6708,7 @@ mod tests {
         assert_eq!(expected_plan.final_tombstone.as_ref(), Some(&tombstone));
         let observations = Arc::new(Mutex::new(Vec::new()));
         let writer_observations = observations.clone();
-        manager.test_ambient_writer_observer = Some(Arc::new(move |path| {
+        manager.set_test_ambient_writer_observer(Arc::new(move |path| {
             writer_observations.lock().unwrap().push(path.to_path_buf());
             Ok(true)
         }));
@@ -6754,7 +6754,7 @@ mod tests {
             assert_eq!(absence_proofs, 0);
         }
         assert_eq!(*observations.lock().unwrap(), vec![object.clone(); 3]);
-        manager.test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
+        manager.set_test_ambient_writer_observer(Arc::new(|_| Ok(false)));
         manager.db().retry_close_retirement(attempt).await.unwrap();
         let completed_snapshot = manager
             .inspect_close_retirement(attempt.clone())
