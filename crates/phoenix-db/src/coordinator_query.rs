@@ -327,8 +327,6 @@ fn function_allowed(name: &str) -> bool {
         "abs"
             | "avg"
             | "coalesce"
-            | "concat"
-            | "concat_ws"
             | "count"
             | "date"
             | "datetime"
@@ -876,6 +874,23 @@ mod tests {
             execute_coordinator_query(path.to_str().unwrap(), "SELECT 1; SELECT 2"),
             Err(CoordinatorQueryError::MultipleStatements)
         ));
+    }
+
+    #[test]
+    fn denies_concat_functions_that_allocate_before_sqlite_length_enforcement() {
+        let (_dir, path) = fixture();
+        for sql in [
+            "SELECT concat('a', 'b')",
+            "SELECT concat_ws(printf('%.*c', 65535, 'x'), '', '')",
+        ] {
+            assert!(
+                matches!(
+                    execute_coordinator_query(path.to_str().unwrap(), sql),
+                    Err(CoordinatorQueryError::Denied(_))
+                ),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
