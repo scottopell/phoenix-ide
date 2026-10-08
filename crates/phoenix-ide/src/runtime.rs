@@ -9061,8 +9061,8 @@ mod scope_liveness_tests {
     async fn failed_pre_runtime_worktree_reinspection_persists_typed_residual() {
         #![allow(clippy::too_many_lines)]
         use phoenix_core::domain::close::{
-            CapturedWorktreeIdentity, CloseAttemptId, ClosePhase, RetiredResourceKind,
-            RetirementFailureReason, RetirementOutcome,
+            CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome, ClosePhase,
+            RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
         };
 
         let manager = test_manager().await;
@@ -9161,7 +9161,27 @@ mod scope_liveness_tests {
             .get_close_obligation(attempt_id.as_str())
             .await
             .unwrap();
-        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
+        assert_eq!(obligation.phase(), ClosePhase::Completed);
+        assert_eq!(
+            obligation.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        let failure_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_cleanup_failures WHERE attempt_id = ?1")
+                .bind(attempt_id.as_str())
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(failure_count, 1);
+        let mandatory_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events
+             WHERE mandatory_failure_occurrence_id = ?1",
+        )
+        .bind(format!("close-cleanup-failure:{attempt_id}:0"))
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(mandatory_event_count, 1);
         let evidence = manager
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())
