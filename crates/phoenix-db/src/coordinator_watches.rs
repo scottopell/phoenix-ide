@@ -282,7 +282,7 @@ pub(crate) async fn record_question_wait_tx(
     transcript_id: &str,
     state: &ConvState,
 ) -> DbResult<()> {
-    let ConvState::AwaitingUserInput {
+    let ConvState::AwaitingUserResponse {
         request_authority, ..
     } = state
     else {
@@ -304,7 +304,7 @@ pub(crate) async fn record_question_wait_tx(
         sqlx::query("INSERT INTO coordinator_watch_events
             (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
              source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
-            VALUES (?1, ?2, 'question_request', ?3, 0, ?4, 'awaiting_user_input', 'question_request', ?5)
+            VALUES (?1, ?2, 'question_request', ?3, 0, ?4, 'awaiting_user_response', 'question_request', ?5)
             ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING")
             .bind(uuid::Uuid::new_v4().to_string()).bind(watch_id)
             .bind(request_id.to_string()).bind(transcript_id)
@@ -476,7 +476,7 @@ mod tests {
             .await
             .unwrap();
         let turn_id = source_turn(&db, &source.id, "active-question-turn").await;
-        let waiting = |authority| ConvState::AwaitingUserInput {
+        let waiting = |authority| ConvState::AwaitingUserResponse {
             tool_use_id: "provider-reused-tool-id".into(),
             request_authority: authority,
             questions: vec![UserQuestion {
@@ -485,8 +485,6 @@ mod tests {
                 options: vec![],
                 multi_select: false,
             }],
-            pending_tool_calls: vec![],
-            completed_results: vec![],
         };
         let first = waiting(QuestionRequestAuthority::new());
         db.update_conversation_state(&source.id, &first)
@@ -506,7 +504,7 @@ mod tests {
             1,
             "one durable request must produce one wait event"
         );
-        assert_eq!(events[0].terminal_kind, "awaiting_user_input");
+        assert_eq!(events[0].terminal_kind, "awaiting_user_response");
         assert_eq!(
             events[0].terminal_reason.as_deref(),
             Some("question_request")
