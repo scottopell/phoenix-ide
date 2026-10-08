@@ -611,7 +611,32 @@ const MIGRATIONS: &[Migration] = &[
         name: "adopt_close_worktree_cleanup_plans",
         sql: MIGRATION_118,
     },
+    Migration {
+        version: 120,
+        name: "require_close_repair_reinspection",
+        sql: MIGRATION_119,
+    },
 ];
+
+const MIGRATION_119: &str = r"
+DROP TRIGGER close_obligations_transition_graph;
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('awaiting_retirement_inspection', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase = 'awaiting_retirement_inspection')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
+";
 
 const MIGRATION_117: &str = concat!(
     include_str!("tool_availability.sql"),
@@ -12065,8 +12090,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(9).copied().collect::<Vec<_>>(),
             vec![
+                (120, "require_close_repair_reinspection"),
                 (119, "adopt_close_worktree_cleanup_plans"),
                 (118, "persist_mcp_token_removals"),
                 (117, "persist_conversation_tool_policy"),
@@ -18696,6 +18722,147 @@ mod tests {
             Some("claude-sonnet-4-6"),
             "non-Opus rows must not be touched"
         );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn migration_119_upgrades_118_close_repair_transition_graph_idempotently() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE close_obligations (phase TEXT NOT NULL);
+             CREATE TRIGGER close_obligations_transition_graph
+             BEFORE UPDATE OF phase ON close_obligations BEGIN SELECT 1; END;
+             INSERT INTO close_obligations VALUES ('needs_repair');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_083).execute(&pool).await.unwrap();
+        stamp_migrations_except(&pool, 119).await;
+        let newest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(newest, 118);
+
+        for target in ["retirement_requested", "completed"] {
+            sqlx::query("UPDATE close_obligations SET phase = ?1")
+                .bind(target)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "DELETE FROM close_obligations;
+                 INSERT INTO close_obligations VALUES ('needs_repair');",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        let stamps: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 119")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stamps, 1);
+        let phase: String = sqlx::query_scalar("SELECT phase FROM close_obligations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(phase, "needs_repair");
+
+        let graph: &[(&str, &[&str])] = &[
+            (
+                "awaiting_blocker_resolution",
+                &[
+                    "awaiting_stop_work_confirmation",
+                    "settling_active_work",
+                    "completed",
+                ],
+            ),
+            (
+                "awaiting_stop_work_confirmation",
+                &["settling_active_work", "completed"],
+            ),
+            (
+                "settling_active_work",
+                &[
+                    "cancel_requested_during_settlement",
+                    "awaiting_retirement_inspection",
+                ],
+            ),
+            ("cancel_requested_during_settlement", &["completed"]),
+            (
+                "awaiting_retirement_inspection",
+                &[
+                    "awaiting_loss_confirmation",
+                    "retirement_requested",
+                    "needs_repair",
+                    "completed",
+                ],
+            ),
+            (
+                "awaiting_loss_confirmation",
+                &[
+                    "awaiting_retirement_inspection",
+                    "retirement_requested",
+                    "completed",
+                ],
+            ),
+            (
+                "retirement_requested",
+                &[
+                    "awaiting_retirement_inspection",
+                    "needs_repair",
+                    "completed",
+                ],
+            ),
+            ("needs_repair", &["awaiting_retirement_inspection"]),
+            ("completed", &[]),
+        ];
+        for &(source, supported) in graph {
+            for &(target, _) in graph {
+                sqlx::query("DELETE FROM close_obligations")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO close_obligations VALUES (?1)")
+                    .bind(source)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let result = sqlx::query("UPDATE close_obligations SET phase = ?1")
+                    .bind(target)
+                    .execute(&pool)
+                    .await;
+                if supported.contains(&target) {
+                    result.unwrap_or_else(|error| panic!("{source} -> {target}: {error}"));
+                } else {
+                    let error = result.expect_err("unsupported phase transition must be rejected");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("invalid close obligation phase transition"),
+                        "{source} -> {target}: {error}"
+                    );
+                }
+                let phase: String = sqlx::query_scalar("SELECT phase FROM close_obligations")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    phase,
+                    if supported.contains(&target) {
+                        target
+                    } else {
+                        source
+                    }
+                );
+            }
+        }
     }
 
     async fn setup_migration_118_dispatch_fixture(pool: &SqlitePool, plan_codec: &str) {

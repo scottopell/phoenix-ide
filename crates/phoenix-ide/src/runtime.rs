@@ -9713,6 +9713,11 @@ mod scope_liveness_tests {
                 .cancel_close_resource_leases(&attempt_id)
                 .await
                 .unwrap();
+            manager.tmux_registry = Arc::new(
+                phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                    sockets.path().to_path_buf(),
+                ),
+            );
             manager.set_test_ambient_writer_observer(Arc::new(|_| {
                 panic!("post-delete or changed identity must not inspect writers")
             }));

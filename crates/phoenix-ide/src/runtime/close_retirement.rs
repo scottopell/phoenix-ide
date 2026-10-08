@@ -1317,75 +1317,73 @@ impl RuntimeManager {
                     let captured_exists = captured_path.try_exists().map_err(|error| {
                         CloseRetirementError::from(error.to_string()).in_scope(&scope)
                     })?;
-                    let existing_cleanup_plan = if !captured_exists
-                        && existing_cleanup_plan.is_none()
-                    {
-                        let prior_plan = self
-                            .db()
-                            .prior_close_worktree_cleanup_plan(
-                                attempt_id,
-                                &scope,
-                                snapshot,
-                                &target.resource,
-                            )
-                            .await
-                            .map_err(|error| {
-                                map_close_retirement_db_error(error).in_scope(&scope)
-                            })?;
-                        if let Some(prior_plan) = prior_plan {
-                            let observed_administrative_dir = prior_plan.administrative_dir;
-                            let observed_path = observed_administrative_dir.clone();
-                            let observed_administrative_dir_incarnation =
-                                tokio::task::spawn_blocking(move || {
-                                    match std::fs::symlink_metadata(&observed_path) {
-                                        Ok(_) => observe_administrative_dir_incarnation(&observed_path)
-                                            .map(Some),
-                                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                            Ok(None)
-                                        }
-                                        Err(error) => Err(format!(
-                                            "cannot inspect worktree administrative directory {}: {error}",
-                                            observed_path.display()
-                                        )),
-                                    }
-                                })
-                                .await
-                                .map_err(|error| {
-                                    CloseRetirementError::from(error.to_string()).in_scope(&scope)
-                                })?
-                                .map_err(|error| {
-                                    CloseRetirementError::from(error).in_scope(&scope)
-                                })?;
-                            match self
+                    let existing_cleanup_plan =
+                        if !captured_exists && existing_cleanup_plan.is_none() {
+                            let prior_plan = self
                                 .db()
-                                .adopt_close_worktree_cleanup_plan(
-                                    AdoptCloseWorktreeCleanupPlanRequest {
-                                        attempt_id: attempt_id.clone(),
-                                        scope: scope.clone(),
-                                        target_snapshot: snapshot.clone(),
-                                        resource: target.resource.clone(),
-                                        observed_administrative_dir,
-                                        observed_administrative_dir_incarnation,
-                                    },
+                                .prior_close_worktree_cleanup_plan(
+                                    attempt_id,
+                                    &scope,
+                                    snapshot,
+                                    &target.resource,
                                 )
                                 .await
                                 .map_err(|error| {
                                     map_close_retirement_db_error(error).in_scope(&scope)
-                                }) {
-                                Ok(plan) => Some(plan),
-                                Err(error @ CloseRetirementError::EvidenceInvariant { .. }) => {
-                                    self.persist_close_error_repair(attempt_id, &scope, &error)
-                                        .await?;
-                                    return Err(error);
+                                })?;
+                            if let Some(prior_plan) = prior_plan {
+                                let observed_administrative_dir = prior_plan.administrative_dir;
+                                let observed_path = observed_administrative_dir.clone();
+                                let observation = tokio::task::spawn_blocking(move || {
+                                    observe_administrative_dir_incarnation(&observed_path)
+                                })
+                                .await
+                                .unwrap_or_else(|error| Err(error.to_string()));
+                                let observed_administrative_dir_incarnation = match observation {
+                                    Ok(incarnation) => incarnation,
+                                    Err(detail) => {
+                                        return self
+                                            .record_close_residual(
+                                                attempt_id,
+                                                snapshot,
+                                                &scope,
+                                                target.resource.clone(),
+                                                RetirementFailureReason::IdentityNotProven,
+                                                &detail,
+                                            )
+                                            .await;
+                                    }
+                                };
+                                match self
+                                    .db()
+                                    .adopt_close_worktree_cleanup_plan(
+                                        AdoptCloseWorktreeCleanupPlanRequest {
+                                            attempt_id: attempt_id.clone(),
+                                            scope: scope.clone(),
+                                            target_snapshot: snapshot.clone(),
+                                            resource: target.resource.clone(),
+                                            observed_administrative_dir,
+                                            observed_administrative_dir_incarnation,
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        map_close_retirement_db_error(error).in_scope(&scope)
+                                    }) {
+                                    Ok(plan) => Some(plan),
+                                    Err(error @ CloseRetirementError::EvidenceInvariant { .. }) => {
+                                        self.persist_close_error_repair(attempt_id, &scope, &error)
+                                            .await?;
+                                        return Err(error);
+                                    }
+                                    Err(error) => return Err(error),
                                 }
-                                Err(error) => return Err(error),
+                            } else {
+                                None
                             }
                         } else {
-                            None
-                        }
-                    } else {
-                        existing_cleanup_plan
-                    };
+                            existing_cleanup_plan
+                        };
                     if let Some(cleanup_plan) = existing_cleanup_plan
                         .as_ref()
                         .filter(|plan| plan.final_tombstone.is_some())
@@ -6811,8 +6809,25 @@ mod tests {
         assert_eq!(error.scope(), Some(&scope));
     }
 
+    enum RetainedAdministrativeObservation {
+        Exact,
+        Conflicting,
+        Missing { quarantine_absent: bool },
+        NotDirectory,
+    }
+
     #[allow(clippy::too_many_lines)]
-    async fn retained_quarantine_retry(conflicting_incarnation: bool, bound_tombstone: bool) {
+    async fn retained_quarantine_retry(
+        observation: RetainedAdministrativeObservation,
+        bound_tombstone: bool,
+    ) {
+        let conflicting_incarnation =
+            matches!(observation, RetainedAdministrativeObservation::Conflicting);
+        let observation_failure = matches!(
+            observation,
+            RetainedAdministrativeObservation::Missing { .. }
+                | RetainedAdministrativeObservation::NotDirectory
+        );
         use super::{CloseAttemptId, ClosePhase, CloseRetirementError, RuntimeManager};
         use crate::db::{
             CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
@@ -7023,15 +7038,39 @@ mod tests {
             })
             .await
             .unwrap();
+        let source_plan = manager
+            .db()
+            .close_worktree_cleanup_plan(&attempt, &scope, &source_snapshot, &resource)
+            .await
+            .unwrap()
+            .unwrap();
+        let retained_admin = temp.path().join("retained-admin");
+        let retained_quarantine = temp.path().join("retained-quarantine");
+        if observation_failure {
+            std::fs::rename(&administrative_dir, &retained_admin).unwrap();
+            if matches!(observation, RetainedAdministrativeObservation::NotDirectory) {
+                std::fs::write(&administrative_dir, "not an administrative directory\n").unwrap();
+            }
+            if matches!(
+                observation,
+                RetainedAdministrativeObservation::Missing {
+                    quarantine_absent: true
+                }
+            ) {
+                std::fs::rename(&quarantine, &retained_quarantine).unwrap();
+            }
+        }
         let result = manager
             .retire_close_worktrees_and_scopes(&attempt, &target_snapshot)
             .await;
-        if conflicting_incarnation {
+        if conflicting_incarnation || observation_failure {
             let error = result.unwrap_err();
-            assert!(matches!(
-                &error,
-                CloseRetirementError::EvidenceInvariant { .. }
-            ));
+            if conflicting_incarnation {
+                assert!(matches!(
+                    &error,
+                    CloseRetirementError::EvidenceInvariant { .. }
+                ));
+            }
             assert_eq!(error.scope(), Some(&scope));
             assert_eq!(
                 manager
@@ -7042,14 +7081,149 @@ mod tests {
                     .phase(),
                 ClosePhase::NeedsRepair
             );
-            assert!(quarantine.exists());
-            assert!(administrative_dir.exists());
+            assert!(quarantine.exists() || retained_quarantine.exists());
+            assert!(administrative_dir.exists() || retained_admin.exists());
             assert!(manager
                 .db()
                 .close_worktree_cleanup_plan(&attempt, &scope, &target_snapshot, &resource)
                 .await
                 .unwrap()
                 .is_none());
+            assert!(!manager
+                .db()
+                .close_retirement_resource_was_dispatched(
+                    &attempt,
+                    &scope,
+                    &target_snapshot,
+                    &resource
+                )
+                .await
+                .unwrap());
+            let adoptions: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1",
+            )
+            .bind(attempt.as_str())
+            .fetch_one(manager.db().pool())
+            .await
+            .unwrap();
+            assert_eq!(adoptions, 0);
+            assert!(manager
+                .db()
+                .close_retirement_resource_was_dispatched(
+                    &attempt,
+                    &scope,
+                    &source_snapshot,
+                    &resource
+                )
+                .await
+                .unwrap());
+            assert_eq!(
+                manager
+                    .db()
+                    .close_worktree_cleanup_plan(&attempt, &scope, &source_snapshot, &resource)
+                    .await
+                    .unwrap(),
+                Some(source_plan.clone()),
+            );
+            assert_eq!(
+                manager
+                    .db()
+                    .prior_close_worktree_cleanup_plan(
+                        &attempt,
+                        &scope,
+                        &target_snapshot,
+                        &resource
+                    )
+                    .await
+                    .unwrap(),
+                Some(source_plan),
+            );
+            if observation_failure {
+                let evidence = manager
+                    .db()
+                    .list_close_retirement_evidence(attempt.as_str())
+                    .await
+                    .unwrap();
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(evidence[0].scope, scope);
+                assert_eq!(evidence[0].resource, resource);
+                assert_eq!(
+                    evidence[0].outcome,
+                    super::RetirementOutcome::Residual {
+                        residual_reason: RetirementFailureReason::IdentityNotProven,
+                    }
+                );
+                let before = manager
+                    .db()
+                    .get_close_obligation(attempt.as_str())
+                    .await
+                    .unwrap();
+                let manager = Arc::new(manager);
+                for _ in 0..2 {
+                    manager
+                        .retire_close_runtime_resources(attempt.clone())
+                        .await
+                        .unwrap();
+                    assert_eq!(manager.resume_pending_close_inspections().await.unwrap(), 0);
+                    assert_eq!(
+                        manager
+                            .resume_pending_close_runtime_retirements()
+                            .await
+                            .unwrap(),
+                        0
+                    );
+                }
+                let after = manager
+                    .db()
+                    .get_close_obligation(attempt.as_str())
+                    .await
+                    .unwrap();
+                assert_eq!(after, before);
+                assert_eq!(
+                    manager
+                        .db()
+                        .list_close_retirement_evidence(attempt.as_str())
+                        .await
+                        .unwrap(),
+                    evidence
+                );
+                assert!(retained_admin.join("gitdir").is_file());
+                if matches!(observation, RetainedAdministrativeObservation::NotDirectory) {
+                    assert_eq!(
+                        std::fs::read_to_string(&administrative_dir).unwrap(),
+                        "not an administrative directory\n",
+                    );
+                } else {
+                    assert!(!administrative_dir.exists());
+                }
+                assert!(
+                    quarantine.join(".git").is_file() || retained_quarantine.join(".git").is_file()
+                );
+                assert!(manager
+                    .db()
+                    .close_worktree_cleanup_plan(&attempt, &scope, &target_snapshot, &resource)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(!manager
+                    .db()
+                    .close_retirement_resource_was_dispatched(
+                        &attempt,
+                        &scope,
+                        &target_snapshot,
+                        &resource
+                    )
+                    .await
+                    .unwrap());
+                let adoptions: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1",
+                )
+                .bind(attempt.as_str())
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+                assert_eq!(adoptions, 0);
+            }
         } else {
             result.unwrap();
             let plan = manager
@@ -7256,17 +7430,44 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatched_absence_retry_preserves_populated_tombstone_until_writer_exits() {
-        retained_quarantine_retry(false, true).await;
+        retained_quarantine_retry(RetainedAdministrativeObservation::Exact, true).await;
     }
 
     #[tokio::test]
     async fn runtime_adopts_exact_retained_quarantine_plan_across_retry_generation() {
-        retained_quarantine_retry(false, false).await;
+        retained_quarantine_retry(RetainedAdministrativeObservation::Exact, false).await;
     }
 
     #[tokio::test]
     async fn runtime_adoption_conflict_routes_exact_scope_to_durable_repair_without_deletion() {
-        retained_quarantine_retry(true, false).await;
+        retained_quarantine_retry(RetainedAdministrativeObservation::Conflicting, false).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_missing_admin_cannot_adopt_retained_quarantine_and_repair_is_inert() {
+        retained_quarantine_retry(
+            RetainedAdministrativeObservation::Missing {
+                quarantine_absent: false,
+            },
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn runtime_missing_admin_and_worktree_paths_cannot_adopt_source_authority() {
+        retained_quarantine_retry(
+            RetainedAdministrativeObservation::Missing {
+                quarantine_absent: true,
+            },
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn runtime_failed_admin_observation_cannot_adopt_and_repair_is_inert() {
+        retained_quarantine_retry(RetainedAdministrativeObservation::NotDirectory, false).await;
     }
 
     #[test]

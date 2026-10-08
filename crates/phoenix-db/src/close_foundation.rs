@@ -329,7 +329,7 @@ fn parse_close_attempt_scope_row(row: SqliteRow) -> DbResult<CloseAttemptScope> 
             _ => {
                 return Err(DbError::Serialization(
                     "partial worktree identity".to_string(),
-                ))
+                ));
             }
         },
         captured_at: parse_rfc3339_utc(row.try_get("captured_at")?, "captured_at")?,
@@ -739,7 +739,7 @@ pub struct AdoptCloseWorktreeCleanupPlanRequest {
     pub target_snapshot: CloseRetirementSnapshot,
     pub resource: RetiredResourceIdentity,
     pub observed_administrative_dir: std::path::PathBuf,
-    pub observed_administrative_dir_incarnation: Option<String>,
+    pub observed_administrative_dir_incarnation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4082,7 +4082,7 @@ impl Database {
                        AND identity_codec=?7 AND identity_value=?8
                        AND administrative_dir_codec='hex_path_v1'
                        AND administrative_dir_value=?9
-                       AND (?10 IS NULL OR administrative_dir_incarnation=?10)
+                       AND administrative_dir_incarnation=?10
                  )",
             )
             .bind(request.attempt_id.as_str())
@@ -4094,7 +4094,7 @@ impl Database {
             .bind(identity.codec())
             .bind(identity.value())
             .bind(&observed_administrative_dir_value)
-            .bind(request.observed_administrative_dir_incarnation.as_deref())
+            .bind(&request.observed_administrative_dir_incarnation)
             .fetch_one(&mut *tx)
             .await?;
             if !target_matches_observation {
@@ -4233,10 +4233,7 @@ impl Database {
         };
         if source.2 != "hex_path_v1"
             || source.3 != observed_administrative_dir_value
-            || request
-                .observed_administrative_dir_incarnation
-                .as_ref()
-                .is_some_and(|incarnation| source.4 != *incarnation)
+            || source.4 != request.observed_administrative_dir_incarnation
         {
             return Err(DbError::CloseEvidenceInvariant {
                 invariant: "adopted_cleanup_plan_requires_fresh_administrative_identity",
@@ -11315,12 +11312,17 @@ mod tests {
             sqlx::raw_sql(mutation).execute(db.pool()).await.unwrap();
             let before = db.get_close_obligation(attempt.as_str()).await.unwrap();
             let rows = legacy_fk787_retained_rows(&db).await;
-            assert!(db
-                .resume_legacy_fk787_close_retirement_generation(&attempt)
-                .await
-                .unwrap()
-                .is_none(), "{mutation}");
-            assert_eq!(db.get_close_obligation(attempt.as_str()).await.unwrap(), before);
+            assert!(
+                db.resume_legacy_fk787_close_retirement_generation(&attempt)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{mutation}"
+            );
+            assert_eq!(
+                db.get_close_obligation(attempt.as_str()).await.unwrap(),
+                before
+            );
             assert_eq!(legacy_fk787_retained_rows(&db).await, rows);
         }
     }
@@ -11596,7 +11598,7 @@ mod tests {
             observed_administrative_dir: std::path::PathBuf::from(
                 "/tmp/git/worktrees/legacy-fk787",
             ),
-            observed_administrative_dir_incarnation: Some("legacy-admin-v1".to_string()),
+            observed_administrative_dir_incarnation: "legacy-admin-v1".to_string(),
         })
         .await
         .unwrap();
@@ -11777,22 +11779,31 @@ mod tests {
             target_snapshot: target_snapshot.clone(),
             resource: resource.clone(),
             observed_administrative_dir: administrative_dir.clone(),
-            observed_administrative_dir_incarnation: Some("admin-adopt-v1".to_string()),
+            observed_administrative_dir_incarnation: "admin-adopt-v1".to_string(),
         };
+        let before_adoption = close_authority_rows(&db).await;
         for invalid_request in [
+            AdoptCloseWorktreeCleanupPlanRequest {
+                observed_administrative_dir_incarnation: String::new(),
+                ..request.clone()
+            },
             AdoptCloseWorktreeCleanupPlanRequest {
                 observed_administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/wrong"),
                 ..request.clone()
             },
             AdoptCloseWorktreeCleanupPlanRequest {
-                observed_administrative_dir_incarnation: Some("replaced-admin".to_string()),
+                observed_administrative_dir_incarnation: "replaced-admin".to_string(),
                 ..request.clone()
             },
         ] {
             assert!(matches!(
                 db.adopt_close_worktree_cleanup_plan(invalid_request).await,
-                Err(DbError::CloseEvidenceInvariant { .. })
+                Err(DbError::CloseEvidenceInvariant {
+                    invariant: "adopted_cleanup_plan_requires_fresh_administrative_identity",
+                    ..
+                })
             ));
+            assert_eq!(close_authority_rows(&db).await, before_adoption);
         }
         sqlx::query(
             "CREATE TRIGGER reject_target_cleanup_plan BEFORE INSERT ON close_worktree_cleanup_plans
@@ -11868,19 +11879,21 @@ mod tests {
             .adopt_close_worktree_cleanup_plan(request.clone())
             .await
             .unwrap();
-        assert!(matches!(
-            db.adopt_close_worktree_cleanup_plan(AdoptCloseWorktreeCleanupPlanRequest {
-                observed_administrative_dir_incarnation: Some(
-                    "replaced-after-adoption".to_string()
-                ),
-                ..request.clone()
-            })
-            .await,
-            Err(DbError::CloseEvidenceInvariant {
-                invariant: "adopted_cleanup_plan_requires_fresh_administrative_identity",
-                ..
-            })
-        ));
+        let after_adoption = close_authority_rows(&db).await;
+        for observed_incarnation in ["", "replaced-after-adoption"] {
+            assert!(matches!(
+                db.adopt_close_worktree_cleanup_plan(AdoptCloseWorktreeCleanupPlanRequest {
+                    observed_administrative_dir_incarnation: observed_incarnation.to_string(),
+                    ..request.clone()
+                })
+                .await,
+                Err(DbError::CloseEvidenceInvariant {
+                    invariant: "adopted_cleanup_plan_requires_fresh_administrative_identity",
+                    ..
+                })
+            ));
+            assert_eq!(close_authority_rows(&db).await, after_adoption);
+        }
         assert_eq!(
             db.adopt_close_worktree_cleanup_plan(request).await.unwrap(),
             adopted
@@ -12014,9 +12027,8 @@ mod tests {
                 target_snapshot: snapshot.clone(),
                 resource: resource.clone(),
                 observed_administrative_dir: std::path::PathBuf::from(observed_administrative_dir),
-                observed_administrative_dir_incarnation: Some(
-                    observed_administrative_dir_incarnation.to_string(),
-                ),
+                observed_administrative_dir_incarnation: observed_administrative_dir_incarnation
+                    .to_string(),
             };
             if generation == "generation-b" {
                 let before = close_authority_rows(db).await;
@@ -12025,7 +12037,7 @@ mod tests {
                         observed_administrative_dir: std::path::PathBuf::from(
                             "/tmp/git/worktrees/older"
                         ),
-                        observed_administrative_dir_incarnation: Some("admin-chain-v1".to_string()),
+                        observed_administrative_dir_incarnation: "admin-chain-v1".to_string(),
                         ..request.clone()
                     })
                     .await,
@@ -12240,7 +12252,7 @@ mod tests {
                 observed_administrative_dir: std::path::PathBuf::from(
                     "/tmp/git/worktrees/adopt-missing",
                 ),
-                observed_administrative_dir_incarnation: Some("admin-adopt-missing-v1".to_string()),
+                observed_administrative_dir_incarnation: "admin-adopt-missing-v1".to_string(),
             })
             .await
             .unwrap_err();
@@ -12384,7 +12396,7 @@ mod tests {
             target_snapshot: target,
             resource: resource.clone(),
             observed_administrative_dir: administrative_dir,
-            observed_administrative_dir_incarnation: Some("admin-v1".to_string()),
+            observed_administrative_dir_incarnation: "admin-v1".to_string(),
         };
         db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
             attempt_id: attempt_id.clone(),
@@ -12576,7 +12588,7 @@ mod tests {
             target_snapshot: replacement.clone(),
             resource: worktree.resource.clone(),
             observed_administrative_dir: cleanup_dir.clone(),
-            observed_administrative_dir_incarnation: Some("admin-cleanup-v1".to_string()),
+            observed_administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
         };
         let before_adoption = close_authority_rows(&db).await;
         for invalid_request in [
@@ -12585,7 +12597,7 @@ mod tests {
                 ..adoption.clone()
             },
             AdoptCloseWorktreeCleanupPlanRequest {
-                observed_administrative_dir_incarnation: Some("replaced-admin-v2".to_string()),
+                observed_administrative_dir_incarnation: "replaced-admin-v2".to_string(),
                 ..adoption.clone()
             },
         ] {
