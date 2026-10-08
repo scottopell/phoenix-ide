@@ -9736,7 +9736,7 @@ mod tests {
             },
             move |path| {
                 super::quarantine_has_open_descriptors_in(path, proc_inventory.path())
-                    .map(ExternalWriterEvidence::found)
+                    .map(super::ExternalWriterEvidence::found)
             },
         )
         .await
