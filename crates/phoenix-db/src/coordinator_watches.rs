@@ -291,25 +291,24 @@ pub(crate) async fn record_question_wait_tx(
         tracing::debug!(transcript_id, "legacy question wait has no durable request identity; not emitting a historical watch event");
         return Ok(());
     };
-    sqlx::query(
-        "INSERT INTO coordinator_watch_events
-        (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
-         source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
-        SELECT ?1, w.id, 'question_request', ?2, 0, c.id,
-               'awaiting_user_input', 'question_request', ?3
-        FROM conversations c JOIN coordinator_watches w
-          ON w.source_product_conversation_id = c.product_conversation_id
-        WHERE c.id = ?4 AND w.ended_at_us IS NULL
-          AND NOT EXISTS (SELECT 1 FROM coordinator_watch_events e
-            WHERE e.watch_id = w.id AND e.source_occurrence_kind = 'question_request'
-              AND e.source_occurrence_id = ?2 AND e.source_generation = 0)",
+    let watch_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT w.id FROM conversations c JOIN coordinator_watches w
+         ON w.source_product_conversation_id = c.product_conversation_id
+         WHERE c.id = ?1 AND w.ended_at_us IS NULL",
     )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(request_id.to_string())
-    .bind(chrono::Utc::now().timestamp_micros())
     .bind(transcript_id)
-    .execute(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
+    for watch_id in watch_ids {
+        sqlx::query("INSERT INTO coordinator_watch_events
+            (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
+             source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
+            VALUES (?1, ?2, 'question_request', ?3, 0, ?4, 'awaiting_user_input', 'question_request', ?5)
+            ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(watch_id)
+            .bind(request_id.to_string()).bind(transcript_id)
+            .bind(chrono::Utc::now().timestamp_micros()).execute(&mut **tx).await?;
+    }
     Ok(())
 }
 
@@ -507,7 +506,10 @@ mod tests {
             "one durable request must produce one wait event"
         );
         assert_eq!(events[0].terminal_kind, "awaiting_user_input");
-        assert_eq!(events[0].outcome.as_deref(), Some("question_request"));
+        assert_eq!(
+            events[0].terminal_reason.as_deref(),
+            Some("question_request")
+        );
         db.update_conversation_state(&source.id, &waiting(QuestionRequestAuthority::new()))
             .await
             .unwrap();
