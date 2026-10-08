@@ -3979,6 +3979,10 @@ impl Database {
     /// This is discovery only. The returned plan is not target-generation authority until
     /// `adopt_close_worktree_cleanup_plan` validates a fresh administrative observation and
     /// atomically records dispatch, plan, and lineage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or decoding error when prior authority cannot be read exactly.
     pub async fn prior_close_worktree_cleanup_plan(
         &self,
         attempt_id: &CloseAttemptId,
@@ -12288,7 +12292,7 @@ mod tests {
             "close_worktree_cleanup_plans",
             "close_worktree_cleanup_adoptions",
         ] {
-            let columns = sqlx::query(&format!("PRAGMA table_info({table})"))
+            let columns = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
                 .fetch_all(db.pool())
                 .await
                 .unwrap()
@@ -12297,9 +12301,9 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ");
             snapshot.push(
-                sqlx::query_scalar::<_, String>(&format!(
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
                     "SELECT json_array(rowid, {columns}) FROM {table} ORDER BY rowid"
-                ))
+                )))
                 .fetch_all(db.pool())
                 .await
                 .unwrap(),
