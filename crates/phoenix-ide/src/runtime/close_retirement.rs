@@ -3026,7 +3026,7 @@ fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B, W>(
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
-    W: Fn(&Path) -> Result<bool, String>,
+    W: Fn(&Path) -> Result<bool, String> + Send + 'static,
 {
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
@@ -3063,6 +3063,7 @@ where
         final_tombstone.cloned(),
         bind_tombstone,
         after_quarantine,
+        inspect_writer,
     ))
 }
 
@@ -4880,17 +4881,19 @@ fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn quarantine_and_remove_exact_worktree<F, B>(
+async fn quarantine_and_remove_exact_worktree<F, B, W>(
     identity: &WorktreeIdentity,
     planned_administrative_dir: PathBuf,
     planned_administrative_dir_incarnation: String,
     final_tombstone: Option<CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
     after_quarantine: F,
+    inspect_writer: W,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+    W: Fn(&Path) -> Result<bool, String> + Send + 'static,
 {
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
