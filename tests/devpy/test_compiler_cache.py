@@ -262,6 +262,50 @@ class CompilerCacheTests(unittest.TestCase):
                     self.assertNotEqual(baseline, changed)
                     os.environ.pop(name)
 
+    @unittest.skipUnless(hasattr(os, "environb"), "requires byte environment")
+    def test_daemon_identity_preserves_surrogate_escaped_environment_bytes(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            os.environb[b"AWS_SECRET_ACCESS_KEY"] = b"abc\xffdef"
+            first = self.dev._kache_daemon_identity(
+                "/bin/kache", cargo_cwd=Path("/repo")
+            )
+            os.environb[b"AWS_SECRET_ACCESS_KEY"] = b"abc\xfedef"
+            second = self.dev._kache_daemon_identity(
+                "/bin/kache", cargo_cwd=Path("/repo")
+            )
+
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(first, second)
+
+    def test_daemon_identity_tracks_google_adc_environment_and_contents(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            default_adc = home / ".config/gcloud/application_default_credentials.json"
+            default_adc.parent.mkdir(parents=True)
+            default_adc.write_text("default-one")
+            explicit_adc = Path(temporary) / "explicit-adc.json"
+            explicit_adc.write_text("explicit-one")
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True):
+                default_one = self.dev._kache_daemon_identity(
+                    "/bin/kache", cargo_cwd=Path(temporary)
+                )
+                default_adc.write_text("default-two")
+                default_two = self.dev._kache_daemon_identity(
+                    "/bin/kache", cargo_cwd=Path(temporary)
+                )
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(explicit_adc)
+                explicit_one = self.dev._kache_daemon_identity(
+                    "/bin/kache", cargo_cwd=Path(temporary)
+                )
+                explicit_adc.write_text("explicit-two")
+                explicit_two = self.dev._kache_daemon_identity(
+                    "/bin/kache", cargo_cwd=Path(temporary)
+                )
+
+        self.assertNotEqual(default_one, default_two)
+        self.assertNotEqual(default_two, explicit_one)
+        self.assertNotEqual(explicit_one, explicit_two)
+
     def test_daemon_identity_tracks_relative_aws_files_under_cargo_cwd(self):
         with self.dev.tempfile.TemporaryDirectory() as temporary:
             cargo_cwd = Path(temporary)
@@ -350,6 +394,31 @@ class CompilerCacheTests(unittest.TestCase):
                     self.dev._kache_daemon_receipt_matches(socket, "a" * 64)
                 )
 
+    def test_daemon_start_receipts_only_the_spawned_serving_process(self):
+        child = mock.Mock(pid=1234)
+        child.poll.return_value = None
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", return_value=child
+        ) as spawn, mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", return_value=None
+        ), mock.patch.object(
+            self.dev, "_kache_daemon_serving_pid", return_value=4321
+        ), mock.patch.object(
+            self.dev, "_record_kache_daemon_receipt"
+        ) as record:
+            error = self.dev._start_kache_daemon_locked(
+                "/bin/kache",
+                cargo_cwd=Path("/repo"),
+                socket=Path("/tmp/kache.sock"),
+                identity="identity",
+            )
+
+        self.assertIn("different process won the daemon bind race", error or "")
+        self.assertEqual(["/bin/kache", "daemon", "run"], spawn.call_args.args[0])
+        record.assert_not_called()
+
     def test_operator_socket_reuses_only_matching_phoenix_started_daemon(self):
         socket = Path("/tmp/operator.sock")
         events = []
@@ -359,7 +428,7 @@ class CompilerCacheTests(unittest.TestCase):
 
         def launch(*_args, **_kwargs):
             events.append("started")
-            return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(pid=1234)
 
         with mock.patch.dict(
             os.environ, {"KACHE_SOCKET_PATH": str(socket)}, clear=True
@@ -368,9 +437,11 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_kache_daemon_is_running", side_effect=status
         ), mock.patch.object(
-            self.dev.subprocess, "run", side_effect=launch
+            self.dev.subprocess, "Popen", side_effect=launch
         ) as run, mock.patch.object(
             self.dev, "_wait_for_kache_daemon", return_value=None
+        ), mock.patch.object(
+            self.dev, "_kache_daemon_serving_pid", return_value=1234
         ), mock.patch.object(
             self.dev, "_record_kache_daemon_receipt", return_value=None
         ) as record, mock.patch.object(
@@ -428,13 +499,13 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("/tmp/config.toml", os.environ["KACHE_CONFIG"])
 
     def test_kache_daemon_uses_cargo_working_directory(self):
-        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        child = mock.Mock(pid=1234)
         cargo_cwd = self.dev.Path("/detached/build")
         daemon_env = {}
 
         def run_daemon(*_args, **kwargs):
             daemon_env.update(kwargs["env"])
-            return completed
+            return child
 
         with mock.patch.dict(
             os.environ,
@@ -447,10 +518,12 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
         ), mock.patch.object(
-            self.dev.subprocess, "run", side_effect=run_daemon
+            self.dev.subprocess, "Popen", side_effect=run_daemon
         ) as run, mock.patch.object(
             self.dev, "_wait_for_kache_daemon", return_value=None
         ) as wait, mock.patch.object(
+            self.dev, "_kache_daemon_serving_pid", return_value=1234
+        ), mock.patch.object(
             self.dev, "_record_kache_daemon_receipt", return_value=None
         ):
             self.assertIsNone(
@@ -488,24 +561,8 @@ class CompilerCacheTests(unittest.TestCase):
                     self.fail("lock body must not run")
         close.assert_called_once_with(42)
 
-    def test_kache_daemon_start_replaces_undecodable_output(self):
-        completed = mock.Mock(returncode=1, stdout="\ufffd", stderr="")
-        with mock.patch.object(
-            self.dev, "_kache_daemon_is_running", return_value=(False, None)
-        ), mock.patch.object(
-            self.dev.subprocess, "run", return_value=completed
-        ) as run:
-            error = self.dev._start_kache_daemon_locked(
-                "/bin/kache",
-                cargo_cwd=None,
-                socket=Path("/tmp/kache.sock"),
-                identity="identity",
-            )
-        self.assertEqual("\ufffd", error)
-        self.assertEqual("replace", run.call_args.kwargs["errors"])
-
     def test_kache_daemon_holds_socket_lock_across_check_start_and_readiness(self):
-        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        child = mock.Mock(pid=1234)
         events = []
 
         @contextlib.contextmanager
@@ -520,7 +577,7 @@ class CompilerCacheTests(unittest.TestCase):
 
         def start(*_args, **_kwargs):
             events.append("start")
-            return completed
+            return child
 
         def ready(*_args, **_kwargs):
             events.append("ready")
@@ -533,9 +590,11 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_kache_daemon_is_running", side_effect=status
         ), mock.patch.object(
-            self.dev.subprocess, "run", side_effect=start
+            self.dev.subprocess, "Popen", side_effect=start
         ), mock.patch.object(
             self.dev, "_wait_for_kache_daemon", side_effect=ready
+        ), mock.patch.object(
+            self.dev, "_kache_daemon_serving_pid", return_value=1234
         ), mock.patch.object(
             self.dev, "_record_kache_daemon_receipt", return_value=None
         ):
@@ -561,7 +620,7 @@ class CompilerCacheTests(unittest.TestCase):
 
                 def launch(*_args, **_kwargs):
                     marker.write_text(candidate)
-                    return mock.Mock(returncode=0, stdout="", stderr="")
+                    return mock.Mock(pid=1234)
 
                 with mock.patch.dict(
                     os.environ,
@@ -573,9 +632,11 @@ class CompilerCacheTests(unittest.TestCase):
                 ), mock.patch.object(
                     dev, "_kache_daemon_is_running", side_effect=status
                 ), mock.patch.object(
-                    dev.subprocess, "run", side_effect=launch
+                    dev.subprocess, "Popen", side_effect=launch
                 ), mock.patch.object(
                     dev, "_wait_for_kache_daemon", return_value=None
+                ), mock.patch.object(
+                    dev, "_kache_daemon_serving_pid", return_value=1234
                 ), mock.patch.object(
                     dev, "_record_kache_daemon_receipt", return_value=None
                 ):
@@ -733,9 +794,11 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
         ), mock.patch.object(
-            self.dev.subprocess, "run", return_value=completed
+            self.dev.subprocess, "Popen", return_value=mock.Mock(pid=1234)
         ) as run, mock.patch.object(
             self.dev, "_wait_for_kache_daemon", return_value=None
+        ), mock.patch.object(
+            self.dev, "_kache_daemon_serving_pid", return_value=1234
         ), mock.patch.object(
             self.dev, "_record_kache_daemon_receipt", return_value=None
         ):

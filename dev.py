@@ -5017,6 +5017,7 @@ def _implicit_kache_files(*, cargo_cwd: Path | None) -> dict[str, dict[str, str]
     aws_credentials = _identity_path(os.environ.get("AWS_SHARED_CREDENTIALS_FILE"), base=base)
     aws_config = _identity_path(os.environ.get("AWS_CONFIG_FILE"), base=base)
     aws_web_identity = _identity_path(os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE"), base=base)
+    google_adc = _identity_path(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"), base=base)
     docker_config = _identity_path(os.environ.get("DOCKER_CONFIG"), base=base)
     paths = {
         "config": config or (config_home / "kache/config.toml" if config_home else None),
@@ -5024,6 +5025,7 @@ def _implicit_kache_files(*, cargo_cwd: Path | None) -> dict[str, dict[str, str]
         "aws_credentials": aws_credentials or (home / ".aws/credentials" if home else None),
         "aws_config": aws_config or (home / ".aws/config" if home else None),
         "aws_web_identity": aws_web_identity,
+        "google_adc": google_adc or (home / ".config/gcloud/application_default_credentials.json" if home else None),
         "docker_config": docker_config / "config.json" if docker_config else home / ".docker/config.json" if home else None,
     }
     return {
@@ -5039,9 +5041,10 @@ def _kache_daemon_identity(binary: str, *, cargo_cwd: Path | None) -> str:
         "XDG_CONFIG_HOME",
         "XDG_CACHE_HOME",
         "DOCKER_CONFIG",
+        "GOOGLE_APPLICATION_CREDENTIALS",
     }
     daemon_environment = {
-        key: hashlib.sha256(value.encode()).hexdigest()
+        key: hashlib.sha256(os.fsencode(value)).hexdigest()
         for key, value in os.environ.items()
         if (key.startswith("KACHE_") and key != "KACHE_SOCKET_PATH")
         or key.startswith("AWS_")
@@ -5111,6 +5114,17 @@ def _kache_daemon_receipt_matches(socket: Path, identity: str) -> bool:
     )
 
 
+def _kache_daemon_serving_pid(socket: Path) -> int | None:
+    try:
+        state = json.loads(socket.with_suffix(".state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, dict) or state.get("phase") != "ready":
+        return None
+    pid = state.get("pid")
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
 def _start_kache_daemon_locked(
     binary: str, *, cargo_cwd: Path | None, socket: Path, identity: str
 ) -> str | None:
@@ -5123,23 +5137,24 @@ def _start_kache_daemon_locked(
         return "selected socket has a running daemon whose environment or process identity cannot be verified"
 
     try:
-        result = subprocess.run(
-            [binary, "daemon", "start"],
+        child = subprocess.Popen(
+            [binary, "daemon", "run"],
             cwd=cargo_cwd,
-            capture_output=True,
-            text=True,
-            errors="replace",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=os.environ,
-            timeout=10,
-            check=False,
+            start_new_session=True,
+            close_fds=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except OSError as error:
         return str(error)
-    if result.returncode != 0:
-        return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
     readiness_error = _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
     if readiness_error:
         return readiness_error
+    serving_pid = _kache_daemon_serving_pid(socket)
+    if serving_pid != child.pid:
+        return "a different process won the daemon bind race; refusing to claim ownership"
     return _record_kache_daemon_receipt(socket, identity)
 
 
