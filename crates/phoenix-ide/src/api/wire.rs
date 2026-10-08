@@ -688,7 +688,13 @@ pub enum ChainSseWireEvent {
     /// Streaming token chunk for an in-flight Q&A. Subscribers filter on
     /// `chain_qa_id` to demultiplex concurrent questions on the same chain
     /// (REQ-CHN-006: a sibling tab's question must not render into mine).
-    ChainQaToken { chain_qa_id: String, delta: String },
+    ChainQaToken {
+        chain_qa_id: String,
+        delta: String,
+    },
+    ChainQaAnswerReset {
+        chain_qa_id: String,
+    },
     /// Stream completed cleanly. `full_answer` matches what was just
     /// persisted to `chain_qa.answer`; subsequent reads via
     /// `list_chain_qa` would return the same string.
@@ -712,6 +718,7 @@ impl ChainSseWireEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::ChainQaToken { .. } => "chain_qa_token",
+            Self::ChainQaAnswerReset { .. } => "chain_qa_answer_reset",
             Self::ChainQaCompleted { .. } => "chain_qa_completed",
             Self::ChainQaFailed { .. } => "chain_qa_failed",
         }
@@ -724,6 +731,7 @@ impl From<ChainSseEvent> for ChainSseWireEvent {
             ChainSseEvent::Token { chain_qa_id, delta } => {
                 Self::ChainQaToken { chain_qa_id, delta }
             }
+            ChainSseEvent::AnswerReset { chain_qa_id } => Self::ChainQaAnswerReset { chain_qa_id },
             ChainSseEvent::Completed {
                 chain_qa_id,
                 full_answer,
@@ -754,6 +762,19 @@ impl From<ChainSseEvent> for ChainSseWireEvent {
 #[cfg(test)]
 mod chain_wire_tests {
     use super::*;
+
+    #[test]
+    fn chain_qa_answer_reset_serializes_with_expected_tag_and_fields() {
+        let wire: ChainSseWireEvent = ChainSseEvent::AnswerReset {
+            chain_qa_id: "qa-reset".into(),
+        }
+        .into();
+        assert_eq!(
+            serde_json::to_value(&wire).unwrap(),
+            serde_json::json!({"type":"chain_qa_answer_reset","chain_qa_id":"qa-reset"})
+        );
+        assert_eq!(wire.event_type(), "chain_qa_answer_reset");
+    }
 
     /// Wire round-trip parity for `ChainQaToken`: the typed wire variant
     /// serializes to the JSON shape the UI's valibot schema will validate

@@ -591,7 +591,22 @@ const MIGRATIONS: &[Migration] = &[
         name: "federation_enrollments",
         sql: MIGRATION_115,
     },
+    Migration {
+        version: 116,
+        name: "federation_peer_connections",
+        sql: MIGRATION_116,
+    },
+    Migration {
+        version: 117,
+        name: "persist_conversation_tool_policy",
+        sql: MIGRATION_117,
+    },
 ];
+
+const MIGRATION_117: &str = concat!(
+    include_str!("tool_availability.sql"),
+    include_str!("responses_replay.sql")
+);
 
 const MIGRATION_113: &str = "";
 
@@ -634,6 +649,42 @@ CREATE TABLE federation_enrollments (
 );
 CREATE UNIQUE INDEX federation_enrollments_one_active_caller
     ON federation_enrollments(caller_instance_id) WHERE revoked_at_us IS NULL;
+";
+
+const MIGRATION_116: &str = r"
+CREATE TABLE federation_peer_connections (
+    peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
+        typeof(peer_instance_id) = 'text'
+        AND length(peer_instance_id) = 36
+        AND peer_instance_id = lower(peer_instance_id)
+        AND substr(peer_instance_id, 9, 1) = '-'
+        AND substr(peer_instance_id, 14, 1) = '-'
+        AND substr(peer_instance_id, 15, 1) = '4'
+        AND substr(peer_instance_id, 19, 1) = '-'
+        AND substr(peer_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(peer_instance_id, 24, 1) = '-'
+        AND length(replace(peer_instance_id, '-', '')) = 32
+        AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
+    host TEXT NOT NULL CHECK(
+        typeof(host) = 'text'
+        AND length(host) > 0
+        AND host NOT GLOB '*[^A-Za-z0-9.-]*'
+    ),
+    port INTEGER NOT NULL CHECK(
+        typeof(port) = 'integer' AND port BETWEEN 1 AND 65535
+    ),
+    bearer_credential TEXT NOT NULL UNIQUE CHECK(
+        bearer_credential GLOB 'phx_peer_*'
+        AND length(bearer_credential) = 52
+        AND substr(bearer_credential, 10) NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    UNIQUE(host, port)
+);
 ";
 
 const MIGRATION_112: &str = r"
@@ -11839,14 +11890,15 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(6).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(7).copied().collect::<Vec<_>>(),
             vec![
+                (117, "persist_conversation_tool_policy"),
+                (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),
                 (114, "persist_instance_identity"),
                 (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
                 (111, "coordinator_conversation_watches"),
-                (110, "trusted_input_origin"),
             ]
         );
     }

@@ -582,7 +582,7 @@ impl std::fmt::Debug for McpServer {
 pub struct McpServer {
     name: String,
     transport: Arc<dyn McpTransport>,
-    tools: std::sync::RwLock<Vec<McpToolDef>>,
+    tools: Arc<std::sync::RwLock<Vec<McpToolDef>>>,
     /// Config retained for reload comparison and for rebuilding the
     /// transport on respawn.
     config: McpServerConfig,
@@ -625,7 +625,7 @@ impl McpServer {
         Ok(Self {
             name: name.to_string(),
             transport: Arc::from(transport),
-            tools: std::sync::RwLock::new(Vec::new()),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
             config,
             tools_changed,
             pending_oauth_urls,
@@ -802,6 +802,7 @@ impl McpServer {
             config: self.config.clone(),
             tools_changed: Arc::clone(&self.tools_changed),
             oauth_bearer: Arc::clone(&self.oauth_bearer),
+            tools: Arc::clone(&self.tools),
         }
     }
 
@@ -815,6 +816,7 @@ impl McpServer {
     }
 
     /// Check whether the underlying transport is still usable.
+    #[must_use]
     pub fn is_alive(&self) -> bool {
         self.transport.is_alive()
     }
@@ -905,6 +907,7 @@ impl McpServer {
 #[derive(Clone)]
 pub(crate) struct CallContext {
     name: String,
+    tools: Arc<std::sync::RwLock<Vec<McpToolDef>>>,
     transport: Arc<dyn McpTransport>,
     config: McpServerConfig,
     tools_changed: Arc<AtomicBool>,
@@ -933,12 +936,43 @@ impl CallContext {
         self.transport.request(method, params, timeout, &sink).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn call_tool(
         &self,
         tool_name: &str,
         arguments: Value,
         cancel: &CancellationToken,
     ) -> Result<String, McpRequestError> {
+        self.call_tool_with_schema(tool_name, arguments, cancel, None)
+            .await
+    }
+
+    pub(crate) async fn call_tool_with_schema(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        cancel: &CancellationToken,
+        expected_schema: Option<&Value>,
+    ) -> Result<String, McpRequestError> {
+        if let Some(expected) = expected_schema {
+            if self.tools_changed.load(Ordering::Acquire) {
+                return Err(McpRequestError::Other(
+                    "EUNAVAIL: MCP catalog changed before execution".into(),
+                ));
+            }
+            let tools = self
+                .tools
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !tools
+                .iter()
+                .any(|tool| tool.name == tool_name && tool.input_schema == *expected)
+            {
+                return Err(McpRequestError::Other(format!(
+                    "EUNAVAIL: MCP tool '{tool_name}' schema changed or is unavailable"
+                )));
+            }
+        }
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": arguments,
@@ -3048,6 +3082,40 @@ impl McpClientManager {
         arguments: Value,
         cancel: CancellationToken,
     ) -> Result<String, McpToolCallError> {
+        self.call_tool_cancellable_bound(server_name, tool_name, arguments, cancel, None)
+            .await
+    }
+
+    /// # Errors
+    /// Returns cancellation, transport failure, or EUNAVAIL when the selected
+    /// server's discovered input schema no longer matches the originating call.
+    pub async fn call_tool_cancellable_with_schema(
+        self: &Arc<Self>,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Value,
+        cancel: CancellationToken,
+        expected_schema: Value,
+    ) -> Result<String, McpToolCallError> {
+        self.call_tool_cancellable_bound(
+            server_name,
+            tool_name,
+            arguments,
+            cancel,
+            Some(expected_schema),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn call_tool_cancellable_bound(
+        self: &Arc<Self>,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Value,
+        cancel: CancellationToken,
+        expected_schema: Option<Value>,
+    ) -> Result<String, McpToolCallError> {
         if self.disabled_servers.read().await.contains(server_name) {
             return Err(McpToolCallError::Failed(format!(
                 "MCP server '{server_name}' is disabled"
@@ -3070,6 +3138,7 @@ impl McpClientManager {
                 tool_name,
                 arguments.clone(),
                 cancel.clone(),
+                expected_schema.clone(),
             )
             .await?;
         let recovery = first.recovery;
@@ -3131,15 +3200,18 @@ impl McpClientManager {
                 CallRecovery::None => unreachable!("handled above"),
             },
         }
-        let retry_handle = self
-            .servers
-            .read()
-            .await
-            .get(server_name)
-            .cloned()
-            .ok_or_else(|| {
-                McpToolCallError::Failed(format!("MCP server '{server_name}' is not connected"))
-            })?;
+        let retry_handle = if expected_schema.is_some() {
+            handle
+        } else {
+            self.servers
+                .read()
+                .await
+                .get(server_name)
+                .cloned()
+                .ok_or_else(|| {
+                    McpToolCallError::Failed(format!("MCP server '{server_name}' is not connected"))
+                })?
+        };
         let retry = self
             .call_actor_when_ready(
                 &retry_handle,
@@ -3147,6 +3219,7 @@ impl McpClientManager {
                 tool_name,
                 arguments,
                 cancel,
+                expected_schema,
             )
             .await?;
         let retry_recovery = retry.recovery;
@@ -3183,6 +3256,7 @@ impl McpClientManager {
         tool_name: &str,
         arguments: Value,
         cancel: CancellationToken,
+        expected_schema: Option<Value>,
     ) -> Result<supervisor::CallOutcome, McpToolCallError> {
         loop {
             let snapshot = handle.snapshot();
@@ -3194,6 +3268,7 @@ impl McpClientManager {
                             tool_name.to_string(),
                             arguments.clone(),
                             cancel.clone(),
+                            expected_schema.clone(),
                         )
                         .await
                     {
@@ -4973,7 +5048,7 @@ mod tests {
                     attempts: Arc::clone(&attempts),
                     failures_remaining: std::sync::atomic::AtomicUsize::new(failures),
                 }),
-                tools: std::sync::RwLock::new(Vec::new()),
+                tools: Arc::new(std::sync::RwLock::new(Vec::new())),
                 config: McpServerConfig::Stdio {
                     command: "unused".to_string(),
                     args: Vec::new(),
@@ -5058,7 +5133,7 @@ mod tests {
         let server = McpServer {
             name: "fake".to_string(),
             transport: Arc::new(transport),
-            tools: std::sync::RwLock::new(Vec::new()),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
             config,
             tools_changed: Arc::new(AtomicBool::new(false)),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
@@ -5125,6 +5200,52 @@ mod tests {
             requests[1].1.get("cursor").and_then(Value::as_str),
             Some("page-2")
         );
+    }
+
+    #[tokio::test]
+    async fn bound_call_checks_selected_cached_schema_before_transport_io() {
+        let (server, requests, _) =
+            fake_server(vec![exchange(Ok(serde_json::json!({"content":[]})))]);
+        let original = serde_json::json!({"type":"object"});
+        let current = serde_json::json!({"type":"object","required":["new"]});
+        let context = server.call_context();
+        *server.tools.write().unwrap() = vec![McpToolDef {
+            name: "report".into(),
+            description: String::new(),
+            input_schema: current.clone(),
+        }];
+        let error = context
+            .call_tool_with_schema(
+                "report",
+                serde_json::json!({}),
+                &CancellationToken::new(),
+                Some(&original),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.into_message("fake").contains("EUNAVAIL"));
+        assert!(requests.lock().unwrap().is_empty());
+        context
+            .call_tool_with_schema(
+                "report",
+                serde_json::json!({"new":true}),
+                &CancellationToken::new(),
+                Some(&current),
+            )
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.tools_changed.store(true, Ordering::Release);
+        assert!(context
+            .call_tool_with_schema(
+                "report",
+                serde_json::json!({"new":true}),
+                &CancellationToken::new(),
+                Some(&current)
+            )
+            .await
+            .is_err());
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -5796,7 +5917,12 @@ for line in sys.stdin:
     if method == "initialize":
         send(req_id, {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "fixture", "version": "1"}})
     elif method == "tools/list":
-        send(req_id, {"tools": [{"name": "report", "description": "Report config", "inputSchema": {"type": "object"}}]})
+        tool_schema = {"type": "object"}
+        schema_file = os.environ.get("MCP_TOOL_SCHEMA_FILE")
+        if schema_file and os.path.exists(schema_file):
+            with open(schema_file, "r", encoding="utf-8") as f:
+                tool_schema = json.load(f)
+        send(req_id, {"tools": [{"name": "report", "description": "Report config", "inputSchema": tool_schema}]})
     elif method == "tools/call":
         append_marker("call")
         block_once = os.environ.get("MCP_BLOCK_ONCE_FILE")
@@ -5820,6 +5946,9 @@ for line in sys.stdin:
         crash_file = os.environ.get("MCP_CRASH_ONCE_FILE")
         if crash_file and os.path.exists(crash_file):
             os.remove(crash_file)
+            if os.environ.get("MCP_TOOL_SCHEMA_AFTER_CRASH"):
+                with open(os.environ["MCP_TOOL_SCHEMA_FILE"], "w", encoding="utf-8") as f:
+                    f.write(os.environ["MCP_TOOL_SCHEMA_AFTER_CRASH"])
             os._exit(2)
         if os.environ.get("MCP_EMIT_PING"):
             # A server-initiated request whose id collides with the client's.
@@ -5888,6 +6017,60 @@ for line in sys.stdin:
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn schema_bound_retry_refuses_changed_schema_after_respawn() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let script = write_fixture_server(&directory);
+        let marker = directory.path().join("calls.log");
+        let crash = directory.path().join("crash-once");
+        let schema = directory.path().join("schema.json");
+        std::fs::write(&crash, "crash").unwrap();
+        let mut config = fixture_config(&script, &marker, "schema-bound", "env");
+        let environment = as_stdio_mut(&mut config).2;
+        environment.insert("MCP_CRASH_ONCE_FILE".into(), crash.display().to_string());
+        environment.insert("MCP_TOOL_SCHEMA_FILE".into(), schema.display().to_string());
+        let changed = serde_json::json!({"type":"object","required":["new"]});
+        environment.insert("MCP_TOOL_SCHEMA_AFTER_CRASH".into(), changed.to_string());
+        let manager = Arc::new(McpClientManager::new());
+        connect_fixture(&manager, &config).await;
+        let error = manager
+            .call_tool_cancellable_with_schema(
+                "fixture",
+                "report",
+                serde_json::json!({}),
+                CancellationToken::new(),
+                serde_json::json!({"type":"object"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error,McpToolCallError::Failed(message) if message.contains("EUNAVAIL")));
+        assert_eq!(
+            marker_lines(&marker)
+                .iter()
+                .filter(|line| line.starts_with("call|"))
+                .count(),
+            1
+        );
+        manager
+            .call_tool_cancellable_with_schema(
+                "fixture",
+                "report",
+                serde_json::json!({"new":true}),
+                CancellationToken::new(),
+                changed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            marker_lines(&marker)
+                .iter()
+                .filter(|line| line.starts_with("call|"))
+                .count(),
+            2
+        );
+        manager.reload_from_configs(Vec::new()).await;
     }
 
     #[tokio::test]

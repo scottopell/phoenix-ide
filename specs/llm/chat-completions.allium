@@ -20,6 +20,11 @@
 
 use "./llm.allium" as llm
 
+-- First-party OpenAI contracts and compatible-route capability boundaries:
+-- https://developers.openai.com/api/docs/guides/function-calling
+-- https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
+-- A compatible message shape does not establish native tool-choice support.
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -66,7 +71,20 @@ entity ChatRequest {
     stream: Boolean
     include_usage: Boolean
     tool_count: Integer
+    tool_choice: ChatToolChoice
     reasoning_effort: String?
+}
+
+entity ChatToolChoice {
+    availability: llm/ToolAvailability
+    kind: ChatAutoTools | ChatNoTools | ChatAllowedTools | ChatAdvisoryTools
+}
+
+variant ChatAutoTools : ChatToolChoice {}
+variant ChatNoTools : ChatToolChoice {}
+variant ChatAdvisoryTools : ChatToolChoice {}
+variant ChatAllowedTools : ChatToolChoice {
+    allowed_names: List<String>
 }
 
 entity ChatResponse {
@@ -102,6 +120,66 @@ entity ChatDroppedProviderBlock {
 entity ChatPrivateReasoningOmission {
     bytes: Integer
     logged: Boolean
+}
+
+------------------------------------------------------------
+-- Contracts — provider tool selection and historical calls
+------------------------------------------------------------
+
+contract ChatToolContinuation {
+    continue_exchange: (messages: List<ChatWireMessage>, availability: llm/ToolAvailability) -> List<ChatWireMessage>
+    select_tools: (availability: llm/ToolAvailability, support: llm/NativeToolRestrictionSupport) -> ChatToolChoice
+
+    @invariant ToolPolicyIsRenderedForChat
+        -- Derive this request's selection from current conversation policy.
+        -- Never serialize Anthropic tool-change events or private blocks,
+        -- Responses allowed_tools shapes, or Responses continuation handles
+        -- and reasoning items. Apply this exact route's supported Chat controls
+        -- or advisory restrictions with independent execution admission.
+
+    @invariant HistoricalCallsRemainPaired
+        -- Preserve assistant tool_calls (IDs, names, JSON arguments) and their
+        -- subsequent tool-role results with matching tool_call_id. Answer every
+        -- pending call before proceeding; do not leave an orphaned result or
+        -- remove a call/result because its function is no longer executable.
+        -- Failure is represented in tool-message content; there is no portable
+        -- Anthropic is_error field. Keep the original error evidence.
+
+    @invariant SelectionDoesNotRewriteMessages
+        -- tools describes functions the model may call on the current request;
+        -- tool_choice controls new generation, not historical tool-call identity.
+        -- First-party OpenAI supports auto, none, required, named selection,
+        -- and allowed_tools. There is no documented monotonic-callability rule
+        -- or requirement to delete history when callability changes.
+        -- Retaining definitions while narrowing allowed_tools is a supported
+        -- way to preserve history and avoid changes to the cached declarations.
+        -- This does not prove acceptance of omitted historical definitions by
+        -- every model or compatible endpoint.
+
+    @invariant ChatAllowedToolsWireShape
+        -- A restricted nonempty subset uses tool_choice =
+        -- {type:"allowed_tools", allowed_tools:{mode:"auto",tools:[
+        --   {type:"function",function:{name:N}}]}}.
+        -- All selected functions have complete declarations in tools.
+        -- The nested allowed_tools object and nested function.name distinguish
+        -- this shape from the Responses API. Full eligibility uses auto;
+        -- empty eligibility uses none. required is not Phoenix's default.
+
+    @invariant CompatibilityDoesNotImplyNativeRestriction
+        -- Native controls require a verified exact endpoint/model capability.
+        -- Third-party compatibility alone establishes neither allowed_tools
+        -- support nor acceptance of history whose declarations are absent.
+        -- Unknown/unsupported routes retain definitions, append instructions
+        -- describing the restriction, and enforce unavailable results locally.
+        -- Use verified basic tool_choice controls where available; do not send
+        -- allowed_tools speculatively, or erase history to conceal rejection.
+
+    @invariant ReasoningContractIsRouteSpecific
+        -- First-party Chat Completions does not use the Responses reasoning-item
+        -- replay protocol. A third-party reasoning_content field is not portable
+        -- proof of that protocol and never becomes visible answer text.
+        -- A provider requiring private reasoning echo needs its own explicit
+        -- continuation capability contract; do not infer it from Chat compatibility.
 }
 
 ------------------------------------------------------------
@@ -165,6 +243,25 @@ entity ChatPrivateReasoningOmission {
 -- Rules — endpoint and request translation
 ------------------------------------------------------------
 
+rule ChatToolChoiceSelected {
+    when: SelectChatTools(availability, support)
+    requires: support = supported
+    ensures:
+        if availability.callable_names.count = 0:
+            ChatNoTools.created(availability: availability)
+        else:
+            if availability.callable_names.count = availability.declarations.count:
+                ChatAutoTools.created(availability: availability)
+            else:
+                ChatAllowedTools.created(availability: availability, allowed_names: availability.callable_names)
+}
+
+rule ChatAdvisoryToolChoiceSelected {
+    when: SelectChatTools(availability, support)
+    requires: support in { unsupported, unknown }
+    ensures: ChatAdvisoryTools.created(availability: availability)
+}
+
 rule ChatEndpointResolved {
     when: ResolveChatEndpoint(configured_url?)
 
@@ -176,7 +273,9 @@ rule ChatEndpointResolved {
 }
 
 rule ChatRequestTranslated {
-    when: TranslateChatRequest(request)
+    when: TranslateChatRequest(request, choice)
+
+    requires: choice.availability = request.tool_availability
 
     ensures: ChatRequest.created(
         model: wire_model_name(request),
@@ -184,6 +283,7 @@ rule ChatRequestTranslated {
         stream: false,
         include_usage: false,
         tool_count: request.tool_count,
+        tool_choice: choice,
         reasoning_effort: request.effective_effort.explicit_level
     )
 
@@ -195,7 +295,9 @@ rule ChatRequestTranslated {
 }
 
 rule ChatStreamingRequested {
-    when: TranslateStreamingChatRequest(request)
+    when: TranslateStreamingChatRequest(request, choice)
+
+    requires: choice.availability = request.tool_availability
 
     ensures: ChatRequest.created(
         model: wire_model_name(request),
@@ -203,6 +305,7 @@ rule ChatStreamingRequested {
         stream: true,
         include_usage: true,
         tool_count: request.tool_count,
+        tool_choice: choice,
         reasoning_effort: request.effective_effort.explicit_level
     )
 }
@@ -398,6 +501,13 @@ invariant ChatToolResultReferencesModelIssuedCall {
         message.tool_call_id != null
 }
 
+invariant ChatAllowedSelectionMatchesCurrentEligibility {
+    for choice in ChatToolChoices where choice.kind = ChatAllowedTools:
+        choice.allowed_names = choice.availability.callable_names
+        choice.allowed_names.count > 0
+        choice.allowed_names.count < choice.availability.declarations.count
+}
+
 invariant ChatCompletedStreamsObservedTerminal {
     for stream in ChatStreams where stream.status = done:
         stream.terminal_observed = true
@@ -419,6 +529,11 @@ surface ChatCompletionsBoundary {
     context dropped: ChatDroppedProviderBlock
     context reasoning_omission: ChatPrivateReasoningOmission
 
+    contracts:
+        fulfils ChatToolContinuation
+        fulfils llm/ToolHistoryIntegrity
+        demands llm/ProviderRequestProjection
+
     exposes:
         endpoint.exact_url
         chat_request.model
@@ -426,6 +541,7 @@ surface ChatCompletionsBoundary {
         chat_request.stream
         chat_request.include_usage
         chat_request.reasoning_effort
+        chat_request.tool_choice
         message.content_kinds
         stream.text
         dropped.block_kind
@@ -434,9 +550,10 @@ surface ChatCompletionsBoundary {
         reasoning_omission.logged
 
     provides:
+        SelectChatTools(availability, support)
         ResolveChatEndpoint(configured_url?)
-        TranslateChatRequest(request)
-        TranslateStreamingChatRequest(request)
+        TranslateChatRequest(request, choice)
+        TranslateStreamingChatRequest(request, choice)
         TranslateChatContent(block)
         TranslateAssistantChatContent(block)
         NormalizeChatResponse(response)

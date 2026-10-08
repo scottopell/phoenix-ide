@@ -1,0 +1,5 @@
+Preserve original OpenAI Responses assistant phase when replaying settled historical turns. Active tool exchanges retain complete owner-bound envelopes, but terminal settlement clears private continuation and portable public messages have no phase field. OpenAI reasoning guidance says manual replay should retain the original phase to avoid commentary being treated as a final answer.
+
+Define provider-owned historical metadata for settled message/output items, respecting provider switching and the distinction between public content and private continuation. Do not retain encrypted reasoning indefinitely as a phase workaround or infer missing historical values. Update normative contracts and an ADR for any new retention policy. Add regressions for a settled commentary/tool chain followed by a new user turn, reload, and provider switching; verify the original phase is preserved where its authentic metadata exists.
+
+This is a baseline limitation outside the active-exchange tool-availability fix. Authority: https://developers.openai.com/api/docs/guides/reasoning and specs/llm/responses.allium ResponsesToolContinuation.

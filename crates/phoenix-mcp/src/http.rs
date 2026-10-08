@@ -3762,6 +3762,7 @@ mod tests {
                 "report".into(),
                 serde_json::json!({}),
                 CancellationToken::new(),
+                None,
             )
             .await
             .err()

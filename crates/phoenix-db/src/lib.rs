@@ -10,6 +10,7 @@ mod close_foundation;
 mod coordinator_query;
 mod coordinator_watches;
 mod federation_enrollment;
+mod federation_peers;
 pub use coordinator_watches::{PendingWatchEvent, WatchSnapshot};
 mod ddl;
 mod git_repository_reconciliation;
@@ -19,6 +20,8 @@ pub use svg_artifacts::SvgArtifact;
 mod migrations;
 mod product_creation;
 mod provider_replay;
+mod responses_replay;
+mod tool_availability;
 pub use product_creation::*;
 mod prompt_projection;
 pub use prompt_projection::{
@@ -10497,6 +10500,14 @@ impl Database {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM conversation_tool_contexts WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
             .bind(id)
             .execute(&mut *tx)
