@@ -384,7 +384,10 @@ that handshake's discovery challenge. A session DELETE authorization rejection
 SHALL admit OAuth cleanup recovery even when the handshake's primary failure
 is not an authorization error. Challenges from both failures SHALL contribute
 required scopes, with the latest supplied discovery metadata retained when later challenges
-omit it. Successful refresh continuations SHALL preserve that challenge for
+omit it. Recovered removal grants SHALL remain persisted until cleanup succeeds. A failed
+removal callback cleanup SHALL retain its complete authorization retry plan so
+expired recovered credentials cannot prevent explicit reauthorization.
+Successful refresh continuations SHALL preserve that challenge for
 replacement connection recovery while the configuration remains unchanged.
 Transient refresh or token persistence failures after successful handshake
 teardown SHALL retain recovery ownership and retry without manual reload.

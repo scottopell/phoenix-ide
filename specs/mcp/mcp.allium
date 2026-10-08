@@ -569,6 +569,9 @@ rule TokenRefreshNeeded {
         -- later challenges omit it. Carry the merged challenge through both
         -- immediate and background successful-refresh connection continuations.
         -- Clear inherited challenges when reconnecting a changed configuration.
+        -- Removal callbacks persist the recovered grant before cleanup. If
+        -- cleanup or grant persistence fails, retain the authorization retry
+        -- plan on the failed owner until successful cleanup or reauthorization.
         -- Successful teardown does not end ownership when refresh or token
         -- persistence fails transiently: retain the closed transport as the
         -- recovery owner and retry through the same fenced path.

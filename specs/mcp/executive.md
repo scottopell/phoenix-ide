@@ -175,3 +175,10 @@ when replacement challenges omit it.
 `retained_refresh_continuation_preserves_discovery_and_scopes` verifies the
 immediate and background successful-refresh continuations, including clean and
 failed replacement teardown, inherit discovery metadata and required scopes.
+
+`failed_removal_callback_retains_grant_and_authorization_retry` covers step-up
+and rejected-refresh removal callbacks, failed cleanup, complete grant retention,
+and explicit reauthorization after recovered credentials expire.
+`removal_callback_persistence_failure_retains_authorization_retry` verifies a
+failed recovered-grant write settles visibly and retains the same scope plan for
+explicit reauthorization.

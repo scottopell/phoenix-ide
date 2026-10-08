@@ -2103,13 +2103,33 @@ impl McpClientManager {
                     listener.abort();
                 }
                 self.pending_oauth_urls.write().await.remove(&name);
-                if !handle
-                    .remove_after_oauth(epoch, record.access_token)
-                    .await?
-                {
+                if handle.snapshot().epoch != epoch {
                     return Err(format!(
                         "MCP server '{name}': removal authorization was superseded"
                     ));
+                }
+                let plan = OAuthRetryPlan {
+                    scopes: flow.scopes.clone(),
+                    www_authenticate: resolved.www_authenticate.clone(),
+                };
+                if let Err(error) = self.oauth.store().upsert_token(&record).await {
+                    let error = format!(
+                        "MCP server '{name}': failed to persist removal OAuth token: {error}"
+                    );
+                    handle.deny_oauth(epoch, error.clone(), plan).await;
+                    return Err(error);
+                }
+                match handle.remove_after_oauth(epoch, record.access_token).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(format!(
+                            "MCP server '{name}': removal authorization was superseded"
+                        ))
+                    }
+                    Err(error) => {
+                        handle.deny_oauth(epoch, error.clone(), plan).await;
+                        return Err(error);
+                    }
                 }
                 self.oauth.delete_token(&name).await?;
                 self.remove_current_handle(&name, &handle).await;

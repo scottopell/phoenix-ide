@@ -3956,6 +3956,150 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Step-up and rejected-refresh flows share the removal fixture.
+    async fn failed_removal_callback_retains_grant_and_authorization_retry() {
+        for step_up in [false, true] {
+            let server = TestServer::start(handshake_responses("sess-1")).await;
+            let manager = ready_refreshable_manager(&server).await;
+            let handle = manager.servers.read().await.get("remote").unwrap().clone();
+            if step_up {
+                let crate::supervisor::RecoveryClaim::Leader(permit) =
+                    handle.claim_oauth_recovery(0).await
+                else {
+                    panic!("OAuth owner")
+                };
+                manager
+                    .step_up_authorization("remote", &handle, &permit, "Bearer scope=\"mcp.write\"")
+                    .await
+                    .unwrap();
+            } else {
+                let mut rejected = json_doc(&serde_json::json!({"error":"invalid_grant"}));
+                rejected.status = 400;
+                server.route("/token", rejected);
+                let challenge = format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\", scope=\"mcp.write\"",server.base());
+                server.push_responses(vec![status_response(
+                    401,
+                    &[("www-authenticate", &challenge)],
+                )]);
+                manager
+                    .call_tool("remote", "report", serde_json::json!({}))
+                    .await
+                    .unwrap_err();
+            }
+            let first = query_params(&pending_auth_url(&manager).await.unwrap());
+            let removal = manager.reload_from_configs(vec![]).await;
+            assert_eq!(removal.failed.len(), 1);
+            server.route("/token", token_response("at-2", Some("rt-2"), None));
+            server.push_responses(vec![status_response(503, &[])]);
+            let error = manager
+                .complete_oauth_authorization(&first["state"], "code", Some(&server.base()))
+                .await
+                .unwrap_err();
+            assert!(error.contains("503"));
+            assert_eq!(manager.status().await[0].state, crate::McpConnState::Failed);
+            assert!(pending_auth_url(&manager).await.is_none());
+            let mut token = manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(token.access_token, "at-2");
+            assert_eq!(token.refresh_token.as_deref(), Some("rt-2"));
+            assert_eq!(
+                token
+                    .scopes
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["mcp.read", "mcp.write"].into_iter().collect()
+            );
+            token.expires_at = 1;
+            manager.oauth.store().upsert_token(&token).await.unwrap();
+            *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-3".into());
+            manager
+                .reload_from_configs(vec![("remote".into(), handle.snapshot().config)])
+                .await;
+            let second = query_params(&pending_auth_url(&manager).await.unwrap());
+            assert_ne!(first["state"], second["state"]);
+            assert_eq!(
+                second["scope"]
+                    .split_whitespace()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["mcp.read", "mcp.write"].into_iter().collect()
+            );
+            server.route("/token", token_response("at-3", Some("rt-3"), None));
+            server.push_responses(vec![delete_ack()]);
+            server.push_responses(handshake_responses("sess-3"));
+            manager
+                .complete_oauth_authorization(&second["state"], "code", Some(&server.base()))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+                .await
+                .unwrap();
+            assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+            server.push_responses(vec![delete_ack()]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_callback_persistence_failure_retains_authorization_retry() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        let crate::supervisor::RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await
+        else {
+            panic!("OAuth owner")
+        };
+        manager
+            .step_up_authorization("remote", &handle, &permit, "Bearer scope=\"mcp.write\"")
+            .await
+            .unwrap();
+        let first = query_params(&pending_auth_url(&manager).await.unwrap());
+        manager.reload_from_configs(vec![]).await;
+        manager.set_oauth_store(Arc::new(FailingRefreshStore {
+            inner: manager.oauth.store(),
+            failures_remaining: std::sync::atomic::AtomicUsize::new(1),
+            fail_lookup: std::sync::atomic::AtomicBool::new(false),
+        }));
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        let error = manager
+            .complete_oauth_authorization(&first["state"], "code", Some(&server.base()))
+            .await
+            .unwrap_err();
+        assert!(error.contains("persist removal OAuth token"));
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Failed);
+        assert!(pending_auth_url(&manager).await.is_none());
+        manager
+            .reload_from_configs(vec![("remote".into(), handle.snapshot().config)])
+            .await;
+        let second = query_params(&pending_auth_url(&manager).await.unwrap());
+        assert_eq!(
+            second["scope"]
+                .split_whitespace()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["mcp.read", "mcp.write"].into_iter().collect()
+        );
+        server.route("/token", token_response("at-3", Some("rt-3"), None));
+        *server.routes.delete_bearer.lock().unwrap() = Some("Bearer at-3".into());
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-3"));
+        manager
+            .complete_oauth_authorization(&second["state"], "code", Some(&server.base()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+            .await
+            .unwrap();
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Ready);
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+    }
+
     struct FailOnceDeleteStore {
         inner: Arc<dyn crate::OAuthStore>,
         fail_next: std::sync::atomic::AtomicBool,
