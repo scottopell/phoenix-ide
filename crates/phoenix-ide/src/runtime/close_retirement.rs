@@ -6697,10 +6697,27 @@ mod tests {
             .retire_close_worktrees_and_scopes(attempt, source_snapshot)
             .await
             .unwrap_err();
-        for _ in 0..2 {
+        for retry in 0..2 {
             manager.db().retry_close_retirement(attempt).await.unwrap();
+            let retained_snapshot = manager
+                .db()
+                .get_close_obligation(attempt.as_str())
+                .await
+                .unwrap()
+                .snapshot()
+                .cloned()
+                .unwrap();
+            let resumed_snapshot = manager
+                .db()
+                .resume_close_retirement_after_dispatched_absence(
+                    attempt,
+                    &retained_snapshot,
+                    &format!("writer-retry-{retry}"),
+                )
+                .await
+                .unwrap();
             manager
-                .inspect_close_retirement(attempt.clone())
+                .retire_close_worktrees_and_scopes(attempt, &resumed_snapshot)
                 .await
                 .unwrap_err();
             let obligation = manager
@@ -6737,8 +6754,25 @@ mod tests {
         assert_eq!(*observations.lock().unwrap(), vec![object.clone(); 3]);
         manager.set_test_ambient_writer_observer(Arc::new(|_| Ok(false)));
         manager.db().retry_close_retirement(attempt).await.unwrap();
+        let retained_snapshot = manager
+            .db()
+            .get_close_obligation(attempt.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .cloned()
+            .unwrap();
         let completed_snapshot = manager
-            .inspect_close_retirement(attempt.clone())
+            .db()
+            .resume_close_retirement_after_dispatched_absence(
+                attempt,
+                &retained_snapshot,
+                "writer-retry-complete",
+            )
+            .await
+            .unwrap();
+        manager
+            .retire_close_worktrees_and_scopes(attempt, &completed_snapshot)
             .await
             .unwrap();
         assert!(!tombstone.root.exists());
@@ -9660,7 +9694,7 @@ mod tests {
         child.wait().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn quarantine_preserves_worktree_with_open_file_descriptor() {
         let temp = tempfile::tempdir().unwrap();
@@ -9675,6 +9709,13 @@ mod tests {
             .append(true)
             .open(&tracked)
             .unwrap();
+        let proc_inventory = tempfile::tempdir().unwrap();
+        let descriptor_inventory = proc_inventory
+            .path()
+            .join(std::process::id().to_string())
+            .join("fd");
+        std::fs::create_dir_all(&descriptor_inventory).unwrap();
+        let quarantined_tracked = worktree_quarantine_path(&identity).unwrap().join("tracked");
 
         let administrative_dir = closing.join(".git");
         let outcome = quarantine_and_remove_exact_worktree(
@@ -9687,8 +9728,13 @@ mod tests {
                 descriptor.write_all(b"after\n").unwrap();
                 descriptor.flush().unwrap();
                 std::mem::forget(descriptor);
+                std::os::unix::fs::symlink(&quarantined_tracked, descriptor_inventory.join("9"))
+                    .unwrap();
             },
-            super::quarantine_has_external_writer,
+            move |path| {
+                super::quarantine_has_open_descriptors_in(path, proc_inventory.path())
+                    .map(|evidence| evidence.found())
+            },
         )
         .await
         .unwrap();
