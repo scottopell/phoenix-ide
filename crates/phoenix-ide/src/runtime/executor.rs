@@ -2657,9 +2657,18 @@ where
                                 }
                             }
                         };
-                        if let Err(error) = self.execute_effect(effect).await {
-                            tracing::error!(%error, "Failed to resume in-flight overload retry");
-                            return RuntimeExitDisposition::Interrupted;
+                        match self.execute_effect(effect).await {
+                            Ok(Some(event)) => {
+                                if let Err(error) = self.process_event(event).await {
+                                    tracing::error!(%error, "Failed to settle resumed overload retry");
+                                    return RuntimeExitDisposition::Interrupted;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::error!(%error, "Failed to resume in-flight overload retry");
+                                return RuntimeExitDisposition::Interrupted;
+                            }
                         }
                     }
                 }
