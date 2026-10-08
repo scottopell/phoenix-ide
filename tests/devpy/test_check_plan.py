@@ -374,8 +374,16 @@ class CargoTestTimeoutTests(unittest.TestCase):
             self.dev.cmd_check(gate=False, lanes="task")
             self.assertFalse(reporter.return_value.lane_failed.called)
 
+    def test_platform_max_budget_is_accepted(self):
+        maximum = self.dev.MAX_CARGO_TEST_TIMEOUT_SECS
+        with self._with_file(None):
+            self.assertEqual(
+                self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: str(maximum)}),
+                (maximum, "environment"),
+            )
+
     def test_invalid_values_fail_loud(self):
-        for raw in ("abc", "0", "-5", "1.5"):
+        for raw in ("abc", "0", "-5", "1.5", str(self.dev.MAX_CARGO_TEST_TIMEOUT_SECS + 1), "9999999999"):
             with self.subTest(raw=raw), self._with_file(None):
                 with self.assertRaisesRegex(SystemExit, "positive integer"):
                     self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: raw})

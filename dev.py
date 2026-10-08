@@ -5687,8 +5687,8 @@ def cmd_check(
         which runs vite in its own worktree.
 
         Test compilation, codegen, and execution each have separate subprocess
-        budgets. The full test execution step has a fifteen-minute bound;
-        compilation and codegen retain the default ten-minute bound.
+        budgets. Test execution has a 900-second default bound, adjustable
+        per host; compilation and codegen retain the ten-minute bound.
 
         Codegen runs here, but never touches `ui/src/generated/`: the ts-rs
         `export_bindings_*` tests run with TS_RS_EXPORT_DIR pointed at a
@@ -8358,6 +8358,9 @@ def native_prod_deploy(
 
 CARGO_TEST_TIMEOUT_ENV = "PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS"
 DEFAULT_CARGO_TEST_TIMEOUT_SECS = 900
+# Keep the lane join (two 600s steps + this budget + 30s) within Python's
+# platform-supported Thread.join timeout, even for an extreme override.
+MAX_CARGO_TEST_TIMEOUT_SECS = int(threading.TIMEOUT_MAX) - 1230
 
 
 def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
@@ -8384,10 +8387,10 @@ def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int
         value = int(raw.strip())
     except ValueError:
         value = 0
-    if value <= 0:
+    if not 0 < value <= MAX_CARGO_TEST_TIMEOUT_SECS:
         raise SystemExit(
-            f"{CARGO_TEST_TIMEOUT_ENV} must be a positive integer number of seconds; "
-            f"got {raw!r} from {source}"
+            f"{CARGO_TEST_TIMEOUT_ENV} must be a positive integer number of seconds "
+            f"at most {MAX_CARGO_TEST_TIMEOUT_SECS}; got {raw!r} from {source}"
         )
     return value, source
 
