@@ -2485,10 +2485,11 @@ mod tests {
         let root_message = service
             .db
             .add_message(
+                "root:message",
                 "root-scope",
-                crate::db::MessageType::User,
-                &crate::db::MessageContent::Text("historical prompt".into()),
-                Some("root:message"),
+                &crate::db::MessageContent::user("historical prompt"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -2500,10 +2501,11 @@ mod tests {
         service
             .db
             .add_message(
+                "foreign-message",
                 "foreign-anchor",
-                crate::db::MessageType::User,
-                &crate::db::MessageContent::Text("foreign prompt".into()),
-                Some("foreign-message"),
+                &crate::db::MessageContent::user("foreign prompt"),
+                None,
+                None,
             )
             .await
             .unwrap();
