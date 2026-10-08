@@ -1,5 +1,6 @@
 use crate::{
     CallContext, McpRequestError, McpServer, McpServerConfig, McpToolDef, OAuthRecoveryKind,
+    TransportError,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -376,7 +377,45 @@ impl SupervisorHandle {
         receive.await.unwrap_or(false)
     }
 
+    pub(crate) async fn oauth_retry_plan(&self, epoch: u64) -> Option<OAuthRetryPlan> {
+        let (reply, receive) = oneshot::channel();
+        self.mailbox
+            .send(Command::OAuthRetryPlan { epoch, reply })
+            .await
+            .ok()?;
+        receive.await.ok().flatten()
+    }
+
+    pub(crate) async fn retain_oauth_plan(&self, epoch: u64, plan: OAuthRetryPlan) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::RetainOAuthPlan { epoch, plan, reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receive.await.unwrap_or(false)
+    }
+
+    pub(crate) async fn deny_oauth_cleanup(&self, epoch: u64, error: String, plan: OAuthRetryPlan) {
+        self.deny_oauth_with_cause(epoch, error, plan, OAuthFailureCause::Cleanup)
+            .await;
+    }
+
     pub(crate) async fn deny_oauth(&self, epoch: u64, error: String, plan: OAuthRetryPlan) {
+        self.deny_oauth_with_cause(epoch, error, plan, OAuthFailureCause::Authorization)
+            .await;
+    }
+
+    async fn deny_oauth_with_cause(
+        &self,
+        epoch: u64,
+        error: String,
+        plan: OAuthRetryPlan,
+        cause: OAuthFailureCause,
+    ) {
         let (reply, receive) = oneshot::channel();
         if self
             .mailbox
@@ -384,6 +423,7 @@ impl SupervisorHandle {
                 epoch,
                 error,
                 plan,
+                cause,
                 reply,
             })
             .await
@@ -549,7 +589,21 @@ struct QueuedCall {
     cancellation_watch: tokio::task::JoinHandle<()>,
 }
 
+enum OAuthFailureCause {
+    Authorization,
+    Cleanup,
+}
+
 enum Command {
+    OAuthRetryPlan {
+        epoch: u64,
+        reply: oneshot::Sender<Option<OAuthRetryPlan>>,
+    },
+    RetainOAuthPlan {
+        epoch: u64,
+        plan: OAuthRetryPlan,
+        reply: oneshot::Sender<bool>,
+    },
     RetainOAuthHandshakeFailure {
         epoch: u64,
         error: String,
@@ -568,6 +622,7 @@ enum Command {
         epoch: u64,
         error: String,
         plan: OAuthRetryPlan,
+        cause: OAuthFailureCause,
         reply: oneshot::Sender<()>,
     },
     RetryOAuth {
@@ -769,17 +824,78 @@ impl Actor {
                 }
                 let _ = reply.send(current);
             }
+            Command::OAuthRetryPlan { epoch, reply } => {
+                let plan = if epoch == self.epoch {
+                    self.teardown_retry
+                        .iter()
+                        .find_map(|retained| match retained {
+                            RetainedTransport::OAuthRecovery { retry_plan, .. } => {
+                                retry_plan.clone()
+                            }
+                            RetainedTransport::TransportRecovery(_)
+                            | RetainedTransport::Other(_) => None,
+                        })
+                } else {
+                    None
+                };
+                let _ = reply.send(plan);
+            }
+            Command::RetainOAuthPlan { epoch, plan, reply } => {
+                let mut retained = false;
+                if epoch == self.epoch && matches!(self.state, SupervisorState::Recovering) {
+                    for transport in &mut self.teardown_retry {
+                        if let RetainedTransport::OAuthRecovery { retry_plan, .. } = transport {
+                            let mut plan = plan.clone();
+                            if let Some(previous) = retry_plan.as_ref() {
+                                crate::extend_unique(
+                                    &mut plan.scopes,
+                                    previous.scopes.iter().map(String::as_str),
+                                );
+                                plan.www_authenticate = crate::merge_oauth_challenges(
+                                    [
+                                        previous.www_authenticate.as_deref(),
+                                        plan.www_authenticate.as_deref(),
+                                    ]
+                                    .into_iter()
+                                    .flatten(),
+                                );
+                            }
+                            *retry_plan = Some(plan);
+                            retained = true;
+                        }
+                    }
+                }
+                let _ = reply.send(retained);
+            }
             Command::DenyOAuth {
                 epoch,
                 error,
                 plan,
+                cause,
                 reply,
             } => {
                 if epoch == self.epoch {
                     let mut retained_oauth = false;
                     for retained in &mut self.teardown_retry {
                         if let RetainedTransport::OAuthRecovery { retry_plan, .. } = retained {
-                            *retry_plan = Some(plan.clone());
+                            let mut plan = plan.clone();
+                            if matches!(cause, OAuthFailureCause::Cleanup) {
+                                if let Some(retained) = retry_plan.as_ref() {
+                                    crate::extend_unique(
+                                        &mut plan.scopes,
+                                        retained.scopes.iter().map(String::as_str),
+                                    );
+                                    plan.www_authenticate = crate::merge_oauth_challenges(
+                                        [
+                                            plan.www_authenticate.as_deref(),
+                                            retained.www_authenticate.as_deref(),
+                                        ]
+                                        .into_iter()
+                                        .flatten(),
+                                    );
+                                }
+                            }
+                            *retry_plan = Some(plan);
                             retained_oauth = true;
                         }
                     }
@@ -1349,8 +1465,33 @@ impl Actor {
 
         let mut failed = Vec::new();
         let mut errors = Vec::new();
-        for retained in std::mem::take(&mut self.teardown_retry) {
+        for mut retained in std::mem::take(&mut self.teardown_retry) {
             if let Err(error) = retained.server().terminate().await {
+                if let (
+                    TransportError::Unauthorized { www_authenticate },
+                    RetainedTransport::OAuthRecovery { retry_plan, .. },
+                ) = (&error, &mut retained)
+                {
+                    let plan = retry_plan.get_or_insert_with(|| OAuthRetryPlan {
+                        scopes: crate::configured_oauth_scopes(&self.snapshot.config).to_vec(),
+                        www_authenticate: None,
+                    });
+                    plan.www_authenticate = crate::merge_oauth_challenges(
+                        [
+                            plan.www_authenticate.as_deref(),
+                            www_authenticate.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten(),
+                    );
+                    if let Some(challenge) = plan.www_authenticate.as_deref() {
+                        if let Some(scope) =
+                            crate::oauth::parse_bearer_challenge(challenge).get("scope")
+                        {
+                            crate::extend_unique(&mut plan.scopes, scope.split_whitespace());
+                        }
+                    }
+                }
                 errors.push(error.to_string());
                 failed.push(retained);
             }

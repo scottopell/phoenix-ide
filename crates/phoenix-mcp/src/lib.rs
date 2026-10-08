@@ -2127,7 +2127,7 @@ impl McpClientManager {
                         ))
                     }
                     Err(error) => {
-                        handle.deny_oauth(epoch, error.clone(), plan).await;
+                        handle.deny_oauth_cleanup(epoch, error.clone(), plan).await;
                         return Err(error);
                     }
                 }
@@ -2333,6 +2333,25 @@ impl McpClientManager {
                 ));
             }
         };
+        let mut scopes = configured_oauth_scopes(config).to_vec();
+        extend_unique(&mut scopes, token.scopes.iter().map(String::as_str));
+        if let Some(challenge) = www_authenticate {
+            if let Some(scope) = oauth::parse_bearer_challenge(challenge).get("scope") {
+                extend_unique(&mut scopes, scope.split_whitespace());
+            }
+        }
+        if !handle
+            .retain_oauth_plan(
+                permit.epoch,
+                OAuthRetryPlan {
+                    scopes,
+                    www_authenticate: www_authenticate.map(str::to_owned),
+                },
+            )
+            .await
+        {
+            return RefreshServerOutcome::Superseded;
+        }
         match oauth_refresh(&self.oauth, name, &url, www_authenticate, &token).await {
             Ok(access_token) => match handle
                 .finish_oauth_cleanup(permit.epoch, access_token)
@@ -2409,6 +2428,21 @@ impl McpClientManager {
     ) -> RefreshServerOutcome {
         let config = &permit.config;
         let mut prior_scopes = configured_oauth_scopes(config).to_vec();
+        let retained_plan = handle.oauth_retry_plan(permit.epoch).await;
+        if let Some(plan) = retained_plan.as_ref() {
+            extend_unique(&mut prior_scopes, plan.scopes.iter().map(String::as_str));
+        }
+        let challenge = merge_oauth_challenges(
+            [
+                www_authenticate,
+                retained_plan
+                    .as_ref()
+                    .and_then(|plan| plan.www_authenticate.as_deref()),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        let www_authenticate = challenge.as_deref();
         if let Ok(Some(token)) = self.oauth.store().token(name).await {
             extend_unique(&mut prior_scopes, token.scopes.iter().map(String::as_str));
         }
@@ -3424,6 +3458,129 @@ impl McpClientManager {
     }
 
     #[allow(clippy::too_many_lines)]
+    async fn remove_oauth_owned(
+        &self,
+        name: &str,
+        handle: &SupervisorHandle,
+    ) -> Option<Result<(), String>> {
+        let snapshot = handle.snapshot();
+        oauth_resource_url(&snapshot.config)?;
+        let mut plan = OAuthRetryPlan {
+            scopes: configured_oauth_scopes(&snapshot.config).to_vec(),
+            www_authenticate: None,
+        };
+        let token = self.oauth.store().token(name).await;
+        if let Ok(Some(token)) = &token {
+            extend_unique(&mut plan.scopes, token.scopes.iter().map(String::as_str));
+        }
+        let permit = match &snapshot.state {
+            SupervisorState::Ready(_) => {
+                if matches!(token, Ok(None)) {
+                    return None;
+                }
+                match handle.claim_oauth_recovery(snapshot.epoch).await {
+                    RecoveryClaim::Leader(permit) => permit,
+                    RecoveryClaim::Unavailable(error) => {
+                        handle
+                            .deny_oauth(handle.snapshot().epoch, error.clone(), plan)
+                            .await;
+                        return Some(Err(error));
+                    }
+                    RecoveryClaim::Follow(_) | RecoveryClaim::Stale => {
+                        return Some(Err("MCP removal recovery was superseded".to_owned()));
+                    }
+                }
+            }
+            SupervisorState::Failed => {
+                let (permit, retained_plan) = handle.retry_oauth().await?;
+                extend_unique(
+                    &mut plan.scopes,
+                    retained_plan.scopes.iter().map(String::as_str),
+                );
+                plan.www_authenticate = retained_plan.www_authenticate;
+                permit
+            }
+            SupervisorState::Connecting
+            | SupervisorState::Recovering
+            | SupervisorState::Removed => return None,
+        };
+        handle.defer_oauth_removal().await;
+        if !handle.retain_oauth_plan(permit.epoch, plan.clone()).await {
+            return Some(Err("MCP removal recovery was superseded".to_owned()));
+        }
+        let outcome = if matches!(snapshot.state, SupervisorState::Ready(_)) {
+            if let Ok(Some(token)) = &token {
+                if token.is_expired() {
+                    self.refresh_authorized_server_owned(
+                        name,
+                        handle,
+                        &permit,
+                        plan.www_authenticate.as_deref(),
+                    )
+                    .await
+                } else {
+                    match handle
+                        .finish_oauth_cleanup(permit.epoch, token.access_token.clone())
+                        .await
+                    {
+                        Ok(true) => RefreshServerOutcome::Refreshed,
+                        Ok(false) => RefreshServerOutcome::Superseded,
+                        Err(error) => RefreshServerOutcome::Failed(error),
+                    }
+                }
+            } else {
+                self.refresh_authorized_server_owned(
+                    name,
+                    handle,
+                    &permit,
+                    plan.www_authenticate.as_deref(),
+                )
+                .await
+            }
+        } else {
+            self.refresh_authorized_server_owned(
+                name,
+                handle,
+                &permit,
+                plan.www_authenticate.as_deref(),
+            )
+            .await
+        };
+        Some(match outcome {
+            RefreshServerOutcome::Refreshed => match handle.remove().await {
+                Ok(()) => match self.oauth.delete_token(name).await {
+                    Ok(()) => {
+                        self.remove_current_handle(name, handle).await;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            },
+            RefreshServerOutcome::Transient(error) => {
+                self.spawn_refresh_retry(
+                    name.to_owned(),
+                    handle.clone(),
+                    permit,
+                    plan.www_authenticate,
+                    OAuthHandshakeAction::Refresh,
+                );
+                Err(error)
+            }
+            RefreshServerOutcome::Failed(error) => {
+                handle
+                    .deny_oauth_cleanup(permit.epoch, error.clone(), plan)
+                    .await;
+                Err(error)
+            }
+            RefreshServerOutcome::Reprompt(error) => Err(error),
+            RefreshServerOutcome::Superseded => {
+                Err("MCP removal recovery was superseded".to_owned())
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn reload_from_actor_configs(
         &self,
         configs: Vec<(String, McpServerConfig)>,
@@ -3449,9 +3606,20 @@ impl McpClientManager {
                     removed.push(name);
                     continue;
                 }
+                if let Some(result) = self.remove_oauth_owned(&name, &handle).await {
+                    match result {
+                        Ok(()) => removed.push(name),
+                        Err(error) => failed.push(McpReloadFailure {
+                            server: name,
+                            action: "remove".to_owned(),
+                            error,
+                        }),
+                    }
+                    continue;
+                }
                 let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
-                let removal = match self.oauth.delete_token(&name).await {
-                    Ok(()) => handle.remove().await,
+                let removal = match handle.remove().await {
+                    Ok(()) => self.oauth.delete_token(&name).await,
                     Err(error) => Err(error),
                 };
                 match removal {

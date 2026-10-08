@@ -569,6 +569,10 @@ rule TokenRefreshNeeded {
         -- later challenges omit it. Carry the merged challenge through both
         -- immediate and background successful-refresh connection continuations.
         -- Clear inherited challenges when reconnecting a changed configuration.
+        -- Ready OAuth removal with a stored grant reserves cleanup ownership;
+        -- refresh expired credentials before deleting the session or token.
+        -- Preserve DELETE authorization challenges on that owner and route
+        -- failed removal retries through refresh or owned reauthorization.
         -- Removal callbacks persist the recovered grant before cleanup. If
         -- cleanup or grant persistence fails, retain the authorization retry
         -- plan on the failed owner until successful cleanup or reauthorization.

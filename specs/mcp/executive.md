@@ -182,3 +182,13 @@ and explicit reauthorization after recovered credentials expire.
 `removal_callback_persistence_failure_retains_authorization_retry` verifies a
 failed recovered-grant write settles visibly and retains the same scope plan for
 explicit reauthorization.
+
+`ready_oauth_removal_refreshes_before_deleting_grant` covers expired Ready
+removal, transient endpoint and grant persistence retries, authenticated cleanup,
+and cleanup-only completion. `ready_oauth_removal_cleanup_failure_retries_with_retained_grant`
+verifies explicit failed cleanup retries retain the rotated grant.
+`ready_oauth_removal_delete_challenge_can_authorize_cleanup` verifies DELETE
+challenge metadata and scope union survive refresh rejection and reauthorization.
+`ready_removal_cleanup_reauthorization_retains_prior_scopes` covers immediate
+and background cleanup rejection after refresh narrows the grant's scopes; the
+retry preserves previously required scopes and the latest DELETE challenge.
