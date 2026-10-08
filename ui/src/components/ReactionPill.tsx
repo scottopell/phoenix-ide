@@ -28,7 +28,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (sourceDocked || discard || hidden) return;
+    if ((sourceDocked && !touchDocked) || discard || hidden) return;
     const focusFromSelection = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.key !== 'Enter' || event.isComposing || event.keyCode === 229
         || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
@@ -41,7 +41,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     };
     document.addEventListener('keydown', focusFromSelection);
     return () => document.removeEventListener('keydown', focusFromSelection);
-  }, [bubbleRef, discard, hidden, scopeId, sourceDocked]);
+  }, [bubbleRef, discard, hidden, scopeId, sourceDocked, touchDocked]);
   const requestClose = () => body ? setDiscard(true) : onClose();
   useKeyboardRouterShortcut({
     id: `${scopeId}:escape`, scopeId, key: 'Escape', layer: 'passive-content',
@@ -62,6 +62,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     let observedScroller: HTMLElement = scroller;
     let initialClearancePending = dockActive;
     let observedObstructions = new Set<Element>();
+    let observedSource: Element | null = null;
     const initialComposer = document.getElementById('input-area');
     const scrollerAncestors = new Set<Element>();
     for (let ancestor: Element | null = scroller; ancestor; ancestor = ancestor.parentElement) scrollerAncestors.add(ancestor);
@@ -108,6 +109,12 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const restoredRange = restoreReactionRange(source);
       const fallbackOwner = sourceRange?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]');
       const range = restoredRange ?? (sourceRange && fallbackOwner && observedScroller.contains(fallbackOwner) ? sourceRange : null);
+      const liveSource = restoredRange?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]') ?? null;
+      if (liveSource !== observedSource) {
+        if (observedSource) resize.unobserve(observedSource);
+        observedSource = liveSource;
+        if (observedSource) resize.observe(observedSource);
+      }
       const rect = range?.getBoundingClientRect();
       if (returning.current && rect && rect.height > 0) {
         returning.current = false;
@@ -179,8 +186,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     position();
     resize.observe(scroller);
     resize.observe(el);
-    const sourceOwner = restoreReactionRange(source)?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]');
-    if (sourceOwner) resize.observe(sourceOwner);
+
     window.addEventListener('scroll', schedule, true);
     window.addEventListener('resize', schedule);
     window.visualViewport?.addEventListener('resize', schedule);

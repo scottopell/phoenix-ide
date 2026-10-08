@@ -70,6 +70,15 @@ describe('reaction pill', () => {
     expect(input).toHaveFocus();
   });
 
+  it('keeps hardware Enter active after the touch source leaves view', async () => {
+    offscreen = true;
+    render(<Fixture touchDocked body="" />);
+    const input = screen.getByRole('textbox');
+    await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(input).toHaveFocus();
+  });
+
   it('releases transcript reservation while another focus scope hides the dock', async () => {
     render(<FocusScopeProvider>
       <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>

@@ -843,6 +843,7 @@ function VirtualTranscriptInner<T>(
       const current = storeRef.current;
       if (!current?.scroller || !Number.isFinite(delta) || delta === 0) return;
       setScrollerScrollTop(current, current.scroller.scrollTop + delta);
+      current.activeAnchor = captureTopAnchor(current);
       recompute(current);
       publish();
     },

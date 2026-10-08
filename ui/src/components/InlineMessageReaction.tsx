@@ -32,17 +32,17 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
   const bubbleRef = useRef<HTMLDivElement>(null);
   const selectedRange = useRef<Range | null>(null);
   const pillFocusPending = useRef(false);
+  const selecting = useRef(false);
+  const selectionInput = useRef<'touch' | 'fine' | null>(null);
   const { activeScope } = useFocusScope();
   const focusScope = `inline-reaction:${scopeKey}`;
   const [notice, setNotice] = useState('');
 
   useEffect(() => {
     let frame = 0;
-    let selecting = false;
-    let selectionInput: 'touch' | 'fine' | null = null;
     const read = () => {
       frame = 0;
-      if (selecting || pillFocusPending.current || !destination || (activeScope && activeScope !== focusScope)) return;
+      if (selecting.current || pillFocusPending.current || !destination || (activeScope && activeScope !== focusScope)) return;
       if (bubbleRef.current?.contains(document.activeElement)) return;
       const current = store.getSnapshot(scopeKey);
       if (current?.body) return;
@@ -53,13 +53,13 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
         const sameSource = current?.source.messageId === selected.source.messageId
           && current.source.occurrenceToken === selected.source.occurrenceToken
           && current.source.quote === selected.source.quote;
-        const touchDocked = selectionInput !== null
-          ? selectionInput === 'touch'
+        const touchDocked = selectionInput.current !== null
+          ? selectionInput.current === 'touch'
           : sameSource
             ? current.presentation === 'touch-docked'
             : window.matchMedia?.('(any-pointer: coarse)').matches ?? false;
         store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: touchDocked ? 'touch-docked' : 'floating' });
-        selectionInput = null;
+        selectionInput.current = null;
         setNotice('');
       } else if (current && (current.presentation === 'floating'
         || Boolean(nativeSelection && nativeSelection.rangeCount > 0 && !nativeSelection.isCollapsed)
@@ -73,12 +73,12 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
     };
     const down = (event: PointerEvent) => {
       if (bubbleRef.current?.contains(event.target as Node)) return;
-      selectionInput = event.pointerType === 'touch' ? 'touch' : 'fine';
-      selecting = event.pointerType !== 'touch';
+      selectionInput.current = event.pointerType === 'touch' ? 'touch' : 'fine';
+      selecting.current = event.pointerType !== 'touch';
     };
-    const up = () => { selecting = false; schedule(); };
+    const up = () => { selecting.current = false; schedule(); };
     const keydown = (event: KeyboardEvent) => {
-      if (event.shiftKey || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a')) selectionInput = 'fine';
+      if (event.shiftKey || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a')) selectionInput.current = 'fine';
     };
     document.addEventListener('selectionchange', schedule);
     document.addEventListener('keydown', keydown, true);
