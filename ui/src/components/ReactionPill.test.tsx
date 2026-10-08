@@ -345,6 +345,30 @@ describe('reaction pill', () => {
     expect(screen.getByRole('textbox')).not.toHaveFocus();
   });
 
+  it('does not block the first later scroll when initial placement was already clear', async () => {
+    const listeners = new Map<string, EventListener>();
+    let rangeBottom = 300;
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockImplementation(() => new DOMRect(0, rangeBottom - 50, 200, 50));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 580, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    vi.spyOn(window, 'addEventListener').mockImplementation((type, listener) => {
+      if (typeof listener === 'function') listeners.set(type, listener);
+    });
+    const scrollTranscriptBy = vi.fn();
+    render(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
+      <ReactionPill source={source} touchDocked scrollTranscriptBy={scrollTranscriptBy} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    expect(scrollTranscriptBy).not.toHaveBeenCalled();
+    rangeBottom = 620;
+    act(() => listeners.get('scroll')?.(new Event('scroll')));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
+    expect(scrollTranscriptBy).not.toHaveBeenCalled();
+  });
+
   it('clamps the touch dock inside visual-viewport safe-area insets', () => {
     Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
       offsetLeft: 0, offsetTop: 0, width: 390, height: 700,

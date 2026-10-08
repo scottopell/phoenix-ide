@@ -152,10 +152,12 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         observedObstructions = nextObstructions;
         y = Math.min(bottom, obstructionTop) - height - 12;
         const sourceBoundary = y - 12;
-        if (initialClearancePending && viewportVisible && rect && rect.bottom > sourceBoundary) {
-          const delta = rect.bottom - sourceBoundary;
-          if (scrollTranscriptBy) scrollTranscriptBy(delta);
-          else observedScroller.scrollTop += delta;
+        if (initialClearancePending) {
+          if (viewportVisible && rect && rect.bottom > sourceBoundary) {
+            const delta = rect.bottom - sourceBoundary;
+            if (scrollTranscriptBy) scrollTranscriptBy(delta);
+            else observedScroller.scrollTop += delta;
+          }
           initialClearancePending = false;
         } else if (rect && rect.bottom > sourceBoundary) {
           sourceVisible = false;
