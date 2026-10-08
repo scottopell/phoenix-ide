@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Message } from '../api';
 import { InlineReactionContext, InlineReactionStore, formatInlineReaction } from '../conversation/InlineReactionStore';
 import { DraftStore } from '../conversation/DraftStore';
-import { FocusScopeProvider } from '../hooks/useFocusScope';
+import { FocusScopeProvider, useRegisterFocusScope } from '../hooks/useFocusScope';
 import { InlineMessageReaction } from './InlineMessageReaction';
 import { readReactionSelection } from './inlineReactionSelection';
 import { MessageContextMenu } from './MessageContextMenu';
@@ -34,7 +34,12 @@ function setCoarsePointer(matches: boolean) {
   }));
 }
 
-function Harness({ store, scope = 'conversation-a', append, sourceMounted = true }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined; sourceMounted?: boolean }) {
+function OtherScope() {
+  useRegisterFocusScope('other-scope');
+  return <button type="button">Other scope control</button>;
+}
+
+function Harness({ store, scope = 'conversation-a', append, sourceMounted = true, otherScope = false, returnToSource }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined; sourceMounted?: boolean; otherScope?: boolean; returnToSource?: () => boolean }) {
   return (
     <FocusScopeProvider>
       <InlineReactionContext.Provider value={store}>
@@ -46,7 +51,8 @@ function Harness({ store, scope = 'conversation-a', append, sourceMounted = true
           ))}
         </div>
         <button type="button" data-testid="unrelated">Unrelated surface</button>
-        <InlineMessageReaction scopeKey={scope} messages={messages} destination={append ? { append } : undefined} />
+        <InlineMessageReaction scopeKey={scope} messages={messages} destination={append ? { append } : undefined} returnToSource={returnToSource} />
+        {otherScope && <OtherScope />}
         <MessageContextMenu messages={messages} />
         <FilePathContextMenu />
       </InlineReactionContext.Provider>
@@ -256,6 +262,48 @@ describe('inline message reactions', () => {
     fireEvent(document, new Event('selectionchange'));
     expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+  });
+
+  it('ignores a hidden focus scope gesture when returning to a retained touch passage', async () => {
+    setCoarsePointer(false);
+    const store = new InlineReactionStore();
+    store.dispatch('conversation-a', {
+      type: 'select', presentation: 'touch-docked',
+      source: { messageId: 'old', sequenceId: 2, occurrenceToken: 'row-old:old', quote: 'Deterministic state patterns', textAnchor: { start: { fragmentId: 'text-0', offset: 0 }, end: { fragmentId: 'text-0', offset: 28 } } },
+    });
+    let passageVisible = false;
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockImplementation(() =>
+      passageVisible
+        ? { left: 50, top: 50, bottom: 80, right: 300, width: 250, height: 30 } as DOMRect
+        : { left: 50, top: 800, bottom: 830, right: 300, width: 250, height: 30 } as DOMRect);
+    const append = vi.fn();
+    const returnToSource = vi.fn(() => {
+      passageVisible = true;
+      window.dispatchEvent(new Event('scroll'));
+      return true;
+    });
+    const view = render(<Harness store={store} append={append} returnToSource={returnToSource} />);
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
+
+    view.rerender(<Harness store={store} append={append} returnToSource={returnToSource} otherScope />);
+    expect(document.querySelector('[role="region"][aria-label="Docked reaction"]')).toHaveAttribute('hidden');
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Other scope control' }), { pointerType: 'mouse' });
+    select(screen.getByTestId('old').firstChild!);
+    fireEvent.pointerUp(screen.getByRole('button', { name: 'Other scope control' }), { pointerType: 'mouse' });
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+
+    view.rerender(<Harness store={store} append={append} returnToSource={returnToSource} />);
+    const returnButton = screen.getByRole('button', { name: /Return to passage/ });
+    fireEvent.pointerDown(returnButton, { pointerType: 'mouse' });
+    fireEvent.click(returnButton);
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(returnToSource).toHaveBeenCalledOnce();
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+    expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
   });
 
   it('clears an empty touch reaction when its mounted selection collapses', async () => {

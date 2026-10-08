@@ -41,6 +41,12 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
 
   useEffect(() => {
     let frame = 0;
+    if (activeScope && activeScope !== focusScope) {
+      selectionInput.current = null;
+      selectionChangedDuringGesture.current = false;
+      selecting.current = false;
+      return;
+    }
     const read = () => {
       frame = 0;
       if (selecting.current || pillFocusPending.current || !destination || (activeScope && activeScope !== focusScope)) return;
