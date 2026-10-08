@@ -91,7 +91,7 @@ pub async fn append_mandatory_close_failure_event_tx(
           source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
          SELECT f.failure_occurrence_id, 'mandatory_close_failure', NULL, f.failure_occurrence_id,
                 f.source_product_conversation_id, 'close_cleanup_failure', f.failure_occurrence_id,
-                0, ?2, 'cleanup_failed', f.reason, f.occurred_at_unix_us
+                0, ?2, 'cleanup_failed', f.reason, f.occurred_at_us
          FROM close_cleanup_failures f JOIN product_conversations p
            ON p.id = f.source_product_conversation_id
          WHERE f.failure_occurrence_id = ?1

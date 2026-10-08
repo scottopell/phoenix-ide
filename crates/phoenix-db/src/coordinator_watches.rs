@@ -170,7 +170,7 @@ impl Database {
                   e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
                   e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
                   f.scope, f.resource_kind, f.identity_kind, f.identity_codec, f.identity_value,
-                  f.detail, f.stop_certainty, f.stop_confirmed_at_unix_us
+                  f.detail, f.stop_certainty, f.confirmed_at_us AS stop_confirmed_at_unix_us
              FROM coordinator_watch_events e
              LEFT JOIN coordinator_watches w ON w.id = e.watch_id
              LEFT JOIN product_conversations p ON p.id = w.source_product_conversation_id

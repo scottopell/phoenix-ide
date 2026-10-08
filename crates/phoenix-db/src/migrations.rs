@@ -614,19 +614,14 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 const MIGRATION_119: &str = r"
-CREATE UNIQUE INDEX close_expected_retirement_resources_exact_codec
-ON close_expected_retirement_resources (
-    attempt_id, scope, inspection_generation, inspection_fingerprint,
-    resource_kind, identity_kind, identity_codec, identity_value
-);
 CREATE TABLE close_cleanup_failures (
     failure_occurrence_id TEXT PRIMARY KEY NOT NULL CHECK (trim(failure_occurrence_id) <> ''),
     attempt_id TEXT NOT NULL REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
     cleanup_run_ordinal INTEGER NOT NULL CHECK (typeof(cleanup_run_ordinal) = 'integer' AND cleanup_run_ordinal >= 0),
     source_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id),
     scope TEXT NOT NULL REFERENCES work_scopes(id),
-    inspection_generation TEXT NOT NULL,
-    inspection_fingerprint TEXT NOT NULL,
+    inspection_generation TEXT,
+    inspection_fingerprint TEXT,
     resource_kind TEXT NOT NULL,
     identity_kind TEXT NOT NULL,
     identity_codec TEXT NOT NULL,
@@ -639,32 +634,68 @@ CREATE TABLE close_cleanup_failures (
     UNIQUE (attempt_id, cleanup_run_ordinal),
     CHECK ((stop_certainty = 'conversation_and_processes_stopped' AND confirmed_at_us IS NOT NULL AND typeof(confirmed_at_us) = 'integer' AND confirmed_at_us >= 0)
         OR (stop_certainty = 'shutdown_uncertain' AND confirmed_at_us IS NULL)),
-    FOREIGN KEY (attempt_id, scope, inspection_generation, inspection_fingerprint,
-        resource_kind, identity_kind, identity_codec, identity_value)
-    REFERENCES close_expected_retirement_resources (attempt_id, scope, inspection_generation,
-        inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value)
-    ON DELETE CASCADE
+    CHECK ((inspection_generation IS NULL) = (inspection_fingerprint IS NULL))
 );
 CREATE TRIGGER close_cleanup_failures_require_initial_authority
 BEFORE INSERT ON close_cleanup_failures
 WHEN NOT EXISTS (
     SELECT 1 FROM close_obligations obligation
     JOIN product_conversations product ON product.id = obligation.product_conversation_id
-    JOIN close_retirement_resources residual ON residual.attempt_id = obligation.attempt_id
-    WHERE obligation.attempt_id = NEW.attempt_id AND obligation.phase = 'retirement_requested'
+    JOIN close_attempt_scopes captured ON captured.attempt_id = obligation.attempt_id
+    WHERE obligation.attempt_id = NEW.attempt_id AND obligation.phase <> 'completed'
+      AND NEW.cleanup_run_ordinal = 0 AND captured.scope = NEW.scope
       AND obligation.product_conversation_id = NEW.source_product_conversation_id
       AND product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'
-      AND obligation.inspection_generation = NEW.inspection_generation
-      AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
-      AND residual.scope = NEW.scope AND residual.inspection_generation = NEW.inspection_generation
-      AND residual.inspection_fingerprint = NEW.inspection_fingerprint
-      AND residual.resource_kind = NEW.resource_kind AND residual.identity_kind = NEW.identity_kind
-      AND residual.identity_codec = NEW.identity_codec AND residual.identity_value = NEW.identity_value
-      AND residual.proof_kind = 'residual' AND residual.residual_reason = NEW.reason
-      AND residual.detail = NEW.detail
+      AND (
+        (NEW.inspection_generation IS NOT NULL AND NEW.inspection_fingerprint IS NOT NULL
+          AND obligation.phase = 'retirement_requested'
+          AND obligation.inspection_generation = NEW.inspection_generation
+          AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
+          AND EXISTS (
+            SELECT 1 FROM close_retirement_resources residual
+            JOIN close_expected_retirement_resources expected
+              ON expected.attempt_id = residual.attempt_id AND expected.scope = residual.scope
+             AND expected.inspection_generation = residual.inspection_generation
+             AND expected.inspection_fingerprint = residual.inspection_fingerprint
+             AND expected.resource_kind = residual.resource_kind AND expected.identity_kind = residual.identity_kind
+             AND expected.identity_codec = residual.identity_codec AND expected.identity_value = residual.identity_value
+            JOIN close_retirement_inventories inventory
+              ON inventory.attempt_id = expected.attempt_id AND inventory.scope = expected.scope
+             AND inventory.inspection_generation = expected.inspection_generation
+             AND inventory.inspection_fingerprint = expected.inspection_fingerprint
+            WHERE residual.attempt_id = NEW.attempt_id AND residual.scope = NEW.scope
+              AND residual.inspection_generation = NEW.inspection_generation
+              AND residual.inspection_fingerprint = NEW.inspection_fingerprint
+              AND residual.resource_kind = NEW.resource_kind AND residual.identity_kind = NEW.identity_kind
+              AND residual.identity_codec = NEW.identity_codec AND residual.identity_value = NEW.identity_value
+              AND residual.proof_kind = 'residual' AND residual.residual_reason = NEW.reason
+              AND residual.detail = NEW.detail AND inventory.sealed = 1
+          ))
+        OR (NEW.inspection_generation IS NULL AND NEW.inspection_fingerprint IS NULL
+          AND NEW.stop_certainty = 'shutdown_uncertain'
+          AND ((NEW.resource_kind = 'work_scope' AND NEW.identity_kind = 'opaque'
+                AND NEW.identity_codec = 'opaque_string_v1' AND NEW.identity_value = captured.scope)
+            OR (NEW.resource_kind = 'worktree' AND NEW.identity_kind = 'worktree'
+                AND NEW.identity_codec = 'worktree_id_v1'
+                AND NEW.identity_value = captured.captured_worktree_identity
+                AND captured.captured_worktree_fingerprint IS NOT NULL
+                AND captured.captured_worktree_locator IS NOT NULL)))
+      )
+      AND (NEW.stop_certainty = 'shutdown_uncertain' OR NOT EXISTS (
+          SELECT 1 FROM close_expected_retirement_resources expected
+          LEFT JOIN close_retirement_resources retired
+            ON retired.attempt_id = expected.attempt_id AND retired.scope = expected.scope
+           AND retired.inspection_generation = expected.inspection_generation
+           AND retired.inspection_fingerprint = expected.inspection_fingerprint
+           AND retired.resource_kind = expected.resource_kind AND retired.identity_kind = expected.identity_kind
+           AND retired.identity_codec = expected.identity_codec AND retired.identity_value = expected.identity_value
+          WHERE expected.attempt_id = NEW.attempt_id
+            AND expected.resource_kind IN ('bash_process_group', 'tmux_server', 'pty_session', 'browser_session', 'equivalent_live_resource')
+            AND (retired.proof_kind IS NULL OR retired.proof_kind = 'residual')
+      ))
 )
 BEGIN
-    SELECT RAISE(ABORT, 'initial cleanup failure requires exact active retirement residual');
+    SELECT RAISE(ABORT, 'initial cleanup failure requires exact active expected-resource or captured-scope authority');
 END;
 CREATE TRIGGER close_cleanup_failures_are_immutable
 BEFORE UPDATE ON close_cleanup_failures
@@ -674,13 +705,17 @@ END;
 CREATE TRIGGER close_cleanup_failure_completion_requires_disposition
 BEFORE UPDATE OF phase, close_outcome ON close_obligations
 WHEN NEW.phase = 'completed' AND NEW.close_outcome IN ('archived_cleanup_attention', 'close_incomplete')
-AND (OLD.phase <> 'retirement_requested' OR NOT EXISTS (
+AND (OLD.phase = 'completed' OR NOT EXISTS (
     SELECT 1 FROM close_cleanup_failures failure
     JOIN product_conversations product ON product.id = failure.source_product_conversation_id
     WHERE failure.attempt_id = NEW.attempt_id AND failure.cleanup_run_ordinal = 0
       AND failure.source_product_conversation_id = NEW.product_conversation_id
-      AND failure.inspection_generation = NEW.inspection_generation
-      AND failure.inspection_fingerprint = NEW.inspection_fingerprint
+      AND ((failure.inspection_generation IS NOT NULL AND failure.inspection_fingerprint IS NOT NULL
+            AND OLD.phase = 'retirement_requested'
+            AND failure.inspection_generation = NEW.inspection_generation
+            AND failure.inspection_fingerprint = NEW.inspection_fingerprint)
+        OR (failure.inspection_generation IS NULL AND failure.inspection_fingerprint IS NULL
+            AND NEW.close_outcome = 'close_incomplete'))
       AND ((NEW.close_outcome = 'archived_cleanup_attention'
             AND failure.stop_certainty = 'conversation_and_processes_stopped'
             AND product.ordinary_lifecycle = 'history')
@@ -709,6 +744,7 @@ async fn run_migration_119(pool: &SqlitePool, migration: &Migration) -> DbResult
         let mut tx = guard.connection().begin().await?;
         for (object, source, target) in [
             ("close_obligations", "close_outcome IN ('archived', 'cancelled')", "close_outcome IN ('archived', 'cancelled', 'archived_cleanup_attention', 'close_incomplete')"),
+            ("close_obligations_transition_graph", "(OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))", "(OLD.phase = 'settling_active_work' AND (NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection') OR (NEW.phase = 'completed' AND NEW.close_outcome = 'close_incomplete')))"),
             ("close_obligations_require_complete_retirement_proof", "AND NEW.phase = 'completed'", "AND NEW.phase = 'completed' AND NEW.close_outcome = 'archived'"),
             ("close_obligations_require_archived_members_for_completion", "NEW.close_outcome = 'archived'", "NEW.close_outcome IN ('archived', 'archived_cleanup_attention')"),
             (
@@ -737,6 +773,8 @@ async fn run_migration_119(pool: &SqlitePool, migration: &Migration) -> DbResult
         sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA schema_version = {}", schema_version + 1)))
             .execute(&mut *tx).await?;
         sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+        sqlx::raw_sql(include_str!("coordinator_watches/mandatory_close_outbox.sql"))
+            .execute(&mut *tx).await?;
         sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
             .bind(migration.version).bind(migration.name).execute(&mut *tx).await?;
         tx.commit().await?;

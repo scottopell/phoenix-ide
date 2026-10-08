@@ -11,8 +11,9 @@ use sha2::{Digest, Sha256};
 use phoenix_core::domain::close::{
     AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseExpectedRetirementResource,
     CloseLossItem, CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot,
-    GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
-    RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
+    CloseStopCertainty, GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity,
+    RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
+    WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
     ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -32,10 +33,10 @@ use super::RuntimeManager;
 use crate::db::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
-    CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
-    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
-    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
-    RouteCloseAttemptToRepairRequest,
+    CloseCleanupFailureAuthority, CloseWorktreeFinalTombstone,
+    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
+    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
+    ReplaceCloseInspectionScopeRequest, TerminalizeInitialCloseCleanupFailureRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -580,7 +581,6 @@ impl RuntimeManager {
     }
 
     /// Acquires all scope fences, then seals the exact server-owned inventory.
-    /// The fence stays held in `close_retirement_leases` until completion or entry into repair.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn capture_close_retirement_inventory(
         &self,
@@ -600,7 +600,6 @@ impl RuntimeManager {
             {
                 Ok(resources) => resources,
                 Err(reason) => {
-                    self.cancel_close_resource_leases(&attempt_id).await?;
                     return self
                         .route_close_attempt_to_repair(
                             &attempt_id,
@@ -615,7 +614,6 @@ impl RuntimeManager {
                 None => None,
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => Some(identity),
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
-                    self.cancel_close_resource_leases(&attempt_id).await?;
                     return self
                         .route_close_attempt_to_repair(
                             &attempt_id,
@@ -680,8 +678,7 @@ impl RuntimeManager {
         }
     }
 
-    /// Retires exactly the unresolved inventory targets. The coordinator never
-    /// advances Close to `Completed`; it only creates per-resource evidence.
+    /// Retires exactly the unresolved inventory targets.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn retire_close_runtime_resources(
         &self,
@@ -916,17 +913,13 @@ impl RuntimeManager {
             {
                 Ok(resources) => resources,
                 Err(CloseLeaseFailure::ProcessEpoch { kind, reason }) => {
-                    let scope_resource =
-                        opaque_resource(RetiredResourceKind::WorkScope, scope.as_str().to_string());
                     return self
-                        .record_close_residual(
+                        .route_close_attempt_to_repair(
                             &attempt_id,
-                            &snapshot,
                             &scope,
-                            scope_resource,
                             RetirementFailureReason::IdentityNotProven,
                             &format!(
-                                "{} process-epoch Close teardown requires repair: {reason}",
+                                "{} process-epoch Close teardown failed: {reason}",
                                 kind.as_str()
                             ),
                         )
@@ -1191,7 +1184,7 @@ impl RuntimeManager {
                     )
                     .map_err(|error| error.to_string())?;
                 return self
-                    .record_close_residual(
+                    .record_close_cleanup_failure(
                         attempt_id,
                         snapshot,
                         &scope,
@@ -1207,7 +1200,7 @@ impl RuntimeManager {
                         Some(CapturedWorktreeIdentity::Resolved(identity)) => identity,
                         Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
                             return self
-                                .record_close_residual(
+                                .record_close_cleanup_failure(
                                     attempt_id,
                                     snapshot,
                                     &scope,
@@ -1219,7 +1212,7 @@ impl RuntimeManager {
                         }
                         None => {
                             return self
-                                .record_close_residual(
+                                .record_close_cleanup_failure(
                                     attempt_id,
                                     snapshot,
                                     &scope,
@@ -1231,7 +1224,21 @@ impl RuntimeManager {
                         }
                     };
                     let captured_path = worktree_path(identity);
-                    let quarantine_path = worktree_quarantine_path(identity)?;
+                    let quarantine_path = match worktree_quarantine_path(identity) {
+                        Ok(path) => path,
+                        Err(detail) => {
+                            return self
+                                .record_close_cleanup_failure(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    &detail,
+                                )
+                                .await;
+                        }
+                    };
                     let existing_cleanup_plan = self
                         .db()
                         .close_worktree_cleanup_plan(attempt_id, &scope, snapshot, &target.resource)
@@ -1260,11 +1267,25 @@ impl RuntimeManager {
                                 &cleanup_plan.administrative_dir_incarnation,
                             )
                         })
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        .await;
+                        let recovery = match recovery {
+                            Ok(recovery) => recovery,
+                            Err(error) => {
+                                return self
+                                    .record_close_cleanup_failure(
+                                        attempt_id,
+                                        snapshot,
+                                        &scope,
+                                        target.resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        &format!("worktree cleanup task failed: {error}"),
+                                    )
+                                    .await;
+                            }
+                        };
                         if let Err(detail) = recovery {
                             return self
-                                .record_close_residual(
+                                .record_close_cleanup_failure(
                                     attempt_id,
                                     snapshot,
                                     &scope,
@@ -1289,7 +1310,7 @@ impl RuntimeManager {
                             Ok(absent) => absent,
                             Err(detail) => {
                                 return self
-                                    .record_close_residual(
+                                    .record_close_cleanup_failure(
                                         attempt_id,
                                         snapshot,
                                         &scope,
@@ -1323,7 +1344,7 @@ impl RuntimeManager {
                             .map_err(|error| error.to_string())?;
                         let Some(cleanup_plan) = planned_administrative_dir else {
                             return self
-                                .record_close_residual(
+                                .record_close_cleanup_failure(
                                     attempt_id,
                                     snapshot,
                                     &scope,
@@ -1335,7 +1356,7 @@ impl RuntimeManager {
                         };
                         if !dispatched {
                             return self
-                                .record_close_residual(
+                                .record_close_cleanup_failure(
                                     attempt_id,
                                     snapshot,
                                     &scope,
@@ -1359,11 +1380,25 @@ impl RuntimeManager {
                                 &cleanup_plan.administrative_dir_incarnation,
                             )
                         })
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        .await;
+                        let recovery = match recovery {
+                            Ok(recovery) => recovery,
+                            Err(error) => {
+                                return self
+                                    .record_close_cleanup_failure(
+                                        attempt_id,
+                                        snapshot,
+                                        &scope,
+                                        target.resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        &format!("worktree cleanup task failed: {error}"),
+                                    )
+                                    .await;
+                            }
+                        };
                         if let Err(detail) = recovery {
                             return self
-                                .record_close_residual(
+                                .record_close_cleanup_failure(
                                     attempt_id,
                                     snapshot,
                                     &scope,
@@ -1392,7 +1427,7 @@ impl RuntimeManager {
                             .find(|inspection| inspection.target.scope == scope)
                         else {
                             return self
-                                .record_close_residual(
+                                .record_close_cleanup_failure(
                                     attempt_id,
                                     snapshot,
                                     &scope,
@@ -1419,7 +1454,7 @@ impl RuntimeManager {
                             Ok(false) => {}
                             Err(error) => {
                                 return self
-                                .record_close_residual(
+                                .record_close_cleanup_failure(
                                     attempt_id,
                                     snapshot,
                                     &scope,
@@ -1451,8 +1486,34 @@ impl RuntimeManager {
                                     administrative_dir_incarnation,
                                 ))
                             })
-                            .await
-                            .map_err(|error| error.to_string())??;
+                            .await;
+                            let discovered = match discovered {
+                                Ok(Ok(discovered)) => discovered,
+                                Ok(Err(detail)) => {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            attempt_id,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            &detail,
+                                        )
+                                        .await;
+                                }
+                                Err(error) => {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            attempt_id,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            &format!("worktree cleanup-plan task failed: {error}"),
+                                        )
+                                        .await;
+                                }
+                            };
                             self.db()
                                 .record_close_worktree_cleanup_plan(
                                     RecordCloseWorktreeCleanupPlanRequest {
@@ -1526,8 +1587,22 @@ impl RuntimeManager {
                                     },
                                 )
                             })
-                            .await
-                            .map_err(|error| error.to_string())?;
+                            .await;
+                        let final_removal = match final_removal {
+                            Ok(final_removal) => final_removal,
+                            Err(error) => {
+                                return self
+                                    .record_close_cleanup_failure(
+                                        attempt_id,
+                                        snapshot,
+                                        &scope,
+                                        target.resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        &format!("worktree removal task failed: {error}"),
+                                    )
+                                    .await;
+                            }
+                        };
                         let fresh_snapshot: Option<CloseRetirementSnapshot> = match final_removal {
                             Ok(ExactWorktreeRemoval::Retired) => {
                                 self.record_close_retired(
@@ -1551,7 +1626,7 @@ impl RuntimeManager {
                             }
                             Ok(ExactWorktreeRemoval::Residual { detail }) => {
                                 return self
-                                    .record_close_residual(
+                                    .record_close_cleanup_failure(
                                         attempt_id,
                                         snapshot,
                                         &scope,
@@ -1563,7 +1638,7 @@ impl RuntimeManager {
                             }
                             Err(reason) => {
                                 return self
-                                    .record_close_residual(
+                                    .record_close_cleanup_failure(
                                         attempt_id,
                                         snapshot,
                                         &scope,
@@ -1579,7 +1654,7 @@ impl RuntimeManager {
                         if let Some(fresh_snapshot) = fresh_snapshot {
                             if fresh_snapshot.fingerprint() != confirmed.snapshot.fingerprint() {
                                 return self
-                                    .record_close_residual(
+                                    .record_close_cleanup_failure(
                                         attempt_id,
                                         snapshot,
                                         &scope,
@@ -1601,13 +1676,18 @@ impl RuntimeManager {
                     }
                 }
             }
-            let work_scope_target = targets
-                .iter()
-                .find(|target| {
-                    target.scope == scope
-                        && target.resource.kind() == RetiredResourceKind::WorkScope
-                })
-                .ok_or_else(|| format!("Close scope {scope} lacks mandatory WorkScope target"))?;
+            let Some(work_scope_target) = targets.iter().find(|target| {
+                target.scope == scope && target.resource.kind() == RetiredResourceKind::WorkScope
+            }) else {
+                return self
+                    .route_close_attempt_to_repair(
+                        attempt_id,
+                        &scope,
+                        RetirementFailureReason::IdentityNotProven,
+                        format!("Close scope {scope} lacks mandatory WorkScope target"),
+                    )
+                    .await;
+            };
             if retired.contains(&(scope.clone(), resource_key(&work_scope_target.resource))) {
                 continue;
             }
@@ -1636,7 +1716,7 @@ impl RuntimeManager {
                 }
                 WorkScopeRetirementOutcome::Blocked(blocker) => {
                     return self
-                        .record_close_residual(
+                        .record_close_cleanup_failure(
                             attempt_id,
                             snapshot,
                             &scope,
@@ -1710,7 +1790,7 @@ impl RuntimeManager {
             .map_err(|error| error.to_string())?
             .into_iter()
             .find(|captured| captured.scope == *scope)
-            .ok_or_else(|| format!("Close repair scope {scope} was not captured"))?;
+            .ok_or_else(|| format!("Close failure scope {scope} was not captured"))?;
         let residual = match captured.captured_worktree {
             Some(CapturedWorktreeIdentity::Resolved(identity)) => RetiredResourceIdentity::parse(
                 RetiredResourceKind::Worktree,
@@ -1727,20 +1807,15 @@ impl RuntimeManager {
             }
         }
         .map_err(|error| error.to_string())?;
-        self.db()
-            .route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
-                attempt_id: attempt_id.clone(),
-                scope: scope.clone(),
-                residual,
-                reason,
-                detail: detail.clone(),
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        self.cancel_close_resource_leases(attempt_id)
-            .await
-            .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(detail)
+        self.terminalize_close_cleanup_failure(
+            attempt_id,
+            scope,
+            CloseCleanupFailureAuthority::CapturedScope { resource: residual },
+            reason,
+            &detail,
+            CloseStopCertainty::ShutdownUncertain,
+        )
+        .await
     }
 
     async fn record_close_residual<T>(
@@ -1752,27 +1827,106 @@ impl RuntimeManager {
         reason: RetirementFailureReason,
         detail: &str,
     ) -> Result<T, String> {
-        self.db()
-            .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-                attempt_id: attempt_id.clone(),
+        self.terminalize_close_cleanup_failure(
+            attempt_id,
+            scope,
+            CloseCleanupFailureAuthority::ExpectedResource {
                 snapshot: snapshot.clone(),
-                scope: scope.clone(),
                 resource,
-                outcome: RetirementOutcome::Residual {
-                    residual_reason: reason,
-                },
-                detail: Some(detail.to_string()),
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        self.cancel_close_resource_leases(attempt_id)
-            .await
-            .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(detail.to_string())
+            },
+            reason,
+            detail,
+            CloseStopCertainty::ShutdownUncertain,
+        )
+        .await
     }
 
-    /// Completes one live lease. Callers must persist exactly one receipt per
-    /// returned identity; the repair transition reopens admission after a residual.
+    async fn record_close_cleanup_failure<T>(
+        &self,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+        scope: &WorkScopeId,
+        resource: RetiredResourceIdentity,
+        reason: RetirementFailureReason,
+        detail: &str,
+    ) -> Result<T, String> {
+        self.terminalize_close_cleanup_failure(
+            attempt_id,
+            scope,
+            CloseCleanupFailureAuthority::ExpectedResource {
+                snapshot: snapshot.clone(),
+                resource,
+            },
+            reason,
+            detail,
+            CloseStopCertainty::ConversationAndProcessesStopped {
+                confirmed_at_us: chrono::Utc::now().timestamp_micros(),
+            },
+        )
+        .await
+    }
+
+    async fn terminalize_close_cleanup_failure<T>(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        authority: CloseCleanupFailureAuthority,
+        reason: RetirementFailureReason,
+        detail: &str,
+        stop_certainty: CloseStopCertainty,
+    ) -> Result<T, String> {
+        let obligation = self
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let failure_occurrence_id = format!("close-cleanup-failure:{attempt_id}:0");
+        let persisted_timing = self
+            .db()
+            .close_cleanup_failure_timing(&failure_occurrence_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let occurred_at_us = persisted_timing
+            .map(|(occurred_at_us, _)| occurred_at_us)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_micros());
+        let stop_certainty = match (stop_certainty, persisted_timing) {
+            (
+                CloseStopCertainty::ConversationAndProcessesStopped { .. },
+                Some((_, Some(confirmed_at_us))),
+            ) => CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us },
+            (certainty, _) => certainty,
+        };
+        self.commit_close_cleanup_failure(&TerminalizeInitialCloseCleanupFailureRequest {
+            failure_occurrence_id,
+            attempt_id: attempt_id.clone(),
+            source_product_conversation_id: obligation.product_conversation_id().clone(),
+            scope: scope.clone(),
+            authority,
+            reason,
+            detail: detail.to_string(),
+            stop_certainty,
+            occurred_at_us,
+        })
+        .await
+    }
+
+    async fn commit_close_cleanup_failure<T>(
+        &self,
+        request: &TerminalizeInitialCloseCleanupFailureRequest,
+    ) -> Result<T, String> {
+        self.db()
+            .terminalize_initial_close_cleanup_failure(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.kick_direct_turn_worker();
+        if let Err(error) = self.cancel_close_resource_leases(&request.attempt_id).await {
+            tracing::warn!(attempt_id = %request.attempt_id, %error,
+                "failed to release Close resource leases after terminal cleanup failure");
+        }
+        Err(request.detail.clone())
+    }
+
+    /// Completes one live lease.
     async fn complete_close_resource_lease(
         &self,
         attempt_id: &CloseAttemptId,
@@ -4993,6 +5147,93 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::io::{BufRead as _, Read as _};
     use std::path::Path;
+
+    #[tokio::test]
+    async fn captured_cleanup_failure_terminalizes_and_kicks_on_exact_replay() {
+        use phoenix_core::domain::close::{
+            CloseAttemptId, CloseCompletionOutcome, ClosePhase, RetirementFailureReason,
+            TranscriptConversationId,
+        };
+        use std::sync::Arc;
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("close-source", "close-source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope = conversation.attached_work_scope_id.unwrap();
+        let attempt_id = CloseAttemptId::parse("runtime-cleanup-failure").unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &TranscriptConversationId::parse(&conversation.id).unwrap(),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        let manager = super::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::platform::PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        );
+        let mut kicks = manager.direct_turn_kick_tx.subscribe();
+        let initial_kick = *kicks.borrow_and_update();
+        let detail = "process shutdown could not be proven";
+        let reason = RetirementFailureReason::IdentityNotProven;
+        assert_eq!(
+            manager
+                .route_close_attempt_to_repair::<()>(&attempt_id, &scope, reason, detail)
+                .await,
+            Err(detail.to_string())
+        );
+        assert!(kicks.has_changed().unwrap());
+        assert_eq!(*kicks.borrow_and_update(), initial_kick + 1);
+        let completed = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
+        assert_eq!(completed.phase(), ClosePhase::Completed);
+        assert_eq!(
+            completed.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        assert!(
+            !db.get_conversation(&conversation.id)
+                .await
+                .unwrap()
+                .archived
+        );
+        let failure_occurrence_id = format!("close-cleanup-failure:{attempt_id}:0");
+        let failures: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT failure_occurrence_id, occurred_at_us FROM close_cleanup_failures",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, failure_occurrence_id);
+        assert_eq!(
+            manager
+                .route_close_attempt_to_repair::<()>(&attempt_id, &scope, reason, detail)
+                .await,
+            Err(detail.to_string())
+        );
+        assert!(kicks.has_changed().unwrap());
+        assert_eq!(*kicks.borrow_and_update(), initial_kick + 2);
+        let events: Vec<(String, String)> =
+            sqlx::query_as("SELECT event_id, route_kind FROM coordinator_watch_events")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            events,
+            vec![(failure_occurrence_id, "mandatory_close_failure".to_string())]
+        );
+        assert_eq!(
+            db.get_close_obligation(attempt_id.as_str()).await.unwrap(),
+            completed
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

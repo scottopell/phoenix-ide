@@ -88,7 +88,7 @@ WHEN NEW.route_kind = 'mandatory_close_failure' AND NOT EXISTS (
       AND NEW.source_occurrence_id = f.failure_occurrence_id
       AND NEW.mandatory_source_product_id IS f.source_product_conversation_id
       AND NEW.terminal_reason IS f.reason
-      AND NEW.occurred_at_us = f.occurred_at_unix_us
+      AND NEW.occurred_at_us = f.occurred_at_us
       AND p.kind = 'ordinary'
       AND root.id = NEW.source_transcript_id AND root.runtime_role = 'user'
       AND root.parent_conversation_id IS NULL

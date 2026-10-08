@@ -951,10 +951,9 @@ impl CloseObligation {
         let is_completed = phase == ClosePhase::Completed;
         let completion_snapshot_disagrees = match close_outcome {
             Some(
-                CloseCompletionOutcome::Archived
-                | CloseCompletionOutcome::ArchivedCleanupAttention
-                | CloseCompletionOutcome::CloseIncomplete,
+                CloseCompletionOutcome::Archived | CloseCompletionOutcome::ArchivedCleanupAttention,
             ) => snapshot.is_none(),
+            Some(CloseCompletionOutcome::CloseIncomplete) => false,
             Some(CloseCompletionOutcome::Cancelled) => snapshot.is_some(),
             None => false,
         };
@@ -1313,19 +1312,30 @@ mod tests {
                 CloseCompletionOutcome::from_db_str(outcome.as_str()),
                 Some(outcome)
             );
-            let now = Utc::now();
-            assert!(CloseObligation::parse(
-                CloseAttemptId::parse("attempt").unwrap(),
-                ProductConversationId::parse("product").unwrap(),
-                ClosePhase::Completed,
-                None,
-                now,
-                now,
-                Some(now),
-                Some(outcome),
-            )
-            .is_err());
         }
+        let now = Utc::now();
+        assert!(CloseObligation::parse(
+            CloseAttemptId::parse("attempt").unwrap(),
+            ProductConversationId::parse("product").unwrap(),
+            ClosePhase::Completed,
+            None,
+            now,
+            now,
+            Some(now),
+            Some(CloseCompletionOutcome::ArchivedCleanupAttention),
+        )
+        .is_err());
+        assert!(CloseObligation::parse(
+            CloseAttemptId::parse("attempt").unwrap(),
+            ProductConversationId::parse("product").unwrap(),
+            ClosePhase::Completed,
+            None,
+            now,
+            now,
+            Some(now),
+            Some(CloseCompletionOutcome::CloseIncomplete),
+        )
+        .is_ok());
     }
 
     #[test]
