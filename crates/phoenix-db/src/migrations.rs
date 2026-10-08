@@ -601,12 +601,54 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_conversation_tool_policy",
         sql: MIGRATION_117,
     },
+<<<<<<< HEAD
     Migration {
         version: 118,
         name: "persist_mcp_token_removals",
         sql: "CREATE TABLE mcp_oauth_removals (server_name TEXT PRIMARY KEY NOT NULL);",
     },
+||||||| parent of ed9e2331d (feat: preserve constrained question wait events and future-only enrollment)
+=======
+    Migration {
+        version: 118,
+        name: "coordinator_question_wait_events",
+        sql: MIGRATION_118,
+    },
+>>>>>>> ed9e2331d (feat: preserve constrained question wait events and future-only enrollment)
 ];
+
+const MIGRATION_118: &str = r"
+PRAGMA defer_foreign_keys = ON;
+CREATE TABLE coordinator_watch_events_waits (
+    event_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(event_id)) > 0),
+    watch_id INTEGER NOT NULL REFERENCES coordinator_watches(id),
+    source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation', 'steering', 'wake', 'seeded_fork', 'interaction_response', 'continuation_summary', 'question_request')),
+    source_occurrence_id TEXT NOT NULL CHECK(length(trim(source_occurrence_id)) > 0),
+    source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
+    source_transcript_id TEXT NOT NULL,
+    terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('completed', 'failed', 'cancelled', 'awaiting_user_response')),
+    terminal_reason TEXT,
+    occurred_at_us INTEGER NOT NULL CHECK(typeof(occurred_at_us) = 'integer' AND occurred_at_us >= 0),
+    continuation_state TEXT NOT NULL DEFAULT 'none'
+        CHECK(continuation_state IN ('none', 'awaiting', 'suppressed')),
+    delivery_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(delivery_state IN ('pending', 'accepted', 'suppressed')),
+    accepted_transcript_id TEXT,
+    CHECK ((delivery_state = 'accepted') = (accepted_transcript_id IS NOT NULL)),
+    UNIQUE(source_occurrence_kind, source_occurrence_id, source_generation, watch_id),
+    CHECK ((terminal_kind IN ('failed', 'awaiting_user_response')) = (terminal_reason IS NOT NULL)),
+    CHECK ((source_occurrence_kind = 'question_request') = (terminal_kind = 'awaiting_user_response')),
+    CHECK (terminal_kind != 'awaiting_user_response' OR terminal_reason = 'question_request')
+);
+INSERT INTO coordinator_watch_events_waits SELECT * FROM coordinator_watch_events;
+DROP TABLE coordinator_watch_events;
+ALTER TABLE coordinator_watch_events_waits RENAME TO coordinator_watch_events;
+CREATE INDEX coordinator_watch_events_pending ON coordinator_watch_events(delivery_state, occurred_at_us);
+CREATE TEMP TABLE watch_event_fk_check (violations INTEGER CHECK (violations = 0));
+INSERT INTO watch_event_fk_check SELECT COUNT(*) FROM pragma_foreign_key_check;
+DROP TABLE watch_event_fk_check;
+PRAGMA defer_foreign_keys = OFF;
+";
 
 const MIGRATION_117: &str = concat!(
     include_str!("tool_availability.sql"),

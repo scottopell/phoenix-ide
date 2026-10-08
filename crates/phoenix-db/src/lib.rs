@@ -7405,6 +7405,8 @@ impl Database {
                 .fetch_one(&mut *tx)
                 .await?;
 
+        coordinator_watches::record_question_wait_tx(&mut tx, id, state).await?;
+
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
         )
@@ -7422,7 +7424,6 @@ impl Database {
         if previous_kind != conv_state_kind(state) {
             record_initial_execution_outcome_tx(&mut tx, id, state).await?;
         }
-        coordinator_watches::record_question_wait_tx(&mut tx, id, state).await?;
         tx.commit().await?;
         Ok(())
     }

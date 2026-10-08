@@ -292,6 +292,21 @@ pub(crate) async fn record_question_wait_tx(
         tracing::debug!(transcript_id, "legacy question wait has no durable request identity; not emitting a historical watch event");
         return Ok(());
     };
+    let previous: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+        .bind(transcript_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let previous: ConvState = serde_json::from_str(&previous)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    if let ConvState::AwaitingUserResponse {
+        request_authority: previous,
+        ..
+    } = previous
+    {
+        if previous.request_id() == Some(request_id) {
+            return Ok(());
+        }
+    }
     let watch_ids: Vec<i64> = sqlx::query_scalar(
         "SELECT w.id FROM conversations c JOIN coordinator_watches w
          ON w.source_product_conversation_id = c.product_conversation_id
@@ -526,6 +541,47 @@ mod tests {
             terminal.is_none(),
             "waiting must not settle the active turn"
         );
+    }
+
+    #[tokio::test]
+    async fn enrolling_during_a_question_wait_does_not_replay_it() {
+        use phoenix_core::domain::sm_state::{QuestionRequestAuthority, UserQuestion};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation(
+                "pending-before-watch",
+                "pending-before-watch",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let waiting = ConvState::AwaitingUserResponse {
+            tool_use_id: "tool".into(),
+            request_authority: QuestionRequestAuthority::new(),
+            questions: vec![UserQuestion {
+                question: "Choose".into(),
+                header: "Choice".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+        };
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

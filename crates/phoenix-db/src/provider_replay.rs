@@ -119,6 +119,8 @@ impl Database {
                 .bind(conversation_id)
                 .fetch_one(&mut *tx)
                 .await?;
+        crate::coordinator_watches::record_question_wait_tx(&mut tx, conversation_id, state)
+            .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let result = sqlx::query(
@@ -137,8 +139,6 @@ impl Database {
         if previous_kind != crate::conv_state_kind(state) {
             crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
         }
-        crate::coordinator_watches::record_question_wait_tx(&mut tx, conversation_id, state)
-            .await?;
         apply_replay_tx(&mut tx, conversation_id, update).await?;
         tx.commit().await?;
         Ok(())
@@ -164,6 +164,8 @@ impl Database {
         for message in tool_results {
             crate::insert_message_tx(&mut tx, message).await?;
         }
+        crate::coordinator_watches::record_question_wait_tx(&mut tx, conversation_id, state)
+            .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query("UPDATE conversations SET state=?1, state_kind=?2, state_updated_at=?3, updated_at=?4 WHERE id=?5")
@@ -173,8 +175,6 @@ impl Database {
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(conversation_id)
             .execute(&mut *tx)
-            .await?;
-        crate::coordinator_watches::record_question_wait_tx(&mut tx, conversation_id, state)
             .await?;
         apply_replay_tx(&mut tx, conversation_id, update).await?;
         tx.commit().await?;
@@ -270,6 +270,8 @@ impl Database {
             .bind(now.to_rfc3339())
             .bind(conversation_id)
             .execute(&mut *tx)
+            .await?;
+        crate::coordinator_watches::record_question_wait_tx(&mut tx, conversation_id, state)
             .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
