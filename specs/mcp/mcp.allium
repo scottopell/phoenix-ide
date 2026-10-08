@@ -551,6 +551,10 @@ rule TokenRefreshNeeded {
         -- non-callable cleanup ownership. Do not require its session DELETE
         -- to succeed before refreshing: the expired bearer can also be
         -- rejected on DELETE. Concurrent recovery requests join that epoch.
+        -- Concurrent insufficient-scope followers merge their challenge into
+        -- the owned plan. Before replay, each scope follower verifies the
+        -- recovered grant covers its challenge; a narrow refresh is followed
+        -- by owned authorization, including challenges arriving after cleanup.
         -- If transport recovery won first and its DELETE failed, an OAuth
         -- failure observed on the same original epoch upgrades that retained
         -- cleanup owner and reserves a fresh recovery epoch. Config supersession
@@ -922,8 +926,11 @@ rule ReloadRemovesServer {
         -- terminate() the connection and discard the persisted token. Leave the
         -- per-authorization-server registration in place for servers that still
         -- share it. HTTP session teardown is the sibling rule below.
-        -- Failed teardown retains cleanup ownership. A pending authorization
-        -- flow is rebound to that epoch with removal intent; its callback
+        -- Failed teardown retains cleanup ownership.
+        -- Cleanup retries use a retained unexpired access token unless DELETE
+        -- supplied an authorization challenge. Expiry or authorization rejection
+        -- follows the refresh or scope-upgrade path before retrying DELETE.
+        -- A pending authorization flow is rebound to that epoch with removal intent; its callback
         -- supplies credentials for DELETE and forgets the server and token
         -- without reconnecting it. Re-adding the same configuration restores
         -- reconnect intent before the callback is admitted.
@@ -1204,12 +1211,19 @@ invariant SingleRecoveryLeaderPerEpoch {
     -- The first recoverable failure for a serving epoch becomes leader; later
     -- callers follow the published lifecycle snapshot and never start a second
     -- recovery for that epoch.
+    -- A scope follower retains its own replay requirement. If the completed
+    -- epoch lacks the challenged scopes, it claims the serving replacement's
+    -- epoch for authorization before replaying; config changes reject the
+    -- original invocation and cannot inherit its scopes or discovery metadata.
 }
 
 invariant SupersededCompletionCannotPublish {
     -- Reconfigure and remove advance the epoch before asynchronous work settles,
     -- so a late connect or recovery completion is discarded and cannot resurrect
     -- removed state or overwrite newer config.
+    -- Initialize and tools/list do not hold the credential mutation fence.
+    -- Their completions reacquire it and check the epoch before changing grants
+    -- or authorization flows. Superseded transports retain authoritative teardown.
 }
 
 invariant SchemaBoundInvocationsCannotRetarget {

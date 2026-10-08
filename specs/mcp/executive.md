@@ -210,3 +210,15 @@ The transient-removal matrix verifies `pending_removals` and removing status.
 `McpStatusPanel` polling coverage verifies a later cleanup authorization remains
 visible with another ready server present and polling settles after removal,
 including removal of the last server and failed removal that later completes.
+
+`hung_handshake_can_be_reconfigured_or_shutdown_without_releasing_rpc` covers
+same-server reload and shutdown during blocked initialize and tools/list.
+The replacement OAuth connection regression requires reload to complete before
+releasing the obsolete initialization, without stale grant or flow publication.
+`concurrent_scope_challenge_survives_refresh_and_replacement_handshake` verifies
+scope followers joining a refresh or its replacement request the complete grant
+before retry. `stale_scope_challenge_cannot_mutate_replacement_oauth_plan` verifies
+configuration-bound plan publication rejects scopes and discovery from an old resource.
+`failed_removal_retries_valid_access_token_without_refresh_or_authorization` covers
+transient DELETE failure with and without a refresh token; retry reuses the valid
+access token and deletes the grant only after cleanup succeeds.

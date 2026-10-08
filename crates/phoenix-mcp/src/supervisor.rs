@@ -424,11 +424,21 @@ impl SupervisorHandle {
         receive.await.ok().flatten()
     }
 
-    pub(crate) async fn retain_oauth_plan(&self, epoch: u64, plan: OAuthRetryPlan) -> bool {
+    pub(crate) async fn retain_oauth_plan(
+        &self,
+        epoch: u64,
+        config: &McpServerConfig,
+        plan: OAuthRetryPlan,
+    ) -> bool {
         let (reply, receive) = oneshot::channel();
         if self
             .mailbox
-            .send(Command::RetainOAuthPlan { epoch, plan, reply })
+            .send(Command::RetainOAuthPlan {
+                epoch,
+                config: config.clone(),
+                plan,
+                reply,
+            })
             .await
             .is_err()
         {
@@ -640,6 +650,7 @@ enum Command {
     },
     RetainOAuthPlan {
         epoch: u64,
+        config: McpServerConfig,
         plan: OAuthRetryPlan,
         reply: oneshot::Sender<bool>,
     },
@@ -888,9 +899,17 @@ impl Actor {
                 };
                 let _ = reply.send(plan);
             }
-            Command::RetainOAuthPlan { epoch, plan, reply } => {
+            Command::RetainOAuthPlan {
+                epoch,
+                config,
+                plan,
+                reply,
+            } => {
                 let mut retained = false;
-                if epoch == self.epoch && matches!(self.state, SupervisorState::Recovering) {
+                if epoch == self.epoch
+                    && config == self.snapshot.config
+                    && matches!(self.state, SupervisorState::Recovering)
+                {
                     for transport in &mut self.teardown_retry {
                         if let RetainedTransport::OAuthRecovery { retry_plan, .. } = transport {
                             let mut plan = plan.clone();
