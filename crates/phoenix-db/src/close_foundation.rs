@@ -12360,15 +12360,21 @@ mod tests {
         })
         .await
         .unwrap();
-        db.return_close_attempt_to_reinspection(&attempt_id)
-            .await
-            .unwrap();
-        let replacement_generation = format!("{}-retry", source.generation());
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            residual: resource.clone(),
+            reason: RetirementFailureReason::RemovalFailed,
+            detail: "cleanup requires explicit retry".to_string(),
+        })
+        .await
+        .unwrap();
+        db.retry_close_retirement(&attempt_id).await.unwrap();
         let target = db
             .resume_close_retirement_after_dispatched_absence(
                 &attempt_id,
                 &source,
-                &replacement_generation,
+                "repair-retry-generation",
             )
             .await
             .unwrap();
