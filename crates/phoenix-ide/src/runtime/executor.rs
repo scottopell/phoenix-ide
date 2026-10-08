@@ -2647,6 +2647,13 @@ where
                     }
                     OverloadStartupAction::Expire => unreachable!("handled before startup action match"),
                     OverloadStartupAction::Dispatch => {
+                        let ordinary_target = matches!(retry.target, ServerOverloadTarget::Ordinary);
+                        let continuation_operation_id = match &retry.target {
+                            ServerOverloadTarget::Continuation { operation_id, .. } => {
+                                Some(operation_id.clone())
+                            }
+                            ServerOverloadTarget::Ordinary => None,
+                        };
                         let effect = match retry.target {
                             ServerOverloadTarget::Ordinary => Effect::RequestLlm,
                             target @ ServerOverloadTarget::Continuation { .. } => {
@@ -2666,8 +2673,20 @@ where
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                tracing::error!(%error, "Failed to resume in-flight overload retry");
-                                return RuntimeExitDisposition::Interrupted;
+                                let failure = if ordinary_target {
+                                    self.llm_dispatch_failure_event(error)
+                                } else {
+                                    Event::ContinuationFailed {
+                                        operation_id: continuation_operation_id
+                                            .expect("continuation target has operation identity"),
+                                        error,
+                                        error_kind: crate::db::ErrorKind::InvalidRequest,
+                                    }
+                                };
+                                if let Err(settle_error) = self.process_event(failure).await {
+                                    tracing::error!(%settle_error, "Failed to settle resumed overload dispatch failure");
+                                    return RuntimeExitDisposition::Interrupted;
+                                }
                             }
                         }
                     }
@@ -7320,8 +7339,9 @@ where
             %error,
             "LLM dispatch failed before starting a provider task"
         );
-        let attempt = match self.state {
-            ConvState::LlmRequesting { attempt } => attempt,
+        let attempt = match &self.state {
+            ConvState::LlmRequesting { attempt } => *attempt,
+            ConvState::ServerOverloadRetrying { retry } => retry.attempt,
             _ => 1,
         };
         Event::LlmError {
