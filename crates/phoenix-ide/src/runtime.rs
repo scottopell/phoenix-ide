@@ -9423,6 +9423,97 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn reacquired_close_leases_are_released_before_changed_worktree_reinspection() {
+        use phoenix_core::domain::close::ClosePhase;
+        let mut manager = test_manager().await;
+        let sockets = tempfile::tempdir().unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let (_repository, attempt_id, scope, worktree) =
+            prepare_worktree_only_close(&manager, "reacquired-changed-worktree").await;
+        manager
+            .cancel_close_resource_leases(&attempt_id)
+            .await
+            .unwrap();
+        std::fs::write(worktree.join("tracked"), "changed after confirmation\n").unwrap();
+        let error = manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.scope(), Some(&scope));
+        assert!(error.to_string().contains("fresh confirmation is required"));
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        let key = ResourceScopeKey::Work(scope);
+        manager.terminals.reserve_spawn(&key).unwrap();
+        manager.terminals.release_spawn(&key);
+        assert_eq!(
+            manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingLossConfirmation,
+        );
+        assert!(manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap()
+            .is_empty());
+        let manager = Arc::new(manager);
+        assert_eq!(
+            manager
+                .resume_pending_close_runtime_retirements()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked")).unwrap(),
+            "changed after confirmation\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn reacquired_close_validation_error_keeps_scope_and_reopens_admission() {
+        let mut manager = test_manager().await;
+        let sockets = tempfile::tempdir().unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let (_repository, attempt_id, scope, worktree) =
+            prepare_worktree_only_close(&manager, "reacquired-invalid-worktree").await;
+        manager
+            .cancel_close_resource_leases(&attempt_id)
+            .await
+            .unwrap();
+        std::fs::remove_file(worktree.join(".git")).unwrap();
+        let error = manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.scope(), Some(&scope));
+        assert!(error.to_string().contains("worktree cannot be reinspected"));
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        let key = ResourceScopeKey::Work(scope);
+        manager.terminals.reserve_spawn(&key).unwrap();
+        manager.terminals.release_spawn(&key);
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(Some(&evidence[0].scope), error.scope());
+    }
+
+    #[tokio::test]
     async fn startup_sealed_worktree_retirement_reacquires_scope_lease_and_completes() {
         use phoenix_core::domain::close::ClosePhase;
         let mut manager = test_manager().await;
@@ -9479,6 +9570,207 @@ mod scope_liveness_tests {
         assert!(observations.load(std::sync::atomic::Ordering::SeqCst) > 0);
         assert!(!worktree.exists());
         assert!(manager.close_retirement_leases.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn startup_bound_tombstone_post_delete_converges_only_with_exact_empty_root() {
+        use crate::db::{
+            BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
+            CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
+            RecordCloseWorktreeCleanupPlanRequest,
+        };
+        use phoenix_core::domain::close::{ClosePhase, RetiredResourceKind, RetirementOutcome};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        for state in ["empty", "nonempty", "replaced-root", "replaced-object"] {
+            let mut manager = test_manager().await;
+            let sockets = tempfile::tempdir().unwrap();
+            manager.tmux_registry = Arc::new(
+                phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                    sockets.path().to_path_buf(),
+                ),
+            );
+            let (repository, attempt_id, scope, worktree) =
+                prepare_worktree_only_close(&manager, &format!("startup-tombstone-{state}")).await;
+            let snapshot = manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap()
+                .snapshot()
+                .cloned()
+                .unwrap();
+            let resource = manager
+                .db()
+                .list_close_expected_retirement_resources(attempt_id.as_str())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|target| target.resource.kind() == RetiredResourceKind::Worktree)
+                .unwrap()
+                .resource;
+            manager
+                .db()
+                .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                    attempt_id: attempt_id.clone(),
+                    scope: scope.clone(),
+                    snapshot: snapshot.clone(),
+                    resource: resource.clone(),
+                })
+                .await
+                .unwrap();
+            let administrative_dir = close_retirement::exact_worktree_administrative_dir(
+                &worktree,
+                &repository.path().join(".git"),
+            )
+            .unwrap();
+            let administrative_dir_incarnation =
+                close_retirement::observe_administrative_dir_incarnation(&administrative_dir)
+                    .unwrap();
+            manager
+                .db()
+                .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+                    attempt_id: attempt_id.clone(),
+                    scope: scope.clone(),
+                    snapshot: snapshot.clone(),
+                    resource: resource.clone(),
+                    administrative_dir: administrative_dir.clone(),
+                    administrative_dir_incarnation,
+                })
+                .await
+                .unwrap();
+            let root = repository.path().join("private-tombstone");
+            std::fs::DirBuilder::new().create(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let root_metadata = std::fs::symlink_metadata(&root).unwrap();
+            manager
+                .db()
+                .bind_close_worktree_final_tombstone(BindCloseWorktreeFinalTombstoneRequest {
+                    attempt_id: attempt_id.clone(),
+                    scope: scope.clone(),
+                    snapshot: snapshot.clone(),
+                    resource: resource.clone(),
+                    tombstone: CloseWorktreeFinalTombstone {
+                        root: root.clone(),
+                        device: root_metadata.dev(),
+                        inode: root_metadata.ino(),
+                        object_device: None,
+                        object_inode: None,
+                    },
+                })
+                .await
+                .unwrap();
+            let object = root.join("object");
+            std::fs::rename(&worktree, &object).unwrap();
+            let object_metadata = std::fs::symlink_metadata(&object).unwrap();
+            manager
+                .db()
+                .bind_close_worktree_final_tombstone_object(
+                    BindCloseWorktreeFinalTombstoneObjectRequest {
+                        attempt_id: attempt_id.clone(),
+                        scope: scope.clone(),
+                        snapshot: snapshot.clone(),
+                        resource,
+                        object_device: object_metadata.dev(),
+                        object_inode: object_metadata.ino(),
+                    },
+                )
+                .await
+                .unwrap();
+            if state == "replaced-object" {
+                std::fs::rename(&object, repository.path().join("displaced-object")).unwrap();
+                std::fs::create_dir(&object).unwrap();
+                std::fs::write(object.join("marker"), "preserve\n").unwrap();
+            } else {
+                std::fs::remove_dir_all(&object).unwrap();
+            }
+            if state == "nonempty" {
+                std::fs::write(root.join("marker"), "preserve\n").unwrap();
+            } else if state == "replaced-root" {
+                std::fs::rename(&root, repository.path().join("displaced-root")).unwrap();
+                std::fs::create_dir(&root).unwrap();
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            manager
+                .cancel_close_resource_leases(&attempt_id)
+                .await
+                .unwrap();
+            manager.set_test_ambient_writer_observer(Arc::new(|_| {
+                panic!("post-delete or changed identity must not inspect writers")
+            }));
+            let manager = Arc::new(manager);
+            assert_eq!(
+                manager
+                    .resume_pending_close_runtime_retirements()
+                    .await
+                    .unwrap(),
+                usize::from(state == "empty")
+            );
+            let obligation = manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap();
+            assert_eq!(
+                obligation.phase(),
+                if state == "empty" {
+                    ClosePhase::Completed
+                } else {
+                    ClosePhase::NeedsRepair
+                }
+            );
+            assert!(manager.close_retirement_leases.lock().await.is_empty());
+            assert!(!worktree.exists());
+            if state == "empty" {
+                assert!(!root.exists());
+                assert!(!administrative_dir.exists());
+            } else {
+                assert!(root.is_dir());
+                assert!(administrative_dir.exists());
+                let evidence = manager
+                    .db()
+                    .list_close_retirement_evidence(attempt_id.as_str())
+                    .await
+                    .unwrap();
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(evidence[0].scope, scope);
+                assert!(matches!(
+                    evidence[0].outcome,
+                    RetirementOutcome::Residual { .. }
+                ));
+                if state == "nonempty" {
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("marker")).unwrap(),
+                        "preserve\n"
+                    );
+                } else if state == "replaced-object" {
+                    assert_eq!(
+                        std::fs::read_to_string(object.join("marker")).unwrap(),
+                        "preserve\n"
+                    );
+                }
+                let key = ResourceScopeKey::Work(scope);
+                manager.terminals.reserve_spawn(&key).unwrap();
+                manager.terminals.release_spawn(&key);
+                assert_eq!(
+                    manager
+                        .resume_pending_close_runtime_retirements()
+                        .await
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    manager
+                        .db()
+                        .list_close_retirement_evidence(attempt_id.as_str())
+                        .await
+                        .unwrap(),
+                    evidence
+                );
+            }
+        }
     }
 
     #[tokio::test]
