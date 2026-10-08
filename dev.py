@@ -5427,7 +5427,6 @@ def cmd_check(
     # local M-class hardware finishes in ~90s. Bump only if a single step
     # legitimately takes longer — never to mask flakes.
     CHECK_TIMEOUT = 600
-    CARGO_TEST_TIMEOUT, cargo_test_timeout_source = _cargo_test_timeout_secs()
 
     # Decide which lanes to run (Option A path-gating) BEFORE any
     # lane-specific setup runs. A skipped lane must not drag in its setup:
@@ -5435,6 +5434,9 @@ def cmd_check(
     # working cargo toolchain to be present. --all / PHOENIX_CHECK_ALL=1
     # (handled in _gate_lanes) forces every lane.
     active, skipped = _resolve_check_lanes(gate=gate, lanes=lanes)
+    CARGO_TEST_TIMEOUT, cargo_test_timeout_source = (
+        _cargo_test_timeout_secs() if "rust" in active else (DEFAULT_CARGO_TEST_TIMEOUT_SECS, None)
+    )
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["active_lanes"] = sorted(active)
     if lanes is not None and not active:

@@ -366,6 +366,14 @@ class CargoTestTimeoutTests(unittest.TestCase):
                 self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: " "}),
                 (900, None))
 
+    def test_task_only_check_ignores_invalid_rust_budget(self):
+        with mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"task"}, {})), \
+             mock.patch.object(self.dev, "_cargo_test_timeout_secs", side_effect=AssertionError("rust-only setting read")), \
+             mock.patch.object(self.dev, "_run_check_threads_sequentially", return_value=[]), \
+             mock.patch.object(self.dev, "_make_reporter") as reporter:
+            self.dev.cmd_check(gate=False, lanes="task")
+            self.assertFalse(reporter.return_value.lane_failed.called)
+
     def test_invalid_values_fail_loud(self):
         for raw in ("abc", "0", "-5", "1.5"):
             with self.subTest(raw=raw), self._with_file(None):
