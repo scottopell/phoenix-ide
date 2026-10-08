@@ -179,13 +179,15 @@ fn parse_rfc3339_instant_key(value: &str, field: &str) -> DbResult<(i64, String)
     let fractional = value
         .split_once('T')
         .and_then(|(_, time)| time.split_once('.'))
-        .map_or("", |(_, fractional_and_offset)| {
-            let end = fractional_and_offset
-                .find(['Z', '+', '-'])
-                .unwrap_or(fractional_and_offset.len());
-            fractional_and_offset[..end].trim_end_matches('0')
+        .map_or_else(String::new, |(_, fractional_and_offset)| {
+            fractional_and_offset
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .trim_end_matches('0')
+                .to_string()
         });
-    Ok((instant.timestamp(), fractional.to_string()))
+    Ok((instant.timestamp(), fractional))
 }
 
 fn parse_product_conversation_id(value: String, field: &str) -> DbResult<ProductConversationId> {
@@ -2931,21 +2933,6 @@ impl Database {
         .into_iter()
         .map(parse_close_inspection_row)
         .collect::<DbResult<Vec<_>>>()?;
-        let losses = sqlx::query(
-            "SELECT loss.attempt_id, loss.scope, loss.generation, inspection.fingerprint,
-                    loss.category, loss.identity_kind, loss.identity_codec, loss.identity_value
-             FROM close_retirement_losses loss
-             JOIN close_retirement_inspections inspection
-               ON inspection.attempt_id = loss.attempt_id
-              AND inspection.scope = loss.scope AND inspection.generation = loss.generation
-             WHERE loss.attempt_id = ?1",
-        )
-        .bind(attempt_id.as_str())
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(parse_close_inspection_loss_row)
-        .collect::<DbResult<Vec<_>>>()?;
         let scopes = inspections
             .into_iter()
             .map(|inspection| {
@@ -2954,16 +2941,10 @@ impl Database {
                     inspection.snapshot.fingerprint().to_string(),
                 )
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
-                let scope = inspection.target.scope;
-                let scoped_losses = losses
-                    .iter()
-                    .filter(|loss| loss.scope == scope)
-                    .map(|loss| loss.item.clone())
-                    .collect();
                 Ok(ReplaceCloseInspectionScopeRequest {
-                    scope,
+                    scope: inspection.target.scope,
                     snapshot,
-                    losses: scoped_losses,
+                    losses: Vec::new(),
                 })
             })
             .collect::<DbResult<Vec<_>>>()?;
@@ -12921,13 +12902,11 @@ mod tests {
             active_inspections[0].snapshot.generation(),
             "server_git_status_v2_retry_dispatched_absence"
         );
-        let active_losses = db
+        assert!(db
             .list_close_retirement_losses(attempt.as_str())
             .await
-            .unwrap();
-        assert_eq!(active_losses.len(), 1);
-        assert_eq!(active_losses[0].snapshot, active_inspections[0].snapshot);
-        assert_eq!(active_losses[0].item, source_losses[0].item);
+            .unwrap()
+            .is_empty());
         let resumed = db.get_close_obligation(attempt.as_str()).await.unwrap();
         assert_eq!(resumed.phase(), ClosePhase::RetirementRequested);
         assert_eq!(resumed.snapshot(), Some(&replacement));
