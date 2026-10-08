@@ -1,3 +1,4 @@
+import { useDesktopRouteOwner } from './useDesktopRouteOwner';
 import { useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
 import {
@@ -7,7 +8,7 @@ import {
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
-import { ApiResponseError, api, type Conversation, type ProductConversationListRow, type ProductConversationSnapshotView } from '../api';
+import { api, type Conversation, type ProductConversationListRow } from '../api';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
@@ -247,50 +248,10 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const productMatch = location.pathname.match(/^\/product-conversations\/([^/?#]+)/);
   const routeSlug = slugMatch?.[1] ?? null;
   const productConversationId = productMatch?.[1] ?? routeSlug;
-  const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
-  const [productNotFound, setProductNotFound] = useState<string | null>(null);
-  const [validatedPin, setValidatedPin] = useState<{ owner: string; query: string; id: string } | null>(null);
-  const [productSnapshotRetry, setProductSnapshotRetry] = useState(0);
-  useEffect(() => {
-    if (!productConversationId) {
-      setProductSnapshot(null);
-      return;
-    }
-    let cancelled = false;
-    setValidatedPin(null);
-    api.getProductConversationSnapshot(productConversationId, { message_limit: 1 })
-      .then(async (snapshot) => {
-        const pins = new URLSearchParams(location.search).getAll('source_transcript');
-        if (pins.length === 1 && pins[0]) {
-          const selected = await api.getProductConversationSnapshot(pins[0], { message_limit: 1 });
-          if (selected.product_conversation_id === snapshot.product_conversation_id && selected.requested_transcript_row_id === pins[0] && !cancelled) {
-            setValidatedPin({ owner: productConversationId, query: location.search, id: pins[0] });
-          }
-        }
-        if (!cancelled) setProductSnapshot({ ownerId: productConversationId, snapshot });
-      })
-      .catch((error: unknown) => {
-        if (!cancelled && error instanceof ApiResponseError && error.status === 404) setProductNotFound(productConversationId);
-        if (!cancelled) setProductSnapshot(null);
-      });
-    return () => { cancelled = true; };
-  }, [productConversationId, productSnapshotRetry, location.search]);
-  const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
-  const hasPin = new URLSearchParams(location.search).has('source_transcript');
-  const activeSlug = hasPin ? (validatedPin?.owner === productConversationId && validatedPin.query === location.search ? validatedPin.id : null) : ownedProductSnapshot?.latest_transcript_row_id ?? routeSlug;
+  const activeSlug = useDesktopRouteOwner(productConversationId, routeSlug, location.search);
   const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
-  useEffect(() => {
-    if (!productConversationId || ownedProductSnapshot || productNotFound === productConversationId) return;
-    const retry = () => setProductSnapshotRetry((value) => value + 1);
-    const timeout = window.setTimeout(retry, 1_000);
-    window.addEventListener('online', retry);
-    return () => {
-      window.clearTimeout(timeout);
-      window.removeEventListener('online', retry);
-    };
-  }, [ownedProductSnapshot, productConversationId, productSnapshotRetry, productNotFound]);
 
   useEffect(() => {
     setActiveNotificationConversationSlug(activeSlug);
