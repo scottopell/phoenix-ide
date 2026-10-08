@@ -448,7 +448,10 @@ impl KeywordSearchTool {
                 content: vec![ContentBlock::text(user_content)],
             }],
             provider_replay: None,
-            tools: vec![],
+            responses_replay: Vec::new(),
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
             max_tokens: Some(
                 selection
                     .max_output_tokens

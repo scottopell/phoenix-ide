@@ -119,6 +119,14 @@ WHILE tokens are arriving
 THE SYSTEM SHALL render them incrementally rather than waiting for the
 full answer
 
+WHEN a streamed answer attempt is rejected because it calls an unavailable tool
+AND another answer attempt will follow
+THE SYSTEM SHALL clear that question's provisional answer before streaming the
+next attempt, without clearing any other question's answer
+
+WHEN an answer attempt fails or exhausts its request budget
+THE SYSTEM SHALL preserve only that attempt's partial answer
+
 **Rationale:** Streaming is part of the user-visible quality bar for
 recall. The page hosting the transcript should also host the live answer
 experience.

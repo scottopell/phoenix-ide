@@ -2019,6 +2019,10 @@ describe('ProductConversationPage', () => {
 
     const handleEvent = chainStream.subscribe.mock.calls.at(-1)?.[1];
     expect(handleEvent).toEqual(expect.any(Function));
+    act(() => handleEvent?.({ type: 'chain_qa_token', chain_qa_id: 'qa-new', delta: 'unfinished narration' }));
+    expect(screen.getByTestId('chain-qa-inflight')).toHaveTextContent('unfinished narration');
+    act(() => handleEvent?.({ type: 'chain_qa_answer_reset', chain_qa_id: 'qa-new' }));
+    expect(screen.getByTestId('chain-qa-inflight')).not.toHaveTextContent('unfinished narration');
     act(() => handleEvent?.({ type: 'chain_qa_token', chain_qa_id: 'qa-new', delta: 'In main' }));
     expect(screen.getByTestId('chain-qa-inflight')).toHaveTextContent('qa-new:In main:');
 

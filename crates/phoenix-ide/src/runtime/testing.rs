@@ -66,6 +66,10 @@ impl MockLlmClient {
 
 #[async_trait]
 impl LlmClient for MockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.requests.lock().unwrap().push(request.clone());
         self.request_count_tx.send_modify(|count| *count += 1);
@@ -149,6 +153,10 @@ impl StreamingMockLlmClient {
 
 #[async_trait]
 impl LlmClient for StreamingMockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         // Not used — complete_streaming is the intended path.
         Err(LlmError::network(
@@ -292,6 +300,10 @@ impl DelayedMockLlmClient {
 
 #[async_trait]
 impl LlmClient for DelayedMockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.inner.requests.lock().unwrap().push(request.clone());
         self.request_started.notify_waiters();
@@ -559,6 +571,8 @@ type StoredSvgArtifacts = HashMap<
 #[allow(dead_code)]
 pub struct InMemoryStorage {
     svg_artifacts: Mutex<StoredSvgArtifacts>,
+    tool_admission_policies:
+        Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -641,9 +655,21 @@ pub struct InMemoryStorage {
 
 #[allow(dead_code)]
 impl InMemoryStorage {
+    pub fn seed_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+        policy: phoenix_core::domain::tool_availability::ToolAvailability,
+    ) {
+        self.tool_admission_policies
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_owned(), policy);
+    }
+
     pub fn new() -> Self {
         Self {
             svg_artifacts: Mutex::new(HashMap::new()),
+            tool_admission_policies: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
@@ -2256,6 +2282,44 @@ impl StateStore for InMemoryStorage {
             .copied())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_tool_availability(
+        &self,
+        conversation_id: &str,
+        _route_key: &str,
+        _anchor_message_id: Option<&str>,
+        live_definitions: &[phoenix_llm::ToolDefinition],
+        callable_names: &std::collections::BTreeSet<String>,
+        _visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
+        _historical_tool_references: &[(String, String)],
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        let policy = phoenix_core::domain::tool_availability::ToolAvailability::new(
+            live_definitions.to_vec(),
+            callable_names.clone(),
+        )?;
+        self.seed_tool_admission_policy(conversation_id, policy.clone());
+        Ok(policy)
+    }
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        Ok(self
+            .tool_admission_policies
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                phoenix_core::domain::tool_availability::ToolAvailability::all(vec![])
+            }))
+    }
+    async fn load_responses_replay_state(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+        Ok(Vec::new())
+    }
     async fn load_provider_replay_state(
         &self,
         _conversation_id: &str,
@@ -2267,7 +2331,7 @@ impl StateStore for InMemoryStorage {
         conversation_id: &str,
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
-        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         self.update_state(conversation_id, state, state_updated_at)
             .await
@@ -2280,7 +2344,7 @@ impl StateStore for InMemoryStorage {
         tool_results: &[crate::db::Message],
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
-        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         self.persist_tool_round_and_state(
             conversation_id,
@@ -2680,9 +2744,12 @@ mod tests {
 
         let request = LlmRequest {
             provider_replay: None,
+            responses_replay: Vec::new(),
             system: vec![],
             messages: vec![],
-            tools: vec![],
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
             max_tokens: Some(100),
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
 
@@ -2772,6 +2839,41 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].message_type, MessageType::User);
         assert_eq!(msgs[1].message_type, MessageType::Agent);
+    }
+
+    #[tokio::test]
+    async fn unavailable_call_reaches_next_request_with_error_without_execution() {
+        let llm = MockLlmClient::new("test-model");
+        llm.queue_response(LlmResponse::non_streaming(
+            vec![ContentBlock::ToolUse {
+                id: "unavailable-call".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"must not execute"}),
+            }],
+            false,
+            Usage::default(),
+        ));
+        llm.queue_response(LlmResponse::non_streaming(
+            vec![ContentBlock::text("done")],
+            true,
+            Usage::default(),
+        ));
+        let mut runtime = TestRuntime::new().llm(llm).build();
+        runtime.send_message("continue").await;
+        assert!(runtime.wait_for_done(Duration::from_secs(5)).await);
+        assert!(runtime.tools.recorded_executions().is_empty());
+        let requests = runtime.llm.recorded_requests();
+        assert_eq!(requests.len(), 2);
+        let next = &requests[1];
+        assert!(next
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block,
+            ContentBlock::ToolUse {id,name,..} if id == "unavailable-call" && name == "bash")));
+        let errors: Vec<_> = next.messages.iter().flat_map(|message| &message.content).filter(|block| matches!(block,
+            ContentBlock::ToolResult {tool_use_id,is_error:true,content,..} if tool_use_id == "unavailable-call" && content.contains("EUNAVAIL"))).collect();
+        assert_eq!(errors.len(), 1);
     }
 
     /// Integration test: tool execution cycle
