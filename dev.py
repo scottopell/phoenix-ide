@@ -4989,16 +4989,138 @@ def _kache_socket_lock(socket_path: Path):
             os.close(descriptor)
 
 
+def _file_identity(path: Path) -> dict[str, str]:
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return {"state": "absent"}
+    except OSError:
+        return {"state": "unreadable"}
+    return {"state": "present", "sha256": hashlib.sha256(content).hexdigest()}
+
+
+def _identity_path(value: str | None, *, base: Path) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else base / path
+
+
+def _implicit_kache_files(*, cargo_cwd: Path | None) -> dict[str, dict[str, str]]:
+    base = Path(cargo_cwd or ROOT).resolve()
+    home_value = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    home = _identity_path(home_value, base=base)
+    xdg_config = _identity_path(os.environ.get("XDG_CONFIG_HOME"), base=base)
+    config_home = xdg_config or (home / ".config" if home else None)
+    config = _identity_path(os.environ.get("KACHE_CONFIG"), base=base)
+    host_config = _identity_path(os.environ.get("KACHE_HOST_CONFIG"), base=base)
+    aws_credentials = _identity_path(os.environ.get("AWS_SHARED_CREDENTIALS_FILE"), base=base)
+    aws_config = _identity_path(os.environ.get("AWS_CONFIG_FILE"), base=base)
+    aws_web_identity = _identity_path(os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE"), base=base)
+    docker_config = _identity_path(os.environ.get("DOCKER_CONFIG"), base=base)
+    paths = {
+        "config": config or (config_home / "kache/config.toml" if config_home else None),
+        "host_config": host_config or Path("/etc/kache/config.toml"),
+        "aws_credentials": aws_credentials or (home / ".aws/credentials" if home else None),
+        "aws_config": aws_config or (home / ".aws/config" if home else None),
+        "aws_web_identity": aws_web_identity,
+        "docker_config": docker_config / "config.json" if docker_config else home / ".docker/config.json" if home else None,
+    }
+    return {
+        name: _file_identity(path.resolve()) if path is not None else {"state": "unresolved"}
+        for name, path in paths.items()
+    }
+
+
+def _kache_daemon_identity(binary: str, *, cargo_cwd: Path | None) -> str:
+    implicit_names = {
+        "HOME",
+        "USERPROFILE",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "DOCKER_CONFIG",
+    }
+    daemon_environment = {
+        key: hashlib.sha256(value.encode()).hexdigest()
+        for key, value in os.environ.items()
+        if (key.startswith("KACHE_") and key != "KACHE_SOCKET_PATH")
+        or key.startswith("AWS_")
+        or key in implicit_names
+    }
+    payload = json.dumps(
+        {
+            "binary": str(Path(binary).resolve()),
+            "cargo_cwd": str(Path(cargo_cwd or ROOT).resolve()),
+            "environment": daemon_environment,
+            "files": _implicit_kache_files(cargo_cwd=cargo_cwd),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _kache_daemon_receipt_path(socket: Path) -> Path:
+    digest = hashlib.sha256(str(socket.resolve()).encode()).hexdigest()[:16]
+    return _private_kache_socket_dir() / f"{digest}.receipt"
+
+
+def _record_kache_daemon_receipt(socket: Path, identity: str) -> str | None:
+    try:
+        socket_info = socket.stat()
+        receipt = _kache_daemon_receipt_path(socket)
+        temporary = receipt.with_suffix(f".tmp.{os.getpid()}")
+        payload = json.dumps(
+            {
+                "version": 1,
+                "identity": identity,
+                "socket_device": socket_info.st_dev,
+                "socket_inode": socket_info.st_ino,
+            },
+            sort_keys=True,
+        )
+        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(descriptor, payload.encode())
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, receipt)
+        receipt.chmod(0o600)
+        return None
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except (OSError, UnboundLocalError):
+            pass
+        return f"cannot record Kache daemon ownership: {error}"
+
+
+def _kache_daemon_receipt_matches(socket: Path, identity: str) -> bool:
+    try:
+        receipt = json.loads(_kache_daemon_receipt_path(socket).read_text())
+        socket_info = socket.stat()
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    return (
+        receipt.get("version") == 1
+        and receipt.get("identity") == identity
+        and receipt.get("socket_device") == socket_info.st_dev
+        and receipt.get("socket_inode") == socket_info.st_ino
+    )
+
+
 def _start_kache_daemon_locked(
-    binary: str, *, cargo_cwd: Path | None, reuse_running: bool = False
+    binary: str, *, cargo_cwd: Path | None, socket: Path, identity: str
 ) -> str | None:
     running, status_error = _kache_daemon_is_running(binary, cargo_cwd=cargo_cwd)
     if status_error:
         return f"cannot verify existing daemon environment: {status_error}"
     if running:
-        if reuse_running:
+        if _kache_daemon_receipt_matches(socket, identity):
             return None
-        return "selected socket already has a running daemon whose environment cannot be verified"
+        return "selected socket has a running daemon whose environment or process identity cannot be verified"
 
     try:
         result = subprocess.run(
@@ -5015,25 +5137,14 @@ def _start_kache_daemon_locked(
         return str(error)
     if result.returncode != 0:
         return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
-    return _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
+    readiness_error = _wait_for_kache_daemon(binary, cargo_cwd=cargo_cwd)
+    if readiness_error:
+        return readiness_error
+    return _record_kache_daemon_receipt(socket, identity)
 
 
 def _generated_kache_socket(binary: str, *, cargo_cwd: Path | None) -> Path:
-    daemon_environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key.startswith("KACHE_") and key != "KACHE_SOCKET_PATH"
-    }
-    identity = json.dumps(
-        {
-            "binary": str(Path(binary).resolve()),
-            "cargo_cwd": str(Path(cargo_cwd or ROOT).resolve()),
-            "environment": daemon_environment,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    digest = _kache_daemon_identity(binary, cargo_cwd=cargo_cwd)[:16]
     return _private_kache_socket_dir() / f"{digest}.sock"
 
 
@@ -5051,10 +5162,15 @@ def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str |
     if not socket:
         return "KACHE_SOCKET_PATH is required to serialize daemon startup"
 
+    socket_path = Path(socket)
+    identity = _kache_daemon_identity(binary, cargo_cwd=cargo_cwd)
     try:
-        with _kache_socket_lock(Path(socket)):
+        with _kache_socket_lock(socket_path):
             return _start_kache_daemon_locked(
-                binary, cargo_cwd=cargo_cwd, reuse_running=generated_socket
+                binary,
+                cargo_cwd=cargo_cwd,
+                socket=socket_path,
+                identity=identity,
             )
     except OSError as error:
         return f"cannot lock Kache socket setup: {error}"
