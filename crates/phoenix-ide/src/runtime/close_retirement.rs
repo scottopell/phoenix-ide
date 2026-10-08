@@ -30,12 +30,12 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
-    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
-    CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
-    CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
-    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
-    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
-    RouteCloseAttemptToRepairRequest,
+    AdoptCloseWorktreeCleanupPlanRequest, BindCloseWorktreeFinalTombstoneObjectRequest,
+    BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
+    CaptureCloseRetirementInventoryScopeRequest, CloseWorktreeFinalTombstone,
+    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
+    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
+    ReplaceCloseInspectionScopeRequest, RouteCloseAttemptToRepairRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -76,6 +76,81 @@ impl std::fmt::Display for CloseLeaseFailure {
                 )
             }
             Self::Tmux { detail, .. } => write!(formatter, "tmux teardown failed: {detail}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum CloseRetirementError {
+    #[error("{0}")]
+    Message(String),
+    #[error("{message}")]
+    ScopedMessage { scope: WorkScopeId, message: String },
+    #[error("Close evidence invariant {invariant} failed in {relation}")]
+    EvidenceInvariant {
+        scope: Option<WorkScopeId>,
+        invariant: String,
+        relation: String,
+    },
+}
+
+impl CloseRetirementError {
+    pub(crate) fn scope(&self) -> Option<&WorkScopeId> {
+        match self {
+            Self::Message(_) => None,
+            Self::ScopedMessage { scope, .. } => Some(scope),
+            Self::EvidenceInvariant { scope, .. } => scope.as_ref(),
+        }
+    }
+
+    fn in_scope(self, scope: &WorkScopeId) -> Self {
+        match self {
+            Self::Message(message) => Self::ScopedMessage {
+                scope: scope.clone(),
+                message,
+            },
+            Self::EvidenceInvariant {
+                scope: None,
+                invariant,
+                relation,
+            } => Self::EvidenceInvariant {
+                scope: Some(scope.clone()),
+                invariant,
+                relation,
+            },
+            error => error,
+        }
+    }
+}
+
+impl From<String> for CloseRetirementError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<CloseRetirementError> for String {
+    fn from(error: CloseRetirementError) -> Self {
+        error.to_string()
+    }
+}
+
+fn map_close_retirement_db_error(error: crate::db::DbError) -> CloseRetirementError {
+    match error {
+        crate::db::DbError::CloseEvidenceInvariant {
+            invariant,
+            relation,
+            ..
+        } => CloseRetirementError::EvidenceInvariant {
+            scope: None,
+            invariant: invariant.to_string(),
+            relation: relation.to_string(),
+        },
+        error => {
+            tracing::error!(%error, "Close retirement persistence failed");
+            CloseRetirementError::Message(
+                "Close retirement persistence failed; retry or inspect server logs".to_string(),
+            )
         }
     }
 }
@@ -137,7 +212,7 @@ impl RuntimeManager {
     pub(crate) async fn inspect_close_retirement(
         &self,
         attempt_id: CloseAttemptId,
-    ) -> Result<CloseRetirementSnapshot, String> {
+    ) -> Result<CloseRetirementSnapshot, CloseRetirementError> {
         self.inspect_close_retirement_with_continuation(attempt_id, true)
             .await
     }
@@ -145,7 +220,7 @@ impl RuntimeManager {
     pub(crate) async fn inspect_close_retirement_only(
         &self,
         attempt_id: CloseAttemptId,
-    ) -> Result<CloseRetirementSnapshot, String> {
+    ) -> Result<CloseRetirementSnapshot, CloseRetirementError> {
         self.inspect_close_retirement_with_continuation(attempt_id, false)
             .await
     }
@@ -155,12 +230,47 @@ impl RuntimeManager {
         &self,
         attempt_id: CloseAttemptId,
         continue_clean_retirement: bool,
-    ) -> Result<CloseRetirementSnapshot, String> {
+    ) -> Result<CloseRetirementSnapshot, CloseRetirementError> {
+        if continue_clean_retirement {
+            if let Some(resumed) = self
+                .db()
+                .resume_legacy_fk787_close_retirement_generation(&attempt_id)
+                .await
+                .map_err(map_close_retirement_db_error)?
+            {
+                let snapshot = resumed.snapshot().cloned().ok_or_else(|| {
+                    CloseRetirementError::Message(
+                        "resumed Close retirement has no inspection snapshot".to_string(),
+                    )
+                })?;
+                let scopes = self
+                    .db()
+                    .list_close_attempt_scopes(attempt_id.as_str())
+                    .await
+                    .map_err(map_close_retirement_db_error)?;
+                for captured in scopes {
+                    if let Err(message) = self
+                        .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
+                        .await
+                    {
+                        self.cancel_close_resource_leases(&attempt_id)
+                            .await
+                            .map_err(CloseRetirementError::Message)?;
+                        return Err(CloseRetirementError::ScopedMessage {
+                            scope: captured.scope,
+                            message,
+                        });
+                    }
+                }
+                self.retire_close_runtime_resources(attempt_id).await?;
+                return Ok(snapshot);
+            }
+        }
         let prior_obligation = self
             .db()
             .get_close_obligation(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let reinspection_generation = (prior_obligation.phase()
             == ClosePhase::AwaitingRetirementInspection
             && prior_obligation.snapshot().is_some())
@@ -169,7 +279,7 @@ impl RuntimeManager {
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let mut requests = Vec::with_capacity(scopes.len());
         for scope in scopes {
             let (snapshot, losses) = match scope.captured_worktree {
@@ -256,7 +366,7 @@ impl RuntimeManager {
                                 .db()
                                 .get_close_obligation(attempt_id.as_str())
                                 .await
-                                .map_err(|error| error.to_string())?;
+                                .map_err(map_close_retirement_db_error)?;
                             if let Some(prior_snapshot) = obligation.snapshot().cloned() {
                                 let worktree = RetiredResourceIdentity::parse(
                                     RetiredResourceKind::Worktree,
@@ -272,7 +382,7 @@ impl RuntimeManager {
                                         &worktree,
                                     )
                                     .await
-                                    .map_err(|error| error.to_string())?
+                                    .map_err(map_close_retirement_db_error)?
                                 {
                                     if continue_clean_retirement {
                                         let active_snapshot = if obligation.phase()
@@ -290,7 +400,7 @@ impl RuntimeManager {
                                                     )?,
                                                 )
                                                 .await
-                                                .map_err(|error| error.to_string())?
+                                                .map_err(map_close_retirement_db_error)?
                                         } else {
                                             prior_snapshot
                                         };
@@ -356,12 +466,12 @@ impl RuntimeManager {
                 reinspection_generation.as_deref(),
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let obligation = self
             .db()
             .get_close_obligation(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let snapshot = obligation
             .snapshot()
             .cloned()
@@ -586,12 +696,12 @@ impl RuntimeManager {
         &self,
         attempt_id: CloseAttemptId,
         snapshot: CloseRetirementSnapshot,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
         let scopes = self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let mut requests = Vec::with_capacity(scopes.len());
         for captured in scopes {
             let resources = match self
@@ -643,14 +753,18 @@ impl RuntimeManager {
                     continue;
                 }
                 let LossItemIdentity::Opaque(identity) = resource.identity() else {
-                    return Err("registry resource identity was not opaque".to_string());
+                    return Err("registry resource identity was not opaque"
+                        .to_string()
+                        .into());
                 };
                 match resource.kind() {
                     RetiredResourceKind::TmuxServer => {
                         inventory.tmux_servers.insert(identity.clone());
                     }
                     kind => {
-                        return Err(format!("unexpected durable permit resource kind {kind:?}"))
+                        return Err(
+                            format!("unexpected durable permit resource kind {kind:?}").into()
+                        )
                     }
                 }
             }
@@ -675,7 +789,7 @@ impl RuntimeManager {
                     .map_err(|cancel_error| {
                         format!("{error}; fence reopening failed: {cancel_error}")
                     })?;
-                Err(error.to_string())
+                Err(map_close_retirement_db_error(error))
             }
         }
     }
@@ -686,7 +800,7 @@ impl RuntimeManager {
     pub(crate) async fn retire_close_runtime_resources(
         &self,
         attempt_id: CloseAttemptId,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
         let _execution = self
             .close_retirement_execution
             .lock(attempt_id.as_str())
@@ -695,7 +809,7 @@ impl RuntimeManager {
             .db()
             .get_close_obligation(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         if !matches!(
             obligation.phase(),
             ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
@@ -710,7 +824,7 @@ impl RuntimeManager {
             .db()
             .close_retirement_inventory_is_complete(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         if !inventory_is_complete {
             self.capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
                 .await?;
@@ -719,12 +833,12 @@ impl RuntimeManager {
             .db()
             .list_close_expected_retirement_resources(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let evidence = self
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let retired = evidence
             .into_iter()
             .filter(|evidence| {
@@ -808,7 +922,7 @@ impl RuntimeManager {
                             resource: resource.clone(),
                         })
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?;
                     let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
                     match self
                         .tmux_registry()
@@ -908,7 +1022,7 @@ impl RuntimeManager {
                         resource: resource.clone(),
                     })
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?;
             }
             let resources = match self
                 .complete_close_resource_lease(&attempt_id, &scope)
@@ -1023,7 +1137,7 @@ impl RuntimeManager {
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(map_close_retirement_db_error)?
         {
             self.broadcast_work_scope_update(&ResourceScopeKey::Work(captured.scope))
                 .await;
@@ -1037,17 +1151,17 @@ impl RuntimeManager {
         snapshot: &CloseRetirementSnapshot,
         targets: &[CloseExpectedRetirementResource],
         retired: &std::collections::BTreeSet<(WorkScopeId, (String, String))>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
         let scopes = self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let inspections = self
             .db()
             .list_close_retirement_inspections(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         for captured in scopes {
             let Some(target) = targets.iter().find(|target| {
                 target.scope == captured.scope
@@ -1123,11 +1237,11 @@ impl RuntimeManager {
                 self.db()
                     .return_close_attempt_to_reinspection(attempt_id)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(map_close_retirement_db_error)?;
                 Box::pin(self.inspect_close_retirement_only(attempt_id.clone())).await?;
                 return Err(
                     "worktree changed after Close inspection confirmation; fresh confirmation is required"
-                        .to_string(),
+                        .to_string().into(),
                 );
             }
         }
@@ -1139,17 +1253,17 @@ impl RuntimeManager {
         &self,
         attempt_id: &CloseAttemptId,
         snapshot: &CloseRetirementSnapshot,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
         let targets = self
             .db()
             .list_close_expected_retirement_resources(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let evidence = self
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         let retired = evidence
             .into_iter()
             .filter(|evidence| {
@@ -1164,7 +1278,7 @@ impl RuntimeManager {
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(map_close_retirement_db_error)?;
         for captured in scopes {
             let scope = captured.scope.clone();
             let worktree_target = targets.iter().find(|target| {
@@ -1174,7 +1288,7 @@ impl RuntimeManager {
                 .db()
                 .work_scope_has_unresolved_product_ownership(&scope)
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?
             {
                 let resource = worktree_target
                     .map_or_else(
@@ -1236,11 +1350,71 @@ impl RuntimeManager {
                         .db()
                         .close_worktree_cleanup_plan(attempt_id, &scope, snapshot, &target.resource)
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?;
+                    let existing_cleanup_plan = if !captured_path.try_exists().map_err(|error| {
+                        CloseRetirementError::from(error.to_string()).in_scope(&scope)
+                    })? && quarantine_path.try_exists().map_err(
+                        |error| CloseRetirementError::from(error.to_string()).in_scope(&scope),
+                    )? && existing_cleanup_plan.is_none()
+                    {
+                        let observed_path = quarantine_path.clone();
+                        let (observed_administrative_dir, observed_administrative_dir_incarnation) =
+                            tokio::task::spawn_blocking(move || {
+                                let common = exact_worktree_common_git_dir(&observed_path)?;
+                                let administrative_dir =
+                                    exact_worktree_administrative_dir(&observed_path, &common)?;
+                                let incarnation =
+                                    observe_administrative_dir_incarnation(&administrative_dir)?;
+                                Ok::<_, String>((administrative_dir, incarnation))
+                            })
+                            .await
+                            .map_err(|error| {
+                                CloseRetirementError::from(error.to_string()).in_scope(&scope)
+                            })?
+                            .map_err(|error| CloseRetirementError::from(error).in_scope(&scope))?;
+                        match self
+                            .db()
+                            .adopt_close_worktree_cleanup_plan(
+                                AdoptCloseWorktreeCleanupPlanRequest {
+                                    attempt_id: attempt_id.clone(),
+                                    scope: scope.clone(),
+                                    target_snapshot: snapshot.clone(),
+                                    resource: target.resource.clone(),
+                                    observed_administrative_dir,
+                                    observed_administrative_dir_incarnation,
+                                },
+                            )
+                            .await
+                            .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))
+                        {
+                            Ok(plan) => Some(plan),
+                            Err(error @ CloseRetirementError::EvidenceInvariant { .. }) => {
+                                self.persist_close_error_repair(attempt_id, &scope, &error)
+                                    .await?;
+                                return Err(error);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        existing_cleanup_plan
+                    };
                     if let Some(cleanup_plan) = existing_cleanup_plan
                         .as_ref()
                         .filter(|plan| plan.final_tombstone.is_some())
                     {
+                        final_tombstone_observation_path(
+                            cleanup_plan
+                                .final_tombstone
+                                .as_ref()
+                                .expect("filtered above"),
+                            &quarantine_path,
+                        )
+                        .map_err(|message| {
+                            CloseRetirementError::ScopedMessage {
+                                scope: scope.clone(),
+                                message,
+                            }
+                        })?;
                         let identity = identity.clone();
                         let cleanup_plan = cleanup_plan.clone();
                         let recovery = tokio::task::spawn_blocking(move || {
@@ -1310,7 +1484,9 @@ impl RuntimeManager {
                                 &target.resource,
                             )
                             .await
-                            .map_err(|error| error.to_string())?;
+                            .map_err(|error| {
+                                map_close_retirement_db_error(error).in_scope(&scope)
+                            })?;
                         let planned_administrative_dir = self
                             .db()
                             .close_worktree_cleanup_plan(
@@ -1320,7 +1496,9 @@ impl RuntimeManager {
                                 &target.resource,
                             )
                             .await
-                            .map_err(|error| error.to_string())?;
+                            .map_err(|error| {
+                                map_close_retirement_db_error(error).in_scope(&scope)
+                            })?;
                         let Some(cleanup_plan) = planned_administrative_dir else {
                             return self
                                 .record_close_residual(
@@ -1386,7 +1564,9 @@ impl RuntimeManager {
                             .db()
                             .list_close_retirement_inspections(attempt_id.as_str())
                             .await
-                            .map_err(|error| error.to_string())?;
+                            .map_err(|error| {
+                                map_close_retirement_db_error(error).in_scope(&scope)
+                            })?;
                         let Some(confirmed) = inspections
                             .iter()
                             .find(|inspection| inspection.target.scope == scope)
@@ -1414,7 +1594,9 @@ impl RuntimeManager {
                                         },
                                     )
                                     .await
-                                    .map_err(|error| error.to_string())?;
+                                    .map_err(|error| {
+                                        map_close_retirement_db_error(error).in_scope(&scope)
+                                    })?;
                             }
                             Ok(false) => {}
                             Err(error) => {
@@ -1465,7 +1647,9 @@ impl RuntimeManager {
                                     },
                                 )
                                 .await
-                                .map_err(|error| error.to_string())?;
+                                .map_err(|error| {
+                                    map_close_retirement_db_error(error).in_scope(&scope)
+                                })?;
                             crate::db::CloseWorktreeCleanupPlan {
                                 administrative_dir: discovered.0,
                                 administrative_dir_incarnation: discovered.1,
@@ -1544,10 +1728,12 @@ impl RuntimeManager {
                                 self.db()
                                     .return_close_attempt_to_reinspection(attempt_id)
                                     .await
-                                    .map_err(|error| error.to_string())?;
+                                    .map_err(|error| {
+                                        map_close_retirement_db_error(error).in_scope(&scope)
+                                    })?;
                                 Box::pin(self.inspect_close_retirement_only(attempt_id.clone()))
                                     .await?;
-                                return Err(detail);
+                                return Err(detail.into());
                             }
                             Ok(ExactWorktreeRemoval::Residual { detail }) => {
                                 return self
@@ -1621,7 +1807,7 @@ impl RuntimeManager {
                     "close retirement",
                 )
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?
             {
                 WorkScopeRetirementOutcome::Retired
                 | WorkScopeRetirementOutcome::AlreadyRetired => {
@@ -1658,7 +1844,7 @@ impl RuntimeManager {
         scope: &WorkScopeId,
         resource: RetiredResourceIdentity,
         detail: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
         self.db()
             .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: attempt_id.clone(),
@@ -1669,7 +1855,7 @@ impl RuntimeManager {
                 detail: Some(detail.to_string()),
             })
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| map_close_retirement_db_error(error).in_scope(scope))
     }
 
     async fn record_close_absence_adopted(
@@ -1679,7 +1865,7 @@ impl RuntimeManager {
         scope: &WorkScopeId,
         resource: RetiredResourceIdentity,
         detail: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
         self.db()
             .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: attempt_id.clone(),
@@ -1692,7 +1878,7 @@ impl RuntimeManager {
                 detail: Some(detail.to_string()),
             })
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| map_close_retirement_db_error(error).in_scope(scope))
     }
 
     pub(crate) async fn route_close_attempt_to_repair<T>(
@@ -1701,13 +1887,40 @@ impl RuntimeManager {
         scope: &WorkScopeId,
         reason: RetirementFailureReason,
         detail: impl Into<String>,
-    ) -> Result<T, String> {
+    ) -> Result<T, CloseRetirementError> {
         let detail = detail.into();
+        self.persist_close_repair(attempt_id, scope, reason, detail.clone())
+            .await?;
+        Err(CloseRetirementError::from(detail).in_scope(scope))
+    }
+
+    pub(crate) async fn persist_close_error_repair(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        error: &CloseRetirementError,
+    ) -> Result<(), CloseRetirementError> {
+        self.persist_close_repair(
+            attempt_id,
+            error.scope().unwrap_or(scope),
+            RetirementFailureReason::ManualRepairRequired,
+            error.to_string(),
+        )
+        .await
+    }
+
+    async fn persist_close_repair(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        reason: RetirementFailureReason,
+        detail: String,
+    ) -> Result<(), CloseRetirementError> {
         let captured = self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| map_close_retirement_db_error(error).in_scope(scope))?
             .into_iter()
             .find(|captured| captured.scope == *scope)
             .ok_or_else(|| format!("Close repair scope {scope} was not captured"))?;
@@ -1736,11 +1949,11 @@ impl RuntimeManager {
                 detail: detail.clone(),
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| map_close_retirement_db_error(error).in_scope(scope))?;
         self.cancel_close_resource_leases(attempt_id)
             .await
             .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(detail)
+        Ok(())
     }
 
     async fn record_close_residual<T>(
@@ -1751,7 +1964,7 @@ impl RuntimeManager {
         resource: RetiredResourceIdentity,
         reason: RetirementFailureReason,
         detail: &str,
-    ) -> Result<T, String> {
+    ) -> Result<T, CloseRetirementError> {
         self.db()
             .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: attempt_id.clone(),
@@ -1764,11 +1977,11 @@ impl RuntimeManager {
                 detail: Some(detail.to_string()),
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| map_close_retirement_db_error(error).in_scope(scope))?;
         self.cancel_close_resource_leases(attempt_id)
             .await
             .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(detail.to_string())
+        Err(CloseRetirementError::from(detail.to_string()).in_scope(scope))
     }
 
     /// Completes one live lease. Callers must persist exactly one receipt per
@@ -2588,6 +2801,23 @@ enum ExactWorktreeRemoval {
 enum FinalTombstoneRecovery {
     Completed,
     Residual(String),
+}
+
+fn final_tombstone_observation_path(
+    tombstone: &CloseWorktreeFinalTombstone,
+    quarantine_path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if quarantine_path
+        .try_exists()
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(Some(quarantine_path.to_path_buf()));
+    }
+    let tombstone_object = tombstone.root.join("object");
+    tombstone_object
+        .try_exists()
+        .map(|exists| exists.then_some(tombstone_object))
+        .map_err(|error| error.to_string())
 }
 
 fn inspect_and_remove_exact_worktree<B>(
@@ -3727,20 +3957,196 @@ fn quarantine_has_process_cwd_in(
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(false);
-    };
-    for process in processes.flatten() {
-        if !linux_process_is_relevant(&process, effective_uid, "cwd") {
-            continue;
-        }
-        if std::fs::read_link(process.path().join("cwd"))
-            .is_ok_and(|cwd| path_is_within(&cwd, &canonical))
-        {
-            return Ok(true);
+    linux_namespace_cwd_scan(&canonical, proc_root, effective_uid, |_| {})
+        .map(|evidence| matches!(evidence, LinuxNamespaceCwdEvidence::Inside))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxNamespaceCwdEvidence {
+    Inside,
+    Clean,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum LinuxCwdScanError {
+    ProcessDisappeared,
+    Indeterminate(String),
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for LinuxCwdScanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProcessDisappeared => {
+                formatter.write_str("process disappeared during cwd inspection")
+            }
+            Self::Indeterminate(detail) => {
+                write!(formatter, "indeterminate Linux cwd inspection: {detail}")
+            }
         }
     }
-    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCwdScanError {
+    fn from_process_io(process: &Path, operation: &str, error: &std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::NotFound
+            && matches!(std::fs::metadata(process), Err(root_error) if root_error.kind() == std::io::ErrorKind::NotFound)
+        {
+            Self::ProcessDisappeared
+        } else {
+            Self::Indeterminate(format!("{operation} for {}: {error}", process.display()))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxCwdProcessIncarnation(u64);
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_process_incarnation(
+    process: &Path,
+) -> Result<LinuxCwdProcessIncarnation, LinuxCwdScanError> {
+    let stat = std::fs::read_to_string(process.join("stat")).map_err(|error| {
+        LinuxCwdScanError::from_process_io(process, "read process incarnation", &error)
+    })?;
+    // The comm field can contain spaces and closing parentheses; starttime is field 22.
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_ascii_whitespace().nth(19))
+        .and_then(|start_time| start_time.parse::<u64>().ok())
+        .map(LinuxCwdProcessIncarnation)
+        .ok_or_else(|| {
+            LinuxCwdScanError::Indeterminate(format!(
+                "malformed process stat for {}",
+                process.display()
+            ))
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_task_inventory(
+    process: &Path,
+) -> Result<std::collections::BTreeSet<std::ffi::OsString>, LinuxCwdScanError> {
+    let tasks = std::fs::read_dir(process.join("task"))
+        .map_err(|error| LinuxCwdScanError::from_process_io(process, "enumerate tasks", &error))?;
+    let mut inventory = std::collections::BTreeSet::new();
+    for task in tasks {
+        let task = task.map_err(|error| {
+            LinuxCwdScanError::from_process_io(process, "enumerate task", &error)
+        })?;
+        let name = task.file_name();
+        if !name.as_encoded_bytes().is_empty()
+            && name.as_encoded_bytes().iter().all(u8::is_ascii_digit)
+        {
+            inventory.insert(name);
+        } else {
+            return Err(LinuxCwdScanError::Indeterminate(format!(
+                "malformed task inventory for {}",
+                process.display()
+            )));
+        }
+    }
+    if inventory.is_empty() {
+        return Err(LinuxCwdScanError::Indeterminate(format!(
+            "empty task inventory for {}",
+            process.display()
+        )));
+    }
+    Ok(inventory)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_process_tasks(
+    process: &Path,
+    canonical: &Path,
+    after_task_reads: &mut impl FnMut(&Path),
+) -> Result<LinuxNamespaceCwdEvidence, LinuxCwdScanError> {
+    let scan = (|| {
+        let before = linux_cwd_task_inventory(process)?;
+        for task in &before {
+            let cwd = std::fs::read_link(process.join("task").join(task).join("cwd")).map_err(
+                |error| LinuxCwdScanError::from_process_io(process, "read task cwd", &error),
+            )?;
+            if path_is_within(&cwd, canonical) {
+                return Ok((LinuxNamespaceCwdEvidence::Inside, before));
+            }
+        }
+        Ok((LinuxNamespaceCwdEvidence::Clean, before))
+    })();
+    after_task_reads(process);
+    let (evidence, before) = scan?;
+    if evidence == LinuxNamespaceCwdEvidence::Clean && linux_cwd_task_inventory(process)? != before
+    {
+        return Err(LinuxCwdScanError::Indeterminate(format!(
+            "task inventory changed for {}",
+            process.display()
+        )));
+    }
+    Ok(evidence)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_namespace_cwd_scan(
+    canonical: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+    mut after_task_reads: impl FnMut(&Path),
+) -> Result<LinuxNamespaceCwdEvidence, LinuxCwdScanError> {
+    let processes = std::fs::read_dir(proc_root).map_err(|error| {
+        LinuxCwdScanError::Indeterminate(format!("enumerate processes: {error}"))
+    })?;
+    for process in processes {
+        let process = process.map_err(|error| {
+            LinuxCwdScanError::Indeterminate(format!("enumerate process: {error}"))
+        })?;
+        let name = process.file_name();
+        if name.as_encoded_bytes().is_empty()
+            || !name.as_encoded_bytes().iter().all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let process = process.path();
+        let before_incarnation = match linux_cwd_process_incarnation(&process) {
+            Ok(incarnation) => incarnation,
+            Err(LinuxCwdScanError::ProcessDisappeared) => continue,
+            Err(error) => return Err(error),
+        };
+        let status = std::fs::read_to_string(process.join("status"))
+            .map_err(|error| {
+                LinuxCwdScanError::from_process_io(&process, "read process credentials", &error)
+            })
+            .and_then(|status| {
+                LinuxProcessEffectiveUid::parse_status(&status)
+                    .map_err(LinuxCwdScanError::Indeterminate)
+            });
+        let scan = match status {
+            Ok(uid) if uid == LinuxProcessEffectiveUid(effective_uid) => {
+                linux_cwd_process_tasks(&process, canonical, &mut after_task_reads)
+            }
+            Ok(_) => Ok(LinuxNamespaceCwdEvidence::Clean),
+            Err(error) => Err(error),
+        };
+        if matches!(scan, Ok(LinuxNamespaceCwdEvidence::Inside)) {
+            return Ok(LinuxNamespaceCwdEvidence::Inside);
+        }
+        match linux_cwd_process_incarnation(&process) {
+            Err(LinuxCwdScanError::ProcessDisappeared) => continue,
+            Ok(current) if current != before_incarnation => {
+                return Err(LinuxCwdScanError::Indeterminate(format!(
+                    "process incarnation changed for {}",
+                    process.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+        scan?;
+    }
+    Ok(LinuxNamespaceCwdEvidence::Clean)
 }
 
 #[cfg(target_os = "macos")]
@@ -5071,6 +5477,359 @@ mod tests {
         std::fs::write(path.join("tracked"), "initial\n").unwrap();
         run_git(path, &["add", "tracked"]);
         run_git(path, &["commit", "--quiet", "-m", "initial"]);
+    }
+
+    #[test]
+    fn close_retirement_error_preserves_typed_invariant_and_exact_scope() {
+        use super::{map_close_retirement_db_error, CloseRetirementError};
+        use crate::work_scope::WorkScopeId;
+
+        let scope = WorkScopeId::parse("second-scope").unwrap();
+        let fallback = WorkScopeId::parse("first-scope").unwrap();
+        let error = map_close_retirement_db_error(crate::db::DbError::CloseEvidenceInvariant {
+            invariant: "exact_plan_required",
+            relation: "close_worktree_cleanup_plans",
+            detail: "private database details".to_string(),
+        })
+        .in_scope(&scope)
+        .in_scope(&fallback);
+        assert_eq!(error.scope(), Some(&scope));
+        assert!(
+            matches!(&error, CloseRetirementError::EvidenceInvariant { invariant, relation, .. }
+            if invariant == "exact_plan_required" && relation == "close_worktree_cleanup_plans")
+        );
+        assert_eq!(
+            error.to_string(),
+            "Close evidence invariant exact_plan_required failed in close_worktree_cleanup_plans"
+        );
+        let message = CloseRetirementError::from("scoped failure".to_string()).in_scope(&scope);
+        assert_eq!(message.scope(), Some(&scope));
+        assert_eq!(message.to_string(), "scoped failure");
+        let unscoped = CloseRetirementError::from(
+            "Close evidence invariant text is not a typed error".to_string(),
+        );
+        assert!(matches!(unscoped, CloseRetirementError::Message(_)));
+        assert!(unscoped.scope().is_none());
+    }
+
+    #[test]
+    fn close_retirement_db_error_redacts_untyped_persistence_details() {
+        let error = super::map_close_retirement_db_error(
+            crate::db::DbError::CloseFoundationPrecondition("private database details".to_string()),
+        );
+        assert!(matches!(error, super::CloseRetirementError::Message(_)));
+        assert!(!error.to_string().contains("private database details"));
+    }
+
+    #[test]
+    fn final_tombstone_observation_prefers_quarantine_then_private_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let root = temp.path().join("final");
+        std::fs::create_dir(&root).unwrap();
+        let tombstone = CloseWorktreeFinalTombstone {
+            root: root.clone(),
+            device: 0,
+            inode: 0,
+            object_device: None,
+            object_inode: None,
+        };
+        assert_eq!(
+            super::final_tombstone_observation_path(&tombstone, &quarantine).unwrap(),
+            None
+        );
+        std::fs::create_dir(root.join("object")).unwrap();
+        assert_eq!(
+            super::final_tombstone_observation_path(&tombstone, &quarantine).unwrap(),
+            Some(root.join("object"))
+        );
+        std::fs::create_dir(&quarantine).unwrap();
+        assert_eq!(
+            super::final_tombstone_observation_path(&tombstone, &quarantine).unwrap(),
+            Some(quarantine)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_tombstone_observation_failure_keeps_exact_scope() {
+        use crate::work_scope::WorkScopeId;
+        let temp = tempfile::tempdir().unwrap();
+        let blocked = temp.path().join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let tombstone = CloseWorktreeFinalTombstone {
+            root: blocked,
+            device: 0,
+            inode: 0,
+            object_device: None,
+            object_inode: None,
+        };
+        let scope = WorkScopeId::parse("second-scope").unwrap();
+        let error =
+            super::final_tombstone_observation_path(&tombstone, &temp.path().join("absent"))
+                .map_err(|message| super::CloseRetirementError::ScopedMessage {
+                    scope: scope.clone(),
+                    message,
+                })
+                .unwrap_err();
+        assert_eq!(error.scope(), Some(&scope));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn retained_quarantine_retry(conflicting_incarnation: bool) {
+        use super::{CloseAttemptId, ClosePhase, CloseRetirementError, RuntimeManager};
+        use crate::db::{
+            CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
+            RecordCloseRetirementDispatchRequest, RecordCloseWorktreeCleanupPlanRequest,
+        };
+        use phoenix_core::domain::close::TranscriptConversationId;
+        use phoenix_core::domain::close::{
+            CapturedWorktreeIdentity, CloseOwnedResourceInventory, LossItemIdentity,
+            RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
+        };
+        use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
+        use std::sync::Arc;
+
+        let manager = RuntimeManager::new(
+            crate::db::Database::open_in_memory().await.unwrap(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let linked = temp.path().join("linked");
+        initialize_repository(&repository);
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "close-test",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let mode = ConvMode::Work {
+            branch_name: NonEmptyString::new("close-test").unwrap(),
+            worktree_path: NonEmptyString::new(linked.to_str().unwrap()).unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("close-test").unwrap(),
+            task_title: NonEmptyString::new("Close test").unwrap(),
+        };
+        let conversation = manager
+            .db()
+            .create_conversation_with_project(
+                "quarantine-retry",
+                "quarantine-retry",
+                linked.to_str().unwrap(),
+                true,
+                None,
+                None,
+                None,
+                &mode,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let attempt = CloseAttemptId::parse("quarantine-retry-attempt").unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse("quarantine-retry").unwrap(),
+                attempt.as_str(),
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .confirm_close_stop_work(attempt.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt.as_str())
+            .await
+            .unwrap();
+        let source_snapshot = manager
+            .inspect_close_retirement_only(attempt.clone())
+            .await
+            .unwrap();
+        let captured = manager
+            .db()
+            .list_close_attempt_scopes(attempt.as_str())
+            .await
+            .unwrap()
+            .remove(0);
+        let Some(CapturedWorktreeIdentity::Resolved(identity)) = captured.captured_worktree else {
+            panic!("test worktree identity must be resolved");
+        };
+        let scope = captured.scope;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(identity.clone()),
+        )
+        .unwrap();
+        let administrative_dir = exact_worktree_administrative_dir(
+            &linked,
+            &super::exact_worktree_common_git_dir(&linked).unwrap(),
+        )
+        .unwrap();
+        let mut incarnation = observe_administrative_dir_incarnation(&administrative_dir).unwrap();
+        if conflicting_incarnation {
+            incarnation.push_str("-conflict");
+        }
+        let inventory = || CloseOwnedResourceInventory {
+            worktree: Some(identity.clone()),
+            work_scopes: Default::default(),
+            bash_process_groups: Default::default(),
+            tmux_servers: Default::default(),
+            pty_sessions: Default::default(),
+            browser_sessions: Default::default(),
+            equivalent_live_resources: Default::default(),
+        };
+        manager
+            .db()
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: source_snapshot.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: inventory(),
+                }],
+            })
+            .await
+            .unwrap();
+        manager
+            .db()
+            .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                attempt_id: attempt.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+            })
+            .await
+            .unwrap();
+        manager
+            .db()
+            .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+                attempt_id: attempt.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+                administrative_dir: administrative_dir.clone(),
+                administrative_dir_incarnation: incarnation,
+            })
+            .await
+            .unwrap();
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        std::fs::rename(&linked, &quarantine).unwrap();
+        manager
+            .route_close_attempt_to_repair::<()>(
+                &attempt,
+                &scope,
+                RetirementFailureReason::ManualRepairRequired,
+                "interrupted quarantine",
+            )
+            .await
+            .unwrap_err();
+        manager.db().retry_close_retirement(&attempt).await.unwrap();
+        let target_snapshot = manager
+            .inspect_close_retirement_only(attempt.clone())
+            .await
+            .unwrap();
+        assert_ne!(target_snapshot.generation(), source_snapshot.generation());
+        assert!(manager
+            .db()
+            .close_worktree_cleanup_plan(&attempt, &scope, &target_snapshot, &resource)
+            .await
+            .unwrap()
+            .is_none());
+        manager
+            .db()
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: target_snapshot.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: inventory(),
+                }],
+            })
+            .await
+            .unwrap();
+        let result = manager
+            .retire_close_worktrees_and_scopes(&attempt, &target_snapshot)
+            .await;
+        if conflicting_incarnation {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                &error,
+                CloseRetirementError::EvidenceInvariant { .. }
+            ));
+            assert_eq!(error.scope(), Some(&scope));
+            assert_eq!(
+                manager
+                    .db()
+                    .get_close_obligation(attempt.as_str())
+                    .await
+                    .unwrap()
+                    .phase(),
+                ClosePhase::NeedsRepair
+            );
+            assert!(quarantine.exists());
+            assert!(administrative_dir.exists());
+            assert!(manager
+                .db()
+                .close_worktree_cleanup_plan(&attempt, &scope, &target_snapshot, &resource)
+                .await
+                .unwrap()
+                .is_none());
+        } else {
+            result.unwrap();
+            let plan = manager
+                .db()
+                .close_worktree_cleanup_plan(&attempt, &scope, &target_snapshot, &resource)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.administrative_dir, administrative_dir);
+            assert!(!quarantine.exists());
+            assert!(!administrative_dir.exists());
+            let adoptions: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1",
+            )
+            .bind(attempt.as_str())
+            .fetch_one(manager.db().pool())
+            .await
+            .unwrap();
+            assert_eq!(adoptions, 1);
+            manager
+                .retire_close_worktrees_and_scopes(&attempt, &target_snapshot)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_adopts_exact_retained_quarantine_plan_across_retry_generation() {
+        retained_quarantine_retry(false).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_adoption_conflict_routes_exact_scope_to_durable_repair_without_deletion() {
+        retained_quarantine_retry(true).await;
     }
 
     #[test]
@@ -6560,7 +7319,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_treats_same_user_nondumpable_process_as_observational() {
+    fn cwd_scan_rejects_same_user_nondumpable_process_unreadability() {
         let temp = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -6611,8 +7370,8 @@ mod tests {
         drop(child.stdin.take());
         child.wait().unwrap();
         assert!(
-            scan.is_ok(),
-            "same-user nondumpable process unreadability must remain observational: {scan:?}"
+            scan != Ok(false),
+            "same-user nondumpable process unreadability must not prove clean: {scan:?}"
         );
     }
 
@@ -6684,28 +7443,211 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn cwd_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
+    fn cwd_fixture_stat(process: &Path, start_time: u64) {
+        std::fs::write(
+            process.join("stat"),
+            format!(
+                "123 (test ) command) S {} {start_time}\n",
+                ["0"; 18].join(" ")
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cwd_fixture_task(process: &Path, tid: &str, cwd: &Path) {
+        let task = process.join("task").join(tid);
+        std::fs::create_dir_all(&task).unwrap();
+        std::os::unix::fs::symlink(cwd, task.join("cwd")).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cwd_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
-        let unreadable_status = proc_root.join("1");
-        let unreadable_cwd = proc_root.join("2");
-        let writer = proc_root.join("3");
-        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
-        std::fs::create_dir_all(&unreadable_cwd).unwrap();
-        std::fs::create_dir_all(&writer).unwrap();
+        let process = proc_root.join("123");
+        std::fs::create_dir_all(&process).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(
-            unreadable_cwd.join("status"),
-            "Name:\ttest\nUid:\t1\t1\t1\t1\n",
-        )
-        .unwrap();
-        std::fs::write(unreadable_cwd.join("cwd"), b"not a symlink").unwrap();
-        std::fs::write(writer.join("status"), "Name:\twriter\nUid:\t1\t1\t1\t1\n").unwrap();
-        std::os::unix::fs::symlink(quarantine.join("nested"), writer.join("cwd")).unwrap();
+        let quarantine = std::fs::canonicalize(quarantine).unwrap();
+        std::fs::write(process.join("status"), "Uid:\t1\t1\t1\t1\n").unwrap();
+        cwd_fixture_stat(&process, 42);
+        cwd_fixture_task(&process, "123", temp.path());
+        std::os::unix::fs::symlink(temp.path(), process.join("cwd")).unwrap();
+        (temp, quarantine, proc_root, process)
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_finds_nonleader_task_inside_with_leader_outside() {
+        let (_temp, quarantine, proc_root, process) = cwd_fixture();
+        cwd_fixture_task(&process, "124", &quarantine.join("nested"));
         assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_accepts_stable_outside_task_inventory() {
+        let (temp, quarantine, proc_root, process) = cwd_fixture();
+        cwd_fixture_task(&process, "124", temp.path());
+        assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_unreadable_missing_and_empty_task_inventory() {
+        for inventory in ["unreadable", "missing", "empty"] {
+            let (_temp, quarantine, proc_root, process) = cwd_fixture();
+            std::fs::remove_dir_all(process.join("task")).unwrap();
+            match inventory {
+                "unreadable" => std::fs::write(process.join("task"), "not a directory").unwrap(),
+                "empty" => std::fs::create_dir(process.join("task")).unwrap(),
+                _ => {}
+            }
+            assert!(
+                super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).is_err(),
+                "{inventory}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_task_cwd_read_errors_for_live_incarnation() {
+        for missing in [true, false] {
+            let (_temp, quarantine, proc_root, process) = cwd_fixture();
+            let cwd = process.join("task/123/cwd");
+            std::fs::remove_file(&cwd).unwrap();
+            if !missing {
+                std::fs::write(cwd, "not a symlink").unwrap();
+            }
+            assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_task_set_race() {
+        for add in [true, false] {
+            let (temp, quarantine, proc_root, process) = cwd_fixture();
+            cwd_fixture_task(&process, "124", temp.path());
+            let scan = super::linux_namespace_cwd_scan(&quarantine, &proc_root, 1, |process| {
+                if add {
+                    cwd_fixture_task(process, "125", &quarantine);
+                } else {
+                    std::fs::remove_dir_all(process.join("task/124")).unwrap();
+                }
+            });
+            assert!(scan
+                .unwrap_err()
+                .to_string()
+                .contains("task inventory changed"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_unreadable_second_task_inventory() {
+        let (_temp, quarantine, proc_root, _process) = cwd_fixture();
+        let scan = super::linux_namespace_cwd_scan(&quarantine, &proc_root, 1, |process| {
+            std::fs::remove_dir_all(process.join("task")).unwrap();
+            std::fs::write(process.join("task"), "not a directory").unwrap();
+        });
+        assert!(scan.unwrap_err().to_string().contains("enumerate tasks"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_revalidates_pid_incarnation_on_clean_and_error_paths() {
+        for unreadable in [true, false] {
+            let (_temp, quarantine, proc_root, process) = cwd_fixture();
+            if unreadable {
+                std::fs::remove_dir_all(process.join("task")).unwrap();
+            }
+            let scan = super::linux_namespace_cwd_scan(&quarantine, &proc_root, 1, |process| {
+                cwd_fixture_stat(process, 43);
+            });
+            assert!(scan
+                .unwrap_err()
+                .to_string()
+                .contains("process incarnation changed"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_accepts_proven_process_disappearance_on_clean_and_error_paths() {
+        for unreadable in [true, false] {
+            let (_temp, quarantine, proc_root, process) = cwd_fixture();
+            if unreadable {
+                std::fs::remove_dir_all(process.join("task")).unwrap();
+            }
+            let scan = super::linux_namespace_cwd_scan(&quarantine, &proc_root, 1, |process| {
+                std::fs::remove_dir_all(process).unwrap();
+            });
+            assert_eq!(scan.unwrap(), super::LinuxNamespaceCwdEvidence::Clean);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_never_treats_missing_stat_leaf_as_process_disappearance() {
+        let (_temp, quarantine, proc_root, process) = cwd_fixture();
+        std::fs::remove_file(process.join("stat")).unwrap();
+        assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_missing_unreadable_or_malformed_credentials() {
+        for status in [None, Some("malformed"), Some("directory")] {
+            let (_temp, quarantine, proc_root, process) = cwd_fixture();
+            std::fs::remove_file(process.join("status")).unwrap();
+            match status {
+                Some("directory") => std::fs::create_dir(process.join("status")).unwrap(),
+                Some(status) => std::fs::write(process.join("status"), status).unwrap(),
+                None => {}
+            }
+            assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_unavailable_process_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let proc_root = temp.path().join("proc");
+        assert!(super::quarantine_has_process_cwd_in(temp.path(), &proc_root, 1).is_err());
+        std::fs::write(&proc_root, "not a directory").unwrap();
+        assert!(super::quarantine_has_process_cwd_in(temp.path(), &proc_root, 1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_missing_stat_during_clean_revalidation() {
+        let (_temp, quarantine, proc_root, _process) = cwd_fixture();
+        let scan = super::linux_namespace_cwd_scan(&quarantine, &proc_root, 1, |process| {
+            std::fs::remove_file(process.join("stat")).unwrap();
+        });
+        assert!(scan
+            .unwrap_err()
+            .to_string()
+            .contains("read process incarnation"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_malformed_process_incarnation() {
+        for stat in ["missing delimiter", "123 (test) S", "123 (test) S 0 0"] {
+            let (_temp, quarantine, proc_root, process) = cwd_fixture();
+            std::fs::write(process.join("stat"), stat).unwrap();
+            assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).is_err());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -6738,14 +7680,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_and_mapping_scans_treat_unavailable_proc_inventory_as_no_evidence() {
+    fn cwd_scan_rejects_unavailable_proc_inventory_while_mapping_scan_remains_observational() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(&proc_root, b"not a proc directory").unwrap();
 
-        assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
+        assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).is_err());
         assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
     }
 
