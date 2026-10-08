@@ -316,7 +316,11 @@ fn previous_cursor_target(target: &str) -> String {
 }
 
 fn bounded_transcript_ref(id: &str) -> String {
-    if id.len() <= 256 {
+    if id.len() <= 256
+        && id
+            .chars()
+            .all(|character| !character.is_whitespace() && character != '#')
+    {
         format!("@transcript:{id}")
     } else {
         format!("@transcript-sha256:{}", sha256_hex(id))
