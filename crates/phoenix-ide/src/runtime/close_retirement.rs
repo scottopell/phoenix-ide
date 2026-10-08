@@ -4419,42 +4419,11 @@ fn linux_cwd_open_directory(path: &Path) -> Result<std::fs::File, LinuxCwdScanEr
 }
 
 #[cfg(target_os = "linux")]
-fn linux_cwd_mount_identity(directory: &std::fs::File) -> Result<u64, LinuxCwdScanError> {
-    use std::os::fd::AsRawFd as _;
-
-    let mut metadata = std::mem::MaybeUninit::<libc::statx>::uninit();
-    // SAFETY: directory is live, the empty path is NUL-terminated, and metadata is writable.
-    if unsafe {
-        libc::statx(
-            directory.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
-            libc::STATX_MNT_ID,
-            metadata.as_mut_ptr(),
-        )
-    } < 0
-    {
-        return Err(LinuxCwdScanError::Indeterminate(format!(
-            "read cwd mount identity: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: statx initialized metadata on success.
-    let metadata = unsafe { metadata.assume_init() };
-    if metadata.stx_mask & libc::STATX_MNT_ID == 0 {
-        return Err(LinuxCwdScanError::Indeterminate(
-            "cwd mount identity is unavailable".to_string(),
-        ));
-    }
-    Ok(metadata.stx_mnt_id)
-}
-
-#[cfg(target_os = "linux")]
 #[derive(Debug, Eq, PartialEq)]
 struct LinuxCwdObservation {
     path: std::path::PathBuf,
     ancestry: Vec<LinuxCwdDirectoryIdentity>,
-    mount: u64,
+    device: u64,
     evidence: LinuxNamespaceCwdEvidence,
 }
 
@@ -4490,8 +4459,7 @@ fn linux_cwd_observe(
     }
     let mut directory = linux_cwd_open_directory(cwd)?;
     let identity = linux_cwd_directory_identity(&directory)?;
-    let mount = linux_cwd_mount_identity(&directory)?;
-    let target_mount = linux_cwd_mount_identity(&linux_cwd_open_directory(canonical)?)?;
+    let device = identity.device;
     let mut ancestry = vec![identity];
     loop {
         // SAFETY: directory is an owned directory descriptor and the literal is NUL-terminated.
@@ -4533,16 +4501,14 @@ fn linux_cwd_observe(
         )));
     }
     let after = linux_cwd_open_directory(cwd)?;
-    if linux_cwd_directory_identity(&after)? != identity
-        || linux_cwd_mount_identity(&after)? != mount
-    {
+    if linux_cwd_directory_identity(&after)? != identity {
         return Err(LinuxCwdScanError::Indeterminate(format!(
             "task cwd changed while reading {}",
             cwd.display()
         )));
     }
     let evidence = linux_cwd_classify(&path, canonical, target, &ancestry);
-    if evidence == LinuxNamespaceCwdEvidence::Clean && mount != target_mount {
+    if evidence == LinuxNamespaceCwdEvidence::Clean && device != target.device {
         return Err(LinuxCwdScanError::Indeterminate(
             "cwd is on another mount; a bind-mounted descendant cannot be excluded".to_string(),
         ));
@@ -4550,7 +4516,7 @@ fn linux_cwd_observe(
     Ok(LinuxCwdObservation {
         path,
         ancestry,
-        mount,
+        device,
         evidence,
     })
 }
