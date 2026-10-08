@@ -18001,7 +18001,8 @@ mod wake_handler_tests {
     #[tokio::test]
     async fn peer_import_requires_owner_authentication() {
         use phoenix_core::domain::instance_identity::InstanceId;
-        let state = hard_delete_cascade_tests::make_test_state().await;
+        let mut state = hard_delete_cascade_tests::make_test_state().await;
+        state.password = Some("owner-password".to_string());
         let local = state.db.instance_id().await.unwrap();
         let body = serde_json::json!({
             "peer_display_name": "peer",
@@ -18013,7 +18014,7 @@ mod wake_handler_tests {
                 "tls_trust": { "kind": "platform_roots" },
             }
         });
-        let app = router(state, true, Some("owner-password".to_string()));
+        let app = create_router(state);
 
         let unauthorized = app
             .clone()

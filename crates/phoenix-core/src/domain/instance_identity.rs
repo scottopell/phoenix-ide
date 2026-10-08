@@ -239,10 +239,10 @@ impl PeerCaCertificatePem {
             return Err(PeerCaCertificatePemError::TooLarge);
         }
         let trimmed = value.trim();
-        if !trimmed.starts_with("-----BEGIN CERTIFICATE-----")
-            || !trimmed.ends_with("-----END CERTIFICATE-----")
-            || trimmed["-----BEGIN CERTIFICATE-----".len()..].contains("-----BEGIN ")
-        {
+        let Some(after_begin) = trimmed.strip_prefix("-----BEGIN CERTIFICATE-----") else {
+            return Err(PeerCaCertificatePemError::CertificateCount);
+        };
+        if !trimmed.ends_with("-----END CERTIFICATE-----") || after_begin.contains("-----BEGIN ") {
             return Err(PeerCaCertificatePemError::CertificateCount);
         }
         let certificates = rustls_pki_types::CertificateDer::pem_slice_iter(trimmed.as_bytes())
@@ -251,9 +251,12 @@ impl PeerCaCertificatePem {
         if certificates.len() != 1 {
             return Err(PeerCaCertificatePemError::CertificateCount);
         }
+        let [certificate]: [_; 1] = certificates
+            .try_into()
+            .map_err(|_| PeerCaCertificatePemError::CertificateCount)?;
         let mut roots = rustls::RootCertStore::empty();
         roots
-            .add(certificates.into_iter().next().expect("length checked"))
+            .add(certificate)
             .map_err(|_| PeerCaCertificatePemError::Invalid)?;
         Ok(Self(format!("{trimmed}\n")))
     }
