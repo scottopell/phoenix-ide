@@ -566,7 +566,9 @@ rule TokenRefreshNeeded {
         -- DELETE authorization rejection also admits OAuth cleanup ownership
         -- after a non-auth handshake failure. Merge required scopes from both
         -- failures and retain the latest supplied discovery metadata when
-        -- later challenges omit it.
+        -- later challenges omit it. Carry the merged challenge through both
+        -- immediate and background successful-refresh connection continuations.
+        -- Clear inherited challenges when reconnecting a changed configuration.
         -- Successful teardown does not end ownership when refresh or token
         -- persistence fails transiently: retain the closed transport as the
         -- recovery owner and retry through the same fenced path.

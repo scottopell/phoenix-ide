@@ -171,3 +171,7 @@ replacement discovery metadata and scope preservation.
 retention and scope union through immediate and background grant rejection.
 Both clean and failed replacement teardown preserve initial discovery metadata
 when replacement challenges omit it.
+
+`retained_refresh_continuation_preserves_discovery_and_scopes` verifies the
+immediate and background successful-refresh continuations, including clean and
+failed replacement teardown, inherit discovery metadata and required scopes.

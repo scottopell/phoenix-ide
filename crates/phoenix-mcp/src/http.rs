@@ -1416,6 +1416,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new())),
             Arc::default(),
             crate::OAuthHandshakeAction::Refresh,
+            None,
         )
         .await
         .map_err(|failure| failure.message)
@@ -2534,6 +2535,7 @@ mod tests {
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
             crate::OAuthHandshakeAction::Refresh,
+            None,
         )
         .await
         .map_err(|failure| failure.message)
@@ -4080,7 +4082,7 @@ mod tests {
             .await;
         assert!(matches!(outcome, crate::RefreshServerOutcome::Refreshed));
         manager
-            .finish_oauth_refresh("remote", &handle, &permit, outcome)
+            .finish_oauth_refresh("remote", &handle, &permit, outcome, None)
             .await
             .unwrap();
         assert!(handle.snapshot().is_ready());
@@ -4388,7 +4390,7 @@ mod tests {
         replacement[2] = unauthorized(&server);
         server.push_responses(replacement);
         assert!(manager
-            .finish_oauth_refresh("remote", &handle, &permit, outcome)
+            .finish_oauth_refresh("remote", &handle, &permit, outcome, None)
             .await
             .is_err());
         assert_eq!(
@@ -4665,6 +4667,117 @@ mod tests {
             assert!(!server.recorded_for_path("/primary-metadata").is_empty());
             server.push_responses(vec![delete_ack()]);
             manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Four refresh/teardown cases share the discovery fixture.
+    async fn retained_refresh_continuation_preserves_discovery_and_scopes() {
+        for transient in [false, true] {
+            for failed_replacement_teardown in [false, true] {
+                let server = TestServer::start(vec![]).await;
+                let challenge = format!(
+                    "Bearer resource_metadata=\"{}/original-metadata\", scope=\"mcp.write\"",
+                    server.base()
+                );
+                let mut initial = handshake_responses("sess-1");
+                initial[2] = status_response(401, &[("www-authenticate", &challenge)]);
+                server.push_responses(initial);
+                server.push_responses(vec![
+                    status_response(401, &[("www-authenticate", "Bearer scope=\"mcp.cleanup\"")]),
+                    delete_ack(),
+                ]);
+                if failed_replacement_teardown {
+                    let mut replacement = handshake_responses("sess-2");
+                    replacement[2] =
+                        status_response(401, &[("www-authenticate", "Bearer scope=\"mcp.extra\"")]);
+                    server.push_responses(replacement);
+                    server.push_responses(vec![status_response(500, &[])]);
+                } else {
+                    server.push_responses(vec![status_response(
+                        401,
+                        &[("www-authenticate", "Bearer scope=\"mcp.extra\"")],
+                    )]);
+                }
+                install_oauth_discovery(&server, true);
+                server.route(
+                    "/.well-known/oauth-protected-resource/mcp",
+                    status_response(404, &[]),
+                );
+                server.route("/original-metadata",json_doc(&serde_json::json!({"resource":server.url,"authorization_servers":[server.base()],"scopes_supported":["mcp.read"]})));
+                server.route_seq(
+                    "/token",
+                    if transient {
+                        vec![
+                            status_response(503, &[]),
+                            token_response("at-2", Some("rt-2"), None),
+                        ]
+                    } else {
+                        vec![token_response("at-2", Some("rt-2"), None)]
+                    },
+                );
+                let manager = McpClientManager::new();
+                manager.set_oauth_redirect_base(REDIRECT_BASE.into());
+                manager
+                    .oauth
+                    .store()
+                    .upsert_registration(&none_registration(&server.base()))
+                    .await
+                    .unwrap();
+                manager
+                    .oauth
+                    .store()
+                    .upsert_token(&stored_token(
+                        &server,
+                        "at-1",
+                        Some("rt-1"),
+                        &["mcp.read"],
+                        1,
+                    ))
+                    .await
+                    .unwrap();
+                manager
+                    .reload_from_configs(vec![(
+                        "remote".into(),
+                        http_config(&server.url, HttpAuth::None),
+                    )])
+                    .await;
+                tokio::time::timeout(Duration::from_secs(15), manager.await_background_tasks())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    manager.status().await[0].state,
+                    crate::McpConnState::Unauthorized
+                );
+                let params = query_params(&pending_auth_url(&manager).await.unwrap());
+                assert_eq!(
+                    params["scope"]
+                        .split_whitespace()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    ["mcp.read", "mcp.write", "mcp.cleanup", "mcp.extra"]
+                        .into_iter()
+                        .collect()
+                );
+                assert_eq!(
+                    server.recorded_for_path("/token").len(),
+                    if transient { 2 } else { 1 }
+                );
+                assert!(server.recorded_for_path("/original-metadata").len() >= 2);
+                let deletes: Vec<_> = server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.http_method() == "DELETE")
+                    .map(|request| request.header("authorization").map(str::to_owned))
+                    .collect();
+                assert_eq!(deletes[0], Some("Bearer at-1".into()));
+                assert!(deletes[1..]
+                    .iter()
+                    .all(|bearer| bearer.as_deref() == Some("Bearer at-2")));
+                server.push_responses(vec![delete_ack()]);
+                manager.shutdown().await;
+            }
         }
     }
 
@@ -5865,6 +5978,7 @@ mod tests {
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
             crate::OAuthHandshakeAction::Refresh,
+            None,
         )
         .await
         .expect("connect with restored token");
@@ -5934,6 +6048,7 @@ mod tests {
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
             crate::OAuthHandshakeAction::Refresh,
+            None,
         )
         .await
         .expect("connect with restored token");

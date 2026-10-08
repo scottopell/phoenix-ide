@@ -2591,6 +2591,7 @@ impl McpClientManager {
                     &handle,
                     epoch,
                     OAuthHandshakeAction::Refresh,
+                    None,
                 )
                 .await;
         })
@@ -2603,12 +2604,20 @@ impl McpClientManager {
         handle: &'a SupervisorHandle,
         epoch: u64,
         action: OAuthHandshakeAction,
+        prior_challenge: Option<&'a str>,
     ) -> futures::future::BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let pending = &self.pending_oauth_urls;
             let oauth = &self.oauth;
-            match Self::connect_one(name, config, Arc::clone(pending), Arc::clone(oauth), action)
-                .await
+            match Self::connect_one(
+                name,
+                config,
+                Arc::clone(pending),
+                Arc::clone(oauth),
+                action,
+                prior_challenge,
+            )
+            .await
             {
                 Ok(server) => {
                     if handle.publish(epoch, server).await {
@@ -2723,6 +2732,7 @@ impl McpClientManager {
                     handle,
                     epoch,
                     OAuthHandshakeAction::Authorize,
+                    plan.www_authenticate.as_deref(),
                 )
                 .await
             }
@@ -3215,8 +3225,14 @@ impl McpClientManager {
                     );
                     return Err(McpToolCallError::Failed(error));
                 }
-                self.finish_oauth_refresh(server_name, handle, &permit, outcome)
-                    .await
+                self.finish_oauth_refresh(
+                    server_name,
+                    handle,
+                    &permit,
+                    outcome,
+                    www_authenticate.as_deref(),
+                )
+                .await
             }
             OAuthRecoveryKind::StepUp { www_authenticate } => {
                 if let Err(error) = self
@@ -3264,6 +3280,7 @@ impl McpClientManager {
                         &permit,
                         outcome,
                         action,
+                        www_authenticate.as_deref(),
                     )
                     .await;
                 return;
@@ -3277,6 +3294,7 @@ impl McpClientManager {
         handle: &SupervisorHandle,
         permit: &RecoveryPermit,
         outcome: RefreshServerOutcome,
+        prior_challenge: Option<&str>,
     ) -> Result<(), McpToolCallError> {
         self.finish_oauth_refresh_with_action(
             server_name,
@@ -3284,6 +3302,7 @@ impl McpClientManager {
             permit,
             outcome,
             OAuthHandshakeAction::Refresh,
+            prior_challenge,
         )
         .await
     }
@@ -3295,6 +3314,7 @@ impl McpClientManager {
         permit: &RecoveryPermit,
         outcome: RefreshServerOutcome,
         action: OAuthHandshakeAction,
+        prior_challenge: Option<&str>,
     ) -> Result<(), McpToolCallError> {
         let gate = self.oauth.mutation_gate(server_name);
         let _mutations = gate.lock().await;
@@ -3314,7 +3334,7 @@ impl McpClientManager {
                     self.remove_current_handle(server_name, handle).await;
                     return Ok(());
                 }
-                let (config, epoch) = if let RecoveryTarget::Reconfigure(config) =
+                let (config, epoch, prior_challenge) = if let RecoveryTarget::Reconfigure(config) =
                     handle.snapshot().recovery_target
                 {
                     self.invalidate_oauth_on_config_change(server_name, &permit.config, &config)
@@ -3323,13 +3343,20 @@ impl McpClientManager {
                         .reconfigure(config.clone())
                         .await
                         .map_err(McpToolCallError::Failed)?;
-                    (config, epoch)
+                    (config, epoch, None)
                 } else {
-                    (permit.config.clone(), permit.epoch)
+                    (permit.config.clone(), permit.epoch, prior_challenge)
                 };
-                self.connect_actor_owned(server_name, &config, handle, epoch, action)
-                    .await
-                    .map_err(McpToolCallError::Failed)
+                self.connect_actor_owned(
+                    server_name,
+                    &config,
+                    handle,
+                    epoch,
+                    action,
+                    prior_challenge,
+                )
+                .await
+                .map_err(McpToolCallError::Failed)
             }
             RefreshServerOutcome::Reprompt(error)
             | RefreshServerOutcome::Transient(error)
@@ -3662,6 +3689,7 @@ impl McpClientManager {
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
         oauth_rt: Arc<OAuthRuntime>,
         action: OAuthHandshakeAction,
+        prior_challenge: Option<&str>,
     ) -> Result<McpServer, ConnectFailure> {
         // A pre-configured client (Claude Code's `oauth` shape) is seeded only
         // once discovery resolves the authorization server's issuer, since the
@@ -3734,7 +3762,7 @@ impl McpClientManager {
             return Err(failure.into_connect_failure(
                 Some(server),
                 OAuthHandshakeAction::Refresh,
-                None,
+                prior_challenge,
             ));
         }
         let HandshakeFailure::Unauthorized {
@@ -3744,6 +3772,11 @@ impl McpClientManager {
         else {
             return Err(failure.to_string().into());
         };
+        www_authenticate = merge_oauth_challenges(
+            [prior_challenge, www_authenticate.as_deref()]
+                .into_iter()
+                .flatten(),
+        );
         // StaticAuthRejected: there is no interactive flow to recover a
         // rejected config credential into (REQ-MCP-008). Stdio cannot 401.
         let Some(url) = oauth_resource_url(entry) else {
@@ -5581,6 +5614,7 @@ for line in sys.stdin:
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
             crate::OAuthHandshakeAction::Refresh,
+            None,
         )
         .await
         .expect("connect fixture");
