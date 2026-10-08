@@ -947,10 +947,16 @@ impl ModelRegistry {
         {
             Self::observe_codex_catalog(spec, codex_catalog);
             let cred = config.codex_credential.as_ref()?;
-            let bound_cred = Arc::new(AccountBoundCodexCredential::new(
-                Arc::clone(cred),
-                cred.account_id(),
-            ));
+            let bound_cred = cred.account_id().and_then(|account_id| {
+                AccountBoundCodexCredential::new(Arc::clone(cred), account_id)
+            });
+            let Some(bound_cred) = bound_cred else {
+                tracing::warn!(
+                    "Codex account ID is unavailable; withholding account-scoped models"
+                );
+                return None;
+            };
+            let bound_cred = Arc::new(bound_cred);
             let auth = LlmAuth::new(
                 Arc::clone(&bound_cred) as Arc<dyn CredentialSource>,
                 AuthStyle::PlainBearer,
@@ -1635,11 +1641,16 @@ impl ModelRegistry {
     ) -> CodexReloadOutcome {
         let mut new_codex_services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut new_codex_specs: HashMap<String, super::ModelSpec> = HashMap::new();
-        if let Some((cred, account_id)) = cred_with_account {
-            let bound_cred = Arc::new(AccountBoundCodexCredential::new(
-                Arc::clone(cred),
-                account_id.clone(),
-            ));
+        let bound_cred = cred_with_account.and_then(|(cred, account_id)| {
+            account_id
+                .as_ref()
+                .and_then(|id| AccountBoundCodexCredential::new(Arc::clone(cred), id.clone()))
+        });
+        if cred_with_account.is_some() && bound_cred.is_none() {
+            tracing::warn!("Codex account ID is unavailable; withholding account-scoped models");
+        }
+        if let Some(bound_cred) = bound_cred {
+            let bound_cred = Arc::new(bound_cred);
             for spec in Self::model_specs(&self.config) {
                 if !Self::is_codex_bridge_model(&spec) {
                     continue;
@@ -2564,6 +2575,65 @@ mod tests {
         )
         .unwrap();
         crate::CodexCredential::load(path).unwrap().0
+    }
+
+    #[test]
+    fn missing_codex_account_withholds_startup_and_reload_bridge_services() {
+        for account_id in [None, Some(""), Some(" \t\n")] {
+            assert_unidentified_codex_account_withheld(account_id);
+        }
+    }
+
+    fn assert_unidentified_codex_account_withheld(account_id: Option<&str>) {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing-account.json");
+        std::fs::write(
+            &missing_path,
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "x", "refresh_token": "r", "account_id": account_id},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let missing = crate::CodexCredential::load(missing_path.clone()).unwrap();
+        assert_eq!(missing.1.as_deref(), account_id);
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(Arc::clone(&missing.0)),
+            openai_api_key: Some("test-key".into()),
+            external_models: vec![external_openai_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(registry.get("gpt-6-astra").is_none());
+        assert!(registry.get("openai-compatible/custom").is_some());
+        let known = (fake_codex_credential(&dir), Some("acc-1".to_string()));
+        registry.reload_codex_credential_snapshot(
+            Some(dir.path().join("auth.json")),
+            Some(&known),
+            None,
+        );
+        let known_route = registry
+            .get("gpt-6-astra")
+            .unwrap()
+            .continuation_route_key();
+        registry.reload_codex_credential_snapshot(Some(missing_path), Some(&missing), None);
+        assert!(registry.get("gpt-6-astra").is_none());
+        assert!(registry.get("gpt-6.1-sol").is_none());
+        assert!(registry.get("openai-compatible/custom").is_some());
+        registry.reload_codex_credential_snapshot(
+            Some(dir.path().join("auth.json")),
+            Some(&known),
+            None,
+        );
+        assert_eq!(
+            registry
+                .get("gpt-6-astra")
+                .unwrap()
+                .continuation_route_key(),
+            known_route
+        );
     }
 
     fn external_openai_model() -> super::super::ModelSpec {

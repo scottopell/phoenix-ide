@@ -2501,6 +2501,10 @@ impl WorkflowRepository {
             conversation_id,
         } = settlement
         {
+            sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
                 .bind(conversation_id)
                 .execute(tx)
