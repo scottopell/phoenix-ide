@@ -137,6 +137,8 @@ impl Database {
         if previous_kind != crate::conv_state_kind(state) {
             crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
         }
+        crate::coordinator_watches::record_question_wait_tx(&mut tx, conversation_id, state)
+            .await?;
         apply_replay_tx(&mut tx, conversation_id, update).await?;
         tx.commit().await?;
         Ok(())
@@ -171,6 +173,8 @@ impl Database {
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(conversation_id)
             .execute(&mut *tx)
+            .await?;
+        crate::coordinator_watches::record_question_wait_tx(&mut tx, conversation_id, state)
             .await?;
         apply_replay_tx(&mut tx, conversation_id, update).await?;
         tx.commit().await?;
