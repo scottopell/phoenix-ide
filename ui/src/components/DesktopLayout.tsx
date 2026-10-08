@@ -7,7 +7,7 @@ import {
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
-import { api, type Conversation, type ProductConversationListRow, type ProductConversationSnapshotView } from '../api';
+import { ApiResponseError, api, type Conversation, type ProductConversationListRow, type ProductConversationSnapshotView } from '../api';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
@@ -248,6 +248,8 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const routeSlug = slugMatch?.[1] ?? null;
   const productConversationId = productMatch?.[1] ?? routeSlug;
   const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
+  const [productNotFound, setProductNotFound] = useState<string | null>(null);
+  const [validatedPin, setValidatedPin] = useState<{ owner: string; query: string; id: string } | null>(null);
   const [productSnapshotRetry, setProductSnapshotRetry] = useState(0);
   useEffect(() => {
     if (!productConversationId) {
@@ -255,23 +257,32 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       return;
     }
     let cancelled = false;
+    setValidatedPin(null);
     api.getProductConversationSnapshot(productConversationId, { message_limit: 1 })
-      .then((snapshot) => {
+      .then(async (snapshot) => {
+        const pins = new URLSearchParams(location.search).getAll('source_transcript');
+        if (pins.length === 1 && pins[0]) {
+          const selected = await api.getProductConversationSnapshot(pins[0], { message_limit: 1 });
+          if (selected.product_conversation_id === snapshot.product_conversation_id && selected.requested_transcript_row_id === pins[0] && !cancelled) {
+            setValidatedPin({ owner: productConversationId, query: location.search, id: pins[0] });
+          }
+        }
         if (!cancelled) setProductSnapshot({ ownerId: productConversationId, snapshot });
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        if (!cancelled && error instanceof ApiResponseError && error.status === 404) setProductNotFound(productConversationId);
         if (!cancelled) setProductSnapshot(null);
       });
     return () => { cancelled = true; };
-  }, [productConversationId, productSnapshotRetry]);
+  }, [productConversationId, productSnapshotRetry, location.search]);
   const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
-  const exactTranscript = new URLSearchParams(location.search).get('source_transcript');
-  const activeSlug = exactTranscript ?? ownedProductSnapshot?.latest_transcript_row_id ?? routeSlug;
+  const hasPin = new URLSearchParams(location.search).has('source_transcript');
+  const activeSlug = hasPin ? (validatedPin?.owner === productConversationId && validatedPin.query === location.search ? validatedPin.id : null) : ownedProductSnapshot?.latest_transcript_row_id ?? routeSlug;
   const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
   useEffect(() => {
-    if (!productConversationId || ownedProductSnapshot) return;
+    if (!productConversationId || ownedProductSnapshot || productNotFound === productConversationId) return;
     const retry = () => setProductSnapshotRetry((value) => value + 1);
     const timeout = window.setTimeout(retry, 1_000);
     window.addEventListener('online', retry);
@@ -279,7 +290,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       window.clearTimeout(timeout);
       window.removeEventListener('online', retry);
     };
-  }, [ownedProductSnapshot, productConversationId, productSnapshotRetry]);
+  }, [ownedProductSnapshot, productConversationId, productSnapshotRetry, productNotFound]);
 
   useEffect(() => {
     setActiveNotificationConversationSlug(activeSlug);

@@ -26,7 +26,7 @@ describe('Global coordinator tool results', () => {
     );
     expect(screen.getByText('Queued as steering')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/c/product-1');
-    expect(screen.getByRole('link', { name: 'Open receiving transcript' })).toHaveAttribute('href', '/c/transcript-1');
+    expect(screen.getByRole('link', { name: 'Open receiving transcript' })).toHaveAttribute('href', '/c/transcript-1?source_transcript=transcript-1');
     expect(screen.getByText('@conv:product-1')).toBeInTheDocument();
     expect(screen.getByText(/recipient understanding or completion is not implied/i)).toBeInTheDocument();
   });
@@ -44,7 +44,7 @@ describe('Global coordinator tool results', () => {
     expect(screen.getByText('Recipient cannot accept messages in this state')).toBeInTheDocument();
     expect(screen.getByText('message-2')).toBeInTheDocument();
     expect(screen.getByText('invalid_state_for_message')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Open target transcript' })).toHaveAttribute('href', '/c/transcript-2');
+    expect(screen.getByRole('link', { name: 'Open target transcript' })).toHaveAttribute('href', '/c/transcript-2?source_transcript=transcript-2');
     expect(screen.queryByText(/understanding or completion/i)).not.toBeInTheDocument();
   });
 
@@ -90,7 +90,7 @@ describe('Global coordinator tool results', () => {
       </MemoryRouter>,
     );
     expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/c/product-3');
-    expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/transcript-3');
+    expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/transcript-3?source_transcript=transcript-3');
     expect(screen.getByText('product-3')).toBeInTheDocument();
     expect(screen.getByText('Idle')).toBeInTheDocument();
   });

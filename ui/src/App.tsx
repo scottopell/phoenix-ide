@@ -169,11 +169,11 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             if (source.product_conversation_id !== snapshot.product_conversation_id || source.requested_transcript_row_id !== pinned) {
               throw new Error('Transcript is not a member of this conversation');
             }
-            if (!cancelled) setExactMember({ reference, transcript: pinned, open: snapshot.ordinary_lifecycle === 'open' });
+            if (!cancelled) setExactMember({ reference, transcript: pinned, open: snapshot.ordinary_lifecycle === 'open' && pinned === snapshot.latest_transcript_row_id });
             return;
           }
           if (snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
-            setExactMember({ reference, transcript: reference, open: snapshot.ordinary_lifecycle === 'open' });
+            setExactMember({ reference, transcript: reference, open: snapshot.ordinary_lifecycle === 'open' && reference === snapshot.latest_transcript_row_id });
             return;
           }
           setResolvedProduct({ reference, id: snapshot.product_conversation_id });

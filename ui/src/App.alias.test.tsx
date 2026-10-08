@@ -126,7 +126,7 @@ describe('ProductConversationAliasRedirect', () => {
     } as never);
     renderAlias('historical', '/c/historical?source_transcript=historical&source_tool=send#message-source');
     await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'historical', suppressCanonicalization: true }));
+    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'historical', suppressCanonicalization: true, mutationEnabled: false }));
     expect(screen.queryByTestId('product-page')).toBeNull();
   });
 
