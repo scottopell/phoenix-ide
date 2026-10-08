@@ -9438,13 +9438,21 @@ mod scope_liveness_tests {
             .cancel_close_resource_leases(&attempt_id)
             .await
             .unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
         std::fs::write(worktree.join("tracked"), "changed after confirmation\n").unwrap();
         let error = manager
             .retire_close_runtime_resources(attempt_id.clone())
             .await
             .unwrap_err();
         assert_eq!(error.scope(), Some(&scope));
-        assert!(error.to_string().contains("fresh confirmation is required"));
+        assert!(
+            error.to_string().contains("fresh confirmation is required"),
+            "unexpected retirement error: {error}"
+        );
         assert!(manager.close_retirement_leases.lock().await.is_empty());
         let key = ResourceScopeKey::Work(scope);
         manager.terminals.reserve_spawn(&key).unwrap();
@@ -9493,13 +9501,21 @@ mod scope_liveness_tests {
             .cancel_close_resource_leases(&attempt_id)
             .await
             .unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
         std::fs::remove_file(worktree.join(".git")).unwrap();
         let error = manager
             .retire_close_runtime_resources(attempt_id.clone())
             .await
             .unwrap_err();
         assert_eq!(error.scope(), Some(&scope));
-        assert!(error.to_string().contains("worktree cannot be reinspected"));
+        assert!(
+            error.to_string().contains("worktree cannot be reinspected"),
+            "unexpected retirement error: {error}"
+        );
         assert!(manager.close_retirement_leases.lock().await.is_empty());
         let key = ResourceScopeKey::Work(scope);
         manager.terminals.reserve_spawn(&key).unwrap();
