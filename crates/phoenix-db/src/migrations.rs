@@ -12081,15 +12081,14 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
             vec![
-                (118, "persist_mcp_token_removals"),
                 (119, "close_cleanup_failures"),
+                (118, "persist_mcp_token_removals"),
                 (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),
                 (114, "persist_instance_identity"),
                 (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
-                (111, "coordinator_conversation_watches"),
             ]
         );
     }
