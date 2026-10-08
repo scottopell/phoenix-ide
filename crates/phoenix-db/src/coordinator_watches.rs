@@ -276,6 +276,43 @@ pub(crate) async fn record_steering_event_tx(
     .await
 }
 
+pub(crate) async fn record_question_wait_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript_id: &str,
+    state: &ConvState,
+) -> DbResult<()> {
+    let ConvState::AwaitingUserInput {
+        request_authority, ..
+    } = state
+    else {
+        return Ok(());
+    };
+    let Some(request_id) = request_authority.request_id() else {
+        tracing::debug!(transcript_id, "legacy question wait has no durable request identity; not emitting a historical watch event");
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO coordinator_watch_events
+        (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
+         source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
+        SELECT ?1, w.id, 'question_request', ?2, 0, c.id,
+               'awaiting_user_input', 'question_request', ?3
+        FROM conversations c JOIN coordinator_watches w
+          ON w.source_product_conversation_id = c.product_conversation_id
+        WHERE c.id = ?4 AND w.ended_at_us IS NULL
+          AND NOT EXISTS (SELECT 1 FROM coordinator_watch_events e
+            WHERE e.watch_id = w.id AND e.source_occurrence_kind = 'question_request'
+              AND e.source_occurrence_id = ?2 AND e.source_generation = 0)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(request_id.to_string())
+    .bind(chrono::Utc::now().timestamp_micros())
+    .bind(transcript_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn record_summary_failure_tx(
     tx: &mut Transaction<'_, Sqlite>,
     transcript_id: &str,
@@ -478,14 +515,14 @@ mod tests {
             db.pending_coordinator_watch_events(16).await.unwrap().len(),
             2
         );
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM direct_turns WHERE turn_id = ?1")
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
                 .bind(&turn_id)
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_ne!(
-            status, "completed",
+        assert!(
+            terminal.is_none(),
             "waiting must not settle the active turn"
         );
     }

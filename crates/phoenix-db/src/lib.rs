@@ -7422,6 +7422,7 @@ impl Database {
         if previous_kind != conv_state_kind(state) {
             record_initial_execution_outcome_tx(&mut tx, id, state).await?;
         }
+        coordinator_watches::record_question_wait_tx(&mut tx, id, state).await?;
         tx.commit().await?;
         Ok(())
     }
