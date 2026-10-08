@@ -2309,6 +2309,7 @@ impl RuntimeManager {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_message_retriever_and_runtime_env(
         db: Database,
         llm_registry: Arc<ModelRegistry>,

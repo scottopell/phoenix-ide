@@ -2955,6 +2955,7 @@ fn final_tombstone_observation_path(
         .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspect_and_remove_exact_worktree<B>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
@@ -3596,6 +3597,7 @@ where
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
 
     let expected_identity = identity.fingerprint().as_str();
     let captured_path = worktree_path(identity);
@@ -3732,9 +3734,10 @@ where
                                 && observe_worktree_fingerprint(source).as_deref() == Some(expected_identity) => {},
                             _ => return FinalTombstoneRecovery::Residual("final tombstone recovery source changed during writer inspection; preserved for manual repair".to_string()),
                         }
-                        let source_name = match CString::new(source.as_os_str().as_bytes()) {
-                            Ok(name) => name,
-                            Err(_) => return FinalTombstoneRecovery::Residual("final tombstone recovery source contains NUL".to_string()),
+                        let Ok(source_name) = CString::new(source.as_os_str().as_bytes()) else {
+                            return FinalTombstoneRecovery::Residual(
+                                "final tombstone recovery source contains NUL".to_string(),
+                            );
                         };
                         if tombstone_identity(&tombstone.root).ok() != Some((tombstone.device, tombstone.inode)) {
                             return FinalTombstoneRecovery::Residual("recorded final tombstone root changed before resumed rename; preserved for manual repair".to_string());
@@ -3774,7 +3777,6 @@ where
         Err(detail) => return FinalTombstoneRecovery::Residual(detail),
     }
     let object = tombstone.root.join("object");
-    use std::os::unix::fs::MetadataExt as _;
     match std::fs::symlink_metadata(&object) {
         Ok(live) if live.is_dir() && (live.dev(), live.ino()) == (expected_object_device, expected_object_inode)
             && observe_worktree_fingerprint(&object).as_deref() == Some(expected_identity) => {},
@@ -6207,6 +6209,7 @@ mod tests {
             None,
             |_, _, _| Ok(()),
             |_| {},
+            |_| Ok(false),
         )
         .await
         .unwrap();
@@ -7664,6 +7667,7 @@ mod tests {
             None,
             |_, _, _| Ok(()),
             |_| {},
+            |_| Ok(false),
         )
         .await
         .unwrap();
@@ -8344,6 +8348,7 @@ mod tests {
                 descriptor.flush().unwrap();
                 std::mem::forget(descriptor);
             },
+            quarantine_has_external_writer,
         )
         .await
         .unwrap();
