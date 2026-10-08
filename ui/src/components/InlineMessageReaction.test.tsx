@@ -153,8 +153,13 @@ describe('inline message reactions', () => {
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'mouse' });
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+    const source = store.getSnapshot('conversation-a')?.source;
+    const dispatch = vi.spyOn(store, 'dispatch');
     fireEvent.pointerDown(screen.getByTestId('unrelated'), { pointerType: 'touch' });
     fireEvent.pointerUp(screen.getByTestId('unrelated'), { pointerType: 'touch' });
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(store.getSnapshot('conversation-a')?.source).toBe(source);
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('floating');
     expect(screen.getByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
   });

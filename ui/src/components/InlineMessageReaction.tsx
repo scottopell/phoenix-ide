@@ -64,7 +64,10 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
         const touchDocked = gesturePresentation ?? (sameSource
           ? current.presentation === 'touch-docked'
           : window.matchMedia?.('(any-pointer: coarse)').matches ?? false);
-        store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: touchDocked ? 'touch-docked' : 'floating' });
+        const presentation = touchDocked ? 'touch-docked' : 'floating';
+        if (!sameSource || current.presentation !== presentation) {
+          store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation });
+        }
         selectionInput.current = null;
         selectionChangedDuringGesture.current = false;
         setNotice('');
