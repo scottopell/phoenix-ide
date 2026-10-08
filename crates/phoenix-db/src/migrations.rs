@@ -994,7 +994,7 @@ END;
 ";
 
 const MIGRATION_121: &str = r"
-DROP TRIGGER close_retirement_resources_allow_only_residual_resolution;
+DROP TRIGGER IF EXISTS close_retirement_resources_allow_only_residual_resolution;
 CREATE TRIGGER close_retirement_resources_allow_only_residual_resolution
 BEFORE UPDATE ON close_retirement_resources
 FOR EACH ROW
