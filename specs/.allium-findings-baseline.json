@@ -1,8 +1,302 @@
 {
   "version": 2,
-  "allium_version": "3.2.3",
+  "allium_version": "3.5.0",
   "description": "Accepted allium analyse findings — cross-spec triggers (emitted by bedrock, invisible to per-spec analyser), intentionally implicit system signals (established repo convention, see viewer_slot.allium), and pre-creation mode-selection events. Keyed on (spec, trigger, sorted listening_rules) so new rules listening on an already-baselined trigger are still caught. Regenerate: allium analyse specs/*/*.allium 2>/dev/null | jq -s (see dev.py check_allium)",
   "findings": [
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "AutoContinuationSettingChanged",
+      "listening_rules": [
+        "ProspectiveAutoContinuationSettingChanged"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "AutomaticContinuationAttemptMadeNoDurableProgress",
+      "listening_rules": [
+        "AutomaticContinuationAttemptWithoutDurableProgressIsBounded",
+        "AutomaticContinuationBreakerPersistsActionableFailure"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "AutomaticContinuationDurableProgress",
+      "listening_rules": [
+        "AutomaticContinuationDurablePhaseAdvances"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "CancellationDeadlineExpires",
+      "listening_rules": [
+        "CancellingSubAgentsDeadlineFires",
+        "CancellingToolDeadlineFires"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "CloseSafeRetryRequested",
+      "listening_rules": [
+        "ExplicitSafeRetryCreatesFreshRunUnderOriginalCloseAuthority",
+        "UnsafeRetryRequiresConcreteProposal"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ContinuationSuccessorAttemptLosesRace",
+      "listening_rules": [
+        "ConcurrentContinuationAttemptResolvesToSingleWinner",
+        "ManualContinuationWinnerSupersedesAutomaticAdmission"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ContinuationSummaryReady",
+      "listening_rules": [
+        "ContextExhaustionAdmitsAutomaticContinuation",
+        "ContextExhaustionDoesNotAdmitAutomaticContinuation",
+        "ContinuationSummaryReceived",
+        "IgnoreStaleOrDuplicateContinuationResult"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "CredentialBecameAvailable",
+      "listening_rules": [
+        "ContinuationRecoverySucceeded",
+        "ConversationTurnRecoverySucceeded"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "CredentialHelperFailed",
+      "listening_rules": [
+        "ContinuationRecoveryFailed",
+        "ConversationTurnRecoveryFailed"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "GraceTurnExhausted",
+      "listening_rules": [
+        "SubAgentTurnLimitHardStop"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "LlmErrors",
+      "listening_rules": [
+        "AuthErrorWithActiveRecovery",
+        "BackendRejectsContextExhausted",
+        "ContinuationNonRecoverableError",
+        "ContinuationRetryableError",
+        "ParentLlmErrorNonRecoverable",
+        "RetryableLlmError",
+        "SubAgentLlmError"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "LlmResponds",
+      "listening_rules": [
+        "AskUserQuestionIntercepted",
+        "ContextThresholdReachedParent",
+        "InterceptedToolNotSole",
+        "LlmRespondsWithTools",
+        "ParentLlmRespondsTextOnly",
+        "ProposeTaskIntercepted",
+        "ProposeTaskInvalid",
+        "SubAgentContextExhausted",
+        "SubAgentImplicitCompletion",
+        "SubAgentProposeTaskRejected",
+        "SubAgentSubmitsError",
+        "SubAgentSubmitsResult",
+        "SubAgentTextOnlyCompletion"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ModeTransitioned",
+      "listening_rules": [
+        "ModeChangeNotification"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "PhoenixStartupObservedCloseRun",
+      "listening_rules": [
+        "ReadOnlyObservationConfirmsStoppedConversationShutdown",
+        "StartupObservesInterruptedCloseWithoutRecovery",
+        "StartupReobservesStoppedCloseWithoutDuplicateFailure"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ProductConversationListProjectionRequested",
+      "listening_rules": [
+        "ProductConversationListProjectsOncePerRoot"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ProductConversationProjectionRequested",
+      "listening_rules": [
+        "CoordinatorProjectionStaysChatOnly",
+        "ProductConversationHistoryProjectionIsReadOnly",
+        "ProductConversationOpenProjectionKeepsHandedOffRowsInsideOpen",
+        "ProductConversationTranscriptProjectsChronologically"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ProductConversationRouteRequested",
+      "listening_rules": [
+        "ProductConversationRouteResolvesLegacyMemberLinks"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ProtectedContinuationHandoffBudgetExceeded",
+      "listening_rules": [
+        "ProtectedContinuationHandoffDoesNotFit"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ResourceRetirementCompleted",
+      "listening_rules": [
+        "CloseRetirementCompletionFinalizesAggregateHistory"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "RetirementInspectionChanged",
+      "listening_rules": [
+        "ChangedInspectionInvalidatesOutstandingConfirmation"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "RetirementInspectionCompletedWithoutConfirmation",
+      "listening_rules": [
+        "RetirementInspectionShowsNoConfirmationRequired"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "RetirementInspectionRequiresConfirmation",
+      "listening_rules": [
+        "FreshRetryCannotInheritOrExpandDiscardAuthority",
+        "RetirementInspectionRequiresLossConfirmation"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "RetryTimeoutExpires",
+      "listening_rules": [
+        "RetryTimeoutFires"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "RuntimeStarts",
+      "listening_rules": [
+        "ResumeInterruptedContinuation",
+        "RuntimeRecreatesUserResumableError"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ServerRestarted",
+      "listening_rules": [
+        "ServerRestartCommittedSteeringTurn",
+        "ServerRestartExhaustedDirectTurn",
+        "ServerRestartOrdinaryConversation",
+        "ServerRestartOwedDirectTurn",
+        "ServerRestartPendingContinuation",
+        "ServerRestartResumesAdmittedAutomaticContinuation",
+        "ServerRestartWithoutDurableOwner"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "SpawnAgentsCompletes",
+      "listening_rules": [
+        "SpawnAgentsCompletesAsLastTool",
+        "SpawnAgentsCompletesWithMoreTools"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "SubAgentReportsResult",
+      "listening_rules": [
+        "DuplicateSubAgentResultIsIdempotent",
+        "LastSubAgentDuringCancellation",
+        "LastSubAgentReportsResult",
+        "SubAgentReportsResultMorePending",
+        "SubAgentResultDuringCancellation"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ToolAborted",
+      "listening_rules": [
+        "ToolAbortConfirmed"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ToolCompletes",
+      "listening_rules": [
+        "LastToolCompletesNoSubAgents",
+        "LastToolCompletesWithSubAgents",
+        "ToolCompletesDuringCancellation",
+        "ToolCompletesWithMoreRemaining"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "TurnLimitReached",
+      "listening_rules": [
+        "SubAgentTurnLimitGraceTurn"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "UnifiedGlobalFailureDeliveryAccepted",
+      "listening_rules": [
+        "MandatoryGlobalFailureDeliveryRecordsAcceptance"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "UserHardDeletesConversation",
+      "listening_rules": [
+        "RejectHardDeleteWhileBusy",
+        "UserHardDeletesConversationRule"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "UserHardDeletesProductConversation",
+      "listening_rules": [
+        "RepeatedHardDeleteOfAbsentAggregateIsIdempotent"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "UserRetriesFailedAutomaticContinuation",
+      "listening_rules": [
+        "FailedAutomaticContinuationUsesPersistedWinner"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "UserStartsFollowUpConversation",
+      "listening_rules": [
+        "UserStartsFollowUpFromHistory"
+      ]
+    },
     {
       "spec": "specs/inline-terminal/inline-terminal.allium",
       "trigger": "InlineSessionTransportLost",

@@ -9302,6 +9302,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn initial_cleanup_failure_captured_scope_before_inventory() {
         for phase in [
@@ -9588,6 +9589,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn initial_cleanup_failure_terminalizes_both_certainties_and_exact_replay() {
         for certainty in [
