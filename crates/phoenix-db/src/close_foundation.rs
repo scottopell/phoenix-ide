@@ -3275,7 +3275,7 @@ impl Database {
         let expected_provenance: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM close_worktree_cleanup_plans plan
-             JOIN close_worktree_cleanup_dispatches dispatch
+             JOIN close_retirement_resource_dispatches dispatch
                ON dispatch.attempt_id=plan.attempt_id AND dispatch.scope=plan.scope
               AND dispatch.inspection_generation=plan.inspection_generation
               AND dispatch.inspection_fingerprint=plan.inspection_fingerprint

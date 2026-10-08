@@ -314,12 +314,15 @@ fn worktree_receipt_absence_rejects_each_reappeared_path_and_dangling_symlink() 
     let temp = tempfile::tempdir().unwrap();
     let captured = temp.path().join("captured");
     let admin = temp.path().join("admin");
-    let encoded: String = admin
+    use std::fmt::Write;
+    let encoded = admin
         .as_os_str()
         .as_encoded_bytes()
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+        .fold(String::new(), |mut encoded, byte| {
+            write!(encoded, "{byte:02x}").unwrap();
+            encoded
+        });
     let identity = WorktreeIdentity::from_parts(
         WorktreeId::parse("receipt-worktree").unwrap(),
         WorktreeFingerprint::parse(format!("git_admin_incarnation_v2:retained:{encoded}")).unwrap(),
