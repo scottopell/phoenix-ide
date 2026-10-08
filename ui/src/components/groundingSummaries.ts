@@ -70,6 +70,7 @@ export function summarizeMcpStatus(servers: McpServerStatus[]): {
   const enabledReady = readyServers.filter(s => s.enabled);
   const disabled = readyServers.filter(s => !s.enabled).length;
   const failed = servers.filter(s => s.state === 'failed').length;
+  const removing = servers.filter(s => s.state === 'removing').length;
   const pendingOAuth = servers.filter(s => s.state === 'unauthorized').length;
   const tools = enabledReady.reduce((sum, s) => sum + s.tool_count, 0);
   const parts: string[] = [];
@@ -77,6 +78,7 @@ export function summarizeMcpStatus(servers: McpServerStatus[]): {
   if (disabled > 0) parts.push(`${disabled} off`);
   if (pendingOAuth > 0) parts.push(`${pendingOAuth} auth`);
   if (failed > 0) parts.push(`${failed} failed`);
+  if (removing > 0) parts.push(`${removing} removal pending`);
   return {
     ready: readyServers.length,
     enabledReady: enabledReady.length,

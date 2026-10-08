@@ -30,25 +30,23 @@ use std::os::unix::ffi::OsStrExt;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use phoenix_core::process_identity::{
-    current_process_identity, process_identity_matches, ProcessIdentity,
-};
+use phoenix_core::process_identity::ProcessIdentity;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::ResourceScopeKey;
 
 use thiserror::Error;
 use tokio::sync::{OnceCell, RwLock};
 
-use super::{
-    parse_last_exit_marker,
-    probe::{command_output, probe, probe_until, ProbeResult},
+use super::backend::{
+    ExactProcessState, GlobalEnvRead, SocketEndpoint, SocketFileIdentity, SystemTmuxBackend,
+    TmuxBackend, TokenBoundKill, SERVER_TOKEN_VAR,
 };
+use super::{parse_last_exit_marker, probe::ProbeResult};
 
 fn ambiguous_socket_probe(path: &Path) -> TmuxError {
     TmuxError::AmbiguousSocketIdentity {
@@ -56,64 +54,6 @@ fn ambiguous_socket_probe(path: &Path) -> TmuxError {
             "endpoint {} exists but its server liveness probe failed",
             path.display()
         ),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SocketFileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreTeardownSocket {
-    Incarnation(SocketFileIdentity),
-    Absent,
-    NotSocket,
-}
-
-fn pre_teardown_socket(path: &Path) -> std::io::Result<PreTeardownSocket> {
-    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            Ok(PreTeardownSocket::Incarnation(SocketFileIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }))
-        }
-        Ok(_) => Ok(PreTeardownSocket::NotSocket),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PreTeardownSocket::Absent),
-        Err(error) => Err(error),
-    }
-}
-
-fn socket_file_identity(path: &Path) -> std::io::Result<Option<SocketFileIdentity>> {
-    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => Ok(Some(SocketFileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })),
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn endpoint_is_definitely_not_socket(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt as _;
-        std::fs::symlink_metadata(path)
-            .map(|metadata| !metadata.file_type().is_socket())
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
     }
 }
 
@@ -133,11 +73,6 @@ fn select_socket_from_probes(
 /// `TMUX_DEFAULT_SESSION`).
 pub const TMUX_DEFAULT_SESSION: &str = "main";
 
-// Bound on the post-spawn pane-readiness poll: 50 * 100ms = 5s ceiling.
-// Conservative — under normal load the pane is ready on the first probe.
-const PANE_READY_MAX_ATTEMPTS: u32 = 50;
-const PANE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 const TMUX_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 const TMUX_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -156,15 +91,6 @@ const SERVER_CONFIG_FILENAME: &str = "_phoenix.tmux.conf";
 /// `src/tools/tmux/server.conf`; the file is written into the socket
 /// directory at registry-init time (see [`TmuxRegistry::ensure_runtime_assets`]).
 pub const SERVER_CONFIG_TEXT: &str = include_str!("server.conf");
-
-/// The `phx`-companion setup version stamped into a tmux server's global
-/// environment under [`COMPANION_VERSION_VAR`]. Bump it whenever the PTY env
-/// injection or the terminal-features that `phx` / OSC-8 run-links depend on
-/// change, so a server spawned under an older version is brought up to date on
-/// reuse (see `refresh_companion_if_stale`). A server with the current stamp is
-/// left untouched.
-const COMPANION_ENV_VERSION: &str = "1";
-const COMPANION_VERSION_VAR: &str = "PHOENIX_COMPANION_VERSION";
 
 /// Errors surfaced by the tmux registry. The tmux tool translates these
 /// into the stable error envelope on the agent's response.
@@ -245,164 +171,6 @@ enum TmuxRetirementAuthority {
     ExactServer,
     ServerAbsenceVerified,
     EndpointAbsent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExactProcessState {
-    Live,
-    DeadOrReused,
-    Unproven,
-}
-
-#[cfg(target_os = "linux")]
-fn process_is_zombie(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    stat.rfind(')')
-        .and_then(|close| stat.get(close + 1..))
-        .and_then(|tail| tail.split_whitespace().next())
-        == Some("Z")
-}
-
-#[cfg(target_os = "macos")]
-fn process_is_zombie(pid: u32) -> bool {
-    let Ok(pid) = libc::c_int::try_from(pid) else {
-        return false;
-    };
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let Ok(size) = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
-        return false;
-    };
-    let rc = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            std::ptr::addr_of_mut!(info).cast::<libc::c_void>(),
-            size,
-        )
-    };
-    rc == size && info.pbi_status == libc::SZOMB
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_is_zombie(_pid: u32) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn wait_process_exit(expected: ProcessIdentity, deadline: std::time::Instant) -> ExactProcessState {
-    let Ok(pid) = libc::pid_t::try_from(expected.pid) else {
-        return ExactProcessState::Unproven;
-    };
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return exact_process_state(expected);
-    }
-    let Ok(fd) = libc::c_int::try_from(fd) else {
-        return ExactProcessState::Unproven;
-    };
-    let mut poll_fd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout = deadline.saturating_duration_since(std::time::Instant::now());
-    let millis =
-        libc::c_int::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
-    let ready = unsafe { libc::poll(std::ptr::addr_of_mut!(poll_fd), 1, millis) };
-    unsafe { libc::close(fd) };
-    if ready > 0 && poll_fd.revents & libc::POLLIN != 0 {
-        ExactProcessState::DeadOrReused
-    } else {
-        exact_process_state(expected)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn wait_process_exit(expected: ProcessIdentity, deadline: std::time::Instant) -> ExactProcessState {
-    let queue = unsafe { libc::kqueue() };
-    if queue < 0 {
-        return ExactProcessState::Unproven;
-    }
-    let mut event = libc::kevent {
-        ident: expected.pid as usize,
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_ONESHOT,
-        fflags: libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    let timeout = deadline.saturating_duration_since(std::time::Instant::now());
-    let deadline = libc::timespec {
-        tv_sec: timeout.as_secs().min(i64::MAX as u64).cast_signed(),
-        tv_nsec: i64::from(timeout.subsec_nanos()),
-    };
-    let ready = unsafe {
-        libc::kevent(
-            queue,
-            std::ptr::addr_of_mut!(event),
-            1,
-            std::ptr::addr_of_mut!(event),
-            1,
-            std::ptr::addr_of!(deadline),
-        )
-    };
-    unsafe { libc::close(queue) };
-    if ready > 0 && event.fflags & libc::NOTE_EXIT != 0 {
-        ExactProcessState::DeadOrReused
-    } else {
-        exact_process_state(expected)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn wait_process_exit(
-    expected: ProcessIdentity,
-    _deadline: std::time::Instant,
-) -> ExactProcessState {
-    exact_process_state(expected)
-}
-
-async fn exact_process_exit_until(
-    expected: ProcessIdentity,
-    expires: tokio::time::Instant,
-) -> ExactProcessState {
-    let remaining = expires.saturating_duration_since(tokio::time::Instant::now());
-    let deadline = std::time::Instant::now() + remaining;
-    match tokio::time::timeout_at(
-        expires,
-        tokio::task::spawn_blocking(move || wait_process_exit(expected, deadline)),
-    )
-    .await
-    {
-        Ok(Ok(state)) => state,
-        _ => ExactProcessState::Unproven,
-    }
-}
-
-fn exact_process_state(expected: ProcessIdentity) -> ExactProcessState {
-    if process_identity_matches(expected) {
-        return if process_is_zombie(expected.pid) {
-            ExactProcessState::DeadOrReused
-        } else {
-            ExactProcessState::Live
-        };
-    }
-    if current_process_identity(expected.pid).is_some() {
-        return ExactProcessState::DeadOrReused;
-    }
-    let Ok(pid) = i32::try_from(expected.pid) else {
-        return ExactProcessState::Unproven;
-    };
-    match unsafe { libc::kill(pid, 0) } {
-        0 => ExactProcessState::Unproven,
-        _ => match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => ExactProcessState::DeadOrReused,
-            _ => ExactProcessState::Unproven,
-        },
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -760,7 +528,6 @@ pub struct TmuxRegistry {
     /// stay disjoint.
     inner: RwLock<HashMap<String, Arc<TmuxScopeEntry>>>,
     socket_dir: PathBuf,
-    binary_available: bool,
     /// Bootstrap of the socket dir + 0700 perms + Phoenix server config
     /// file. Runs at most once per process — config-text bumps require a
     /// Phoenix restart anyway (existing tmux servers don't reload `-f`).
@@ -772,8 +539,7 @@ pub struct TmuxRegistry {
     /// so transitions flow into the work-scope push bridge; `None` for
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
-    #[cfg(any(test, feature = "test-support"))]
-    test_spawn_handoff: bool,
+    backend: Arc<dyn TmuxBackend>,
     #[cfg(test)]
     ensure_live_lock_test_hook: Option<Arc<EnsureLiveLockTestHook>>,
     #[cfg(test)]
@@ -794,10 +560,8 @@ pub enum PersistentTmuxDiscovery {
 
 impl TmuxRegistry {
     /// Construct a registry with the default socket directory rooted at
-    /// `~/.phoenix-ide/tmux-sockets/` (or `$PHOENIX_DATA_DIR` if set).
-    /// `which::which("tmux")` is called once here and cached for the
-    /// process lifetime (REQ-TMUX-003 design / "Binary Availability
-    /// Detection").
+    /// `~/.phoenix-ide/tmux-sockets/` (or `$PHOENIX_DATA_DIR` if set),
+    /// backed by [`SystemTmuxBackend::detect`].
     #[must_use]
     pub fn new() -> Self {
         Self::with_socket_dir(default_socket_dir())
@@ -808,15 +572,22 @@ impl TmuxRegistry {
     /// `tempfile::TempDir`.
     #[must_use]
     pub fn with_socket_dir(socket_dir: PathBuf) -> Self {
-        let binary_available = which::which("tmux").is_ok();
+        Self::with_backend(socket_dir, Arc::new(SystemTmuxBackend::detect()), None)
+    }
+
+    /// Construct a registry whose tmux effects go through `backend`.
+    #[must_use]
+    pub fn with_backend(
+        socket_dir: PathBuf,
+        backend: Arc<dyn TmuxBackend>,
+        lifecycle_sink: Option<TmuxLifecycleSink>,
+    ) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
             socket_dir,
-            binary_available,
             runtime_assets: OnceCell::new(),
-            lifecycle_sink: None,
-            #[cfg(any(test, feature = "test-support"))]
-            test_spawn_handoff: false,
+            lifecycle_sink,
+            backend,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -826,6 +597,11 @@ impl TmuxRegistry {
             #[cfg(test)]
             cancel_retirement_test_hook: None,
         }
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> &dyn TmuxBackend {
+        self.backend.as_ref()
     }
 
     /// Construct a registry (default socket dir) that publishes tmux
@@ -858,69 +634,6 @@ impl TmuxRegistry {
                 "dropping tmux lifecycle event — sink closed"
             );
         }
-    }
-
-    /// Test-only constructor that lets the caller force
-    /// `binary_available` to a chosen value, regardless of whether tmux
-    /// is on PATH. Used to exercise the "tmux binary missing" branches
-    /// of the tool dispatch and the terminal attach fallback without
-    /// requiring a host without tmux.
-    #[cfg(test)]
-    #[must_use]
-    pub fn with_socket_dir_and_binary(socket_dir: PathBuf, binary_available: bool) -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-            socket_dir,
-            binary_available,
-            runtime_assets: OnceCell::new(),
-            lifecycle_sink: None,
-            #[cfg(any(test, feature = "test-support"))]
-            test_spawn_handoff: false,
-            #[cfg(test)]
-            ensure_live_lock_test_hook: None,
-            #[cfg(test)]
-            complete_retirement_lock_test_hook: None,
-            #[cfg(test)]
-            cascade_not_probed_test_hook: None,
-            #[cfg(test)]
-            cancel_retirement_test_hook: None,
-        }
-    }
-
-    /// Test-only constructor combining a caller-supplied socket directory,
-    /// forced `binary_available`, and a lifecycle sink — used to assert that
-    /// status transitions and cascade removal round-trip through the sink
-    /// without requiring a real tmux server.
-    #[cfg(test)]
-    #[must_use]
-    pub fn with_socket_dir_binary_and_sink(
-        socket_dir: PathBuf,
-        binary_available: bool,
-        sink: Option<TmuxLifecycleSink>,
-    ) -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-            socket_dir,
-            binary_available,
-            runtime_assets: OnceCell::new(),
-            lifecycle_sink: sink,
-            #[cfg(any(test, feature = "test-support"))]
-            test_spawn_handoff: false,
-            #[cfg(test)]
-            ensure_live_lock_test_hook: None,
-            #[cfg(test)]
-            complete_retirement_lock_test_hook: None,
-            #[cfg(test)]
-            cascade_not_probed_test_hook: None,
-            #[cfg(test)]
-            cancel_retirement_test_hook: None,
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_test_spawn_handoff(mut self) -> Self {
-        self.test_spawn_handoff = true;
-        self
     }
 
     #[cfg(test)]
@@ -985,23 +698,10 @@ impl TmuxRegistry {
         self
     }
 
-    async fn spawn_owned_session(&self, socket_path: &Path, cwd: &Path) -> Result<(), TmuxError> {
-        spawn_session_owned(
-            socket_path,
-            &self.config_path(),
-            cwd,
-            #[cfg(any(test, feature = "test-support"))]
-            self.test_spawn_handoff,
-            #[cfg(not(any(test, feature = "test-support")))]
-            false,
-        )
-        .await
-    }
-
     /// Cached `which("tmux")` result (REQ-TMUX-003). Discovered once at
     /// registry init and not re-checked.
     pub fn binary_available(&self) -> bool {
-        self.binary_available
+        self.backend.binary_available()
     }
 
     /// Configured socket directory for this registry. Available to the
@@ -1018,6 +718,48 @@ impl TmuxRegistry {
     /// `~/.tmux.conf` / `~/.config/tmux/tmux.conf`.
     pub fn config_path(&self) -> PathBuf {
         self.socket_dir.join(SERVER_CONFIG_FILENAME)
+    }
+
+    async fn probe_socket(&self, socket_path: &Path) -> std::io::Result<ProbeResult> {
+        self.backend.probe(socket_path, None).await?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "tmux probe timed out")
+        })
+    }
+
+    async fn probe_socket_until(
+        &self,
+        socket_path: &Path,
+        expires: tokio::time::Instant,
+    ) -> std::io::Result<Option<ProbeResult>> {
+        self.backend.probe(socket_path, Some(expires)).await
+    }
+
+    fn endpoint_is_definitely_not_socket(&self, path: &Path) -> bool {
+        matches!(self.backend.endpoint(path), Ok(SocketEndpoint::NotSocket))
+    }
+
+    async fn read_server_token(&self, socket_path: &Path) -> Option<String> {
+        self.backend
+            .global_env(socket_path, SERVER_TOKEN_VAR, None)
+            .await
+            .into_value()
+    }
+
+    /// `None` means `expires` passed before the token was read.
+    async fn read_server_token_until(
+        &self,
+        socket_path: &Path,
+        expires: tokio::time::Instant,
+    ) -> Option<Option<String>> {
+        match self
+            .backend
+            .global_env(socket_path, SERVER_TOKEN_VAR, Some(expires))
+            .await
+        {
+            GlobalEnvRead::Value(token) => Some(Some(token)),
+            GlobalEnvRead::Unreadable => Some(None),
+            GlobalEnvRead::DeadlineExceeded => None,
+        }
     }
 
     /// One-shot bootstrap of the socket dir (perms 0700) and the
@@ -1088,7 +830,8 @@ impl TmuxRegistry {
         legacy: Option<PathBuf>,
         expires: tokio::time::Instant,
     ) -> Result<PathBuf, TmuxError> {
-        let current_probe = probe_until(&current, expires)
+        let current_probe = self
+            .probe_socket_until(&current, expires)
             .await
             .map_err(|source| TmuxError::ProbeFailed {
                 socket_path: current.clone(),
@@ -1102,13 +845,16 @@ impl TmuxRegistry {
             })?;
         match current_probe {
             ProbeResult::Live => Ok(current),
-            ProbeResult::DeadSocket if endpoint_is_definitely_not_socket(&current) => Ok(current),
+            ProbeResult::DeadSocket if self.endpoint_is_definitely_not_socket(&current) => {
+                Ok(current)
+            }
             ProbeResult::DeadSocket => Err(ambiguous_socket_probe(&current)),
             ProbeResult::NoSocket | ProbeResult::NoServer => {
                 let Some(legacy) = legacy.filter(|legacy| *legacy != current) else {
                     return Ok(current);
                 };
-                let legacy_probe = probe_until(&legacy, expires)
+                let legacy_probe = self
+                    .probe_socket_until(&legacy, expires)
                     .await
                     .map_err(|source| TmuxError::ProbeFailed {
                         socket_path: legacy.clone(),
@@ -1175,13 +921,13 @@ impl TmuxRegistry {
         let socket_path = self
             .select_current_or_legacy_socket_until(current_socket, legacy_socket, expires)
             .await?;
-        let Some(probe_result) =
-            probe_until(&socket_path, expires)
-                .await
-                .map_err(|source| TmuxError::ProbeFailed {
-                    socket_path: socket_path.clone(),
-                    source,
-                })?
+        let Some(probe_result) = self
+            .probe_socket_until(&socket_path, expires)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: socket_path.clone(),
+                source,
+            })?
         else {
             return Ok(PersistentTmuxDiscovery::Ambiguous {
                 reason: format!(
@@ -1199,7 +945,7 @@ impl TmuxRegistry {
                     socket_path.display()
                 ),
             }),
-            ProbeResult::Live => match read_server_token_until(&socket_path, expires).await {
+            ProbeResult::Live => match self.read_server_token_until(&socket_path, expires).await {
                 Some(Some(server_token)) => {
                     Ok(PersistentTmuxDiscovery::Exact(TmuxServerInstanceIdentity {
                         socket_path,
@@ -1239,7 +985,7 @@ impl TmuxRegistry {
         } else {
             None
         };
-        if !self.binary_available {
+        if !self.backend.binary_available() {
             return Err(TmuxError::BinaryUnavailable);
         }
         self.ensure_runtime_assets().await?;
@@ -1262,7 +1008,7 @@ impl TmuxRegistry {
             existing_socket
         } else {
             let current_probe =
-                probe(&socket_path)
+                self.probe_socket(&socket_path)
                     .await
                     .map_err(|source| TmuxError::ProbeFailed {
                         socket_path: socket_path.clone(),
@@ -1270,19 +1016,18 @@ impl TmuxRegistry {
                     })?;
             match current_probe {
                 ProbeResult::Live => socket_path.clone(),
-                ProbeResult::DeadSocket if endpoint_is_definitely_not_socket(&socket_path) => {
+                ProbeResult::DeadSocket if self.endpoint_is_definitely_not_socket(&socket_path) => {
                     socket_path.clone()
                 }
                 ProbeResult::DeadSocket => return Err(ambiguous_socket_probe(&socket_path)),
                 ProbeResult::NoSocket | ProbeResult::NoServer => {
                     if let Some(legacy) = legacy_socket.filter(|legacy| *legacy != socket_path) {
-                        let legacy_probe =
-                            probe(&legacy)
-                                .await
-                                .map_err(|source| TmuxError::ProbeFailed {
-                                    socket_path: legacy.clone(),
-                                    source,
-                                })?;
+                        let legacy_probe = self.probe_socket(&legacy).await.map_err(|source| {
+                            TmuxError::ProbeFailed {
+                                socket_path: legacy.clone(),
+                                source,
+                            }
+                        })?;
                         select_socket_from_probes(socket_path.clone(), legacy, legacy_probe)?
                     } else {
                         socket_path.clone()
@@ -1328,45 +1073,44 @@ impl TmuxRegistry {
         // marking the entry Live would skip the spawn and leave a
         // dead-but-Live entry behind. Always probing under the lock
         // gives us the latest server state at the moment we decide.
-        let probe_result =
-            probe(&server.socket_path)
-                .await
-                .map_err(|source| TmuxError::ProbeFailed {
-                    socket_path: server.socket_path.clone(),
-                    source,
-                })?;
+        let probe_result = self
+            .probe_socket(&server.socket_path)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: server.socket_path.clone(),
+                source,
+            })?;
 
         let mut reused_live = false;
         match probe_result {
             ProbeResult::Live => {
-                match read_server_token(&server.socket_path).await {
+                match self.read_server_token(&server.socket_path).await {
                     Some(token) => server.server_token = token,
                     None => {
-                        run_tmux_quiet(
-                            &server.socket_path,
-                            &[
-                                "set-environment",
-                                "-g",
+                        self.backend
+                            .set_global_env(
+                                &server.socket_path,
                                 SERVER_TOKEN_VAR,
                                 &server.server_token,
-                            ],
-                        )
-                        .await;
+                            )
+                            .await;
                     }
                 }
                 server.status = ServerStatus::Live;
                 reused_live = true;
             }
             ProbeResult::NoSocket => {
-                self.spawn_owned_session(&server.socket_path, cwd).await?;
-                server.server_token =
-                    read_server_token(&server.socket_path)
-                        .await
-                        .ok_or_else(|| TmuxError::SpawnFailed {
-                            socket_path: server.socket_path.clone(),
-                            reason: "spawned tmux server did not publish its identity token"
-                                .to_string(),
-                        })?;
+                self.backend
+                    .spawn_session(&server.socket_path, &self.config_path(), cwd)
+                    .await?;
+                server.server_token = self
+                    .read_server_token(&server.socket_path)
+                    .await
+                    .ok_or_else(|| TmuxError::SpawnFailed {
+                        socket_path: server.socket_path.clone(),
+                        reason: "spawned tmux server did not publish its identity token"
+                            .to_string(),
+                    })?;
                 server.status = ServerStatus::Live;
             }
             ProbeResult::NoServer => {
@@ -1374,30 +1118,37 @@ impl TmuxRegistry {
                     socket = %server.socket_path.display(),
                     "tmux: server absence proven, unlinking stale socket and respawning"
                 );
-                let _ = tokio::fs::remove_file(&server.socket_path).await;
-                self.spawn_owned_session(&server.socket_path, cwd).await?;
-                server.server_token =
-                    read_server_token(&server.socket_path)
-                        .await
-                        .ok_or_else(|| TmuxError::SpawnFailed {
-                            socket_path: server.socket_path.clone(),
-                            reason: "spawned tmux server did not publish its identity token"
-                                .to_string(),
-                        })?;
+                let _ = self.backend.remove_endpoint(&server.socket_path).await;
+                self.backend
+                    .spawn_session(&server.socket_path, &self.config_path(), cwd)
+                    .await?;
+                server.server_token = self
+                    .read_server_token(&server.socket_path)
+                    .await
+                    .ok_or_else(|| TmuxError::SpawnFailed {
+                        socket_path: server.socket_path.clone(),
+                        reason: "spawned tmux server did not publish its identity token"
+                            .to_string(),
+                    })?;
                 server.status = ServerStatus::Live;
             }
-            ProbeResult::DeadSocket if endpoint_is_definitely_not_socket(&server.socket_path) => {
+            ProbeResult::DeadSocket
+                if self.endpoint_is_definitely_not_socket(&server.socket_path) =>
+            {
                 tracing::debug!(
                     socket = %server.socket_path.display(),
                     "tmux: non-socket endpoint detected, unlinking and respawning"
                 );
-                tokio::fs::remove_file(&server.socket_path)
+                self.backend
+                    .remove_endpoint(&server.socket_path)
                     .await
                     .map_err(|source| TmuxError::ProbeFailed {
                         socket_path: server.socket_path.clone(),
                         source,
                     })?;
-                self.spawn_owned_session(&server.socket_path, cwd).await?;
+                self.backend
+                    .spawn_session(&server.socket_path, &self.config_path(), cwd)
+                    .await?;
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => return Err(ambiguous_socket_probe(&server.socket_path)),
@@ -1413,7 +1164,7 @@ impl TmuxRegistry {
         // server costs only one `show-environment` probe. Freshly spawned
         // servers (NoSocket / DeadSocket) already carry the current setup.
         if reused_live {
-            refresh_companion_if_stale(&socket_path).await;
+            self.backend.refresh_companion_if_stale(&socket_path).await;
         }
         // Emit on the work-scope inventory edge once the status has
         // SETTLED. Two cases collapse to the same rule:
@@ -1487,7 +1238,8 @@ impl TmuxRegistry {
         identity: &TmuxServerInstanceIdentity,
         expires: tokio::time::Instant,
     ) -> Result<ExactTmuxIdentityState, TmuxError> {
-        let Some(result) = probe_until(&identity.socket_path, expires)
+        let Some(result) = self
+            .probe_socket_until(&identity.socket_path, expires)
             .await
             .map_err(|source| TmuxError::ProbeFailed {
                 socket_path: identity.socket_path.clone(),
@@ -1498,35 +1250,15 @@ impl TmuxRegistry {
                 reason: "tmux exact-identity probe exceeded the Close deadline".to_string(),
             });
         };
-        Self::exact_identity_state_from_probe_with_binary(
-            identity,
-            result,
-            expires,
-            Path::new("tmux"),
-        )
-        .await
+        self.exact_identity_state_from_probe(identity, result, expires)
+            .await
     }
 
-    #[cfg(test)]
     async fn exact_identity_state_from_probe(
+        &self,
         identity: &TmuxServerInstanceIdentity,
         result: ProbeResult,
         expires: tokio::time::Instant,
-    ) -> Result<ExactTmuxIdentityState, TmuxError> {
-        Self::exact_identity_state_from_probe_with_binary(
-            identity,
-            result,
-            expires,
-            Path::new("tmux"),
-        )
-        .await
-    }
-
-    async fn exact_identity_state_from_probe_with_binary(
-        identity: &TmuxServerInstanceIdentity,
-        result: ProbeResult,
-        expires: tokio::time::Instant,
-        binary: &Path,
     ) -> Result<ExactTmuxIdentityState, TmuxError> {
         match result {
             ProbeResult::NoSocket | ProbeResult::NoServer => Ok(ExactTmuxIdentityState::Absent),
@@ -1537,12 +1269,9 @@ impl TmuxRegistry {
                     identity.stable_identity()
                 ),
             }),
-            ProbeResult::Live => match read_server_token_until_with_binary(
-                &identity.socket_path,
-                expires,
-                binary,
-            )
-            .await
+            ProbeResult::Live => match self
+                .read_server_token_until(&identity.socket_path, expires)
+                .await
             {
                 Some(Some(token)) if token == identity.server_token => {
                     Ok(ExactTmuxIdentityState::Live)
@@ -1567,7 +1296,7 @@ impl TmuxRegistry {
         &self,
         expected_server_token: &str,
     ) -> Result<Option<PathBuf>, TmuxError> {
-        let mut entries = match tokio::fs::read_dir(&self.socket_dir).await {
+        let entries = match self.backend.list_dir(&self.socket_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
@@ -1577,21 +1306,13 @@ impl TmuxRegistry {
                 });
             }
         };
-        while let Some(entry) =
-            entries
-                .next_entry()
-                .await
-                .map_err(|source| TmuxError::ProbeFailed {
-                    socket_path: self.socket_dir.clone(),
-                    source,
-                })?
-        {
-            let candidate = entry.path();
+        for candidate in entries {
             if candidate.extension().and_then(|ext| ext.to_str()) != Some("sock") {
                 continue;
             }
-            if matches!(probe(&candidate).await, Ok(ProbeResult::Live))
-                && read_server_token(&candidate).await.as_deref() == Some(expected_server_token)
+            if matches!(self.probe_socket(&candidate).await, Ok(ProbeResult::Live))
+                && self.read_server_token(&candidate).await.as_deref()
+                    == Some(expected_server_token)
             {
                 return Ok(Some(candidate));
             }
@@ -1626,15 +1347,17 @@ impl TmuxRegistry {
             matched
         };
 
-        let output = run_tmux_quiet_output(
-            &socket_path,
-            &["capture-pane", "-p", "-t", window_id, "-S", "-2000"],
-        )
-        .await?;
-        if !output.status.success() {
+        let Some(stdout) = self
+            .backend
+            .capture_pane(&socket_path, window_id)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: socket_path.clone(),
+                source,
+            })?
+        else {
             return Ok(None);
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        };
         let final_tail = stdout
             .lines()
             .map(std::string::ToString::to_string)
@@ -1671,7 +1394,7 @@ impl TmuxRegistry {
             };
             matched
         };
-        run_tmux_quiet(&socket_path, &["kill-window", "-t", window_id]).await;
+        self.backend.kill_window(&socket_path, window_id).await;
         Ok(())
     }
 
@@ -1810,12 +1533,14 @@ impl TmuxRegistry {
                         Ok(TmuxRetirementRehydration::Residual { reason })
                     }
                     ExactTmuxIdentityState::Live => {
-                        let exact_process = exact_server_process_identity_until(
-                            &persisted.socket_path,
-                            &persisted.server_token,
-                            expires,
-                        )
-                        .await;
+                        let exact_process = self
+                            .backend
+                            .server_process(
+                                &persisted.socket_path,
+                                &persisted.server_token,
+                                expires,
+                            )
+                            .await;
                         let map = match deadline
                             .write_map(self, "retirement rehydration authority")
                             .await
@@ -1988,12 +1713,14 @@ impl TmuxRegistry {
                         Ok(TmuxRetirementRehydration::Residual { reason })
                     }
                     ExactTmuxIdentityState::Live => {
-                        let exact_process = exact_server_process_identity_until(
-                            &persisted.socket_path,
-                            &persisted.server_token,
-                            expires,
-                        )
-                        .await;
+                        let exact_process = self
+                            .backend
+                            .server_process(
+                                &persisted.socket_path,
+                                &persisted.server_token,
+                                expires,
+                            )
+                            .await;
                         let map = match deadline
                             .write_map(self, "rehydrated retirement authority")
                             .await
@@ -2085,13 +1812,13 @@ impl TmuxRegistry {
         let socket_path = if let Some(legacy) = legacy {
             if legacy != current
                 && matches!(
-                    probe_until(&current, expires).await,
+                    self.probe_socket_until(&current, expires).await,
                     Ok(Some(
                         ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket
                     ))
                 )
                 && matches!(
-                    probe_until(&legacy, expires).await,
+                    self.probe_socket_until(&legacy, expires).await,
                     Ok(Some(ProbeResult::Live))
                 )
             {
@@ -2120,14 +1847,12 @@ impl TmuxRegistry {
                 })?;
             let identity = server.exact_identity();
             drop(server);
-            let process = exact_server_process_identity_until(
-                &identity.socket_path,
-                &identity.server_token,
-                expires,
-            )
-            .await;
+            let process = self
+                .backend
+                .server_process(&identity.socket_path, &identity.server_token, expires)
+                .await;
             let token = if process.is_none() {
-                read_server_token_until(&identity.socket_path, expires)
+                self.read_server_token_until(&identity.socket_path, expires)
                     .await
                     .flatten()
             } else {
@@ -2210,7 +1935,8 @@ impl TmuxRegistry {
         &self,
         permit: &TmuxRetirementPermit,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
-        let Some(result) = probe_until(&permit.instance.socket_path, permit.expires)
+        let Some(result) = self
+            .probe_socket_until(&permit.instance.socket_path, permit.expires)
             .await
             .map_err(|source| TmuxError::ProbeFailed {
                 socket_path: permit.instance.socket_path.clone(),
@@ -2221,13 +1947,8 @@ impl TmuxRegistry {
                 reason: "tmux exact-absence probe exceeded the Close deadline".to_string(),
             });
         };
-        Self::verify_exact_absence_from_probe_with_binary(
-            permit,
-            result,
-            permit.expires,
-            Path::new("tmux"),
-        )
-        .await
+        self.verify_exact_absence_from_probe(permit, result, permit.expires)
+            .await
     }
 
     fn dead_socket_shutdown_decision(
@@ -2272,11 +1993,13 @@ impl TmuxRegistry {
     }
 
     async fn observe_exact_shutdown(
+        &self,
         permit: &TmuxRetirementPermit,
         killed_socket: SocketFileIdentity,
         expires: tokio::time::Instant,
     ) -> Result<ExactShutdownObservation, TmuxError> {
-        let Some(result) = probe_until(&permit.instance.socket_path, expires)
+        let Some(result) = self
+            .probe_socket_until(&permit.instance.socket_path, expires)
             .await
             .map_err(|source| TmuxError::ProbeFailed {
                 socket_path: permit.instance.socket_path.clone(),
@@ -2288,7 +2011,10 @@ impl TmuxRegistry {
             });
         };
         let token = if result == ProbeResult::Live {
-            match read_server_token_until(&permit.instance.socket_path, expires).await {
+            match self
+                .read_server_token_until(&permit.instance.socket_path, expires)
+                .await
+            {
                 Some(Some(token)) => ExactShutdownToken::Value(token),
                 Some(None) => ExactShutdownToken::Unreadable,
                 None => ExactShutdownToken::NotRead,
@@ -2297,12 +2023,16 @@ impl TmuxRegistry {
             ExactShutdownToken::NotRead
         };
         let socket = if result == ProbeResult::DeadSocket {
-            socket_file_identity(&permit.instance.socket_path).map_err(|source| {
-                TmuxError::ProbeFailed {
-                    socket_path: permit.instance.socket_path.clone(),
-                    source,
+            match self.backend.endpoint(&permit.instance.socket_path) {
+                Ok(SocketEndpoint::Socket(identity)) => Some(identity),
+                Ok(SocketEndpoint::Absent | SocketEndpoint::NotSocket) => None,
+                Err(source) => {
+                    return Err(TmuxError::ProbeFailed {
+                        socket_path: permit.instance.socket_path.clone(),
+                        source,
+                    });
                 }
-            })?
+            }
         } else {
             None
         };
@@ -2363,31 +2093,16 @@ impl TmuxRegistry {
         killed_socket: SocketFileIdentity,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
         Self::wait_for_exact_shutdown_with(permit.expires, TMUX_SHUTDOWN_POLL_INTERVAL, |expires| {
-            Self::observe_exact_shutdown(permit, killed_socket, expires)
+            self.observe_exact_shutdown(permit, killed_socket, expires)
         })
         .await
     }
 
-    #[cfg(test)]
     async fn verify_exact_absence_from_probe(
+        &self,
         permit: &TmuxRetirementPermit,
         result: ProbeResult,
         expires: tokio::time::Instant,
-    ) -> Result<TmuxRetirementOutcome, TmuxError> {
-        Self::verify_exact_absence_from_probe_with_binary(
-            permit,
-            result,
-            expires,
-            Path::new("tmux"),
-        )
-        .await
-    }
-
-    async fn verify_exact_absence_from_probe_with_binary(
-        permit: &TmuxRetirementPermit,
-        result: ProbeResult,
-        expires: tokio::time::Instant,
-        binary: &Path,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
         match result {
             ProbeResult::NoSocket | ProbeResult::NoServer => {
@@ -2400,12 +2115,9 @@ impl TmuxRegistry {
                 ),
             }),
             ProbeResult::Live => {
-                match read_server_token_until_with_binary(
-                    &permit.instance.socket_path,
-                    expires,
-                    binary,
-                )
-                .await
+                match self
+                    .read_server_token_until(&permit.instance.socket_path, expires)
+                    .await
                 {
                     Some(Some(token)) if token == permit.instance.server_token => {
                         Ok(TmuxRetirementOutcome::RemovalFailed {
@@ -2463,8 +2175,8 @@ impl TmuxRegistry {
             entered.notify_one();
             release.notified().await;
         }
-        let pre_teardown = if self.binary_available {
-            match pre_teardown_socket(&permit.instance.socket_path) {
+        let pre_teardown = if self.backend.binary_available() {
+            match self.backend.endpoint(&permit.instance.socket_path) {
                 Ok(observation) => Some(observation),
                 Err(source) => {
                     return Err(TmuxError::ProbeFailed {
@@ -2477,7 +2189,7 @@ impl TmuxRegistry {
             None
         };
         if permit.authority != TmuxRetirementAuthority::ServerAbsenceVerified
-            && matches!(pre_teardown, Some(PreTeardownSocket::NotSocket))
+            && matches!(pre_teardown, Some(SocketEndpoint::NotSocket))
         {
             return Ok(TmuxRetirementOutcome::IdentityNotProven {
                 reason: "tmux socket incarnation was unavailable before exact teardown".to_string(),
@@ -2485,56 +2197,32 @@ impl TmuxRegistry {
         }
         let process_state_before_teardown = permit
             .exact_process
-            .map(exact_process_state)
+            .map(|process| self.backend.process_state(process))
             .unwrap_or(ExactProcessState::Unproven);
         let kill_failure = if permit.authority != TmuxRetirementAuthority::ServerAbsenceVerified
             && process_state_before_teardown != ExactProcessState::DeadOrReused
-            && matches!(pre_teardown, Some(PreTeardownSocket::Incarnation(_)))
+            && matches!(pre_teardown, Some(SocketEndpoint::Socket(_)))
         {
-            let token_test = format!(
-                "#{{==:#{{E:{SERVER_TOKEN_VAR}}},{}}}",
-                permit.instance.server_token
-            );
-            let mut command = tokio::process::Command::new("tmux");
-            command
-                .arg("-f")
-                .arg(self.config_path())
-                .arg("-S")
-                .arg(&permit.instance.socket_path)
-                .args([
-                    "if-shell",
-                    "-F",
-                    &token_test,
-                    "kill-server",
-                    "display-message -p PHOENIX_TOKEN_MISMATCH",
-                ])
-                .env_remove("TMUX")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            command.kill_on_drop(true);
-            match command_output(command, Some(permit.expires)).await {
-                Ok(None) => Some(TmuxRetirementOutcome::RemovalFailed {
+            match self
+                .backend
+                .kill_server_if_token(
+                    &permit.instance.socket_path,
+                    &self.config_path(),
+                    &permit.instance.server_token,
+                    permit.expires,
+                )
+                .await
+            {
+                TokenBoundKill::Killed => None,
+                TokenBoundKill::DeadlineExceeded => Some(TmuxRetirementOutcome::RemovalFailed {
                     reason: "tmux exact teardown command exceeded the Close deadline".to_string(),
                 }),
-                Ok(Some(output)) if output.status.success() => {
-                    if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
-                        Some(TmuxRetirementOutcome::IdentityNotProven {
-                            reason: "tmux server token changed before exact teardown".to_string(),
-                        })
-                    } else {
-                        None
-                    }
+                TokenBoundKill::TokenMismatch => Some(TmuxRetirementOutcome::IdentityNotProven {
+                    reason: "tmux server token changed before exact teardown".to_string(),
+                }),
+                TokenBoundKill::Failed { reason } => {
+                    Some(TmuxRetirementOutcome::RemovalFailed { reason })
                 }
-                Ok(Some(output)) => Some(TmuxRetirementOutcome::RemovalFailed {
-                    reason: format!(
-                        "exact token-bound kill-server failed: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ),
-                }),
-                Err(error) => Some(TmuxRetirementOutcome::RemovalFailed {
-                    reason: error.to_string(),
-                }),
             }
         } else {
             None
@@ -2543,7 +2231,11 @@ impl TmuxRegistry {
 
         let exact_process_exit = if permit.authority == TmuxRetirementAuthority::ExactServer {
             match permit.exact_process {
-                Some(process) => exact_process_exit_until(process, permit.expires).await,
+                Some(process) => {
+                    self.backend
+                        .wait_process_exit(process, permit.expires)
+                        .await
+                }
                 None => ExactProcessState::Unproven,
             }
         } else {
@@ -2564,12 +2256,12 @@ impl TmuxRegistry {
             }
             (
                 None,
-                Some(PreTeardownSocket::Absent),
+                Some(SocketEndpoint::Absent),
                 TmuxRetirementAuthority::ExactServer | TmuxRetirementAuthority::EndpointAbsent,
             ) => TmuxRetirementOutcome::IdentityNotProven {
                 reason: "tmux socket incarnation was unavailable before exact teardown".to_string(),
             },
-            (None, Some(PreTeardownSocket::Incarnation(killed_socket)), _) => {
+            (None, Some(SocketEndpoint::Socket(killed_socket)), _) => {
                 self.verify_exact_absence_after_successful_kill(permit, killed_socket)
                     .await?
             }
@@ -3133,459 +2825,6 @@ pub async fn cascade_tmux_on_delete(
         .await
 }
 
-/// Set an explicit environment on a tmux command so the spawned server (and
-/// thus its pane shells) match the direct-shell PTY contract: the fixed base
-/// env plus the `PtyEnvInjection` (the `phx` shim on PATH, `PHOENIX_API_URL`,
-/// `PHOENIX_SUGGEST_TOKEN`) and the safe-var allowlist — never a blind copy of
-/// the Phoenix process environment, which would leak server secrets (LLM API
-/// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
-/// is the single source for that env (`specs/terminal` REQ-TERM-002).
-fn tmux_server_env(server_token: &str) -> Vec<(String, String)> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
-    let launch_uuid = uuid::Uuid::new_v4().to_string();
-    tmux_server_env_for(server_token, &shell, &launch_uuid)
-}
-
-fn tmux_server_env_for(
-    server_token: &str,
-    shell: &str,
-    launch_uuid: &str,
-) -> Vec<(String, String)> {
-    let mut env = phoenix_terminal::spawn::build_env_for_tmux(shell, launch_uuid);
-    env.push((
-        COMPANION_VERSION_VAR.to_owned(),
-        COMPANION_ENV_VERSION.to_owned(),
-    ));
-    env.push((SERVER_TOKEN_VAR.to_owned(), server_token.to_owned()));
-    env
-}
-
-fn set_tmux_server_env(cmd: &mut tokio::process::Command, env: &[(String, String)]) {
-    cmd.env_clear();
-    cmd.envs(env.iter().cloned());
-}
-
-/// Run a tmux command against an existing server, discarding output.
-/// Best-effort: errors are ignored, because a companion refresh must never
-/// block or fail a terminal attach.
-async fn run_tmux_quiet(socket_path: &Path, args: &[&str]) {
-    let sock = socket_path.to_string_lossy().into_owned();
-    let mut full: Vec<&str> = vec!["-S", &sock];
-    full.extend_from_slice(args);
-    let _ = tokio::process::Command::new("tmux")
-        .args(&full)
-        .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-}
-
-async fn run_tmux_quiet_output(
-    socket_path: &Path,
-    args: &[&str],
-) -> Result<std::process::Output, TmuxError> {
-    let sock = socket_path.to_string_lossy().into_owned();
-    let mut full: Vec<&str> = vec!["-S", &sock];
-    full.extend_from_slice(args);
-    tokio::process::Command::new("tmux")
-        .args(&full)
-        .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|source| TmuxError::ProbeFailed {
-            socket_path: socket_path.to_path_buf(),
-            source,
-        })
-}
-
-const SERVER_TOKEN_VAR: &str = "PHOENIX_TMUX_SERVER_TOKEN";
-
-async fn exact_server_process_identity_until(
-    socket_path: &Path,
-    expected_token: &str,
-    expires: tokio::time::Instant,
-) -> Option<ProcessIdentity> {
-    let mut command = tokio::process::Command::new("tmux");
-    command
-        .arg("-S")
-        .arg(socket_path)
-        .args([
-            "display-message",
-            "-p",
-            &format!("#{{pid}} #{{E:{SERVER_TOKEN_VAR}}}"),
-        ])
-        .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let output = crate::tmux::probe::command_output(command, Some(expires))
-        .await
-        .ok()??;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let (pid, token) = stdout.trim().split_once(' ')?;
-    if token != expected_token {
-        return None;
-    }
-    current_process_identity(pid.parse().ok()?)
-}
-
-async fn read_server_token(socket_path: &Path) -> Option<String> {
-    tmux_global_env(socket_path, SERVER_TOKEN_VAR).await
-}
-
-async fn read_server_token_until(
-    socket_path: &Path,
-    expires: tokio::time::Instant,
-) -> Option<Option<String>> {
-    read_server_token_until_with_binary(socket_path, expires, Path::new("tmux")).await
-}
-
-async fn read_server_token_until_with_binary(
-    socket_path: &Path,
-    expires: tokio::time::Instant,
-    binary: &Path,
-) -> Option<Option<String>> {
-    match tmux_global_env_output_with_binary(socket_path, SERVER_TOKEN_VAR, Some(expires), binary)
-        .await
-    {
-        Ok(Some(output)) => Some(parse_tmux_global_env(&output, SERVER_TOKEN_VAR)),
-        Ok(None) => None,
-        Err(_) => Some(None),
-    }
-}
-
-/// Read one variable from a server's global environment, or `None` if unset.
-/// `tmux show-environment -g VAR` prints `VAR=value` when set and `-VAR` when
-/// not.
-async fn tmux_global_env(socket_path: &Path, var: &str) -> Option<String> {
-    let output = tmux_global_env_output(socket_path, var, None)
-        .await
-        .ok()??;
-    parse_tmux_global_env(&output, var)
-}
-
-async fn tmux_global_env_output(
-    socket_path: &Path,
-    var: &str,
-    expires: Option<tokio::time::Instant>,
-) -> std::io::Result<Option<std::process::Output>> {
-    tmux_global_env_output_with_binary(socket_path, var, expires, Path::new("tmux")).await
-}
-
-async fn tmux_global_env_output_with_binary(
-    socket_path: &Path,
-    var: &str,
-    expires: Option<tokio::time::Instant>,
-    binary: &Path,
-) -> std::io::Result<Option<std::process::Output>> {
-    let mut command = tokio::process::Command::new(binary);
-    command
-        .arg("-S")
-        .arg(socket_path)
-        .args(["show-environment", "-g", var])
-        .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    command_output(command, expires).await
-}
-
-fn parse_tmux_global_env(out: &std::process::Output, var: &str) -> Option<String> {
-    if !out.status.success() {
-        return None;
-    }
-    let prefix = format!("{var}=");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
-}
-
-/// Bring a reused tmux server up to the current companion version,
-/// non-destructively. Gated on the version stamp, so a current server is a
-/// no-op. A pre-feature/older live server otherwise reuses panes whose
-/// environment and loaded config predate `phx`, so:
-///
-/// - `set -ag terminal-features ",*:hyperlinks"` restores OSC-8 hyperlink
-///   forwarding for the next fresh attach (the relay re-attaches on every panel
-///   open, so the user gets it then);
-/// - `set-environment -g` injects the `phx` env (PATH prefix, API URL, token)
-///   for new windows/panes;
-/// - a one-time status hint tells the user how to reach `phx` in the *current*
-///   pane, whose shell already exported its PATH and cannot be changed from
-///   outside.
-///
-/// Recreating the server would fix the current pane too but destroy the user's
-/// running panes and jobs — rejected. Best-effort throughout.
-async fn refresh_companion_if_stale(socket_path: &Path) {
-    if tmux_global_env(socket_path, COMPANION_VERSION_VAR)
-        .await
-        .as_deref()
-        == Some(COMPANION_ENV_VERSION)
-    {
-        return;
-    }
-
-    run_tmux_quiet(
-        socket_path,
-        &["set", "-ag", "terminal-features", ",*:hyperlinks"],
-    )
-    .await;
-
-    // Put `phx` on new panes' PATH. A `set-environment -g PATH` is silently
-    // ignored by tmux for new panes (they take PATH from the server process),
-    // so instead wrap the pane shell via default-command to prepend the bin dir
-    // before exec — honored for every new window/pane, non-destructive to
-    // existing ones.
-    if let Some(bin) = phoenix_terminal::spawn::phx_bin_dir() {
-        let wrapper = format!(
-            r#"PATH="{}:$PATH"; export PATH; exec "${{SHELL:-/bin/sh}}""#,
-            bin.display()
-        );
-        run_tmux_quiet(socket_path, &["set", "-g", "default-command", &wrapper]).await;
-    }
-
-    // The suggest token and API URL DO propagate to new panes via the global
-    // environment (unlike PATH), so set them there.
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
-    let launch_uuid = uuid::Uuid::new_v4().to_string();
-    for (k, v) in phoenix_terminal::spawn::build_env_for_tmux(&shell, &launch_uuid) {
-        if k == "PHOENIX_API_URL" || k == "PHOENIX_SUGGEST_TOKEN" {
-            run_tmux_quiet(
-                socket_path,
-                &["set-environment", "-g", k.as_str(), v.as_str()],
-            )
-            .await;
-        }
-    }
-
-    run_tmux_quiet(
-        socket_path,
-        &[
-            "set-environment",
-            "-g",
-            COMPANION_VERSION_VAR,
-            COMPANION_ENV_VERSION,
-        ],
-    )
-    .await;
-
-    // The current pane's shell already exported its PATH and can't pick up
-    // `phx` retroactively; a new window (which the wrapper above dresses) can.
-    run_tmux_quiet(
-        socket_path,
-        &[
-            "display-message",
-            "-d",
-            "5000",
-            "phx now available in new windows — open one (prefix + c) to use it",
-        ],
-    )
-    .await;
-}
-
-/// Spawn a fresh detached tmux session named `main` against
-/// `socket_path` with `cwd` as the pane's start directory
-/// (REQ-TMUX-002 / `tmux_default_session`). This is the only place
-/// `new-session -d` is issued, and therefore the only place where
-/// `-f <config_path>` actually loads the Phoenix-shipped config —
-/// subsequent invocations against the same socket connect to the
-/// already-running server and inherit its loaded config.
-///
-/// `-c <cwd>` is load-bearing: without it tmux would inherit Phoenix's
-/// own working directory for the pane's shell, putting the agent (and
-/// any in-app terminal that later attaches) in the Phoenix repo
-/// instead of the conversation's project directory.
-///
-/// # Errors
-/// Returns a [`TmuxError`] when the `tmux new-session` process fails to
-/// spawn or exits non-zero.
-pub async fn spawn_session(
-    socket_path: &Path,
-    config_path: &Path,
-    cwd: &Path,
-) -> Result<(), TmuxError> {
-    spawn_session_owned(socket_path, config_path, cwd, false).await
-}
-
-#[cfg(test)]
-pub(crate) async fn spawn_test_session_with_handoff(
-    socket_path: &Path,
-    config_path: &Path,
-    cwd: &Path,
-) -> Result<(), TmuxError> {
-    spawn_session_owned(socket_path, config_path, cwd, true).await
-}
-
-fn tmux_new_session_args(
-    socket_path: &Path,
-    config_path: &Path,
-    cwd: &Path,
-    server_token: &str,
-) -> Vec<String> {
-    vec![
-        "-f".to_string(),
-        config_path.to_string_lossy().into_owned(),
-        "-S".to_string(),
-        socket_path.to_string_lossy().into_owned(),
-        "new-session".to_string(),
-        "-d".to_string(),
-        "-c".to_string(),
-        cwd.to_string_lossy().into_owned(),
-        "-s".to_string(),
-        TMUX_DEFAULT_SESSION.to_string(),
-        ";".to_string(),
-        "set-environment".to_string(),
-        "-g".to_string(),
-        SERVER_TOKEN_VAR.to_string(),
-        server_token.to_owned(),
-    ]
-}
-
-async fn wait_for_spawned_pane(socket_path: &Path, config_path: &Path) -> Result<(), TmuxError> {
-    let mut last_diag = String::from("no probe ran");
-    for attempt in 0..PANE_READY_MAX_ATTEMPTS {
-        let panes = tokio::process::Command::new("tmux")
-            .args([
-                "-f",
-                &config_path.to_string_lossy(),
-                "-S",
-                &socket_path.to_string_lossy(),
-                "list-panes",
-                "-t",
-                TMUX_DEFAULT_SESSION,
-            ])
-            .env_remove("TMUX")
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|error| TmuxError::SpawnFailed {
-                socket_path: socket_path.to_path_buf(),
-                reason: format!("failed to probe pane readiness: {error}"),
-            })?;
-        if panes.status.success() && !panes.stdout.is_empty() {
-            return Ok(());
-        }
-        last_diag = format!(
-            "exit {:?}, stderr: {}",
-            panes.status.code(),
-            String::from_utf8_lossy(&panes.stderr).trim()
-        );
-        if attempt + 1 < PANE_READY_MAX_ATTEMPTS {
-            tokio::time::sleep(PANE_READY_POLL_INTERVAL).await;
-        }
-    }
-    Err(TmuxError::SpawnFailed {
-        socket_path: socket_path.to_path_buf(),
-        reason: format!("session spawned but pane never became ready after {PANE_READY_MAX_ATTEMPTS} probes (last: {last_diag})"),
-    })
-}
-
-fn test_spawn_command(
-    socket_path: &Path,
-    tmux_args: &[String],
-    server_token: &str,
-    enabled: bool,
-) -> Result<(tokio::process::Command, Option<PathBuf>), TmuxError> {
-    if !enabled {
-        let mut command = tokio::process::Command::new("tmux");
-        command.args(tmux_args);
-        return Ok((command, None));
-    }
-    let root = socket_path.parent().ok_or_else(|| TmuxError::SpawnFailed {
-        socket_path: socket_path.to_path_buf(),
-        reason: "test socket has no parent root".to_string(),
-    })?;
-    let marker = root.join(format!(".creating-{}", uuid::Uuid::new_v4()));
-    let marker_payload = serde_json::json!({
-        "socket": socket_path.file_name().and_then(|name| name.to_str()),
-        "token": server_token,
-    });
-    std::fs::write(&marker, marker_payload.to_string()).map_err(|error| {
-        TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to publish test spawn obligation: {error}"),
-        }
-    })?;
-    let wrapper = r#"
-import fcntl
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-marker = Path(sys.argv[1])
-with marker.open("r+") as marker_file:
-    fcntl.flock(marker_file, fcntl.LOCK_EX)
-    child = subprocess.Popen(sys.argv[2:], start_new_session=True)
-    active = marker.with_suffix(".active")
-    active.touch()
-    try:
-        while (marker.parent / ".pause-creators").exists():
-            time.sleep(0.01)
-        sys.exit(child.wait())
-    finally:
-        active.unlink(missing_ok=True)
-"#;
-    let mut command = tokio::process::Command::new("python3");
-    command.arg("-c").arg(wrapper).arg(&marker).arg("tmux");
-    command.args(tmux_args);
-    Ok((command, Some(marker)))
-}
-
-async fn spawn_session_owned(
-    socket_path: &Path,
-    config_path: &Path,
-    cwd: &Path,
-    test_spawn_handoff: bool,
-) -> Result<(), TmuxError> {
-    let server_token = uuid::Uuid::new_v4().to_string();
-    let server_env = tmux_server_env(&server_token);
-    let tmux_args = tmux_new_session_args(socket_path, config_path, cwd, &server_token);
-    let (mut command, spawn_marker) =
-        test_spawn_command(socket_path, &tmux_args, &server_token, test_spawn_handoff)?;
-    set_tmux_server_env(&mut command, &server_env);
-    let output = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to invoke tmux: {error}"),
-        })?;
-    if !output.status.success() {
-        if let Some(marker) = &spawn_marker {
-            let _ = std::fs::remove_file(marker);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!(
-                "tmux new-session exited with {:?}: {}",
-                output.status.code(),
-                stderr.trim()
-            ),
-        });
-    }
-    wait_for_spawned_pane(socket_path, config_path).await?;
-    if let Some(marker) = spawn_marker {
-        std::fs::remove_file(marker).map_err(|error| TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to complete test spawn handoff: {error}"),
-        })?;
-    }
-    Ok(())
-}
-
 /// Default socket directory, resolved through [`PhoenixRuntimeEnvironment`]:
 /// `$PHOENIX_DATA_DIR/tmux-sockets/` if set, else
 /// `$HOME/.phoenix-ide/tmux-sockets/`, falling back to the system temp dir
@@ -3597,37 +2836,28 @@ fn default_socket_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux::test_server::TestTmuxServerOwner;
+    use crate::tmux::fake_backend::{FakeTmuxBackend, Stall};
     use tempfile::TempDir;
 
     fn scope(id: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
     }
 
-    async fn wait_for_exact_process_absence(identity: ProcessIdentity) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            match current_process_identity(identity.pid) {
-                Some(current) if current == identity => {}
-                Some(_) => return,
-                None => {
-                    let exists = match libc::pid_t::try_from(identity.pid) {
-                        Ok(pid) => {
-                            (unsafe { libc::kill(pid, 0) }) == 0
-                                || std::io::Error::last_os_error().raw_os_error()
-                                    != Some(libc::ESRCH)
-                        }
-                        Err(_) => true,
-                    };
-                    if !exists {
-                        return;
-                    }
-                }
-            }
-            assert!(tokio::time::Instant::now() < deadline);
-            // test-timing-allow: outer bound observes exact kernel process identity disappearance.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    /// A registry on a host without tmux.
+    fn without_tmux(socket_dir: &Path) -> TmuxRegistry {
+        TmuxRegistry::with_backend(
+            socket_dir.to_path_buf(),
+            FakeTmuxBackend::unavailable(),
+            None,
+        )
+    }
+
+    fn with_fake(socket_dir: &Path, fake: &Arc<FakeTmuxBackend>) -> TmuxRegistry {
+        TmuxRegistry::with_backend(socket_dir.to_path_buf(), fake.clone(), None)
+    }
+
+    async fn live_identity(server: &Arc<RwLock<TmuxServer>>) -> TmuxServerInstanceIdentity {
+        server.read().await.exact_identity()
     }
 
     #[test]
@@ -3692,9 +2922,9 @@ mod tests {
     async fn cascade_removal_round_trips_through_sink() {
         let tmp = TempDir::new().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let reg = TmuxRegistry::with_socket_dir_binary_and_sink(
+        let reg = TmuxRegistry::with_backend(
             tmp.path().to_path_buf(),
-            false,
+            FakeTmuxBackend::unavailable(),
             Some(tx),
         );
 
@@ -3716,9 +2946,9 @@ mod tests {
     async fn cascade_no_entry_does_not_emit() {
         let tmp = TempDir::new().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let reg = TmuxRegistry::with_socket_dir_binary_and_sink(
+        let reg = TmuxRegistry::with_backend(
             tmp.path().to_path_buf(),
-            false,
+            FakeTmuxBackend::unavailable(),
             Some(tx),
         );
         let scope = scope("never-existed");
@@ -3732,9 +2962,9 @@ mod tests {
     async fn cascade_preserve_does_not_emit() {
         let tmp = TempDir::new().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let reg = TmuxRegistry::with_socket_dir_binary_and_sink(
+        let reg = TmuxRegistry::with_backend(
             tmp.path().to_path_buf(),
-            false,
+            FakeTmuxBackend::unavailable(),
             Some(tx),
         );
         let wt = scope("/tmp/phoenix-tmux-preserve-emit");
@@ -3757,7 +2987,7 @@ mod tests {
     #[tokio::test]
     async fn cascade_preserve_leaves_registry_entry_intact() {
         let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let reg = without_tmux(tmp.path());
         let wt = scope("/tmp/phoenix-tmux-preserve-entry");
         let sock =
             socket_path_for_worktree(tmp.path(), Path::new("/tmp/phoenix-tmux-preserve-entry"));
@@ -3788,7 +3018,7 @@ mod tests {
         let observed = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let registry = Arc::new(
-            TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false)
+            without_tmux(tmp.path())
                 .with_cascade_not_probed_test_hook(Arc::clone(&observed), Arc::clone(&release)),
         );
         let work_scope = scope("cascade-promotion-authority");
@@ -3826,27 +3056,11 @@ mod tests {
         assert_eq!(current.server.read().await.status, ServerStatus::Live);
     }
 
-    #[test]
-    fn pre_teardown_socket_distinguishes_absence_from_unknown_incarnation() {
-        let tmp = TempDir::new().unwrap();
-        let missing = tmp.path().join("missing.sock");
-        assert_eq!(
-            pre_teardown_socket(&missing).unwrap(),
-            PreTeardownSocket::Absent
-        );
-
-        let unknown = tmp.path().join("not-a-socket");
-        std::fs::write(&unknown, b"not an owned socket incarnation").unwrap();
-        assert_eq!(
-            pre_teardown_socket(&unknown).unwrap(),
-            PreTeardownSocket::NotSocket
-        );
-    }
-
     #[tokio::test]
     async fn unknown_pre_teardown_incarnation_remains_repair_required() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
+        let fake = FakeTmuxBackend::new();
+        let registry = with_fake(tmp.path(), &fake);
         let work_scope = scope("unknown-pre-teardown-incarnation");
         let socket_path = registry.derived_socket_path(&work_scope);
         let _ = registry
@@ -3856,7 +3070,7 @@ mod tests {
             .begin_retirement(&work_scope, None, None, close_deadline())
             .await
             .expect("capture exact in-memory authority");
-        std::fs::write(&socket_path, b"not an owned socket incarnation").unwrap();
+        fake.place_file(&socket_path);
 
         assert!(matches!(
             registry.complete_retirement(&permit).await.unwrap(),
@@ -3869,7 +3083,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_absence_without_registered_resource_retires_placeholder() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
+        let registry = with_fake(tmp.path(), &FakeTmuxBackend::new());
         let work_scope = scope("endpoint-only-absence");
         let permit = registry
             .begin_retirement_after_discovery(
@@ -3890,10 +3104,11 @@ mod tests {
     #[tokio::test]
     async fn verified_server_absence_with_stale_socket_skips_teardown() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
+        let fake = FakeTmuxBackend::new();
+        let registry = with_fake(tmp.path(), &fake);
         let work_scope = scope("verified-absent-stale-socket");
         let socket_path = registry.derived_socket_path(&work_scope);
-        std::fs::write(&socket_path, b"stale endpoint").unwrap();
+        fake.place_file(&socket_path);
         let permit = registry
             .begin_retirement_after_discovery(
                 &work_scope,
@@ -3907,7 +3122,8 @@ mod tests {
             registry.complete_retirement(&permit).await.unwrap(),
             TmuxRetirementOutcome::Retired
         );
-        assert_eq!(std::fs::read(&socket_path).unwrap(), b"stale endpoint");
+        assert!(fake.endpoint_exists(&socket_path));
+        assert_eq!(fake.kill_server_count(&socket_path), 0);
         assert!(registry.get_existing(&work_scope).await.is_none());
     }
 
@@ -3917,7 +3133,7 @@ mod tests {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let registry = Arc::new(
-            TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false)
+            without_tmux(tmp.path())
                 .with_final_authority_test_hook(Arc::clone(&entered), Arc::clone(&release)),
         );
         let work_scope = scope("completion-replacement-authority");
@@ -3963,7 +3179,7 @@ mod tests {
     #[tokio::test]
     async fn begin_retirement_fences_ensure_live_until_reopened() {
         let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let reg = without_tmux(tmp.path());
         let work_scope = scope("retirement-fence");
         let permit = reg
             .begin_retirement(&work_scope, None, None, close_deadline())
@@ -3991,7 +3207,7 @@ mod tests {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let registry = Arc::new(
-            TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false)
+            without_tmux(tmp.path())
                 .with_cancel_retirement_test_hook(Arc::clone(&entered), Arc::clone(&release)),
         );
         let work_scope = scope("stale-cancel-newer-fence");
@@ -4028,7 +3244,7 @@ mod tests {
     #[tokio::test]
     async fn exact_tmux_cancel_reopens_admission_after_residual() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let registry = without_tmux(tmp.path());
         let work_scope = scope("exact-cancel-residual");
         let permit = registry
             .begin_retirement(&work_scope, None, None, close_deadline())
@@ -4052,7 +3268,7 @@ mod tests {
     #[tokio::test]
     async fn close_deadline_bounds_tmux_cancel_map_lock() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let registry = without_tmux(tmp.path());
         let work_scope = scope("cancel-deadline-map-lock");
         let permit = registry
             .begin_retirement(
@@ -4083,7 +3299,7 @@ mod tests {
     #[tokio::test]
     async fn batch_cancel_deadline_preserves_every_scope_fence_and_permit() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let registry = without_tmux(tmp.path());
         let scope_a = scope("batch-cancel-a");
         let scope_b = scope("batch-cancel-b");
         let permit_a = registry
@@ -4127,7 +3343,7 @@ mod tests {
     #[tokio::test]
     async fn deadline_failed_cancel_n_cannot_reopen_newer_fence_n_plus_one() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let registry = without_tmux(tmp.path());
         let work_scope = scope("deadline-stale-cancel-newer-fence");
         let permit_n = registry
             .begin_retirement(
@@ -4166,7 +3382,7 @@ mod tests {
     #[tokio::test]
     async fn close_deadline_bounds_tmux_cancel_entry_lock() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let registry = without_tmux(tmp.path());
         let work_scope = scope("cancel-deadline-entry-lock");
         let permit = registry
             .begin_retirement(
@@ -4201,13 +3417,13 @@ mod tests {
         assert!(!registry.is_retirement_fenced(&work_scope).await);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_deadline_bounds_retirement_lock_held_by_wedged_ensure_live() {
         let tmp = TempDir::new().unwrap();
         let lock_held = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let registry = Arc::new(
-            TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true)
+            with_fake(tmp.path(), &FakeTmuxBackend::new())
                 .with_ensure_live_lock_test_hook(Arc::clone(&lock_held), Arc::clone(&release)),
         );
         let work_scope = scope("deadline-ensure-live-lock");
@@ -4260,10 +3476,7 @@ mod tests {
     #[tokio::test]
     async fn close_deadline_bounds_begin_registry_map_lock_without_partial_fence() {
         let tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
-            tmp.path().to_path_buf(),
-            false,
-        ));
+        let registry = Arc::new(without_tmux(tmp.path()));
         let work_scope = scope("deadline-begin-map");
         let map_guard = registry.inner.write().await;
         let expires = tokio::time::Instant::now() + Duration::from_millis(50);
@@ -4284,7 +3497,7 @@ mod tests {
     #[tokio::test]
     async fn close_deadline_bounds_complete_initial_registry_map_lock() {
         let tmp = TempDir::new().unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let registry = without_tmux(tmp.path());
         let work_scope = scope("deadline-complete-initial-map");
         let socket_path = registry.derived_socket_path(&work_scope);
         registry.get_or_insert(&work_scope, socket_path).await;
@@ -4315,14 +3528,11 @@ mod tests {
         let final_authority_reached = Arc::new(tokio::sync::Notify::new());
         let release_final_authority = Arc::new(tokio::sync::Notify::new());
         let final_map_lock_reached = Arc::new(tokio::sync::Notify::new());
-        let registry = Arc::new(
-            TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false)
-                .with_final_map_lock_test_hook(
-                    Arc::clone(&final_authority_reached),
-                    Arc::clone(&release_final_authority),
-                    Arc::clone(&final_map_lock_reached),
-                ),
-        );
+        let registry = Arc::new(without_tmux(tmp.path()).with_final_map_lock_test_hook(
+            Arc::clone(&final_authority_reached),
+            Arc::clone(&release_final_authority),
+            Arc::clone(&final_map_lock_reached),
+        ));
         let work_scope = scope("deadline-complete-final-map");
         let socket_path = registry.derived_socket_path(&work_scope);
         registry.get_or_insert(&work_scope, socket_path).await;
@@ -4358,21 +3568,23 @@ mod tests {
         assert!(map_guard.get(&work_scope.stable_key()).is_some());
     }
 
+    /// REQ-WL-002d: a persisted identity whose socket is gone proves the
+    /// server is absent, both at restart rehydration and at completion.
     #[tokio::test]
-    async fn missing_socket_still_proves_exact_absence() {
+    async fn missing_socket_proves_exact_absence() {
         let tmp = TempDir::new().unwrap();
+        let registry = with_fake(tmp.path(), &FakeTmuxBackend::new());
         let work_scope = scope("missing-proves-absence");
         let identity = TmuxServerInstanceIdentity {
             socket_path: tmp.path().join("missing.sock"),
             server_token: "persisted-token".to_string(),
         };
-        let result = probe(&identity.socket_path).await.unwrap();
-        assert_eq!(result, ProbeResult::NoSocket);
         assert_eq!(
-            TmuxRegistry::exact_identity_state_from_probe(&identity, result, close_deadline())
+            registry
+                .rehydrate_retirement(&work_scope, &identity, close_deadline())
                 .await
                 .unwrap(),
-            ExactTmuxIdentityState::Absent
+            TmuxRetirementRehydration::AbsenceVerified
         );
         let permit = TmuxRetirementPermit {
             work_scope,
@@ -4384,9 +3596,7 @@ mod tests {
             expires: close_deadline(),
         };
         assert_eq!(
-            TmuxRegistry::verify_exact_absence_from_probe(&permit, result, close_deadline())
-                .await
-                .unwrap(),
+            registry.complete_retirement(&permit).await.unwrap(),
             TmuxRetirementOutcome::AbsenceVerified
         );
     }
@@ -4528,28 +3738,19 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    fn fake_unresponsive_tmux(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let binary = dir.join("unresponsive-tmux");
-        std::fs::write(&binary, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        binary
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
     async fn close_deadline_bounds_current_discovery_probe() {
         let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
         let work_scope = scope("deadline-current-discovery");
         let socket_path =
             socket_path_for_worktree(tmp.path(), Path::new("deadline-current-discovery"));
-        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
+        fake.place_orphan_socket(&socket_path);
+        fake.stall(&socket_path, Stall::Everything);
+        let registry = with_fake(tmp.path(), &fake);
 
         let error = registry
-            .discover_persistent_identity(&work_scope, None, None, tokio::time::Instant::now())
+            .discover_persistent_identity(&work_scope, None, None, close_deadline())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4559,23 +3760,19 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn close_deadline_bounds_legacy_discovery_probe() {
         let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
         let work_scope = scope("deadline-legacy-discovery");
         let legacy_path = Path::new("deadline-legacy-path");
         let legacy_socket = socket_path_for_worktree(tmp.path(), legacy_path);
-        let _listener = std::os::unix::net::UnixListener::bind(&legacy_socket).unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
+        fake.place_orphan_socket(&legacy_socket);
+        fake.stall(&legacy_socket, Stall::Everything);
+        let registry = with_fake(tmp.path(), &fake);
 
         let error = registry
-            .discover_persistent_identity(
-                &work_scope,
-                Some(legacy_path),
-                None,
-                tokio::time::Instant::now(),
-            )
+            .discover_persistent_identity(&work_scope, Some(legacy_path), None, close_deadline())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4585,72 +3782,81 @@ mod tests {
         ));
     }
 
+    /// A live server whose token read misses the Close deadline is not proof
+    /// of identity: rehydration stays a residual.
     #[tokio::test]
     async fn close_deadline_bounds_rehydration_token_read() {
         let tmp = TempDir::new().unwrap();
-        let binary = fake_unresponsive_tmux(tmp.path());
-        let identity = TmuxServerInstanceIdentity {
-            socket_path: tmp.path().join("rehydration-token.sock"),
-            server_token: uuid::Uuid::new_v4().to_string(),
-        };
-        let state = TmuxRegistry::exact_identity_state_from_probe_with_binary(
-            &identity,
-            ProbeResult::Live,
-            tokio::time::Instant::now() + Duration::from_millis(100),
-            &binary,
+        let fake = FakeTmuxBackend::new();
+        let work_scope = scope("deadline-rehydration-token");
+        let bootstrap = with_fake(tmp.path(), &fake);
+        let persisted = live_identity(
+            &bootstrap
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
         )
-        .await
-        .unwrap();
+        .await;
+        fake.stall(&persisted.socket_path, Stall::AfterProbe);
+
+        let restarted = with_fake(tmp.path(), &fake);
         assert!(matches!(
-            state,
-            ExactTmuxIdentityState::Ambiguous { reason }
+            restarted
+                .rehydrate_retirement(&work_scope, &persisted, close_deadline())
+                .await
+                .unwrap(),
+            TmuxRetirementRehydration::Residual { reason }
                 if reason.contains("token read") && reason.contains("Close deadline")
         ));
+        assert!(fake.server(&persisted.socket_path).unwrap().live);
     }
 
     #[tokio::test]
     async fn close_deadline_bounds_stale_permit_verification() {
         let tmp = TempDir::new().unwrap();
-        let binary = fake_unresponsive_tmux(tmp.path());
+        let fake = FakeTmuxBackend::new();
+        let socket_path = tmp.path().join("stale-token.sock");
+        fake.spawn_session(&socket_path, Path::new("/conf"), tmp.path())
+            .await
+            .unwrap();
+        fake.stall(&socket_path, Stall::AfterProbe);
+        let registry = with_fake(tmp.path(), &fake);
         let permit = TmuxRetirementPermit {
             work_scope: scope("deadline-stale-permit"),
             instance: TmuxServerInstanceIdentity {
-                socket_path: tmp.path().join("stale-token.sock"),
+                socket_path,
                 server_token: uuid::Uuid::new_v4().to_string(),
             },
             generation: TmuxRetirementGeneration(1),
             authority: TmuxRetirementAuthority::ExactServer,
             exact_process: None,
             had_entry: true,
-            expires: tokio::time::Instant::now() + Duration::from_millis(100),
+            expires: close_deadline(),
         };
-        let outcome = TmuxRegistry::verify_exact_absence_from_probe_with_binary(
-            &permit,
-            ProbeResult::Live,
-            permit.expires,
-            &binary,
-        )
-        .await
-        .unwrap();
         assert!(matches!(
-            outcome,
+            registry.complete_retirement(&permit).await.unwrap(),
             TmuxRetirementOutcome::IdentityNotProven { reason }
                 if reason.contains("token read") && reason.contains("Close deadline")
         ));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn close_deadline_bounds_teardown_command_and_leaves_residual_fence() {
         let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = with_fake(tmp.path(), &fake);
         let work_scope = scope("deadline-teardown");
-        let socket_path = tmp.path().join("teardown.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
-        let (entry, _) = registry.get_or_insert(&work_scope, socket_path).await;
-        entry.server.write().await.status = ServerStatus::Live;
+        let socket_path = live_identity(
+            &registry
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await
+        .socket_path;
+        fake.stall(&socket_path, Stall::AfterProbe);
         let permit = registry
-            .begin_retirement(&work_scope, None, None, tokio::time::Instant::now())
+            .begin_retirement(&work_scope, None, None, close_deadline())
             .await
             .expect("uncontended retirement fence should be acquired");
 
@@ -4661,6 +3867,7 @@ mod tests {
                 if reason.contains("teardown command") && reason.contains("Close deadline")
         ));
         assert!(registry.is_retirement_fenced(&work_scope).await);
+        assert!(fake.server(&socket_path).unwrap().live);
     }
 
     #[tokio::test(start_paused = true)]
@@ -4771,150 +3978,270 @@ mod tests {
         ));
     }
 
+    /// REQ-WL-002d / ADR-040: after a restart, a fresh registry rehydrates
+    /// authority for the same live server by its durable socket+token
+    /// identity and retires exactly that server.
     #[tokio::test]
-    async fn rehydrate_retirement_fresh_registry_reclaims_same_live_server() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let scope = scope("rehydrate-same-server");
-        let bootstrap = owner.registry();
-        let live = bootstrap
-            .ensure_live(&scope, owner.path(), None, None)
-            .await
-            .expect("bootstrap live server");
-        let persisted = {
-            let live = live.read().await;
-            TmuxServerInstanceIdentity {
-                socket_path: live.socket_path.clone(),
-                server_token: live.server_token.clone(),
-            }
-        };
+    async fn restart_rehydration_reclaims_the_same_live_server_by_durable_identity() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let work_scope = scope("rehydrate-same-server");
+        let bootstrap = with_fake(tmp.path(), &fake);
+        let persisted = live_identity(
+            &bootstrap
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .expect("bootstrap live server"),
+        )
+        .await;
+        let server_process = fake.server(&persisted.socket_path).unwrap().process;
 
-        let restarted = owner.registry();
-        let permit = match restarted
-            .rehydrate_retirement(&scope, &persisted, close_deadline())
+        let restarted = with_fake(tmp.path(), &fake);
+        let TmuxRetirementRehydration::Permit(permit) = restarted
+            .rehydrate_retirement(&work_scope, &persisted, close_deadline())
             .await
             .unwrap()
-        {
-            TmuxRetirementRehydration::Permit(permit) => permit,
-            other @ (TmuxRetirementRehydration::AbsenceVerified
-            | TmuxRetirementRehydration::Residual { .. }) => {
-                panic!("expected exact rehydrated permit, got {other:?}")
-            }
+        else {
+            panic!("expected an exact rehydrated permit");
         };
-        let outcome = restarted
-            .complete_retirement(&permit)
-            .await
-            .expect("complete exact rehydrated retirement");
-        assert_eq!(outcome, TmuxRetirementOutcome::Retired);
-        assert!(matches!(
-            probe(&persisted.socket_path).await.unwrap(),
-            ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket
-        ));
-        let _ = std::fs::remove_file(&persisted.socket_path);
-        owner.shutdown();
+        assert_eq!(permit.instance, persisted);
+        assert_eq!(permit.exact_process, Some(server_process));
+
+        assert_eq!(
+            restarted.complete_retirement(&permit).await.unwrap(),
+            TmuxRetirementOutcome::Retired
+        );
+        assert_eq!(fake.kill_server_count(&persisted.socket_path), 1);
+        assert!(!fake.endpoint_exists(&persisted.socket_path));
+        assert_eq!(
+            restarted.backend().process_state(server_process),
+            ExactProcessState::DeadOrReused
+        );
+        assert!(restarted.get_existing(&work_scope).await.is_none());
     }
 
+    /// REQ-WL-002d: a replacement at the reused socket proves the persisted
+    /// server absent, and the replacement is left untouched.
     #[tokio::test]
-    async fn retirement_absence_verification_does_not_kill_reopened_replacement() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let reg = owner.registry();
-        let work_scope = scope("retirement-absence-replacement");
+    async fn restart_rehydration_of_a_replaced_server_proves_absence_and_spares_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let work_scope = scope("rehydrate-replaced-server");
+        let bootstrap = with_fake(tmp.path(), &fake);
+        let persisted = live_identity(
+            &bootstrap
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        fake.kill_server(&persisted.socket_path);
+        let replacement = live_identity(
+            &bootstrap
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(replacement.socket_path, persisted.socket_path);
+        assert_ne!(replacement.server_token, persisted.server_token);
 
-        let first = reg
-            .ensure_live(&work_scope, owner.path(), None, None)
-            .await
-            .expect("first server");
-        let stale_socket = first.read().await.socket_path.clone();
-        let stale_token = first.read().await.server_token.clone();
+        let restarted = with_fake(tmp.path(), &fake);
+        assert_eq!(
+            restarted
+                .rehydrate_retirement(&work_scope, &persisted, close_deadline())
+                .await
+                .unwrap(),
+            TmuxRetirementRehydration::AbsenceVerified
+        );
+        let survivor = fake.server(&persisted.socket_path).unwrap();
+        assert!(survivor.live);
+        assert_eq!(survivor.token, Some(replacement.server_token));
+        assert_eq!(fake.kill_server_count(&persisted.socket_path), 0);
+    }
+
+    /// REQ-WL-002d: when the identity cannot be proven, rehydration fails
+    /// closed and the server is preserved.
+    #[tokio::test]
+    async fn restart_rehydration_fails_closed_on_unproven_identity() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let bootstrap = with_fake(tmp.path(), &fake);
+        let tokenless_scope = scope("rehydrate-tokenless");
+        let tokenless = live_identity(
+            &bootstrap
+                .ensure_live(&tokenless_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        fake.remove_global_env(&tokenless.socket_path, SERVER_TOKEN_VAR);
+        let ambiguous_scope = scope("rehydrate-ambiguous-probe");
+        let ambiguous = live_identity(
+            &bootstrap
+                .ensure_live(&ambiguous_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        fake.make_probe_ambiguous(&ambiguous.socket_path);
+
+        let restarted = with_fake(tmp.path(), &fake);
+        for (work_scope, identity) in [(tokenless_scope, tokenless), (ambiguous_scope, ambiguous)] {
+            assert!(matches!(
+                restarted
+                    .rehydrate_retirement(&work_scope, &identity, close_deadline())
+                    .await
+                    .unwrap(),
+                TmuxRetirementRehydration::Residual { .. }
+            ));
+            assert!(fake.server(&identity.socket_path).unwrap().live);
+            assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+        }
+    }
+
+    /// REQ-WL-002d: completing a stale permit after admission reopened and a
+    /// replacement server started proves the old server absent and never
+    /// kills the replacement.
+    #[tokio::test]
+    async fn exact_retirement_never_kills_a_reopened_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let reg = with_fake(tmp.path(), &fake);
+        let work_scope = scope("retirement-absence-replacement");
+        let stale = live_identity(
+            &reg.ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .expect("first server"),
+        )
+        .await;
         let permit = reg
             .begin_retirement(&work_scope, None, None, close_deadline())
             .await
             .expect("retirement fence should be acquired");
-        assert_eq!(permit.instance.socket_path, stale_socket);
-        assert_eq!(permit.instance.server_token, stale_token);
-        let stale_identity = exact_server_process_identity_until(
-            &stale_socket,
-            &stale_token,
-            tokio::time::Instant::now() + Duration::from_secs(2),
-        )
-        .await
-        .expect("capture exact stale server identity");
+        assert_eq!(permit.instance, stale);
 
         reg.reopen_after_repair(&work_scope).await;
-        kill_socket(&stale_socket).await;
-        wait_for_exact_process_absence(stale_identity).await;
-        let replacement = reg
-            .ensure_live(&work_scope, owner.path(), None, None)
-            .await
-            .expect("replacement server");
-        let replacement_token = replacement.read().await.server_token.clone();
-        assert_ne!(
-            replacement_token, stale_token,
-            "replacement must rotate token"
-        );
+        fake.kill_server(&stale.socket_path);
+        let replacement = live_identity(
+            &reg.ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .expect("replacement server"),
+        )
+        .await;
+        assert_ne!(replacement.server_token, stale.server_token);
 
-        let outcome = reg
-            .complete_retirement(&permit)
-            .await
-            .expect("retirement completion");
-        assert_eq!(outcome, TmuxRetirementOutcome::AbsenceVerified);
+        assert_eq!(
+            reg.complete_retirement(&permit).await.unwrap(),
+            TmuxRetirementOutcome::AbsenceVerified
+        );
         assert!(reg.get_existing(&work_scope).await.is_some());
+        let survivor = fake.server(&stale.socket_path).unwrap();
+        assert!(survivor.live);
+        assert_eq!(survivor.token, Some(replacement.server_token));
+        assert_eq!(fake.kill_server_count(&stale.socket_path), 0);
+    }
 
-        let output = run_tmux_quiet_output(&stale_socket, &["list-sessions"])
+    /// A dead but unreaped (zombie) exact server process proves absence, so
+    /// completion retires without sending a kill command.
+    #[tokio::test]
+    async fn zombie_exact_server_process_proves_absence_without_kill() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let reg = with_fake(tmp.path(), &fake);
+        let work_scope = scope("zombie-exact-server");
+        let identity = live_identity(
+            &reg.ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let permit = reg
+            .begin_retirement(&work_scope, None, None, close_deadline())
             .await
-            .expect("replacement still reachable");
-        assert!(
-            output.status.success(),
-            "replacement server must survive stale permit retirement"
+            .unwrap();
+        assert!(permit.exact_process.is_some());
+        fake.zombify_server(&identity.socket_path);
+
+        assert_eq!(
+            reg.complete_retirement(&permit).await.unwrap(),
+            TmuxRetirementOutcome::Retired
         );
-        owner.shutdown();
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+        assert!(reg.get_existing(&work_scope).await.is_none());
     }
 
-    #[test]
-    fn production_spawn_builds_exact_pane_environment() {
-        let token = "test-server-token";
-        let shell = "/bin/test-shell";
-        let launch_id = "test-launch-id";
-        let expected = tmux_server_env_for(token, shell, launch_id)
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        let base = phoenix_terminal::spawn::build_env_for_tmux(shell, launch_id)
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        for (key, value) in base {
-            assert_eq!(
-                expected.get(&key),
-                Some(&value),
-                "base environment key {key}"
-            );
-        }
-        assert_eq!(
-            expected.get(SERVER_TOKEN_VAR).map(String::as_str),
-            Some(token)
-        );
-        assert_eq!(
-            expected.get(COMPANION_VERSION_VAR).map(String::as_str),
-            Some(COMPANION_ENV_VERSION)
-        );
-        assert_eq!(
-            expected.len(),
-            phoenix_terminal::spawn::build_env_for_tmux(shell, launch_id).len() + 2
-        );
-        assert!(!expected.contains_key("OPENAI_API_KEY"));
-        assert!(!expected.contains_key("ANTHROPIC_API_KEY"));
+    /// REQ-TMUX-005: a live server at the scope socket is reused, not
+    /// respawned, and its published token becomes the entry's identity.
+    #[tokio::test]
+    async fn ensure_live_reuses_a_live_server_from_a_previous_process() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let work_scope = scope("reuse-live-server");
+        let first = live_identity(
+            &with_fake(tmp.path(), &fake)
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let restarted = with_fake(tmp.path(), &fake);
+        let reused = live_identity(
+            &restarted
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(reused, first);
+        assert_eq!(fake.spawn_count(&first.socket_path), 1);
     }
 
-    async fn kill_socket(socket_path: &Path) {
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &socket_path.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
+    /// REQ-TMUX-006: a socket file whose server is proven gone is unlinked and
+    /// a fresh server is spawned in the conversation cwd.
+    #[tokio::test]
+    async fn ensure_live_replaces_an_orphan_socket_with_a_fresh_server() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let work_scope = scope("orphan-socket-respawn");
+        let registry = with_fake(tmp.path(), &fake);
+        let socket_path = registry.derived_socket_path(&work_scope);
+        fake.place_orphan_socket(&socket_path);
+        let cwd = tmp.path().join("project");
+
+        let server = registry
+            .ensure_live(&work_scope, &cwd, None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let spawned = fake.server(&socket_path).unwrap();
+        assert!(spawned.live);
+        assert_eq!(spawned.cwd, cwd);
+        assert_eq!(spawned.token, Some(identity.server_token));
+        assert_eq!(server.read().await.status, ServerStatus::Live);
+    }
+
+    /// An existing socket whose liveness probe proves nothing is never
+    /// unlinked or replaced.
+    #[tokio::test]
+    async fn ensure_live_fails_closed_on_an_ambiguous_socket() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let work_scope = scope("ambiguous-socket");
+        let registry = with_fake(tmp.path(), &fake);
+        let socket_path = registry.derived_socket_path(&work_scope);
+        fake.place_orphan_socket(&socket_path);
+        fake.make_probe_ambiguous(&socket_path);
+
+        assert!(matches!(
+            registry
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await,
+            Err(TmuxError::AmbiguousSocketIdentity { .. })
+        ));
+        assert!(fake.endpoint_exists(&socket_path));
+        assert_eq!(fake.spawn_count(&socket_path), 0);
     }
 
     /// `emit_lifecycle` with no sink wired is a no-op (no panic). Mirrors the
@@ -4922,7 +4249,7 @@ mod tests {
     #[tokio::test]
     async fn emit_lifecycle_without_sink_is_no_op() {
         let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let reg = without_tmux(tmp.path());
         reg.emit_lifecycle(&scope("conv-X"));
     }
 
@@ -4959,7 +4286,7 @@ mod tests {
     #[tokio::test]
     async fn binary_unavailable_short_circuits_ensure_live() {
         let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let reg = without_tmux(tmp.path());
         assert!(matches!(
             reg.ensure_live(&scope("conv-x"), tmp.path(), None, None)
                 .await,
@@ -4971,7 +4298,7 @@ mod tests {
     async fn ensure_runtime_assets_sets_0700_perms_and_writes_config_file() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("nested").join("tmux-sockets");
-        let reg = TmuxRegistry::with_socket_dir_and_binary(dir.clone(), false);
+        let reg = without_tmux(&dir);
         reg.ensure_runtime_assets()
             .await
             .expect("mkdir + config write");
@@ -5004,7 +4331,7 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let reg = TmuxRegistry::with_socket_dir_and_binary(dir.clone(), false);
+        let reg = without_tmux(&dir);
         reg.ensure_runtime_assets()
             .await
             .expect("bootstrap on pre-existing dir");
@@ -5028,7 +4355,7 @@ mod tests {
         // We verify this by hand-mutating the file between calls and
         // checking that the second call leaves our mutation intact.
         let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let reg = without_tmux(tmp.path());
         reg.ensure_runtime_assets().await.expect("first call");
         let config_path = reg.config_path();
 
@@ -5045,49 +4372,69 @@ mod tests {
 
     #[test]
     fn config_path_is_in_socket_dir() {
-        let reg = TmuxRegistry::with_socket_dir_and_binary("/tmp/x".into(), false);
+        let reg = without_tmux(Path::new("/tmp/x"));
         assert_eq!(
             reg.config_path(),
             std::path::PathBuf::from("/tmp/x/_phoenix.tmux.conf")
         );
     }
 
-    /// Approval scope-flip: a server entry created under the conversation
-    /// scope is reachable under the worktree scope after a rekey, the old key
-    /// is gone, and the stored `socket_path` is PRESERVED (the running tmux
-    /// server lives on the old socket — re-deriving from the new scope would
-    /// orphan it). The `work_scope` diagnostic field follows the new scope.
+    /// REQ-TMUX-007: cascade on a scope with no registry entry (restarted
+    /// Phoenix) still discovers and retires the persistent server.
     #[tokio::test]
-    async fn cascade_on_delete_empty_registry_reclaims_persistent_server() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
+    async fn cascade_on_delete_reclaims_a_persistent_server_with_an_empty_registry() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
         let scope = scope("cascade-persistent-empty-registry");
-        let bootstrap = owner.registry();
-        let live = bootstrap
-            .ensure_live(&scope, owner.path(), None, None)
-            .await
-            .expect("bootstrap persistent server");
-        let socket_path = live.read().await.socket_path.clone();
+        let socket_path = live_identity(
+            &with_fake(tmp.path(), &fake)
+                .ensure_live(&scope, tmp.path(), None, None)
+                .await
+                .expect("bootstrap persistent server"),
+        )
+        .await
+        .socket_path;
 
-        let restarted = owner.registry();
+        let restarted = with_fake(tmp.path(), &fake);
         assert_eq!(restarted.conversation_count().await, 0);
         let report = restarted.cascade_on_delete(&scope, None, None, None).await;
 
         assert!(report.kill_server_error.is_none(), "{report:?}");
-        assert!(matches!(
-            probe(&socket_path).await.unwrap(),
-            ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket
-        ));
-        let _ = std::fs::remove_file(&socket_path);
-        owner.shutdown();
+        assert_eq!(report.socket_path, socket_path);
+        assert_eq!(fake.kill_server_count(&socket_path), 1);
+        assert!(!fake.endpoint_exists(&socket_path));
+        assert_eq!(restarted.conversation_count().await, 0);
+    }
+
+    /// Cascade with an empty registry never destroys a server whose identity
+    /// it cannot prove.
+    #[tokio::test]
+    async fn cascade_on_delete_preserves_an_ambiguous_persistent_server() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let scope = scope("cascade-ambiguous-empty-registry");
+        let socket_path = live_identity(
+            &with_fake(tmp.path(), &fake)
+                .ensure_live(&scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await
+        .socket_path;
+        fake.make_probe_ambiguous(&socket_path);
+
+        let report = with_fake(tmp.path(), &fake)
+            .cascade_on_delete(&scope, None, None, None)
+            .await;
+        assert!(report.kill_server_error.is_some());
+        assert!(fake.server(&socket_path).unwrap().live);
+        assert_eq!(fake.kill_server_count(&socket_path), 0);
     }
 
     #[tokio::test]
     async fn cascade_on_delete_no_entry_attempts_socket_unlink() {
         let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let reg = without_tmux(tmp.path());
         // No prior entry, no on-disk socket — cascade should be a no-op
         // that returns without errors.
         let scope = scope("never-existed");
@@ -5108,7 +4455,7 @@ mod tests {
         // binary_available = false so ensure_live short-circuits before
         // probing/spawning; we exercise only the registry insertion +
         // removal contract, not the tmux subprocess.
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let reg = without_tmux(tmp.path());
 
         let conv_scope = scope("conv-direct");
         let conv_sock = socket_path_for(tmp.path(), "conv-direct");
@@ -5145,7 +4492,7 @@ mod tests {
     #[tokio::test]
     async fn cascade_on_delete_continuation_preserves_socket() {
         let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let reg = without_tmux(tmp.path());
         let worktree = std::path::PathBuf::from("/tmp/phoenix-test-worktree-preserve");
         let socket_path = socket_path_for_worktree(tmp.path(), &worktree);
         std::fs::write(&socket_path, b"live").unwrap();

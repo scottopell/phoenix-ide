@@ -330,13 +330,87 @@ still matches the server's configured URI; a changed URL (or authorization
 server), or a fully dead token (expired with no refresh token), discards the
 stored token instead of sending it to the new endpoint
 AND, on expiry or a post-authorization 401, refresh using the refresh token,
-persisting any rotated refresh token the server returns
-AND, when refresh fails, discard the stored token and return the server to an
+persisting any rotated refresh token the server returns; a successful grant
+whose local store write fails SHALL retain its response and retry persistence
+without repeating the grant with the replaced refresh token
+AND, when refresh is definitively rejected, discard the stored token and return the server to an
 unauthorized state requiring a new authorization
 AND, when a tool call returns HTTP 403 `insufficient_scope` with a
 `WWW-Authenticate` challenge, re-authorize requesting the **union** of the
 previously granted scopes and the newly challenged scope, then retry, rather
 than surfacing a permanent tool failure.
+
+OAuth recovery SHALL retain the old session as non-callable cleanup ownership
+without requiring authenticated session deletion before token refresh or
+re-authorization. THE SYSTEM SHALL use the recovered bearer to finish that
+cleanup before making a replacement connection callable. An unresolved cleanup
+failure SHALL retain retry ownership and block replacement.
+Configuration supersession SHALL fence token persistence, token invalidation,
+and authorization-flow publication, including background refresh retries.
+A recovered bearer SHALL reach the retained session before configuration
+supersession can discard its stored token or retry cleanup with old credentials.
+Authorization retained solely to finish removal SHALL complete cleanup and
+forget the removed server and token without republishing its tools.
+A denied authorization SHALL clear its pending URL and settle as
+failed while retaining the session cleanup owner and requested scopes. An
+explicit unchanged-configuration reload SHALL request authorization again
+with those scopes and the discovery challenge before attempting authenticated
+session deletion, including when denied removal cleanup failed and the server
+is re-added.
+Stream-quiescence failure SHALL settle as failed with teardown ownership
+retained, including during handshake shutdown. It SHALL prevent OAuth refresh
+or replacement publication from masking that failure; session deletion SHALL
+remain available to an explicit cleanup retry.
+An OAuth failure from the same observed connection epoch SHALL be able to
+take over transport recovery whose session cleanup failed, obtaining a bearer
+before retrying that cleanup. Reauthorization setup failure SHALL settle as
+failed and require explicit retry; only transient token-refresh failures retry
+automatically while retaining the existing grant.
+Removal requested between transient refresh attempts SHALL retain the grant
+and recovery epoch until authenticated cleanup finishes, then delete the token
+and forget the server without reconnecting. Re-adding the same configuration
+SHALL restore reconnect intent. A rejected grant during deferred removal SHALL
+transfer cleanup-only intent to the new authorization flow.
+Removal intent SHALL be persisted before admitting credential cleanup. A token
+deletion failure SHALL retain a visible, non-callable cleanup owner and SHALL
+not report completed removal. Startup and reload SHALL retry persisted credential
+removals whose server name remains absent from configuration; re-adding the name
+SHALL cancel that intent without deleting the grant. Token deletion and durable
+removal completion SHALL commit atomically. This restart recovery covers stored
+credentials and removal intent; it does not recover volatile HTTP session identifiers.
+A changed configuration requested during owned OAuth cleanup SHALL queue the
+new configuration while retaining the old resource's grant and cleanup plan.
+THE SYSTEM SHALL finish authenticated cleanup before invalidating that grant
+and applying the queued configuration. A tool invocation SHALL remain bound to
+its original configuration; applying a different configuration SHALL supersede
+the invocation rather than replay its tool and arguments against the new server.
+Pending authorization SHALL be replaced
+with a fresh nonce while preserving the cleanup discovery challenge and scopes.
+A replacement connection that requires authorization SHALL expose its owned
+pending authorization as unauthorized, including after successful token refresh.
+A handshake's authorization failure SHALL retain its challenge and OAuth cleanup
+ownership when session teardown also fails. A restored token SHALL still take
+the silent refresh path before reauthorization; a handshake rejected after that
+refresh SHALL request owned reauthorization without repeating the grant, using
+that handshake's discovery challenge. A session DELETE authorization rejection
+SHALL admit OAuth cleanup recovery even when the handshake's primary failure
+is not an authorization error. Challenges from both failures SHALL contribute
+required scopes, with the latest supplied discovery metadata retained when later challenges
+omit it. Removing a ready OAuth server SHALL reserve exclusive OAuth cleanup ownership
+before discarding its grant. Expired tokens SHALL refresh before session cleanup;
+a cleanup authorization rejection SHALL retain its challenge and support refresh
+or owned reauthorization. A DELETE `403 insufficient_scope` challenge SHALL
+retain its discovery metadata and required scopes and request owned
+reauthorization instead of refreshing the same insufficient grant.
+Failed removal retries SHALL retain that ownership.
+Recovered removal grants SHALL remain persisted until cleanup succeeds. A failed
+removal callback cleanup SHALL retain its complete authorization retry plan so
+expired recovered credentials cannot prevent explicit reauthorization.
+Successful refresh continuations SHALL preserve the complete authorization plan,
+including previously required scopes when the returned grant narrows, for
+replacement connection recovery while the configuration remains unchanged.
+Transient refresh or token persistence failures after successful handshake
+teardown SHALL retain recovery ownership and retry without manual reload.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
 survive restarts; the stored token must be loaded and attached to the very
@@ -347,7 +421,7 @@ it merely because the config kept the same display name -- after the URL changed
 conditional on the resource matching. A rotating server may issue a replacement
 refresh token on each refresh; dropping it forces a needless re-authorization.
 The access token must ride every request or protected servers reject calls
-despite a successful authorization. A failed refresh must discard the stale
+despite a successful authorization. A rejected refresh must discard the stale
 token so it cannot be reused or duplicated, and is the condition that re-prompts
 the user. A `403 insufficient_scope` is a step-up request, not a terminal error;
 it must request the union of prior and challenged scopes, or fixing one
@@ -359,7 +433,8 @@ through repeated re-authorization.
 ### REQ-MCP-013: Authorization Status Surfaced to the UI
 
 THE SYSTEM SHALL expose, per server, whether it is connected, awaiting
-authorization (with the authorization URL), or failed (with the error), via
+authorization (with the authorization URL), removing while cleanup is pending,
+or failed (with the error), via
 `GET /api/mcp/status`.
 
 **Rationale:** A server blocked on authorization must be distinguishable from
@@ -393,8 +468,12 @@ WHEN MCP config is reloaded
 THE SYSTEM SHALL reconcile the running set against the new config: connect added
 servers, disconnect removed servers, restart servers whose config changed, and
 leave unchanged servers untouched
-AND report the per-server outcome (added / removed / restarted / unchanged /
-failed).
+AND report the per-server outcome (added / removed / pending removal / restarted /
+unchanged / failed). Deferred cleanup SHALL report pending removal until the
+server is forgotten; the UI SHALL keep awaiting its cleanup or authorization
+outcome within the reload polling window, including while another server is ready.
+Applying a queued configuration SHALL consume its queued target so later
+recovery on that configuration remains eligible for replay.
 
 **Rationale:** Reload must not tear down healthy connections. Reconciliation
 applies the minimum change and reports what happened so the operator sees the

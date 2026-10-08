@@ -184,8 +184,7 @@ For complex scripts, write them to a file first and execute the file."#
                 },
                 "label": {
                     "type": "string",
-                    "maxLength": 64,
-                    "description": "Optional human-readable annotation for the spawned handle (op=run). Echoed on every response carrying the handle and on each entry of `live_handles[]` in the cap-reached error."
+                    "description": "Optional short human-readable annotation for the spawned handle (op=run). Prefer 64 characters or fewer. Longer labels are deterministically shortened for display while preserving their prefix and suffix. Echoed on every response carrying the handle and on each entry of `live_handles[]` in the cap-reached error."
                 },
                 "wait_seconds": {
                     "type": "integer",
@@ -1238,24 +1237,62 @@ mod tests {
             .await;
     }
 
+    #[test]
+    fn label_schema_allows_provider_to_deliver_over_cap_presentation_metadata() {
+        let schema = BashTool.input_schema();
+        let label = &schema["properties"]["label"];
+        assert!(label.get("maxLength").is_none());
+        assert!(label["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("64 characters or fewer")));
+    }
+
     #[tokio::test]
-    async fn label_over_cap_returns_label_too_long() {
+    async fn label_over_cap_is_normalized_without_changing_command_execution() {
         let tool = BashTool;
-        let oversized = "x".repeat(65);
+        let oversized = format!("{}{}{}", "α".repeat(48), "middle", "終".repeat(20));
         let result = tool
             .run(
                 json!({
                     "op": "run",
-                    "cmd": "echo hi",
-                    "label": oversized
+                    "cmd": "printf exact-command-output",
+                    "label": oversized,
+                    "wait_seconds": 5
                 }),
                 ctx(),
             )
             .await;
-        assert!(!result.is_success());
+        assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
-        assert_eq!(v["error"], "label_too_long");
-        assert_eq!(v["max_label_length"], 64);
+        assert!(
+            result.output().contains("exact-command-output"),
+            "command output changed or was hidden: {}",
+            result.output()
+        );
+        let label = v["label"].as_str().unwrap();
+        assert_eq!(label.chars().count(), 64);
+        assert!(label.starts_with(&"α".repeat(47)));
+        assert!(label.ends_with(&"終".repeat(16)));
+    }
+
+    #[tokio::test]
+    async fn labels_at_unicode_boundary_are_preserved_exactly() {
+        let tool = BashTool;
+        let exact = format!("{}{}", "🦀".repeat(63), "終");
+        let result = tool
+            .run(
+                json!({
+                    "op": "run",
+                    "cmd": "true",
+                    "label": exact,
+                    "wait_seconds": 5
+                }),
+                ctx(),
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["label"], exact);
     }
 
     #[tokio::test]

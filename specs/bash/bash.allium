@@ -377,9 +377,26 @@ config {
     -- Lines returned by peek when neither lines= nor since= is supplied.
 
     max_label_length: Integer = 64
-    -- Soft cap on Handle.label length. Labels longer than this are
-    -- rejected with `error: "label_too_long"`.
+    -- Display bound on Handle.label length. Longer labels are shortened by
+    -- Unicode scalar count while preserving a 47-scalar prefix, one ellipsis,
+    -- and a 16-scalar suffix.
 }
+
+------------------------------------------------------------
+-- Helpers (pure functions referenced by the rules below)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; this block is the single
+-- source of truth for the bare helper used below.
+--
+--   shorten_label(label: String?, max_length: Integer) -> String?
+--       Null and the empty string both normalize to null. A non-empty label
+--       with at most max_length Unicode scalar values remains byte-for-byte
+--       unchanged. With max_length = 64, a longer
+--       label becomes its first 47 Unicode scalar values, U+2026, and its last
+--       16 Unicode scalar values, for exactly 64 scalar values. The helper reads
+--       and changes no command, path, scope, operation, handle, or wait value.
+--
 
 deferred BashTerminalEdgeWorkScopeReconciliation
     -- REQ-BASH-010a, REQ-BASH-010b, REQ-BASH-010c. When a Work-owned bash handle
@@ -454,8 +471,9 @@ rule HandleSpawned {
               < config.live_handle_cap
     requires: 0 <= wait_seconds
     requires: wait_seconds <= config.max_wait_seconds
-    requires: label = null or len(label) <= config.max_label_length
-
+    let stored_label = shorten_label(label, config.max_label_length)
+    -- shorten_label counts Unicode scalar values; over-bound values use a
+    -- 47-scalar prefix, U+2026, and a 16-scalar suffix.
     let h_id = next_global_handle_id()
 
     ensures: Handle.created(
@@ -463,7 +481,7 @@ rule HandleSpawned {
         controller_scope:  resolve_resource_scope(conversation),
         handle_id:        h_id,
         cmd:              cmd,
-        label:            label,
+        label:            stored_label,
         working_dir:      selected_target.canonical_working_dir,
         status:           running,
         started_at:       now(),
@@ -471,6 +489,14 @@ rule HandleSpawned {
         next_line_offset: 0
     )
     ensures: ChildProcessSpawned(owner_scope, h_id, cmd)
+    ensures: label = null or label = ""
+             implies Handle{handle_id: h_id}.label = null
+    ensures: label != null and label != ""
+             implies len(Handle{handle_id: h_id}.label) <= config.max_label_length
+    ensures: label != null and label != "" and len(label) <= config.max_label_length
+             implies Handle{handle_id: h_id}.label = label
+    ensures: label != null and len(label) > config.max_label_length
+             implies Handle{handle_id: h_id}.label != label
 
     @guidance
         -- Run sequence (in src/tools/bash/operations.rs):
@@ -555,18 +581,6 @@ rule RunRejectedByRange {
     ensures: AgentReceivesError(
         error: "wait_seconds_out_of_range",
         max_wait_seconds: config.max_wait_seconds
-    )
-}
-
--- REQ-BASH-010: label exceeds the configured cap.
-rule RunRejectedByLabelLength {
-    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
-
-    requires: label != null and len(label) > config.max_label_length
-
-    ensures: AgentReceivesError(
-        error: "label_too_long",
-        max_label_length: config.max_label_length
     )
 }
 
@@ -1260,7 +1274,6 @@ surface AgentBashAccess {
     provides:
         AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
             when 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
-            and (label = null or len(label) <= config.max_label_length)
             and count(Handle{owner_scope: spawn_target.owner_scope, status: running})
                 < config.live_handle_cap
 

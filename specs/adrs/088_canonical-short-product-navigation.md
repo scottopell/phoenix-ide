@@ -1,4 +1,4 @@
-# ADR-086: Canonical short ProductConversation navigation
+# ADR-088: Canonical short ProductConversation navigation
 
 - **Status:** Accepted
 
