@@ -1175,6 +1175,74 @@ enum WebReferenceResolution {
     NotWeb,
 }
 
+fn parse_transcript_pins(query: &str) -> Result<Vec<String>, AppError> {
+    let parsed = reqwest::Url::parse(&format!("http://route.invalid/?{query}"))
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let pins: Vec<_> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key == "source_transcript")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    if pins.len() > 1
+        || pins
+            .first()
+            .is_some_and(|pin| pin.is_empty() || pin.trim() != pin)
+    {
+        return Err(AppError::BadRequest(
+            "Invalid exact transcript reference".into(),
+        ));
+    }
+    Ok(pins)
+}
+
+async fn exact_global_domain(
+    service: &GlobalReadService,
+    conv: &Conversation,
+    global: bool,
+) -> Result<bool, AppError> {
+    let coordinator = service
+        .db
+        .product_conversation_kind(&conv.product_conversation_id)
+        .await
+        .map_err(map_db_not_found)?
+        == Some(phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator);
+    if global
+        && (!coordinator
+            || conv.parent_conversation_id.is_some()
+            || conv.runtime_role != phoenix_core::work_scope::RuntimeRole::User)
+    {
+        return Err(AppError::BadRequest(
+            "Global route requires a Coordinator conversation".into(),
+        ));
+    }
+    let global = coordinator
+        && conv.parent_conversation_id.is_none()
+        && conv.runtime_role == phoenix_core::work_scope::RuntimeRole::User;
+    Ok(global)
+}
+
+async fn resolve_anchored_product_member(
+    service: &GlobalReadService,
+    product: Option<&phoenix_core::domain::product_conversation::ProductConversationId>,
+    message_id: Option<&str>,
+) -> Result<Option<Conversation>, AppError> {
+    let (Some(product), Some(message_id)) = (product, message_id) else {
+        return Ok(None);
+    };
+    let message = service
+        .db
+        .get_message_by_id(&decode_route_value(message_id)?)
+        .await
+        .map_err(map_db_not_found)?;
+    let owner = load_conversation_by_slug_or_id(service, &message.conversation_id).await?;
+    if *product != owner.product_conversation_id {
+        return Err(AppError::NotFound(
+            "message is not a member of this conversation".into(),
+        ));
+    }
+    Ok(Some(owner))
+}
+
 async fn resolve_web_reference(
     service: &GlobalReadService,
     raw: &str,
@@ -1194,22 +1262,7 @@ async fn resolve_web_reference(
                 "Conversation reference must not be empty".into(),
             ));
         }
-        let parsed = reqwest::Url::parse(&format!("http://route.invalid/?{query}"))
-            .map_err(|error| AppError::BadRequest(error.to_string()))?;
-        let pins: Vec<_> = parsed
-            .query_pairs()
-            .filter(|(key, _)| key == "source_transcript")
-            .map(|(_, value)| value.into_owned())
-            .collect();
-        if pins.len() > 1
-            || pins
-                .first()
-                .is_some_and(|pin| pin.is_empty() || pin.trim() != pin)
-        {
-            return Err(AppError::BadRequest(
-                "Invalid exact transcript reference".into(),
-            ));
-        }
+        let pins = parse_transcript_pins(query)?;
         let global = reference.starts_with("/global/");
         let product = service.db.resolve_ordinary_product_conversation(&id).await;
         if let Err(error) = &product {
@@ -1230,49 +1283,34 @@ async fn resolve_web_reference(
             }
         }
         if canonical_product.is_none() {
-            let anchored_owner = if pins.is_empty() && product.is_ok() {
-                if let Some(message_id) = fragment.and_then(message_id_fragment) {
-                    let message = service
-                        .db
-                        .get_message_by_id(&decode_route_value(message_id)?)
-                        .await
-                        .map_err(map_db_not_found)?;
-                    let owner =
-                        load_conversation_by_slug_or_id(service, &message.conversation_id).await?;
-                    if product.as_ref().is_ok_and(|product| {
-                        product.product_conversation_id != owner.product_conversation_id
-                    }) {
-                        return Err(AppError::NotFound(
-                            "message is not a member of this conversation".into(),
-                        ));
-                    }
-                    Some(owner)
+            let anchored_owner = resolve_anchored_product_member(
+                service,
+                product
+                    .as_ref()
+                    .ok()
+                    .map(|product| &product.product_conversation_id),
+                if pins.is_empty() {
+                    fragment.and_then(message_id_fragment)
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                },
+            )
+            .await?;
             let conv = match anchored_owner {
                 Some(owner) => owner,
                 None => {
                     load_conversation_by_slug_or_id(service, pins.first().unwrap_or(&id)).await?
                 }
             };
-            let coordinator = service.db.product_conversation_kind(&conv.product_conversation_id)
-                .await.map_err(map_db_not_found)? == Some(phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator);
-            if global
-                && (!coordinator
-                    || conv.parent_conversation_id.is_some()
+            if product.is_ok()
+                && (conv.parent_conversation_id.is_some()
                     || conv.runtime_role != phoenix_core::work_scope::RuntimeRole::User)
             {
-                return Err(AppError::BadRequest(
-                    "Global route requires a Coordinator conversation".into(),
+                return Err(AppError::NotFound(
+                    "transcript is not an ordinary conversation member".into(),
                 ));
             }
-            let global = coordinator
-                && conv.parent_conversation_id.is_none()
-                && conv.runtime_role == phoenix_core::work_scope::RuntimeRole::User;
+            let global = exact_global_domain(service, &conv, global).await?;
             if let Some(pin) = pins.first() {
                 if conv.id != *pin {
                     return Err(AppError::BadRequest(

@@ -258,7 +258,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               let id = pendingConversationID,
               let origin = serverManager.webOrigin else { return }
         pendingConversationID = nil
-        webView.load(URLRequest(url: origin.url(path: "/c/\(id.uuidString.lowercased())")))
+        var target = URLComponents(url: origin.url(path: "/c/\(id.uuidString.lowercased())"), resolvingAgainstBaseURL: false)!
+        target.queryItems = [URLQueryItem(name: "source_transcript", value: id.uuidString.lowercased())]
+        webView.load(URLRequest(url: target.url!))
     }
 
     private func validateAndQueueConversationNavigation(_ id: UUID) {
