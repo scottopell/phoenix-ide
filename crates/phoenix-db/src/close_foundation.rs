@@ -2978,6 +2978,36 @@ impl Database {
                 "attempt {attempt_id} dispatched absence requires retained retry inspection authority"
             )));
         }
+        let unretained_loss_scope: Option<String> = sqlx::query_scalar(
+            "SELECT loss.scope FROM close_retirement_losses loss
+             WHERE loss.attempt_id = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM close_retirement_inspections inspection
+                 JOIN close_worktree_cleanup_plans plan
+                   ON plan.attempt_id = inspection.attempt_id
+                  AND plan.scope = inspection.scope
+                  AND plan.inspection_generation = ?2
+                  AND plan.inspection_fingerprint = ?3
+                 JOIN close_retirement_inventories inventory
+                   ON inventory.attempt_id = plan.attempt_id
+                  AND inventory.scope = plan.scope
+                  AND inventory.inspection_generation = plan.inspection_generation
+                  AND inventory.inspection_fingerprint = plan.inspection_fingerprint
+                  AND inventory.sealed = 1
+                 WHERE inspection.attempt_id = loss.attempt_id
+                   AND inspection.scope = loss.scope
+                   AND inspection.generation = loss.generation
+             ) ORDER BY loss.scope LIMIT 1",
+        )
+        .bind(attempt_id.as_str())
+        .bind(retained_snapshot.generation())
+        .bind(retained_snapshot.fingerprint())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(scope) = unretained_loss_scope {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} scope {scope} dispatched absence cannot rotate source losses without exact cleanup plan and sealed inventory authority"
+            )));
+        }
         let request = ReplaceCloseInspectionRequest {
             attempt_id: attempt_id.clone(),
             scopes,
@@ -12355,25 +12385,6 @@ mod tests {
             parse_rfc3339_instant_key(older_capture, "captured_at").unwrap()
                 < parse_rfc3339_instant_key(newer_capture, "captured_at").unwrap()
         );
-        for (snapshot, captured_at) in [
-            (&source_snapshot, older_capture),
-            (&newest_unadopted_snapshot, newer_capture),
-        ] {
-            let updated = sqlx::query(
-                "UPDATE close_retirement_inventories SET captured_at=?5
-                 WHERE attempt_id=?1 AND scope=?2
-                   AND inspection_generation=?3 AND inspection_fingerprint=?4",
-            )
-            .bind(attempt_id.as_str())
-            .bind(scope.as_str())
-            .bind(snapshot.generation())
-            .bind(snapshot.fingerprint())
-            .bind(captured_at)
-            .execute(db.pool())
-            .await
-            .unwrap();
-            assert_eq!(updated.rows_affected(), 1);
-        }
         let (snapshot_b, plan_b) = rotate_and_adopt(
             &db,
             &attempt_id,
@@ -12561,6 +12572,8 @@ mod tests {
             "close_obligations",
             "close_retirement_inspections",
             "close_retirement_losses",
+            "close_retained_retirement_inspections",
+            "close_retained_retirement_losses",
             "close_retirement_inventories",
             "close_expected_retirement_resources",
             "close_retirement_resources",
@@ -12679,6 +12692,112 @@ mod tests {
                 relation: "close_obligations",
                 ..
             })
+        ));
+        assert_eq!(close_authority_rows(&db).await, before);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn dispatched_absence_retry_rejects_other_scope_loss_without_writes() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "leaf", "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let other_scope = allocate_scope_worktree(&db, "leaf").await;
+        assert_ne!(scope, other_scope);
+        let attempt = CloseAttemptId::parse("attempt-other-scope-loss").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("leaf"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            attempt.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt.clone(),
+            scopes: [&scope, &other_scope]
+                .into_iter()
+                .map(|scope| ReplaceCloseInspectionScopeRequest {
+                    scope: scope.clone(),
+                    snapshot: CloseRetirementSnapshot::parse(
+                        "source-generation",
+                        "source-fingerprint",
+                    )
+                    .unwrap(),
+                    losses: vec![CloseLossItem::UntrackedNonIgnoredPath(
+                        GitPathIdentity::from_bytes(vec![0xff, b'a']),
+                    )],
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+        let source = current_test_snapshot(&db, attempt.as_str()).await;
+        db.confirm_close_loss_retirement(&attempt, &source)
+            .await
+            .unwrap();
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            attempt.as_str(),
+            &scope,
+            &source,
+            vec![resource.clone()],
+        )
+        .await;
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt.clone(),
+            scope: scope.clone(),
+            snapshot: source.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        db.record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt.clone(),
+            scope: scope.clone(),
+            snapshot: source.clone(),
+            resource: resource.clone(),
+            administrative_dir: std::path::PathBuf::from("/tmp/other-scope-loss-admin"),
+            administrative_dir_incarnation: "admin-v1".to_string(),
+        })
+        .await
+        .unwrap();
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: attempt.clone(),
+            scope,
+            residual: resource,
+            reason: RetirementFailureReason::RemovalFailed,
+            detail: "cleanup requires explicit retry".to_string(),
+        })
+        .await
+        .unwrap();
+        db.retry_close_retirement(&attempt).await.unwrap();
+
+        let before = close_authority_rows(&db).await;
+        let error = db
+            .resume_close_retirement_after_dispatched_absence(
+                &attempt,
+                &source,
+                "other-scope-loss-retry-generation",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::CloseFoundationPrecondition(ref detail)
+                if detail.contains(other_scope.as_str())
+                    && detail.contains("without exact cleanup plan and sealed inventory authority")
         ));
         assert_eq!(close_authority_rows(&db).await, before);
     }
@@ -12862,24 +12981,43 @@ mod tests {
             )
             .await
             .unwrap();
-        let retained: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT generation, fingerprint, inspected_at FROM close_retained_retirement_inspections
+        assert_eq!(source_inspections.len(), 1);
+        assert_eq!(source_inspections[0].target.scope, scope);
+        assert_eq!(
+            source_inspections[0].snapshot.generation(),
+            "source-generation"
+        );
+        assert_eq!(
+            source_inspections[0].snapshot.fingerprint(),
+            "source-fingerprint"
+        );
+        assert_eq!(source_losses.len(), 1);
+        assert_eq!(
+            source_losses[0].item,
+            CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(vec![0xff, b'a']))
+        );
+        let retained: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT scope, generation, fingerprint, inspected_at FROM close_retained_retirement_inspections
              WHERE attempt_id=?1 AND inspection_generation=?2 AND inspection_fingerprint=?3",
         ).bind(attempt.as_str()).bind(snapshot.generation()).bind(snapshot.fingerprint())
             .fetch_all(db.pool()).await.unwrap();
         assert_eq!(
             retained,
             vec![(
+                scope.as_str().to_string(),
                 source_inspections[0].snapshot.generation().to_string(),
                 source_inspections[0].snapshot.fingerprint().to_string(),
                 source_inspections[0].inspected_at.to_rfc3339(),
             )]
         );
-        let retained_losses: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT category, identity_kind, identity_codec, identity_value
-             FROM close_retained_retirement_losses WHERE attempt_id=?1",
+        let retained_losses: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT scope, category, identity_kind, identity_codec, identity_value
+             FROM close_retained_retirement_losses WHERE attempt_id=?1
+               AND inspection_generation=?2 AND inspection_fingerprint=?3",
         )
         .bind(attempt.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
         .fetch_all(db.pool())
         .await
         .unwrap();
@@ -12887,6 +13025,7 @@ mod tests {
         assert_eq!(
             retained_losses,
             vec![(
+                scope.as_str().to_string(),
                 source_loss.category().as_str().to_string(),
                 source_loss.identity().identity_kind().to_string(),
                 source_loss.identity().codec().to_string(),
@@ -12901,6 +13040,11 @@ mod tests {
         assert_eq!(
             active_inspections[0].snapshot.generation(),
             "server_git_status_v2_retry_dispatched_absence"
+        );
+        assert_eq!(active_inspections[0].target.scope, scope);
+        assert_eq!(
+            active_inspections[0].snapshot.fingerprint(),
+            "source-fingerprint"
         );
         assert!(db
             .list_close_retirement_losses(attempt.as_str())
