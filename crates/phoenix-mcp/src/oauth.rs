@@ -82,6 +82,10 @@ pub trait OAuthStore: Send + Sync {
     async fn token(&self, server_name: &str) -> Result<Option<OAuthTokenRecord>, String>;
     async fn upsert_token(&self, record: &OAuthTokenRecord) -> Result<(), String>;
     async fn delete_token(&self, server_name: &str) -> Result<(), String>;
+    async fn record_removal(&self, server_name: &str) -> Result<(), String>;
+    async fn pending_removals(&self) -> Result<Vec<String>, String>;
+    async fn cancel_removal(&self, server_name: &str) -> Result<(), String>;
+    async fn complete_removal(&self, server_name: &str) -> Result<(), String>;
 }
 
 /// In-memory [`OAuthStore`]: the default for a manager constructed without a
@@ -90,6 +94,7 @@ pub trait OAuthStore: Send + Sync {
 pub struct MemoryOAuthStore {
     registrations: std::sync::Mutex<HashMap<String, OAuthRegistrationRecord>>,
     tokens: std::sync::Mutex<HashMap<String, OAuthTokenRecord>>,
+    removals: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[async_trait]
@@ -123,6 +128,26 @@ impl OAuthStore for MemoryOAuthStore {
 
     async fn delete_token(&self, server_name: &str) -> Result<(), String> {
         self.tokens.lock().unwrap().remove(server_name);
+        Ok(())
+    }
+
+    async fn record_removal(&self, server_name: &str) -> Result<(), String> {
+        self.removals.lock().unwrap().insert(server_name.to_owned());
+        Ok(())
+    }
+
+    async fn pending_removals(&self) -> Result<Vec<String>, String> {
+        Ok(self.removals.lock().unwrap().iter().cloned().collect())
+    }
+
+    async fn cancel_removal(&self, server_name: &str) -> Result<(), String> {
+        self.removals.lock().unwrap().remove(server_name);
+        Ok(())
+    }
+
+    async fn complete_removal(&self, server_name: &str) -> Result<(), String> {
+        self.tokens.lock().unwrap().remove(server_name);
+        self.removals.lock().unwrap().remove(server_name);
         Ok(())
     }
 }
