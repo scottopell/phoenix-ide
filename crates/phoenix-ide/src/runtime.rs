@@ -9584,6 +9584,7 @@ mod scope_liveness_tests {
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
         let mut manager = test_manager().await;
         manager.tmux_registry = Arc::new(owner.registry());
+        manager.test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
         let (_repository, attempt_id, scope, socket, stale_token) =
             prepare_clean_close_with_tmux(&manager, &owner, "live-tmux-close", "live-tmux-attempt")
                 .await;
@@ -9618,6 +9619,7 @@ mod scope_liveness_tests {
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
         let mut manager = test_manager().await;
         manager.tmux_registry = Arc::new(owner.registry());
+        manager.test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
         let (_repository, attempt_id, scope, socket, stale_token) = prepare_clean_close_with_tmux(
             &manager,
             &owner,
