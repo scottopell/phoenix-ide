@@ -78,14 +78,14 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
         if (!sameSource || current?.presentation !== presentation) {
           store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation });
         }
-        selectionInput.current = null;
-        selectionChangedDuringGesture.current = false;
         setNotice('');
       } else if (current && (current.presentation === 'floating'
         || Boolean(nativeSelection && nativeSelection.rangeCount > 0 && !nativeSelection.isCollapsed)
         || Boolean(restoreReactionRange(current.source)))) {
         store.dispatch(scopeKey, { type: 'clear' });
       }
+      selectionInput.current = null;
+      selectionChangedDuringGesture.current = false;
     };
     const schedule = () => {
       cancelAnimationFrame(frame);

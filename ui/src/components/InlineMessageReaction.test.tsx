@@ -264,6 +264,20 @@ describe('inline message reactions', () => {
     await act(async () => { await new Promise(requestAnimationFrame); });
     expect(store.getSnapshot('conversation-a')).toEqual(owned);
     expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId('unrelated'), { pointerType: 'mouse' });
+    fireEvent.pointerUp(screen.getByTestId('unrelated'), { pointerType: 'mouse' });
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    view.rerender(<Harness store={store} append={append} />);
+    const restoredText = screen.getByTestId('old').firstChild!;
+    const restored = document.createRange();
+    restored.setStart(restoredText, 0);
+    restored.setEnd(restoredText, 28);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(restored);
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
   });
 
   it('preserves touch presentation when source restoration emits selectionchange', async () => {
