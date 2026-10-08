@@ -1740,6 +1740,20 @@ mod tests {
             assert!(properties.contains_key("signal"));
             assert!(properties.contains_key("lines"));
             assert!(properties.contains_key("since"));
+            let label_schema = properties
+                .get("label")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{label}: bash schema missing label"));
+            assert!(
+                !label_schema.contains_key("maxLength"),
+                "{label}: provider schema must not pre-reject presentation-only labels"
+            );
+            assert!(
+                label_schema["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("64 characters or fewer")),
+                "{label}: bash schema must guide the model toward short labels"
+            );
 
             // `op` is the only schema-required field.
             let required = schema
