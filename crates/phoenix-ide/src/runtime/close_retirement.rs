@@ -2963,7 +2963,7 @@ fn inspect_and_remove_exact_worktree<B>(
     administrative_dir_incarnation: &str,
     final_tombstone: Option<&CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
-    inspect_writer: impl Fn(&Path) -> Result<bool, String>,
+    inspect_writer: impl Fn(&Path) -> Result<bool, String> + Send + 'static,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
