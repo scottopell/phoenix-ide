@@ -1691,11 +1691,10 @@ impl RuntimeManager {
                                     },
                                     move |path| {
                                         #[cfg(test)]
-                                        {
-                                            return test_writer_observer(path);
-                                        }
+                                        let result = test_writer_observer(path);
                                         #[cfg(not(test))]
-                                        quarantine_has_external_writer(path)
+                                        let result = quarantine_has_external_writer(path);
+                                        result
                                     },
                                 )
                             })
@@ -3589,7 +3588,7 @@ fn validate_final_tombstone_root(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(test)))]
 #[allow(
     clippy::useless_conversion,
     reason = "libc stat device width differs across supported Unix targets"
