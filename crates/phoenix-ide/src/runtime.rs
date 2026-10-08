@@ -9624,6 +9624,7 @@ mod scope_liveness_tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn startup_runtime_retirement_does_not_retry_needs_repair() {
         use phoenix_core::domain::close::{

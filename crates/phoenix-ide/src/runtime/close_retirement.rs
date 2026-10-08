@@ -1993,6 +1993,7 @@ impl RuntimeManager {
 
     /// Completes one live lease. Callers must persist exactly one receipt per
     /// returned identity; the repair transition reopens admission after a residual.
+    #[allow(clippy::too_many_lines)]
     async fn complete_close_resource_lease(
         &self,
         attempt_id: &CloseAttemptId,
@@ -2045,7 +2046,7 @@ impl RuntimeManager {
                         detail: error.to_string(),
                     })? {
                     TmuxRetirementRehydration::AbsenceVerified => {
-                        absent_tmux.push((*resource).clone())
+                        absent_tmux.push((*resource).clone());
                     }
                     TmuxRetirementRehydration::Residual { reason } => {
                         return Err(CloseLeaseFailure::Tmux {
