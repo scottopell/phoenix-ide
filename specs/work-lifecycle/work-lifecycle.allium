@@ -20,7 +20,7 @@
 --     (pr-association owns those authorities);
 --   - UI layout and copy.
 --
--- Requirement traceability: REQ-WL-001 through REQ-WL-003,
+-- Requirement traceability: REQ-WL-001 through REQ-WL-008,
 -- REQ-PROJ-028a, REQ-PROJ-WS-001
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -185,15 +185,26 @@ external entity RestartRepairEvidenceAdoption {
     restart_repair_evidence: gitrep/RestartRepairEvidence
 }
 
+value CleanupInspectionPair {
+    generation: String
+    fingerprint: String
+}
+
+external entity LegacyFk787CleanupProvenance {
+    source: WorktreeCleanupPlan
+    recognized_pair: CleanupInspectionPair
+    recognized_at_unix_us: Integer
+}
+
 external entity WorktreeCleanupDispatch {
     attempt: RetirementAttempt
-    inspection: RetirementInspection
+    inspection: CleanupInspectionPair
     resource: CleanupResourceIdentity
 }
 
 external entity WorktreeCleanupPlan {
     attempt: RetirementAttempt
-    inspection: RetirementInspection
+    inspection: CleanupInspectionPair
     resource: CleanupResourceIdentity
     payload: CleanupPlanPayload
 }
@@ -203,6 +214,17 @@ external entity WorktreeCleanupAdoption {
     target: WorktreeCleanupPlan
     adopted_at_unix_micros: Integer
 }
+
+external entity WorktreeRetirementReceiptAdoption {
+    attempt: RetirementAttempt
+    source_inspection: CleanupInspectionPair
+    target_inspection: CleanupInspectionPair
+    resource: CleanupResourceIdentity
+    state: ReceiptAdoptionState
+    adopted_at_unix_micros: Integer
+}
+
+enum ReceiptAdoptionState { pending, finalized }
 
 ------------------------------------------------------------
 -- Rules
@@ -779,6 +801,53 @@ rule RepeatedAdoptionRevalidatesAndReturnsExistingPlan {
     ensures: CleanupPlanAvailable(attempt, target_inspection, resource)
 }
 
+rule PrepareExactSuccessfulWorktreeReceipt {
+    when: WorktreeRetirementReceiptPreparationRequested(attempt, source_inspection, target_inspection, resource)
+    requires: bedrock/CloseObligation{product_conversation: attempt.product_conversation, attempt_id: attempt.attempt_id}.phase = retirement_requested
+    requires: source_inspection != target_inspection
+    requires: exact_successful_worktree_receipt_exists(attempt, source_inspection, resource)
+    requires: exact_sealed_target_inventory_contains(attempt, target_inspection, resource)
+    requires: exact_worktree_and_administrative_locations_absent_no_follow(attempt, resource)
+    ensures: WorktreeRetirementReceiptAdoption.created(
+        attempt: attempt,
+        source_inspection: source_inspection,
+        target_inspection: target_inspection,
+        resource: resource,
+        state: pending,
+        adopted_at_unix_micros: current_unix_micros()
+    )
+    ensures: WorktreeCleanupDispatch.created(attempt: attempt, inspection: target_inspection, resource: resource)
+    ensures: worktree_cleanup_plan_absent(attempt, target_inspection, resource)
+}
+
+rule FinalizeExactSuccessfulWorktreeReceipt {
+    when: WorktreeRetirementReceiptFinalizationRequested(attempt, source_inspection, target_inspection, resource)
+    requires: exists WorktreeRetirementReceiptAdoption{
+        attempt: attempt,
+        source_inspection: source_inspection,
+        target_inspection: target_inspection,
+        resource: resource,
+        state: pending
+    }
+    requires: exact_worktree_and_administrative_locations_absent_no_follow(attempt, resource)
+    ensures: worktree_absence_adopted(attempt, target_inspection, resource)
+    ensures: worktree_receipt_adoption_finalized(attempt, target_inspection, resource)
+}
+
+rule ReappearedPathLeavesReceiptPendingForRepair {
+    when: WorktreeRetirementReceiptFinalizationRequested(attempt, source_inspection, target_inspection, resource)
+    requires: exists WorktreeRetirementReceiptAdoption{
+        attempt: attempt,
+        source_inspection: source_inspection,
+        target_inspection: target_inspection,
+        resource: resource,
+        state: pending
+    }
+    requires: not exact_worktree_and_administrative_locations_absent_no_follow(attempt, resource)
+    ensures: worktree_receipt_adoption_pending(attempt, target_inspection, resource)
+    ensures: WorktreeRetirementResidualRecorded(attempt.product_conversation, attempt.attempt_id, attempt.scope)
+}
+
 rule CleanupAdoptionConflictRollsBack {
     when: WorktreeCleanupAdoptionRequested(attempt, target_inspection, resource, observed_directory, observed_incarnation)
     requires: cleanup_adoption_conflicts(attempt, target_inspection, resource, observed_directory, observed_incarnation)
@@ -790,6 +859,24 @@ rule CleanupAdoptionConflictRollsBack {
         -- fresh directory mismatch, conflicting target rows and mismatched
         -- lineage/payload. Rollback includes a dispatch inserted before a later plan
         -- or lineage failure. Never continue deletion after this result.
+}
+
+rule ExactLegacyShapeRecordsProvenanceNotInspection {
+    when: LegacyFk787CleanupProvenanceRequested(attempt, source, recognized_pair)
+    requires: exact_fk787_partial_generation(attempt.product_conversation, attempt.attempt_id)
+    requires: legacy_source_dispatch_and_sealed_inventory_match(attempt, source, recognized_pair)
+    requires: not exact_retained_source_inspection_exists(source)
+    ensures: LegacyFk787CleanupProvenance.created(
+        source: source,
+        recognized_pair: recognized_pair,
+        recognized_at_unix_us: current_unix_micros()
+    )
+    ensures: retained_close_evidence_unchanged(attempt.product_conversation, attempt.attempt_id)
+
+    @guidance
+        -- Record every eligible scope's provenance before any active-pair dispatch
+        -- or plan is written. The source pair is plan metadata, not a fabricated
+        -- inspection observation. Freeze its payload and retain exact legacy rows.
 }
 
 -- REQ-WL-005: compatibility is the full conjunction, not the error alone.
@@ -893,6 +980,19 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
         -- and never closes, mutates, or retargets a PR.
 }
 
+rule RetainedInspectionAndLegacyProvenanceMigrationPreservesExistingRows {
+    when: CleanupEvidenceMigration121Requested(database)
+    requires: existing_adoptions_have_exact_retained_sources(database)
+    ensures: retained_close_database_rows_unchanged(database)
+    ensures: cleanup_evidence_storage_installed_empty(database)
+    ensures: retirement_filesystem_actions_suppressed(database)
+
+    @guidance
+        -- No inspection/loss/provenance fabrication, automatic recognition or
+        -- lifecycle transition. Existing adoptions without exact source evidence
+        -- fail atomically without a migration stamp or destructive rewrite.
+}
+
 ------------------------------------------------------------
 -- Helpers (pure predicates referenced by restart-repair rules)
 ------------------------------------------------------------
@@ -901,6 +1001,26 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 -- complete semantics of each bare helper used above.
 --
 -- Cleanup adoption, recovery and upgrade helpers:
+--
+--   legacy_source_dispatch_and_sealed_inventory_match(attempt, source, pair) -> Boolean
+--       Same exact attempt/scope/worktree identity, matching prior plan/dispatch
+--       and sealed source inventory; pair equals the recognized sealed active
+--       inventory pair and differs from source. The full REQ-WL-005 conjunction
+--       is required before any active-pair dispatch/plan is written.
+--   exact_retained_source_inspection_exists(source) -> Boolean
+--       Immutable retained per-scope inspection and exact loss identities belong
+--       to source's aggregate pair. Its inspected_at_unix_us is a nonnegative
+--       integer; Rust converts the actual active RFC3339 time without fabricating
+--       a value. No observation from another pair can stand in for this source.
+--   existing_adoptions_have_exact_retained_sources(database) -> Boolean
+--       Every pre-upgrade adoption has its exact retained source inspection;
+--       unsupported rows fail migration without backfilling evidence/provenance.
+--   cleanup_evidence_storage_installed_empty(database) -> Boolean
+--       Retained inspections/losses and typed legacy provenance tables are empty.
+--       Provenance references the exact source plan and recognized inventory,
+--       has a nonnegative integer recognition time, freezes source payloads and
+--       is immutable except completed-History hard deletion after all transcript
+--       members are removed. Delete provenance before referenced plans/inventories.
 --
 --   retirement_dispatch_suppressed(product_conversation, attempt_id) -> Boolean
 --       No inspection, lease reacquisition, resource dispatch, or automatic retry
@@ -915,10 +1035,35 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --   newest_compatible_cleanup_source(attempt, inspection, resource,
 --       observed_directory, observed_incarnation) -> WorktreeCleanupPlan?
 --       Select only the same attempt/scope/exact worktree identity in a different
---       generation/fingerprint, with a matching dispatch and inventory, identical
---       fresh administrative locator/incarnation, and no existing outgoing adoption.
+--       generation/fingerprint, with a matching dispatch and sealed inventory,
+--       an exact retained source inspection/loss snapshot or immutable typed
+--       LegacyFk787CleanupProvenance, identical fresh administrative locator/
+--       incarnation, and no existing outgoing adoption. Pair metadata alone does
+--       not assert an observed inspection; mismatched active observations are
+--       never relabelled as source evidence.
 --       Order inventory capture time descending then plan row order descending.
 --       Return absent if no eligible source exists. Never rewrite a consumed source.
+--   exact_successful_worktree_receipt_exists(attempt, inspection, resource) -> Boolean
+--       The exact same-attempt Worktree resource has sealed inventory, dispatch,
+--       successful retired/absence-adopted evidence, and either a cleanup plan or
+--       an immutable prior successful-receipt lineage at this source pair.
+--   exact_sealed_target_inventory_contains(attempt, inspection, resource) -> Boolean
+--       The active RetirementRequested pair equals inspection and its sealed expected
+--       inventory names this exact Worktree resource identity.
+--   exact_worktree_and_administrative_locations_absent_no_follow(attempt, resource)
+--       -> Boolean
+--       Captured path, Worktree quarantine, retained administrative directory and
+--       administrative quarantine each return NotFound under no-follow observation;
+--       symlink, replacement, inaccessibility or any present entry returns false.
+--   worktree_cleanup_plan_absent(attempt, inspection, resource) -> Boolean
+--       No target-generation cleanup plan is fabricated for already-deleted admin state.
+--   worktree_receipt_adoption_pending(attempt, inspection, resource) -> Boolean
+--       Exact target receipt lineage exists in pending state and target success is absent.
+--   worktree_receipt_adoption_finalized(attempt, inspection, resource) -> Boolean
+--       Exact target receipt lineage is finalized and exact AbsenceAdopted evidence exists.
+--   immutable_receipt_payload(lineage) -> Boolean
+--       Attempt, scope, source/target pairs, resource and adoption timestamp never change;
+--       the only update is pending to finalized coupled to exact target success evidence.
 --   cleanup_adoption_target_matches_or_is_absent(attempt, inspection, resource,
 --       source) -> Boolean
 --       Any existing target dispatch names the identical key and any existing plan
@@ -1008,7 +1153,8 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       Source/target relation and adopted-source payload cannot change or be
 --       deleted during runtime repair/retry. Only explicit completed aggregate hard
 --       deletion after every transcript member is removed may erase history, with
---       lineage dependencies removed before referenced plans/obligation.
+--       lineage/provenance dependencies removed before referenced plans,
+--       recognized inventories and obligation.
 --
 --   attempt_bound_scope_inspections(
 --       product_conversation: bedrock/ProductConversation,
@@ -1162,6 +1308,16 @@ invariant NoAutomaticRecoveryArtifactFromRetirement {
         implies not AutomaticRetirementSnapshotCreated(a.product_conversation)
 }
 
+
+invariant WorktreeReceiptAdoptionIsExactAndImmutable {
+    for lineage in WorktreeRetirementReceiptAdoption:
+        lineage.attempt.phase in {RetirementRequested, Completed}
+        and lineage.source_inspection != lineage.target_inspection
+        and exact_successful_worktree_receipt_exists(lineage.attempt, lineage.source_inspection, lineage.resource)
+        and exact_sealed_target_inventory_contains(lineage.attempt, lineage.target_inspection, lineage.resource)
+        and (lineage.state = pending or worktree_absence_adopted(lineage.attempt, lineage.target_inspection, lineage.resource))
+        and immutable_receipt_payload(lineage)
+}
 
 invariant CleanupAdoptionIsExactAndImmutable {
     for lineage in WorktreeCleanupAdoption:

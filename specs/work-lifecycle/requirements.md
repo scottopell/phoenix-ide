@@ -287,13 +287,16 @@ AND SHALL require that resource in the target generation's sealed expected-resou
 AND SHALL require fresh observation of the retained Git administrative-directory locator and incarnation before adoption
 AND SHALL NOT infer continuity from a worktree path, branch name, or a different attempt
 
-THE SYSTEM SHALL select the newest compatible prior-generation plan with its exact matching dispatch and inventory, excluding plans already consumed as a lineage source
+THE SYSTEM SHALL select the newest compatible prior-generation plan with its exact matching dispatch and sealed inventory, excluding plans already consumed as a lineage source
+AND SHALL require the exact retained source inspection and loss identities, except for the typed legacy provenance admitted by REQ-WL-005
+AND SHALL NOT treat an inspection from a different aggregate generation/fingerprint pair as the source observation
 AND SHALL order eligible sources by inventory capture time descending, then cleanup-plan row order descending
 AND SHALL require its administrative-directory locator and incarnation to match the fresh observation
 AND SHALL copy the complete cleanup payload, including any bound final-tombstone root and object identities
 
 THE SYSTEM SHALL commit the target dispatch, target cleanup plan, and exact source-to-target adoption relation in one transaction
-AND SHALL retain the source dispatch, plan, inspection, residual evidence, and prior lineage
+AND SHALL retain the source dispatch, plan, every existing inspection and loss identity, residual evidence, prior lineage, and any typed legacy provenance
+AND SHALL store retained inspection times as nonnegative integer microseconds since the Unix epoch, converting the active RFC3339 observation in Rust without fabricating or replacing its time
 AND SHALL enforce one incoming adoption per exact target and one outgoing adoption per exact source
 AND SHALL freeze the source plan payload once it is adopted and prohibit lineage update or ordinary deletion
 
@@ -309,9 +312,21 @@ AND SHALL NOT leave a dispatch committed without its plan or a plan committed wi
 WHEN a further explicit retry follows
 THE SYSTEM SHALL extend the lineage from the newest eligible plan rather than rewriting an earlier source
 
+WHEN a prior generation already contains a successful exact Worktree retirement receipt and the active retry freshly proves the captured path, worktree quarantine, retained administrative directory, and administrative quarantine are all absent without following links
+THE SYSTEM SHALL prepare immutable pending receipt lineage and target dispatch bound to the same attempt, scope, complete Worktree identity, exact source and target generation/fingerprint pairs, source dispatch and successful evidence, source cleanup-plan or finalized prior receipt lineage, and sealed target inventory
+AND SHALL repeat the no-follow absence observation after preparation before finalizing target `AbsenceAdopted` evidence
+AND SHALL continue only the remaining WorkScope retirement after finalization
+AND SHALL NOT recreate or adopt a cleanup plan for the deleted administrative directory, accept a source residual or pending receipt, or treat an inaccessible, dangling, or reappeared path as absence
+
+WHEN any path reappears or becomes indeterminate after receipt preparation
+THE SYSTEM SHALL preserve the pending lineage and path, record exact target-generation residual evidence, enter `NeedsRepair`, and SHALL NOT record target success or allow the pending receipt to authorize a later receipt chain
+
+WHEN identical successful receipt preparation or finalization is requested again
+THE SYSTEM SHALL revalidate the exact source, target and target evidence and return idempotently without adding a second lineage edge, dispatch, or evidence row
+
 WHEN a completed History aggregate is explicitly hard-deleted
 THE SYSTEM MAY delete its adoption history only after all transcript members have been removed, within the authorized aggregate deletion transaction
-AND SHALL remove lineage dependencies before deleting referenced plans and the Close obligation
+AND SHALL remove cleanup-plan lineage, successful-receipt lineage, and legacy-provenance dependencies before deleting referenced evidence, plans, recognized inventories, and the Close obligation
 AND SHALL NOT use this deletion exception during retry, startup recovery, or migration
 
 ---
@@ -337,6 +352,16 @@ THE SYSTEM SHALL reacquire the exact captured scope leases before runtime retire
 AND SHALL perform live administrative-directory, worktree/quarantine/tombstone identity validation and writer inspection before removal
 AND SHALL adopt prior-generation cleanup authority only through REQ-WL-004
 AND SHALL preserve ambiguous or replaced resources in typed repair
+
+WHEN this exact partial-generation shape has prior dispatch/plan authority but no exact retained source inspection
+THE SYSTEM MAY record immutable typed legacy FK787 cleanup provenance for each eligible source before any active-pair dispatch or plan is written
+AND SHALL bind it to the exact attempt, scope, source pair, worktree resource identity, recognized active inventory pair, and nonnegative integer recognition time in microseconds since the Unix epoch
+AND SHALL require the source's exact dispatch and sealed inventory
+AND SHALL freeze the source plan payload and prohibit ordinary provenance update or deletion
+AND SHALL distinguish recognition of retained legacy authority from an observed source inspection
+AND SHALL NOT fabricate source inspection generations, fingerprints, timestamps, loss rows, or empty loss classifications
+AND SHALL revalidate fresh administrative identity and writer safety before the atomic adoption in REQ-WL-004
+AND SHALL permit this provenance to authorize only that exact source, not an arbitrary historical plan or another attempt
 
 WHEN any recognizer condition fails
 THE SYSTEM SHALL NOT use the retained pair as this compatibility shortcut
@@ -397,9 +422,11 @@ AND SHALL NOT interpret inaccessible paths, replacements, or partial identity bi
 
 ### REQ-WL-008: Cleanup-Lineage Upgrade Preserves Evidence Without Executing Retirement
 
-WHEN migration 119 installs exact cleanup-plan adoption constraints and lineage storage
+WHEN cleanup-lineage migrations install exact cleanup-plan adoption constraints, retained inspection storage, typed legacy FK787 provenance storage, and successful Worktree receipt-lineage storage
 THE SYSTEM SHALL preserve every existing Close obligation, phase, captured member and scope, inspection, inventory, resource outcome/history, dispatch, cleanup plan, and bound tombstone identity
-AND SHALL NOT synthesize adoption lineage for existing rows
+AND SHALL install retained inspection, retained loss, legacy provenance, and successful-receipt lineage storage without backfilling missing observations, recognizing legacy authority, or preparing receipt adoption
+AND SHALL NOT synthesize adoption lineage, source inspections, loss identities, timestamps, legacy provenance, pending receipt lineage, dispatch, or success evidence for existing rows
+AND SHALL require each new receipt lineage to bind exact successful source evidence, exact source and target dispatch authority, sealed inventories, no target cleanup plan, and a pending-or-finalized state whose finalization is coupled to exact target success evidence
 AND SHALL NOT automatically retry an attempt, release a repair gate, rename or delete a worktree/quarantine/tombstone, or discard residual evidence
 
 WHEN existing rows violate the required exact identity constraints

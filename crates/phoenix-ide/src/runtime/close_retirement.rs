@@ -30,12 +30,13 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
-    AdoptCloseWorktreeCleanupPlanRequest, BindCloseWorktreeFinalTombstoneObjectRequest,
-    BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
-    CaptureCloseRetirementInventoryScopeRequest, CloseWorktreeFinalTombstone,
-    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
-    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
-    ReplaceCloseInspectionScopeRequest, RouteCloseAttemptToRepairRequest,
+    AdoptCloseWorktreeCleanupPlanRequest, AdoptCloseWorktreeRetirementReceiptRequest,
+    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
+    CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
+    CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
+    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
+    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
+    RouteCloseAttemptToRepairRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -1309,6 +1310,32 @@ impl RuntimeManager {
                     let captured_path = worktree_path(identity);
                     let quarantine_path = worktree_quarantine_path(identity)
                         .map_err(|error| CloseRetirementError::from(error).in_scope(&scope))?;
+                    if let Some(receipt) = self
+                        .db()
+                        .prior_close_worktree_retirement_receipt(
+                            attempt_id, &scope, snapshot, identity,
+                        )
+                        .await
+                        .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?
+                    {
+                        self.adopt_close_worktree_receipt_with_hook(
+                            AdoptCloseWorktreeRetirementReceiptRequest {
+                                attempt_id: attempt_id.clone(),
+                                scope: scope.clone(),
+                                source_snapshot: receipt.snapshot,
+                                target_snapshot: snapshot.clone(),
+                                worktree: identity.clone(),
+                            },
+                            &receipt.cleanup_plan,
+                            || {},
+                        )
+                        .await?;
+                        self.retire_close_work_scope(
+                            attempt_id, snapshot, &scope, &targets, &retired,
+                        )
+                        .await?;
+                        continue;
+                    }
                     let existing_cleanup_plan = self
                         .db()
                         .close_worktree_cleanup_plan(attempt_id, &scope, snapshot, &target.resource)
@@ -1828,6 +1855,53 @@ impl RuntimeManager {
             self.retire_close_work_scope(attempt_id, snapshot, &scope, &targets, &retired)
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn adopt_close_worktree_receipt_with_hook<F: FnOnce() + Send>(
+        &self,
+        request: AdoptCloseWorktreeRetirementReceiptRequest,
+        plan: &crate::db::CloseWorktreeCleanupPlan,
+        after_prepare: F,
+    ) -> Result<(), CloseRetirementError> {
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(request.worktree.clone()),
+        )
+        .map_err(|error| CloseRetirementError::from(error.to_string()).in_scope(&request.scope))?;
+        if let Err(detail) = verify_worktree_receipt_paths_absent(&request.worktree, plan) {
+            return self
+                .record_close_residual(
+                    &request.attempt_id,
+                    &request.target_snapshot,
+                    &request.scope,
+                    resource,
+                    RetirementFailureReason::IdentityNotProven,
+                    &detail,
+                )
+                .await;
+        }
+        self.db()
+            .prepare_close_worktree_retirement_receipt(request.clone())
+            .await
+            .map_err(|error| map_close_retirement_db_error(error).in_scope(&request.scope))?;
+        after_prepare();
+        if let Err(detail) = verify_worktree_receipt_paths_absent(&request.worktree, plan) {
+            return self
+                .record_close_residual(
+                    &request.attempt_id,
+                    &request.target_snapshot,
+                    &request.scope,
+                    resource,
+                    RetirementFailureReason::IdentityNotProven,
+                    &detail,
+                )
+                .await;
+        }
+        self.db()
+            .finalize_close_worktree_retirement_receipt(request.clone())
+            .await
+            .map_err(|error| map_close_retirement_db_error(error).in_scope(&request.scope))?;
         Ok(())
     }
 
@@ -3989,7 +4063,7 @@ where
     )
 }
 
-fn administrative_dir_quarantine_path(
+pub(super) fn administrative_dir_quarantine_path(
     administrative_dir: &Path,
     incarnation: &str,
 ) -> Result<PathBuf, String> {
@@ -4024,10 +4098,8 @@ where
     F: FnOnce(&Path),
 {
     let quarantine = administrative_dir_quarantine_path(administrative_dir, expected_incarnation)?;
-    let source_exists = administrative_dir
-        .try_exists()
-        .map_err(|error| error.to_string())?;
-    let quarantine_exists = quarantine.try_exists().map_err(|error| error.to_string())?;
+    let source_exists = !planned_administrative_dir_is_absent(administrative_dir)?;
+    let quarantine_exists = !planned_administrative_dir_is_absent(&quarantine)?;
     let deletion_target = match (source_exists, quarantine_exists) {
         (false, false) => return Ok(()),
         (true, true) => {
@@ -4136,9 +4208,7 @@ fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
-    // SAFETY: `geteuid` has no preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_writable_mappings_in(path, Path::new("/proc"), effective_uid)
+    quarantine_has_writable_mappings_in(path, Path::new("/proc"))
 }
 
 #[cfg(target_os = "linux")]
@@ -4220,37 +4290,137 @@ fn linux_mapping_is_inside_with_fdinfo(
 }
 
 #[cfg(target_os = "linux")]
-fn quarantine_has_writable_mappings_in(
+fn quarantine_has_writable_mappings_in(path: &Path, proc_root: &Path) -> Result<bool, String> {
+    linux_mapping_scan_with(path, proc_root, linux_descriptor_read_dir, |path| {
+        std::fs::read_to_string(path)
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, PartialEq)]
+struct LinuxMappingSnapshot {
+    effective_uid: LinuxProcessEffectiveUid,
+    mappings: String,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mapping_snapshot(
+    process: &Path,
+    read_to_string: &mut impl FnMut(&Path) -> std::io::Result<String>,
+) -> Result<LinuxMappingSnapshot, String> {
+    let mut read = |name| {
+        read_to_string(&process.join(name)).map_err(|error| {
+            format!(
+                "indeterminate Linux mapping inspection: read {name} for {}: {error}",
+                process.display()
+            )
+        })
+    };
+    let effective_uid =
+        LinuxProcessEffectiveUid::parse_status(&read("status")?).map_err(|error| {
+            format!(
+                "indeterminate Linux mapping inspection: malformed status for {}: {error}",
+                process.display()
+            )
+        })?;
+    Ok(LinuxMappingSnapshot {
+        effective_uid,
+        mappings: read("maps")?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mapping_snapshot_is_inside(
+    process: &Path,
+    snapshot: &LinuxMappingSnapshot,
+    target: LinuxCwdMountedIdentity,
+) -> Result<bool, String> {
+    let mut indeterminate = None;
+    for mapping in snapshot.mappings.lines() {
+        match linux_mapping_is_inside(process, mapping, target) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                indeterminate.get_or_insert(error);
+            }
+        }
+    }
+    indeterminate.map_or(Ok(false), Err)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mapping_scan_with(
     path: &Path,
     proc_root: &Path,
-    effective_uid: libc::uid_t,
+    mut read_dir: impl FnMut(&Path) -> std::io::Result<LinuxDescriptorEntries>,
+    mut read_to_string: impl FnMut(&Path) -> std::io::Result<String>,
 ) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
     let target = linux_writer_target(&canonical)?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(false);
-    };
-    let mut indeterminate = None;
-    for process in processes.flatten() {
-        if !linux_process_is_relevant(&process, effective_uid, "mapping") {
-            continue;
+    let processes = linux_writer_process_inventory(proc_root, &mut read_dir, "mapping")?;
+    let mut incarnations = std::collections::BTreeMap::new();
+    for name in &processes {
+        incarnations.insert(
+            name.clone(),
+            linux_cwd_process_incarnation(&proc_root.join(name))
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let mut snapshots = std::collections::BTreeMap::new();
+    for (name, incarnation) in &incarnations {
+        let process = proc_root.join(name);
+        let snapshot = linux_mapping_snapshot(&process, &mut read_to_string)?;
+        if linux_mapping_snapshot_is_inside(&process, &snapshot, target)? {
+            return Ok(true);
         }
-        let Ok(mappings) = std::fs::read_to_string(process.path().join("maps")) else {
-            continue;
-        };
-        for mapping in mappings.lines() {
-            match linux_mapping_is_inside(&process.path(), mapping, target) {
-                Ok(true) => return Ok(true),
-                Ok(false) => {}
-                Err(error) => {
-                    indeterminate.get_or_insert(error);
-                }
+        if linux_cwd_process_incarnation(&process).map_err(|error| error.to_string())?
+            != *incarnation
+        {
+            return Err(
+                "indeterminate Linux mapping inspection: process incarnation changed".to_string(),
+            );
+        }
+        snapshots.insert(name.clone(), snapshot);
+    }
+    for _ in 0..2 {
+        linux_writer_revalidate_processes(proc_root, &incarnations, &mut read_dir, "mapping")?;
+        for (name, snapshot) in &snapshots {
+            let process = proc_root.join(name);
+            let incarnation = incarnations[name];
+            if linux_cwd_process_incarnation(&process).map_err(|error| error.to_string())?
+                != incarnation
+            {
+                return Err(
+                    "indeterminate Linux mapping inspection: process incarnation changed"
+                        .to_string(),
+                );
+            }
+            let after = linux_mapping_snapshot(&process, &mut read_to_string)?;
+            if linux_mapping_snapshot_is_inside(&process, &after, target)? {
+                return Ok(true);
+            }
+            if after != *snapshot {
+                return Err("indeterminate Linux mapping inspection: process mappings or credentials changed".to_string());
+            }
+            if linux_cwd_process_incarnation(&process).map_err(|error| error.to_string())?
+                != incarnation
+            {
+                return Err(
+                    "indeterminate Linux mapping inspection: process incarnation changed"
+                        .to_string(),
+                );
             }
         }
     }
-    indeterminate.map_or(Ok(false), Err)
+    if linux_writer_target(&canonical)? != target {
+        return Err(
+            "indeterminate Linux mapping inspection: quarantine identity changed".to_string(),
+        );
+    }
+    linux_writer_revalidate_processes(proc_root, &incarnations, &mut read_dir, "mapping")?;
+    Ok(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -4819,9 +4989,28 @@ fn linux_namespace_cwd_scan_with_hooks(
 fn linux_namespace_cwd_scan_with_fdinfo(
     canonical: &Path,
     proc_root: &Path,
+    after_task_reads: impl FnMut(&Path),
+    after_final_pid_inventory: impl FnMut(),
+    fdinfo_path: impl Fn(&std::fs::File) -> std::path::PathBuf,
+) -> Result<LinuxNamespaceCwdEvidence, LinuxCwdScanError> {
+    linux_namespace_cwd_scan_with_fence(
+        canonical,
+        proc_root,
+        after_task_reads,
+        after_final_pid_inventory,
+        fdinfo_path,
+        linux_descriptor_read_dir,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_namespace_cwd_scan_with_fence(
+    canonical: &Path,
+    proc_root: &Path,
     mut after_task_reads: impl FnMut(&Path),
     mut after_final_pid_inventory: impl FnMut(),
     fdinfo_path: impl Fn(&std::fs::File) -> std::path::PathBuf,
+    mut read_fence_dir: impl FnMut(&Path) -> std::io::Result<LinuxDescriptorEntries>,
 ) -> Result<LinuxNamespaceCwdEvidence, LinuxCwdScanError> {
     let target_directory = linux_cwd_open_directory(canonical)?;
     let target = linux_cwd_mounted_identity(&target_directory, &fdinfo_path)?;
@@ -4876,11 +5065,13 @@ fn linux_namespace_cwd_scan_with_fdinfo(
             &fdinfo_path,
         )?;
     }
-    if linux_cwd_process_inventory(proc_root)? != before {
-        return Err(LinuxCwdScanError::Indeterminate(
-            "process inventory changed during cwd revalidation".to_string(),
-        ));
-    }
+    linux_writer_revalidate_processes(
+        proc_root,
+        &incarnations,
+        &mut linux_descriptor_read_dir,
+        "cwd",
+    )
+    .map_err(LinuxCwdScanError::Indeterminate)?;
     after_final_pid_inventory();
     for (name, before_incarnation) in &incarnations {
         let process = proc_root.join(name);
@@ -4909,6 +5100,8 @@ fn linux_namespace_cwd_scan_with_fdinfo(
             "target directory identity changed during cwd inspection".to_string(),
         ));
     }
+    linux_writer_revalidate_processes(proc_root, &incarnations, &mut read_fence_dir, "cwd")
+        .map_err(LinuxCwdScanError::Indeterminate)?;
     Ok(LinuxNamespaceCwdEvidence::Clean)
 }
 
@@ -5021,7 +5214,7 @@ impl LinuxProcessEffectiveUid {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxProcessOwner {
     Relevant,
@@ -5029,7 +5222,7 @@ enum LinuxProcessOwner {
     Vanished,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn linux_process_owner(
     process: &std::fs::DirEntry,
     effective_uid: libc::uid_t,
@@ -5066,23 +5259,6 @@ fn linux_process_owner(
             LinuxProcessOwner::Unrelated
         },
     )
-}
-
-#[cfg(target_os = "linux")]
-fn linux_process_is_relevant(
-    process: &std::fs::DirEntry,
-    effective_uid: libc::uid_t,
-    inventory: &str,
-) -> bool {
-    process
-        .file_name()
-        .as_encoded_bytes()
-        .iter()
-        .all(u8::is_ascii_digit)
-        && matches!(
-            linux_process_owner(process, effective_uid, inventory),
-            Ok(LinuxProcessOwner::Relevant)
-        )
 }
 
 #[cfg(target_os = "linux")]
@@ -5477,15 +5653,24 @@ fn linux_descriptor_process_inventory(
     proc_root: &Path,
     read_dir: &mut impl FnMut(&Path) -> std::io::Result<LinuxDescriptorEntries>,
 ) -> Result<std::collections::BTreeSet<std::ffi::OsString>, String> {
+    linux_writer_process_inventory(proc_root, read_dir, "descriptor")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_process_inventory(
+    proc_root: &Path,
+    read_dir: &mut impl FnMut(&Path) -> std::io::Result<LinuxDescriptorEntries>,
+    inspection: &str,
+) -> Result<std::collections::BTreeSet<std::ffi::OsString>, String> {
     let mut names = std::collections::BTreeSet::new();
     for process in read_dir(proc_root).map_err(|error| {
-        format!("indeterminate Linux descriptor inspection: enumerate processes: {error}")
+        format!("indeterminate Linux {inspection} inspection: enumerate processes: {error}")
     })? {
         let process = process.map_err(|error| {
-            format!("indeterminate Linux descriptor inspection: read process entry: {error}")
+            format!("indeterminate Linux {inspection} inspection: read process entry: {error}")
         })?;
         let name = process.file_name().ok_or_else(|| {
-            "indeterminate Linux descriptor inspection: unnamed process".to_string()
+            format!("indeterminate Linux {inspection} inspection: unnamed process")
         })?;
         if !name.as_encoded_bytes().is_empty()
             && name.as_encoded_bytes().iter().all(u8::is_ascii_digit)
@@ -5494,11 +5679,37 @@ fn linux_descriptor_process_inventory(
         }
     }
     if names.is_empty() {
-        return Err(
-            "indeterminate Linux descriptor inspection: empty process inventory".to_string(),
-        );
+        return Err(format!(
+            "indeterminate Linux {inspection} inspection: empty process inventory"
+        ));
     }
     Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_revalidate_processes(
+    proc_root: &Path,
+    incarnations: &std::collections::BTreeMap<std::ffi::OsString, LinuxCwdProcessIncarnation>,
+    read_dir: &mut impl FnMut(&Path) -> std::io::Result<LinuxDescriptorEntries>,
+    inspection: &str,
+) -> Result<(), String> {
+    let processes = linux_writer_process_inventory(proc_root, read_dir, inspection)?;
+    if processes != incarnations.keys().cloned().collect() {
+        return Err(format!(
+            "indeterminate Linux {inspection} inspection: process inventory changed during final revalidation"
+        ));
+    }
+    for (name, incarnation) in incarnations {
+        if linux_cwd_process_incarnation(&proc_root.join(name))
+            .map_err(|error| error.to_string())?
+            != *incarnation
+        {
+            return Err(format!(
+                "indeterminate Linux {inspection} inspection: process incarnation changed during final revalidation"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5577,11 +5788,7 @@ fn linux_descriptor_scan_with(
         snapshots.insert(name.clone(), (incarnation, tasks, descriptors));
     }
     for _ in 0..2 {
-        if linux_descriptor_process_inventory(proc_root, &mut read_dir)? != processes {
-            return Err(
-                "indeterminate Linux descriptor inspection: process inventory changed".to_string(),
-            );
-        }
+        linux_writer_revalidate_processes(proc_root, &incarnations, &mut read_dir, "descriptor")?;
         for (name, (incarnation, tasks, descriptors)) in &snapshots {
             let process = proc_root.join(name);
             if linux_cwd_process_incarnation(&process).map_err(|error| error.to_string())?
@@ -5612,6 +5819,7 @@ fn linux_descriptor_scan_with(
             "indeterminate Linux descriptor inspection: quarantine identity changed".to_string(),
         );
     }
+    linux_writer_revalidate_processes(proc_root, &incarnations, &mut read_dir, "descriptor")?;
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
@@ -5728,6 +5936,46 @@ fn quarantine_has_open_descriptors(_path: &Path) -> Result<ExternalWriterEvidenc
     Err("open-descriptor inspection is unsupported on this platform".to_string())
 }
 
+fn verify_worktree_receipt_paths_absent(
+    identity: &WorktreeIdentity,
+    plan: &crate::db::CloseWorktreeCleanupPlan,
+) -> Result<(), String> {
+    validate_cleanup_plan_registration_incarnation(identity, &plan.administrative_dir)?;
+    let quarantine = worktree_quarantine_path(identity)?;
+    let administrative_quarantine = administrative_dir_quarantine_path(
+        &plan.administrative_dir,
+        &plan.administrative_dir_incarnation,
+    )?;
+    let mut paths = vec![
+        worktree_path(identity),
+        quarantine,
+        plan.administrative_dir.clone(),
+        administrative_quarantine,
+    ];
+    if let Some(tombstone) = &plan.final_tombstone {
+        paths.push(tombstone.root.clone());
+        paths.push(tombstone.root.join("object"));
+    }
+    for path in paths {
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(format!(
+                    "successful Worktree receipt path reappeared: {}",
+                    path.display()
+                ))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot prove Worktree receipt path absent: {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn both_worktree_paths_absent(path: &Path, quarantine: &Path) -> Result<bool, String> {
     for (path, description) in [(path, "captured"), (quarantine, "quarantined")] {
         match std::fs::symlink_metadata(path) {
@@ -5744,9 +5992,14 @@ fn both_worktree_paths_absent(path: &Path, quarantine: &Path) -> Result<bool, St
 }
 
 fn planned_administrative_dir_is_absent(path: &Path) -> Result<bool, String> {
-    path.try_exists().map(|exists| !exists).map_err(|error| {
-        format!("cannot observe planned worktree administrative directory: {error}")
-    })
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(metadata) if metadata.is_dir() => Ok(false),
+        Ok(_) => Err("worktree administrative registration is not a directory".to_string()),
+        Err(error) => Err(format!(
+            "cannot observe planned worktree administrative directory: {error}"
+        )),
+    }
 }
 
 fn complete_persisted_worktree_administrative_cleanup(
@@ -6824,11 +7077,15 @@ mod tests {
         assert_eq!(error.scope(), Some(&scope));
     }
 
+    include!("close_retirement_receipt_tests.rs");
+
     enum RetainedAdministrativeObservation {
         Exact,
         Conflicting,
         Missing { quarantine_absent: bool },
         NotDirectory,
+        SuccessfulReceipt,
+        ReceiptRace(usize),
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7006,6 +7263,26 @@ mod tests {
             .unwrap();
         let quarantine = worktree_quarantine_path(&identity).unwrap();
         std::fs::rename(&linked, &quarantine).unwrap();
+        if matches!(
+            observation,
+            RetainedAdministrativeObservation::SuccessfulReceipt
+                | RetainedAdministrativeObservation::ReceiptRace(_)
+        ) {
+            successful_receipt_work_scope_retry(
+                &mut manager,
+                &attempt,
+                &scope,
+                &source_snapshot,
+                &resource,
+                &identity,
+                match observation {
+                    RetainedAdministrativeObservation::ReceiptRace(index) => Some(index),
+                    _ => None,
+                },
+            )
+            .await;
+            return;
+        }
         #[cfg(unix)]
         if bound_tombstone {
             bound_tombstone_dispatched_absence_retry(
@@ -8463,6 +8740,78 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn administrative_cleanup_preserves_dangling_symlinks_instead_of_adopting_absence() {
+        for persisted in [false, true] {
+            for location in ["source", "quarantine", "quarantine-with-live-source"] {
+                let temp = tempfile::tempdir().unwrap();
+                let repository = temp.path().join("repository");
+                let linked = temp.path().join("linked");
+                initialize_repository(&repository);
+                run_git(
+                    &repository,
+                    &[
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        "--detach",
+                        linked.to_str().unwrap(),
+                        "HEAD",
+                    ],
+                );
+                let identity = inspection_identity(&linked);
+                let common = super::exact_worktree_common_git_dir(&linked).unwrap();
+                let administrative_dir =
+                    exact_worktree_administrative_dir(&linked, &common).unwrap();
+                let incarnation =
+                    observe_administrative_dir_incarnation(&administrative_dir).unwrap();
+                let quarantine =
+                    super::administrative_dir_quarantine_path(&administrative_dir, &incarnation)
+                        .unwrap();
+                std::fs::remove_dir_all(&linked).unwrap();
+                if location != "quarantine-with-live-source" {
+                    std::fs::remove_dir_all(&administrative_dir).unwrap();
+                }
+                let symlink = if location == "source" {
+                    &administrative_dir
+                } else {
+                    &quarantine
+                };
+                let missing_target = temp.path().join("missing-admin-target");
+                std::os::unix::fs::symlink(&missing_target, symlink).unwrap();
+
+                let result = if persisted {
+                    complete_persisted_worktree_administrative_cleanup(
+                        &identity,
+                        &administrative_dir,
+                        &incarnation,
+                    )
+                } else {
+                    super::remove_exact_worktree_administrative_dir(
+                        &administrative_dir,
+                        &incarnation,
+                    )
+                };
+
+                let error = result.unwrap_err();
+                assert!(error.contains("not a directory"), "{location}: {error}");
+                assert!(std::fs::symlink_metadata(symlink)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert_eq!(std::fs::read_link(symlink).unwrap(), missing_target);
+                if location == "quarantine-with-live-source" {
+                    assert_eq!(
+                        observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
+                        incarnation
+                    );
+                    assert!(administrative_dir.join("gitdir").is_file());
+                }
+            }
+        }
+    }
+
     #[test]
     fn restart_completes_only_exact_persisted_admin_cleanup_after_quarantine_removal() {
         let temp = tempfile::tempdir().unwrap();
@@ -9774,6 +10123,67 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn descriptor_scan_rejects_new_pid_during_last_revalidation() {
+        let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+        let fd = process.join("task/1273/fd");
+        let mut proc_reads = 0;
+        let mut added = false;
+        let result = super::linux_descriptor_scan_with(
+            &quarantine,
+            &proc_root,
+            |path| {
+                if path == proc_root {
+                    proc_reads += 1;
+                } else if path == fd && proc_reads == 3 && !added {
+                    added = true;
+                    let writer = proc_root.join("1274");
+                    std::fs::create_dir(&writer).unwrap();
+                    cwd_fixture_stat(&writer, 43);
+                    descriptor_fixture_task(&writer, "1274", &quarantine);
+                    std::os::unix::fs::symlink(&quarantine, writer.join("task/1274/fd/3")).unwrap();
+                }
+                super::linux_descriptor_read_dir(path)
+            },
+            |path| std::fs::read_link(path),
+        );
+        assert!(added);
+        assert!(result.unwrap_err().contains("process inventory changed"));
+        assert_eq!(proc_reads, 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_rejects_same_number_pid_replacement_during_final_fence() {
+        let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+        let mut proc_reads = 0;
+        let result = super::linux_descriptor_scan_with(
+            &quarantine,
+            &proc_root,
+            |path| {
+                let entries = super::linux_descriptor_read_dir(path)?;
+                if path == proc_root {
+                    proc_reads += 1;
+                    if proc_reads == 4 {
+                        std::fs::rename(&process, proc_root.join("retired-process")).unwrap();
+                        std::fs::create_dir(&process).unwrap();
+                        cwd_fixture_stat(&process, 42);
+                        descriptor_fixture_task(&process, "1273", &quarantine);
+                        std::os::unix::fs::symlink(&quarantine, process.join("task/1273/fd/3"))
+                            .unwrap();
+                    }
+                }
+                Ok(entries)
+            },
+            |path| std::fs::read_link(path),
+        );
+        assert_eq!(proc_reads, 4);
+        assert!(result
+            .unwrap_err()
+            .contains("process incarnation changed during final revalidation"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn descriptor_scan_read_only_links_are_observational_positive_evidence() {
         let (_temp, quarantine, proc_root, process) = descriptor_fixture();
         let file_path = quarantine.join("read-only");
@@ -10173,6 +10583,57 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn cwd_scan_rejects_new_pid_after_final_pid_inventory() {
+        let (_temp, quarantine, proc_root, _process) = cwd_fixture();
+        let mut added = false;
+        let result = super::linux_namespace_cwd_scan_with_hooks(
+            &quarantine,
+            &proc_root,
+            |_| {},
+            || {
+                added = true;
+                let writer = proc_root.join("124");
+                cwd_fixture_task(&writer, "124", &quarantine);
+                cwd_fixture_stat(&writer, 43);
+            },
+        );
+        assert!(added);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("process inventory changed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_same_number_pid_replacement_during_final_fence() {
+        let (_temp, quarantine, proc_root, process) = cwd_fixture();
+        let mut fence_reads = 0;
+        let result = super::linux_namespace_cwd_scan_with_fence(
+            &quarantine,
+            &proc_root,
+            |_| {},
+            || {},
+            super::linux_cwd_fdinfo_path,
+            |path| {
+                let entries = super::linux_descriptor_read_dir(path)?;
+                fence_reads += 1;
+                assert_eq!(path, proc_root);
+                std::fs::rename(&process, proc_root.join("retired-process")).unwrap();
+                cwd_fixture_task(&process, "123", &quarantine);
+                cwd_fixture_stat(&process, 42);
+                Ok(entries)
+            },
+        );
+        assert_eq!(fence_reads, 1);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("process incarnation changed during final revalidation"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn cwd_scan_revalidates_after_final_pid_inventory() {
         for change in ["pid", "tid", "task-set", "cwd"] {
             let (temp, quarantine, proc_root, process) = cwd_fixture();
@@ -10564,32 +11025,318 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn mapping_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
-        let temp = tempfile::tempdir().unwrap();
-        let quarantine = temp.path().join("quarantine");
-        let proc_root = temp.path().join("proc");
-        let unreadable_status = proc_root.join("1");
-        let unreadable_maps = proc_root.join("2");
-        let writer = proc_root.join("3");
-        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
-        std::fs::create_dir_all(unreadable_maps.join("maps")).unwrap();
-        std::fs::create_dir_all(&writer).unwrap();
-        std::fs::create_dir(&quarantine).unwrap();
-        for process in [&unreadable_maps, &writer] {
-            std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
-        }
-        let mapped = quarantine.join("mapped-file");
-        std::fs::write(&mapped, b"mapped").unwrap();
-        std::os::unix::fs::symlink("/", writer.join("root")).unwrap();
-        std::fs::write(writer.join("maps"), mapping_fixture_line(&mapped)).unwrap();
-
-        assert!(super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+    fn mapping_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let fixture = descriptor_fixture();
+        let process = &fixture.3;
+        std::fs::write(process.join("status"), "Uid:\t2\t2\t2\t2\n").unwrap();
+        std::fs::write(process.join("maps"), "").unwrap();
+        std::os::unix::fs::symlink("/", process.join("root")).unwrap();
+        fixture
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_rejects_unavailable_proc_inventory_while_mapping_scan_remains_observational() {
+    fn mapping_scan_finds_cross_uid_writer() {
+        let (_temp, quarantine, proc_root, process) = mapping_fixture();
+        // SAFETY: geteuid has no preconditions.
+        let other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        std::fs::write(
+            process.join("status"),
+            format!("Uid:\t{other_uid}\t{other_uid}\t{other_uid}\t{other_uid}\n"),
+        )
+        .unwrap();
+        let mapped = quarantine.join("mapped-file");
+        std::fs::write(&mapped, b"mapped").unwrap();
+        std::fs::write(process.join("maps"), mapping_fixture_line(&mapped)).unwrap();
+        assert!(super::quarantine_has_writable_mappings_in(&quarantine, &proc_root).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_accepts_stable_cross_uid_inventory() {
+        let (_temp, quarantine, proc_root, _process) = mapping_fixture();
+        assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_rejects_missing_non_directory_and_empty_proc() {
+        let (temp, quarantine, proc_root, process) = mapping_fixture();
+        assert!(super::quarantine_has_writable_mappings_in(
+            &quarantine,
+            &temp.path().join("missing")
+        )
+        .is_err());
+        std::fs::remove_dir_all(&process).unwrap();
+        assert!(
+            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root)
+                .unwrap_err()
+                .contains("empty process inventory")
+        );
+        std::fs::write(&process, b"not a process directory").unwrap();
+        assert!(super::quarantine_has_writable_mappings_in(&quarantine, &proc_root).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_proc_read_and_iterator_errors_are_indeterminate() {
+        for fail_read in 1..=4 {
+            for iterator_failure in [false, true] {
+                for kind in [
+                    std::io::ErrorKind::NotFound,
+                    std::io::ErrorKind::PermissionDenied,
+                ] {
+                    let (_temp, quarantine, proc_root, _process) = mapping_fixture();
+                    let mut reads = 0;
+                    let result = super::linux_mapping_scan_with(
+                        &quarantine,
+                        &proc_root,
+                        |path| {
+                            reads += 1;
+                            if reads == fail_read {
+                                let error = std::io::Error::from(kind);
+                                return if iterator_failure {
+                                    Ok(Box::new(std::iter::once(Err(error)))
+                                        as super::LinuxDescriptorEntries)
+                                } else {
+                                    Err(error)
+                                };
+                            }
+                            super::linux_descriptor_read_dir(path)
+                        },
+                        |path| std::fs::read_to_string(path),
+                    );
+                    let error = result.unwrap_err();
+                    let expected = if iterator_failure {
+                        "read process entry"
+                    } else {
+                        "enumerate processes"
+                    };
+                    assert!(error.contains(expected), "{error}");
+                    assert_eq!(reads, fail_read);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_status_and_maps_unreadability_never_prove_clean() {
+        for name in ["status", "maps"] {
+            for fail_read in 1..=3 {
+                for kind in [
+                    std::io::ErrorKind::NotFound,
+                    std::io::ErrorKind::PermissionDenied,
+                    std::io::ErrorKind::InvalidData,
+                    std::io::ErrorKind::IsADirectory,
+                ] {
+                    let (_temp, quarantine, proc_root, process) = mapping_fixture();
+                    let mut reads = 0;
+                    let result = super::linux_mapping_scan_with(
+                        &quarantine,
+                        &proc_root,
+                        super::linux_descriptor_read_dir,
+                        |path| {
+                            if path == process.join(name) {
+                                reads += 1;
+                                if reads == fail_read {
+                                    return Err(std::io::Error::from(kind));
+                                }
+                            }
+                            std::fs::read_to_string(path)
+                        },
+                    );
+                    assert!(result.unwrap_err().contains(&format!("read {name}")));
+                    assert_eq!(reads, fail_read);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_rejects_actual_status_and_maps_type_errors() {
+        for name in ["status", "maps"] {
+            for directory in [false, true] {
+                let (_temp, quarantine, proc_root, process) = mapping_fixture();
+                let path = process.join(name);
+                std::fs::remove_file(&path).unwrap();
+                if directory {
+                    std::fs::create_dir(&path).unwrap();
+                }
+                assert!(
+                    super::quarantine_has_writable_mappings_in(&quarantine, &proc_root)
+                        .unwrap_err()
+                        .contains(&format!("read {name}"))
+                );
+            }
+        }
+        for status in ["", "Uid: 1 2", "Uid: 1 2 3 4\nUid: 1 2 3 4", "Uid: x x x x"] {
+            let (_temp, quarantine, proc_root, process) = mapping_fixture();
+            std::fs::write(process.join("status"), status).unwrap();
+            assert!(
+                super::quarantine_has_writable_mappings_in(&quarantine, &proc_root)
+                    .unwrap_err()
+                    .contains("malformed status")
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_rejects_reuse_exec_and_disappearance_at_every_read_pass() {
+        for change in ["birth", "directory", "exec", "disappearance"] {
+            for change_read in 1..=3 {
+                let (temp, quarantine, proc_root, process) = mapping_fixture();
+                let mut reads = 0;
+                let result = super::linux_mapping_scan_with(
+                    &quarantine,
+                    &proc_root,
+                    super::linux_descriptor_read_dir,
+                    |path| {
+                        let contents = std::fs::read_to_string(path)?;
+                        if path == process.join("maps") {
+                            reads += 1;
+                            if reads == change_read {
+                                match change {
+                                    "birth" => cwd_fixture_stat(&process, 43),
+                                    "directory" => {
+                                        std::fs::rename(&process, temp.path().join("old-process"))
+                                            .unwrap();
+                                        std::fs::create_dir(&process).unwrap();
+                                        cwd_fixture_stat(&process, 42);
+                                        std::fs::write(process.join("status"), "Uid: 2 2 2 2\n")
+                                            .unwrap();
+                                        std::fs::write(process.join("maps"), "").unwrap();
+                                    }
+                                    "exec" => {
+                                        let stat =
+                                            std::fs::read_to_string(process.join("stat")).unwrap();
+                                        std::fs::write(
+                                            process.join("stat"),
+                                            stat.replace("100 200 300", "100 200 301"),
+                                        )
+                                        .unwrap();
+                                    }
+                                    "disappearance" => std::fs::remove_dir_all(&process).unwrap(),
+                                    _ => unreachable!(),
+                                }
+                            }
+                        }
+                        Ok(contents)
+                    },
+                );
+                assert!(result.is_err(), "{change}, pass {change_read}: {result:?}");
+                assert_eq!(reads, change_read);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_rejects_new_pid_during_last_revalidation() {
+        let (_temp, quarantine, proc_root, process) = mapping_fixture();
+        let mut reads = 0;
+        let result = super::linux_mapping_scan_with(
+            &quarantine,
+            &proc_root,
+            super::linux_descriptor_read_dir,
+            |path| {
+                let contents = std::fs::read_to_string(path)?;
+                if path == process.join("maps") {
+                    reads += 1;
+                    if reads == 3 {
+                        let writer = proc_root.join("1274");
+                        std::fs::create_dir(&writer).unwrap();
+                        cwd_fixture_stat(&writer, 43);
+                        std::fs::write(writer.join("status"), "Uid: 3 3 3 3\n").unwrap();
+                        let mapped = quarantine.join("mapped");
+                        std::fs::write(&mapped, b"mapped").unwrap();
+                        std::fs::write(writer.join("maps"), mapping_fixture_line(&mapped)).unwrap();
+                        std::os::unix::fs::symlink("/", writer.join("root")).unwrap();
+                    }
+                }
+                Ok(contents)
+            },
+        );
+        assert_eq!(reads, 3);
+        assert!(result.unwrap_err().contains("process inventory changed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_rejects_same_number_pid_replacement_during_final_fence() {
+        let (_temp, quarantine, proc_root, process) = mapping_fixture();
+        let mut proc_reads = 0;
+        let result = super::linux_mapping_scan_with(
+            &quarantine,
+            &proc_root,
+            |path| {
+                let entries = super::linux_descriptor_read_dir(path)?;
+                if path == proc_root {
+                    proc_reads += 1;
+                    if proc_reads == 4 {
+                        std::fs::rename(&process, proc_root.join("retired-process")).unwrap();
+                        std::fs::create_dir(&process).unwrap();
+                        cwd_fixture_stat(&process, 42);
+                        std::fs::write(process.join("status"), "Uid: 2 2 2 2\n").unwrap();
+                        let mapped = quarantine.join("mapped");
+                        std::fs::write(&mapped, b"mapped").unwrap();
+                        std::fs::write(process.join("maps"), mapping_fixture_line(&mapped))
+                            .unwrap();
+                        std::os::unix::fs::symlink("/", process.join("root")).unwrap();
+                    }
+                }
+                Ok(entries)
+            },
+            |path| std::fs::read_to_string(path),
+        );
+        assert_eq!(proc_reads, 4);
+        assert!(result
+            .unwrap_err()
+            .contains("process incarnation changed during final revalidation"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_revalidates_credentials_and_mapping_contents() {
+        for change in ["status", "maps"] {
+            let (_temp, quarantine, proc_root, process) = mapping_fixture();
+            let mut reads = 0;
+            let result = super::linux_mapping_scan_with(
+                &quarantine,
+                &proc_root,
+                super::linux_descriptor_read_dir,
+                |path| {
+                    if path == process.join(change) {
+                        reads += 1;
+                        if reads == 3 {
+                            let contents = if change == "status" {
+                                "Uid: 3 3 3 3\n"
+                            } else {
+                                "00000000-00001000 rw-p 00000000 00:00 0\n"
+                            };
+                            std::fs::write(path, contents).unwrap();
+                        }
+                    }
+                    std::fs::read_to_string(path)
+                },
+            );
+            assert_eq!(reads, 3);
+            assert!(result
+                .unwrap_err()
+                .contains("mappings or credentials changed"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_and_mapping_scans_reject_unavailable_proc_inventory() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
@@ -10597,7 +11344,7 @@ mod tests {
         std::fs::write(&proc_root, b"not a proc directory").unwrap();
 
         assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root).is_err());
-        assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+        assert!(super::quarantine_has_writable_mappings_in(&quarantine, &proc_root).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -10609,7 +11356,7 @@ mod tests {
 
         assert!(super::quarantine_has_process_cwd_in(&missing_quarantine, &proc_root).is_err());
         assert!(
-            super::quarantine_has_writable_mappings_in(&missing_quarantine, &proc_root, 1).is_err()
+            super::quarantine_has_writable_mappings_in(&missing_quarantine, &proc_root).is_err()
         );
     }
 
@@ -10654,7 +11401,9 @@ mod tests {
             Ok(super::ExternalWriterEvidence::PositiveWriterFound),
             "the closed mapped file must not be observed as an open descriptor",
         );
-        assert!(super::quarantine_has_writable_mappings(temp.path()).unwrap());
+        assert!(
+            super::quarantine_has_writable_mappings_in(temp.path(), proc_inventory.path()).unwrap()
+        );
 
         // SAFETY: `mapping` is the successful result of the matching 4096-byte mmap call.
         assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);

@@ -10938,7 +10938,34 @@ impl Database {
         product_conversation_id: &str,
     ) -> DbResult<bool> {
         sqlx::query(
+            "DELETE FROM close_worktree_retirement_receipt_adoptions
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1 AND phase = 'completed'
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
             "DELETE FROM close_worktree_cleanup_adoptions
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1 AND phase = 'completed'
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM close_legacy_fk787_cleanup_provenance
              WHERE attempt_id IN (
                  SELECT attempt_id FROM close_obligations
                  WHERE product_conversation_id = ?1 AND phase = 'completed'

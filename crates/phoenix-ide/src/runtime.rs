@@ -9600,7 +9600,14 @@ mod scope_liveness_tests {
         use phoenix_core::domain::close::{ClosePhase, RetiredResourceKind, RetirementOutcome};
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-        for state in ["empty", "nonempty", "replaced-root", "replaced-object"] {
+        for state in [
+            "empty",
+            "nonempty",
+            "replaced-root",
+            "replaced-object",
+            "dangling-admin",
+            "dangling-admin-quarantine",
+        ] {
             let mut manager = test_manager().await;
             let sockets = tempfile::tempdir().unwrap();
             manager.tmux_registry = Arc::new(
@@ -9653,7 +9660,7 @@ mod scope_liveness_tests {
                     snapshot: snapshot.clone(),
                     resource: resource.clone(),
                     administrative_dir: administrative_dir.clone(),
-                    administrative_dir_incarnation,
+                    administrative_dir_incarnation: administrative_dir_incarnation.clone(),
                 })
                 .await
                 .unwrap();
@@ -9708,6 +9715,22 @@ mod scope_liveness_tests {
                 std::fs::rename(&root, repository.path().join("displaced-root")).unwrap();
                 std::fs::create_dir(&root).unwrap();
                 std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let dangling_admin = match state {
+                "dangling-admin" => Some(administrative_dir.clone()),
+                "dangling-admin-quarantine" => Some(
+                    close_retirement::administrative_dir_quarantine_path(
+                        &administrative_dir,
+                        &administrative_dir_incarnation,
+                    )
+                    .unwrap(),
+                ),
+                _ => None,
+            };
+            let missing_admin_target = repository.path().join("missing-admin-target");
+            if let Some(path) = &dangling_admin {
+                std::fs::remove_dir_all(&administrative_dir).unwrap();
+                std::os::unix::fs::symlink(&missing_admin_target, path).unwrap();
             }
             manager
                 .cancel_close_resource_leases(&attempt_id)
@@ -9764,14 +9787,38 @@ mod scope_liveness_tests {
                         && matches!(proof.outcome, RetirementOutcome::Retired)
                 }));
             } else {
-                assert!(root.is_dir());
-                assert!(administrative_dir.exists());
+                if let Some(path) = &dangling_admin {
+                    assert!(!root.exists());
+                    assert!(std::fs::symlink_metadata(path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
+                    assert_eq!(std::fs::read_link(path).unwrap(), missing_admin_target);
+                    assert_eq!(evidence[0].resource.kind(), RetiredResourceKind::Worktree);
+                    assert!(matches!(
+                        evidence[0].outcome,
+                        RetirementOutcome::Residual {
+                            residual_reason:
+                                phoenix_core::domain::close::RetirementFailureReason::IdentityNotProven
+                        }
+                    ));
+                } else {
+                    assert!(root.is_dir());
+                    assert!(administrative_dir.exists());
+                }
                 assert_eq!(evidence.len(), 1);
                 assert_eq!(evidence[0].scope, scope);
                 assert!(matches!(
                     evidence[0].outcome,
                     RetirementOutcome::Residual { .. }
                 ));
+                assert!(!evidence.iter().any(|proof| {
+                    proof.resource.kind() == RetiredResourceKind::WorkScope
+                        && matches!(
+                            proof.outcome,
+                            RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. }
+                        )
+                }));
                 if state == "nonempty" {
                     assert_eq!(
                         std::fs::read_to_string(root.join("marker")).unwrap(),

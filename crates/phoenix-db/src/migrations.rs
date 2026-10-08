@@ -621,9 +621,399 @@ const MIGRATIONS: &[Migration] = &[
         name: "retain_close_cleanup_source_inspections",
         sql: MIGRATION_121,
     },
+    Migration {
+        version: 122,
+        name: "adopt_exact_worktree_retirement_receipts",
+        sql: MIGRATION_122,
+    },
 ];
 
+const MIGRATION_122: &str = r"
+CREATE UNIQUE INDEX close_retirement_resources_exact_receipt_identity
+ON close_retirement_resources (
+    attempt_id, scope, inspection_generation, inspection_fingerprint,
+    resource_kind, identity_kind, identity_codec, identity_value
+);
+CREATE UNIQUE INDEX close_retirement_dispatches_exact_receipt_identity
+ON close_retirement_resource_dispatches (
+    attempt_id, scope, inspection_generation, inspection_fingerprint,
+    resource_kind, identity_kind, identity_codec, identity_value
+);
+CREATE TABLE close_worktree_retirement_receipt_adoptions (
+    receipt_state TEXT NOT NULL CHECK (receipt_state IN ('pending', 'finalized')),
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    source_inspection_generation TEXT NOT NULL,
+    source_inspection_fingerprint TEXT NOT NULL,
+    target_inspection_generation TEXT NOT NULL,
+    target_inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL CHECK (identity_kind = 'worktree'),
+    identity_codec TEXT NOT NULL CHECK (identity_codec = 'worktree_id_v1'),
+    identity_value TEXT NOT NULL CHECK (identity_value <> ''),
+    adopted_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(adopted_at_unix_micros) = 'integer' AND adopted_at_unix_micros >= 0),
+    CHECK (source_inspection_generation <> target_inspection_generation
+           OR source_inspection_fingerprint <> target_inspection_fingerprint),
+    PRIMARY KEY (attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value),
+    UNIQUE (attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+            resource_kind, identity_kind, identity_codec, identity_value),
+    FOREIGN KEY (attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value)
+        REFERENCES close_retirement_resources (
+            attempt_id, scope, inspection_generation, inspection_fingerprint,
+            resource_kind, identity_kind, identity_codec, identity_value) ON DELETE RESTRICT,
+    FOREIGN KEY (attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value)
+        REFERENCES close_retirement_resource_dispatches (
+            attempt_id, scope, inspection_generation, inspection_fingerprint,
+            resource_kind, identity_kind, identity_codec, identity_value) ON DELETE RESTRICT
+);
+CREATE TRIGGER close_worktree_receipt_requires_exact_authority
+BEFORE INSERT ON close_worktree_retirement_receipt_adoptions
+WHEN NEW.receipt_state <> 'pending' OR NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN close_attempt_scopes captured ON captured.attempt_id = obligation.attempt_id
+    JOIN close_retirement_resources source ON source.attempt_id = captured.attempt_id AND source.scope = captured.scope
+    JOIN close_expected_retirement_resources target ON target.attempt_id = source.attempt_id AND target.scope = source.scope
+      AND target.resource_kind = source.resource_kind AND target.identity_kind = source.identity_kind
+      AND target.identity_codec = source.identity_codec AND target.identity_value = source.identity_value
+    JOIN close_retirement_inventories source_inventory ON source_inventory.attempt_id = source.attempt_id
+      AND source_inventory.scope = source.scope AND source_inventory.inspection_generation = source.inspection_generation
+      AND source_inventory.inspection_fingerprint = source.inspection_fingerprint AND source_inventory.sealed = 1
+    JOIN close_retirement_inventories target_inventory ON target_inventory.attempt_id = target.attempt_id
+      AND target_inventory.scope = target.scope AND target_inventory.inspection_generation = target.inspection_generation
+      AND target_inventory.inspection_fingerprint = target.inspection_fingerprint AND target_inventory.sealed = 1
+    WHERE obligation.attempt_id = NEW.attempt_id AND captured.scope = NEW.scope
+      AND obligation.phase = 'retirement_requested'
+      AND obligation.inspection_generation = NEW.target_inspection_generation
+      AND obligation.inspection_fingerprint = NEW.target_inspection_fingerprint
+      AND captured.captured_worktree_identity = NEW.identity_value
+      AND source.inspection_generation = NEW.source_inspection_generation
+      AND source.inspection_fingerprint = NEW.source_inspection_fingerprint
+      AND target.inspection_generation = NEW.target_inspection_generation
+      AND target.inspection_fingerprint = NEW.target_inspection_fingerprint
+      AND source.resource_kind = NEW.resource_kind AND source.identity_kind = NEW.identity_kind
+      AND source.identity_codec = NEW.identity_codec AND source.identity_value = NEW.identity_value
+      AND source.proof_kind IN ('retired', 'absence_adopted')
+      AND EXISTS (
+          SELECT 1 FROM close_retirement_resource_dispatches dispatch
+          WHERE dispatch.attempt_id = source.attempt_id AND dispatch.scope = source.scope
+            AND dispatch.inspection_generation = source.inspection_generation
+            AND dispatch.inspection_fingerprint = source.inspection_fingerprint
+            AND dispatch.resource_kind = source.resource_kind AND dispatch.identity_kind = source.identity_kind
+            AND dispatch.identity_codec = source.identity_codec AND dispatch.identity_value = source.identity_value
+      )
+      AND EXISTS (
+          SELECT 1 FROM close_retirement_resource_dispatches dispatch
+          WHERE dispatch.attempt_id = target.attempt_id AND dispatch.scope = target.scope
+            AND dispatch.inspection_generation = target.inspection_generation
+            AND dispatch.inspection_fingerprint = target.inspection_fingerprint
+            AND dispatch.resource_kind = target.resource_kind AND dispatch.identity_kind = target.identity_kind
+            AND dispatch.identity_codec = target.identity_codec AND dispatch.identity_value = target.identity_value
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM close_worktree_cleanup_plans target_plan
+          WHERE target_plan.attempt_id = target.attempt_id AND target_plan.scope = target.scope
+            AND target_plan.inspection_generation = target.inspection_generation
+            AND target_plan.inspection_fingerprint = target.inspection_fingerprint
+            AND target_plan.resource_kind = target.resource_kind
+            AND target_plan.identity_kind = target.identity_kind
+            AND target_plan.identity_codec = target.identity_codec
+            AND target_plan.identity_value = target.identity_value
+      )
+      AND (EXISTS (
+          SELECT 1 FROM close_worktree_cleanup_plans plan
+          WHERE plan.attempt_id = source.attempt_id AND plan.scope = source.scope
+            AND plan.inspection_generation = source.inspection_generation
+            AND plan.inspection_fingerprint = source.inspection_fingerprint
+            AND plan.resource_kind = source.resource_kind AND plan.identity_kind = source.identity_kind
+            AND plan.identity_codec = source.identity_codec AND plan.identity_value = source.identity_value
+      ) OR EXISTS (
+          SELECT 1 FROM close_worktree_retirement_receipt_adoptions prior
+          WHERE prior.attempt_id = source.attempt_id AND prior.scope = source.scope
+            AND prior.receipt_state = 'finalized'
+            AND prior.target_inspection_generation = source.inspection_generation
+            AND prior.target_inspection_fingerprint = source.inspection_fingerprint
+            AND prior.resource_kind = source.resource_kind AND prior.identity_kind = source.identity_kind
+            AND prior.identity_codec = source.identity_codec AND prior.identity_value = source.identity_value
+      ))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt requires exact successful source and sealed active target authority');
+END;
+CREATE TRIGGER close_worktree_receipt_reject_update
+BEFORE UPDATE ON close_worktree_retirement_receipt_adoptions
+WHEN NOT (
+    OLD.receipt_state = 'pending' AND NEW.receipt_state = 'finalized'
+    AND OLD.attempt_id = NEW.attempt_id AND OLD.scope = NEW.scope
+    AND OLD.source_inspection_generation = NEW.source_inspection_generation
+    AND OLD.source_inspection_fingerprint = NEW.source_inspection_fingerprint
+    AND OLD.target_inspection_generation = NEW.target_inspection_generation
+    AND OLD.target_inspection_fingerprint = NEW.target_inspection_fingerprint
+    AND OLD.resource_kind = NEW.resource_kind AND OLD.identity_kind = NEW.identity_kind
+    AND OLD.identity_codec = NEW.identity_codec AND OLD.identity_value = NEW.identity_value
+    AND OLD.adopted_at_unix_micros = NEW.adopted_at_unix_micros
+    AND EXISTS (
+        SELECT 1 FROM close_retirement_resources target
+        WHERE target.attempt_id=NEW.attempt_id AND target.scope=NEW.scope
+          AND target.inspection_generation=NEW.target_inspection_generation
+          AND target.inspection_fingerprint=NEW.target_inspection_fingerprint
+          AND target.resource_kind=NEW.resource_kind AND target.identity_kind=NEW.identity_kind
+          AND target.identity_codec=NEW.identity_codec AND target.identity_value=NEW.identity_value
+          AND target.proof_kind='absence_adopted' AND target.absence_basis='same_attempt_prior_retirement'
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree retirement receipt lineage is immutable');
+END;
+CREATE TRIGGER close_worktree_receipt_reject_delete
+BEFORE DELETE ON close_worktree_retirement_receipt_adoptions
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = OLD.attempt_id AND obligation.phase = 'completed'
+      AND NOT EXISTS (SELECT 1 FROM conversations member
+                      WHERE member.product_conversation_id = obligation.product_conversation_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree retirement receipt lineage is immutable');
+END;
+CREATE TRIGGER close_retirement_resources_receipt_reject_update
+BEFORE UPDATE ON close_retirement_resources
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id=OLD.attempt_id AND receipt.scope=OLD.scope
+      AND receipt.resource_kind=OLD.resource_kind AND receipt.identity_kind=OLD.identity_kind
+      AND receipt.identity_codec=OLD.identity_codec AND receipt.identity_value=OLD.identity_value
+      AND ((receipt.source_inspection_generation=OLD.inspection_generation
+            AND receipt.source_inspection_fingerprint=OLD.inspection_fingerprint)
+           OR (receipt.target_inspection_generation=OLD.inspection_generation
+               AND receipt.target_inspection_fingerprint=OLD.inspection_fingerprint))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt authority is immutable');
+END;
+CREATE TRIGGER close_retirement_resources_receipt_reject_delete
+BEFORE DELETE ON close_retirement_resources
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id=OLD.attempt_id AND receipt.scope=OLD.scope
+      AND receipt.resource_kind=OLD.resource_kind AND receipt.identity_kind=OLD.identity_kind
+      AND receipt.identity_codec=OLD.identity_codec AND receipt.identity_value=OLD.identity_value
+      AND ((receipt.source_inspection_generation=OLD.inspection_generation
+            AND receipt.source_inspection_fingerprint=OLD.inspection_fingerprint)
+           OR (receipt.target_inspection_generation=OLD.inspection_generation
+               AND receipt.target_inspection_fingerprint=OLD.inspection_fingerprint))
+) AND NOT EXISTS (SELECT 1 FROM close_obligations o WHERE o.attempt_id=OLD.attempt_id AND o.phase='completed' AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.product_conversation_id=o.product_conversation_id))
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt authority is immutable');
+END;
+CREATE TRIGGER close_retirement_resource_dispatches_receipt_reject_update
+BEFORE UPDATE ON close_retirement_resource_dispatches
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id=OLD.attempt_id AND receipt.scope=OLD.scope
+      AND receipt.resource_kind=OLD.resource_kind AND receipt.identity_kind=OLD.identity_kind
+      AND receipt.identity_codec=OLD.identity_codec AND receipt.identity_value=OLD.identity_value
+      AND ((receipt.source_inspection_generation=OLD.inspection_generation
+            AND receipt.source_inspection_fingerprint=OLD.inspection_fingerprint)
+           OR (receipt.target_inspection_generation=OLD.inspection_generation
+               AND receipt.target_inspection_fingerprint=OLD.inspection_fingerprint))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt authority is immutable');
+END;
+CREATE TRIGGER close_retirement_resource_dispatches_receipt_reject_delete
+BEFORE DELETE ON close_retirement_resource_dispatches
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id=OLD.attempt_id AND receipt.scope=OLD.scope
+      AND receipt.resource_kind=OLD.resource_kind AND receipt.identity_kind=OLD.identity_kind
+      AND receipt.identity_codec=OLD.identity_codec AND receipt.identity_value=OLD.identity_value
+      AND ((receipt.source_inspection_generation=OLD.inspection_generation
+            AND receipt.source_inspection_fingerprint=OLD.inspection_fingerprint)
+           OR (receipt.target_inspection_generation=OLD.inspection_generation
+               AND receipt.target_inspection_fingerprint=OLD.inspection_fingerprint))
+) AND NOT EXISTS (SELECT 1 FROM close_obligations o WHERE o.attempt_id=OLD.attempt_id AND o.phase='completed' AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.product_conversation_id=o.product_conversation_id))
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt authority is immutable');
+END;
+CREATE TRIGGER close_worktree_cleanup_plans_receipt_reject_update
+BEFORE UPDATE ON close_worktree_cleanup_plans
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id=OLD.attempt_id AND receipt.scope=OLD.scope
+      AND receipt.resource_kind=OLD.resource_kind AND receipt.identity_kind=OLD.identity_kind
+      AND receipt.identity_codec=OLD.identity_codec AND receipt.identity_value=OLD.identity_value
+      AND ((receipt.source_inspection_generation=OLD.inspection_generation
+            AND receipt.source_inspection_fingerprint=OLD.inspection_fingerprint)
+           OR (receipt.target_inspection_generation=OLD.inspection_generation
+               AND receipt.target_inspection_fingerprint=OLD.inspection_fingerprint))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt authority is immutable');
+END;
+CREATE TRIGGER close_worktree_cleanup_plans_receipt_reject_delete
+BEFORE DELETE ON close_worktree_cleanup_plans
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id=OLD.attempt_id AND receipt.scope=OLD.scope
+      AND receipt.resource_kind=OLD.resource_kind AND receipt.identity_kind=OLD.identity_kind
+      AND receipt.identity_codec=OLD.identity_codec AND receipt.identity_value=OLD.identity_value
+      AND ((receipt.source_inspection_generation=OLD.inspection_generation
+            AND receipt.source_inspection_fingerprint=OLD.inspection_fingerprint)
+           OR (receipt.target_inspection_generation=OLD.inspection_generation
+               AND receipt.target_inspection_fingerprint=OLD.inspection_fingerprint))
+) AND NOT EXISTS (SELECT 1 FROM close_obligations o WHERE o.attempt_id=OLD.attempt_id AND o.phase='completed' AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.product_conversation_id=o.product_conversation_id))
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt authority is immutable');
+END;
+DROP TRIGGER close_worktree_absence_requires_cleanup_plan_on_insert;
+CREATE TRIGGER close_worktree_absence_requires_cleanup_plan_on_insert
+BEFORE INSERT ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind = 'worktree'
+ AND NEW.proof_kind = 'absence_adopted'
+ AND NEW.absence_basis = 'same_attempt_prior_retirement'
+ AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE proof.attempt_id = NEW.attempt_id AND proof.scope = NEW.scope
+      AND proof.inspection_generation = NEW.inspection_generation
+      AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+      AND proof.resource_kind = NEW.resource_kind AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec AND proof.identity_value = NEW.identity_value
+      AND proof.proof_kind = 'retired'
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_plans plan
+    WHERE plan.attempt_id = NEW.attempt_id AND plan.scope = NEW.scope
+      AND plan.inspection_generation = NEW.inspection_generation
+      AND plan.inspection_fingerprint = NEW.inspection_fingerprint
+      AND plan.resource_kind = NEW.resource_kind AND plan.identity_kind = NEW.identity_kind
+      AND plan.identity_codec = NEW.identity_codec AND plan.identity_value = NEW.identity_value
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id = NEW.attempt_id AND receipt.scope = NEW.scope
+      AND receipt.target_inspection_generation = NEW.inspection_generation
+      AND receipt.target_inspection_fingerprint = NEW.inspection_fingerprint
+      AND receipt.resource_kind = NEW.resource_kind AND receipt.identity_kind = NEW.identity_kind
+      AND receipt.identity_codec = NEW.identity_codec AND receipt.identity_value = NEW.identity_value
+      AND receipt.receipt_state = 'pending'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'adopted worktree absence requires exact cleanup plan');
+END;
+DROP TRIGGER close_worktree_absence_requires_cleanup_plan_on_update;
+CREATE TRIGGER close_worktree_absence_requires_cleanup_plan_on_update
+BEFORE UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind = 'worktree'
+ AND NEW.proof_kind = 'absence_adopted'
+ AND NEW.absence_basis = 'same_attempt_prior_retirement'
+ AND (
+     OLD.proof_kind <> 'absence_adopted' OR OLD.absence_basis IS NOT NEW.absence_basis
+     OR OLD.attempt_id <> NEW.attempt_id OR OLD.scope <> NEW.scope
+     OR OLD.inspection_generation <> NEW.inspection_generation
+     OR OLD.inspection_fingerprint <> NEW.inspection_fingerprint
+     OR OLD.resource_kind <> NEW.resource_kind OR OLD.identity_kind <> NEW.identity_kind
+     OR OLD.identity_codec <> NEW.identity_codec OR OLD.identity_value <> NEW.identity_value
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_plans plan
+    WHERE plan.attempt_id = NEW.attempt_id AND plan.scope = NEW.scope
+      AND plan.inspection_generation = NEW.inspection_generation
+      AND plan.inspection_fingerprint = NEW.inspection_fingerprint
+      AND plan.resource_kind = NEW.resource_kind AND plan.identity_kind = NEW.identity_kind
+      AND plan.identity_codec = NEW.identity_codec AND plan.identity_value = NEW.identity_value
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id = NEW.attempt_id AND receipt.scope = NEW.scope
+      AND receipt.target_inspection_generation = NEW.inspection_generation
+      AND receipt.target_inspection_fingerprint = NEW.inspection_fingerprint
+      AND receipt.resource_kind = NEW.resource_kind AND receipt.identity_kind = NEW.identity_kind
+      AND receipt.identity_codec = NEW.identity_codec AND receipt.identity_value = NEW.identity_value
+      AND receipt.receipt_state = 'pending'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'adopted worktree absence requires exact cleanup plan');
+END;
+CREATE TRIGGER close_worktree_receipt_target_requires_success_on_insert
+BEFORE INSERT ON close_retirement_resources
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id=NEW.attempt_id AND receipt.scope=NEW.scope
+      AND receipt.target_inspection_generation=NEW.inspection_generation
+      AND receipt.target_inspection_fingerprint=NEW.inspection_fingerprint
+      AND receipt.resource_kind=NEW.resource_kind AND receipt.identity_kind=NEW.identity_kind
+      AND receipt.identity_codec=NEW.identity_codec AND receipt.identity_value=NEW.identity_value
+) AND NOT (NEW.proof_kind = 'residual'
+           OR (NEW.proof_kind = 'absence_adopted' AND NEW.absence_basis = 'same_attempt_prior_retirement'
+               AND EXISTS (
+                   SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+                   JOIN close_obligations obligation ON obligation.attempt_id=receipt.attempt_id
+                   WHERE receipt.attempt_id=NEW.attempt_id AND receipt.scope=NEW.scope
+                     AND receipt.target_inspection_generation=NEW.inspection_generation
+                     AND receipt.target_inspection_fingerprint=NEW.inspection_fingerprint
+                     AND receipt.resource_kind=NEW.resource_kind AND receipt.identity_kind=NEW.identity_kind
+                     AND receipt.identity_codec=NEW.identity_codec AND receipt.identity_value=NEW.identity_value
+                     AND receipt.receipt_state='pending' AND obligation.phase='retirement_requested'
+                     AND obligation.inspection_generation=NEW.inspection_generation
+                     AND obligation.inspection_fingerprint=NEW.inspection_fingerprint
+               )))
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt target requires residual or adopted absence');
+END;
+CREATE TRIGGER close_worktree_receipt_finalize_after_success
+AFTER INSERT ON close_retirement_resources
+WHEN NEW.proof_kind = 'absence_adopted' AND NEW.absence_basis = 'same_attempt_prior_retirement'
+BEGIN
+    UPDATE close_worktree_retirement_receipt_adoptions SET receipt_state='finalized'
+    WHERE attempt_id=NEW.attempt_id AND scope=NEW.scope
+      AND target_inspection_generation=NEW.inspection_generation
+      AND target_inspection_fingerprint=NEW.inspection_fingerprint
+      AND resource_kind=NEW.resource_kind AND identity_kind=NEW.identity_kind
+      AND identity_codec=NEW.identity_codec AND identity_value=NEW.identity_value
+      AND receipt_state='pending';
+END;
+CREATE TRIGGER close_worktree_receipt_target_reject_plan
+BEFORE INSERT ON close_worktree_cleanup_plans
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_retirement_receipt_adoptions receipt
+    WHERE receipt.attempt_id=NEW.attempt_id AND receipt.scope=NEW.scope
+      AND receipt.target_inspection_generation=NEW.inspection_generation
+      AND receipt.target_inspection_fingerprint=NEW.inspection_fingerprint
+      AND receipt.resource_kind=NEW.resource_kind AND receipt.identity_kind=NEW.identity_kind
+      AND receipt.identity_codec=NEW.identity_codec AND receipt.identity_value=NEW.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Worktree receipt target cannot acquire a cleanup plan');
+END;
+";
+
 const MIGRATION_121: &str = r"
+DROP TRIGGER close_retirement_resources_allow_only_residual_resolution;
+CREATE TRIGGER close_retirement_resources_allow_only_residual_resolution
+BEFORE UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN NOT (
+    OLD.proof_kind = 'residual'
+    AND NEW.proof_kind IN ('residual', 'retired', 'absence_adopted')
+    AND OLD.attempt_id = NEW.attempt_id
+    AND OLD.scope = NEW.scope
+    AND OLD.inspection_generation = NEW.inspection_generation
+    AND OLD.inspection_fingerprint = NEW.inspection_fingerprint
+    AND OLD.resource_kind = NEW.resource_kind
+    AND OLD.identity_kind = NEW.identity_kind
+    AND OLD.identity_codec = NEW.identity_codec
+    AND OLD.identity_value = NEW.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement evidence may only refresh or resolve residual proof');
+END;
+
 CREATE TABLE close_retained_retirement_inspections (
     attempt_id TEXT NOT NULL,
     inspection_generation TEXT NOT NULL CHECK (inspection_generation <> ''),
@@ -631,29 +1021,12 @@ CREATE TABLE close_retained_retirement_inspections (
     scope TEXT NOT NULL,
     generation TEXT NOT NULL CHECK (generation <> ''),
     fingerprint TEXT NOT NULL CHECK (fingerprint <> ''),
-    inspected_at TEXT NOT NULL,
+    inspected_at_unix_us INTEGER NOT NULL
+        CHECK (typeof(inspected_at_unix_us) = 'integer' AND inspected_at_unix_us >= 0),
     PRIMARY KEY (attempt_id, inspection_generation, inspection_fingerprint, scope),
     FOREIGN KEY (attempt_id, scope)
         REFERENCES close_attempt_scopes(attempt_id, scope) ON DELETE CASCADE
 );
-CREATE TRIGGER close_retained_retirement_inspections_reject_invalid_timestamp
-BEFORE INSERT ON close_retained_retirement_inspections
-FOR EACH ROW
-WHEN (
-      NEW.inspected_at NOT GLOB '????-??-??T??:??:??Z'
-      AND NEW.inspected_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
-      AND (NEW.inspected_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.inspected_at, 21, LENGTH(NEW.inspected_at) - 21) GLOB '*[^0-9]*')
-      AND (NEW.inspected_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.inspected_at, 21, LENGTH(NEW.inspected_at) - 26) GLOB '*[^0-9]*')
-  )
-  OR date(SUBSTR(NEW.inspected_at, 1, 10), '+0 days') <> SUBSTR(NEW.inspected_at, 1, 10)
-  OR CAST(SUBSTR(NEW.inspected_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
-  OR CAST(SUBSTR(NEW.inspected_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
-  OR CAST(SUBSTR(NEW.inspected_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
-  OR julianday(NEW.inspected_at) IS NULL
-BEGIN
-    SELECT RAISE(ABORT, 'retained close inspection timestamp must be valid RFC 3339');
-END;
-
 CREATE TABLE close_retained_retirement_losses (
     attempt_id TEXT NOT NULL,
     inspection_generation TEXT NOT NULL,
@@ -684,6 +1057,158 @@ CREATE TABLE close_retained_retirement_losses (
             (attempt_id, inspection_generation, inspection_fingerprint, scope)
         ON DELETE CASCADE
 );
+
+CREATE TABLE close_legacy_fk787_cleanup_provenance (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    source_inspection_generation TEXT NOT NULL CHECK (source_inspection_generation <> ''),
+    source_inspection_fingerprint TEXT NOT NULL CHECK (source_inspection_fingerprint <> ''),
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL CHECK (identity_kind = 'worktree'),
+    identity_codec TEXT NOT NULL CHECK (identity_codec = 'worktree_id_v1'),
+    identity_value TEXT NOT NULL CHECK (identity_value <> ''),
+    recognized_inspection_generation TEXT NOT NULL CHECK (recognized_inspection_generation <> ''),
+    recognized_inspection_fingerprint TEXT NOT NULL CHECK (recognized_inspection_fingerprint <> ''),
+    recognized_at_unix_us INTEGER NOT NULL
+        CHECK (typeof(recognized_at_unix_us) = 'integer' AND recognized_at_unix_us >= 0),
+    CHECK (source_inspection_generation <> recognized_inspection_generation
+           OR source_inspection_fingerprint <> recognized_inspection_fingerprint),
+    PRIMARY KEY (attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value),
+    FOREIGN KEY (attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value)
+        REFERENCES close_worktree_cleanup_plans
+            (attempt_id, scope, inspection_generation, inspection_fingerprint,
+             resource_kind, identity_kind, identity_codec, identity_value) ON DELETE RESTRICT,
+    FOREIGN KEY (attempt_id, scope, recognized_inspection_generation, recognized_inspection_fingerprint)
+        REFERENCES close_retirement_inventories
+            (attempt_id, scope, inspection_generation, inspection_fingerprint) ON DELETE RESTRICT
+);
+CREATE TRIGGER close_legacy_fk787_cleanup_provenance_requires_exact_shape
+BEFORE INSERT ON close_legacy_fk787_cleanup_provenance
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN close_attempt_scopes target ON target.attempt_id = obligation.attempt_id
+    JOIN close_worktree_cleanup_plans source
+      ON source.attempt_id = target.attempt_id AND source.scope = target.scope
+    JOIN close_retirement_resource_dispatches dispatch
+      ON dispatch.attempt_id = source.attempt_id AND dispatch.scope = source.scope
+     AND dispatch.inspection_generation = source.inspection_generation
+     AND dispatch.inspection_fingerprint = source.inspection_fingerprint
+     AND dispatch.resource_kind = source.resource_kind AND dispatch.identity_kind = source.identity_kind
+     AND dispatch.identity_codec = source.identity_codec AND dispatch.identity_value = source.identity_value
+    JOIN close_retirement_inventories inventory
+      ON inventory.attempt_id = source.attempt_id AND inventory.scope = source.scope
+     AND inventory.inspection_generation = source.inspection_generation
+     AND inventory.inspection_fingerprint = source.inspection_fingerprint AND inventory.sealed = 1
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase IN ('awaiting_retirement_inspection', 'retirement_requested')
+      AND obligation.inspection_generation = NEW.recognized_inspection_generation
+      AND obligation.inspection_fingerprint = NEW.recognized_inspection_fingerprint
+      AND target.scope = NEW.scope AND target.captured_worktree_identity = NEW.identity_value
+      AND source.inspection_generation = NEW.source_inspection_generation
+      AND source.inspection_fingerprint = NEW.source_inspection_fingerprint
+      AND source.resource_kind = NEW.resource_kind AND source.identity_kind = NEW.identity_kind
+      AND source.identity_codec = NEW.identity_codec AND source.identity_value = NEW.identity_value
+      AND (SELECT COUNT(*) FROM close_attempt_scopes
+           WHERE attempt_id = NEW.attempt_id AND captured_worktree_identity IS NOT NULL) > 0
+      AND (SELECT COUNT(*) FROM close_attempt_scopes
+           WHERE attempt_id = NEW.attempt_id AND captured_worktree_identity IS NOT NULL) =
+          (SELECT COUNT(*) FROM close_retirement_inspections WHERE attempt_id = NEW.attempt_id)
+      AND (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = NEW.attempt_id) =
+          (SELECT COUNT(*) FROM close_retirement_inventories
+           WHERE attempt_id = NEW.attempt_id AND inspection_generation = NEW.recognized_inspection_generation
+             AND inspection_fingerprint = NEW.recognized_inspection_fingerprint AND sealed = 1)
+      AND (SELECT COUNT(*) FROM close_attempt_scopes
+           WHERE attempt_id = NEW.attempt_id AND captured_worktree_identity IS NOT NULL) =
+          (SELECT COUNT(*) FROM close_retirement_resources
+           WHERE attempt_id = NEW.attempt_id AND inspection_generation = NEW.recognized_inspection_generation
+             AND inspection_fingerprint = NEW.recognized_inspection_fingerprint AND proof_kind = 'residual')
+      AND NOT EXISTS (
+          SELECT 1 FROM close_retirement_resource_dispatches
+          WHERE attempt_id = NEW.attempt_id AND inspection_generation = NEW.recognized_inspection_generation
+            AND inspection_fingerprint = NEW.recognized_inspection_fingerprint
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM close_worktree_cleanup_plans
+          WHERE attempt_id = NEW.attempt_id AND inspection_generation = NEW.recognized_inspection_generation
+            AND inspection_fingerprint = NEW.recognized_inspection_fingerprint
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM close_retained_retirement_inspections
+          WHERE attempt_id = NEW.attempt_id AND scope = NEW.scope
+            AND inspection_generation = NEW.source_inspection_generation
+            AND inspection_fingerprint = NEW.source_inspection_fingerprint
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM close_attempt_scopes captured
+          WHERE captured.attempt_id = NEW.attempt_id AND captured.captured_worktree_identity IS NOT NULL
+            AND (NOT EXISTS (
+                SELECT 1 FROM close_retirement_resources residual
+                WHERE residual.attempt_id = captured.attempt_id AND residual.scope = captured.scope
+                  AND residual.inspection_generation = NEW.recognized_inspection_generation
+                  AND residual.inspection_fingerprint = NEW.recognized_inspection_fingerprint
+                  AND residual.resource_kind = 'worktree' AND residual.identity_kind = 'worktree'
+                  AND residual.identity_codec = 'worktree_id_v1'
+                  AND residual.identity_value = captured.captured_worktree_identity
+                  AND residual.proof_kind = 'residual' AND residual.residual_reason = 'manual_repair_required'
+                  AND residual.detail = 'Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed'
+            ) OR NOT EXISTS (
+                SELECT 1 FROM close_worktree_cleanup_plans prior
+                JOIN close_retirement_resource_dispatches authority
+                  ON authority.attempt_id = prior.attempt_id AND authority.scope = prior.scope
+                 AND authority.inspection_generation = prior.inspection_generation
+                 AND authority.inspection_fingerprint = prior.inspection_fingerprint
+                 AND authority.resource_kind = prior.resource_kind AND authority.identity_kind = prior.identity_kind
+                 AND authority.identity_codec = prior.identity_codec AND authority.identity_value = prior.identity_value
+                WHERE prior.attempt_id = captured.attempt_id AND prior.scope = captured.scope
+                  AND prior.resource_kind = 'worktree' AND prior.identity_kind = 'worktree'
+                  AND prior.identity_codec = 'worktree_id_v1' AND prior.identity_value = captured.captured_worktree_identity
+                  AND (prior.inspection_generation <> NEW.recognized_inspection_generation
+                       OR prior.inspection_fingerprint <> NEW.recognized_inspection_fingerprint)
+            ))
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'legacy cleanup provenance requires exact FK787 partial-generation shape');
+END;
+CREATE TRIGGER close_worktree_cleanup_plan_reject_legacy_provenance_update
+BEFORE UPDATE ON close_worktree_cleanup_plans
+WHEN EXISTS (
+    SELECT 1 FROM close_legacy_fk787_cleanup_provenance provenance
+    WHERE provenance.attempt_id = OLD.attempt_id AND provenance.scope = OLD.scope
+      AND provenance.source_inspection_generation = OLD.inspection_generation
+      AND provenance.source_inspection_fingerprint = OLD.inspection_fingerprint
+      AND provenance.resource_kind = OLD.resource_kind AND provenance.identity_kind = OLD.identity_kind
+      AND provenance.identity_codec = OLD.identity_codec AND provenance.identity_value = OLD.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'legacy cleanup source payload is immutable');
+END;
+CREATE TRIGGER close_legacy_fk787_cleanup_provenance_reject_update
+BEFORE UPDATE ON close_legacy_fk787_cleanup_provenance
+BEGIN
+    SELECT RAISE(ABORT, 'legacy cleanup provenance is immutable');
+END;
+CREATE TRIGGER close_legacy_fk787_cleanup_provenance_reject_delete
+BEFORE DELETE ON close_legacy_fk787_cleanup_provenance
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations product ON product.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id AND obligation.phase = 'completed'
+      AND NOT EXISTS (SELECT 1 FROM conversations member WHERE member.product_conversation_id = product.id)
+      AND NOT EXISTS (
+          SELECT 1 FROM close_worktree_cleanup_adoptions adoption
+          WHERE adoption.attempt_id = OLD.attempt_id AND adoption.scope = OLD.scope
+            AND adoption.source_inspection_generation = OLD.source_inspection_generation
+            AND adoption.source_inspection_fingerprint = OLD.source_inspection_fingerprint
+            AND adoption.resource_kind = OLD.resource_kind AND adoption.identity_kind = OLD.identity_kind
+            AND adoption.identity_codec = OLD.identity_codec AND adoption.identity_value = OLD.identity_value
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'legacy cleanup provenance is immutable');
+END;
 
 CREATE TABLE migration_121_retained_source_validation (sentinel INTEGER);
 CREATE TRIGGER migration_121_requires_retained_source
@@ -725,8 +1250,18 @@ WHEN NOT EXISTS (
       AND inspection.inspection_generation = NEW.source_inspection_generation
       AND inspection.inspection_fingerprint = NEW.source_inspection_fingerprint
 )
+AND NOT EXISTS (
+    SELECT 1 FROM close_legacy_fk787_cleanup_provenance provenance
+    WHERE provenance.attempt_id = NEW.attempt_id AND provenance.scope = NEW.scope
+      AND provenance.source_inspection_generation = NEW.source_inspection_generation
+      AND provenance.source_inspection_fingerprint = NEW.source_inspection_fingerprint
+      AND provenance.resource_kind = NEW.resource_kind AND provenance.identity_kind = NEW.identity_kind
+      AND provenance.identity_codec = NEW.identity_codec AND provenance.identity_value = NEW.identity_value
+      AND provenance.recognized_inspection_generation = NEW.target_inspection_generation
+      AND provenance.recognized_inspection_fingerprint = NEW.target_inspection_fingerprint
+)
 BEGIN
-    SELECT RAISE(ABORT, 'cleanup adoption requires exact retained source inspection');
+    SELECT RAISE(ABORT, 'cleanup adoption requires exact retained source inspection or typed legacy provenance');
 END;
 
 CREATE TRIGGER close_retained_retirement_inspections_reject_update
@@ -12231,8 +12766,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(11).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(12).copied().collect::<Vec<_>>(),
             vec![
+                (122, "adopt_exact_worktree_retirement_receipts"),
                 (121, "retain_close_cleanup_source_inspections"),
                 (120, "require_close_repair_reinspection"),
                 (119, "adopt_close_worktree_cleanup_plans"),
@@ -18869,17 +19405,53 @@ mod tests {
     async fn migration_121_fixture(pool: &SqlitePool) {
         sqlx::raw_sql(
             "CREATE TABLE close_attempt_scopes (
-                 attempt_id TEXT NOT NULL, scope TEXT NOT NULL, PRIMARY KEY (attempt_id, scope)
+                 attempt_id TEXT NOT NULL, scope TEXT NOT NULL, captured_worktree_identity TEXT,
+                 PRIMARY KEY (attempt_id, scope)
+             );
+             CREATE TABLE product_conversations (id TEXT PRIMARY KEY);
+             CREATE TABLE conversations (id TEXT PRIMARY KEY, product_conversation_id TEXT);
+             CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY, product_conversation_id TEXT,
+                 phase TEXT, inspection_generation TEXT, inspection_fingerprint TEXT
+             );
+             CREATE TABLE close_retirement_inspections (
+                 attempt_id TEXT, scope TEXT, generation TEXT, fingerprint TEXT, inspected_at TEXT,
+                 PRIMARY KEY (attempt_id, scope)
+             );
+             CREATE TABLE close_retirement_losses (
+                 attempt_id TEXT, scope TEXT, category TEXT, identity_kind TEXT,
+                 identity_codec TEXT, identity_value TEXT
              );
              CREATE TABLE close_retirement_inventories (
                  attempt_id TEXT, scope TEXT, inspection_generation TEXT,
-                 inspection_fingerprint TEXT, sealed INTEGER
+                 inspection_fingerprint TEXT, sealed INTEGER,
+                 PRIMARY KEY (attempt_id, scope, inspection_generation, inspection_fingerprint)
+             );
+             CREATE TABLE close_retirement_resources (
+                 attempt_id TEXT, scope TEXT, inspection_generation TEXT, inspection_fingerprint TEXT,
+                 resource_kind TEXT, identity_kind TEXT, identity_codec TEXT, identity_value TEXT,
+                 proof_kind TEXT, residual_reason TEXT, detail TEXT
+             );
+             CREATE TABLE close_retirement_resource_dispatches (
+                 attempt_id TEXT, scope TEXT, inspection_generation TEXT, inspection_fingerprint TEXT,
+                 resource_kind TEXT, identity_kind TEXT, identity_codec TEXT, identity_value TEXT
+             );
+             CREATE TABLE close_worktree_cleanup_plans (
+                 attempt_id TEXT, scope TEXT, inspection_generation TEXT, inspection_fingerprint TEXT,
+                 resource_kind TEXT, identity_kind TEXT, identity_codec TEXT, identity_value TEXT,
+                 PRIMARY KEY (attempt_id, scope, inspection_generation, inspection_fingerprint,
+                              resource_kind, identity_kind, identity_codec, identity_value)
              );
              CREATE TABLE close_worktree_cleanup_adoptions (
                  attempt_id TEXT, scope TEXT, source_inspection_generation TEXT,
-                 source_inspection_fingerprint TEXT
+                 source_inspection_fingerprint TEXT, target_inspection_generation TEXT,
+                 target_inspection_fingerprint TEXT, resource_kind TEXT, identity_kind TEXT,
+                 identity_codec TEXT, identity_value TEXT
              );
-             INSERT INTO close_attempt_scopes VALUES ('attempt', 'scope');
+             INSERT INTO product_conversations VALUES ('product');
+             INSERT INTO conversations VALUES ('member', 'product');
+             INSERT INTO close_obligations VALUES ('attempt', 'product', 'awaiting_retirement_inspection', 'aggregate', 'fp');
+             INSERT INTO close_attempt_scopes VALUES ('attempt', 'scope', 'worktree');
              INSERT INTO close_retirement_inventories VALUES ('attempt', 'scope', 'aggregate', 'fp', 1);",
         )
         .execute(pool)
@@ -18892,7 +19464,7 @@ mod tests {
     async fn migration_121_rejects_adoption_without_source_without_fabrication_or_stamp() {
         let pool = test_pool().await;
         migration_121_fixture(&pool).await;
-        sqlx::query("INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'aggregate', 'fp')")
+        sqlx::query("INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'aggregate', 'fp', 'next', 'next-fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree')")
             .execute(&pool).await.unwrap();
         let error = run_pending_migrations(&pool).await.unwrap_err();
         assert!(error
@@ -18900,7 +19472,7 @@ mod tests {
             .contains("cleanup adoption requires exact retained source inspection"));
         for query in [
             "SELECT COUNT(*) FROM _migrations WHERE version = 121",
-            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'close_retained_retirement_%' OR name LIKE 'migration_121_%'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'close_retained_retirement_%' OR name LIKE 'close_legacy_fk787_%' OR name LIKE 'migration_121_%'",
         ] {
             let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
             assert_eq!(count, 0);
@@ -18927,7 +19499,7 @@ mod tests {
                 .unwrap();
         assert_eq!(count, 0);
         let inspection = "INSERT INTO close_retained_retirement_inspections VALUES (
-            'attempt', 'aggregate', 'fp', 'scope', 'scope-generation', 'scope-fp', '2026-01-01T00:00:00Z')";
+            'attempt', 'aggregate', 'fp', 'scope', 'scope-generation', 'scope-fp', 1767225600000000)";
         let loss = "INSERT INTO close_retained_retirement_losses VALUES (
             'attempt', 'aggregate', 'fp', 'scope', 'staged_tracked_paths', 'git_path',
             'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:ff')";
@@ -18938,8 +19510,26 @@ mod tests {
         .execute(&pool)
         .await
         .is_err());
-        let adoption = "INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'aggregate', 'fp')";
+        let adoption = "INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'aggregate', 'fp', 'next', 'next-fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree')";
         assert!(sqlx::query(adoption).execute(&pool).await.is_err());
+        for timestamp in [
+            "NULL",
+            "-1",
+            "1.5",
+            "'bad'",
+            "X'01'",
+            "'2026-01-01T00:00:00Z'",
+        ] {
+            assert!(
+                sqlx::query(sqlx::AssertSqlSafe(
+                    inspection.replace("1767225600000000", timestamp)
+                ))
+                .execute(&pool)
+                .await
+                .is_err(),
+                "{timestamp}"
+            );
+        }
         sqlx::query(inspection).execute(&pool).await.unwrap();
         sqlx::query(loss).execute(&pool).await.unwrap();
         sqlx::query(adoption).execute(&pool).await.unwrap();
@@ -18949,7 +19539,10 @@ mod tests {
             "DELETE FROM close_retained_retirement_inspections",
             "DELETE FROM close_retained_retirement_losses",
         ] {
-            assert!(sqlx::query(forbidden).execute(&pool).await.is_err(), "{forbidden}");
+            assert!(
+                sqlx::query(forbidden).execute(&pool).await.is_err(),
+                "{forbidden}"
+            );
         }
         sqlx::query("DELETE FROM close_attempt_scopes")
             .execute(&pool)
@@ -18972,6 +19565,191 @@ mod tests {
                 .await
                 .unwrap();
         assert!(violations.is_empty());
+    }
+
+    const MIGRATION_121_LEGACY_FIXTURE_ROWS: &str = "
+        INSERT INTO close_retirement_inspections VALUES
+            ('attempt', 'scope', 'scope-generation', 'scope-fp', '2026-01-01T00:00:00.123456+00:00');
+        INSERT INTO close_retirement_losses VALUES
+            ('attempt', 'scope', 'staged_tracked_paths', 'git_path', 'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:ff');
+        INSERT INTO close_retirement_inventories VALUES ('attempt', 'scope', 'prior', 'prior-fp', 1);
+        INSERT INTO close_retirement_resource_dispatches VALUES
+            ('attempt', 'scope', 'prior', 'prior-fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree');
+        INSERT INTO close_worktree_cleanup_plans VALUES
+            ('attempt', 'scope', 'prior', 'prior-fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree');
+        INSERT INTO close_retirement_resources VALUES
+            ('attempt', 'scope', 'aggregate', 'fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree',
+             'residual', 'manual_repair_required',
+             'Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed');
+    ";
+
+    const MIGRATION_121_LEGACY_PROVENANCE_INSERT: &str = "
+        INSERT INTO close_legacy_fk787_cleanup_provenance VALUES
+            ('attempt', 'scope', 'prior', 'prior-fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree',
+             'aggregate', 'fp', 1767225600123456)
+    ";
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn migration_121_preserves_pre121_fk787_evidence_without_fabrication() {
+        let pool = test_pool().await;
+        migration_121_fixture(&pool).await;
+        sqlx::raw_sql(MIGRATION_121_LEGACY_FIXTURE_ROWS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        let active: (String, String, String) = sqlx::query_as(
+            "SELECT generation, fingerprint, inspected_at FROM close_retirement_inspections",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            active,
+            (
+                "scope-generation".into(),
+                "scope-fp".into(),
+                "2026-01-01T00:00:00.123456+00:00".into()
+            )
+        );
+        let identity: String =
+            sqlx::query_scalar("SELECT identity_value FROM close_retirement_losses")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(identity, "git_path_bytes_hex_v1:ff");
+        for table in [
+            "close_retained_retirement_inspections",
+            "close_retained_retirement_losses",
+            "close_legacy_fk787_cleanup_provenance",
+            "close_worktree_cleanup_adoptions",
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0, "{table}: upgrade must not invent evidence");
+        }
+        sqlx::query(MIGRATION_121_LEGACY_PROVENANCE_INSERT)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for forbidden in [
+            "UPDATE close_legacy_fk787_cleanup_provenance SET recognized_at_unix_us = 0",
+            "UPDATE close_worktree_cleanup_plans SET identity_value = 'replaced'",
+            "DELETE FROM close_legacy_fk787_cleanup_provenance",
+            "DELETE FROM close_worktree_cleanup_plans",
+            "DELETE FROM close_retirement_inventories WHERE inspection_generation = 'aggregate'",
+        ] {
+            assert!(
+                sqlx::query(forbidden).execute(&pool).await.is_err(),
+                "{forbidden}"
+            );
+        }
+        sqlx::query("INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'prior', 'prior-fp', 'next', 'next-fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree')")
+            .execute(&pool).await.unwrap();
+        let fabricated: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_retained_retirement_inspections")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fabricated, 0);
+        sqlx::query("UPDATE close_obligations SET phase = 'completed'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("DELETE FROM close_legacy_fk787_cleanup_provenance")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        sqlx::query("DELETE FROM conversations")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("DELETE FROM close_legacy_fk787_cleanup_provenance")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        sqlx::query("DELETE FROM close_worktree_cleanup_adoptions")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM close_legacy_fk787_cleanup_provenance")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM close_worktree_cleanup_plans")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM close_retirement_inventories")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_121_legacy_provenance_rejects_near_miss_shape_and_invalid_timestamp() {
+        for mutation in [
+            "UPDATE close_retirement_resources SET detail = 'prefix: Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed'",
+            "UPDATE close_retirement_resources SET detail = 'Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed suffix'",
+            "INSERT INTO close_retirement_resource_dispatches SELECT attempt_id, scope, 'aggregate', 'fp', resource_kind, identity_kind, identity_codec, identity_value FROM close_retirement_resource_dispatches",
+            "INSERT INTO close_worktree_cleanup_plans SELECT attempt_id, scope, 'aggregate', 'fp', resource_kind, identity_kind, identity_codec, identity_value FROM close_worktree_cleanup_plans",
+            "INSERT INTO close_retained_retirement_inspections VALUES ('attempt', 'prior', 'prior-fp', 'scope', 'observed', 'observed-fp', 1767225600123456)",
+            "UPDATE close_obligations SET phase = 'needs_repair'",
+            "UPDATE close_retirement_inventories SET sealed = 0 WHERE inspection_generation = 'aggregate'",
+            "UPDATE close_retirement_inventories SET sealed = 0 WHERE inspection_generation = 'prior'",
+            "DELETE FROM close_retirement_resource_dispatches",
+            "DELETE FROM close_retirement_inspections",
+            "UPDATE close_attempt_scopes SET captured_worktree_identity = 'replacement'",
+        ] {
+            let pool = test_pool().await;
+            migration_121_fixture(&pool).await;
+            sqlx::raw_sql(MIGRATION_121_LEGACY_FIXTURE_ROWS)
+                .execute(&pool)
+                .await
+                .unwrap();
+            run_pending_migrations(&pool).await.unwrap();
+            sqlx::query(mutation).execute(&pool).await.unwrap();
+            assert!(
+                sqlx::query(MIGRATION_121_LEGACY_PROVENANCE_INSERT)
+                    .execute(&pool)
+                    .await
+                    .is_err(),
+                "{mutation}"
+            );
+        }
+        let pool = test_pool().await;
+        migration_121_fixture(&pool).await;
+        sqlx::raw_sql(MIGRATION_121_LEGACY_FIXTURE_ROWS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_pending_migrations(&pool).await.unwrap();
+        for timestamp in ["NULL", "-1", "1.5", "'bad'", "X'01'"] {
+            assert!(
+                sqlx::query(sqlx::AssertSqlSafe(
+                    MIGRATION_121_LEGACY_PROVENANCE_INSERT.replace("1767225600123456", timestamp)
+                ))
+                .execute(&pool)
+                .await
+                .is_err(),
+                "{timestamp}"
+            );
+        }
     }
 
     #[allow(clippy::too_many_lines)]
