@@ -1217,7 +1217,10 @@ async fn resolve_web_reference(
                 return Err(AppError::Internal(error.to_string()));
             }
         }
-        if pins.is_empty() && fragment.is_none() && !global {
+        if pins.is_empty()
+            && !global
+            && (fragment.is_none() || fragment.and_then(message_id_fragment).is_none())
+        {
             if let Ok(product) = &product {
                 if product.product_conversation_id.as_str() == id
                     || reference.starts_with("/product-conversations/")
@@ -1227,16 +1230,49 @@ async fn resolve_web_reference(
             }
         }
         if canonical_product.is_none() {
-            let selected = pins.first().unwrap_or(&id);
-            let conv = load_conversation_by_slug_or_id(service, selected).await?;
+            let anchored_owner = if pins.is_empty() && product.is_ok() {
+                if let Some(message_id) = fragment.and_then(message_id_fragment) {
+                    let message = service
+                        .db
+                        .get_message_by_id(&decode_route_value(message_id)?)
+                        .await
+                        .map_err(map_db_not_found)?;
+                    let owner =
+                        load_conversation_by_slug_or_id(service, &message.conversation_id).await?;
+                    if product.as_ref().is_ok_and(|product| {
+                        product.product_conversation_id != owner.product_conversation_id
+                    }) {
+                        return Err(AppError::NotFound(
+                            "message is not a member of this conversation".into(),
+                        ));
+                    }
+                    Some(owner)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let conv = match anchored_owner {
+                Some(owner) => owner,
+                None => {
+                    load_conversation_by_slug_or_id(service, pins.first().unwrap_or(&id)).await?
+                }
+            };
             let coordinator = service.db.product_conversation_kind(&conv.product_conversation_id)
                 .await.map_err(map_db_not_found)? == Some(phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator);
-            if global && !coordinator {
+            if global
+                && (!coordinator
+                    || conv.parent_conversation_id.is_some()
+                    || conv.runtime_role != phoenix_core::work_scope::RuntimeRole::User)
+            {
                 return Err(AppError::BadRequest(
                     "Global route requires a Coordinator conversation".into(),
                 ));
             }
-            let global = coordinator;
+            let global = coordinator
+                && conv.parent_conversation_id.is_none()
+                && conv.runtime_role == phoenix_core::work_scope::RuntimeRole::User;
             if let Some(pin) = pins.first() {
                 if conv.id != *pin {
                     return Err(AppError::BadRequest(
