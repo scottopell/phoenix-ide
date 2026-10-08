@@ -953,9 +953,8 @@ impl CloseObligation {
             Some(
                 CloseCompletionOutcome::Archived | CloseCompletionOutcome::ArchivedCleanupAttention,
             ) => snapshot.is_none(),
-            Some(CloseCompletionOutcome::CloseIncomplete) => false,
             Some(CloseCompletionOutcome::Cancelled) => snapshot.is_some(),
-            None => false,
+            Some(CloseCompletionOutcome::CloseIncomplete) | None => false,
         };
         if (requires_snapshot && snapshot.is_none())
             || (forbids_snapshot && snapshot.is_some())
