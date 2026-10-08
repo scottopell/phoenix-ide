@@ -172,7 +172,8 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             if (!cancelled) setExactMember({ reference, transcript: pinned, open: pinned === snapshot.writable_transcript_row_id });
             return;
           }
-          if (snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
+          if (!location.pathname.startsWith('/product-conversations/') &&
+              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
             setExactMember({ reference, transcript: reference, open: reference === snapshot.writable_transcript_row_id });
             return;
           }

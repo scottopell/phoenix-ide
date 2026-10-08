@@ -1,6 +1,6 @@
 import { Suspense } from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProductConversationAliasRedirect } from './App';
 import { api, ApiResponseError } from './api';
@@ -31,13 +31,18 @@ function Location() {
   return <div data-testid="location">{location.pathname}{location.search}{location.hash}</div>;
 }
 
+function RoutedAlias() {
+  const { slug } = useParams();
+  return <ProductConversationAliasRedirect reference={slug} />;
+}
+
 function renderAlias(reference: string, entry = `/c/${reference}`) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
       <Location />
       <Suspense fallback={null}>
         <Routes>
-          <Route path="/c/:slug" element={<ProductConversationAliasRedirect reference={reference} />} />
+          <Route path="/c/:slug" element={<RoutedAlias />} />
           <Route path="/product-conversations/:id" element={entry.startsWith('/product-conversations/') ? <ProductConversationAliasRedirect reference={reference} /> : null} />
           <Route path="/global/:slug" element={null} />
         </Routes>
@@ -116,6 +121,17 @@ describe('ProductConversationAliasRedirect', () => {
     } as never);
     renderAlias('product-1');
     expect(await screen.findByTestId('product-page')).toHaveTextContent('product-1');
+    expect(embeddedSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(['historical', 'legacy-slug'])('preserves aggregate navigation for long compatibility reference %s', async (reference) => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      latest_transcript_row_id: 'successor', writable_transcript_row_id: 'successor',
+      requested_transcript_row_id: reference === 'historical' ? reference : 'historical',
+    } as never);
+    renderAlias(reference, `/product-conversations/${reference}?viewer=inspect#details`);
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/c/product-1?viewer=inspect#details'));
     expect(embeddedSpy).not.toHaveBeenCalled();
   });
 
