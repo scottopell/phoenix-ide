@@ -10,6 +10,8 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   const { activeScope } = useFocusScope();
   const [sourceDocked, setSourceDocked] = useState(false);
   const docked = touchDocked || sourceDocked;
+  const hidden = Boolean(activeScope && activeScope !== scopeId);
+  const dockActive = touchDocked && !hidden;
   const [discard, setDiscard] = useState(false);
   const [error, setError] = useState('');
   const returning = useRef(false);
@@ -26,7 +28,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (docked || discard || (activeScope && activeScope !== scopeId)) return;
+    if (sourceDocked || discard || hidden) return;
     const focusFromSelection = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.key !== 'Enter' || event.isComposing || event.keyCode === 229
         || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
@@ -39,7 +41,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     };
     document.addEventListener('keydown', focusFromSelection);
     return () => document.removeEventListener('keydown', focusFromSelection);
-  }, [activeScope, bubbleRef, discard, docked, scopeId]);
+  }, [bubbleRef, discard, hidden, scopeId, sourceDocked]);
   const requestClose = () => body ? setDiscard(true) : onClose();
   useKeyboardRouterShortcut({
     id: `${scopeId}:escape`, scopeId, key: 'Escape', layer: 'passive-content',
@@ -58,6 +60,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     let frame = 0;
     let observedComposer: Element | null = null;
     let observedScroller: HTMLElement = scroller;
+    let initialClearancePending = dockActive;
     let observedObstructions = new Set<Element>();
     const initialComposer = document.getElementById('input-area');
     const scrollerAncestors = new Set<Element>();
@@ -82,7 +85,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         observedScroller = liveScroller;
         scroller = liveScroller;
         resize.observe(observedScroller);
-        if (touchDocked) observedScroller.classList.add('reaction-dock-reserved');
+        if (dockActive) observedScroller.classList.add('reaction-dock-reserved');
       }
       const composer = document.getElementById('input-area');
       if (composer !== observedComposer) {
@@ -113,19 +116,19 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       }
       const visibleTop = Math.max(top, transcript.top);
       const visibleBottom = Math.min(bottom, transcript.bottom);
-      const visible = Boolean(rect && rect.height > 0 && rect.bottom > visibleTop && rect.top < visibleBottom);
-      setSourceDocked(!visible);
+      const viewportVisible = Boolean(rect && rect.height > 0 && rect.bottom > visibleTop && rect.top < visibleBottom);
+      let sourceVisible = viewportVisible;
       const pillWidth = Math.min(420, width - 24);
       el.style.width = `${pillWidth}px`;
       const height = el.getBoundingClientRect().height || 46;
-      if (touchDocked) {
+      if (dockActive) {
         const dockHeight = `${height + 24}px`;
         observedScroller.style.setProperty('--reaction-dock-height', dockHeight);
         observedScroller.closest<HTMLElement>('#main-area')?.style.setProperty('--reaction-dock-height', dockHeight);
       }
       let y = Math.min(visibleBottom, bottom) - height - 12;
       let x = transcript.right - pillWidth - 12;
-      if (touchDocked) {
+      if (dockActive) {
         let obstructionTop = composer?.getBoundingClientRect().top ?? bottom;
         const composerOwner = composer?.closest('.conversation-column') ?? layoutOwner;
         const composerChild = childWithin(composer, composerOwner);
@@ -148,21 +151,26 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         }
         observedObstructions = nextObstructions;
         y = Math.min(bottom, obstructionTop) - height - 12;
-        if (visible && rect && rect.bottom > y - 12) {
-          const delta = rect.bottom - (y - 12);
+        const sourceBoundary = y - 12;
+        if (initialClearancePending && viewportVisible && rect && rect.bottom > sourceBoundary) {
+          const delta = rect.bottom - sourceBoundary;
           if (scrollTranscriptBy) scrollTranscriptBy(delta);
           else observedScroller.scrollTop += delta;
+          initialClearancePending = false;
+        } else if (rect && rect.bottom > sourceBoundary) {
+          sourceVisible = false;
         }
-      } else if (visible && rect) {
+      } else if (viewportVisible && rect) {
         x = rect.left;
         y = rect.bottom + 16;
         if (y + height > visibleBottom - 8) y = rect.top - height - 16;
       }
+      setSourceDocked(!sourceVisible);
       el.style.left = `${Math.max(left + 12, Math.min(x, left + width - pillWidth - 12))}px`;
       el.style.top = `${Math.max(top + 12, Math.min(y, bottom - height - 12))}px`;
     };
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(position); };
-    if (touchDocked) scroller.classList.add('reaction-dock-reserved');
+    if (dockActive) scroller.classList.add('reaction-dock-reserved');
     const mutations = new MutationObserver(schedule);
     mutations.observe(layoutOwner, { childList: true, subtree: true });
     const resize = new ResizeObserver(schedule);
@@ -187,7 +195,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       window.visualViewport?.removeEventListener('resize', schedule);
       window.visualViewport?.removeEventListener('scroll', schedule);
     };
-  }, [source, sourceRange, touchDocked, scrollTranscriptBy, bubbleRef]);
+  }, [source, sourceRange, touchDocked, dockActive, scrollTranscriptBy, bubbleRef]);
 
   useEffect(() => {
     if (!sourceDocked) setError('');
@@ -218,7 +226,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   };
 
   return (
-    <div ref={bubbleRef} className="reaction-pill" role="region" aria-label={docked ? 'Docked reaction' : 'React to selected text'} hidden={Boolean(activeScope && activeScope !== scopeId)}>
+    <div ref={bubbleRef} className="reaction-pill" role="region" aria-label={docked ? 'Docked reaction' : 'React to selected text'} hidden={hidden}>
       {discard ? (
         <>
           <span className="reaction-pill-label">Discard reaction?</span>

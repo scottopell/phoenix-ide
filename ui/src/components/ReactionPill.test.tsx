@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReactionPill } from './ReactionPill';
 import { restoreReactionRange } from './reactionRange';
-import { FocusScopeProvider } from '../hooks/useFocusScope';
+import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import type { ReactionSource } from '../conversation/InlineReactionStore';
 
 const source: ReactionSource = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'second', textAnchor: { start: { fragmentId: 'text-0', offset: 6 }, end: { fragmentId: 'text-0', offset: 12 } } };
@@ -22,6 +22,11 @@ function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = f
     <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
 }
+function ActivateOtherScope() {
+  const { pushScope } = useFocusScopeCommands();
+  return <button type="button" onClick={() => pushScope('viewer')}>Open viewer</button>;
+}
+
 
 beforeEach(() => {
   offscreen = false;
@@ -55,6 +60,28 @@ describe('reaction pill', () => {
     expect(add).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: 'Enter', metaKey: true });
     expect(add).toHaveBeenCalledOnce();
+  });
+
+  it('allows hardware Enter to focus a touch-docked editor', () => {
+    render(<Fixture touchDocked body="" />);
+    const input = screen.getByRole('textbox');
+    expect(input).not.toHaveFocus();
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(input).toHaveFocus();
+  });
+
+  it('releases transcript reservation while another focus scope hides the dock', async () => {
+    render(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
+      <ActivateOtherScope />
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="Retained" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    const scroller = document.getElementById('messages')!;
+    expect(scroller).toHaveClass('reaction-dock-reserved');
+    fireEvent.click(screen.getByRole('button', { name: 'Open viewer' }));
+    await waitFor(() => expect(document.querySelector('.reaction-pill')).not.toBeVisible());
+    expect(scroller).not.toHaveClass('reaction-dock-reserved');
+    expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('');
   });
 
   it('leaves Enter to native disclosure controls and custom focus stops', () => {
@@ -313,7 +340,8 @@ describe('reaction pill', () => {
     await waitFor(() => expect(scrollTranscriptBy).toHaveBeenCalledWith(98));
     rangeBottom = 620;
     act(() => listeners.get('scroll')?.(new Event('scroll')));
-    await waitFor(() => expect(scrollTranscriptBy).toHaveBeenLastCalledWith(118));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
+    expect(scrollTranscriptBy).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('textbox')).not.toHaveFocus();
   });
 
