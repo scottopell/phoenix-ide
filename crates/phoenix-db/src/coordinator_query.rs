@@ -135,6 +135,8 @@ pub fn execute_coordinator_query(
     if sql.len() > MAX_SQL_BYTES {
         return Err(CoordinatorQueryError::BudgetExceeded);
     }
+    let sqlite_length_limit =
+        c_int::try_from(MAX_BYTES).map_err(|_| CoordinatorQueryError::BudgetExceeded)?;
     let path = CString::new(path).map_err(|_| CoordinatorQueryError::InvalidPath)?;
     let sql = CString::new(sql).map_err(|_| CoordinatorQueryError::InvalidQuery)?;
     let started = Instant::now();
@@ -156,11 +158,7 @@ pub fn execute_coordinator_query(
     unsafe {
         ffi::sqlite3_extended_result_codes(connection.0, 1);
         ffi::sqlite3_limit(connection.0, ffi::SQLITE_LIMIT_COLUMN, MAX_COLUMNS);
-        ffi::sqlite3_limit(
-            connection.0,
-            ffi::SQLITE_LIMIT_LENGTH,
-            c_int::try_from(MAX_BYTES).expect("byte limit fits SQLite's integer range"),
-        );
+        ffi::sqlite3_limit(connection.0, ffi::SQLITE_LIMIT_LENGTH, sqlite_length_limit);
         ffi::sqlite3_set_authorizer(connection.0, Some(authorize), (&raw mut *authorizer).cast());
         ffi::sqlite3_progress_handler(
             connection.0,

@@ -4000,6 +4000,36 @@ mod tests {
     }
 
     #[test]
+    fn responses_provider_preserves_bash_label_schema_without_prevalidation_cap() {
+        let mut request = request_with(&[("run a command", MessageRole::User)]);
+        request.tool_availability =
+            phoenix_core::domain::tool_availability::ToolAvailability::all(vec![
+                phoenix_core::domain::llm_types::ToolDefinition {
+                    name: "bash".to_string(),
+                    description: "shell".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "Prefer 64 characters or fewer"
+                            }
+                        }
+                    }),
+                    defer_loading: false,
+                },
+            ]);
+
+        let wire = serde_json::to_value(translate_to_responses_request(
+            "gpt-test", &request, false, true,
+        ))
+        .unwrap();
+        let label = &wire["tools"][0]["parameters"]["properties"]["label"];
+        assert!(label.get("maxLength").is_none());
+        assert_eq!(label["description"], "Prefer 64 characters or fewer");
+    }
+
+    #[test]
     fn wrapped_websocket_usage_limit_preserves_quota_headers() {
         let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
             "type": "error",

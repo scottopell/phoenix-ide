@@ -178,8 +178,8 @@ phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
 # explore-mode test wrapper is visible to this crate's tests. Dev-only.
 phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
-# Re-declared with test-support so runtime tests that spawn real tmux servers
-# use the same runner-death containment owner as phoenix-tools' own tests.
+# Re-declared with test-support so runtime tests can drive the in-memory
+# tmux backend (`phoenix_tools::tmux::fake_backend`).
 phoenix-tools = { path = "../phoenix-tools", features = ["test-support"] }
 proptest = "1"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the

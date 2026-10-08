@@ -99,7 +99,9 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [083](083_federation-instance-identity-and-known-credential-query-exclusions.md) | Federation establishes stable instance identity and excludes known credentials from agent SQL | Accepted | REQ-GR-011A; federation instance identity |
 | [084](084_tool-policy-is-independent-of-provider-history.md) | Tool policy is independent of provider history | Accepted | REQ-LLM-004i, REQ-LLM-005; provider continuation |
 | [085](085_codex-continuation-requires-an-identified-account.md) | Codex continuation requires an identified account | Accepted | REQ-LLM-004h, REQ-LLM-004i; account-bound route admission |
-| [086](086_federation-pins-imported-private-ca-trust-per-peer.md) | Federation pins imported private-CA trust per peer | Accepted | REQ-RQD-003, REQ-RQD-004; federation enrollment transfer and caller-side peer persistence |
+| [086](086_mcp-credential-removal-has-durable-intent.md) | MCP credential removal has durable intent | Accepted | REQ-MCP-012; credential-removal recovery |
+| [087](087_tmux-effects-go-through-a-backend-seam.md) | Tmux effects go through a backend seam, and tests use an in-memory fake | Accepted | tmux registry and `tmux_run`; Close retirement of tmux servers |
+| [088](088_federation-pins-imported-private-ca-trust-per-peer.md) | Federation pins imported private-CA trust per peer | Accepted | REQ-RQD-003, REQ-RQD-004; federation enrollment transfer and caller-side peer persistence |
 
 ## For agents: which decisions bind your task
 
@@ -113,8 +115,9 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
-| Implementing federation peer TLS trust or enrollment transfer | 086, then 083 and 034 |
+| Implementing federation peer TLS trust or enrollment transfer | 088, then 083 and 034 |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
+| Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |

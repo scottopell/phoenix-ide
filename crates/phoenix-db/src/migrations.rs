@@ -603,8 +603,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 118,
+        name: "persist_mcp_token_removals",
+        sql: "CREATE TABLE mcp_oauth_removals (server_name TEXT PRIMARY KEY NOT NULL);",
+    },
+    Migration {
+        version: 119,
         name: "persist_federation_peer_tls_trust",
-        sql: MIGRATION_118,
+        sql: MIGRATION_119,
     },
 ];
 
@@ -613,7 +618,7 @@ const MIGRATION_117: &str = concat!(
     include_str!("responses_replay.sql")
 );
 
-const MIGRATION_118: &str = r#"
+const MIGRATION_119: &str = r"
 ALTER TABLE federation_peer_connections
 ADD COLUMN tls_ca_certificate_pem TEXT
 CHECK (
@@ -625,7 +630,7 @@ CHECK (
         AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
     )
 );
-"#;
+";
 
 const MIGRATION_113: &str = "";
 
@@ -11905,7 +11910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_118_preserves_existing_peers_as_platform_root_trust() {
+    async fn migration_119_preserves_existing_peers_as_platform_root_trust() {
         let pool = test_pool().await;
         sqlx::raw_sql(MIGRATION_116).execute(&pool).await.unwrap();
         let peer = phoenix_core::domain::instance_identity::InstanceId::new();
@@ -11920,7 +11925,7 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(MIGRATION_118).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_119).execute(&pool).await.unwrap();
         let trust: Option<String> = sqlx::query_scalar(
             "SELECT tls_ca_certificate_pem FROM federation_peer_connections
              WHERE peer_instance_id = ?1",
@@ -11937,9 +11942,10 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(7).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
             vec![
-                (118, "persist_federation_peer_tls_trust"),
+                (119, "persist_federation_peer_tls_trust"),
+                (118, "persist_mcp_token_removals"),
                 (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),

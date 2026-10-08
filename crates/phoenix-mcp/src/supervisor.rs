@@ -21,7 +21,28 @@ pub(crate) enum SupervisorState {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum RecoveryTarget {
+    Configured,
+    Remove,
+    Reconfigure(McpServerConfig),
+}
+
+#[derive(Clone)]
+pub(crate) struct OAuthRetryPlan {
+    pub(crate) retry_cause: OAuthRetryCause,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) www_authenticate: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OAuthRetryCause {
+    Authorization,
+    Cleanup,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct Snapshot {
+    pub(crate) recovery_target: RecoveryTarget,
     pub(crate) epoch: u64,
     pub(crate) state: SupervisorState,
     pub(crate) config: McpServerConfig,
@@ -90,6 +111,7 @@ impl SupervisorHandle {
 
     fn spawn(config: McpServerConfig, state: SupervisorState) -> Self {
         let initial = Snapshot {
+            recovery_target: RecoveryTarget::Configured,
             epoch: 0,
             state: state.clone(),
             config,
@@ -173,11 +195,13 @@ impl SupervisorHandle {
         arguments: Value,
         cancel: CancellationToken,
     ) -> Result<CallOutcome, String> {
-        self.call_with_schema(tool, arguments, cancel, None).await
+        self.call_for_config(self.snapshot().config, tool, arguments, cancel, None)
+            .await
     }
 
-    pub(crate) async fn call_with_schema(
+    pub(crate) async fn call_for_config(
         &self,
+        config: McpServerConfig,
         tool: String,
         arguments: Value,
         cancel: CancellationToken,
@@ -189,6 +213,7 @@ impl SupervisorHandle {
             .ok_or_else(|| "MCP tool call timeout exceeds platform deadline range".to_string())?;
         let call_cancel = cancel.child_token();
         let command = Command::Call {
+            config,
             expected_schema,
             tool,
             arguments,
@@ -224,11 +249,20 @@ impl SupervisorHandle {
 
     /// Attempt to claim recovery leadership for `observed_epoch`.
     pub(crate) async fn claim_recovery(&self, observed_epoch: u64) -> RecoveryClaim {
+        self.claim(observed_epoch, RecoveryKind::Transport).await
+    }
+
+    pub(crate) async fn claim_oauth_recovery(&self, observed_epoch: u64) -> RecoveryClaim {
+        self.claim(observed_epoch, RecoveryKind::OAuth).await
+    }
+
+    async fn claim(&self, observed_epoch: u64, kind: RecoveryKind) -> RecoveryClaim {
         let (reply, receive) = oneshot::channel();
         if self
             .mailbox
             .send(Command::Claim {
                 observed_epoch,
+                kind,
                 reply,
             })
             .await
@@ -239,6 +273,63 @@ impl SupervisorHandle {
         receive
             .await
             .unwrap_or_else(|_| RecoveryClaim::Unavailable(stopped()))
+    }
+
+    pub(crate) async fn finish_oauth_cleanup(
+        &self,
+        epoch: u64,
+        access_token: String,
+    ) -> Result<bool, String> {
+        self.oauth_cleanup(epoch, access_token, OAuthCleanupNext::Recovering)
+            .await
+            .map(|epoch| epoch.is_some())
+    }
+
+    pub(crate) async fn restart_after_oauth(
+        &self,
+        epoch: u64,
+        access_token: String,
+        config: McpServerConfig,
+    ) -> Result<Option<u64>, String> {
+        self.oauth_cleanup(epoch, access_token, OAuthCleanupNext::Reconnect(config))
+            .await
+    }
+
+    async fn oauth_cleanup(
+        &self,
+        epoch: u64,
+        access_token: String,
+        next: OAuthCleanupNext,
+    ) -> Result<Option<u64>, String> {
+        let (reply, receive) = oneshot::channel();
+        self.mailbox
+            .send(Command::FinishOAuthCleanup {
+                epoch,
+                access_token,
+                next,
+                reply,
+            })
+            .await
+            .map_err(|_| stopped())?;
+        receive.await.map_err(|_| stopped())?
+    }
+
+    pub(crate) async fn await_oauth(&self, epoch: u64, url: String, error: String) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::AwaitOAuth {
+                epoch,
+                url,
+                error,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receive.await.unwrap_or(false)
     }
 
     /// Publish a freshly connected server for `epoch`.  Returns false
@@ -268,6 +359,179 @@ impl SupervisorHandle {
         self.fail_with_teardown_retry(epoch, error, None).await
     }
 
+    pub(crate) async fn retain_quiescence_failure(
+        &self,
+        epoch: u64,
+        error: String,
+        server: McpServer,
+        oauth_plan: Option<OAuthRetryPlan>,
+    ) {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::RetainQuiescenceFailure {
+                epoch,
+                error,
+                server,
+                oauth_plan,
+                reply,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = receive.await;
+        }
+    }
+
+    pub(crate) async fn retain_oauth_handshake_failure(
+        &self,
+        epoch: u64,
+        error: String,
+        server: McpServer,
+        plan: OAuthRetryPlan,
+    ) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if let Err(error) = self
+            .mailbox
+            .send(Command::RetainOAuthHandshakeFailure {
+                epoch,
+                error,
+                server,
+                plan,
+                reply,
+            })
+            .await
+        {
+            if let Command::RetainOAuthHandshakeFailure { server, .. } = error.0 {
+                if let Err(error) = server.terminate().await {
+                    tracing::warn!(%error, "MCP OAuth handshake cleanup failed after supervisor stopped");
+                }
+            }
+            return false;
+        }
+        receive.await.unwrap_or(false)
+    }
+
+    pub(crate) async fn oauth_retry_plan(&self, epoch: u64) -> Option<OAuthRetryPlan> {
+        let (reply, receive) = oneshot::channel();
+        self.mailbox
+            .send(Command::OAuthRetryPlan { epoch, reply })
+            .await
+            .ok()?;
+        receive.await.ok().flatten()
+    }
+
+    pub(crate) async fn retain_oauth_plan(
+        &self,
+        epoch: u64,
+        config: &McpServerConfig,
+        plan: OAuthRetryPlan,
+    ) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::RetainOAuthPlan {
+                epoch,
+                config: config.clone(),
+                plan,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receive.await.unwrap_or(false)
+    }
+
+    pub(crate) async fn deny_oauth_cleanup(&self, epoch: u64, error: String, plan: OAuthRetryPlan) {
+        self.deny_oauth_with_cause(epoch, error, plan, OAuthFailureCause::Cleanup)
+            .await;
+    }
+
+    pub(crate) async fn deny_oauth(&self, epoch: u64, error: String, plan: OAuthRetryPlan) {
+        self.deny_oauth_with_cause(epoch, error, plan, OAuthFailureCause::Authorization)
+            .await;
+    }
+
+    async fn deny_oauth_with_cause(
+        &self,
+        epoch: u64,
+        error: String,
+        plan: OAuthRetryPlan,
+        cause: OAuthFailureCause,
+    ) {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::DenyOAuth {
+                epoch,
+                error,
+                plan,
+                cause,
+                reply,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = receive.await;
+        }
+    }
+
+    pub(crate) async fn retry_oauth(&self) -> Option<(RecoveryPermit, OAuthRetryPlan)> {
+        let (reply, receive) = oneshot::channel();
+        self.mailbox
+            .send(Command::RetryOAuth { reply })
+            .await
+            .ok()?;
+        receive.await.ok().flatten()
+    }
+
+    pub(crate) async fn prepare_removal(&self) -> Result<u64, String> {
+        let (reply, receive) = oneshot::channel();
+        self.mailbox
+            .send(Command::PrepareRemoval { reply })
+            .await
+            .map_err(|_| "MCP supervisor stopped".to_owned())?;
+        receive
+            .await
+            .map_err(|_| "MCP supervisor stopped".to_owned())?
+    }
+
+    pub(crate) async fn defer_oauth_removal(&self) -> bool {
+        self.defer_oauth_transition(RecoveryTarget::Remove).await
+    }
+
+    pub(crate) async fn defer_oauth_reconfigure(&self, config: McpServerConfig) -> bool {
+        self.defer_oauth_transition(RecoveryTarget::Reconfigure(config))
+            .await
+    }
+
+    async fn defer_oauth_transition(&self, target: RecoveryTarget) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::DeferOAuthTransition { target, reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receive.await.unwrap_or(false)
+    }
+
+    pub(crate) async fn retain_configured(&self) {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::RetainConfigured { reply })
+            .await
+            .is_ok()
+        {
+            let _ = receive.await;
+        }
+    }
+
     pub(crate) async fn fail_with_teardown_retry(
         &self,
         epoch: u64,
@@ -291,6 +555,7 @@ impl SupervisorHandle {
         receive.await.unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub(crate) async fn unauthorized(&self, epoch: u64, url: String, error: String) -> bool {
         self.unauthorized_with_teardown_retry(epoch, url, error, None)
             .await
@@ -357,6 +622,17 @@ pub(crate) enum RecoveryClaim {
     Unavailable(String),
 }
 
+enum OAuthCleanupNext {
+    Recovering,
+    Reconnect(McpServerConfig),
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryKind {
+    Transport,
+    OAuth,
+}
+
 struct QueuedCall {
     expected_schema: Option<Value>,
     epoch: u64,
@@ -369,7 +645,49 @@ struct QueuedCall {
     cancellation_watch: tokio::task::JoinHandle<()>,
 }
 
+enum OAuthFailureCause {
+    Authorization,
+    Cleanup,
+}
+
 enum Command {
+    PrepareRemoval {
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    OAuthRetryPlan {
+        epoch: u64,
+        reply: oneshot::Sender<Option<OAuthRetryPlan>>,
+    },
+    RetainOAuthPlan {
+        epoch: u64,
+        config: McpServerConfig,
+        plan: OAuthRetryPlan,
+        reply: oneshot::Sender<bool>,
+    },
+    RetainOAuthHandshakeFailure {
+        epoch: u64,
+        error: String,
+        server: McpServer,
+        plan: OAuthRetryPlan,
+        reply: oneshot::Sender<bool>,
+    },
+    DeferOAuthTransition {
+        target: RecoveryTarget,
+        reply: oneshot::Sender<bool>,
+    },
+    RetainConfigured {
+        reply: oneshot::Sender<()>,
+    },
+    DenyOAuth {
+        epoch: u64,
+        error: String,
+        plan: OAuthRetryPlan,
+        cause: OAuthFailureCause,
+        reply: oneshot::Sender<()>,
+    },
+    RetryOAuth {
+        reply: oneshot::Sender<Option<(RecoveryPermit, OAuthRetryPlan)>>,
+    },
     Status {
         reply: oneshot::Sender<Snapshot>,
     },
@@ -378,6 +696,7 @@ enum Command {
         reply: oneshot::Sender<Result<u64, String>>,
     },
     Call {
+        config: McpServerConfig,
         expected_schema: Option<Value>,
         tool: String,
         arguments: Value,
@@ -405,7 +724,20 @@ enum Command {
     },
     Claim {
         observed_epoch: u64,
+        kind: RecoveryKind,
         reply: oneshot::Sender<RecoveryClaim>,
+    },
+    FinishOAuthCleanup {
+        epoch: u64,
+        access_token: String,
+        next: OAuthCleanupNext,
+        reply: oneshot::Sender<Result<Option<u64>, String>>,
+    },
+    AwaitOAuth {
+        epoch: u64,
+        url: String,
+        error: String,
+        reply: oneshot::Sender<bool>,
     },
     Publish {
         epoch: u64,
@@ -417,6 +749,13 @@ enum Command {
         error: String,
         teardown_retry: Option<McpServer>,
         reply: oneshot::Sender<bool>,
+    },
+    RetainQuiescenceFailure {
+        epoch: u64,
+        error: String,
+        server: McpServer,
+        oauth_plan: Option<OAuthRetryPlan>,
+        reply: oneshot::Sender<()>,
     },
     Unauthorized {
         epoch: u64,
@@ -433,6 +772,25 @@ enum Command {
     },
 }
 
+enum RetainedTransport {
+    TransportRecovery(Arc<McpServer>),
+    OAuthRecovery {
+        server: Arc<McpServer>,
+        retry_plan: Option<OAuthRetryPlan>,
+    },
+    Other(Arc<McpServer>),
+}
+
+impl RetainedTransport {
+    fn server(&self) -> &McpServer {
+        match self {
+            Self::OAuthRecovery { server, .. }
+            | Self::TransportRecovery(server)
+            | Self::Other(server) => server,
+        }
+    }
+}
+
 struct Actor {
     mailbox: mpsc::WeakSender<Command>,
     commands: mpsc::Receiver<Command>,
@@ -445,7 +803,7 @@ struct Actor {
     stdio_active: bool,
     stdio_queue: VecDeque<QueuedCall>,
     active_calls: HashMap<u64, CancellationToken>,
-    teardown_retry: Vec<Arc<McpServer>>,
+    teardown_retry: Vec<RetainedTransport>,
 }
 
 impl Actor {
@@ -467,10 +825,205 @@ impl Actor {
     #[allow(clippy::too_many_lines)]
     async fn handle(&mut self, command: Command) {
         match command {
+            Command::DeferOAuthTransition { target, reply } => {
+                let eligible = match target {
+                    RecoveryTarget::Remove => {
+                        matches!(self.state, SupervisorState::Recovering)
+                            && self.snapshot.pending_oauth_url.is_none()
+                    }
+                    RecoveryTarget::Reconfigure(_) => {
+                        matches!(self.state, SupervisorState::Recovering)
+                            || (matches!(self.state, SupervisorState::Failed)
+                                && self.teardown_retry.iter().any(|retained| {
+                                    matches!(
+                                        retained,
+                                        RetainedTransport::OAuthRecovery {
+                                            retry_plan: Some(_),
+                                            ..
+                                        }
+                                    )
+                                }))
+                    }
+                    RecoveryTarget::Configured => false,
+                };
+                let deferred = eligible
+                    && self.teardown_retry.iter().any(|retained| {
+                        matches!(retained, RetainedTransport::OAuthRecovery { .. })
+                    });
+                if deferred {
+                    self.snapshot.recovery_target = target;
+                    self.publish_snapshot(
+                        self.snapshot.last_error.clone(),
+                        self.snapshot.pending_oauth_url.clone(),
+                    );
+                }
+                let _ = reply.send(deferred);
+            }
+            Command::RetainConfigured { reply } => {
+                self.snapshot.recovery_target = RecoveryTarget::Configured;
+                self.publish_snapshot(
+                    self.snapshot.last_error.clone(),
+                    self.snapshot.pending_oauth_url.clone(),
+                );
+                let _ = reply.send(());
+            }
+            Command::RetainOAuthHandshakeFailure {
+                epoch,
+                error,
+                server,
+                plan,
+                reply,
+            } => {
+                let current = epoch == self.epoch;
+                if current {
+                    self.recovery_from = None;
+                    if let SupervisorState::Ready(server) =
+                        std::mem::replace(&mut self.state, SupervisorState::Recovering)
+                    {
+                        self.teardown_retry.push(RetainedTransport::Other(server));
+                    }
+                    self.teardown_retry.push(RetainedTransport::OAuthRecovery {
+                        server: Arc::new(server),
+                        retry_plan: Some(plan),
+                    });
+                    self.publish_snapshot(Some(error), None);
+                } else {
+                    self.retain_unresolved_stale_teardown(Arc::new(server), error)
+                        .await;
+                }
+                let _ = reply.send(current);
+            }
+            Command::OAuthRetryPlan { epoch, reply } => {
+                let plan = if epoch == self.epoch {
+                    self.teardown_retry
+                        .iter()
+                        .find_map(|retained| match retained {
+                            RetainedTransport::OAuthRecovery { retry_plan, .. } => {
+                                retry_plan.clone()
+                            }
+                            RetainedTransport::TransportRecovery(_)
+                            | RetainedTransport::Other(_) => None,
+                        })
+                } else {
+                    None
+                };
+                let _ = reply.send(plan);
+            }
+            Command::RetainOAuthPlan {
+                epoch,
+                config,
+                plan,
+                reply,
+            } => {
+                let mut retained = false;
+                if epoch == self.epoch
+                    && config == self.snapshot.config
+                    && matches!(self.state, SupervisorState::Recovering)
+                {
+                    for transport in &mut self.teardown_retry {
+                        if let RetainedTransport::OAuthRecovery { retry_plan, .. } = transport {
+                            let mut plan = plan.clone();
+                            if let Some(previous) = retry_plan.as_ref() {
+                                if plan.www_authenticate.is_none() {
+                                    plan.retry_cause = previous.retry_cause;
+                                }
+                                crate::extend_unique(
+                                    &mut plan.scopes,
+                                    previous.scopes.iter().map(String::as_str),
+                                );
+                                plan.www_authenticate = crate::merge_oauth_challenges(
+                                    [
+                                        previous.www_authenticate.as_deref(),
+                                        plan.www_authenticate.as_deref(),
+                                    ]
+                                    .into_iter()
+                                    .flatten(),
+                                );
+                            }
+                            *retry_plan = Some(plan);
+                            retained = true;
+                        }
+                    }
+                }
+                let _ = reply.send(retained);
+            }
+            Command::DenyOAuth {
+                epoch,
+                error,
+                plan,
+                cause,
+                reply,
+            } => {
+                if epoch == self.epoch {
+                    let mut retained_oauth = false;
+                    for retained in &mut self.teardown_retry {
+                        if let RetainedTransport::OAuthRecovery { retry_plan, .. } = retained {
+                            let mut plan = plan.clone();
+                            if matches!(cause, OAuthFailureCause::Cleanup) {
+                                if let Some(retained) = retry_plan.as_ref() {
+                                    plan.retry_cause = retained.retry_cause;
+                                    crate::extend_unique(
+                                        &mut plan.scopes,
+                                        retained.scopes.iter().map(String::as_str),
+                                    );
+                                    plan.www_authenticate = crate::merge_oauth_challenges(
+                                        [
+                                            plan.www_authenticate.as_deref(),
+                                            retained.www_authenticate.as_deref(),
+                                        ]
+                                        .into_iter()
+                                        .flatten(),
+                                    );
+                                }
+                            }
+                            *retry_plan = Some(plan);
+                            retained_oauth = true;
+                        }
+                    }
+                    let error = if retained_oauth {
+                        error
+                    } else {
+                        compose_teardown_error(error, self.stop_server().await)
+                    };
+                    self.state = SupervisorState::Failed;
+                    self.recovery_from = None;
+                    self.publish_snapshot(Some(error), None);
+                }
+                let _ = reply.send(());
+            }
+            Command::RetryOAuth { reply } => {
+                let scopes = if matches!(self.state, SupervisorState::Failed) {
+                    self.teardown_retry
+                        .iter_mut()
+                        .find_map(|retained| match retained {
+                            RetainedTransport::OAuthRecovery { retry_plan, .. } => {
+                                retry_plan.take()
+                            }
+                            RetainedTransport::TransportRecovery(_)
+                            | RetainedTransport::Other(_) => None,
+                        })
+                } else {
+                    None
+                };
+                let permit = scopes.map(|scopes| {
+                    self.epoch = self.epoch.wrapping_add(1);
+                    self.state = SupervisorState::Recovering;
+                    self.publish_snapshot(None, None);
+                    (
+                        RecoveryPermit {
+                            epoch: self.epoch,
+                            config: self.snapshot.config.clone(),
+                        },
+                        scopes,
+                    )
+                });
+                let _ = reply.send(permit);
+            }
             Command::Status { reply } => {
                 let _ = reply.send(self.snapshot.clone());
             }
             Command::Reconfigure { config, reply } => {
+                self.snapshot.recovery_target = RecoveryTarget::Configured;
                 for cancellation in self.active_calls.values() {
                     cancellation.cancel();
                 }
@@ -492,12 +1045,19 @@ impl Actor {
                 }
             }
             Command::Call {
+                config,
                 expected_schema,
                 tool,
                 arguments,
                 cancel,
                 reply,
             } => {
+                if self.snapshot.config != config {
+                    let _ = reply.send(Err(
+                        "MCP tool invocation was superseded by a configuration change".to_owned(),
+                    ));
+                    return;
+                }
                 let SupervisorState::Ready(server) = &self.state else {
                     let _ = reply.send(Err(self.not_ready_message()));
                     return;
@@ -652,9 +1212,49 @@ impl Actor {
             }
             Command::Claim {
                 observed_epoch,
+                kind,
                 reply,
             } => {
-                if matches!(self.state, SupervisorState::Recovering)
+                if matches!(kind, RecoveryKind::OAuth)
+                    && matches!(self.state, SupervisorState::Failed)
+                    && self.recovery_from == Some(observed_epoch)
+                    && self
+                        .teardown_retry
+                        .iter()
+                        .any(|retained| matches!(retained, RetainedTransport::TransportRecovery(_)))
+                {
+                    for cancellation in self.active_calls.values() {
+                        cancellation.cancel();
+                    }
+                    self.active_calls.clear();
+                    for retained in &mut self.teardown_retry {
+                        if let RetainedTransport::TransportRecovery(server) = retained {
+                            *retained = RetainedTransport::OAuthRecovery {
+                                server: Arc::clone(server),
+                                retry_plan: None,
+                            };
+                        }
+                    }
+                    self.epoch = self.epoch.wrapping_add(1);
+                    self.state = SupervisorState::Recovering;
+                    for retained in &self.teardown_retry {
+                        if matches!(retained, RetainedTransport::OAuthRecovery { .. }) {
+                            if let Err(error) = retained.server().transport.quiesce().await {
+                                let error = error.to_string();
+                                self.state = SupervisorState::Failed;
+                                self.recovery_from = None;
+                                self.publish_snapshot(Some(error.clone()), None);
+                                let _ = reply.send(RecoveryClaim::Unavailable(error));
+                                return;
+                            }
+                        }
+                    }
+                    self.publish_snapshot(None, None);
+                    let _ = reply.send(RecoveryClaim::Leader(RecoveryPermit {
+                        epoch: self.epoch,
+                        config: self.snapshot.config.clone(),
+                    }));
+                } else if matches!(self.state, SupervisorState::Recovering)
                     && self.recovery_from == Some(observed_epoch)
                 {
                     let _ = reply.send(RecoveryClaim::Follow(self.snapshots.subscribe()));
@@ -663,7 +1263,39 @@ impl Actor {
                 } else if matches!(self.state, SupervisorState::Ready(_)) {
                     self.recovery_from = Some(observed_epoch);
                     self.epoch = self.epoch.wrapping_add(1);
-                    match self.stop_server().await {
+                    let teardown = match kind {
+                        RecoveryKind::Transport => {
+                            if let SupervisorState::Ready(server) =
+                                std::mem::replace(&mut self.state, SupervisorState::Recovering)
+                            {
+                                self.teardown_retry
+                                    .push(RetainedTransport::TransportRecovery(server));
+                            }
+                            self.stop_server().await
+                        }
+                        RecoveryKind::OAuth => {
+                            for cancellation in self.active_calls.values() {
+                                cancellation.cancel();
+                            }
+                            self.active_calls.clear();
+                            if let SupervisorState::Ready(server) =
+                                std::mem::replace(&mut self.state, SupervisorState::Recovering)
+                            {
+                                self.teardown_retry.push(RetainedTransport::OAuthRecovery {
+                                    server: Arc::clone(&server),
+                                    retry_plan: None,
+                                });
+                                server
+                                    .transport
+                                    .quiesce()
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    };
+                    match teardown {
                         Ok(()) => {
                             self.state = SupervisorState::Recovering;
                             self.publish_snapshot(None, None);
@@ -673,7 +1305,10 @@ impl Actor {
                             }));
                         }
                         Err(error) => {
-                            self.recovery_from = None;
+                            self.state = SupervisorState::Failed;
+                            if matches!(kind, RecoveryKind::OAuth) {
+                                self.recovery_from = None;
+                            }
                             self.publish_snapshot(Some(error.clone()), None);
                             let _ = reply.send(RecoveryClaim::Unavailable(error));
                         }
@@ -681,6 +1316,68 @@ impl Actor {
                 } else {
                     let _ = reply.send(RecoveryClaim::Unavailable(self.not_ready_message()));
                 }
+            }
+            Command::FinishOAuthCleanup {
+                epoch,
+                access_token,
+                next,
+                reply,
+            } => {
+                if epoch != self.epoch || !matches!(self.state, SupervisorState::Recovering) {
+                    let _ = reply.send(Ok(None));
+                    return;
+                }
+                for retained in &mut self.teardown_retry {
+                    if let RetainedTransport::OAuthRecovery { server, retry_plan } = retained {
+                        *server.oauth_bearer.write().unwrap() = Some(access_token.clone());
+                        let plan = retry_plan.get_or_insert_with(|| OAuthRetryPlan {
+                            retry_cause: OAuthRetryCause::Cleanup,
+                            scopes: crate::configured_oauth_scopes(&self.snapshot.config).to_vec(),
+                            www_authenticate: None,
+                        });
+                        plan.retry_cause = OAuthRetryCause::Cleanup;
+                    }
+                }
+                match self.stop_server().await {
+                    Ok(()) => {
+                        match next {
+                            OAuthCleanupNext::Recovering => {
+                                self.state = SupervisorState::Recovering;
+                            }
+                            OAuthCleanupNext::Reconnect(config) => {
+                                for cancellation in self.active_calls.values() {
+                                    cancellation.cancel();
+                                }
+                                self.active_calls.clear();
+                                self.epoch = self.epoch.wrapping_add(1);
+                                self.recovery_from = None;
+                                self.snapshot.config = config;
+                                self.snapshot.recovery_target = RecoveryTarget::Configured;
+                                self.state = SupervisorState::Connecting;
+                            }
+                        }
+                        self.publish_snapshot(None, None);
+                        let _ = reply.send(Ok(Some(self.epoch)));
+                    }
+                    Err(error) => {
+                        self.recovery_from = None;
+                        self.publish_snapshot(Some(error.clone()), None);
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Command::AwaitOAuth {
+                epoch,
+                url,
+                error,
+                reply,
+            } => {
+                let current = epoch == self.epoch;
+                if current {
+                    self.state = SupervisorState::Recovering;
+                    self.publish_snapshot(Some(error), Some(url));
+                }
+                let _ = reply.send(current);
             }
             Command::Publish {
                 epoch,
@@ -712,6 +1409,38 @@ impl Actor {
                     let _ = reply.send(false);
                 }
             }
+            Command::RetainQuiescenceFailure {
+                epoch,
+                error,
+                server,
+                oauth_plan,
+                reply,
+            } => {
+                let current = epoch == self.epoch;
+                for cancellation in self.active_calls.values() {
+                    cancellation.cancel();
+                }
+                self.active_calls.clear();
+                if let SupervisorState::Ready(server) =
+                    std::mem::replace(&mut self.state, SupervisorState::Failed)
+                {
+                    self.teardown_retry.push(RetainedTransport::Other(server));
+                }
+                let server = Arc::new(server);
+                self.teardown_retry.push(match oauth_plan {
+                    Some(plan) if current => RetainedTransport::OAuthRecovery {
+                        server,
+                        retry_plan: Some(plan),
+                    },
+                    Some(_) | None => RetainedTransport::Other(server),
+                });
+                if !current {
+                    self.epoch = self.epoch.wrapping_add(1);
+                }
+                self.recovery_from = None;
+                self.publish_snapshot(Some(error), None);
+                let _ = reply.send(());
+            }
             Command::Fail {
                 epoch,
                 error,
@@ -722,7 +1451,8 @@ impl Actor {
                 if current {
                     self.recovery_from = None;
                     if let Some(server) = teardown_retry {
-                        self.teardown_retry.push(Arc::new(server));
+                        self.teardown_retry
+                            .push(RetainedTransport::Other(Arc::new(server)));
                     }
                     let error = compose_teardown_error(error, self.stop_server().await);
                     self.state = SupervisorState::Failed;
@@ -744,7 +1474,8 @@ impl Actor {
                 if current {
                     self.recovery_from = None;
                     if let Some(server) = teardown_retry {
-                        self.teardown_retry.push(Arc::new(server));
+                        self.teardown_retry
+                            .push(RetainedTransport::Other(Arc::new(server)));
                     }
                     let error = compose_teardown_error(error, self.stop_server().await);
                     if self.teardown_retry.is_empty() {
@@ -758,6 +1489,21 @@ impl Actor {
                         .await;
                 }
                 let _ = reply.send(current);
+            }
+            Command::PrepareRemoval { reply } => {
+                for cancellation in self.active_calls.values() {
+                    cancellation.cancel();
+                }
+                self.active_calls.clear();
+                self.epoch = self.epoch.wrapping_add(1);
+                self.snapshot.recovery_target = RecoveryTarget::Remove;
+                let result = self.stop_server().await;
+                self.recovery_from = None;
+                if result.is_ok() {
+                    self.state = SupervisorState::Recovering;
+                }
+                self.publish_snapshot(result.as_ref().err().cloned(), None);
+                let _ = reply.send(result.map(|()| self.epoch));
             }
             Command::Remove { reply } | Command::Shutdown { reply } => {
                 for cancellation in self.active_calls.values() {
@@ -842,7 +1588,7 @@ impl Actor {
     }
 
     async fn retain_unresolved_stale_teardown(&mut self, stale: Arc<McpServer>, primary: String) {
-        self.teardown_retry.push(stale);
+        self.teardown_retry.push(RetainedTransport::Other(stale));
         let current = match std::mem::replace(&mut self.state, SupervisorState::Failed) {
             SupervisorState::Ready(server) => Some(server),
             SupervisorState::Connecting
@@ -854,7 +1600,7 @@ impl Actor {
         if let Some(current) = current {
             if let Err(teardown) = current.terminate().await {
                 error = format!("{error}; current transport teardown also failed: {teardown}");
-                self.teardown_retry.push(current);
+                self.teardown_retry.push(RetainedTransport::Other(current));
             }
         }
         self.recovery_from = None;
@@ -865,15 +1611,42 @@ impl Actor {
         if let SupervisorState::Ready(server) =
             std::mem::replace(&mut self.state, SupervisorState::Removed)
         {
-            self.teardown_retry.push(server);
+            self.teardown_retry.push(RetainedTransport::Other(server));
         }
 
         let mut failed = Vec::new();
         let mut errors = Vec::new();
-        for server in std::mem::take(&mut self.teardown_retry) {
-            if let Err(error) = server.terminate().await {
+        for mut retained in std::mem::take(&mut self.teardown_retry) {
+            if let Err(error) = retained.server().terminate().await {
+                if let (
+                    Some(www_authenticate),
+                    RetainedTransport::OAuthRecovery { retry_plan, .. },
+                ) = (crate::oauth_cleanup_challenge(&error), &mut retained)
+                {
+                    let plan = retry_plan.get_or_insert_with(|| OAuthRetryPlan {
+                        retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
+                        scopes: crate::configured_oauth_scopes(&self.snapshot.config).to_vec(),
+                        www_authenticate: None,
+                    });
+                    plan.retry_cause = OAuthRetryCause::Authorization;
+                    plan.www_authenticate = crate::merge_oauth_challenges(
+                        [
+                            plan.www_authenticate.as_deref(),
+                            www_authenticate.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten(),
+                    );
+                    if let Some(challenge) = plan.www_authenticate.as_deref() {
+                        if let Some(scope) =
+                            crate::oauth::parse_bearer_challenge(challenge).get("scope")
+                        {
+                            crate::extend_unique(&mut plan.scopes, scope.split_whitespace());
+                        }
+                    }
+                }
                 errors.push(error.to_string());
-                failed.push(server);
+                failed.push(retained);
             }
         }
         self.teardown_retry = failed;
@@ -920,11 +1693,22 @@ mod epoch_tests {
 
     struct RetryShutdownTransport {
         attempts: Arc<AtomicUsize>,
+        fail_quiesce: bool,
         failures_remaining: AtomicUsize,
+        shutdown_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
     }
 
     #[async_trait]
     impl McpTransport for RetryShutdownTransport {
+        async fn quiesce(&self) -> Result<(), TransportError> {
+            if self.fail_quiesce {
+                Err(TransportError::Disconnected(
+                    "injected quiescence failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
         async fn request(
             &self,
             _method: &str,
@@ -949,6 +1733,10 @@ mod epoch_tests {
 
         async fn shutdown(&self) -> Result<(), TransportError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
+            if let Some((started, releases)) = &self.shutdown_gate {
+                started.send(()).unwrap();
+                releases.acquire().await.unwrap().forget();
+            }
             if self
                 .failures_remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -972,7 +1760,9 @@ mod epoch_tests {
                 name: "retry".to_string(),
                 transport: Arc::new(RetryShutdownTransport {
                     attempts: Arc::clone(&attempts),
+                    fail_quiesce: false,
                     failures_remaining: AtomicUsize::new(failures),
+                    shutdown_gate: None,
                 }),
                 tools: Arc::new(std::sync::RwLock::new(Vec::new())),
                 config: stdio_config(),
@@ -1089,6 +1879,7 @@ mod epoch_tests {
         handle
             .mailbox
             .send(Command::Call {
+                config: handle.snapshot().config,
                 expected_schema: Some(original),
                 tool: "report".into(),
                 arguments: serde_json::json!({}),
@@ -1291,6 +2082,255 @@ mod epoch_tests {
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+    }
+
+    #[tokio::test]
+    async fn oauth_recovery_has_one_leader_before_authenticated_cleanup() {
+        let (serving, attempts) = retry_shutdown_server(0);
+        let bearer = Arc::clone(&serving.oauth_bearer);
+        *bearer.write().unwrap() = Some("expired".to_string());
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth recovery leads before teardown");
+        };
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert!(handle.inspect().await.is_err());
+        assert!(matches!(
+            handle.claim_oauth_recovery(0).await,
+            RecoveryClaim::Follow(_)
+        ));
+        assert!(matches!(
+            handle.claim_recovery(0).await,
+            RecoveryClaim::Follow(_)
+        ));
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".to_string())
+            .await
+            .unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(bearer.read().unwrap().as_deref(), Some("fresh"));
+        let (replacement, _, _) = server(http_config());
+        assert!(handle.publish(permit.epoch, replacement).await);
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_recovery_cancels_active_calls_before_session_cleanup() {
+        let (serving, mut started, _) = server(http_config());
+        let handle = SupervisorHandle::connected(serving);
+        let call = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .call(
+                        "report".into(),
+                        serde_json::json!({}),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth recovery owner");
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome.result, Err(McpRequestError::Cancelled)));
+        assert!(matches!(outcome.recovery, CallRecovery::None));
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .unwrap());
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_cleanup_never_rotates_a_stale_transport_bearer() {
+        let (serving, _) = retry_shutdown_server(0);
+        let current_bearer = Arc::clone(&serving.oauth_bearer);
+        *current_bearer.write().unwrap() = Some("expired".into());
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth recovery owner");
+        };
+        let (stale, _) = retry_shutdown_server(2);
+        let stale_bearer = Arc::clone(&stale.oauth_bearer);
+        *stale_bearer.write().unwrap() = Some("old-resource-token".into());
+        assert!(!handle.publish(0, stale).await);
+        assert!(!handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .unwrap());
+        assert_eq!(current_bearer.read().unwrap().as_deref(), Some("expired"));
+        assert!(
+            handle
+                .await_oauth(permit.epoch, "https://auth.test".into(), "retry".into())
+                .await
+        );
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .is_err());
+        assert_eq!(current_bearer.read().unwrap().as_deref(), Some("fresh"));
+        assert_eq!(
+            stale_bearer.read().unwrap().as_deref(),
+            Some("old-resource-token")
+        );
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_cleanup_failure_retains_non_callable_retry_ownership() {
+        let (serving, attempts) = retry_shutdown_server(1);
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth recovery leads before teardown");
+        };
+        let error = handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected teardown failure"));
+        assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+        assert!(handle.inspect().await.is_err());
+        let epoch = handle.reconfigure(http_config()).await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let (replacement, _, _) = server(http_config());
+        let bearer = Arc::clone(&replacement.oauth_bearer);
+        assert!(handle.publish(epoch, replacement).await);
+        assert!(!handle
+            .finish_oauth_cleanup(permit.epoch, "stale".to_string())
+            .await
+            .unwrap());
+        assert!(bearer.read().unwrap().is_none());
+        assert!(handle.snapshot().is_ready());
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_oauth_claim_upgrades_failed_transport_recovery() {
+        let (mut serving, attempts) = retry_shutdown_server(0);
+        let bearer = Arc::clone(&serving.oauth_bearer);
+        let (started, mut started_rx) = mpsc::unbounded_channel();
+        let releases = Arc::new(Semaphore::new(0));
+        serving.transport = Arc::new(RetryShutdownTransport {
+            attempts: Arc::clone(&attempts),
+            fail_quiesce: false,
+            failures_remaining: AtomicUsize::new(1),
+            shutdown_gate: Some((started, Arc::clone(&releases))),
+        });
+        let handle = SupervisorHandle::connected(serving);
+        let transport_claim = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.claim_recovery(0).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut oauth_claim = Box::pin(handle.claim_oauth_recovery(0));
+        assert!(futures::poll!(oauth_claim.as_mut()).is_pending());
+        releases.add_permits(1);
+        assert!(matches!(
+            transport_claim.await.unwrap(),
+            RecoveryClaim::Unavailable(_)
+        ));
+        let RecoveryClaim::Leader(permit) = oauth_claim.await else {
+            panic!("OAuth takeover");
+        };
+        assert_eq!(permit.epoch, 2);
+        releases.add_permits(1);
+        assert!(handle
+            .finish_oauth_cleanup(permit.epoch, "fresh".into())
+            .await
+            .unwrap());
+        assert_eq!(bearer.read().unwrap().as_deref(), Some("fresh"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let (replacement, _, _) = server(http_config());
+        assert!(handle.publish(permit.epoch, replacement).await);
+        handle.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_quiescence_failure_settles_failed_and_retains_cleanup() {
+        let (mut serving, attempts) = retry_shutdown_server(0);
+        serving.transport = Arc::new(RetryShutdownTransport {
+            attempts: Arc::clone(&attempts),
+            fail_quiesce: true,
+            failures_remaining: AtomicUsize::new(0),
+            shutdown_gate: None,
+        });
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Unavailable(error) = handle.claim_oauth_recovery(0).await else {
+            panic!("quiescence should fail");
+        };
+        assert!(error.contains("injected quiescence failure"));
+        assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+        assert!(handle.snapshot().pending_oauth_url.is_none());
+        assert!(handle.inspect().await.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        handle.remove().await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_cleanup_and_restart_cannot_supersede_queued_reload() {
+        let (mut serving, attempts) = retry_shutdown_server(0);
+        let (started, mut started_rx) = mpsc::unbounded_channel();
+        let releases = Arc::new(Semaphore::new(0));
+        serving.transport = Arc::new(RetryShutdownTransport {
+            attempts,
+            fail_quiesce: false,
+            failures_remaining: AtomicUsize::new(0),
+            shutdown_gate: Some((started, Arc::clone(&releases))),
+        });
+        let handle = SupervisorHandle::connected(serving);
+        let RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await else {
+            panic!("OAuth claim");
+        };
+        let callback = tokio::spawn({
+            let handle = handle.clone();
+            let config = permit.config.clone();
+            async move {
+                handle
+                    .restart_after_oauth(permit.epoch, "fresh".to_string(), config)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (reply, reload) = oneshot::channel();
+        handle
+            .mailbox
+            .send(Command::Reconfigure {
+                config: http_config(),
+                reply,
+            })
+            .await
+            .unwrap();
+        releases.add_permits(1);
+        let callback_epoch = callback.await.unwrap().unwrap().unwrap();
+        let reload_epoch = reload.await.unwrap().unwrap();
+        assert!(reload_epoch > callback_epoch);
+        assert_eq!(handle.snapshot().config, http_config());
+        assert_eq!(handle.snapshot().epoch, reload_epoch);
+        assert!(handle
+            .restart_after_oauth(callback_epoch, "stale".to_string(), stdio_config())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(handle.snapshot().config, http_config());
+        assert_eq!(handle.snapshot().epoch, reload_epoch);
+        handle.remove().await.unwrap();
     }
 
     #[tokio::test]
