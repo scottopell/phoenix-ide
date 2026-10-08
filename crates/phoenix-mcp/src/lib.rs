@@ -72,6 +72,8 @@ pub enum TransportError {
     /// The connection itself is gone (pipe closed, process exited, reset).
     /// For stdio this is the crash-like class that triggers a respawn.
     Disconnected(String),
+    /// A server stream could not be stopped cleanly.
+    Quiescence(String),
     /// The request deadline elapsed without evidence the connection is dead.
     /// Distinct from `Disconnected`: a live-but-slow stdio server is not
     /// respawned for this.
@@ -88,7 +90,10 @@ impl std::fmt::Display for TransportError {
             Self::Unauthorized { .. } => write!(f, "unauthorized (HTTP 401)"),
             Self::InsufficientScope { .. } => write!(f, "insufficient scope (HTTP 403)"),
             Self::SessionExpired => write!(f, "session expired"),
-            Self::Disconnected(detail) | Self::Timeout(detail) | Self::Protocol(detail) => {
+            Self::Disconnected(detail)
+            | Self::Quiescence(detail)
+            | Self::Timeout(detail)
+            | Self::Protocol(detail) => {
                 write!(f, "{detail}")
             }
             Self::Rpc { code, message } => write!(f, "JSON-RPC error {code}: {message}"),
@@ -228,14 +233,11 @@ pub struct McpToolDef {
     pub input_schema: Value,
 }
 
-/// The lifecycle state surfaced for a server (REQ-MCP-013, REQ-MCP-018). The
-/// transient `connecting`/`reconnecting` states of `mcp.allium`'s `ConnState`
-/// are not separately retained -- the status API distinguishes the three
-/// states an operator acts on: a healthy server, one awaiting authorization,
-/// and one that failed.
+/// The lifecycle state surfaced for a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpConnState {
+    Removing,
     Ready,
     Unauthorized,
     Failed,
@@ -419,6 +421,15 @@ impl From<String> for ConnectFailure {
 }
 
 impl HandshakeFailure {
+    fn quiescence_failed(&self) -> bool {
+        match self {
+            Self::Teardown {
+                failure, teardown, ..
+            } => matches!(teardown, TransportError::Quiescence(_)) || failure.quiescence_failed(),
+            Self::Unauthorized { .. } | Self::Other(_) => false,
+        }
+    }
+
     fn classify(error: McpRequestError, server_name: &str) -> Self {
         match error {
             McpRequestError::Transport(TransportError::Unauthorized { www_authenticate }) => {
@@ -469,7 +480,7 @@ impl HandshakeFailure {
         let message = self.to_string();
         let mut challenges = Vec::new();
         self.authorization_challenges(&mut challenges);
-        let unauthorized = !challenges.is_empty();
+        let unauthorized = !challenges.is_empty() && !self.quiescence_failed();
         let www_authenticate = merge_oauth_challenges(
             prior_plan
                 .and_then(|plan| plan.www_authenticate.as_deref())
@@ -1821,6 +1832,7 @@ fn oauth_recovery_kind_parts(
         | TransportError::Disconnected(_)
         | TransportError::Timeout(_)
         | TransportError::Rpc { .. }
+        | TransportError::Quiescence(_)
         | TransportError::Protocol(_) => None,
     }
 }
@@ -1840,6 +1852,7 @@ fn oauth_cleanup_challenge(error: &TransportError) -> Option<&Option<String>> {
         | TransportError::Disconnected(_)
         | TransportError::Timeout(_)
         | TransportError::Rpc { .. }
+        | TransportError::Quiescence(_)
         | TransportError::Protocol(_) => None,
     }
 }
@@ -2975,6 +2988,12 @@ impl McpClientManager {
                     (McpConnState::Unauthorized, None)
                 }
                 SupervisorState::Failed => (McpConnState::Failed, snapshot.last_error.clone()),
+                SupervisorState::Recovering
+                    if matches!(snapshot.recovery_target, RecoveryTarget::Remove)
+                        && pending_url.is_none() =>
+                {
+                    (McpConnState::Removing, None)
+                }
                 SupervisorState::Connecting | SupervisorState::Recovering
                     if pending_url.is_some() =>
                 {
@@ -3725,13 +3744,14 @@ impl McpClientManager {
             .collect();
         let mut failed = Vec::new();
         let mut removed = Vec::new();
+        let mut pending_removals = Vec::new();
         for name in removed_names {
             let gate = self.oauth.mutation_gate(&name);
             let _mutations = gate.lock().await;
             let handle = { self.servers.read().await.get(&name).cloned() };
             if let Some(handle) = handle {
                 if handle.defer_oauth_removal().await {
-                    removed.push(name);
+                    pending_removals.push(name);
                     continue;
                 }
                 if let Some(result) = self.remove_oauth_owned(&name, &handle).await {
@@ -3937,6 +3957,7 @@ impl McpClientManager {
         McpReloadResult {
             added,
             removed,
+            pending_removals,
             restarted,
             unchanged,
             failed,
@@ -4458,6 +4479,7 @@ impl McpClientManager {
 pub struct McpReloadResult {
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub pending_removals: Vec<String>,
     pub restarted: Vec<String>,
     pub unchanged: Vec<String>,
     pub failed: Vec<McpReloadFailure>,

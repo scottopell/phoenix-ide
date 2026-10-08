@@ -571,6 +571,8 @@ rule TokenRefreshNeeded {
         -- Carry the complete scope plan in the refreshed outcome before cleanup
         -- consumes the retained transport; a narrowed grant cannot replace it.
         -- Clear inherited challenges when reconnecting a changed configuration.
+        -- Adopting the queued configuration clears the queued target; subsequent
+        -- refresh on that connection retains ordinary replay eligibility.
         -- Ready OAuth removal with a stored grant reserves cleanup ownership;
         -- refresh expired credentials before deleting the session or token.
         -- Preserve DELETE authorization challenges on that owner and route
@@ -586,6 +588,12 @@ rule TokenRefreshNeeded {
         -- recovery owner and retry through the same fenced path.
         -- Cancel active calls before retaining the old session for cleanup;
         -- cancellation does not authorize replay of those other calls.
+        -- Stream-quiescence failure is a distinct cleanup failure. Stop shutdown
+        -- before DELETE and retain the session for explicit retry; handshake
+        -- authorization provenance cannot admit automatic recovery through it.
+        -- Deferred removal reports a pending reload outcome and a removing
+        -- status until cleanup forgets its handle or requests authorization.
+        -- The panel awaits that outcome even when another server is ready.
         -- Quiesce the server-initiated HTTP stream without deleting the session,
         -- so retained ownership does not keep reconnecting with stale credentials.
         -- A transient refresh failure retains the token and cleanup ownership

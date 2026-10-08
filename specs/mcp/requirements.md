@@ -358,7 +358,9 @@ with those scopes and the discovery challenge before attempting authenticated
 session deletion, including when denied removal cleanup failed and the server
 is re-added.
 Stream-quiescence failure SHALL settle as failed with teardown ownership
-retained, rather than remaining in recovery without an authorization URL.
+retained, including during handshake shutdown. It SHALL prevent OAuth refresh
+or replacement publication from masking that failure; session deletion SHALL
+remain available to an explicit cleanup retry.
 An OAuth failure from the same observed connection epoch SHALL be able to
 take over transport recovery whose session cleanup failed, obtaining a bearer
 before retrying that cleanup. Reauthorization setup failure SHALL settle as
@@ -424,7 +426,8 @@ through repeated re-authorization.
 ### REQ-MCP-013: Authorization Status Surfaced to the UI
 
 THE SYSTEM SHALL expose, per server, whether it is connected, awaiting
-authorization (with the authorization URL), or failed (with the error), via
+authorization (with the authorization URL), removing while cleanup is pending,
+or failed (with the error), via
 `GET /api/mcp/status`.
 
 **Rationale:** A server blocked on authorization must be distinguishable from
@@ -458,8 +461,12 @@ WHEN MCP config is reloaded
 THE SYSTEM SHALL reconcile the running set against the new config: connect added
 servers, disconnect removed servers, restart servers whose config changed, and
 leave unchanged servers untouched
-AND report the per-server outcome (added / removed / restarted / unchanged /
-failed).
+AND report the per-server outcome (added / removed / pending removal / restarted /
+unchanged / failed). Deferred cleanup SHALL report pending removal until the
+server is forgotten; the UI SHALL keep awaiting its cleanup or authorization
+outcome within the reload polling window, including while another server is ready.
+Applying a queued configuration SHALL consume its queued target so later
+recovery on that configuration remains eligible for replay.
 
 **Rationale:** Reload must not tear down healthy connections. Reconciliation
 applies the minimum change and reports what happened so the operator sees the

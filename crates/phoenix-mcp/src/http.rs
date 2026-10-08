@@ -472,7 +472,7 @@ impl McpTransport for HttpTransport {
             task.abort();
             if let Err(error) = task.await {
                 if !error.is_cancelled() {
-                    return Err(TransportError::Disconnected(format!(
+                    return Err(TransportError::Quiescence(format!(
                         "MCP server '{}': stream task failed during quiescence: {error}",
                         self.name,
                     )));
@@ -483,7 +483,7 @@ impl McpTransport for HttpTransport {
     }
 
     async fn shutdown(&self) -> Result<(), TransportError> {
-        let background_error = self.quiesce().await.err();
+        self.quiesce().await?;
         // End the server-side session explicitly so it does not linger until
         // expiry (REQ-MCP-005). Stateless servers have nothing to delete.
         let session_id = self.session_id.lock().unwrap().clone();
@@ -522,10 +522,7 @@ impl McpTransport for HttpTransport {
                 )));
             }
         }
-        match background_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -2242,6 +2239,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_quiescence_failure_blocks_handshake_oauth_cleanup() {
+        for status in [401, 403] {
+            let server = TestServer::start(vec![status_response(
+                status,
+                &[(
+                    "www-authenticate",
+                    "Bearer error=\"insufficient_scope\", scope=\"cleanup\"",
+                )],
+            )])
+            .await;
+            let bearer: crate::SharedBearer = Arc::default();
+            *bearer.write().unwrap() = Some("expired".into());
+            let transport = Arc::new(
+                HttpTransport::connect(
+                    "remote",
+                    &server.url,
+                    &HashMap::new(),
+                    &HttpAuth::None,
+                    Arc::clone(&bearer),
+                    discard_sink(),
+                )
+                .unwrap(),
+            );
+            *transport.session_id.lock().unwrap() = Some("retained-session".into());
+            let task = tokio::spawn(async { panic!("fixture stream panic") });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            *transport.stream_task.lock().unwrap() = Some(task);
+            let error = transport.shutdown().await.unwrap_err();
+            assert!(matches!(error, TransportError::Quiescence(_)));
+            assert!(error.to_string().contains("fixture stream panic"));
+            assert!(server.requests.lock().unwrap().is_empty());
+            assert_eq!(
+                transport.session_id.lock().unwrap().as_deref(),
+                Some("retained-session")
+            );
+            let mcp = crate::McpServer {
+                name: "remote".into(),
+                transport: transport.clone(),
+                config: http_config(&server.url, HttpAuth::None),
+                tools: <_>::default(),
+                tools_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+                oauth_bearer: bearer,
+            };
+            let failure = crate::HandshakeFailure::Unauthorized {
+                www_authenticate: None,
+                message: "handshake 401".into(),
+            }
+            .with_teardown(error)
+            .into_connect_failure(
+                Some(mcp),
+                crate::OAuthHandshakeAction::Refresh,
+                None,
+            );
+            assert!(matches!(
+                failure.teardown_retry,
+                Some(crate::ConnectTeardown::Other(_))
+            ));
+            let retry = transport.shutdown().await.unwrap_err();
+            assert!(matches!(
+                (status, retry),
+                (401, TransportError::Unauthorized { .. })
+                    | (403, TransportError::InsufficientScope { .. })
+            ));
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn http_shutdown_retry_accepts_session_already_gone() {
         let server = TestServer::start(handshake_responses("sess-gone")).await;
         let mcp = connect_http(&server, HttpAuth::None)
@@ -3628,7 +3700,12 @@ mod tests {
                 .unwrap_err();
             let epoch = handle.snapshot().epoch;
             let removed = manager.reload_from_configs(vec![]).await;
-            assert_eq!(removed.removed, vec!["remote"]);
+            assert!(removed.removed.is_empty());
+            assert_eq!(removed.pending_removals, vec!["remote"]);
+            assert_eq!(
+                manager.status().await[0].state,
+                crate::McpConnState::Removing
+            );
             assert!(removed.failed.is_empty());
             assert!(matches!(
                 handle.snapshot().recovery_target,
@@ -5653,8 +5730,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn changed_configuration_replaces_pending_cleanup_authorization() {
-        for denied_before_change in [false, true] {
+        for (denied_before_change, oauth_replacement) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let server = TestServer::start(handshake_responses("sess-1")).await;
             let replacement = TestServer::start(handshake_responses("new-session")).await;
             let manager = ready_refreshable_manager(&server).await;
@@ -5682,7 +5762,11 @@ mod tests {
             }
             let config = http_config(
                 &replacement.url,
-                HttpAuth::Static(crate::StaticCred::Bearer("new-configured".into())),
+                if oauth_replacement {
+                    HttpAuth::None
+                } else {
+                    HttpAuth::Static(crate::StaticCred::Bearer("new-configured".into()))
+                },
             );
             manager
                 .reload_from_configs(vec![("remote".into(), config.clone())])
@@ -5724,6 +5808,45 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
+            if oauth_replacement {
+                install_oauth_discovery(&replacement, true);
+                manager
+                    .oauth
+                    .store()
+                    .upsert_registration(&none_registration(&replacement.base()))
+                    .await
+                    .unwrap();
+                manager
+                    .oauth
+                    .store()
+                    .upsert_token(&stored_token(
+                        &replacement,
+                        "new-at-1",
+                        Some("new-rt-1"),
+                        &["mcp.read"],
+                        1,
+                    ))
+                    .await
+                    .unwrap();
+                let crate::supervisor::SupervisorState::Ready(ready) = handle.snapshot().state
+                else {
+                    panic!("ready replacement");
+                };
+                *ready.oauth_bearer.write().unwrap() = Some("new-at-1".into());
+                replacement.route("/token", token_response("new-at-2", Some("new-rt-2"), None));
+                replacement.push_responses(vec![unauthorized(&replacement), delete_ack()]);
+                replacement.push_responses(handshake_responses("new-refreshed-session"));
+                replacement.push_responses(vec![echo_id_response(
+                    &serde_json::json!({"content":[{"type":"text","text":"new result"}]}),
+                )]);
+                assert_eq!(
+                    manager
+                        .call_tool("remote", "report", serde_json::json!({}))
+                        .await
+                        .unwrap(),
+                    "new result"
+                );
+            }
             replacement.push_responses(vec![delete_ack()]);
             manager.shutdown().await;
         }

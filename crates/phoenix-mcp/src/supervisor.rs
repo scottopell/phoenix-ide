@@ -1287,6 +1287,7 @@ impl Actor {
                                 self.epoch = self.epoch.wrapping_add(1);
                                 self.recovery_from = None;
                                 self.snapshot.config = config;
+                                self.snapshot.recovery_target = RecoveryTarget::Configured;
                                 self.state = SupervisorState::Connecting;
                             }
                         }

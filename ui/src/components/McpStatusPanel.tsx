@@ -29,7 +29,7 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
   // refresh. `awaitingRef` is null while the reload request itself is in flight
   // (the awaited set isn't known yet), then the names being (re)connected.
   const reloadUntilRef = useRef<number>(0);
-  const awaitingRef = useRef<Set<string> | null>(null);
+  const awaitingRef = useRef<Map<string, 'ready' | 'removed'> | null>(null);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -49,7 +49,8 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
     const awaiting = awaitingRef.current;
     if (awaiting === null) return false; // reload request still in flight
     const ready = new Set(s.filter(srv => srv.state === 'ready').map(srv => srv.name));
-    return [...awaiting].every(name => ready.has(name));
+    const present = new Set(s.map(srv => srv.name));
+    return [...awaiting].every(([name, outcome]) => outcome === 'removed' ? !present.has(name) : ready.has(name));
   }, []);
 
   // Poll every 3s until servers are connected. Keep polling while any server
@@ -111,15 +112,16 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
       // flips to `ready` later, within the window above. `failed` is included
       // because a timed-out restart still has a background connect running that
       // may publish successfully and clear the failure.
-      awaitingRef.current = new Set([
-        ...result.added,
-        ...result.restarted,
-        ...result.failed.map(f => f.server),
+      awaitingRef.current = new Map<string, 'ready' | 'removed'>([
+        ...[...result.added, ...result.restarted, ...result.failed.map(f => f.server)]
+          .map(name => [name, 'ready'] as const),
+        ...result.pending_removals.map(name => [name, 'removed'] as const),
       ]);
       await fetchStatus();
       const parts: string[] = [];
       if (result.added.length > 0) parts.push(`+${result.added.length} added`);
       if (result.removed.length > 0) parts.push(`-${result.removed.length} removed`);
+      if (result.pending_removals.length > 0) parts.push(`${result.pending_removals.length} removal pending`);
       if (result.restarted.length > 0) parts.push(`↻${result.restarted.length} restarted`);
       if (result.failed.length > 0) parts.push(`!${result.failed.length} failed`);
       if (result.unchanged.length > 0) parts.push(`${result.unchanged.length} unchanged`);
@@ -296,6 +298,8 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
                     <span className="mcp-server-state">
                       {server.state === 'failed'
                         ? <span className="mcp-state-failed">failed</span>
+                        : server.state === 'removing'
+                          ? 'removal pending'
                         : server.state === 'unauthorized'
                           ? <span className="mcp-auth-needed">auth needed</span>
                           : `${server.tool_count} tool${server.tool_count !== 1 ? 's' : ''}`}
