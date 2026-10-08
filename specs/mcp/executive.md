@@ -189,6 +189,11 @@ and cleanup-only completion. `ready_oauth_removal_cleanup_failure_retries_with_r
 verifies explicit failed cleanup retries retain the rotated grant.
 `ready_oauth_removal_delete_challenge_can_authorize_cleanup` verifies DELETE
 challenge metadata and scope union survive refresh rejection and reauthorization.
+It also covers DELETE `403 insufficient_scope`, which requests broader owned
+authorization without refreshing the insufficient grant again.
+`queued_reconfiguration_supersedes_the_original_tool_invocation` verifies an
+OAuth recovery can publish a changed endpoint while failing the old invocation,
+including rejection of a stale dispatch in the supervisor before network I/O.
 `ready_removal_cleanup_reauthorization_retains_prior_scopes` covers immediate
 and background cleanup rejection after refresh narrows the grant's scopes; the
 retry preserves previously required scopes and the latest DELETE challenge.

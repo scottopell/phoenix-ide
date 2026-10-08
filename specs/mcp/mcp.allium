@@ -575,6 +575,9 @@ rule TokenRefreshNeeded {
         -- refresh expired credentials before deleting the session or token.
         -- Preserve DELETE authorization challenges on that owner and route
         -- failed removal retries through refresh or owned reauthorization.
+        -- A DELETE 403 insufficient_scope retains its challenge and requests
+        -- owned reauthorization with the complete scope union, without another
+        -- refresh of the same insufficient grant. A plain 403 is not a step-up.
         -- Removal callbacks persist the recovered grant before cleanup. If
         -- cleanup or grant persistence fails, retain the authorization retry
         -- plan on the failed owner until successful cleanup or reauthorization.
@@ -636,7 +639,10 @@ rule TokenRefreshed {
         -- The request whose 401 triggered the refresh (a tools/call or
         -- initialize) is replayed by the executor with the refreshed bearer
         -- once authorized, so a normal token expiry never surfaces as a tool
-        -- failure (see deferred ReAuthCallRetry). The state machine models the
+        -- failure (see deferred ReAuthCallRetry). Bind dispatch and replay to
+        -- the invocation's original configuration inside the supervisor;
+        -- applying a changed configuration supersedes that invocation.
+        -- The state machine models the
         -- refresh; holding and replaying the specific request is executor-level.
 }
 

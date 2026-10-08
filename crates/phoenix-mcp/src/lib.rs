@@ -452,7 +452,7 @@ impl HandshakeFailure {
                 failure, teardown, ..
             } => {
                 failure.authorization_challenges(challenges);
-                if let TransportError::Unauthorized { www_authenticate } = teardown {
+                if let Some(www_authenticate) = oauth_cleanup_challenge(teardown) {
                     challenges.push(www_authenticate);
                 }
             }
@@ -1791,6 +1791,25 @@ fn oauth_recovery_kind_parts(
     }
 }
 
+fn oauth_cleanup_challenge(error: &TransportError) -> Option<&Option<String>> {
+    match error {
+        TransportError::Unauthorized { www_authenticate } => Some(www_authenticate),
+        TransportError::InsufficientScope { www_authenticate }
+            if www_authenticate
+                .as_deref()
+                .is_some_and(oauth::is_insufficient_scope_challenge) =>
+        {
+            Some(www_authenticate)
+        }
+        TransportError::InsufficientScope { .. }
+        | TransportError::SessionExpired
+        | TransportError::Disconnected(_)
+        | TransportError::Timeout(_)
+        | TransportError::Rpc { .. }
+        | TransportError::Protocol(_) => None,
+    }
+}
+
 /// Outcome of refreshing an authorized server's token mid-recovery.
 enum RefreshServerOutcome {
     Refreshed(OAuthRetryPlan),
@@ -2360,6 +2379,21 @@ impl McpClientManager {
         let Some(plan) = handle.oauth_retry_plan(permit.epoch).await else {
             return RefreshServerOutcome::Superseded;
         };
+        if plan
+            .www_authenticate
+            .as_deref()
+            .is_some_and(oauth::is_insufficient_scope_challenge)
+        {
+            return self
+                .reprompt_after_refresh_failure(
+                    name,
+                    handle,
+                    permit,
+                    plan.www_authenticate.as_deref(),
+                    "additional OAuth scopes required for session cleanup",
+                )
+                .await;
+        }
         match oauth_refresh(&self.oauth, name, &url, www_authenticate, &token).await {
             Ok(access_token) => match handle
                 .finish_oauth_cleanup(permit.epoch, access_token)
@@ -3028,8 +3062,15 @@ impl McpClientManager {
             .ok_or_else(|| {
                 McpToolCallError::Failed(format!("MCP server '{server_name}' is not connected"))
             })?;
+        let invocation_config = handle.snapshot().config;
         let first = self
-            .call_actor_when_ready(&handle, tool_name, arguments.clone(), cancel.clone())
+            .call_actor_when_ready(
+                &handle,
+                &invocation_config,
+                tool_name,
+                arguments.clone(),
+                cancel.clone(),
+            )
             .await?;
         let recovery = first.recovery;
         match first.result {
@@ -3100,7 +3141,13 @@ impl McpClientManager {
                 McpToolCallError::Failed(format!("MCP server '{server_name}' is not connected"))
             })?;
         let retry = self
-            .call_actor_when_ready(&retry_handle, tool_name, arguments, cancel)
+            .call_actor_when_ready(
+                &retry_handle,
+                &invocation_config,
+                tool_name,
+                arguments,
+                cancel,
+            )
             .await?;
         let retry_recovery = retry.recovery;
         match retry.result {
@@ -3132,6 +3179,7 @@ impl McpClientManager {
     async fn call_actor_when_ready(
         &self,
         handle: &SupervisorHandle,
+        invocation_config: &McpServerConfig,
         tool_name: &str,
         arguments: Value,
         cancel: CancellationToken,
@@ -3141,7 +3189,12 @@ impl McpClientManager {
             match snapshot.state {
                 SupervisorState::Ready(_) => {
                     match handle
-                        .call(tool_name.to_string(), arguments.clone(), cancel.clone())
+                        .call_for_config(
+                            invocation_config.clone(),
+                            tool_name.to_string(),
+                            arguments.clone(),
+                            cancel.clone(),
+                        )
                         .await
                     {
                         Ok(outcome) => return Ok(outcome),
@@ -3384,6 +3437,10 @@ impl McpClientManager {
                     self.remove_current_handle(server_name, handle).await;
                     return Ok(());
                 }
+                let reconfigured = matches!(
+                    handle.snapshot().recovery_target,
+                    RecoveryTarget::Reconfigure(_)
+                );
                 let (config, epoch, prior_plan) = if let RecoveryTarget::Reconfigure(config) =
                     handle.snapshot().recovery_target
                 {
@@ -3399,7 +3456,14 @@ impl McpClientManager {
                 };
                 self.connect_actor_owned(server_name, &config, handle, epoch, action, prior_plan)
                     .await
-                    .map_err(McpToolCallError::Failed)
+                    .map_err(McpToolCallError::Failed)?;
+                if reconfigured {
+                    Err(McpToolCallError::Failed(
+                        "MCP tool invocation was superseded by a configuration change".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
             }
             RefreshServerOutcome::Reprompt(error)
             | RefreshServerOutcome::Transient(error)
@@ -5589,61 +5653,65 @@ mod tests {
         }
     }
 
-    /// A failing call whose server got replaced mid-flight (here: an HTTP
-    /// instance swapped for a stdio one, as a reload would) must be judged by
-    /// the policy of the instance that served it -- `SessionExpired` is
-    /// recoverable for the serving HTTP instance, so the call retries on the
-    /// replacement instead of surfacing the stale error or re-reconnecting.
     #[tokio::test]
-    async fn stale_recoverable_error_retries_on_the_replacement_server() {
-        let manager = Arc::new(McpClientManager::new());
-        let (serving_exchange, serving_started) =
-            witnessed_delayed_exchange(Err(TransportError::SessionExpired), 200);
-        let (serving, _, _) = fake_server_with_config(
-            vec![serving_exchange],
-            McpServerConfig::Http {
-                url: "http://127.0.0.1:1/mcp".to_string(),
-                headers: HashMap::new(),
-                auth: HttpAuth::None,
-                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
-            },
-        );
-        manager
-            .servers
-            .write()
-            .await
-            .insert("fake".to_string(), server_handle(serving));
-
-        let (replacement, replacement_requests, _) = fake_server_with_config(
-            vec![exchange(Ok(serde_json::json!({
-                "content": [{"type": "text", "text": "fresh"}]
-            })))],
-            stdio_test_config("replacement"),
-        );
-        let swapper = Arc::clone(&manager);
-        let swap = tokio::spawn(async move {
-            let method = tokio::time::timeout(Duration::from_secs(5), serving_started)
-                .await
-                .expect("serving request started in time")
-                .expect("serving transport retained its witness");
-            assert_eq!(method, "tools/call");
-            swapper
+    async fn stale_recoverable_error_replays_only_on_unchanged_configuration() {
+        for changed_config in [false, true] {
+            let manager = Arc::new(McpClientManager::new());
+            let (serving_exchange, serving_started) =
+                witnessed_delayed_exchange(Err(TransportError::SessionExpired), 200);
+            let (serving, _, _) = fake_server_with_config(
+                vec![serving_exchange],
+                McpServerConfig::Http {
+                    url: "http://127.0.0.1:1/mcp".to_string(),
+                    headers: HashMap::new(),
+                    auth: HttpAuth::None,
+                    tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
+                },
+            );
+            let serving_config = serving.config.clone();
+            manager
                 .servers
                 .write()
                 .await
-                .insert("fake".to_string(), server_handle(replacement));
-        });
+                .insert("fake".to_string(), server_handle(serving));
 
-        let result = manager
-            .call_tool("fake", "report", serde_json::json!({}))
-            .await;
-        swap.await.expect("swap task");
+            let (replacement, replacement_requests, _) = fake_server_with_config(
+                vec![exchange(Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": "fresh"}]
+                })))],
+                if changed_config {
+                    stdio_test_config("replacement")
+                } else {
+                    serving_config
+                },
+            );
+            let swapper = Arc::clone(&manager);
+            let swap = tokio::spawn(async move {
+                let method = tokio::time::timeout(Duration::from_secs(5), serving_started)
+                    .await
+                    .expect("serving request started in time")
+                    .expect("serving transport retained its witness");
+                assert_eq!(method, "tools/call");
+                swapper
+                    .servers
+                    .write()
+                    .await
+                    .insert("fake".to_string(), server_handle(replacement));
+            });
 
-        assert_eq!(
-            result.expect("stale recoverable error must retry on the replacement"),
-            "fresh"
-        );
-        assert_eq!(replacement_requests.lock().unwrap().len(), 1);
+            let result = manager
+                .call_tool("fake", "report", serde_json::json!({}))
+                .await;
+            swap.await.expect("swap task");
+
+            if changed_config {
+                assert!(result.unwrap_err().contains("superseded"));
+                assert!(replacement_requests.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(result.unwrap(), "fresh");
+                assert_eq!(replacement_requests.lock().unwrap().len(), 1);
+            }
+        }
     }
 
     /// The inverse: the serving instance (stdio) deems its timeout

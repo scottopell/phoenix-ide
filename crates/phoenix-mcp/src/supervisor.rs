@@ -1,6 +1,5 @@
 use crate::{
     CallContext, McpRequestError, McpServer, McpServerConfig, McpToolDef, OAuthRecoveryKind,
-    TransportError,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -182,8 +181,20 @@ impl SupervisorHandle {
         receive.await.map_err(|_| stopped())?
     }
 
+    #[cfg(test)]
     pub(crate) async fn call(
         &self,
+        tool: String,
+        arguments: Value,
+        cancel: CancellationToken,
+    ) -> Result<CallOutcome, String> {
+        self.call_for_config(self.snapshot().config, tool, arguments, cancel)
+            .await
+    }
+
+    pub(crate) async fn call_for_config(
+        &self,
+        config: McpServerConfig,
         tool: String,
         arguments: Value,
         cancel: CancellationToken,
@@ -194,6 +205,7 @@ impl SupervisorHandle {
             .ok_or_else(|| "MCP tool call timeout exceeds platform deadline range".to_string())?;
         let call_cancel = cancel.child_token();
         let command = Command::Call {
+            config,
             tool,
             arguments,
             cancel: call_cancel.clone(),
@@ -636,6 +648,7 @@ enum Command {
         reply: oneshot::Sender<Result<u64, String>>,
     },
     Call {
+        config: McpServerConfig,
         tool: String,
         arguments: Value,
         cancel: CancellationToken,
@@ -964,11 +977,18 @@ impl Actor {
                 }
             }
             Command::Call {
+                config,
                 tool,
                 arguments,
                 cancel,
                 reply,
             } => {
+                if self.snapshot.config != config {
+                    let _ = reply.send(Err(
+                        "MCP tool invocation was superseded by a configuration change".to_owned(),
+                    ));
+                    return;
+                }
                 let SupervisorState::Ready(server) = &self.state else {
                     let _ = reply.send(Err(self.not_ready_message()));
                     return;
@@ -1468,9 +1488,9 @@ impl Actor {
         for mut retained in std::mem::take(&mut self.teardown_retry) {
             if let Err(error) = retained.server().terminate().await {
                 if let (
-                    TransportError::Unauthorized { www_authenticate },
+                    Some(www_authenticate),
                     RetainedTransport::OAuthRecovery { retry_plan, .. },
-                ) = (&error, &mut retained)
+                ) = (crate::oauth_cleanup_challenge(&error), &mut retained)
                 {
                     let plan = retry_plan.get_or_insert_with(|| OAuthRetryPlan {
                         scopes: crate::configured_oauth_scopes(&self.snapshot.config).to_vec(),

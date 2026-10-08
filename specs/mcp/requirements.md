@@ -372,7 +372,10 @@ transfer cleanup-only intent to the new authorization flow.
 A changed configuration requested during owned OAuth cleanup SHALL queue the
 new configuration while retaining the old resource's grant and cleanup plan.
 THE SYSTEM SHALL finish authenticated cleanup before invalidating that grant
-and applying the queued configuration. Pending authorization SHALL be replaced
+and applying the queued configuration. A tool invocation SHALL remain bound to
+its original configuration; applying a different configuration SHALL supersede
+the invocation rather than replay its tool and arguments against the new server.
+Pending authorization SHALL be replaced
 with a fresh nonce while preserving the cleanup discovery challenge and scopes.
 A replacement connection that requires authorization SHALL expose its owned
 pending authorization as unauthorized, including after successful token refresh.
@@ -387,7 +390,10 @@ required scopes, with the latest supplied discovery metadata retained when later
 omit it. Removing a ready OAuth server SHALL reserve exclusive OAuth cleanup ownership
 before discarding its grant. Expired tokens SHALL refresh before session cleanup;
 a cleanup authorization rejection SHALL retain its challenge and support refresh
-or owned reauthorization. Failed removal retries SHALL retain that ownership.
+or owned reauthorization. A DELETE `403 insufficient_scope` challenge SHALL
+retain its discovery metadata and required scopes and request owned
+reauthorization instead of refreshing the same insufficient grant.
+Failed removal retries SHALL retain that ownership.
 Recovered removal grants SHALL remain persisted until cleanup succeeds. A failed
 removal callback cleanup SHALL retain its complete authorization retry plan so
 expired recovered credentials cannot prevent explicit reauthorization.
