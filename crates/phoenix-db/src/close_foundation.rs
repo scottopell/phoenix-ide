@@ -3273,10 +3273,23 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let expected_provenance: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM close_attempt_scopes
-             WHERE attempt_id=?1 AND captured_worktree_identity IS NOT NULL",
+            "SELECT COUNT(*)
+             FROM close_worktree_cleanup_plans plan
+             JOIN close_worktree_cleanup_dispatches dispatch
+               ON dispatch.attempt_id=plan.attempt_id AND dispatch.scope=plan.scope
+              AND dispatch.inspection_generation=plan.inspection_generation
+              AND dispatch.inspection_fingerprint=plan.inspection_fingerprint
+              AND dispatch.resource_kind=plan.resource_kind
+              AND dispatch.identity_kind=plan.identity_kind
+              AND dispatch.identity_codec=plan.identity_codec
+              AND dispatch.identity_value=plan.identity_value
+             WHERE plan.attempt_id=?1
+               AND plan.inspection_generation<>?2
+               AND plan.inspection_fingerprint<>?3",
         )
         .bind(attempt_id.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
         .fetch_one(&mut *tx)
         .await?;
         let current_provenance: i64 = sqlx::query_scalar(
@@ -3290,7 +3303,7 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         if current_provenance != expected_provenance
-            || provenance_insert.rows_affected() > expected_provenance as u64
+            || i64::try_from(provenance_insert.rows_affected()).ok() > Some(expected_provenance)
         {
             return Err(close_precondition(
                 "legacy FK787 provenance does not cover every exact captured worktree scope",

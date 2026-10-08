@@ -10933,79 +10933,45 @@ impl Database {
         Ok(())
     }
 
+    async fn delete_completed_close_history(
+        connection: &mut sqlx::SqliteConnection,
+        product_conversation_id: &str,
+    ) -> DbResult<()> {
+        for statement in [
+            "DELETE FROM close_worktree_retirement_receipt_adoptions
+             WHERE attempt_id IN (SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1 AND phase = 'completed')
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE product_conversation_id = ?1)",
+            "DELETE FROM close_worktree_cleanup_adoptions
+             WHERE attempt_id IN (SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1 AND phase = 'completed')
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE product_conversation_id = ?1)",
+            "DELETE FROM close_legacy_fk787_cleanup_provenance
+             WHERE attempt_id IN (SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1 AND phase = 'completed')
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE product_conversation_id = ?1)",
+            "DELETE FROM close_worktree_cleanup_plans
+             WHERE attempt_id IN (SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE product_conversation_id = ?1)",
+            "DELETE FROM close_retirement_resource_dispatches
+             WHERE attempt_id IN (SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE product_conversation_id = ?1)",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .bind(product_conversation_id)
+                .execute(&mut *connection)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn delete_product_conversation_if_empty(
         connection: &mut sqlx::SqliteConnection,
         product_conversation_id: &str,
     ) -> DbResult<bool> {
-        sqlx::query(
-            "DELETE FROM close_worktree_retirement_receipt_adoptions
-             WHERE attempt_id IN (
-                 SELECT attempt_id FROM close_obligations
-                 WHERE product_conversation_id = ?1 AND phase = 'completed'
-             )
-               AND NOT EXISTS (
-                   SELECT 1 FROM conversations WHERE product_conversation_id = ?1
-               )",
-        )
-        .bind(product_conversation_id)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(
-            "DELETE FROM close_worktree_cleanup_adoptions
-             WHERE attempt_id IN (
-                 SELECT attempt_id FROM close_obligations
-                 WHERE product_conversation_id = ?1 AND phase = 'completed'
-             )
-               AND NOT EXISTS (
-                   SELECT 1 FROM conversations
-                   WHERE product_conversation_id = ?1
-               )",
-        )
-        .bind(product_conversation_id)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(
-            "DELETE FROM close_legacy_fk787_cleanup_provenance
-             WHERE attempt_id IN (
-                 SELECT attempt_id FROM close_obligations
-                 WHERE product_conversation_id = ?1 AND phase = 'completed'
-             )
-               AND NOT EXISTS (
-                   SELECT 1 FROM conversations
-                   WHERE product_conversation_id = ?1
-               )",
-        )
-        .bind(product_conversation_id)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(
-            "DELETE FROM close_worktree_cleanup_plans
-             WHERE attempt_id IN (
-                 SELECT attempt_id FROM close_obligations
-                 WHERE product_conversation_id = ?1
-             )
-               AND NOT EXISTS (
-                   SELECT 1 FROM conversations
-                   WHERE product_conversation_id = ?1
-               )",
-        )
-        .bind(product_conversation_id)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(
-            "DELETE FROM close_retirement_resource_dispatches
-             WHERE attempt_id IN (
-                 SELECT attempt_id FROM close_obligations
-                 WHERE product_conversation_id = ?1
-             )
-               AND NOT EXISTS (
-                   SELECT 1 FROM conversations
-                   WHERE product_conversation_id = ?1
-               )",
-        )
-        .bind(product_conversation_id)
-        .execute(&mut *connection)
-        .await?;
+        Self::delete_completed_close_history(connection, product_conversation_id).await?;
         sqlx::query(
             "DELETE FROM approved_task_creation_bindings
              WHERE source_product_conversation_id = ?1

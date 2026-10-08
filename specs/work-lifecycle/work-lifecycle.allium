@@ -224,7 +224,10 @@ external entity WorktreeRetirementReceiptAdoption {
     adopted_at_unix_micros: Integer
 }
 
-enum ReceiptAdoptionState { pending, finalized }
+enum ReceiptAdoptionState {
+    pending
+    | finalized
+}
 
 ------------------------------------------------------------
 -- Rules
