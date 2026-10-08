@@ -9294,7 +9294,9 @@ mod scope_liveness_tests {
             .retire_close_runtime_resources(attempt_id.clone())
             .await
             .unwrap_err();
-        assert!(error.contains("worktree cannot be reinspected before live resource retirement"));
+        assert!(error
+            .to_string()
+            .contains("worktree cannot be reinspected before live resource retirement"));
 
         let obligation = manager
             .db()
