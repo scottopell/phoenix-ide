@@ -9722,18 +9722,26 @@ mod scope_liveness_tests {
                 panic!("post-delete or changed identity must not inspect writers")
             }));
             let manager = Arc::new(manager);
-            assert_eq!(
-                manager
-                    .resume_pending_close_runtime_retirements()
-                    .await
-                    .unwrap(),
-                usize::from(state == "empty")
-            );
+            let resumed = manager
+                .resume_pending_close_runtime_retirements()
+                .await
+                .unwrap();
             let obligation = manager
                 .db()
                 .get_close_obligation(attempt_id.as_str())
                 .await
                 .unwrap();
+            let evidence = manager
+                .db()
+                .list_close_retirement_evidence(attempt_id.as_str())
+                .await
+                .unwrap();
+            assert_eq!(
+                resumed,
+                usize::from(state == "empty"),
+                "state={state} phase={:?} evidence={evidence:?}",
+                obligation.phase()
+            );
             assert_eq!(
                 obligation.phase(),
                 if state == "empty" {
@@ -9750,11 +9758,6 @@ mod scope_liveness_tests {
             } else {
                 assert!(root.is_dir());
                 assert!(administrative_dir.exists());
-                let evidence = manager
-                    .db()
-                    .list_close_retirement_evidence(attempt_id.as_str())
-                    .await
-                    .unwrap();
                 assert_eq!(evidence.len(), 1);
                 assert_eq!(evidence[0].scope, scope);
                 assert!(matches!(
