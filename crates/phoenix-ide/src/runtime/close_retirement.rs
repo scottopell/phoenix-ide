@@ -5463,14 +5463,6 @@ where
         }
 
         after_quarantine(&path);
-        if quarantine_has_open_descriptors(&quarantine)?.found() {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "open descriptors can still modify the confirmed worktree; retained at {}",
-                    quarantine.display()
-                ),
-            });
-        }
         if path
             .try_exists()
             .map_err(|error| format!("cannot inspect original worktree path: {error}"))?
