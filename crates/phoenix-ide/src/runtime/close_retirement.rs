@@ -5683,6 +5683,7 @@ mod tests {
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
+    use std::collections::BTreeSet;
     use std::io::Write as _;
     #[cfg(target_os = "linux")]
     use std::io::{BufRead as _, Read as _};
