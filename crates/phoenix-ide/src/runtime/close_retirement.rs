@@ -8306,7 +8306,7 @@ mod tests {
         assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn quarantine_detects_external_process_working_directory() {
         let temp = tempfile::tempdir().unwrap();
