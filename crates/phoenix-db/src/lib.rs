@@ -11,7 +11,10 @@ mod coordinator_query;
 mod coordinator_watches;
 mod federation_enrollment;
 mod federation_peers;
-pub use coordinator_watches::{PendingWatchEvent, WatchSnapshot};
+pub use coordinator_watches::{
+    append_mandatory_close_failure_event_tx, CloseFailureStop, PendingWatchEvent, WatchEventRoute,
+    WatchSnapshot,
+};
 mod ddl;
 mod git_repository_reconciliation;
 mod message_attachments;

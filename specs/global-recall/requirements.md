@@ -367,8 +367,15 @@ THE SYSTEM SHALL deliver factual packets with source identity, occurrence identi
 
 THE SYSTEM SHALL admit notifications through ordinary durable input admission or steering, with stable replay identity, and SHALL NOT introduce a separate execution scheduler.
 
-WHEN removal or source Close precedes notification acceptance
-THE SYSTEM SHALL suppress the unaccepted notification.
+WHEN removal or source Close precedes subscription notification acceptance
+THE SYSTEM SHALL suppress the unaccepted subscription notification.
+
+WHEN a distinct Close cleanup failure is durably recorded
+THE SYSTEM SHALL append a mandatory factual notification to the same event outbox, regardless of watch enrollment or source History membership, and SHALL route it to the current Global Coordinator transcript.
+
+THE SYSTEM SHALL identify the mandatory notification by the persisted failure occurrence, SHALL deduplicate replay of that occurrence, and SHALL emit a new notification for a distinct failure of a newly authorized cleanup run.
+
+THE SYSTEM SHALL preserve the failure and notification atomically, SHALL distinguish confirmed conversation-and-process shutdown from uncertain shutdown in the notification, and SHALL NOT treat notification delivery or failure as authorization to resume cleanup.
 
 WHEN notification acceptance precedes removal or source Close
 THE SYSTEM SHALL retain accepted input without retraction.

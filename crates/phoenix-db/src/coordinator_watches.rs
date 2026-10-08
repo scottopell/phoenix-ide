@@ -1,3 +1,9 @@
+mod mandatory_close;
+use mandatory_close::decode_route;
+pub use mandatory_close::{
+    append_mandatory_close_failure_event_tx, CloseFailureStop, WatchEventRoute,
+};
+
 use chrono::Utc;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use serde::Serialize;
@@ -18,6 +24,7 @@ pub struct WatchSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct PendingWatchEvent {
+    pub route: WatchEventRoute,
     pub event_id: String,
     pub product_conversation_id: ProductConversationId,
     pub source_transcript_id: String,
@@ -133,7 +140,7 @@ impl Database {
     /// # Errors
     /// Returns a database error if suppression fails.
     pub async fn suppress_stale_watch_event(&self, event_id: &str) -> DbResult<()> {
-        sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed' WHERE event_id = ?1 AND delivery_state = 'pending' AND NOT EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p ON p.id = w.source_product_conversation_id WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open')")
+        sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed' WHERE event_id = ?1 AND route_kind = 'subscription' AND delivery_state = 'pending' AND NOT EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p ON p.id = w.source_product_conversation_id WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open')")
             .bind(event_id).execute(self.pool()).await?;
         Ok(())
     }
@@ -158,21 +165,29 @@ impl Database {
         &self,
         limit: i64,
     ) -> DbResult<Vec<PendingWatchEvent>> {
-        let rows = sqlx::query("SELECT e.event_id, w.source_product_conversation_id,
+        let rows = sqlx::query("SELECT e.event_id, e.route_kind,
+                  COALESCE(w.source_product_conversation_id, f.source_product_conversation_id) AS source_product_conversation_id,
                   e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
-                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us
-             FROM coordinator_watch_events e JOIN coordinator_watches w ON w.id = e.watch_id
-             JOIN product_conversations p ON p.id = w.source_product_conversation_id
-             WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none' AND w.ended_at_us IS NULL
-               AND p.ordinary_lifecycle = 'open'
-               AND NOT EXISTS (SELECT 1 FROM close_obligations o
-                               WHERE o.product_conversation_id = p.id AND o.phase != 'completed')
+                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
+                  f.scope, f.resource_kind, f.identity_kind, f.identity_codec, f.identity_value,
+                  f.detail, f.stop_certainty, f.stop_confirmed_at_unix_us
+             FROM coordinator_watch_events e
+             LEFT JOIN coordinator_watches w ON w.id = e.watch_id
+             LEFT JOIN product_conversations p ON p.id = w.source_product_conversation_id
+             LEFT JOIN close_cleanup_failures f ON f.failure_occurrence_id = e.mandatory_failure_occurrence_id
+             WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none'
+               AND (e.route_kind = 'mandatory_close_failure' OR
+                    (e.route_kind = 'subscription' AND w.ended_at_us IS NULL
+                     AND p.ordinary_lifecycle = 'open'
+                     AND NOT EXISTS (SELECT 1 FROM close_obligations o
+                                     WHERE o.product_conversation_id = p.id AND o.phase != 'completed')))
              ORDER BY e.occurred_at_us, e.event_id LIMIT ?1")
             .bind(limit).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
                 let product_id: String = row.try_get("source_product_conversation_id")?;
                 Ok(PendingWatchEvent {
+                    route: decode_route(&row)?,
                     event_id: row.try_get("event_id")?,
                     product_conversation_id: ProductConversationId::parse(product_id)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,

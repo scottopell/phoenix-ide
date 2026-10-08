@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use phoenix_core::domain::db_schema::InputOrigin;
-use phoenix_db::PendingWatchEvent;
+use phoenix_db::{CloseFailureStop, PendingWatchEvent, WatchEventRoute};
 
 use crate::runtime::RuntimeManager;
 use crate::send_chat_service::{
@@ -9,8 +9,12 @@ use crate::send_chat_service::{
 };
 
 fn notification(event: &PendingWatchEvent) -> String {
+    let label = match &event.route {
+        WatchEventRoute::Subscription => "Watched conversation terminal event",
+        WatchEventRoute::MandatoryCloseFailure { .. } => "Mandatory Close cleanup failure",
+    };
     let mut text = format!(
-        "Watched conversation terminal event. Event ID: {}. Stable ProductConversation: {}. Source transcript: {}. Source occurrence: {} {}. Source generation: {}. Outcome: {}. Occurred at (Unix microseconds): {}.",
+        "{label}. Event ID: {}. Stable ProductConversation: {}. Source transcript: {}. Source occurrence: {} {}. Source generation: {}. Outcome: {}. Occurred at (Unix microseconds): {}.",
         event.event_id,
         event.product_conversation_id.as_str(),
         event.source_transcript_id,
@@ -23,6 +27,30 @@ fn notification(event: &PendingWatchEvent) -> String {
     if let Some(reason) = &event.terminal_reason {
         text.push_str(" Reason: ");
         text.push_str(reason);
+    }
+    if let WatchEventRoute::MandatoryCloseFailure {
+        scope,
+        resource_kind,
+        identity_kind,
+        identity_codec,
+        identity_value,
+        detail,
+        stop,
+    } = &event.route
+    {
+        text.push_str(&format!(
+            " Scope: {scope}. Resource kind: {resource_kind}. Identity ({identity_kind}, {identity_codec}): {identity_value}. Detail: {detail}."
+        ));
+        match stop {
+            CloseFailureStop::ConversationAndProcessesStopped {
+                confirmed_at_unix_us,
+            } => {
+                text.push_str(&format!(" Conversation and processes stopped, confirmed at (Unix microseconds): {confirmed_at_unix_us}. Cleanup needs attention."));
+            }
+            CloseFailureStop::ShutdownUncertain => {
+                text.push_str(" Shutdown uncertain. Close incomplete.");
+            }
+        }
     }
     text
 }
@@ -80,5 +108,68 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phoenix_core::domain::product_conversation::ProductConversationId;
+
+    fn failure(stop: CloseFailureStop) -> PendingWatchEvent {
+        PendingWatchEvent {
+            route: WatchEventRoute::MandatoryCloseFailure {
+                scope: "scope-1".into(),
+                resource_kind: "worktree".into(),
+                identity_kind: "path".into(),
+                identity_codec: "utf8".into(),
+                identity_value: "/preserved/worktree".into(),
+                detail: "resource preserved".into(),
+                stop,
+            },
+            event_id: "failure-1".into(),
+            product_conversation_id: ProductConversationId::parse("product-1").unwrap(),
+            source_transcript_id: "root-1".into(),
+            source_occurrence_kind: "close_cleanup_failure".into(),
+            source_occurrence_id: "failure-1".into(),
+            source_generation: 0,
+            terminal_kind: "cleanup_failed".into(),
+            terminal_reason: Some("remove failed".into()),
+            occurred_at_us: 20,
+        }
+    }
+
+    #[test]
+    fn confirmed_cleanup_failure_is_not_an_ordinary_watch_or_success() {
+        let text = notification(&failure(
+            CloseFailureStop::ConversationAndProcessesStopped {
+                confirmed_at_unix_us: 10,
+            },
+        ));
+        for fact in [
+            "Mandatory Close cleanup failure",
+            "product-1",
+            "root-1",
+            "failure-1",
+            "scope-1",
+            "worktree",
+            "/preserved/worktree",
+            "resource preserved",
+            "remove failed",
+            "Conversation and processes stopped",
+            "Cleanup needs attention",
+        ] {
+            assert!(text.contains(fact), "missing {fact}: {text}");
+        }
+        assert!(!text.contains("Watched conversation"));
+        assert!(!text.contains("Close incomplete"));
+    }
+
+    #[test]
+    fn uncertain_shutdown_never_claims_confirmed_stop() {
+        let text = notification(&failure(CloseFailureStop::ShutdownUncertain));
+        assert!(text.contains("Shutdown uncertain. Close incomplete."));
+        assert!(!text.contains("Conversation and processes stopped"));
+        assert!(!text.contains("confirmed at"));
     }
 }
