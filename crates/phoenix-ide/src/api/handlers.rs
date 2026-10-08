@@ -571,6 +571,10 @@ pub fn create_router(state: AppState) -> Router {
             post(super::federation::issue_enrollment),
         )
         .route(
+            "/api/federation/peers/import",
+            post(super::federation::import_peer_connection),
+        )
+        .route(
             "/api/federation/enrollments/:caller_instance_id/revoke",
             post(super::federation::revoke_enrollment),
         )
@@ -9989,6 +9993,8 @@ pub(crate) mod hard_delete_cascade_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -16253,6 +16259,8 @@ mod regenerate_conversation_name_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -16489,6 +16497,8 @@ mod upgrade_model_state_guard_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -16788,6 +16798,8 @@ mod file_read_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -17572,6 +17584,8 @@ mod chat_authority_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -17896,6 +17910,8 @@ mod wake_handler_tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -17980,6 +17996,52 @@ mod wake_handler_tests {
             )
             .await
             .expect("router response")
+    }
+
+    #[tokio::test]
+    async fn peer_import_requires_owner_authentication() {
+        use phoenix_core::domain::instance_identity::InstanceId;
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let local = state.db.instance_id().await.unwrap();
+        let body = serde_json::json!({
+            "peer_display_name": "peer",
+            "base_url": "https://peer.example",
+            "enrollment": {
+                "receiver_instance_id": InstanceId::new(),
+                "caller_instance_id": local,
+                "token": format!("phx_peer_{}", "a".repeat(43)),
+                "tls_trust": { "kind": "platform_roots" },
+            }
+        });
+        let app = router(state, true, Some("owner-password".to_string()));
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peers/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let imported = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peers/import")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer owner-password")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::OK);
     }
 
     #[tokio::test]

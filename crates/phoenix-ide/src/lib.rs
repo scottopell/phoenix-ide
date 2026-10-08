@@ -113,7 +113,7 @@ fn build_deployment_config(
         (Some(source), Some(loaded)) => {
             let hosts = match source {
                 tls::ConfigSource::Auto { hosts, .. } => hosts.clone(),
-                tls::ConfigSource::Manual(_) => Vec::new(),
+                tls::ConfigSource::Manual { .. } => Vec::new(),
             };
             TlsInfo {
                 enabled: true,
@@ -379,7 +379,7 @@ fn build_disk_locations(
                 mode: MeasureMode::RecurseSmall,
             });
         }
-        (Some(tls::ConfigSource::Manual(_)), Some(loaded)) => {
+        (Some(tls::ConfigSource::Manual { .. }), Some(loaded)) => {
             locations.push(DiskLocation {
                 category: DiskCategory::Tls,
                 label: "TLS certificate".to_string(),
@@ -847,6 +847,17 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         Some(source) => Some(tls::load_config(source)?),
         None => None,
     };
+    let federation_tls_trust = match loaded_tls
+        .as_ref()
+        .and_then(|tls| tls.ca_cert_path.as_ref())
+    {
+        Some(path) => phoenix_core::domain::instance_identity::PeerTlsTrust::PrivateCa {
+            certificate_pem: phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+                std::fs::read_to_string(path)?,
+            )?,
+        },
+        None => phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+    };
 
     // Bind (or adopt the systemd socket-activated) listener now, so the
     // deployment report records the address the server is actually bound to.
@@ -970,6 +981,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         deployment,
         runtime_env,
         suggest_token,
+        federation_tls_trust,
     )
     .await?;
 

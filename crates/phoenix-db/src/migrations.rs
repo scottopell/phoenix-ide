@@ -601,12 +601,31 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_conversation_tool_policy",
         sql: MIGRATION_117,
     },
+    Migration {
+        version: 118,
+        name: "persist_federation_peer_tls_trust",
+        sql: MIGRATION_118,
+    },
 ];
 
 const MIGRATION_117: &str = concat!(
     include_str!("tool_availability.sql"),
     include_str!("responses_replay.sql")
 );
+
+const MIGRATION_118: &str = r#"
+ALTER TABLE federation_peer_connections
+ADD COLUMN tls_ca_certificate_pem TEXT
+CHECK (
+    tls_ca_certificate_pem IS NULL
+    OR (
+        typeof(tls_ca_certificate_pem) = 'text'
+        AND length(tls_ca_certificate_pem) BETWEEN 1 AND 32768
+        AND tls_ca_certificate_pem LIKE '-----BEGIN CERTIFICATE-----%'
+        AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
+    )
+);
+"#;
 
 const MIGRATION_113: &str = "";
 
@@ -11885,6 +11904,34 @@ mod tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn migration_118_preserves_existing_peers_as_platform_root_trust() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(MIGRATION_116).execute(&pool).await.unwrap();
+        let peer = phoenix_core::domain::instance_identity::InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections
+                 (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
+             VALUES (?1, 'peer', 'peer.example', 443, ?2, 1)",
+        )
+        .bind(peer.to_string())
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_118).execute(&pool).await.unwrap();
+        let trust: Option<String> = sqlx::query_scalar(
+            "SELECT tls_ca_certificate_pem FROM federation_peer_connections
+             WHERE peer_instance_id = ?1",
+        )
+        .bind(peer.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(trust, None);
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
@@ -11892,13 +11939,13 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(7).copied().collect::<Vec<_>>(),
             vec![
+                (118, "persist_federation_peer_tls_trust"),
                 (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),
                 (114, "persist_instance_identity"),
                 (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
-                (111, "coordinator_conversation_watches"),
             ]
         );
     }

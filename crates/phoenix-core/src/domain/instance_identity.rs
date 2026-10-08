@@ -1,3 +1,4 @@
+use rustls_pki_types::pem::PemObject as _;
 use std::fmt;
 use std::str::FromStr;
 
@@ -209,6 +210,91 @@ impl PeerBearerCredential {
     }
 }
 
+const MAX_PEER_CA_CERTIFICATE_PEM_BYTES: usize = 32 * 1024;
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PeerTlsTrust {
+    PlatformRoots,
+    PrivateCa {
+        certificate_pem: PeerCaCertificatePem,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerCaCertificatePem(String);
+
+impl PeerCaCertificatePem {
+    /// Parse one bounded public CA certificate in PEM form.
+    ///
+    /// # Errors
+    /// Returns an error when the value is empty, oversized, malformed, or contains anything other
+    /// than one certificate.
+    pub fn parse(value: impl Into<String>) -> Result<Self, PeerCaCertificatePemError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(PeerCaCertificatePemError::Empty);
+        }
+        if value.len() > MAX_PEER_CA_CERTIFICATE_PEM_BYTES {
+            return Err(PeerCaCertificatePemError::TooLarge);
+        }
+        let trimmed = value.trim();
+        if !trimmed.starts_with("-----BEGIN CERTIFICATE-----")
+            || !trimmed.ends_with("-----END CERTIFICATE-----")
+            || trimmed["-----BEGIN CERTIFICATE-----".len()..].contains("-----BEGIN ")
+        {
+            return Err(PeerCaCertificatePemError::CertificateCount);
+        }
+        let certificates = rustls_pki_types::CertificateDer::pem_slice_iter(trimmed.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PeerCaCertificatePemError::Invalid)?;
+        if certificates.len() != 1 {
+            return Err(PeerCaCertificatePemError::CertificateCount);
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(certificates.into_iter().next().expect("length checked"))
+            .map_err(|_| PeerCaCertificatePemError::Invalid)?;
+        Ok(Self(format!("{trimmed}\n")))
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl serde::Serialize for PeerCaCertificatePem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.expose())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PeerCaCertificatePem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PeerCaCertificatePemError {
+    #[error("peer CA certificate PEM must not be empty")]
+    Empty,
+    #[error("peer CA certificate PEM exceeds 32 KiB")]
+    TooLarge,
+    #[error("peer CA certificate PEM is invalid")]
+    Invalid,
+    #[error("peer CA certificate PEM must contain exactly one certificate")]
+    CertificateCount,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FederationCredentialVerifier([u8; 32]);
 
@@ -265,6 +351,41 @@ mod tests {
         ] {
             assert!(PeerBearerCredential::parse(value).is_err());
         }
+    }
+
+    #[test]
+    fn peer_private_ca_requires_one_bounded_certificate() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = phoenix_tls::ensure_ca(temp.path()).unwrap();
+        let certificate = std::fs::read_to_string(paths.cert_path).unwrap();
+        assert_eq!(
+            PeerCaCertificatePem::parse(&certificate).unwrap().expose(),
+            certificate
+        );
+        assert_eq!(
+            PeerCaCertificatePem::parse(" ").unwrap_err(),
+            PeerCaCertificatePemError::Empty
+        );
+        assert_eq!(
+            PeerCaCertificatePem::parse(format!("{certificate}{certificate}")).unwrap_err(),
+            PeerCaCertificatePemError::CertificateCount
+        );
+        let private_key = std::fs::read_to_string(paths.key_path).unwrap();
+        assert_eq!(
+            PeerCaCertificatePem::parse(format!("{certificate}{private_key}")).unwrap_err(),
+            PeerCaCertificatePemError::CertificateCount
+        );
+        assert_eq!(
+            PeerCaCertificatePem::parse(format!("{certificate}not PEM")).unwrap_err(),
+            PeerCaCertificatePemError::CertificateCount
+        );
+        assert_eq!(
+            PeerCaCertificatePem::parse(
+                "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----"
+            )
+            .unwrap_err(),
+            PeerCaCertificatePemError::Invalid
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use std::str::FromStr;
 
 use chrono::Utc;
-use phoenix_core::domain::instance_identity::{InstanceId, PeerBaseUrl, PeerBearerCredential};
+use phoenix_core::domain::instance_identity::{
+    InstanceId, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem, PeerTlsTrust,
+};
 use sqlx::Row;
 
 use crate::{Database, DbError, DbResult};
@@ -11,6 +13,7 @@ pub struct FederationPeerConnection {
     pub peer_display_name: String,
     pub base_url: PeerBaseUrl,
     pub bearer_credential: PeerBearerCredential,
+    pub tls_trust: PeerTlsTrust,
     pub created_at: chrono::DateTime<Utc>,
 }
 
@@ -25,18 +28,25 @@ impl Database {
         peer_display_name: &str,
         base_url: &PeerBaseUrl,
         bearer_credential: &PeerBearerCredential,
+        tls_trust: &PeerTlsTrust,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = Utc::now().timestamp_micros();
+        let tls_ca_certificate_pem = match tls_trust {
+            PeerTlsTrust::PlatformRoots => None,
+            PeerTlsTrust::PrivateCa { certificate_pem } => Some(certificate_pem.expose()),
+        };
         sqlx::query(
             "INSERT INTO federation_peer_connections
-                 (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (peer_instance_id, peer_display_name, host, port, bearer_credential,
+                  tls_ca_certificate_pem, created_at_us)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(peer_instance_id) DO UPDATE SET
                  peer_display_name = excluded.peer_display_name,
                  host = excluded.host,
                  port = excluded.port,
                  bearer_credential = excluded.bearer_credential,
+                 tls_ca_certificate_pem = excluded.tls_ca_certificate_pem,
                  created_at_us = excluded.created_at_us",
         )
         .bind(peer_instance_id.to_string())
@@ -44,6 +54,7 @@ impl Database {
         .bind(base_url.host())
         .bind(i64::from(base_url.port()))
         .bind(bearer_credential.expose())
+        .bind(tls_ca_certificate_pem)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -60,7 +71,8 @@ impl Database {
         peer_instance_id: InstanceId,
     ) -> DbResult<Option<FederationPeerConnection>> {
         let row = sqlx::query(
-            "SELECT peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us
+            "SELECT peer_instance_id, peer_display_name, host, port, bearer_credential,
+                    tls_ca_certificate_pem, created_at_us
              FROM federation_peer_connections WHERE peer_instance_id = ?1",
         )
         .bind(peer_instance_id.to_string())
@@ -71,6 +83,7 @@ impl Database {
             let host: String = row.try_get("host")?;
             let port: i64 = row.try_get("port")?;
             let bearer: String = row.try_get("bearer_credential")?;
+            let ca_certificate: Option<String> = row.try_get("tls_ca_certificate_pem")?;
             let created_at_us: i64 = row.try_get("created_at_us")?;
             Ok(FederationPeerConnection {
                 peer_instance_id: InstanceId::from_str(&id)
@@ -84,6 +97,13 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
                 bearer_credential: PeerBearerCredential::parse(bearer)
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
+                tls_trust: match ca_certificate {
+                    Some(certificate) => PeerTlsTrust::PrivateCa {
+                        certificate_pem: PeerCaCertificatePem::parse(certificate)
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    },
+                    None => PeerTlsTrust::PlatformRoots,
+                },
                 created_at: chrono::DateTime::from_timestamp_micros(created_at_us).ok_or_else(
                     || DbError::Serialization("peer creation timestamp is out of range".into()),
                 )?,
@@ -166,17 +186,38 @@ mod tests {
         let second_token =
             PeerBearerCredential::parse(format!("phx_peer_{}", "b".repeat(43))).unwrap();
 
-        db.save_federation_peer_connection(peer, "peer", &first_url, &first_token)
-            .await
-            .unwrap();
-        db.save_federation_peer_connection(peer, "renamed", &second_url, &second_token)
-            .await
-            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let ca_paths = phoenix_tls::ensure_ca(temp.path()).unwrap();
+        let private_ca = PeerTlsTrust::PrivateCa {
+            certificate_pem: PeerCaCertificatePem::parse(
+                std::fs::read_to_string(ca_paths.cert_path).unwrap(),
+            )
+            .unwrap(),
+        };
+        db.save_federation_peer_connection(
+            peer,
+            "peer",
+            &first_url,
+            &first_token,
+            &PeerTlsTrust::PlatformRoots,
+        )
+        .await
+        .unwrap();
+        db.save_federation_peer_connection(
+            peer,
+            "renamed",
+            &second_url,
+            &second_token,
+            &private_ca,
+        )
+        .await
+        .unwrap();
         let saved = db.federation_peer_connection(peer).await.unwrap().unwrap();
         assert_eq!(saved.peer_instance_id, peer);
         assert_eq!(saved.peer_display_name, "renamed");
         assert_eq!(saved.base_url, second_url);
         assert_eq!(saved.bearer_credential.expose(), second_token.expose());
+        assert_eq!(saved.tls_trust, private_ca);
         assert!(saved.created_at.timestamp_micros() >= 0);
         assert!(db.remove_federation_peer_connection(peer).await.unwrap());
         assert!(db.federation_peer_connection(peer).await.unwrap().is_none());

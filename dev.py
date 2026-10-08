@@ -3604,12 +3604,18 @@ def cmd_tls_issue(
             args.extend(["--host", item])
         _tls_helper(args)
 
+        ca_cert_path = ca_dir / "phoenix-local-ca.pem"
+        if not ca_cert_path.is_file():
+            raise RuntimeError(f"TLS CA certificate missing after issuance: {ca_cert_path}")
+        shutil.copy2(ca_cert_path, tmp_path / "ca.pem")
+
         metadata = {
             "host": host,
             "hosts": hosts,
             "port": port,
             "cert": "server.pem",
             "key": "server-key.pem",
+            "ca": "ca.pem",
         }
         metadata_path = tmp_path / "phoenix-tls.json"
         metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
@@ -3618,11 +3624,12 @@ def cmd_tls_issue(
             with tarfile.open(fileobj=bundle_file, mode="w:gz") as tar:
                 tar.add(cert_path, arcname="server.pem")
                 tar.add(key_path, arcname="server-key.pem")
+                tar.add(tmp_path / "ca.pem", arcname="ca.pem")
                 tar.add(metadata_path, arcname="phoenix-tls.json")
 
     print(f"Bundle: {bundle_path}")
     print(f"Hosts:  {', '.join(hosts)}")
-    print("Contains: server cert/key only; the CA private key stays local.")
+    print("Contains: server cert/key and public CA cert; the CA private key stays local.")
     print(f"Copy to host, then run: ./dev.py tls install ~/{bundle_path.name}")
 
 
@@ -3644,7 +3651,7 @@ def cmd_tls_install(
         with tarfile.open(bundle, "r:gz") as tar:
             members = tar.getmembers()
             names = {member.name for member in members}
-            expected = {"server.pem", "server-key.pem", "phoenix-tls.json"}
+            expected = {"server.pem", "server-key.pem", "ca.pem", "phoenix-tls.json"}
             if names != expected or not all(member.isfile() for member in members):
                 print(f"ERROR: invalid TLS bundle contents: {sorted(names)}", file=sys.stderr)
                 sys.exit(1)
@@ -3658,10 +3665,13 @@ def cmd_tls_install(
 
         cert_dest = install_dir / f"{name}.pem"
         key_dest = install_dir / f"{name}-key.pem"
+        ca_dest = install_dir / f"{name}-ca.pem"
         shutil.copy2(tmp_path / "server.pem", cert_dest)
         shutil.copy2(tmp_path / "server-key.pem", key_dest)
+        shutil.copy2(tmp_path / "ca.pem", ca_dest)
         cert_dest.chmod(0o644)
         key_dest.chmod(0o600)
+        ca_dest.chmod(0o644)
 
     _update_env_file(
         env_file,
@@ -3669,12 +3679,14 @@ def cmd_tls_install(
             "PHOENIX_TLS": "manual",
             "PHOENIX_TLS_CERT_PATH": str(cert_dest),
             "PHOENIX_TLS_KEY_PATH": str(key_dest),
+            "PHOENIX_TLS_CA_CERT_PATH": str(ca_dest),
             "PHOENIX_PUBLIC_URL": f"https://{host}:{port}",
         },
     )
 
     print(f"Installed cert: {cert_dest}")
     print(f"Installed key:  {key_dest}")
+    print(f"Installed CA:   {ca_dest}")
     print(f"Updated env:    {env_file}")
     print("Run: ./dev.py prod deploy")
 

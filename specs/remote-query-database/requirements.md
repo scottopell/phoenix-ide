@@ -74,6 +74,16 @@ AND SHALL NOT apply it to another peer, disable certificate or hostname verifica
 IF the selected peer's TLS trust cannot be established
 THE SYSTEM SHALL fail the operation without an insecure transport fallback.
 
+THE owner-authorized enrollment transfer SHALL identify platform roots or carry exactly one bounded public private-CA certificate
+AND SHALL NOT carry a private key, infer trust on first use, or replace an enrolled trust anchor without an explicit owner-authorized import.
+
+THE owner SHALL supply the peer origin during import
+AND THE SYSTEM SHALL persist that owner assertion atomically with the transferred receiver identity, credential, and TLS trust.
+
+WHEN migration adds typed TLS trust to a persisted peer connection
+THE SYSTEM SHALL preserve a row without a private-CA certificate as platform-root trust
+AND SHALL NOT infer or fabricate a private trust anchor for that row.
+
 ### REQ-RQD-005: Authoritative Caller and Destination Provenance
 
 WHEN the receiver accepts a remote query request

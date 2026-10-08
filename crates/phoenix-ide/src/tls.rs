@@ -73,8 +73,14 @@ where
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConfigSource {
-    Manual(Paths),
-    Auto { dir: PathBuf, hosts: Vec<String> },
+    Manual {
+        paths: Paths,
+        ca_cert_path: Option<PathBuf>,
+    },
+    Auto {
+        dir: PathBuf,
+        hosts: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -113,20 +119,24 @@ impl ConfigSource {
     pub(crate) fn external_host(&self) -> Option<String> {
         match self {
             Self::Auto { hosts, .. } => hosts.iter().find(|h| !is_loopback_host(h)).cloned(),
-            Self::Manual(_) => None,
+            Self::Manual { .. } => None,
         }
     }
 
     pub(crate) fn from_env(db_path: &str) -> Result<Option<Self>, Box<dyn Error>> {
         let cert_path = env::var_os("PHOENIX_TLS_CERT_PATH");
         let key_path = env::var_os("PHOENIX_TLS_KEY_PATH");
+        let ca_cert_path = env::var_os("PHOENIX_TLS_CA_CERT_PATH").map(PathBuf::from);
         let mode = env::var("PHOENIX_TLS").unwrap_or_default();
 
         match (cert_path, key_path) {
-            (Some(cert_path), Some(key_path)) => Ok(Some(Self::Manual(Paths {
-                cert_path: PathBuf::from(cert_path),
-                key_path: PathBuf::from(key_path),
-            }))),
+            (Some(cert_path), Some(key_path)) => Ok(Some(Self::Manual {
+                paths: Paths {
+                    cert_path: PathBuf::from(cert_path),
+                    key_path: PathBuf::from(key_path),
+                },
+                ca_cert_path,
+            })),
             (Some(_), None) => {
                 Err("PHOENIX_TLS_CERT_PATH is set but PHOENIX_TLS_KEY_PATH is missing".into())
             }
@@ -154,7 +164,10 @@ impl ConfigSource {
 
 pub(crate) fn load_config(source: &ConfigSource) -> Result<LoadedConfig, Box<dyn Error>> {
     let (paths, ca_cert_path, mode) = match source {
-        ConfigSource::Manual(paths) => (paths.clone(), None, "manual"),
+        ConfigSource::Manual {
+            paths,
+            ca_cert_path,
+        } => (paths.clone(), ca_cert_path.clone(), "manual"),
         ConfigSource::Auto { dir, hosts } => {
             let managed = ensure_managed_cert(dir, hosts)?;
             let ca_cert_path = Some(dir.join("phoenix-local-ca.pem"));
