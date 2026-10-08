@@ -305,10 +305,13 @@ struct PreviousCursor {
 }
 
 fn previous_scope(binding: &PreviousTranscriptsBinding) -> String {
-    sha256_hex(&format!(
-        "{}:{}",
-        binding.product_conversation_id, binding.executing_transcript_id
-    ))
+    sha256_hex(
+        &serde_json::to_string(&(
+            binding.product_conversation_id.as_str(),
+            binding.executing_transcript_id.as_str(),
+        ))
+        .expect("cursor scope tuple serializes"),
+    )
 }
 
 fn previous_cursor_target(target: &str) -> String {
@@ -775,7 +778,10 @@ impl GlobalReadService {
 }
 
 fn bounded_message_provenance(transcript_id: &str, message_id: &str) -> PreviousMessageProvenance {
-    let message_ref = format!("@transcript:{transcript_id}#message-{message_id}");
+    let message_ref = format!(
+        "{}#message-{message_id}",
+        bounded_transcript_ref(transcript_id)
+    );
     if message_ref.len() <= 1024
         && message_id
             .chars()
