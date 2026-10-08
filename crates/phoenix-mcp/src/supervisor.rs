@@ -362,6 +362,30 @@ impl SupervisorHandle {
         self.fail_with_teardown_retry(epoch, error, None).await
     }
 
+    pub(crate) async fn retain_quiescence_failure(
+        &self,
+        epoch: u64,
+        error: String,
+        server: McpServer,
+        oauth_plan: Option<OAuthRetryPlan>,
+    ) {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .mailbox
+            .send(Command::RetainQuiescenceFailure {
+                epoch,
+                error,
+                server,
+                oauth_plan,
+                reply,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = receive.await;
+        }
+    }
+
     pub(crate) async fn retain_oauth_handshake_failure(
         &self,
         epoch: u64,
@@ -704,6 +728,13 @@ enum Command {
         error: String,
         teardown_retry: Option<McpServer>,
         reply: oneshot::Sender<bool>,
+    },
+    RetainQuiescenceFailure {
+        epoch: u64,
+        error: String,
+        server: McpServer,
+        oauth_plan: Option<OAuthRetryPlan>,
+        reply: oneshot::Sender<()>,
     },
     Unauthorized {
         epoch: u64,
@@ -1343,6 +1374,38 @@ impl Actor {
                     }
                     let _ = reply.send(false);
                 }
+            }
+            Command::RetainQuiescenceFailure {
+                epoch,
+                error,
+                server,
+                oauth_plan,
+                reply,
+            } => {
+                let current = epoch == self.epoch;
+                for cancellation in self.active_calls.values() {
+                    cancellation.cancel();
+                }
+                self.active_calls.clear();
+                if let SupervisorState::Ready(server) =
+                    std::mem::replace(&mut self.state, SupervisorState::Failed)
+                {
+                    self.teardown_retry.push(RetainedTransport::Other(server));
+                }
+                let server = Arc::new(server);
+                self.teardown_retry.push(match oauth_plan {
+                    Some(plan) if current => RetainedTransport::OAuthRecovery {
+                        server,
+                        retry_plan: Some(plan),
+                    },
+                    Some(_) | None => RetainedTransport::Other(server),
+                });
+                if !current {
+                    self.epoch = self.epoch.wrapping_add(1);
+                }
+                self.recovery_from = None;
+                self.publish_snapshot(Some(error), None);
+                let _ = reply.send(());
             }
             Command::Fail {
                 epoch,

@@ -58,11 +58,12 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
   useEffect(() => {
     let cancelled = false;
     const shouldStopPolling = (s: McpServerStatus[]) =>
-      s.length > 0 && s.every(srv => !srv.pending_oauth_url) && reloadSettled(s);
+      (s.length > 0 || awaitingRef.current !== null) && s.every(srv => !srv.pending_oauth_url) && reloadSettled(s);
 
     fetchStatus().then(count => {
       if (cancelled) return;
       if (count > 0 && shouldStopPolling(servers)) return;
+      if (pollRef.current) return;
       pollRef.current = setInterval(async () => {
         await fetchStatus();
         // Re-evaluate stop condition after each fetch via the state update.
@@ -78,7 +79,7 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
   // settled.
   useEffect(() => {
     if (
-      servers.length > 0 &&
+      (servers.length > 0 || awaitingRef.current !== null) &&
       servers.every(s => !s.pending_oauth_url) &&
       reloadSettled(servers) &&
       pollRef.current
@@ -113,8 +114,9 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
       // because a timed-out restart still has a background connect running that
       // may publish successfully and clear the failure.
       awaitingRef.current = new Map<string, 'ready' | 'removed'>([
-        ...[...result.added, ...result.restarted, ...result.failed.map(f => f.server)]
+        ...[...result.added, ...result.restarted]
           .map(name => [name, 'ready'] as const),
+        ...result.failed.map(f => [f.server, f.action === 'remove' ? 'removed' : 'ready'] as const),
         ...result.pending_removals.map(name => [name, 'removed'] as const),
       ]);
       await fetchStatus();

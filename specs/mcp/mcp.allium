@@ -591,6 +591,8 @@ rule TokenRefreshNeeded {
         -- Stream-quiescence failure is a distinct cleanup failure. Stop shutdown
         -- before DELETE and retain the session for explicit retry; handshake
         -- authorization provenance cannot admit automatic recovery through it.
+        -- Preserve that cause through the actor handoff: retain ownership and
+        -- the OAuth retry plan in failed state without retrying shutdown.
         -- Deferred removal reports a pending reload outcome and a removing
         -- status until cleanup forgets its handle or requests authorization.
         -- The panel awaits that outcome even when another server is ready.

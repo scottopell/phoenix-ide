@@ -202,9 +202,11 @@ and verifies the replacement authorization still includes prior required scopes.
 
 `stream_quiescence_failure_blocks_handshake_oauth_cleanup` verifies a panicked
 stream retains its session without DELETE or automatic OAuth recovery, with
-explicit cleanup retry preserving typed 401/403 classification.
+the supervisor handoff retaining failed ownership and an OAuth retry plan until
+explicit cleanup retry, which preserves typed 401/403 classification.
 The pending-configuration authorization matrix verifies later token expiry on
 the applied OAuth configuration refreshes and replays normally.
 The transient-removal matrix verifies `pending_removals` and removing status.
 `McpStatusPanel` polling coverage verifies a later cleanup authorization remains
-visible with another ready server present and polling settles after removal.
+visible with another ready server present and polling settles after removal,
+including removal of the last server and failed removal that later completes.

@@ -395,6 +395,10 @@ struct OAuthHandshakeCleanup {
 enum ConnectTeardown {
     Other(McpServer),
     OAuth(OAuthHandshakeCleanup),
+    Quiescence {
+        server: McpServer,
+        oauth_plan: Option<OAuthRetryPlan>,
+    },
 }
 
 struct ConnectFailure {
@@ -480,7 +484,8 @@ impl HandshakeFailure {
         let message = self.to_string();
         let mut challenges = Vec::new();
         self.authorization_challenges(&mut challenges);
-        let unauthorized = !challenges.is_empty() && !self.quiescence_failed();
+        let unauthorized = !challenges.is_empty();
+        let quiescence_failed = self.quiescence_failed();
         let www_authenticate = merge_oauth_challenges(
             prior_plan
                 .and_then(|plan| plan.www_authenticate.as_deref())
@@ -491,14 +496,21 @@ impl HandshakeFailure {
             Self::Teardown { retry, .. } => ConnectFailure {
                 message,
                 teardown_retry: retry.map(|server| *server).or(caller).map(|server| {
-                    if oauth_resource_url(&server.config).is_some() && unauthorized {
+                    let plan = OAuthRetryPlan {
+                        scopes: prior_plan.map_or_else(Vec::new, |plan| plan.scopes.clone()),
+                        www_authenticate,
+                    };
+                    if quiescence_failed {
+                        let oauth_plan = (oauth_resource_url(&server.config).is_some()
+                            && (unauthorized
+                                || oauth_active(&server.config, &server.oauth_bearer)
+                                || prior_plan.is_some()))
+                        .then_some(plan);
+                        ConnectTeardown::Quiescence { server, oauth_plan }
+                    } else if oauth_resource_url(&server.config).is_some() && unauthorized {
                         ConnectTeardown::OAuth(OAuthHandshakeCleanup {
                             server,
-                            plan: OAuthRetryPlan {
-                                scopes: prior_plan
-                                    .map_or_else(Vec::new, |plan| plan.scopes.clone()),
-                                www_authenticate,
-                            },
+                            plan,
                             action,
                         })
                     } else {
@@ -2784,6 +2796,34 @@ impl McpClientManager {
                                 .await;
                         }
                         Some(ConnectTeardown::Other(server)) => Some(server),
+                        Some(ConnectTeardown::Quiescence {
+                            server,
+                            mut oauth_plan,
+                        }) => {
+                            if let Some(plan) = &mut oauth_plan {
+                                extend_unique(
+                                    &mut plan.scopes,
+                                    configured_oauth_scopes(config).iter().map(String::as_str),
+                                );
+                                if let Ok(Some(token)) = oauth.store().token(name).await {
+                                    extend_unique(
+                                        &mut plan.scopes,
+                                        token.scopes.iter().map(String::as_str),
+                                    );
+                                }
+                                if let Some(scope) =
+                                    plan.www_authenticate.as_deref().and_then(|challenge| {
+                                        oauth::parse_bearer_challenge(challenge).remove("scope")
+                                    })
+                                {
+                                    extend_unique(&mut plan.scopes, scope.split_whitespace());
+                                }
+                            }
+                            handle
+                                .retain_quiescence_failure(epoch, error.clone(), server, oauth_plan)
+                                .await;
+                            return Err(error);
+                        }
                         None => None,
                     };
                     if let Some(url) = pending.read().await.get(name).cloned() {

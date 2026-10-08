@@ -2299,10 +2299,32 @@ mod tests {
                 crate::OAuthHandshakeAction::Refresh,
                 None,
             );
+            let Some(crate::ConnectTeardown::Quiescence {
+                server: retained,
+                oauth_plan,
+            }) = failure.teardown_retry
+            else {
+                panic!("quiescence failure handoff");
+            };
+            let handle = crate::supervisor::SupervisorHandle::connecting(retained.config.clone());
+            handle
+                .retain_quiescence_failure(0, failure.message, retained, oauth_plan)
+                .await;
             assert!(matches!(
-                failure.teardown_retry,
-                Some(crate::ConnectTeardown::Other(_))
+                handle.snapshot().state,
+                crate::supervisor::SupervisorState::Failed
             ));
+            assert!(handle
+                .snapshot()
+                .last_error
+                .unwrap()
+                .contains("fixture stream panic"));
+            assert!(server.requests.lock().unwrap().is_empty());
+            assert!(
+                handle.retry_oauth().await.is_some(),
+                "explicit OAuth retry retains its cleanup plan"
+            );
+            assert!(server.requests.lock().unwrap().is_empty());
             let retry = transport.shutdown().await.unwrap_err();
             assert!(matches!(
                 (status, retry),
@@ -2310,6 +2332,8 @@ mod tests {
                     | (403, TransportError::InsufficientScope { .. })
             ));
             assert_eq!(server.requests.lock().unwrap().len(), 1);
+            server.push_responses(vec![delete_ack()]);
+            handle.remove().await.unwrap();
         }
     }
 
