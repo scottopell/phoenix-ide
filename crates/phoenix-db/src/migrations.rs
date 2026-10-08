@@ -616,7 +616,148 @@ const MIGRATIONS: &[Migration] = &[
         name: "require_close_repair_reinspection",
         sql: MIGRATION_119,
     },
+    Migration {
+        version: 121,
+        name: "retain_close_cleanup_source_inspections",
+        sql: MIGRATION_120,
+    },
 ];
+
+const MIGRATION_120: &str = r"
+CREATE TABLE close_retained_retirement_inspections (
+    attempt_id TEXT NOT NULL,
+    inspection_generation TEXT NOT NULL CHECK (inspection_generation <> ''),
+    inspection_fingerprint TEXT NOT NULL CHECK (inspection_fingerprint <> ''),
+    scope TEXT NOT NULL,
+    generation TEXT NOT NULL CHECK (generation <> ''),
+    fingerprint TEXT NOT NULL CHECK (fingerprint <> ''),
+    inspected_at TEXT NOT NULL,
+    PRIMARY KEY (attempt_id, inspection_generation, inspection_fingerprint, scope),
+    FOREIGN KEY (attempt_id, scope)
+        REFERENCES close_attempt_scopes(attempt_id, scope) ON DELETE CASCADE
+);
+CREATE TRIGGER close_retained_retirement_inspections_reject_invalid_timestamp
+BEFORE INSERT ON close_retained_retirement_inspections
+FOR EACH ROW
+WHEN (
+      NEW.inspected_at NOT GLOB '????-??-??T??:??:??Z'
+      AND NEW.inspected_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+      AND (NEW.inspected_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.inspected_at, 21, LENGTH(NEW.inspected_at) - 21) GLOB '*[^0-9]*')
+      AND (NEW.inspected_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.inspected_at, 21, LENGTH(NEW.inspected_at) - 26) GLOB '*[^0-9]*')
+  )
+  OR date(SUBSTR(NEW.inspected_at, 1, 10), '+0 days') <> SUBSTR(NEW.inspected_at, 1, 10)
+  OR CAST(SUBSTR(NEW.inspected_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+  OR CAST(SUBSTR(NEW.inspected_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR CAST(SUBSTR(NEW.inspected_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR julianday(NEW.inspected_at) IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'retained close inspection timestamp must be valid RFC 3339');
+END;
+
+CREATE TABLE close_retained_retirement_losses (
+    attempt_id TEXT NOT NULL,
+    inspection_generation TEXT NOT NULL,
+    inspection_fingerprint TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    category TEXT NOT NULL CHECK (category IN (
+        'staged_tracked_paths', 'unstaged_tracked_paths', 'untracked_non_ignored_paths',
+        'initialized_submodule_state', 'detached_unreachable_commits'
+    )),
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL CHECK (identity_value <> ''),
+    CHECK (
+        (category = 'detached_unreachable_commits' AND identity_kind = 'git_oid'
+         AND identity_codec = 'hex' AND length(identity_value) IN (40, 64)
+         AND identity_value NOT GLOB '*[^0-9a-f]*')
+        OR (category <> 'detached_unreachable_commits' AND identity_kind = 'git_path'
+            AND identity_codec = 'git_path_bytes_hex_v1'
+            AND substr(identity_value, 1, length('git_path_bytes_hex_v1:')) = 'git_path_bytes_hex_v1:'
+            AND length(substr(identity_value, length('git_path_bytes_hex_v1:') + 1)) > 0
+            AND length(substr(identity_value, length('git_path_bytes_hex_v1:') + 1)) % 2 = 0
+            AND substr(identity_value, length('git_path_bytes_hex_v1:') + 1) NOT GLOB '*[^0-9a-f]*')
+    ),
+    PRIMARY KEY (attempt_id, inspection_generation, inspection_fingerprint, scope,
+                 category, identity_kind, identity_codec, identity_value),
+    FOREIGN KEY (attempt_id, inspection_generation, inspection_fingerprint, scope)
+        REFERENCES close_retained_retirement_inspections
+            (attempt_id, inspection_generation, inspection_fingerprint, scope)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE migration_120_retained_source_validation (sentinel INTEGER);
+CREATE TRIGGER migration_120_requires_retained_source
+BEFORE INSERT ON migration_120_retained_source_validation
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_adoptions adoption
+    WHERE NOT EXISTS (
+        SELECT 1 FROM close_retained_retirement_inspections inspection
+        JOIN close_retirement_inventories inventory
+          ON inventory.attempt_id = inspection.attempt_id
+         AND inventory.scope = inspection.scope
+         AND inventory.inspection_generation = inspection.inspection_generation
+         AND inventory.inspection_fingerprint = inspection.inspection_fingerprint
+         AND inventory.sealed = 1
+        WHERE inspection.attempt_id = adoption.attempt_id
+          AND inspection.scope = adoption.scope
+          AND inspection.inspection_generation = adoption.source_inspection_generation
+          AND inspection.inspection_fingerprint = adoption.source_inspection_fingerprint
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup adoption requires exact retained source inspection');
+END;
+INSERT INTO migration_120_retained_source_validation VALUES (1);
+DROP TABLE migration_120_retained_source_validation;
+
+CREATE TRIGGER close_worktree_cleanup_adoption_requires_retained_inspection
+BEFORE INSERT ON close_worktree_cleanup_adoptions
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_retained_retirement_inspections inspection
+    JOIN close_retirement_inventories inventory
+      ON inventory.attempt_id = inspection.attempt_id
+     AND inventory.scope = inspection.scope
+     AND inventory.inspection_generation = inspection.inspection_generation
+     AND inventory.inspection_fingerprint = inspection.inspection_fingerprint
+     AND inventory.sealed = 1
+    WHERE inspection.attempt_id = NEW.attempt_id
+      AND inspection.scope = NEW.scope
+      AND inspection.inspection_generation = NEW.source_inspection_generation
+      AND inspection.inspection_fingerprint = NEW.source_inspection_fingerprint
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup adoption requires exact retained source inspection');
+END;
+
+CREATE TRIGGER close_retained_retirement_inspections_reject_update
+BEFORE UPDATE ON close_retained_retirement_inspections
+BEGIN
+    SELECT RAISE(ABORT, 'retained close inspection is immutable');
+END;
+CREATE TRIGGER close_retained_retirement_losses_reject_update
+BEFORE UPDATE ON close_retained_retirement_losses
+BEGIN
+    SELECT RAISE(ABORT, 'retained close loss is immutable');
+END;
+CREATE TRIGGER close_retained_retirement_inspections_reject_delete
+BEFORE DELETE ON close_retained_retirement_inspections
+WHEN EXISTS (
+    SELECT 1 FROM close_attempt_scopes
+    WHERE attempt_id = OLD.attempt_id AND scope = OLD.scope
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retained close inspection requires scope deletion');
+END;
+CREATE TRIGGER close_retained_retirement_losses_reject_delete
+BEFORE DELETE ON close_retained_retirement_losses
+WHEN EXISTS (
+    SELECT 1 FROM close_attempt_scopes
+    WHERE attempt_id = OLD.attempt_id AND scope = OLD.scope
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retained close loss requires scope deletion');
+END;
+";
 
 const MIGRATION_119: &str = r"
 DROP TRIGGER close_obligations_transition_graph;
@@ -12090,8 +12231,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(9).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(10).copied().collect::<Vec<_>>(),
             vec![
+                (121, "retain_close_cleanup_source_inspections"),
                 (120, "require_close_repair_reinspection"),
                 (119, "adopt_close_worktree_cleanup_plans"),
                 (118, "persist_mcp_token_removals"),
@@ -18724,6 +18866,114 @@ mod tests {
         );
     }
 
+    async fn migration_120_fixture(pool: &SqlitePool) {
+        sqlx::raw_sql(
+            "CREATE TABLE close_attempt_scopes (
+                 attempt_id TEXT NOT NULL, scope TEXT NOT NULL, PRIMARY KEY (attempt_id, scope)
+             );
+             CREATE TABLE close_retirement_inventories (
+                 attempt_id TEXT, scope TEXT, inspection_generation TEXT,
+                 inspection_fingerprint TEXT, sealed INTEGER
+             );
+             CREATE TABLE close_worktree_cleanup_adoptions (
+                 attempt_id TEXT, scope TEXT, source_inspection_generation TEXT,
+                 source_inspection_fingerprint TEXT
+             );
+             INSERT INTO close_attempt_scopes VALUES ('attempt', 'scope');
+             INSERT INTO close_retirement_inventories VALUES ('attempt', 'scope', 'aggregate', 'fp', 1);",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(pool, 120).await;
+    }
+
+    #[tokio::test]
+    async fn migration_120_rejects_adoption_without_source_without_fabrication_or_stamp() {
+        let pool = test_pool().await;
+        migration_120_fixture(&pool).await;
+        sqlx::query("INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'aggregate', 'fp')")
+            .execute(&pool).await.unwrap();
+        let error = run_pending_migrations(&pool).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cleanup adoption requires exact retained source inspection"));
+        for query in [
+            "SELECT COUNT(*) FROM _migrations WHERE version = 120",
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'close_retained_retirement_%' OR name LIKE 'migration_120_%'",
+        ] {
+            let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 0);
+        }
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_worktree_cleanup_adoptions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn migration_120_is_empty_idempotent_and_retained_rows_require_scope_cascade() {
+        let pool = test_pool().await;
+        migration_120_fixture(&pool).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_retained_retirement_inspections")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        let inspection = "INSERT INTO close_retained_retirement_inspections VALUES (
+            'attempt', 'aggregate', 'fp', 'scope', 'scope-generation', 'scope-fp', '2026-01-01T00:00:00Z')";
+        let loss = "INSERT INTO close_retained_retirement_losses VALUES (
+            'attempt', 'aggregate', 'fp', 'scope', 'staged_tracked_paths', 'git_path',
+            'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:ff')";
+        assert!(sqlx::query(loss).execute(&pool).await.is_err());
+        assert!(sqlx::query(sqlx::AssertSqlSafe(
+            inspection.replace("'scope'", "'missing-scope'")
+        ))
+        .execute(&pool)
+        .await
+        .is_err());
+        let adoption = "INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'aggregate', 'fp')";
+        assert!(sqlx::query(adoption).execute(&pool).await.is_err());
+        sqlx::query(inspection).execute(&pool).await.unwrap();
+        sqlx::query(loss).execute(&pool).await.unwrap();
+        sqlx::query(adoption).execute(&pool).await.unwrap();
+        for forbidden in [
+            "UPDATE close_retained_retirement_inspections SET generation = 'changed'",
+            "UPDATE close_retained_retirement_losses SET identity_value = 'git_path_bytes_hex_v1:01'",
+            "DELETE FROM close_retained_retirement_inspections",
+            "DELETE FROM close_retained_retirement_losses",
+        ] {
+            assert!(sqlx::query(forbidden).execute(&pool).await.is_err(), "{forbidden}");
+        }
+        sqlx::query("DELETE FROM close_attempt_scopes")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for table in [
+            "close_retained_retirement_inspections",
+            "close_retained_retirement_losses",
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0);
+        }
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn migration_119_upgrades_118_close_repair_transition_graph_idempotently() {
@@ -18739,10 +18989,11 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(MIGRATION_083).execute(&pool).await.unwrap();
         stamp_migrations_except(&pool, 119).await;
-        let newest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migrations")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let newest: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _migrations WHERE version < 120")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(newest, 118);
 
         for target in ["retirement_requested", "completed"] {

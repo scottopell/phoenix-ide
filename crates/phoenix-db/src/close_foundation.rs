@@ -174,6 +174,20 @@ fn parse_rfc3339_utc(value: String, field: &str) -> DbResult<DateTime<Utc>> {
         .map_err(|error| DbError::Serialization(format!("invalid {field}: {error}")))
 }
 
+fn parse_rfc3339_instant_key(value: &str, field: &str) -> DbResult<(i64, String)> {
+    let instant = parse_rfc3339_utc(value.to_string(), field)?;
+    let fractional = value
+        .split_once('T')
+        .and_then(|(_, time)| time.split_once('.'))
+        .map_or("", |(_, fractional_and_offset)| {
+            let end = fractional_and_offset
+                .find(['Z', '+', '-'])
+                .unwrap_or(fractional_and_offset.len());
+            fractional_and_offset[..end].trim_end_matches('0')
+        });
+    Ok((instant.timestamp(), fractional.to_string()))
+}
+
 fn parse_product_conversation_id(value: String, field: &str) -> DbResult<ProductConversationId> {
     ProductConversationId::parse(value)
         .map_err(|error| DbError::Serialization(format!("invalid {field}: {error}")))
@@ -2245,6 +2259,10 @@ impl Database {
         }
         self.ensure_inspection_replacement_allowed(&mut tx, &request)
             .await?;
+        if let Some(snapshot) = obligation.snapshot() {
+            self.retain_cleanup_source_inspections(&mut tx, &request.attempt_id, snapshot)
+                .await?;
+        }
         self.clear_retirement_inspection_rows(&mut tx, request.attempt_id.as_str())
             .await?;
         self.insert_retirement_inspection_rows(&mut tx, &request)
@@ -2983,6 +3001,8 @@ impl Database {
             attempt_id: attempt_id.clone(),
             scopes,
         };
+        self.retain_cleanup_source_inspections(&mut tx, attempt_id, retained_snapshot)
+            .await?;
         self.clear_retirement_inspection_rows(&mut tx, attempt_id.as_str())
             .await?;
         self.insert_retirement_inspection_rows(&mut tx, &request)
@@ -4108,6 +4128,17 @@ impl Database {
                 "SELECT EXISTS(
                      SELECT 1
                      FROM close_worktree_cleanup_plans source
+                     JOIN close_retained_retirement_inspections inspection
+                       ON inspection.attempt_id = source.attempt_id
+                      AND inspection.scope = source.scope
+                      AND inspection.inspection_generation = source.inspection_generation
+                      AND inspection.inspection_fingerprint = source.inspection_fingerprint
+                     JOIN close_retirement_inventories inventory
+                       ON inventory.attempt_id = inspection.attempt_id
+                      AND inventory.scope = inspection.scope
+                      AND inventory.inspection_generation = inspection.inspection_generation
+                      AND inventory.inspection_fingerprint = inspection.inspection_fingerprint
+                      AND inventory.sealed = 1
                      JOIN close_worktree_cleanup_plans target
                        ON target.attempt_id=source.attempt_id
                       AND target.scope=source.scope
@@ -4177,8 +4208,9 @@ impl Database {
             tx.commit().await?;
             return Ok(target_plan);
         }
-        let source: Option<AdoptableWorktreeCleanupPlanColumns> = sqlx::query_as(
-            "SELECT plan.inspection_generation, plan.inspection_fingerprint,
+        let candidates = sqlx::query(
+            "SELECT inventory.captured_at, plan.rowid AS plan_rowid,
+                    plan.inspection_generation, plan.inspection_fingerprint,
                     plan.administrative_dir_codec, plan.administrative_dir_value,
                     plan.administrative_dir_incarnation, plan.final_tombstone_root_codec,
                     plan.final_tombstone_root_value, plan.final_tombstone_root_device,
@@ -4189,6 +4221,12 @@ impl Database {
                ON inventory.attempt_id = plan.attempt_id AND inventory.scope = plan.scope
               AND inventory.inspection_generation = plan.inspection_generation
               AND inventory.inspection_fingerprint = plan.inspection_fingerprint
+              AND inventory.sealed = 1
+             JOIN close_retained_retirement_inspections inspection
+               ON inspection.attempt_id = inventory.attempt_id
+              AND inspection.scope = inventory.scope
+              AND inspection.inspection_generation = inventory.inspection_generation
+              AND inspection.inspection_fingerprint = inventory.inspection_fingerprint
              JOIN close_retirement_resource_dispatches dispatch
                ON dispatch.attempt_id = plan.attempt_id AND dispatch.scope = plan.scope
               AND dispatch.inspection_generation = plan.inspection_generation
@@ -4211,8 +4249,7 @@ impl Database {
                      AND adoption.identity_kind=plan.identity_kind
                      AND adoption.identity_codec=plan.identity_codec
                      AND adoption.identity_value=plan.identity_value
-               )
-             ORDER BY inventory.captured_at DESC, plan.rowid DESC LIMIT 1",
+               )",
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
@@ -4222,15 +4259,42 @@ impl Database {
         .bind(identity.value())
         .bind(request.target_snapshot.generation())
         .bind(request.target_snapshot.fingerprint())
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        let Some(source) = source else {
+        let mut newest = None;
+        for candidate in candidates {
+            let captured_at: String = candidate.try_get("captured_at")?;
+            let (whole_seconds, fractional) =
+                parse_rfc3339_instant_key(&captured_at, "captured_at")?;
+            let rowid: i64 = candidate.try_get("plan_rowid")?;
+            let key = (whole_seconds, fractional, rowid);
+            if newest
+                .as_ref()
+                .is_none_or(|(newest_key, _)| key > *newest_key)
+            {
+                newest = Some((key, candidate));
+            }
+        }
+        let Some((_, source_row)) = newest else {
             return Err(DbError::CloseEvidenceInvariant {
                 invariant: "newest_compatible_prior_dispatch_and_cleanup_plan",
                 relation: "close_retirement_inventories+close_retirement_resource_dispatches+close_worktree_cleanup_plans",
                 detail: "found no compatible source plans".to_string(),
             });
         };
+        let source: AdoptableWorktreeCleanupPlanColumns = (
+            source_row.try_get("inspection_generation")?,
+            source_row.try_get("inspection_fingerprint")?,
+            source_row.try_get("administrative_dir_codec")?,
+            source_row.try_get("administrative_dir_value")?,
+            source_row.try_get("administrative_dir_incarnation")?,
+            source_row.try_get("final_tombstone_root_codec")?,
+            source_row.try_get("final_tombstone_root_value")?,
+            source_row.try_get("final_tombstone_root_device")?,
+            source_row.try_get("final_tombstone_root_inode")?,
+            source_row.try_get("final_tombstone_object_device")?,
+            source_row.try_get("final_tombstone_object_inode")?,
+        );
         if source.2 != "hex_path_v1"
             || source.3 != observed_administrative_dir_value
             || source.4 != request.observed_administrative_dir_incarnation
@@ -4980,6 +5044,149 @@ impl Database {
                 "attempt {} replacement scopes do not exactly match targeted scopes",
                 request.attempt_id.as_str()
             )));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn retain_cleanup_source_inspections(
+        &self,
+        tx: &mut DbTx<'_>,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+    ) -> DbResult<()> {
+        let inspections: Vec<(String, String, String, String, bool)> = sqlx::query_as(
+            "SELECT inspection.scope, inspection.generation, inspection.fingerprint,
+                    inspection.inspected_at, EXISTS (
+                        SELECT 1 FROM close_worktree_cleanup_plans plan
+                        JOIN close_retirement_inventories inventory
+                          ON inventory.attempt_id = plan.attempt_id
+                         AND inventory.scope = plan.scope
+                         AND inventory.inspection_generation = plan.inspection_generation
+                         AND inventory.inspection_fingerprint = plan.inspection_fingerprint
+                         AND inventory.sealed = 1
+                        WHERE plan.attempt_id = inspection.attempt_id
+                          AND plan.scope = inspection.scope
+                          AND plan.inspection_generation = ?2
+                          AND plan.inspection_fingerprint = ?3
+                    )
+             FROM close_retirement_inspections inspection
+             WHERE inspection.attempt_id = ?1 ORDER BY inspection.scope",
+        )
+        .bind(attempt_id.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .fetch_all(&mut **tx)
+        .await?;
+        if !inspections.iter().any(|inspection| inspection.4) {
+            return Ok(());
+        }
+        let scopes = inspections
+            .iter()
+            .map(|inspection| {
+                WorkScopeId::parse(&inspection.0)
+                    .map_err(|error| DbError::Serialization(error.to_string()))
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        let generation = encode_aggregate_snapshot_component(
+            scopes
+                .iter()
+                .zip(&inspections)
+                .map(|(scope, row)| (scope, row.1.as_str())),
+        );
+        let fingerprint = encode_aggregate_snapshot_component(
+            scopes
+                .iter()
+                .zip(&inspections)
+                .map(|(scope, row)| (scope, row.2.as_str())),
+        );
+        if generation != snapshot.generation() || fingerprint != snapshot.fingerprint() {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} cleanup source inspection differs from its aggregate snapshot"
+            )));
+        }
+        for (scope, generation, fingerprint, inspected_at, eligible) in inspections {
+            if !eligible {
+                continue;
+            }
+            let existing: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT generation, fingerprint, inspected_at
+                 FROM close_retained_retirement_inspections
+                 WHERE attempt_id = ?1 AND inspection_generation = ?2
+                   AND inspection_fingerprint = ?3 AND scope = ?4",
+            )
+            .bind(attempt_id.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .bind(&scope)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let losses: Vec<(String, String, String, String)> = sqlx::query_as(
+                "SELECT category, identity_kind, identity_codec, identity_value
+                 FROM close_retirement_losses
+                 WHERE attempt_id = ?1 AND scope = ?2 AND generation = ?3
+                 ORDER BY category, identity_kind, identity_codec, identity_value",
+            )
+            .bind(attempt_id.as_str())
+            .bind(&scope)
+            .bind(&generation)
+            .fetch_all(&mut **tx)
+            .await?;
+            if let Some(existing) = existing {
+                let retained_losses: Vec<(String, String, String, String)> = sqlx::query_as(
+                    "SELECT category, identity_kind, identity_codec, identity_value
+                     FROM close_retained_retirement_losses
+                     WHERE attempt_id = ?1 AND inspection_generation = ?2
+                       AND inspection_fingerprint = ?3 AND scope = ?4
+                     ORDER BY category, identity_kind, identity_codec, identity_value",
+                )
+                .bind(attempt_id.as_str())
+                .bind(snapshot.generation())
+                .bind(snapshot.fingerprint())
+                .bind(&scope)
+                .fetch_all(&mut **tx)
+                .await?;
+                if existing != (generation, fingerprint, inspected_at) || losses != retained_losses
+                {
+                    return Err(close_precondition(format!(
+                        "attempt {attempt_id} scope {scope} retained cleanup source conflicts with exact inspection/loss evidence"
+                    )));
+                }
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO close_retained_retirement_inspections (
+                    attempt_id, inspection_generation, inspection_fingerprint, scope,
+                    generation, fingerprint, inspected_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(attempt_id.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .bind(&scope)
+            .bind(generation)
+            .bind(fingerprint)
+            .bind(inspected_at)
+            .execute(&mut **tx)
+            .await?;
+            for (category, identity_kind, identity_codec, identity_value) in losses {
+                sqlx::query(
+                    "INSERT INTO close_retained_retirement_losses (
+                        attempt_id, inspection_generation, inspection_fingerprint, scope,
+                        category, identity_kind, identity_codec, identity_value
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .bind(attempt_id.as_str())
+                .bind(snapshot.generation())
+                .bind(snapshot.fingerprint())
+                .bind(&scope)
+                .bind(category)
+                .bind(identity_kind)
+                .bind(identity_codec)
+                .bind(identity_value)
+                .execute(&mut **tx)
+                .await?;
+            }
         }
         Ok(())
     }
@@ -11580,6 +11787,54 @@ mod tests {
             .is_some());
     }
 
+    #[tokio::test]
+    async fn cleanup_adoption_requires_retained_exact_source_inspection() {
+        let (db, attempt, scope, snapshot) = legacy_fk787_fixture("exact").await;
+        db.resume_legacy_fk787_close_retirement_generation(&attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::raw_sql(
+            "DROP TRIGGER close_retained_retirement_inspections_reject_delete;
+             DROP TRIGGER close_retained_retirement_losses_reject_delete;
+             INSERT INTO close_retained_retirement_inspections
+                 SELECT attempt_id, inspection_generation, 'wrong-source-fingerprint', scope,
+                        generation, fingerprint, inspected_at
+                 FROM close_retained_retirement_inspections;
+             DELETE FROM close_retained_retirement_inspections
+                 WHERE inspection_fingerprint <> 'wrong-source-fingerprint';",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let before = close_authority_rows(&db).await;
+        let error = db
+            .adopt_close_worktree_cleanup_plan(AdoptCloseWorktreeCleanupPlanRequest {
+                attempt_id: attempt.clone(),
+                scope: scope.clone(),
+                target_snapshot: snapshot,
+                resource: RetiredResourceIdentity::parse(
+                    RetiredResourceKind::Worktree,
+                    LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+                )
+                .unwrap(),
+                observed_administrative_dir: std::path::PathBuf::from(
+                    "/tmp/git/worktrees/legacy-fk787",
+                ),
+                observed_administrative_dir_incarnation: "legacy-admin-v1".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::CloseEvidenceInvariant {
+                invariant: "newest_compatible_prior_dispatch_and_cleanup_plan",
+                ..
+            }
+        ));
+        assert_eq!(close_authority_rows(&db).await, before);
+    }
+
     async fn adopted_cleanup_test_fixture() -> (Database, CloseAttemptId, CloseRetirementSnapshot) {
         let (db, attempt, scope, snapshot) = legacy_fk787_fixture("exact").await;
         db.resume_legacy_fk787_close_retirement_generation(&attempt)
@@ -11679,6 +11934,8 @@ mod tests {
             "close_worktree_cleanup_adoptions",
             "close_worktree_cleanup_plans",
             "close_retirement_resource_dispatches",
+            "close_retained_retirement_inspections",
+            "close_retained_retirement_losses",
         ] {
             let count: i64 =
                 sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
@@ -12110,6 +12367,32 @@ mod tests {
         })
         .await
         .unwrap();
+        let older_capture = "2026-01-01T01:00:00.1234567891+01:00";
+        let newer_capture = "2026-01-01T00:00:00.1234567892Z";
+        assert!(older_capture > newer_capture);
+        assert!(
+            parse_rfc3339_instant_key(older_capture, "captured_at").unwrap()
+                < parse_rfc3339_instant_key(newer_capture, "captured_at").unwrap()
+        );
+        for (snapshot, captured_at) in [
+            (&source_snapshot, older_capture),
+            (&newest_unadopted_snapshot, newer_capture),
+        ] {
+            let updated = sqlx::query(
+                "UPDATE close_retirement_inventories SET captured_at=?5
+                 WHERE attempt_id=?1 AND scope=?2
+                   AND inspection_generation=?3 AND inspection_fingerprint=?4",
+            )
+            .bind(attempt_id.as_str())
+            .bind(scope.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .bind(captured_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(updated.rows_affected(), 1);
+        }
         let (snapshot_b, plan_b) = rotate_and_adopt(
             &db,
             &attempt_id,
@@ -12417,14 +12700,6 @@ mod tests {
             })
         ));
         assert_eq!(close_authority_rows(&db).await, before);
-        sqlx::query(
-            "UPDATE close_obligations SET phase='retirement_requested' WHERE attempt_id=?1",
-        )
-        .bind(attempt_id.as_str())
-        .execute(db.pool())
-        .await
-        .unwrap();
-        db.adopt_close_worktree_cleanup_plan(request).await.unwrap();
     }
 
     #[tokio::test]
@@ -12463,8 +12738,37 @@ mod tests {
         )
         .await
         .unwrap();
-        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        set_close_phase(
+            &db,
+            attempt.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt.clone(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("source-generation", "source-fingerprint")
+                    .unwrap(),
+                losses: vec![CloseLossItem::UntrackedNonIgnoredPath(
+                    GitPathIdentity::from_bytes(vec![0xff, b'a']),
+                )],
+            }],
+        })
+        .await
+        .unwrap();
         let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+        db.confirm_close_loss_retirement(&attempt, &snapshot)
+            .await
+            .unwrap();
+        let source_inspections = db
+            .list_close_retirement_inspections(attempt.as_str())
+            .await
+            .unwrap();
+        let source_losses = db
+            .list_close_retirement_losses(attempt.as_str())
+            .await
+            .unwrap();
         let resources = db
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: attempt.clone(),
@@ -12548,6 +12852,27 @@ mod tests {
         .unwrap();
         db.retry_close_retirement(&attempt).await.unwrap();
 
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        db.retain_cleanup_source_inspections(&mut tx, &attempt, &snapshot)
+            .await
+            .unwrap();
+        db.retain_cleanup_source_inspections(&mut tx, &attempt, &snapshot)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut conflicting = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("DELETE FROM close_retirement_losses WHERE attempt_id=?1")
+            .bind(attempt.as_str())
+            .execute(&mut *conflicting)
+            .await
+            .unwrap();
+        assert!(db
+            .retain_cleanup_source_inspections(&mut conflicting, &attempt, &snapshot)
+            .await
+            .is_err());
+        conflicting.rollback().await.unwrap();
+
         let replacement = db
             .resume_close_retirement_after_dispatched_absence(
                 &attempt,
@@ -12556,6 +12881,53 @@ mod tests {
             )
             .await
             .unwrap();
+        let retained: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT generation, fingerprint, inspected_at FROM close_retained_retirement_inspections
+             WHERE attempt_id=?1 AND inspection_generation=?2 AND inspection_fingerprint=?3",
+        ).bind(attempt.as_str()).bind(snapshot.generation()).bind(snapshot.fingerprint())
+            .fetch_all(db.pool()).await.unwrap();
+        assert_eq!(
+            retained,
+            vec![(
+                source_inspections[0].snapshot.generation().to_string(),
+                source_inspections[0].snapshot.fingerprint().to_string(),
+                source_inspections[0].inspected_at.to_rfc3339(),
+            )]
+        );
+        let retained_losses: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT category, identity_kind, identity_codec, identity_value
+             FROM close_retained_retirement_losses WHERE attempt_id=?1",
+        )
+        .bind(attempt.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let source_loss = &source_losses[0].item;
+        assert_eq!(
+            retained_losses,
+            vec![(
+                source_loss.category().as_str().to_string(),
+                source_loss.identity().identity_kind().to_string(),
+                source_loss.identity().codec().to_string(),
+                source_loss.identity().value(),
+            )]
+        );
+        let active_inspections = db
+            .list_close_retirement_inspections(attempt.as_str())
+            .await
+            .unwrap();
+        assert_eq!(active_inspections.len(), 1);
+        assert_eq!(
+            active_inspections[0].snapshot.generation(),
+            "server_git_status_v2_retry_dispatched_absence"
+        );
+        let active_losses = db
+            .list_close_retirement_losses(attempt.as_str())
+            .await
+            .unwrap();
+        assert_eq!(active_losses.len(), 1);
+        assert_eq!(active_losses[0].snapshot, active_inspections[0].snapshot);
+        assert_eq!(active_losses[0].item, source_losses[0].item);
         let resumed = db.get_close_obligation(attempt.as_str()).await.unwrap();
         assert_eq!(resumed.phase(), ClosePhase::RetirementRequested);
         assert_eq!(resumed.snapshot(), Some(&replacement));

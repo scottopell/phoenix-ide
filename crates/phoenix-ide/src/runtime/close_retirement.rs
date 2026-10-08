@@ -6821,13 +6821,6 @@ mod tests {
         observation: RetainedAdministrativeObservation,
         bound_tombstone: bool,
     ) {
-        let conflicting_incarnation =
-            matches!(observation, RetainedAdministrativeObservation::Conflicting);
-        let observation_failure = matches!(
-            observation,
-            RetainedAdministrativeObservation::Missing { .. }
-                | RetainedAdministrativeObservation::NotDirectory
-        );
         use super::{CloseAttemptId, ClosePhase, CloseRetirementError, RuntimeManager};
         use crate::db::{
             CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
@@ -6840,6 +6833,14 @@ mod tests {
         };
         use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
         use std::sync::Arc;
+
+        let conflicting_incarnation =
+            matches!(observation, RetainedAdministrativeObservation::Conflicting);
+        let observation_failure = matches!(
+            observation,
+            RetainedAdministrativeObservation::Missing { .. }
+                | RetainedAdministrativeObservation::NotDirectory
+        );
 
         let mut manager = RuntimeManager::new(
             crate::db::Database::open_in_memory().await.unwrap(),
