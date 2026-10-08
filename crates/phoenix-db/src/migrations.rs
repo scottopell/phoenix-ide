@@ -598,12 +598,22 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 117,
-        name: "admit_server_overload_retrying_state",
+        name: "persist_conversation_tool_policy",
         sql: MIGRATION_117,
+    },
+    Migration {
+        version: 118,
+        name: "admit_server_overload_retrying_state",
+        sql: MIGRATION_118,
     },
 ];
 
-const MIGRATION_117: &str = r"
+const MIGRATION_117: &str = concat!(
+    include_str!("tool_availability.sql"),
+    include_str!("responses_replay.sql")
+);
+
+const MIGRATION_118: &str = r"
 UPDATE sqlite_schema
 SET sql = replace(
     sql,
@@ -628,7 +638,7 @@ WHERE type = 'table'
 ";
 
 #[cfg(test)]
-mod migration_117_tests {
+mod migration_118_tests {
     use super::{run_pending_migrations, MIGRATIONS};
     use sqlx::{sqlite::SqlitePoolOptions, Row};
 
@@ -660,7 +670,7 @@ mod migration_117_tests {
         .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version <= 116)
+            .filter(|migration| migration.version <= 117)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -686,7 +696,7 @@ mod migration_117_tests {
                 .get("sql");
         assert!(close_schema.contains("'server_overload_retrying'"));
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 117")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 118")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -4455,7 +4465,7 @@ CREATE TABLE close_attempt_members (
     continuation_ordinal INTEGER NOT NULL CHECK (continuation_ordinal >= 0),
     captured_continued_in_conv_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
     captured_state_kind TEXT NOT NULL CHECK (captured_state_kind IN (
-        'idle', 'llm_requesting', 'server_overload_retrying', 'tool_executing', 'cancelling_tool',
+        'idle', 'llm_requesting', 'tool_executing', 'cancelling_tool',
         'awaiting_sub_agents', 'cancelling_sub_agents', 'error',
         'awaiting_continuation', 'recoverable_continuation_failure',
         'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response',
@@ -10374,7 +10384,7 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
     restore
 }
 
-async fn run_migration_117(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+async fn run_migration_118(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
     let result = async {
         let mut tx = guard.connection().begin().await?;
@@ -10413,7 +10423,7 @@ async fn run_migration_117(pool: &SqlitePool, migration: &Migration) -> DbResult
                     .is_some_and(|schema| !schema.contains("'server_overload_retrying'"))
             {
                 return Err(DbError::Serialization(
-                    "migration 117 expected overload-compatible conversation and Close schemas"
+                    "migration 118 expected overload-compatible conversation and Close schemas"
                         .to_string(),
                 ));
             }
@@ -10465,7 +10475,6 @@ async fn apply_migration_body(
 /// # Errors
 ///
 /// Returns a [`DbError`] if the underlying database operation fails.
-#[allow(clippy::too_many_lines)]
 pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
     // Ensure the tracking table exists
     sqlx::raw_sql(
@@ -10522,8 +10531,8 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             continue;
         }
 
-        if migration.version == 117 {
-            run_migration_117(pool, migration).await?;
+        if migration.version == 118 {
+            run_migration_118(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -12066,13 +12075,13 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(7).copied().collect::<Vec<_>>(),
             vec![
-                (117, "admit_server_overload_retrying_state"),
+                (118, "admit_server_overload_retrying_state"),
+                (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),
                 (114, "persist_instance_identity"),
                 (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
-                (111, "coordinator_conversation_watches"),
             ]
         );
     }

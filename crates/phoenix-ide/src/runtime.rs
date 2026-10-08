@@ -12736,11 +12736,11 @@ mod scope_liveness_tests {
             .expect("valid replay response")
             .with_owner_message_id("direct-final-response".into());
         mgr.db()
-            .update_state_and_provider_replay(
+            .update_state_and_replay(
                 conversation_id,
                 &ConvState::LlmRequesting { attempt: 1 },
                 Utc::now(),
-                &phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(
+                &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Anthropic(
                     replay_response,
                 ),
             )

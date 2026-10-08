@@ -7,7 +7,8 @@
 //! references them.
 
 /// SQL schema for initialization.
-pub(crate) const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = concat!(
+    r#"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     slug TEXT UNIQUE,
@@ -248,7 +249,10 @@ CREATE TABLE IF NOT EXISTS active_provider_replay_state (
         CHECK (length(trim(response_id)) > 0),
     payload TEXT NOT NULL
 );
-"#;
+"#,
+    include_str!("tool_availability.sql"),
+    include_str!("responses_replay.sql")
+);
 
 /// Migration SQL to convert old state format to typed JSON
 /// Runs at startup to ensure all state values are valid JSON

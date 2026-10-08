@@ -1,3 +1,4 @@
+import type { ChainSseWireEvent } from './generated/ChainSseWireEvent';
 // SSE wire-format runtime validation (task 02674) + compile-time
 // alignment to Rust-generated types (task 02677).
 //
@@ -522,6 +523,11 @@ export const ChainQaTokenSchema = v.looseObject({
   chain_qa_id: v.string(),
   delta: v.string(),
 }) satisfies v.GenericSchema<unknown, WireChainQaTokenData>;
+
+export const ChainQaAnswerResetSchema = v.looseObject({
+  chain_qa_id: v.string(),
+}) satisfies v.GenericSchema<unknown, Omit<Extract<ChainSseWireEvent, { type: 'chain_qa_answer_reset' }>, 'type'>>;
+export type ChainQaAnswerResetData = v.InferOutput<typeof ChainQaAnswerResetSchema>;
 
 /** Stream completed cleanly. `full_answer` matches what was just persisted
  *  to `chain_qa.answer`; subsequent reads via the GET endpoint return the

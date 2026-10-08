@@ -39,6 +39,7 @@ export type {
   SseAgentDoneData,
   SseConversationBecameTerminalData,
   SseErrorData,
+  ChainQaAnswerResetData,
   ChainQaTokenData,
   ChainQaCompletedData,
   ChainQaFailedData,
@@ -51,9 +52,11 @@ import type { ChainView as ChainViewType } from './generated/ChainView';
 import type { SubmitChainQaResponse as SubmitChainQaResponseType } from './generated/SubmitChainQaResponse';
 import * as v from 'valibot';
 import {
+  ChainQaAnswerResetSchema,
   ChainQaTokenSchema,
   ChainQaCompletedSchema,
   ChainQaFailedSchema,
+  type ChainQaAnswerResetData,
   type ChainQaTokenData,
   type ChainQaCompletedData,
   type ChainQaFailedData,
@@ -2938,6 +2941,7 @@ export const api = {
  *  field matches the SSE `event:` label so consumers can dispatch on it
  *  without re-deriving the discriminator from the payload. */
 export type ChainSseEventData =
+  | ({ type: 'chain_qa_answer_reset' } & ChainQaAnswerResetData)
   | ({ type: 'chain_qa_token' } & ChainQaTokenData)
   | ({ type: 'chain_qa_completed' } & ChainQaCompletedData)
   | ({ type: 'chain_qa_failed' } & ChainQaFailedData);
@@ -2958,7 +2962,7 @@ export function subscribeToChainStream(
   const source = new EventSource(`/api/chains/${encodeURIComponent(rootId)}/stream`);
 
   const handle = <T,>(
-    eventName: 'chain_qa_token' | 'chain_qa_completed' | 'chain_qa_failed',
+    eventName: 'chain_qa_answer_reset' | 'chain_qa_token' | 'chain_qa_completed' | 'chain_qa_failed',
     schema: v.GenericSchema<unknown, T>,
   ) => {
     source.addEventListener(eventName, (msg) => {
@@ -2975,6 +2979,7 @@ export function subscribeToChainStream(
     });
   };
 
+  handle('chain_qa_answer_reset', ChainQaAnswerResetSchema);
   handle('chain_qa_token', ChainQaTokenSchema);
   handle('chain_qa_completed', ChainQaCompletedSchema);
   handle('chain_qa_failed', ChainQaFailedSchema);

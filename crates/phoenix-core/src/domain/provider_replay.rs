@@ -17,6 +17,24 @@
 use super::llm_types::ContentBlock;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderReplayUpdate {
+    Anthropic(AnthropicResponseSet),
+    Responses(super::responses_replay::ResponsesResponseSet),
+    Clear,
+}
+
+impl ProviderReplayUpdate {
+    #[must_use]
+    pub fn with_owner_message_id(self, owner_message_id: String) -> Self {
+        match self {
+            Self::Anthropic(set) => Self::Anthropic(set.with_owner_message_id(owner_message_id)),
+            Self::Responses(set) => Self::Responses(set.with_owner_message_id(owner_message_id)),
+            Self::Clear => Self::Clear,
+        }
+    }
+}
+
 /// The index of a block within the Anthropic response's `content` array.
 ///
 /// Anthropic requires positioned replay: each private block carries the 0-based
@@ -344,6 +362,15 @@ impl ProviderReplaySettlement {
 pub enum AnthropicReplayUpdate {
     Append(AnthropicResponseSet),
     Clear,
+}
+
+impl From<AnthropicReplayUpdate> for ProviderReplayUpdate {
+    fn from(update: AnthropicReplayUpdate) -> Self {
+        match update {
+            AnthropicReplayUpdate::Append(set) => Self::Anthropic(set),
+            AnthropicReplayUpdate::Clear => Self::Clear,
+        }
+    }
 }
 
 #[cfg(test)]

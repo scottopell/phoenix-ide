@@ -229,7 +229,7 @@ THE successor SHALL preserve the parent's request-speed selection
 
 ### REQ-LLM-004h: Codex Model Discovery and Route Identity
 
-WHEN ChatGPT/Codex authentication has a configured connection and loaded credential
+WHEN ChatGPT/Codex authentication has a configured connection and loaded credential with an identified account
 THE SYSTEM SHALL advertise and route Phoenix-supported built-in Codex models independently of whether provider discovery lists their exact wire identifiers
 
 WHEN Codex model discovery fails or omits a Phoenix-supported built-in model
@@ -282,6 +282,40 @@ WHEN reporting context-window usage
 THE SYSTEM SHALL distinguish consumed context from reserved output headroom rather than treating reserved output capacity as already-consumed input context
 
 **Rationale:** Input history and reserved completion budget are different quantities. Reasoning effort can change how much output space Phoenix must reserve, so the reservation has to be explicit and recomputable.
+
+---
+
+### REQ-LLM-004i: Tool Availability and Provider Continuation
+
+WHEN tool execution eligibility changes during a conversation
+THE SYSTEM SHALL preserve historical calls, arguments, results, errors, and required provider references
+AND SHALL retain the latest authentic declaration for each tool name independently of current execution eligibility
+AND SHALL check current execution authority before dispatching every new invocation
+AND SHALL require admission under the originating request's callable policy and dispatch only to a tool whose input schema equals its authentic originating declaration, allowing live changes only to revoke that admission
+AND SHALL return one matching unavailable error result without execution when authority is absent
+
+WHEN preparing a provider request
+THE SYSTEM SHALL render the current conversation policy using only controls supported by the selected route and model
+AND SHALL bind request preparation and dispatch to the same resolved provider service so a registry reload cannot retarget prepared private continuation
+AND SHALL preserve required provider-private continuation through retry and restart
+AND SHALL scope Codex continuation to its selected account identity, preserving it through same-account token refresh and retiring it before requests under another account
+AND SHALL admit Codex routes only when their account identity is known
+AND SHALL retain complete Responses tool-round output envelopes, including returned assistant phase, until exchange settlement
+AND SHALL keep provider-specific controls and private data outside portable public messages
+
+WHEN a provider switch settles or authoritatively abandons an exchange
+THE SYSTEM SHALL atomically retire its native continuation context with the selected-model settings
+AND SHALL preserve conversation tool policy and public history
+AND SHALL establish current policy afresh when returning to a provider
+AND SHALL NOT revive retired private data, native events, or transport continuation handles
+
+WHEN explicit context management removes a native tool-change anchor
+THE SYSTEM SHALL establish a fresh native tool prefix and current policy at a legal visible position
+AND SHALL NOT relocate individual historical native events or rewrite active private replay owners
+
+WHEN a historical tool reference lacks an authentic retained declaration
+THE SYSTEM SHALL report the missing declaration and preserve the exchange for retry
+AND SHALL NOT fabricate a schema from historical arguments or assume that uncaptured declarations can be recovered
 
 ---
 

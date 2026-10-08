@@ -31,6 +31,7 @@ import {
   SseAgentDoneDataSchema,
   SseConversationBecameTerminalDataSchema,
   SseErrorDataSchema,
+  ChainQaAnswerResetSchema,
   ChainQaTokenSchema,
   ChainQaCompletedSchema,
   ChainQaFailedSchema,
@@ -833,6 +834,10 @@ describe('message_type picklist tripwire', () => {
 // ---------------------------------------------------------------------------
 
 describe('chain Q&A SSE schemas', () => {
+  it('requires a question id for an answer reset', () => {
+    expect(v.safeParse(ChainQaAnswerResetSchema, { chain_qa_id: 'qa-1' }).success).toBe(true);
+    expect(v.safeParse(ChainQaAnswerResetSchema, {}).success).toBe(false);
+  });
   it('accepts a well-formed chain_qa_token payload', () => {
     const result = v.safeParse(ChainQaTokenSchema, {
       chain_qa_id: 'qa-1',

@@ -9,11 +9,12 @@ use super::types::{
 };
 use super::LlmError;
 use phoenix_core::domain::provider_replay::{
-    AnthropicPrivateBlock, AnthropicReplayUpdate, AnthropicResponseIdentity, AnthropicResponseSet,
-    ContentIndex,
+    AnthropicPrivateBlock, AnthropicResponseIdentity, AnthropicResponseSet, ContentIndex,
+    ProviderReplayUpdate,
 };
 use reqwest::header::HeaderMap;
 
+use phoenix_core::domain::tool_availability::{ToolAvailability, ToolChange};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -551,6 +552,34 @@ fn supports_thinking_binding(spec: &ModelSpec, base_url_override: Option<&str>) 
     ) && is_official_anthropic_route(base_url_override)
 }
 
+const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+
+fn supports_native_tool_changes(spec: &ModelSpec, base_url_override: Option<&str>) -> bool {
+    is_official_anthropic_route(base_url_override)
+        && matches!(
+            spec.api_name.as_str(),
+            "claude-opus-5-5" | "claude-sonnet-5-5"
+        )
+}
+
+#[cfg(feature = "test-support")]
+/// # Errors
+/// Rejects invalid continuation history or a request that cannot be serialized.
+pub fn render_anthropic_request_for_test(
+    spec: &ModelSpec,
+    request: &LlmRequest,
+) -> Result<serde_json::Value, LlmError> {
+    let wire = translate_request_with_tool_policy(
+        spec,
+        request,
+        false,
+        supports_thinking_binding(spec, None),
+        supports_native_tool_changes(spec, None),
+    )?;
+    serde_json::to_value(wire)
+        .map_err(|_| LlmError::invalid_request("Anthropic test request could not be serialized"))
+}
+
 /// Compose the ordered `anthropic-beta` token list for a request. Tool search
 /// and Fast mode are independent betas that can both apply; they are joined
 /// into one comma-separated header value.
@@ -596,13 +625,20 @@ pub async fn complete_streaming(
 
     let fast_mode = is_fast_mode(spec, base_url_override, request);
     let thinking_binding = supports_thinking_binding(spec, base_url_override);
-    let mut anthropic_request = translate_request(spec, request, fast_mode, thinking_binding)?;
+    let native_tool_changes = supports_native_tool_changes(spec, base_url_override);
+    let mut anthropic_request = translate_request_with_tool_policy(
+        spec,
+        request,
+        fast_mode,
+        thinking_binding,
+        native_tool_changes,
+    )?;
     anthropic_request.stream = Some(true);
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
     }
 
-    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
+    let has_deferred = uses_tool_search(spec, request, native_tool_changes);
 
     if let Some(telemetry) = request.telemetry.as_ref() {
         telemetry
@@ -619,7 +655,10 @@ pub async fn complete_streaming(
     };
     // Tool search and Fast mode are independent betas; compose them into one
     // comma-separated header value so both can apply on the same request.
-    let beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode, thinking_binding);
+    let mut beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode, thinking_binding);
+    if native_tool_changes {
+        beta_tokens.push(INLINE_TOOLS_BETA);
+    }
     if !beta_tokens.is_empty() {
         builder = builder.header("anthropic-beta", beta_tokens.join(", "));
     }
@@ -711,12 +750,19 @@ pub async fn complete(
 
     let fast_mode = is_fast_mode(spec, base_url_override, request);
     let thinking_binding = supports_thinking_binding(spec, base_url_override);
-    let mut anthropic_request = translate_request(spec, request, fast_mode, thinking_binding)?;
+    let native_tool_changes = supports_native_tool_changes(spec, base_url_override);
+    let mut anthropic_request = translate_request_with_tool_policy(
+        spec,
+        request,
+        fast_mode,
+        thinking_binding,
+        native_tool_changes,
+    )?;
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
     }
 
-    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
+    let has_deferred = uses_tool_search(spec, request, native_tool_changes);
 
     let mut builder = client.post(&base_url);
     builder = match auth.style {
@@ -725,7 +771,10 @@ pub async fn complete(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
-    let beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode, thinking_binding);
+    let mut beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode, thinking_binding);
+    if native_tool_changes {
+        beta_tokens.push(INLINE_TOOLS_BETA);
+    }
     if !beta_tokens.is_empty() {
         builder = builder.header("anthropic-beta", beta_tokens.join(", "));
     }
@@ -776,13 +825,24 @@ pub async fn complete(
     normalize_response_with_diagnostics(anthropic_response, None, fast_mode)
 }
 
+#[cfg(test)]
 fn translate_request(
     spec: &super::ModelSpec,
     request: &LlmRequest,
     fast_mode: bool,
     thinking_binding: bool,
 ) -> Result<AnthropicRequest, LlmError> {
-    let system: Vec<AnthropicSystemBlock> = request
+    translate_request_with_tool_policy(spec, request, fast_mode, thinking_binding, false)
+}
+
+fn translate_request_with_tool_policy(
+    spec: &super::ModelSpec,
+    request: &LlmRequest,
+    fast_mode: bool,
+    thinking_binding: bool,
+    native_tool_changes: bool,
+) -> Result<AnthropicRequest, LlmError> {
+    let mut system: Vec<AnthropicSystemBlock> = request
         .system
         .iter()
         .map(|s| AnthropicSystemBlock {
@@ -804,11 +864,11 @@ fn translate_request(
         apply_provider_replay(&request.messages, &mut messages, payload)?;
     }
 
-    let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
+    let declarations = anthropic_declarations(request, native_tool_changes);
+    let has_deferred = uses_tool_search(spec, request, native_tool_changes);
 
-    let tool_count = request.tools.len();
-    let mut tools: Vec<AnthropicToolEntry> = request
-        .tools
+    let tool_count = declarations.len();
+    let mut tools: Vec<AnthropicToolEntry> = declarations
         .iter()
         .enumerate()
         .map(|(i, t)| {
@@ -840,20 +900,26 @@ fn translate_request(
         }));
     }
 
-    // Set explicit cache breakpoint on last content block of last user message.
-    // Combined with system-prompt and last-tool breakpoints, this gives Anthropic
-    // three deterministic cache anchor points per request.
-    if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
-        if let Some(
-            AnthropicContentBlock::Text { cache_control, .. }
-            | AnthropicContentBlock::Image { cache_control, .. }
-            | AnthropicContentBlock::ToolResult { cache_control, .. },
-        ) = last_user.content.last_mut()
-        {
-            *cache_control = Some(CacheControl {
-                r#type: "ephemeral".to_string(),
-            });
-        }
+    set_history_cache_breakpoint(&mut messages);
+
+    if native_tool_changes {
+        messages = insert_tool_changes(request, messages)?;
+    }
+    validate_tool_search_references(declarations, &messages)?;
+    if (native_tool_changes && native_policy_needs_advisory(&request.tool_availability))
+        || (!native_tool_changes
+            && request
+                .tool_availability
+                .declarations()
+                .iter()
+                .any(|tool| !request.tool_availability.is_callable(&tool.name)))
+    {
+        system.push(AnthropicSystemBlock {
+            r#type: "text".into(),
+            text: tool_advisory(&request.tool_availability),
+            cache_control: None,
+        });
+        tracing::debug!("Anthropic route uses advisory tool restrictions with execution admission");
     }
 
     Ok(AnthropicRequest {
@@ -884,6 +950,156 @@ fn translate_request(
         stream: None,
         tags: None,
     })
+}
+
+fn set_history_cache_breakpoint(messages: &mut [AnthropicMessage]) {
+    if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+        if let Some(
+            AnthropicContentBlock::Text { cache_control, .. }
+            | AnthropicContentBlock::Image { cache_control, .. }
+            | AnthropicContentBlock::ToolResult { cache_control, .. },
+        ) = last_user.content.last_mut()
+        {
+            *cache_control = Some(CacheControl {
+                r#type: "ephemeral".to_string(),
+            });
+        }
+    }
+}
+
+fn validate_tool_search_references(
+    declarations: &[super::types::ToolDefinition],
+    messages: &[AnthropicMessage],
+) -> Result<(), LlmError> {
+    let mut defined: std::collections::BTreeSet<&str> = declarations
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect();
+    for message in messages {
+        for block in &message.content {
+            if let AnthropicContentBlock::ToolAddition {
+                tool: AnthropicChangedTool::ToolDefinition { definition },
+            } = block
+            {
+                defined.insert(definition.name.as_str());
+            }
+            if let AnthropicContentBlock::ToolSearchToolResult { content, .. } = block {
+                if content
+                    .tool_references
+                    .iter()
+                    .any(|reference| !defined.contains(reference.tool_name.as_str()))
+                {
+                    return Err(LlmError::invalid_request(
+                            "Historical Anthropic tool-search references need authentic tool definitions. Reconnect the tool catalog before resuming this conversation.",
+                        ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn native_policy_needs_advisory(availability: &ToolAvailability) -> bool {
+    let mut offered: std::collections::BTreeSet<_> = availability
+        .anthropic_initial_declarations()
+        .iter()
+        .map(|definition| definition.name.clone())
+        .collect();
+    for event in availability.anthropic_changes() {
+        match &event.change {
+            ToolChange::Addition(definition) => {
+                offered.insert(definition.name.clone());
+            }
+            ToolChange::Removal { name } => {
+                offered.remove(name);
+            }
+        }
+    }
+    &offered != availability.callable_names()
+}
+
+fn anthropic_declarations(request: &LlmRequest, native: bool) -> &[super::types::ToolDefinition] {
+    if native {
+        request.tool_availability.anthropic_initial_declarations()
+    } else {
+        request.tool_availability.declarations()
+    }
+}
+
+fn uses_tool_search(spec: &ModelSpec, request: &LlmRequest, native: bool) -> bool {
+    spec.supports_tool_search
+        && (anthropic_declarations(request, native)
+            .iter()
+            .any(|definition| definition.defer_loading)
+            || request.messages.iter().any(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolSearchToolResult { .. }))
+            }))
+}
+
+fn tool_advisory(availability: &ToolAvailability) -> String {
+    format!(
+        "The currently callable client tools are: {}. Other declared tools are retained only for historical context and must not be called; execution will return an unavailable error.",
+        serde_json::to_string(availability.callable_names()).expect("tool names serialize"),
+    )
+}
+
+fn insert_tool_changes(
+    request: &LlmRequest,
+    messages: Vec<AnthropicMessage>,
+) -> Result<Vec<AnthropicMessage>, LlmError> {
+    let changes = request.tool_availability.anthropic_changes();
+    let mut positioned = BTreeMap::<usize, Vec<AnthropicContentBlock>>::new();
+    for change in changes {
+        let index = request
+            .messages
+            .iter()
+            .position(|message| {
+                message.source_message_id.as_deref() == Some(change.after_message_id.as_str())
+            })
+            .ok_or_else(|| {
+                LlmError::invalid_request(
+                    "Anthropic tool-change anchor is absent from projected history",
+                )
+            })?;
+        if messages[index].role != "user"
+            || messages
+                .get(index + 1)
+                .is_some_and(|next| next.role != "assistant")
+        {
+            return Err(LlmError::invalid_request("Anthropic tool change requires a user turn followed by an assistant turn or end of input"));
+        }
+        let block = match &change.change {
+            ToolChange::Removal { name } => AnthropicContentBlock::ToolRemoval {
+                tool: AnthropicChangedTool::ToolReference { name: name.clone() },
+            },
+            ToolChange::Addition(definition) => AnthropicContentBlock::ToolAddition {
+                tool: AnthropicChangedTool::ToolDefinition {
+                    definition: AnthropicFunctionTool {
+                        name: definition.name.clone(),
+                        description: definition.description.clone(),
+                        input_schema: definition.input_schema.clone(),
+                        defer_loading: false,
+                        cache_control: None,
+                    },
+                },
+            },
+        };
+        positioned.entry(index).or_default().push(block);
+    }
+    let mut projected = Vec::with_capacity(messages.len() + positioned.len());
+    for (index, message) in messages.into_iter().enumerate() {
+        projected.push(message);
+        if let Some(content) = positioned.remove(&index) {
+            projected.push(AnthropicMessage {
+                role: "system".into(),
+                content,
+            });
+        }
+    }
+    Ok(projected)
 }
 
 fn apply_provider_replay(
@@ -1246,6 +1462,12 @@ fn normalize_response_with_diagnostics(
                      Update AnthropicContentBlock enum to handle it."
                 );
             }
+            AnthropicContentBlock::ToolAddition { .. }
+            | AnthropicContentBlock::ToolRemoval { .. } => {
+                return Err(LlmError::invalid_response(
+                    "Anthropic returned request-only tool-change blocks",
+                ));
+            }
         }
     }
 
@@ -1316,7 +1538,7 @@ fn normalize_response_with_diagnostics(
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
     let provider_replay = if has_tool_use && !private_blocks.is_empty() {
-        Some(AnthropicReplayUpdate::Append(
+        Some(ProviderReplayUpdate::Anthropic(
             AnthropicResponseSet::with_public_content(
                 response_identity,
                 content.clone(),
@@ -1327,7 +1549,7 @@ fn normalize_response_with_diagnostics(
     } else if has_tool_use {
         None
     } else {
-        Some(AnthropicReplayUpdate::Clear)
+        Some(ProviderReplayUpdate::Clear)
     };
 
     let mut response = LlmResponse::non_streaming(
@@ -1426,6 +1648,12 @@ pub(crate) struct AnthropicMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AnthropicContentBlock {
+    ToolAddition {
+        tool: AnthropicChangedTool,
+    },
+    ToolRemoval {
+        tool: AnthropicChangedTool,
+    },
     Text {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1523,8 +1751,8 @@ enum AnthropicToolEntry {
     ToolSearch(AnthropicToolSearchTool),
 }
 
-#[derive(Debug, Serialize)]
-struct AnthropicFunctionTool {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct AnthropicFunctionTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
@@ -1532,6 +1760,13 @@ struct AnthropicFunctionTool {
     defer_loading: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum AnthropicChangedTool {
+    ToolReference { name: String },
+    ToolDefinition { definition: AnthropicFunctionTool },
 }
 
 #[derive(Debug, Serialize)]
@@ -1632,7 +1867,8 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            tools: vec![
+            responses_replay: vec![],
+            tool_availability: ToolAvailability::all(vec![
                 ToolDefinition {
                     name: "bash".into(),
                     description: "Run a bash command".into(),
@@ -1645,7 +1881,7 @@ mod tests {
                     input_schema: serde_json::json!({"type": "object"}),
                     defer_loading: true,
                 },
-            ],
+            ]),
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
@@ -1659,13 +1895,444 @@ mod tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            tools: vec![],
+            responses_replay: vec![],
+            tool_availability: ToolAvailability::all(vec![]),
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
+    }
+
+    fn tool_policy_request() -> LlmRequest {
+        let mut request = test_request_with_tools();
+        request.messages = vec![LlmMessage {
+            source_message_id: Some("user-policy-anchor".into()),
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("Continue")],
+        }];
+        request
+    }
+
+    #[test]
+    fn native_tool_changes_require_known_model_and_official_route() {
+        let mut spec = test_spec(true);
+        spec.api_name = "claude-opus-5-5".into();
+        assert!(supports_native_tool_changes(&spec, None));
+        assert!(supports_native_tool_changes(
+            &spec,
+            Some(OFFICIAL_ANTHROPIC_URL)
+        ));
+        assert!(!supports_native_tool_changes(
+            &spec,
+            Some("https://proxy.example/v1/messages")
+        ));
+        spec.api_name = "claude-sonnet-5-5".into();
+        assert!(supports_native_tool_changes(&spec, None));
+        spec.api_name = "claude-sonnet-5".into();
+        assert!(!supports_native_tool_changes(&spec, None));
+    }
+
+    #[test]
+    fn native_withdrawal_keeps_prefix_and_replays_original_position() {
+        use phoenix_core::domain::tool_availability::PositionedToolChange;
+        let spec = test_spec(true);
+        let mut request = tool_policy_request();
+        let initial = request.tool_availability.declarations().to_vec();
+        request.tool_availability = ToolAvailability::new(
+            initial.clone(),
+            std::collections::BTreeSet::from(["bash".into()]),
+        )
+        .unwrap()
+        .with_anthropic_context(
+            initial,
+            vec![PositionedToolChange {
+                after_message_id: "user-policy-anchor".into(),
+                change: ToolChange::Removal {
+                    name: "mcp_tool".into(),
+                },
+            }],
+        )
+        .unwrap();
+        let wire = serde_json::to_value(
+            translate_request_with_tool_policy(&spec, &request, false, false, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["tools"][1]["name"], "mcp_tool");
+        assert_eq!(
+            wire["messages"][1],
+            serde_json::json!({
+                "role": "system", "content": [{"type": "tool_removal", "tool": {"type": "tool_reference", "name": "mcp_tool"}}]
+            })
+        );
+        request.messages.push(LlmMessage {
+            source_message_id: Some("following-assistant".into()),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::text("OK")],
+        });
+        request.messages.push(LlmMessage {
+            source_message_id: Some("following-user".into()),
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("Next")],
+        });
+        let next = serde_json::to_value(
+            translate_request_with_tool_policy(&spec, &request, false, false, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(next["messages"][1], wire["messages"][1]);
+        assert_eq!(next["messages"][2]["role"], "assistant");
+        assert!(next.get("tool_choice").is_none());
+        let retry = serde_json::to_value(
+            translate_request_with_tool_policy(&spec, &request, false, false, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(next, retry);
+    }
+
+    #[test]
+    fn native_schema_change_is_inline_and_keeps_initial_definition() {
+        use phoenix_core::domain::tool_availability::PositionedToolChange;
+        let spec = test_spec(true);
+        let mut request = tool_policy_request();
+        let initial = request.tool_availability.declarations().to_vec();
+        let mut updated = initial.clone();
+        updated[0].input_schema = serde_json::json!({"type":"object","required":["command"]});
+        request.tool_availability = ToolAvailability::all(updated.clone())
+            .with_anthropic_context(
+                initial.clone(),
+                vec![PositionedToolChange {
+                    after_message_id: "user-policy-anchor".into(),
+                    change: ToolChange::Addition(updated[0].clone()),
+                }],
+            )
+            .unwrap();
+        let wire = serde_json::to_value(
+            translate_request_with_tool_policy(&spec, &request, false, false, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["tools"][0]["input_schema"], initial[0].input_schema);
+        assert_eq!(
+            wire["messages"][1]["content"][0]["tool"]["type"],
+            "tool_definition"
+        );
+        assert_eq!(
+            wire["messages"][1]["content"][0]["tool"]["definition"]["input_schema"],
+            updated[0].input_schema
+        );
+        let advisory = serde_json::to_value(
+            translate_request_with_tool_policy(&spec, &request, false, false, false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            advisory["tools"][0]["input_schema"],
+            updated[0].input_schema
+        );
+        assert_eq!(advisory["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_call_and_search_reference_survive_private_replay() {
+        use phoenix_core::domain::llm_types::{ToolReference, ToolSearchResultContent};
+        use phoenix_core::domain::provider_replay::AnthropicReplayPayload;
+        use phoenix_core::domain::tool_availability::PositionedToolChange;
+        let spec = test_spec(true);
+        let mut request = tool_policy_request();
+        let public = vec![
+            ContentBlock::ServerToolUse {
+                id: "srvtoolu_search".into(),
+                name: TOOL_SEARCH_NAME.into(),
+                input: serde_json::json!({"query":"mcp_tool"}),
+            },
+            ContentBlock::ToolSearchToolResult {
+                tool_use_id: "srvtoolu_search".into(),
+                content: ToolSearchResultContent {
+                    r#type: "tool_search_tool_search_result".into(),
+                    tool_references: vec![ToolReference {
+                        r#type: "tool_reference".into(),
+                        tool_name: "mcp_tool".into(),
+                    }],
+                    error_code: None,
+                },
+            },
+            ContentBlock::ToolUse {
+                id: "toolu_failed".into(),
+                name: "mcp_tool".into(),
+                input: serde_json::json!({}),
+            },
+        ];
+        request.messages.push(LlmMessage {
+            source_message_id: Some("owner".into()),
+            role: MessageRole::Assistant,
+            content: public.clone(),
+        });
+        request.messages.push(LlmMessage {
+            source_message_id: Some("failed-result".into()),
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_failed".into(),
+                content: "Session expired".into(),
+                images: vec![],
+                is_error: true,
+            }],
+        });
+        request.provider_replay = Some(
+            AnthropicReplayPayload::new(vec![AnthropicResponseSet::with_public_content(
+                AnthropicResponseIdentity {
+                    response_id: "provider-response".into(),
+                    model: "claude-opus-5-5".into(),
+                },
+                public,
+                vec![AnthropicPrivateBlock::Thinking {
+                    index: ContentIndex(0),
+                    thinking: "private".into(),
+                    signature: "signed".into(),
+                }],
+            )
+            .unwrap()
+            .with_owner_message_id("owner".into())])
+            .unwrap(),
+        );
+        let initial = request.tool_availability.declarations().to_vec();
+        request.tool_availability = ToolAvailability::new(
+            initial.clone(),
+            std::collections::BTreeSet::from(["bash".into()]),
+        )
+        .unwrap()
+        .with_anthropic_context(
+            initial,
+            vec![PositionedToolChange {
+                after_message_id: "failed-result".into(),
+                change: ToolChange::Removal {
+                    name: "mcp_tool".into(),
+                },
+            }],
+        )
+        .unwrap();
+        for native in [true, false] {
+            let wire = serde_json::to_value(
+                translate_request_with_tool_policy(&spec, &request, false, true, native).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["messages"][1]["content"][0]["signature"], "signed");
+            assert_eq!(
+                wire["messages"][1]["content"][2]["content"]["tool_references"][0]["tool_name"],
+                "mcp_tool"
+            );
+            assert_eq!(wire["messages"][1]["content"][3]["name"], "mcp_tool");
+            assert_eq!(
+                wire["messages"][2]["content"][0]["tool_use_id"],
+                "toolu_failed"
+            );
+            assert_eq!(wire["messages"][2]["content"][0]["is_error"], true);
+            if !native {
+                assert_eq!(wire["messages"].as_array().unwrap().len(), 3);
+                assert!(wire["system"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("historical context"));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_illegal_native_anchor_is_not_relocated() {
+        use phoenix_core::domain::tool_availability::PositionedToolChange;
+        let spec = test_spec(true);
+        for anchor in ["missing", "user-policy-anchor"] {
+            let mut request = tool_policy_request();
+            request.messages.push(LlmMessage {
+                source_message_id: Some("next-user".into()),
+                role: MessageRole::User,
+                content: vec![ContentBlock::text("Next")],
+            });
+            let initial = request.tool_availability.declarations().to_vec();
+            request.tool_availability = request
+                .tool_availability
+                .with_anthropic_context(
+                    initial,
+                    vec![PositionedToolChange {
+                        after_message_id: anchor.into(),
+                        change: ToolChange::Removal {
+                            name: "bash".into(),
+                        },
+                    }],
+                )
+                .unwrap();
+            let error = translate_request_with_tool_policy(&spec, &request, false, false, true)
+                .unwrap_err();
+            assert_eq!(error.kind, crate::LlmErrorKind::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn legacy_missing_tool_search_schema_requires_catalog_reconnection() {
+        use phoenix_core::domain::llm_types::{ToolReference, ToolSearchResultContent};
+        let spec = test_spec(true);
+        let mut request = tool_policy_request();
+        request.tool_availability = ToolAvailability::all(vec![]);
+        request.messages.push(LlmMessage {
+            source_message_id: Some("private-message-id".into()),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolSearchToolResult {
+                tool_use_id: "private-search-id".into(),
+                content: ToolSearchResultContent {
+                    r#type: "tool_search_tool_search_result".into(),
+                    tool_references: vec![ToolReference {
+                        r#type: "tool_reference".into(),
+                        tool_name: "private-tool-name".into(),
+                    }],
+                    error_code: None,
+                },
+            }],
+        });
+        let before = request.messages[1].content.clone();
+        for native in [true, false] {
+            let error = translate_request_with_tool_policy(&spec, &request, false, false, native)
+                .unwrap_err();
+            assert_eq!(error.kind, crate::LlmErrorKind::InvalidRequest);
+            assert!(error.message.contains("Reconnect the tool catalog"));
+            assert!(!error.message.contains("private-"));
+            assert!(error.message.len() < 200);
+            assert_eq!(request.messages[1].content, before);
+        }
+    }
+
+    #[test]
+    fn historical_search_references_require_definition_before_the_reference() {
+        use phoenix_core::domain::llm_types::{ToolReference, ToolSearchResultContent};
+        use phoenix_core::domain::tool_availability::PositionedToolChange;
+        let spec = test_spec(true);
+        for anchor in ["user-policy-anchor", "result-after-search"] {
+            let mut request = tool_policy_request();
+            let declarations = request.tool_availability.declarations().to_vec();
+            request.messages.push(LlmMessage {
+                source_message_id: Some("search-owner".into()),
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolSearchToolResult {
+                    tool_use_id: "srvtoolu_search".into(),
+                    content: ToolSearchResultContent {
+                        r#type: "tool_search_tool_search_result".into(),
+                        tool_references: vec![ToolReference {
+                            r#type: "tool_reference".into(),
+                            tool_name: "mcp_tool".into(),
+                        }],
+                        error_code: None,
+                    },
+                }],
+            });
+            request.messages.push(LlmMessage {
+                source_message_id: Some("result-after-search".into()),
+                role: MessageRole::User,
+                content: vec![ContentBlock::text("Next")],
+            });
+            request.tool_availability = ToolAvailability::all(declarations.clone())
+                .with_anthropic_context(
+                    vec![declarations[0].clone()],
+                    vec![PositionedToolChange {
+                        after_message_id: anchor.into(),
+                        change: ToolChange::Addition(declarations[1].clone()),
+                    }],
+                )
+                .unwrap();
+            let result = translate_request_with_tool_policy(&spec, &request, false, false, true);
+            assert_eq!(result.is_ok(), anchor == "user-policy-anchor");
+            assert!(
+                translate_request_with_tool_policy(&spec, &request, false, false, false).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn historical_search_keeps_server_declaration_with_nondeferred_catalog() {
+        use phoenix_core::domain::llm_types::ToolSearchResultContent;
+        let spec = test_spec(true);
+        let mut request = tool_policy_request();
+        let declarations: Vec<_> = request
+            .tool_availability
+            .declarations()
+            .iter()
+            .cloned()
+            .map(|mut definition| {
+                definition.defer_loading = false;
+                definition
+            })
+            .collect();
+        request.tool_availability = ToolAvailability::all(declarations);
+        request.messages.push(LlmMessage {
+            source_message_id: Some("old-search".into()),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolSearchToolResult {
+                tool_use_id: "srvtoolu_search".into(),
+                content: ToolSearchResultContent {
+                    r#type: "tool_search_tool_result_error".into(),
+                    tool_references: vec![],
+                    error_code: Some("too_many_requests".into()),
+                },
+            }],
+        });
+        for native in [true, false] {
+            assert!(uses_tool_search(&spec, &request, native));
+            let wire = serde_json::to_value(
+                translate_request_with_tool_policy(&spec, &request, false, false, native).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["tools"][2]["type"], TOOL_SEARCH_VARIANT);
+        }
+    }
+
+    #[test]
+    fn paused_tail_uses_advisory_until_a_user_turn_can_anchor_change() {
+        let spec = test_spec(true);
+        let mut request = tool_policy_request();
+        let initial = request.tool_availability.declarations().to_vec();
+        request.tool_availability =
+            ToolAvailability::new(initial, std::collections::BTreeSet::from(["bash".into()]))
+                .unwrap();
+        request.messages.push(LlmMessage {
+            source_message_id: Some("paused-owner".into()),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolSearchToolResult {
+                tool_use_id: "srvtoolu_pause".into(),
+                content: super::super::types::ToolSearchResultContent {
+                    r#type: "tool_search_tool_result_error".into(),
+                    tool_references: vec![],
+                    error_code: Some("too_many_requests".into()),
+                },
+            }],
+        });
+        let wire = serde_json::to_value(
+            translate_request_with_tool_policy(&spec, &request, false, true, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(wire["messages"][1]["role"], "assistant");
+        assert!(wire["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("must not be called"));
+    }
+
+    #[test]
+    fn fresh_anthropic_context_uses_retained_policy_without_old_native_events() {
+        let spec = test_spec(true);
+        let mut request = tool_policy_request();
+        let declarations = request.tool_availability.declarations().to_vec();
+        request.tool_availability = ToolAvailability::new(
+            declarations,
+            std::collections::BTreeSet::from(["bash".into()]),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(
+            translate_request_with_tool_policy(&spec, &request, false, false, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(wire["messages"].as_array().unwrap().len(), 1);
+        assert!(wire["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("must not be called"));
     }
 
     #[test]
@@ -1952,7 +2619,8 @@ mod tests {
                 }],
             }],
             provider_replay: None,
-            tools: vec![],
+            responses_replay: vec![],
+            tool_availability: ToolAvailability::all(vec![]),
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
@@ -2303,8 +2971,7 @@ mod tests {
             "public response contains only tool use"
         );
         let update = response.provider_replay.expect("private replay update");
-        let phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(set) = update
-        else {
+        let ProviderReplayUpdate::Anthropic(set) = update else {
             panic!("tool response must append private replay");
         };
         assert_eq!(set.private_blocks.len(), 2);

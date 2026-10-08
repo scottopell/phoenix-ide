@@ -84,6 +84,7 @@ export type ChainAction =
   | { type: 'SUBMIT_FAIL'; error: string }
 
   // Wire-driven mutations of the in-flight buffer.
+  | { type: 'ANSWER_RESET'; chainQaId: string }
   | { type: 'TOKEN_APPENDED'; chainQaId: string; delta: string }
   | {
       type: 'INFLIGHT_FAIL';
@@ -178,6 +179,15 @@ export function chainReducer(atom: ChainAtom, action: ChainAction): ChainAtom {
             preToken: false,
           },
         },
+      };
+    }
+
+    case 'ANSWER_RESET': {
+      const cur = atom.inflight[action.chainQaId];
+      if (!cur) return atom;
+      return {
+        ...atom,
+        inflight: { ...atom.inflight, [action.chainQaId]: { ...cur, answer: '', preToken: true } },
       };
     }
 
