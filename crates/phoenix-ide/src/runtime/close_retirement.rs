@@ -1480,6 +1480,10 @@ impl RuntimeManager {
                             "resumed the exact recorded private final tombstone and administrative cleanup",
                         )
                         .await?;
+                        self.retire_close_work_scope(
+                            attempt_id, snapshot, &scope, &targets, &retired,
+                        )
+                        .await?;
                         continue;
                     }
                     let worktree_absent =
@@ -1821,54 +1825,65 @@ impl RuntimeManager {
                     }
                 }
             }
-            let work_scope_target = targets
-                .iter()
-                .find(|target| {
-                    target.scope == scope
-                        && target.resource.kind() == RetiredResourceKind::WorkScope
-                })
-                .ok_or_else(|| CloseRetirementError::ScopedMessage {
-                    scope: scope.clone(),
-                    message: format!("Close scope {scope} lacks mandatory WorkScope target"),
-                })?;
-            if retired.contains(&(scope.clone(), resource_key(&work_scope_target.resource))) {
-                continue;
-            }
-            match self
-                .db()
-                .retire_work_scope_for_close_attempt(
+            self.retire_close_work_scope(attempt_id, snapshot, &scope, &targets, &retired)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn retire_close_work_scope(
+        &self,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+        scope: &WorkScopeId,
+        targets: &[CloseExpectedRetirementResource],
+        retired: &std::collections::BTreeSet<(WorkScopeId, (String, String))>,
+    ) -> Result<(), CloseRetirementError> {
+        let work_scope_target = targets
+            .iter()
+            .find(|target| {
+                &target.scope == scope && target.resource.kind() == RetiredResourceKind::WorkScope
+            })
+            .ok_or_else(|| CloseRetirementError::ScopedMessage {
+                scope: scope.clone(),
+                message: format!("Close scope {scope} lacks mandatory WorkScope target"),
+            })?;
+        if retired.contains(&(scope.clone(), resource_key(&work_scope_target.resource))) {
+            return Ok(());
+        }
+        match self
+            .db()
+            .retire_work_scope_for_close_attempt(
+                attempt_id,
+                WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(
+                    scope.clone(),
+                ),
+                "close retirement",
+            )
+            .await
+            .map_err(|error| map_close_retirement_db_error(error).in_scope(scope))?
+        {
+            WorkScopeRetirementOutcome::Retired | WorkScopeRetirementOutcome::AlreadyRetired => {
+                self.record_close_retired(
                     attempt_id,
-                    WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(
-                        scope.clone(),
-                    ),
-                    "close retirement",
+                    snapshot,
+                    scope,
+                    work_scope_target.resource.clone(),
+                    "exact Close WorkScope retirement",
                 )
-                .await
-                .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?
-            {
-                WorkScopeRetirementOutcome::Retired
-                | WorkScopeRetirementOutcome::AlreadyRetired => {
-                    self.record_close_retired(
+                .await?;
+            }
+            WorkScopeRetirementOutcome::Blocked(blocker) => {
+                return self
+                    .record_close_residual(
                         attempt_id,
                         snapshot,
-                        &scope,
+                        scope,
                         work_scope_target.resource.clone(),
-                        "exact Close WorkScope retirement",
+                        RetirementFailureReason::StillSharedByLiveOwner,
+                        &format!("Close WorkScope retirement remains blocked: {blocker:?}"),
                     )
-                    .await?;
-                }
-                WorkScopeRetirementOutcome::Blocked(blocker) => {
-                    return self
-                        .record_close_residual(
-                            attempt_id,
-                            snapshot,
-                            &scope,
-                            work_scope_target.resource.clone(),
-                            RetirementFailureReason::StillSharedByLiveOwner,
-                            &format!("Close WorkScope retirement remains blocked: {blocker:?}"),
-                        )
-                        .await;
-                }
+                    .await;
             }
         }
         Ok(())

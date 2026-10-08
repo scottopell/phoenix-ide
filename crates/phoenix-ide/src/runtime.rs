@@ -9755,6 +9755,14 @@ mod scope_liveness_tests {
             if state == "empty" {
                 assert!(!root.exists());
                 assert!(!administrative_dir.exists());
+                assert!(evidence.iter().any(|proof| {
+                    proof.resource.kind() == RetiredResourceKind::Worktree
+                        && matches!(proof.outcome, RetirementOutcome::AbsenceAdopted { .. })
+                }));
+                assert!(evidence.iter().any(|proof| {
+                    proof.resource.kind() == RetiredResourceKind::WorkScope
+                        && matches!(proof.outcome, RetirementOutcome::Retired)
+                }));
             } else {
                 assert!(root.is_dir());
                 assert!(administrative_dir.exists());
