@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use supervisor::{
-    CallOutcome, CallRecovery, OAuthRetryPlan, RecoveryClaim, RecoveryPermit, RecoveryTarget,
-    SupervisorHandle, SupervisorState,
+    CallOutcome, CallRecovery, OAuthRetryCause, OAuthRetryPlan, RecoveryClaim, RecoveryPermit,
+    RecoveryTarget, SupervisorHandle, SupervisorState,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -552,6 +552,7 @@ impl HandshakeFailure {
                 message,
                 teardown_retry: retry.map(|server| *server).or(caller).map(|server| {
                     let plan = OAuthRetryPlan {
+                        retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                         scopes: prior_plan.map_or_else(Vec::new, |plan| plan.scopes.clone()),
                         www_authenticate,
                     };
@@ -2082,7 +2083,7 @@ impl McpClientManager {
         name: &str,
         old_config: &McpServerConfig,
         new_config: &McpServerConfig,
-    ) {
+    ) -> Result<(), String> {
         let client_id_changed =
             preconfigured_client_id(old_config) != preconfigured_client_id(new_config);
         let configured_scopes_changed =
@@ -2101,10 +2102,12 @@ impl McpClientManager {
         }
         let token = match self.oauth.store().token(name).await {
             Ok(Some(token)) => token,
-            Ok(None) => return,
+            Ok(None) => return Ok(()),
             Err(e) => {
                 tracing::warn!(server = %name, "OAuth token lookup failed during reload: {e}");
-                return;
+                return Err(format!(
+                    "MCP server '{name}': OAuth invalidation lookup failed: {e}"
+                ));
             }
         };
         let resource_matches = oauth_resource_url(new_config)
@@ -2122,8 +2125,12 @@ impl McpClientManager {
             );
             if let Err(e) = self.oauth.delete_token(name).await {
                 tracing::warn!(server = %name, "Failed to delete invalidated OAuth token: {e}");
+                return Err(format!(
+                    "MCP server '{name}': OAuth invalidation failed: {e}"
+                ));
             }
         }
+        Ok(())
     }
 
     /// Handle the OAuth redirect: validate `state` against the pending flow
@@ -2247,6 +2254,7 @@ impl McpClientManager {
                     ));
                 }
                 let plan = OAuthRetryPlan {
+                    retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                     scopes: flow.scopes.clone(),
                     www_authenticate: resolved.www_authenticate.clone(),
                 };
@@ -2290,14 +2298,26 @@ impl McpClientManager {
             })
             .unwrap_or_else(|| old_config.clone());
         let owner = self
-            .restart_oauth_owner(&name, &config, reconnect_owner, record.access_token)
+            .restart_oauth_owner(&name, &old_config, reconnect_owner, record.access_token)
             .await?;
         if config != old_config {
-            self.invalidate_oauth_on_config_change(&name, &old_config, &config)
-                .await;
+            if let Err(error) = self
+                .invalidate_oauth_on_config_change(&name, &old_config, &config)
+                .await
+            {
+                if let Some((handle, epoch)) = &owner {
+                    handle.fail(*epoch, error.clone()).await;
+                }
+                return Err(error);
+            }
         }
-        let (handle, epoch) = if let Some(owner) = owner {
-            owner
+        let (handle, epoch) = if let Some((handle, epoch)) = owner {
+            let epoch = if config == old_config {
+                epoch
+            } else {
+                handle.reconfigure(config.clone()).await?
+            };
+            (handle, epoch)
         } else {
             let handle = {
                 let mut servers = self.servers.write().await;
@@ -2381,6 +2401,7 @@ impl McpClientManager {
             "MCP OAuth authorization failed at the authorization server"
         );
         let plan = OAuthRetryPlan {
+            retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
             scopes: flow.scopes.clone(),
             www_authenticate: flow.www_authenticate.clone(),
         };
@@ -2432,6 +2453,7 @@ impl McpClientManager {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn refresh_authorized_server_owned(
         &self,
         name: &str,
@@ -2473,16 +2495,21 @@ impl McpClientManager {
         };
         let mut scopes = configured_oauth_scopes(config).to_vec();
         extend_unique(&mut scopes, token.scopes.iter().map(String::as_str));
-        if let Some(challenge) = www_authenticate {
-            if let Some(scope) = oauth::parse_bearer_challenge(challenge).get("scope") {
-                extend_unique(&mut scopes, scope.split_whitespace());
-            }
+        if let Some(scope) = www_authenticate
+            .and_then(|challenge| oauth::parse_bearer_challenge(challenge).remove("scope"))
+        {
+            extend_unique(&mut scopes, scope.split_whitespace());
         }
+        let retry_cause = handle
+            .oauth_retry_plan(permit.epoch)
+            .await
+            .map_or(OAuthRetryCause::Authorization, |plan| plan.retry_cause);
         if !handle
             .retain_oauth_plan(
                 permit.epoch,
                 &permit.config,
                 OAuthRetryPlan {
+                    retry_cause,
                     scopes,
                     www_authenticate: www_authenticate.map(str::to_owned),
                 },
@@ -2494,10 +2521,11 @@ impl McpClientManager {
         let Some(plan) = handle.oauth_retry_plan(permit.epoch).await else {
             return RefreshServerOutcome::Superseded;
         };
-        if plan
-            .www_authenticate
-            .as_deref()
-            .is_some_and(oauth::is_insufficient_scope_challenge)
+        if plan.retry_cause == OAuthRetryCause::Authorization
+            && plan
+                .www_authenticate
+                .as_deref()
+                .is_some_and(oauth::is_insufficient_scope_challenge)
         {
             return self
                 .reprompt_after_refresh_failure(
@@ -2509,7 +2537,15 @@ impl McpClientManager {
                 )
                 .await;
         }
-        match oauth_refresh(&self.oauth, name, &url, www_authenticate, &token).await {
+        match oauth_refresh(
+            &self.oauth,
+            name,
+            &url,
+            plan.www_authenticate.as_deref(),
+            &token,
+        )
+        .await
+        {
             Ok(access_token) => match handle
                 .finish_oauth_cleanup(permit.epoch, access_token)
                 .await
@@ -2640,6 +2676,7 @@ impl McpClientManager {
                                 permit.epoch,
                                 error.clone(),
                                 OAuthRetryPlan {
+                                    retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                                     scopes: prior_scopes.clone(),
                                     www_authenticate: www_authenticate.map(str::to_owned),
                                 },
@@ -2656,6 +2693,7 @@ impl McpClientManager {
                         permit.epoch,
                         error.clone(),
                         OAuthRetryPlan {
+                            retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                             scopes: prior_scopes.clone(),
                             www_authenticate: www_authenticate.map(str::to_owned),
                         },
@@ -2671,6 +2709,7 @@ impl McpClientManager {
     /// and challenged scopes. The claim moves into the pending flow so the
     /// triggering call stays parked until the re-authorized server is
     /// republished (REQ-MCP-012, deferred `ReAuthCallRetry`).
+    #[allow(clippy::too_many_lines)]
     async fn step_up_authorization(
         &self,
         name: &str,
@@ -2719,6 +2758,20 @@ impl McpClientManager {
         if let Some(scopes) = challenge.get("scope") {
             extend_unique(&mut prior_scopes, scopes.split_whitespace());
         }
+        if !handle
+            .retain_oauth_plan(
+                permit.epoch,
+                config,
+                OAuthRetryPlan {
+                    retry_cause: OAuthRetryCause::Authorization,
+                    scopes: prior_scopes.clone(),
+                    www_authenticate: Some(www_authenticate.to_owned()),
+                },
+            )
+            .await
+        {
+            return Err("MCP OAuth recovery was superseded".to_owned());
+        }
         if let Err(e) = self.oauth.delete_token(name).await {
             tracing::warn!(server = %name, "Failed to delete narrow OAuth token: {e}");
         }
@@ -2752,6 +2805,7 @@ impl McpClientManager {
                             permit.epoch,
                             error.clone(),
                             OAuthRetryPlan {
+                                retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                                 scopes: prior_scopes,
                                 www_authenticate: Some(www_authenticate.to_owned()),
                             },
@@ -2767,6 +2821,7 @@ impl McpClientManager {
                         permit.epoch,
                         error.clone(),
                         OAuthRetryPlan {
+                            retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                             scopes: prior_scopes,
                             www_authenticate: Some(www_authenticate.to_owned()),
                         },
@@ -3046,6 +3101,73 @@ impl McpClientManager {
         }
     }
 
+    async fn retry_oauth_cleanup_owned(
+        &self,
+        name: String,
+        handle: SupervisorHandle,
+        permit: RecoveryPermit,
+        plan: OAuthRetryPlan,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        if !handle
+            .retain_oauth_plan(permit.epoch, &permit.config, plan.clone())
+            .await
+        {
+            return Err("MCP cleanup retry was superseded".to_owned());
+        }
+        let token = self.oauth.store().token(&name).await;
+        let outcome = if let Some(token) = token.ok().flatten().filter(|token| {
+            !token.is_expired()
+                && oauth_resource_url(&permit.config)
+                    .is_some_and(|url| oauth::canonical_resource(url) == token.resource)
+        }) {
+            match handle
+                .finish_oauth_cleanup(permit.epoch, token.access_token)
+                .await
+            {
+                Ok(true) => RefreshServerOutcome::Refreshed(plan.clone()),
+                Ok(false) => RefreshServerOutcome::Superseded,
+                Err(error) => RefreshServerOutcome::Failed(error),
+            }
+        } else {
+            self.refresh_authorized_server_owned(&name, &handle, &permit, None)
+                .await
+        };
+        match outcome {
+            RefreshServerOutcome::Refreshed(plan) => {
+                let manager = self.clone();
+                Ok(tokio::spawn(async move {
+                    let _ = manager
+                        .finish_oauth_refresh_with_action(
+                            &name,
+                            &handle,
+                            &permit,
+                            RefreshServerOutcome::Refreshed(plan),
+                            OAuthHandshakeAction::Authorize,
+                        )
+                        .await;
+                }))
+            }
+            RefreshServerOutcome::Transient(error) => {
+                self.spawn_refresh_retry(
+                    name,
+                    handle,
+                    permit,
+                    None,
+                    OAuthHandshakeAction::Authorize,
+                );
+                Err(error)
+            }
+            RefreshServerOutcome::Failed(error) => {
+                handle
+                    .deny_oauth_cleanup(permit.epoch, error.clone(), plan)
+                    .await;
+                Err(error)
+            }
+            RefreshServerOutcome::Reprompt(error) => Err(error),
+            RefreshServerOutcome::Superseded => Err("MCP cleanup retry was superseded".to_owned()),
+        }
+    }
+
     async fn begin_actor_connect(
         &self,
         name: String,
@@ -3054,6 +3176,11 @@ impl McpClientManager {
     ) -> Result<tokio::task::JoinHandle<()>, String> {
         if handle.snapshot().config == config {
             if let Some((permit, plan)) = handle.retry_oauth().await {
+                if plan.retry_cause == OAuthRetryCause::Cleanup {
+                    return self
+                        .retry_oauth_cleanup_owned(name, handle, permit, plan)
+                        .await;
+                }
                 let result = begin_oauth_flow(
                     &self.oauth,
                     &self.pending_oauth_urls,
@@ -3603,6 +3730,7 @@ impl McpClientManager {
                         handle.snapshot().epoch,
                         invocation_config,
                         OAuthRetryPlan {
+                            retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                             scopes: challenged.clone(),
                             www_authenticate: Some(www_authenticate.clone()),
                         },
@@ -3783,8 +3911,13 @@ impl McpClientManager {
                 let (config, epoch, prior_plan) = if let RecoveryTarget::Reconfigure(config) =
                     handle.snapshot().recovery_target
                 {
-                    self.invalidate_oauth_on_config_change(server_name, &permit.config, &config)
-                        .await;
+                    if let Err(error) = self
+                        .invalidate_oauth_on_config_change(server_name, &permit.config, &config)
+                        .await
+                    {
+                        handle.fail(permit.epoch, error.clone()).await;
+                        return Err(McpToolCallError::Failed(error));
+                    }
                     let epoch = handle
                         .reconfigure(config.clone())
                         .await
@@ -3859,6 +3992,7 @@ impl McpClientManager {
         let snapshot = handle.snapshot();
         oauth_resource_url(&snapshot.config)?;
         let mut plan = OAuthRetryPlan {
+            retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
             scopes: configured_oauth_scopes(&snapshot.config).to_vec(),
             www_authenticate: None,
         };
@@ -3891,6 +4025,7 @@ impl McpClientManager {
                     retained_plan.scopes.iter().map(String::as_str),
                 );
                 plan.www_authenticate = retained_plan.www_authenticate;
+                plan.retry_cause = retained_plan.retry_cause;
                 permit
             }
             SupervisorState::Connecting
@@ -3904,9 +4039,28 @@ impl McpClientManager {
         {
             return Some(Err("MCP removal recovery was superseded".to_owned()));
         }
-        let outcome = if plan.www_authenticate.is_none() {
-            if let Ok(Some(token)) = &token {
-                if token.is_expired() {
+        let outcome =
+            if plan.retry_cause == OAuthRetryCause::Cleanup || plan.www_authenticate.is_none() {
+                if let Ok(Some(token)) = &token {
+                    if token.is_expired() {
+                        self.refresh_authorized_server_owned(
+                            name,
+                            handle,
+                            &permit,
+                            plan.www_authenticate.as_deref(),
+                        )
+                        .await
+                    } else {
+                        match handle
+                            .finish_oauth_cleanup(permit.epoch, token.access_token.clone())
+                            .await
+                        {
+                            Ok(true) => RefreshServerOutcome::Refreshed(plan.clone()),
+                            Ok(false) => RefreshServerOutcome::Superseded,
+                            Err(error) => RefreshServerOutcome::Failed(error),
+                        }
+                    }
+                } else {
                     self.refresh_authorized_server_owned(
                         name,
                         handle,
@@ -3914,15 +4068,6 @@ impl McpClientManager {
                         plan.www_authenticate.as_deref(),
                     )
                     .await
-                } else {
-                    match handle
-                        .finish_oauth_cleanup(permit.epoch, token.access_token.clone())
-                        .await
-                    {
-                        Ok(true) => RefreshServerOutcome::Refreshed(plan.clone()),
-                        Ok(false) => RefreshServerOutcome::Superseded,
-                        Err(error) => RefreshServerOutcome::Failed(error),
-                    }
                 }
             } else {
                 self.refresh_authorized_server_owned(
@@ -3932,16 +4077,7 @@ impl McpClientManager {
                     plan.www_authenticate.as_deref(),
                 )
                 .await
-            }
-        } else {
-            self.refresh_authorized_server_owned(
-                name,
-                handle,
-                &permit,
-                plan.www_authenticate.as_deref(),
-            )
-            .await
-        };
+            };
         Some(match outcome {
             RefreshServerOutcome::Refreshed(_) => match handle.remove().await {
                 Ok(()) => match self.oauth.delete_token(name).await {
@@ -4115,6 +4251,8 @@ impl McpClientManager {
                                     handle.snapshot().epoch,
                                     "authorization superseded by configuration change".to_owned(),
                                     OAuthRetryPlan {
+                                        retry_cause:
+                                            crate::supervisor::OAuthRetryCause::Authorization,
                                         scopes: flow.scopes,
                                         www_authenticate: flow.www_authenticate,
                                     },
@@ -4138,8 +4276,17 @@ impl McpClientManager {
                     }
                     self.cancel_pending_oauth_flow(&name).await;
                     self.pending_oauth_urls.write().await.remove(&name);
-                    self.invalidate_oauth_on_config_change(&name, &old, &config)
-                        .await;
+                    if let Err(error) = self
+                        .invalidate_oauth_on_config_change(&name, &old, &config)
+                        .await
+                    {
+                        failed.push(McpReloadFailure {
+                            server: name,
+                            action: "restart".to_owned(),
+                            error,
+                        });
+                        continue;
+                    }
                     (handle, true)
                 }
                 None => {
@@ -4424,6 +4571,8 @@ impl McpClientManager {
                                     None,
                                     OAuthHandshakeAction::Authorize,
                                     Some(&OAuthRetryPlan {
+                                        retry_cause:
+                                            crate::supervisor::OAuthRetryCause::Authorization,
                                         scopes: prior_scopes,
                                         www_authenticate,
                                     }),
@@ -4450,6 +4599,8 @@ impl McpClientManager {
                                     None,
                                     OAuthHandshakeAction::Authorize,
                                     Some(&OAuthRetryPlan {
+                                        retry_cause:
+                                            crate::supervisor::OAuthRetryCause::Authorization,
                                         scopes: prior_scopes,
                                         www_authenticate,
                                     }),
@@ -4465,6 +4616,7 @@ impl McpClientManager {
                             teardown_retry: Some(ConnectTeardown::OAuth(OAuthHandshakeCleanup {
                                 server,
                                 plan: OAuthRetryPlan {
+                                    retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                                     scopes: prior_scopes,
                                     www_authenticate,
                                 },

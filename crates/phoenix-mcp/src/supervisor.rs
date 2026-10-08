@@ -29,8 +29,15 @@ pub(crate) enum RecoveryTarget {
 
 #[derive(Clone)]
 pub(crate) struct OAuthRetryPlan {
+    pub(crate) retry_cause: OAuthRetryCause,
     pub(crate) scopes: Vec<String>,
     pub(crate) www_authenticate: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OAuthRetryCause {
+    Authorization,
+    Cleanup,
 }
 
 #[derive(Debug, Clone)]
@@ -914,6 +921,9 @@ impl Actor {
                         if let RetainedTransport::OAuthRecovery { retry_plan, .. } = transport {
                             let mut plan = plan.clone();
                             if let Some(previous) = retry_plan.as_ref() {
+                                if plan.www_authenticate.is_none() {
+                                    plan.retry_cause = previous.retry_cause;
+                                }
                                 crate::extend_unique(
                                     &mut plan.scopes,
                                     previous.scopes.iter().map(String::as_str),
@@ -948,6 +958,7 @@ impl Actor {
                             let mut plan = plan.clone();
                             if matches!(cause, OAuthFailureCause::Cleanup) {
                                 if let Some(retained) = retry_plan.as_ref() {
+                                    plan.retry_cause = retained.retry_cause;
                                     crate::extend_unique(
                                         &mut plan.scopes,
                                         retained.scopes.iter().map(String::as_str),
@@ -1313,9 +1324,15 @@ impl Actor {
                     let _ = reply.send(Ok(None));
                     return;
                 }
-                for retained in &self.teardown_retry {
-                    if let RetainedTransport::OAuthRecovery { server, .. } = retained {
+                for retained in &mut self.teardown_retry {
+                    if let RetainedTransport::OAuthRecovery { server, retry_plan } = retained {
                         *server.oauth_bearer.write().unwrap() = Some(access_token.clone());
+                        let plan = retry_plan.get_or_insert_with(|| OAuthRetryPlan {
+                            retry_cause: OAuthRetryCause::Cleanup,
+                            scopes: crate::configured_oauth_scopes(&self.snapshot.config).to_vec(),
+                            www_authenticate: None,
+                        });
+                        plan.retry_cause = OAuthRetryCause::Cleanup;
                     }
                 }
                 match self.stop_server().await {
@@ -1594,9 +1611,11 @@ impl Actor {
                 ) = (crate::oauth_cleanup_challenge(&error), &mut retained)
                 {
                     let plan = retry_plan.get_or_insert_with(|| OAuthRetryPlan {
+                        retry_cause: crate::supervisor::OAuthRetryCause::Authorization,
                         scopes: crate::configured_oauth_scopes(&self.snapshot.config).to_vec(),
                         www_authenticate: None,
                     });
+                    plan.retry_cause = OAuthRetryCause::Authorization;
                     plan.www_authenticate = crate::merge_oauth_challenges(
                         [
                             plan.www_authenticate.as_deref(),

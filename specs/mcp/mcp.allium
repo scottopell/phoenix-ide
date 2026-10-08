@@ -868,6 +868,9 @@ rule ReloadDefersConfigurationForOAuthCleanup {
         -- publish a new cleanup authorization with its challenge and scope union.
         -- After authenticated cleanup, apply ReloadInvalidatesOAuth and
         -- ReloadRestartsServer before connecting the queued configuration.
+        -- Token lookup or deletion failure blocks configuration adoption and
+        -- leaves the old configuration failed and explicitly retryable. A
+        -- same-resource client or scope change cannot restore the old grant.
 }
 
 -- A config change cancels the pending nonce, including when a new cleanup
@@ -1215,6 +1218,10 @@ invariant SingleRecoveryLeaderPerEpoch {
     -- epoch lacks the challenged scopes, it claims the serving replacement's
     -- epoch for authorization before replaying; config changes reject the
     -- original invocation and cannot inherit its scopes or discovery metadata.
+    -- Failed owned cleanup distinguishes authorization rejection from transient
+    -- teardown failure after fresh credentials were installed. Explicit retry
+    -- reuses a valid persisted bearer for the latter, refreshing on expiry;
+    -- authorization retries preserve the challenge and scope union for sign-in.
 }
 
 invariant SupersededCompletionCannotPublish {

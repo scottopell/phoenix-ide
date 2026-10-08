@@ -222,3 +222,14 @@ configuration-bound plan publication rejects scopes and discovery from an old re
 `failed_removal_retries_valid_access_token_without_refresh_or_authorization` covers
 transient DELETE failure with and without a refresh token; retry reuses the valid
 access token and deletes the grant only after cleanup succeeds.
+
+`unchanged_reload_retries_refreshed_cleanup_without_browser_authorization`
+verifies DELETE failure after successful refresh retries authenticated cleanup
+on unchanged-config reload, including another access-token expiry before retry.
+`queued_configuration_invalidation_failure_blocks_old_grant_restore` covers
+refresh and authorization callback completion, lookup and deletion failure, and
+same-resource client/scope changes. Failed invalidation preserves the old
+configuration; explicit retry invalidates the grant before new authorization.
+`expired_cleanup_retry_preserves_challenge_discovery_and_completed_step_up`
+requires challenge-only discovery for expired cleanup retry after refresh or
+completed scope upgrade, covering both reconnect and removal without repeat sign-in.
