@@ -232,8 +232,24 @@ THE SYSTEM SHALL request retirement again for that same exact Close attempt
 AND SHALL preserve the attempt-bound retirement evidence and residual state already recorded for prior steps
 AND SHALL NOT mint a new Close attempt, silently complete the Close obligation, or mutate ProductConversation lifecycle state outside the typed Close retry command
 
-WHEN repair completes automatically through operator action or an idempotent external precondition change
-THE SYSTEM SHALL converge by driving the same exact-attempt retry/completion authority rather than by fabricating an unbound success path that bypasses the visible needs-repair attempt
+WHILE the exact Close attempt is in `NeedsRepair`
+THE SYSTEM SHALL require an explicit `CloseRetirementRetryRequested(product_conversation, attempt_id)` before resuming retirement
+AND SHALL NOT interpret startup, migration, background observation, progress replay, operator filesystem repair, or an external precondition change as that retry request
+
+WHEN Phoenix starts with an exact Close attempt already in `RetirementRequested`
+THE SYSTEM MAY recover that already-authorized retirement without a new retry request
+AND SHALL reseal the exact scope gates and revalidate live identity and writer safety before destructive work
+AND SHALL NOT extend this startup authority to `NeedsRepair`
+
+WHEN an explicit retry is accepted
+THE SYSTEM SHALL return the same attempt to retirement inspection before authorizing resumed destructive work
+AND SHALL retain prior generations as evidence rather than treating them as fresh discard confirmation
+AND SHALL use a fresh inspection generation except for the specifically supported partial-generation shape in REQ-WL-005
+AND SHALL NOT fabricate an unbound success path that bypasses the visible needs-repair attempt
+
+WHEN a scope-specific observation or cleanup step fails
+THE SYSTEM SHALL retain the exact failing scope through error propagation and atomically persist the typed residual resource and `NeedsRepair` transition for that scope
+AND SHALL NOT substitute the first attached scope or an unscoped fallback identity
 
 **Rationale:** A transient retirement failure should stay user-retryable on the exact visible Close attempt. Reusing the same attempt preserves evidence continuity and avoids hidden local lifecycle drift.
 
@@ -259,3 +275,162 @@ THE SYSTEM SHALL NOT automatically close a conversation because a PR appears mer
 AND SHALL NOT treat PR state as ownership of the conversation lifecycle
 
 **Rationale:** PR state helps the user understand whether work appears shipped, but Phoenix does not observe every repository event with enough authority to close work automatically. Close remains an explicit user decision.
+
+
+---
+
+### REQ-WL-004: Fresh-Generation Cleanup Authority Is Adopted Atomically Within One Attempt
+
+WHEN an authorized retry or interrupted retirement needs a retained worktree cleanup plan in its active inspection generation/fingerprint pair
+THE SYSTEM SHALL bind adoption to the same exact Close attempt, captured WorkScope, worktree resource kind, identity kind, identity codec, and identity value
+AND SHALL require that resource in the target generation's sealed expected-resource inventory
+AND SHALL require fresh observation of the retained Git administrative-directory locator and incarnation before adoption
+AND SHALL NOT infer continuity from a worktree path, branch name, or a different attempt
+
+THE SYSTEM SHALL select the newest compatible prior-generation plan with its exact matching dispatch and sealed inventory, excluding plans already consumed as a lineage source
+AND SHALL require the exact retained source inspection and loss identities, except for the typed legacy provenance admitted by REQ-WL-005
+AND SHALL NOT treat an inspection from a different aggregate generation/fingerprint pair as the source observation
+AND SHALL order eligible sources by inventory capture time descending, then cleanup-plan row order descending
+AND SHALL require its administrative-directory locator and incarnation to match the fresh observation
+AND SHALL copy the complete cleanup payload, including any bound final-tombstone root and object identities
+
+THE SYSTEM SHALL commit the target dispatch, target cleanup plan, and exact source-to-target adoption relation in one transaction
+AND SHALL retain the source dispatch, plan, every existing inspection and loss identity, residual evidence, prior lineage, and any typed legacy provenance
+AND SHALL store retained inspection times as nonnegative integer microseconds since the Unix epoch, converting the active RFC3339 observation in Rust without fabricating or replacing its time
+AND SHALL enforce one incoming adoption per exact target and one outgoing adoption per exact source
+AND SHALL freeze the source plan payload once it is adopted and prohibit lineage update or ordinary deletion
+
+WHEN the identical target adoption is requested again
+THE SYSTEM SHALL revalidate fresh administrative identity and exact source/target payload equality
+AND SHALL return the existing plan without adding a second lineage edge or dispatch
+
+WHEN source authority is missing, target authority is stale or unsealed, fresh identity differs, or a target dispatch, plan, or lineage conflicts
+THE SYSTEM SHALL roll back all adoption writes
+AND SHALL report typed evidence-invariant failure without destructive cleanup
+AND SHALL NOT leave a dispatch committed without its plan or a plan committed without its lineage
+
+WHEN a further explicit retry follows
+THE SYSTEM SHALL extend the lineage from the newest eligible plan rather than rewriting an earlier source
+
+WHEN a prior generation already contains a successful exact Worktree retirement receipt and the active retry freshly proves the captured path, worktree quarantine, retained administrative directory, and administrative quarantine are all absent without following links
+THE SYSTEM SHALL prepare immutable pending receipt lineage and target dispatch bound to the same attempt, scope, complete Worktree identity, exact source and target generation/fingerprint pairs, source dispatch and successful evidence, source cleanup-plan or finalized prior receipt lineage, and sealed target inventory
+AND SHALL repeat the no-follow absence observation after preparation before finalizing target `AbsenceAdopted` evidence
+AND SHALL continue only the remaining WorkScope retirement after finalization
+AND SHALL NOT recreate or adopt a cleanup plan for the deleted administrative directory, accept a source residual or pending receipt, or treat an inaccessible, dangling, or reappeared path as absence
+
+WHEN any path reappears or becomes indeterminate after receipt preparation
+THE SYSTEM SHALL preserve the pending lineage and path, record exact target-generation residual evidence, enter `NeedsRepair`, and SHALL NOT record target success or allow the pending receipt to authorize a later receipt chain
+
+WHEN identical successful receipt preparation or finalization is requested again
+THE SYSTEM SHALL revalidate the exact source, target and target evidence and return idempotently without adding a second lineage edge, dispatch, or evidence row
+
+WHEN a completed History aggregate is explicitly hard-deleted
+THE SYSTEM MAY delete its adoption history only after all transcript members have been removed, within the authorized aggregate deletion transaction
+AND SHALL remove cleanup-plan lineage, successful-receipt lineage, and legacy-provenance dependencies before deleting referenced evidence, plans, recognized inventories, and the Close obligation
+AND SHALL NOT use this deletion exception during retry, startup recovery, or migration
+
+---
+
+### REQ-WL-005: Partial-Generation Foreign-Key Failure Has One Supported Recognizer
+
+WHEN an exact Close obligation is in `awaiting_retirement_inspection` with a retained inspection generation/fingerprint pair
+THE SYSTEM MAY resume that same pair as `RetirementRequested` only when all of the following retained conditions hold:
+
+- At least one captured scope owns a worktree, and the total retained per-scope inspection count equals the captured worktree-owning scope count.
+- Every captured scope has a sealed retirement inventory for the retained active pair, with no missing or extra active inventory.
+- The active pair's residual-resource count equals the captured worktree-owning scope count; each such scope has its exact worktree residual with resource and identity kind `worktree`, identity codec `worktree_id_v1`, captured identity value, and reason `manual_repair_required`.
+- Each exact residual detail equals the complete retained diagnostic `Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed`; a prefix, suffix, generic FK-787 message, or cleanup-plan-prefixed message does not match.
+- The active pair has no dispatch and no worktree cleanup plan for the attempt.
+- Every captured worktree-owning scope has a cleanup plan and matching dispatch from a different generation/fingerprint pair of this same attempt, scope, and exact worktree resource identity.
+
+THE SYSTEM SHALL evaluate this conjunction and the phase change atomically
+AND SHALL retain all existing inspections, inventories, residuals, dispatches, plans, and identity bindings unchanged
+AND SHALL make repeated recognition a no-op once the phase is no longer `awaiting_retirement_inspection`
+
+WHEN that recognizer succeeds
+THE SYSTEM SHALL reacquire the exact captured scope leases before runtime retirement
+AND SHALL perform live administrative-directory, worktree/quarantine/tombstone identity validation and writer inspection before removal
+AND SHALL adopt prior-generation cleanup authority only through REQ-WL-004
+AND SHALL preserve ambiguous or replaced resources in typed repair
+
+WHEN this exact partial-generation shape has prior dispatch/plan authority but no exact retained source inspection
+THE SYSTEM MAY record immutable typed legacy FK787 cleanup provenance for each eligible source before any active-pair dispatch or plan is written
+AND SHALL bind it to the exact attempt, scope, source pair, worktree resource identity, recognized active inventory pair, and nonnegative integer recognition time in microseconds since the Unix epoch
+AND SHALL require the source's exact dispatch and sealed inventory
+AND SHALL freeze the source plan payload and prohibit ordinary provenance update or deletion
+AND SHALL distinguish recognition of retained legacy authority from an observed source inspection
+AND SHALL NOT fabricate source inspection generations, fingerprints, timestamps, loss rows, or empty loss classifications
+AND SHALL revalidate fresh administrative identity and writer safety before the atomic adoption in REQ-WL-004
+AND SHALL permit this provenance to authorize only that exact source, not an arbitrary historical plan or another attempt
+
+WHEN any recognizer condition fails
+THE SYSTEM SHALL NOT use the retained pair as this compatibility shortcut
+AND SHALL use ordinary fresh inspection or typed repair without deleting retained evidence
+
+THE SYSTEM SHALL support only this enumerated foreign-key partial-generation shape
+AND SHALL NOT treat an arbitrary SQLite error, generic manual-repair reason, resource absence, or unmatched historical cleanup plan as compatibility authority
+AND SHALL NOT use recognition to leave `NeedsRepair` without the explicit retry required by REQ-WL-002c
+
+---
+
+### REQ-WL-006: Linux Writer Inventory Covers All Processes and All Tasks Fail-Closed
+
+WHEN Linux retirement inspects whether a quarantined worktree or final-tombstone object has a process working directory within it
+THE SYSTEM SHALL enumerate every numeric process entry in the visible process namespace and every numeric task entry for every enumerated process
+AND SHALL inspect each task's cwd rather than only the thread-group leader's cwd
+AND SHALL NOT restrict this inventory to Phoenix, its process groups, or its effective UID
+
+THE SYSTEM SHALL bind process and task observations to their proc-directory device/inode and parsed stat identity, including numeric ID, start time, start-code, end-code, and start-stack values
+AND SHALL revalidate process incarnations, task sets and incarnations, and the full process set before accepting a clean scan
+
+WHEN any task cwd is within the retirement object
+THE SYSTEM SHALL preserve the object and report residual writer evidence
+
+WHEN enumeration, cwd or stat access is denied, missing, malformed, or incomplete
+OR a process/task appears, disappears, or changes incarnation during the scan
+THE SYSTEM SHALL classify the inventory as indeterminate and preserve the object in typed repair
+AND SHALL NOT treat a vanished process, PID reuse, exec, an empty task set, or an unreadable non-Phoenix process as proof of a clean scan
+
+THE SYSTEM SHALL NOT signal an ambient process solely because writer inspection finds it
+AND SHALL limit this guarantee to the visible Linux process namespace and the private-directory reliability boundary of REQ-WL-002b
+
+---
+
+### REQ-WL-007: Final-Tombstone Recovery Reinspects Writers Before Deletion
+
+WHEN retirement resumes with a retained final-tombstone binding
+THE SYSTEM SHALL validate the Phoenix-owned owner-only tombstone root through a no-follow opened descriptor and its retained device/inode
+AND SHALL validate the moved object relative to that descriptor against its retained device/inode and captured worktree fingerprint
+AND SHALL freshly inspect writers at the actual current deletion location, including process cwd and open-descriptor inspection
+AND SHALL revalidate the root, object, and worktree fingerprint after inspection and before deletion
+AND SHALL NOT reuse a pre-rename, pre-crash, or prior-generation clean scan as permission to delete
+
+WHEN writer evidence is present or indeterminate, an identity has changed, or an observation fails
+THE SYSTEM SHALL leave the object untouched and route the exact attempt and failing scope to typed repair
+
+WHEN a crash occurs after tombstone-root binding but before object binding
+THE SYSTEM SHALL resume normal identity-checked cleanup only if the tombstone has no moved object and exactly one of the captured or quarantine paths contains the exact retained worktree
+AND SHALL reinspect writers and revalidate that source before continuing
+AND SHALL preserve an already-moved but unbound tombstone object for repair rather than guessing its identity
+
+WHEN a bound tombstone object is absent after an interrupted deletion
+THE SYSTEM SHALL accept completion only with same-attempt durable cleanup authority and verified absence of the captured and quarantine paths and of any tombstone object
+AND SHALL accept a missing tombstone root only when the captured and quarantine paths are also proven missing
+AND SHALL NOT interpret inaccessible paths, replacements, or partial identity bindings as absence
+
+---
+
+### REQ-WL-008: Cleanup-Lineage Upgrade Preserves Evidence Without Executing Retirement
+
+WHEN cleanup-lineage migrations install exact cleanup-plan adoption constraints, retained inspection storage, typed legacy FK787 provenance storage, and successful Worktree receipt-lineage storage
+THE SYSTEM SHALL preserve every existing Close obligation, phase, captured member and scope, inspection, inventory, resource outcome/history, dispatch, cleanup plan, and bound tombstone identity
+AND SHALL install retained inspection, retained loss, legacy provenance, and successful-receipt lineage storage without backfilling missing observations, recognizing legacy authority, or preparing receipt adoption
+AND SHALL NOT synthesize adoption lineage, source inspections, loss identities, timestamps, legacy provenance, pending receipt lineage, dispatch, or success evidence for existing rows
+AND SHALL require each new receipt lineage to bind exact successful source evidence, exact source and target dispatch authority, sealed inventories, no target cleanup plan, and a pending-or-finalized state whose finalization is coupled to exact target success evidence
+AND SHALL NOT automatically retry an attempt, release a repair gate, rename or delete a worktree/quarantine/tombstone, or discard residual evidence
+
+WHEN existing rows violate the required exact identity constraints
+THE SYSTEM SHALL fail the migration rather than silently deleting, merging, or rewriting those rows
+
+THE SYSTEM SHALL treat this as a forward-only feature-scoped upgrade under `specs/compatibility/requirements.md`
+AND SHALL NOT infer downgrade, mixed-version database access, generic foreign-key repair, or arbitrary legacy recovery guarantees from it

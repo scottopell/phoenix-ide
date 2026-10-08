@@ -247,7 +247,6 @@ entity CloseObligation {
         retirement_requested -> awaiting_retirement_inspection
         needs_repair -> awaiting_retirement_inspection
         retirement_requested -> completed
-        needs_repair -> completed
         terminal: completed
     }
 }
@@ -2015,7 +2014,7 @@ rule ChangedInspectionInvalidatesOutstandingConfirmation {
 
 rule CloseRetirementCompletionFinalizesAggregateHistory {
     when: ResourceRetirementCompleted(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { retirement_requested, needs_repair }
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
     requires: product_conversation.lifecycle = open
     ensures: CloseOutcomeSystemMessagePersisted(product_conversation, attempt_id)
     ensures: product_conversation.lifecycle = history
@@ -2049,9 +2048,9 @@ rule CloseNeedsRepairRetriesThroughReinspection {
     @guidance
         -- Retry preserves exact-attempt retirement and dispatch evidence while reinspection
         -- refreshes the worktree snapshot and reseals resources admitted during repair.
-        -- User retry and startup recovery use this same exact-attempt branch. Recovery
-        -- dispatches inspection immediately after reopening the attempt; it does not wait
-        -- for another restart or synthesize a replacement Close attempt.
+        -- NeedsRepair remains inert until this explicit retry trigger occurs. Startup may resume
+        -- only an already-admitted RetirementRequested obligation; it never synthesizes a retry
+        -- or replacement Close attempt.
 }
 
 ------------------------------------------------------------

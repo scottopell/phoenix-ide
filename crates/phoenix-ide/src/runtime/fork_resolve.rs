@@ -1650,6 +1650,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationStaleLatest { .. }
         | DbError::CloseFoundationRepairRequired(_)
+        | DbError::CloseEvidenceInvariant { .. }
         | DbError::CloseFoundationNotFound(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::DirectTurnConflict(_)

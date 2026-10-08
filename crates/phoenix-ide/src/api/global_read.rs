@@ -1580,6 +1580,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationStaleLatest { .. }
         | DbError::CloseFoundationRepairRequired(_)
+        | DbError::CloseEvidenceInvariant { .. }
         | DbError::CloseFoundationNotFound(_)
         | DbError::ForkProposalConflict(_)
         | DbError::DirectTurnConflict(_)

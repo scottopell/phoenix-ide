@@ -15434,6 +15434,14 @@ pub(crate) mod hard_delete_cascade_tests {
     #[tokio::test]
     async fn archive_chain_captures_first_pass_close_inventory() {
         let state = make_test_state().await;
+        let writer_observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observations = Arc::clone(&writer_observations);
+        state
+            .runtime
+            .set_test_ambient_writer_observer(Arc::new(move |_| {
+                observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(false)
+            }));
         let ids = ["sc-a", "sc-a2", "sc-a3"];
         let (_tmp, repo, worktree, branch) =
             build_workmode_chain_with_shared_worktree(&state, &ids).await;
@@ -15450,6 +15458,10 @@ pub(crate) mod hard_delete_cascade_tests {
         )
         .await
         .expect("first-pass Close must capture inventory and converge");
+        assert!(
+            writer_observations.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "archive Close must use the injected writer observer"
+        );
 
         assert!(!worktree.exists(), "Close must retire the shared worktree");
         assert!(
