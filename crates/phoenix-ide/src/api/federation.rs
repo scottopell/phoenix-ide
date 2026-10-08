@@ -314,17 +314,16 @@ pub async fn import_peer_connection(
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let base_url = match request.base_url.parse() {
-        Ok(base_url) => base_url,
-        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    let Ok(base_url) = request.base_url.parse() else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };
-    let bearer_credential =
-        match phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
+    let Ok(bearer_credential) =
+        phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
             request.enrollment.token,
-        ) {
-            Ok(credential) => credential,
-            Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-        };
+        )
+    else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
     match state
         .db
         .save_federation_peer_connection(
