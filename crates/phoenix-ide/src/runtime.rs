@@ -9076,7 +9076,7 @@ mod scope_liveness_tests {
                 scope: scope.clone(),
                 residual: resource.clone(),
                 reason: RetirementFailureReason::ManualRepairRequired,
-                detail: "error returned from database: (code: 787) FOREIGN KEY constraint failed"
+                detail: "cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed"
                     .to_string(),
             })
             .await
