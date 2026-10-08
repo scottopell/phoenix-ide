@@ -333,10 +333,6 @@ def workflow_order(group):
     }[group]
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CargoTestTimeoutTests(unittest.TestCase):
     def setUp(self):
         self.dev = load_devpy()
@@ -375,3 +371,7 @@ class CargoTestTimeoutTests(unittest.TestCase):
             with self.subTest(raw=raw), self._with_file(None):
                 with self.assertRaisesRegex(SystemExit, "positive integer"):
                     self.dev._cargo_test_timeout_secs({self.dev.CARGO_TEST_TIMEOUT_ENV: raw})
+
+
+if __name__ == "__main__":
+    unittest.main()
