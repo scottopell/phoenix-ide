@@ -51,6 +51,7 @@ use phoenix_core::domain::product_conversation::{
     AutoContinueOnContextExhaustion, AutomaticContinuationPhase, ContinuationOpeningAuthority,
     ProductConversationId,
 };
+use phoenix_core::domain::retry_policy::OVERLOAD_MAX_ATTEMPTS;
 use phoenix_core::domain::sm_state::{
     ServerOverloadPhase, ServerOverloadTarget, LEGACY_CONTINUATION_OPERATION_ID,
 };
@@ -360,6 +361,17 @@ pub(crate) async fn persist_continuation_start_tx(
                     ..
                 } if target_operation_id == operation_id
             )
+    ) || matches!(
+        (&persisted, target_state),
+        (
+            ConvState::ServerOverloadRetrying { retry: persisted_retry },
+            ConvState::RecoverableContinuationFailure { failure },
+        ) if matches!(persisted_retry.target, ServerOverloadTarget::Ordinary)
+            && matches!(persisted_retry.phase, ServerOverloadPhase::InFlight)
+            && persisted_retry.attempt == OVERLOAD_MAX_ATTEMPTS
+            && failure.request.operation_id == operation_id
+            && failure.request.attempt == persisted_retry.attempt
+            && failure.error_kind == ErrorKind::ServerOverloaded
     );
     if !accepts_start {
         return Ok(ContinuationCommitOutcome::Stale);
@@ -20238,6 +20250,102 @@ mod tests {
             ContinuationCommitOutcome::Stale
         );
         assert_eq!(db.get_messages(conversation_id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capped_overload_continuation_start_atomically_persists_response_and_failure() {
+        use phoenix_core::domain::sm_state::{
+            ContinuationSummaryRequest, RecoverableContinuationFailure, ServerOverloadRetry,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "capped-overload-continuation-start";
+        db.create_conversation(conversation_id, "capped-overload", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::ServerOverloadRetrying {
+                retry: ServerOverloadRetry {
+                    target: ServerOverloadTarget::Ordinary,
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: OVERLOAD_MAX_ATTEMPTS,
+                    started_at: now - chrono::Duration::seconds(30),
+                    deadline_at: now + chrono::Duration::seconds(90),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let operation_id = "capped-overload-operation";
+        let failure = ConvState::RecoverableContinuationFailure {
+            failure: RecoverableContinuationFailure {
+                request: ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: OVERLOAD_MAX_ATTEMPTS,
+                },
+                error_kind: ErrorKind::ServerOverloaded,
+                message: "Automatic overload retry attempts exhausted before continuation"
+                    .to_string(),
+            },
+        };
+        let content =
+            MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "threshold response",
+            )]);
+        let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            message_id: operation_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content: content.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+
+        let uncapped_failure = ConvState::RecoverableContinuationFailure {
+            failure: RecoverableContinuationFailure {
+                request: ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: OVERLOAD_MAX_ATTEMPTS - 1,
+                },
+                error_kind: ErrorKind::ServerOverloaded,
+                message: "not capped".to_string(),
+            },
+        };
+        assert_eq!(
+            db.recover_continuation_start(
+                conversation_id,
+                operation_id,
+                &message,
+                &uncapped_failure,
+                now,
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Stale
+        );
+        assert!(db.get_messages(conversation_id).await.unwrap().is_empty());
+
+        assert_eq!(
+            db.recover_continuation_start(conversation_id, operation_id, &message, &failure, now,)
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            failure
+        );
+        let messages = db.get_messages(conversation_id).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, content);
     }
 
     #[tokio::test]

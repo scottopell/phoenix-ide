@@ -480,8 +480,7 @@ pub fn transition(
                     let result = continue_overload_after_mixed_transient(
                         retry,
                         context,
-                        message.clone(),
-                        error_kind.clone(),
+                        message,
                         *observed_at,
                     )?;
                     return Ok(if context.is_sub_agent {
@@ -556,8 +555,7 @@ pub fn transition(
                         return continue_overload_after_mixed_transient(
                             retry,
                             context,
-                            message.clone(),
-                            error_kind.clone(),
+                            message,
                             *observed_at,
                         );
                     }
@@ -1849,14 +1847,18 @@ fn schedule_server_overload(
 fn continue_overload_after_mixed_transient(
     retry: &ServerOverloadRetry,
     context: &ConvContext,
-    message: String,
-    error_kind: ErrorKind,
+    message: &str,
     observed_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<TransitionResult, TransitionError> {
     let next_attempt = retry.attempt + 1;
     if next_attempt > OVERLOAD_MAX_ATTEMPTS {
-        return overload_terminal(retry, message, error_kind, None)
-            .map(CoreTransitionResult::into_conv_result);
+        return overload_terminal(
+            retry,
+            format!("{message} Automatic overload retry attempts exhausted."),
+            ErrorKind::ServerOverloaded,
+            None,
+        )
+        .map(CoreTransitionResult::into_conv_result);
     }
     let identity = match &retry.target {
         ServerOverloadTarget::Ordinary => &context.conversation_id,
@@ -1866,8 +1868,13 @@ fn continue_overload_after_mixed_transient(
     let retry_at =
         observed_at + chrono::Duration::from_std(delay).expect("overload delay fits chrono");
     if retry_at >= retry.deadline_at {
-        return overload_terminal(retry, message, error_kind, None)
-            .map(CoreTransitionResult::into_conv_result);
+        return overload_terminal(
+            retry,
+            format!("{message} Automatic overload retry deadline elapsed."),
+            ErrorKind::ServerOverloaded,
+            None,
+        )
+        .map(CoreTransitionResult::into_conv_result);
     }
     let mut next = retry.clone();
     next.attempt = next_attempt;
@@ -1879,7 +1886,7 @@ fn continue_overload_after_mixed_transient(
                 delay,
                 attempt: next_attempt,
                 max_attempts: OVERLOAD_MAX_ATTEMPTS,
-                reason: error_kind_to_attempt_reason(&error_kind),
+                reason: LlmAttemptReason::ServerOverloaded,
                 resets_at: None,
             })
             .with_effect(Effect::notify_state_change())
@@ -1955,6 +1962,7 @@ fn handle_server_overload_retry(
             Ok(
                 CoreTransitionResult::new(CoreState::ServerOverloadRetrying { retry: in_flight })
                     .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
                     .with_effect(effect),
             )
         }
@@ -4666,10 +4674,14 @@ mod tests {
                 }
             }
         ));
-        assert!(dispatched
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::RequestLlm)));
+        assert!(matches!(
+            dispatched.effects.as_slice(),
+            [
+                Effect::PersistState,
+                Effect::NotifyStateChange,
+                Effect::RequestLlm
+            ]
+        ));
         let mut state = dispatched.new_state;
         for attempt in 3..=5 {
             let next = transition(
@@ -4917,6 +4929,7 @@ mod tests {
                         delay,
                         attempt: 4,
                         max_attempts: 5,
+                        reason: LlmAttemptReason::ServerOverloaded,
                         ..
                     } => Some(*delay),
                     _ => None,
@@ -4929,6 +4942,68 @@ mod tests {
             let restored: ConvState =
                 serde_json::from_str(&serde_json::to_string(&result.new_state).unwrap()).unwrap();
             assert_eq!(restored, result.new_state);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn mixed_transient_exhaustion_terminalizes_the_overload_incident() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for target in [
+            ServerOverloadTarget::Ordinary,
+            ServerOverloadTarget::Continuation {
+                operation_id: "mixed-exhausted-op".to_string(),
+                rejected_tool_calls: vec![],
+            },
+        ] {
+            let state = ConvState::ServerOverloadRetrying {
+                retry: ServerOverloadRetry {
+                    target: target.clone(),
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: OVERLOAD_MAX_ATTEMPTS,
+                    started_at: at,
+                    deadline_at: at + chrono::Duration::seconds(120),
+                },
+            };
+            let event = match target {
+                ServerOverloadTarget::Ordinary => Event::LlmError {
+                    message: "connection reset".to_string(),
+                    error_kind: ErrorKind::Network,
+                    attempt: OVERLOAD_MAX_ATTEMPTS,
+                    recovery_in_progress: false,
+                    observed_at: at + chrono::Duration::seconds(1),
+                    resets_at: None,
+                },
+                ServerOverloadTarget::Continuation { operation_id, .. } => {
+                    Event::ContinuationError {
+                        operation_id,
+                        message: "upstream 500".to_string(),
+                        error_kind: ErrorKind::ServerError,
+                        observed_at: at + chrono::Duration::seconds(1),
+                        resets_at: None,
+                    }
+                }
+            };
+
+            let result = transition(&state, &test_context(), event).unwrap();
+            match result.new_state {
+                ConvState::Error {
+                    message,
+                    error_kind: ErrorKind::ServerOverloaded,
+                    ..
+                } => {
+                    assert!(message.contains("connection reset"));
+                    assert!(message.contains("attempts exhausted"));
+                }
+                ConvState::RecoverableContinuationFailure { failure } => {
+                    assert_eq!(failure.error_kind, ErrorKind::ServerOverloaded);
+                    assert!(failure.message.contains("upstream 500"));
+                    assert!(failure.message.contains("attempts exhausted"));
+                }
+                other => panic!("unexpected mixed-failure terminal state: {other:?}"),
+            }
         }
     }
 
@@ -4963,8 +5038,8 @@ mod tests {
             &result.new_state,
             ConvState::Failed {
                 error,
-                error_kind: ErrorKind::Network,
-            } if error == "connection reset"
+                error_kind: ErrorKind::ServerOverloaded,
+            } if error == "connection reset Automatic overload retry attempts exhausted."
         ));
         assert!(matches!(
             result.effects.as_slice(),
@@ -4973,10 +5048,10 @@ mod tests {
                 Effect::NotifyParent {
                     outcome: SubAgentOutcome::Failure {
                         error,
-                        error_kind: ErrorKind::Network,
+                        error_kind: ErrorKind::ServerOverloaded,
                     },
                 },
-            ] if error == "connection reset"
+            ] if error == "connection reset Automatic overload retry attempts exhausted."
         ));
     }
 
@@ -5455,7 +5530,14 @@ mod tests {
             Event::RetryTimeout { attempt: 2 },
         )
         .unwrap();
-        assert!(dispatched.effects.iter().any(|effect| matches!(effect, Effect::RequestContinuation { request } if request.operation_id == "op-1" && request.attempt == 2)));
+        assert!(matches!(
+            dispatched.effects.as_slice(),
+            [
+                Effect::PersistState,
+                Effect::NotifyStateChange,
+                Effect::RequestContinuation { request },
+            ] if request.operation_id == "op-1" && request.attempt == 2
+        ));
     }
 
     #[test]

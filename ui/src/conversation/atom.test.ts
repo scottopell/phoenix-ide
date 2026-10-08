@@ -1602,7 +1602,11 @@ describe('conversationReducer', () => {
       expect(waiting.turnRetryContext).toBe(retryContext);
 
       for (const phase of [
-        { type: 'error', message: 'capacity', error_kind: 'server_overloaded' },
+        {
+          type: 'error',
+          message: 'connection reset Automatic overload retry attempts exhausted.',
+          error_kind: 'server_overloaded',
+        },
         {
           type: 'recoverable_continuation_failure',
           message: 'capacity',
@@ -1618,6 +1622,7 @@ describe('conversationReducer', () => {
           stateUpdatedAt: 1,
         });
         expect(terminal.turnRetryContext).toBeNull();
+        expect(terminal.phase).toEqual(phase);
       }
     });
 
