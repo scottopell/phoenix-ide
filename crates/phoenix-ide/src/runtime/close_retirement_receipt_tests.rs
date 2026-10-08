@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn successful_receipt_work_scope_retry(
     manager: &mut super::RuntimeManager,
@@ -314,7 +316,6 @@ fn worktree_receipt_absence_rejects_each_reappeared_path_and_dangling_symlink() 
     let temp = tempfile::tempdir().unwrap();
     let captured = temp.path().join("captured");
     let admin = temp.path().join("admin");
-    use std::fmt::Write;
     let encoded = admin
         .as_os_str()
         .as_encoded_bytes()

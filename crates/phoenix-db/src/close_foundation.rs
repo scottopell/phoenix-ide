@@ -3275,6 +3275,9 @@ impl Database {
         let expected_provenance: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM close_worktree_cleanup_plans plan
+             JOIN close_attempt_scopes captured
+               ON captured.attempt_id=plan.attempt_id AND captured.scope=plan.scope
+              AND captured.captured_worktree_identity=plan.identity_value
              JOIN close_retirement_resource_dispatches dispatch
                ON dispatch.attempt_id=plan.attempt_id AND dispatch.scope=plan.scope
               AND dispatch.inspection_generation=plan.inspection_generation
@@ -3283,9 +3286,20 @@ impl Database {
               AND dispatch.identity_kind=plan.identity_kind
               AND dispatch.identity_codec=plan.identity_codec
               AND dispatch.identity_value=plan.identity_value
-             WHERE plan.attempt_id=?1
-               AND plan.inspection_generation<>?2
-               AND plan.inspection_fingerprint<>?3",
+             JOIN close_retirement_inventories inventory
+               ON inventory.attempt_id=plan.attempt_id AND inventory.scope=plan.scope
+              AND inventory.inspection_generation=plan.inspection_generation
+              AND inventory.inspection_fingerprint=plan.inspection_fingerprint
+              AND inventory.sealed=1
+             WHERE plan.attempt_id=?1 AND plan.resource_kind='worktree'
+               AND plan.identity_kind='worktree' AND plan.identity_codec='worktree_id_v1'
+               AND (plan.inspection_generation<>?2 OR plan.inspection_fingerprint<>?3)
+               AND NOT EXISTS (
+                   SELECT 1 FROM close_retained_retirement_inspections inspection
+                   WHERE inspection.attempt_id=plan.attempt_id AND inspection.scope=plan.scope
+                     AND inspection.inspection_generation=plan.inspection_generation
+                     AND inspection.inspection_fingerprint=plan.inspection_fingerprint
+               )",
         )
         .bind(attempt_id.as_str())
         .bind(snapshot.generation())
