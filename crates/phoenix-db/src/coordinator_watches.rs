@@ -428,6 +428,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_question_wait_is_emitted_once_per_request_without_settling_turn() {
+        use phoenix_core::domain::sm_state::{QuestionRequestAuthority, UserQuestion};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-wait", "watch-wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let turn_id = create_turn(&db, &source.id, "active-question-turn").await;
+        let waiting = |authority| ConvState::AwaitingUserInput {
+            tool_use_id: "provider-reused-tool-id".into(),
+            request_authority: authority,
+            questions: vec![UserQuestion {
+                question: "Choose".into(),
+                header: "Choice".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+            pending_tool_calls: vec![],
+            completed_results: vec![],
+        };
+        let first = waiting(QuestionRequestAuthority::new());
+        db.update_conversation_state(&source.id, &first)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &first)
+            .await
+            .unwrap();
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        db.update_conversation_state(&source.id, &restored)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one durable request must produce one wait event"
+        );
+        assert_eq!(events[0].terminal_kind, "awaiting_user_input");
+        assert_eq!(events[0].outcome.as_deref(), Some("question_request"));
+        db.update_conversation_state(&source.id, &waiting(QuestionRequestAuthority::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            2
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM direct_turns WHERE turn_id = ?1")
+                .bind(&turn_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_ne!(
+            status, "completed",
+            "waiting must not settle the active turn"
+        );
+    }
+
+    #[tokio::test]
     async fn recorded_cancel_overrides_idle_completion_without_inventing_actor() {
         let db = Database::open_in_memory().await.unwrap();
         let source = db
