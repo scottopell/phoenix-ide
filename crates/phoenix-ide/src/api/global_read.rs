@@ -2374,6 +2374,8 @@ mod tests {
             format!("/c/{product_id}"),
             format!("/c/{product_id}?viewer=inspect"),
             format!("/product-conversations/{product_id}"),
+            format!("/product-conversations/{product_id}?viewer=inspect#section"),
+            "/product-conversations/root-scope".to_string(),
         ] {
             let canonical = service.resolve_reference(&reference).await.unwrap();
             assert_eq!(canonical.id, stable.id);
