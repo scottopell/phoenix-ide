@@ -277,13 +277,6 @@ pub enum BashErrorResponse {
     SpawnFailed {
         error_message: String,
     },
-    /// Run call carried a `label` longer than `MAX_LABEL_LENGTH`
-    /// (REQ-BASH-002 / REQ-BASH-010). Structured so the agent can drop
-    /// or shorten the label and retry.
-    LabelTooLong {
-        error_message: String,
-        max_label_length: usize,
-    },
     /// Catch-all for input-shape failures the schema didn't reject:
     /// missing `op`, missing required peer field for the chosen op,
     /// invalid `lines` value (REQ-BASH-010). The variant name is
@@ -622,17 +615,6 @@ mod bash_tmux_wire_tests {
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["error"], "mutually_exclusive_modes");
         assert!(v["conflicting_args"].is_array());
-    }
-
-    #[test]
-    fn bash_error_label_too_long_serializes_with_error_tag() {
-        let resp = BashErrorResponse::LabelTooLong {
-            error_message: "label exceeds the 64-character cap".into(),
-            max_label_length: 64,
-        };
-        let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["error"], "label_too_long");
-        assert_eq!(v["max_label_length"], 64);
     }
 
     #[test]
