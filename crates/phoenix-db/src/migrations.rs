@@ -619,6 +619,29 @@ const MIGRATION_117: &str = concat!(
 );
 
 const MIGRATION_118: &str = r"
+CREATE TABLE migration_118_cleanup_plan_validation (sentinel INTEGER);
+CREATE TRIGGER migration_118_cleanup_plan_requires_exact_dispatch
+BEFORE INSERT ON migration_118_cleanup_plan_validation
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_plans plan
+    WHERE NOT EXISTS (
+        SELECT 1 FROM close_retirement_resource_dispatches dispatch
+        WHERE dispatch.attempt_id = plan.attempt_id
+          AND dispatch.scope = plan.scope
+          AND dispatch.inspection_generation = plan.inspection_generation
+          AND dispatch.inspection_fingerprint = plan.inspection_fingerprint
+          AND dispatch.resource_kind = plan.resource_kind
+          AND dispatch.identity_kind = plan.identity_kind
+          AND dispatch.identity_codec = plan.identity_codec
+          AND dispatch.identity_value = plan.identity_value
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup plan requires exact parent dispatch identity');
+END;
+INSERT INTO migration_118_cleanup_plan_validation VALUES (1);
+DROP TABLE migration_118_cleanup_plan_validation;
+
 CREATE UNIQUE INDEX close_worktree_cleanup_plans_exact_identity
 ON close_worktree_cleanup_plans (
     attempt_id, scope, inspection_generation, inspection_fingerprint,
@@ -18675,6 +18698,147 @@ mod tests {
         );
     }
 
+    async fn setup_migration_118_dispatch_fixture(pool: &SqlitePool, plan_codec: &str) {
+        sqlx::raw_sql(
+            "CREATE TABLE product_conversations (id TEXT PRIMARY KEY);
+             CREATE TABLE conversations (id TEXT PRIMARY KEY, product_conversation_id TEXT);
+             CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY, product_conversation_id TEXT, phase TEXT
+             );
+             CREATE TABLE close_attempt_members (attempt_id TEXT);
+             CREATE TABLE close_attempt_scopes (attempt_id TEXT);
+             CREATE TRIGGER close_obligations_require_member_cleanup_before_delete
+             BEFORE DELETE ON close_obligations BEGIN SELECT 1; END;
+             CREATE TABLE close_retirement_resource_dispatches (
+                 attempt_id TEXT NOT NULL, scope TEXT NOT NULL,
+                 inspection_generation TEXT NOT NULL, inspection_fingerprint TEXT NOT NULL,
+                 resource_kind TEXT NOT NULL, identity_kind TEXT NOT NULL,
+                 identity_codec TEXT NOT NULL, identity_value TEXT NOT NULL,
+                 PRIMARY KEY (attempt_id, scope, inspection_generation, inspection_fingerprint,
+                              resource_kind, identity_kind, identity_value)
+             );
+             INSERT INTO close_retirement_resource_dispatches VALUES (
+                 'attempt', 'scope', 'generation', 'fingerprint', 'worktree', 'worktree',
+                 'worktree_id_v1', 'identity'
+             );",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for migration in [MIGRATION_084, MIGRATION_088, MIGRATION_090] {
+            sqlx::raw_sql(migration).execute(pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 administrative_dir_codec, administrative_dir_value, planned_at_us
+             ) VALUES (
+                 'attempt', 'scope', 'generation', 'fingerprint', 'worktree', 'worktree',
+                 ?1, 'identity', 'hex_path_v1', '00', 1
+             )",
+        )
+        .bind(plan_codec)
+        .execute(pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(pool, 118).await;
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "fixture must be legal before 118");
+    }
+
+    #[tokio::test]
+    async fn migration_118_rejects_legacy_codec_mismatch_transactionally() {
+        let pool = test_pool().await;
+        setup_migration_118_dispatch_fixture(&pool, "legacy_other_codec").await;
+        let schema_query = "SELECT type, name, sql FROM sqlite_master ORDER BY type, name";
+        let old_schema: Vec<(String, String, Option<String>)> =
+            sqlx::query_as(schema_query).fetch_all(&pool).await.unwrap();
+        let rows_query = "SELECT plan.identity_codec, dispatch.identity_codec,
+                                 plan.administrative_dir_value,
+                                 plan.administrative_dir_incarnation, plan.planned_at_us
+                          FROM close_worktree_cleanup_plans plan
+                          JOIN close_retirement_resource_dispatches dispatch
+                            USING (attempt_id, scope, inspection_generation,
+                                   inspection_fingerprint, resource_kind,
+                                   identity_kind, identity_value)";
+        let old_rows: Vec<(String, String, String, String, i64)> =
+            sqlx::query_as(rows_query).fetch_all(&pool).await.unwrap();
+        let error = run_pending_migrations(&pool).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cleanup plan requires exact parent dispatch identity"));
+        let ledger_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 118")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ledger_count, 0);
+        let schema: Vec<(String, String, Option<String>)> =
+            sqlx::query_as(schema_query).fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            schema, old_schema,
+            "no validation or adoption schema may remain"
+        );
+        let rows: Vec<(String, String, String, String, i64)> =
+            sqlx::query_as(rows_query).fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            rows, old_rows,
+            "legacy plan and dispatch must remain unchanged"
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "legacy_other_codec");
+        assert_eq!(rows[0].1, "worktree_id_v1");
+    }
+
+    #[tokio::test]
+    async fn migration_118_upgrades_exact_dispatch_plans_with_clean_foreign_keys() {
+        let pool = test_pool().await;
+        setup_migration_118_dispatch_fixture(&pool, "worktree_id_v1").await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        let ledger_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 118")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ledger_count, 1);
+        let plan: (String, String, String, i64) = sqlx::query_as(
+            "SELECT identity_codec, administrative_dir_value,
+                    administrative_dir_incarnation, planned_at_us
+             FROM close_worktree_cleanup_plans",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            plan,
+            (
+                "worktree_id_v1".to_string(),
+                "00".to_string(),
+                "legacy_unknown".to_string(),
+                1
+            )
+        );
+        let validation_artifacts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'migration_118_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(validation_artifacts, 0);
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn migration_118_preserves_plans_and_enforces_exact_immutable_adoption() {
@@ -18692,6 +18856,16 @@ mod tests {
              INSERT INTO product_conversations VALUES ('product');
              INSERT INTO conversations VALUES ('member', 'product');
              INSERT INTO close_obligations VALUES ('attempt', 'product', 'retirement_requested');
+             CREATE TABLE close_retirement_resource_dispatches (
+                 attempt_id TEXT, scope TEXT, inspection_generation TEXT,
+                 inspection_fingerprint TEXT, resource_kind TEXT, identity_kind TEXT,
+                 identity_codec TEXT, identity_value TEXT
+             );
+             INSERT INTO close_retirement_resource_dispatches VALUES
+                 ('attempt', 'scope', 'source', 'fp', 'worktree', 'worktree',
+                  'worktree_id_v1', 'identity'),
+                 ('attempt', 'scope', 'target', 'fp', 'worktree', 'worktree',
+                  'worktree_id_v1', 'identity');
              CREATE TABLE close_worktree_cleanup_plans (
                  attempt_id TEXT, scope TEXT, inspection_generation TEXT,
                  inspection_fingerprint TEXT, resource_kind TEXT, identity_kind TEXT,

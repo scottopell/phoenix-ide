@@ -3054,12 +3054,18 @@ impl Database {
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_codec, identity_value,
                  administrative_dir_codec, administrative_dir_value,
-                 administrative_dir_incarnation, planned_at_us
+                 administrative_dir_incarnation, planned_at_us,
+                 final_tombstone_root_codec, final_tombstone_root_value,
+                 final_tombstone_root_device, final_tombstone_root_inode,
+                 final_tombstone_object_device, final_tombstone_object_inode
              )
              SELECT plan.attempt_id, plan.scope, ?3, ?4, plan.resource_kind,
                     plan.identity_kind, plan.identity_codec, plan.identity_value,
                     plan.administrative_dir_codec, plan.administrative_dir_value,
-                    plan.administrative_dir_incarnation, plan.planned_at_us
+                    plan.administrative_dir_incarnation, plan.planned_at_us,
+                    plan.final_tombstone_root_codec, plan.final_tombstone_root_value,
+                    plan.final_tombstone_root_device, plan.final_tombstone_root_inode,
+                    plan.final_tombstone_object_device, plan.final_tombstone_object_inode
              FROM close_worktree_cleanup_plans plan
              WHERE plan.attempt_id = ?1
                AND plan.inspection_generation = ?2
@@ -3069,6 +3075,28 @@ impl Database {
         .bind(retained_snapshot.generation())
         .bind(replacement_snapshot.generation())
         .bind(replacement_snapshot.fingerprint())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_worktree_cleanup_adoptions (
+                 attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+                 target_inspection_generation, target_inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 adopted_at_unix_micros
+             )
+             SELECT plan.attempt_id, plan.scope, plan.inspection_generation,
+                    plan.inspection_fingerprint, ?3, ?4, plan.resource_kind,
+                    plan.identity_kind, plan.identity_codec, plan.identity_value, ?5
+             FROM close_worktree_cleanup_plans plan
+             WHERE plan.attempt_id = ?1
+               AND plan.inspection_generation = ?2
+               AND plan.inspection_fingerprint = ?4",
+        )
+        .bind(attempt_id.as_str())
+        .bind(retained_snapshot.generation())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .bind(Utc::now().timestamp_micros())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -12023,11 +12051,29 @@ mod tests {
 
     #[tokio::test]
     async fn dispatched_absence_retry_resumes_retirement_with_retained_snapshot() {
-        dispatched_absence_retry_resumes_retirement_with_retained_snapshot_fixture().await;
+        dispatched_absence_retry_resumes_retirement_with_retained_snapshot_fixture(None).await;
+    }
+
+    #[tokio::test]
+    async fn dispatched_absence_retry_preserves_complete_tombstone_authority_and_lineage() {
+        for object in [None, Some((29, 31))] {
+            dispatched_absence_retry_resumes_retirement_with_retained_snapshot_fixture(Some(
+                CloseWorktreeFinalTombstone {
+                    root: std::path::PathBuf::from("/tmp/dispatched-absence-tombstone"),
+                    device: 17,
+                    inode: 19,
+                    object_device: object.map(|(device, _)| device),
+                    object_inode: object.map(|(_, inode)| inode),
+                },
+            ))
+            .await;
+        }
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn dispatched_absence_retry_resumes_retirement_with_retained_snapshot_fixture() {
+    async fn dispatched_absence_retry_resumes_retirement_with_retained_snapshot_fixture(
+        tombstone: Option<CloseWorktreeFinalTombstone>,
+    ) {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
@@ -12083,6 +12129,33 @@ mod tests {
         })
         .await
         .unwrap();
+        if let Some(tombstone) = &tombstone {
+            db.bind_close_worktree_final_tombstone(BindCloseWorktreeFinalTombstoneRequest {
+                attempt_id: attempt.clone(),
+                snapshot: snapshot.clone(),
+                scope: scope.clone(),
+                resource: worktree.resource.clone(),
+                tombstone: tombstone.clone(),
+            })
+            .await
+            .unwrap();
+            if let (Some(object_device), Some(object_inode)) =
+                (tombstone.object_device, tombstone.object_inode)
+            {
+                db.bind_close_worktree_final_tombstone_object(
+                    BindCloseWorktreeFinalTombstoneObjectRequest {
+                        attempt_id: attempt.clone(),
+                        snapshot: snapshot.clone(),
+                        scope: scope.clone(),
+                        resource: worktree.resource.clone(),
+                        object_device,
+                        object_inode,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: attempt.clone(),
             snapshot: snapshot.clone(),
@@ -12122,11 +12195,64 @@ mod tests {
                 .await
                 .unwrap(),
             Some(CloseWorktreeCleanupPlan {
-                administrative_dir: cleanup_dir,
+                administrative_dir: cleanup_dir.clone(),
                 administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
-                final_tombstone: None,
+                final_tombstone: tombstone.clone(),
             }),
         );
+        let adoption = AdoptCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt.clone(),
+            scope: scope.clone(),
+            target_snapshot: replacement.clone(),
+            resource: worktree.resource.clone(),
+            observed_administrative_dir: cleanup_dir.clone(),
+            observed_administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                db.adopt_close_worktree_cleanup_plan(adoption.clone())
+                    .await
+                    .unwrap(),
+                CloseWorktreeCleanupPlan {
+                    administrative_dir: cleanup_dir.clone(),
+                    administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
+                    final_tombstone: tombstone.clone(),
+                }
+            );
+        }
+        let lineage: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source_inspection_generation, target_inspection_generation
+             FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1",
+        )
+        .bind(attempt.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            lineage,
+            vec![(
+                snapshot.generation().to_string(),
+                replacement.generation().to_string(),
+            )]
+        );
+        let immutable_error = sqlx::query(
+            "UPDATE close_worktree_cleanup_plans SET planned_at_us = planned_at_us
+             WHERE attempt_id=?1 AND inspection_generation=?2",
+        )
+        .bind(attempt.as_str())
+        .bind(snapshot.generation())
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+        assert!(immutable_error
+            .to_string()
+            .contains("adopted cleanup-plan payload is immutable"));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
         assert!(db
             .close_retirement_inventory_is_complete(attempt.as_str())
             .await

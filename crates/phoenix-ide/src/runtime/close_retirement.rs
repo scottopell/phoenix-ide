@@ -4408,6 +4408,55 @@ fn linux_cwd_directory_identity(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxCwdMountedIdentity {
+    directory: LinuxCwdDirectoryIdentity,
+    mount_id: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_parse_mount_id(fdinfo: &str) -> Result<u64, LinuxCwdScanError> {
+    let parse = || {
+        let mut mount_ids = fdinfo
+            .lines()
+            .filter_map(|line| line.strip_prefix("mnt_id:"));
+        let value = mount_ids.next()?.trim();
+        if mount_ids.next().is_some()
+            || value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        value.parse::<u64>().ok()
+    };
+    parse().ok_or_else(|| {
+        LinuxCwdScanError::Indeterminate("missing or malformed fdinfo mnt_id".to_string())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_fdinfo_path(directory: &std::fs::File) -> std::path::PathBuf {
+    use std::os::fd::AsRawFd as _;
+
+    Path::new("/proc/self/fdinfo").join(directory.as_raw_fd().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_mounted_identity(
+    directory: &std::fs::File,
+    fdinfo_path: &impl Fn(&std::fs::File) -> std::path::PathBuf,
+) -> Result<LinuxCwdMountedIdentity, LinuxCwdScanError> {
+    let path = fdinfo_path(directory);
+    let fdinfo = std::fs::read_to_string(&path).map_err(|error| {
+        LinuxCwdScanError::from_process_io(&path, "read cwd descriptor fdinfo", &error)
+    })?;
+    Ok(LinuxCwdMountedIdentity {
+        directory: linux_cwd_directory_identity(directory)?,
+        mount_id: linux_cwd_parse_mount_id(&fdinfo)?,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn linux_cwd_open_directory(path: &Path) -> Result<std::fs::File, LinuxCwdScanError> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -4423,7 +4472,7 @@ fn linux_cwd_open_directory(path: &Path) -> Result<std::fs::File, LinuxCwdScanEr
 struct LinuxCwdObservation {
     path: std::path::PathBuf,
     ancestry: Vec<LinuxCwdDirectoryIdentity>,
-    device: u64,
+    mount_id: u64,
     evidence: LinuxNamespaceCwdEvidence,
 }
 
@@ -4445,7 +4494,8 @@ fn linux_cwd_classify(
 fn linux_cwd_observe(
     cwd: &Path,
     canonical: &Path,
-    target: LinuxCwdDirectoryIdentity,
+    target: LinuxCwdMountedIdentity,
+    fdinfo_path: &impl Fn(&std::fs::File) -> std::path::PathBuf,
 ) -> Result<LinuxCwdObservation, LinuxCwdScanError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
@@ -4458,9 +4508,8 @@ fn linux_cwd_observe(
         )));
     }
     let mut directory = linux_cwd_open_directory(cwd)?;
-    let identity = linux_cwd_directory_identity(&directory)?;
-    let device = identity.device;
-    let mut ancestry = vec![identity];
+    let identity = linux_cwd_mounted_identity(&directory, fdinfo_path)?;
+    let mut ancestry = vec![identity.directory];
     loop {
         // SAFETY: directory is an owned directory descriptor and the literal is NUL-terminated.
         let parent = unsafe {
@@ -4501,14 +4550,14 @@ fn linux_cwd_observe(
         )));
     }
     let after = linux_cwd_open_directory(cwd)?;
-    if linux_cwd_directory_identity(&after)? != identity {
+    if linux_cwd_mounted_identity(&after, fdinfo_path)? != identity {
         return Err(LinuxCwdScanError::Indeterminate(format!(
             "task cwd changed while reading {}",
             cwd.display()
         )));
     }
-    let evidence = linux_cwd_classify(&path, canonical, target, &ancestry);
-    if evidence == LinuxNamespaceCwdEvidence::Clean && device != target.device {
+    let evidence = linux_cwd_classify(&path, canonical, target.directory, &ancestry);
+    if evidence == LinuxNamespaceCwdEvidence::Clean && identity.mount_id != target.mount_id {
         return Err(LinuxCwdScanError::Indeterminate(
             "cwd is on another mount; a bind-mounted descendant cannot be excluded".to_string(),
         ));
@@ -4516,7 +4565,7 @@ fn linux_cwd_observe(
     Ok(LinuxCwdObservation {
         path,
         ancestry,
-        device,
+        mount_id: identity.mount_id,
         evidence,
     })
 }
@@ -4532,8 +4581,9 @@ struct LinuxCwdTaskSnapshot {
 fn linux_cwd_revalidate_tasks(
     process: &Path,
     canonical: &Path,
-    target: LinuxCwdDirectoryIdentity,
+    target: LinuxCwdMountedIdentity,
     before: &LinuxCwdTaskSnapshot,
+    fdinfo_path: &impl Fn(&std::fs::File) -> std::path::PathBuf,
 ) -> Result<(), LinuxCwdScanError> {
     if linux_cwd_task_inventory(process)? != before.inventory {
         return Err(LinuxCwdScanError::Indeterminate(format!(
@@ -4546,6 +4596,7 @@ fn linux_cwd_revalidate_tasks(
             &process.join("task").join(task).join("cwd"),
             canonical,
             target,
+            fdinfo_path,
         )? != *observation
         {
             return Err(LinuxCwdScanError::Indeterminate(format!(
@@ -4567,8 +4618,9 @@ fn linux_cwd_revalidate_tasks(
 fn linux_cwd_process_tasks(
     process: &Path,
     canonical: &Path,
-    target: LinuxCwdDirectoryIdentity,
+    target: LinuxCwdMountedIdentity,
     after_task_reads: &mut impl FnMut(&Path),
+    fdinfo_path: &impl Fn(&std::fs::File) -> std::path::PathBuf,
 ) -> Result<(LinuxNamespaceCwdEvidence, LinuxCwdTaskSnapshot), LinuxCwdScanError> {
     let scan = (|| {
         let mut before = LinuxCwdTaskSnapshot {
@@ -4580,6 +4632,7 @@ fn linux_cwd_process_tasks(
                 &process.join("task").join(task).join("cwd"),
                 canonical,
                 target,
+                fdinfo_path,
             )?;
             if observation.evidence == LinuxNamespaceCwdEvidence::Inside {
                 return Ok((LinuxNamespaceCwdEvidence::Inside, before));
@@ -4591,7 +4644,7 @@ fn linux_cwd_process_tasks(
     after_task_reads(process);
     let (evidence, before) = scan?;
     if evidence == LinuxNamespaceCwdEvidence::Clean {
-        linux_cwd_revalidate_tasks(process, canonical, target, &before)?;
+        linux_cwd_revalidate_tasks(process, canonical, target, &before, fdinfo_path)?;
     }
     Ok((evidence, before))
 }
@@ -4609,11 +4662,28 @@ fn linux_namespace_cwd_scan(
 fn linux_namespace_cwd_scan_with_hooks(
     canonical: &Path,
     proc_root: &Path,
+    after_task_reads: impl FnMut(&Path),
+    after_final_pid_inventory: impl FnMut(),
+) -> Result<LinuxNamespaceCwdEvidence, LinuxCwdScanError> {
+    linux_namespace_cwd_scan_with_fdinfo(
+        canonical,
+        proc_root,
+        after_task_reads,
+        after_final_pid_inventory,
+        linux_cwd_fdinfo_path,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_namespace_cwd_scan_with_fdinfo(
+    canonical: &Path,
+    proc_root: &Path,
     mut after_task_reads: impl FnMut(&Path),
     mut after_final_pid_inventory: impl FnMut(),
+    fdinfo_path: impl Fn(&std::fs::File) -> std::path::PathBuf,
 ) -> Result<LinuxNamespaceCwdEvidence, LinuxCwdScanError> {
     let target_directory = linux_cwd_open_directory(canonical)?;
-    let target = linux_cwd_directory_identity(&target_directory)?;
+    let target = linux_cwd_mounted_identity(&target_directory, &fdinfo_path)?;
     let before = linux_cwd_process_inventory(proc_root)?;
     let mut incarnations = std::collections::BTreeMap::new();
     for name in &before {
@@ -4625,7 +4695,13 @@ fn linux_namespace_cwd_scan_with_hooks(
     let mut task_inventories = std::collections::BTreeMap::new();
     for (name, before_incarnation) in &incarnations {
         let process = proc_root.join(name);
-        let scan = linux_cwd_process_tasks(&process, canonical, target, &mut after_task_reads);
+        let scan = linux_cwd_process_tasks(
+            &process,
+            canonical,
+            target,
+            &mut after_task_reads,
+            &fdinfo_path,
+        );
         if matches!(scan, Ok((LinuxNamespaceCwdEvidence::Inside, _))) {
             return Ok(LinuxNamespaceCwdEvidence::Inside);
         }
@@ -4651,7 +4727,13 @@ fn linux_namespace_cwd_scan_with_hooks(
                 process.display()
             )));
         }
-        linux_cwd_revalidate_tasks(&process, canonical, target, &task_inventories[name])?;
+        linux_cwd_revalidate_tasks(
+            &process,
+            canonical,
+            target,
+            &task_inventories[name],
+            &fdinfo_path,
+        )?;
     }
     if linux_cwd_process_inventory(proc_root)? != before {
         return Err(LinuxCwdScanError::Indeterminate(
@@ -4667,7 +4749,13 @@ fn linux_namespace_cwd_scan_with_hooks(
                 process.display()
             )));
         }
-        linux_cwd_revalidate_tasks(&process, canonical, target, &task_inventories[name])?;
+        linux_cwd_revalidate_tasks(
+            &process,
+            canonical,
+            target,
+            &task_inventories[name],
+            &fdinfo_path,
+        )?;
         if linux_cwd_process_incarnation(&process)? != *before_incarnation {
             return Err(LinuxCwdScanError::Indeterminate(format!(
                 "process incarnation changed for {}",
@@ -4675,7 +4763,7 @@ fn linux_namespace_cwd_scan_with_hooks(
             )));
         }
     }
-    if linux_cwd_directory_identity(&linux_cwd_open_directory(canonical)?)? != target {
+    if linux_cwd_mounted_identity(&linux_cwd_open_directory(canonical)?, &fdinfo_path)? != target {
         return Err(LinuxCwdScanError::Indeterminate(
             "target directory identity changed during cwd inspection".to_string(),
         ));
@@ -4857,11 +4945,77 @@ fn linux_process_is_relevant(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_descriptor_target_is_within(
-    target: std::io::Result<PathBuf>,
-    canonical_worktree: &Path,
+type LinuxDescriptorEntries = Box<dyn Iterator<Item = std::io::Result<PathBuf>>>;
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_read_dir(path: &Path) -> std::io::Result<LinuxDescriptorEntries> {
+    Ok(Box::new(
+        std::fs::read_dir(path)?.map(|entry| entry.map(|entry| entry.path())),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_directory_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_entry_is_absent(
+    parent: &Path,
+    entry: &Path,
+    read_dir: &mut impl FnMut(&Path) -> std::io::Result<LinuxDescriptorEntries>,
+) -> std::io::Result<bool> {
+    let before = linux_descriptor_directory_identity(parent)?;
+    let mut present = false;
+    for candidate in read_dir(parent)? {
+        if candidate?.file_name() == entry.file_name() {
+            present = true;
+        }
+    }
+    let after = linux_descriptor_directory_identity(parent)?;
+    if before != after {
+        return Err(std::io::Error::other(
+            "descriptor inventory directory changed",
+        ));
+    }
+    Ok(!present)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_failure_is_vanished(
+    proc_root: &Path,
+    process: &Path,
+    process_identity: (u64, u64),
+    descriptor: Option<(&Path, (u64, u64))>,
+    read_dir: &mut impl FnMut(&Path) -> std::io::Result<LinuxDescriptorEntries>,
 ) -> bool {
-    target.is_ok_and(|candidate| path_is_within(&candidate, canonical_worktree))
+    if matches!(
+        linux_descriptor_entry_is_absent(proc_root, process, read_dir),
+        Ok(true)
+    ) {
+        return true;
+    }
+    let Some((descriptor, fd_identity)) = descriptor else {
+        return false;
+    };
+    let fd_directory = process.join("fd");
+    linux_descriptor_directory_identity(process).is_ok_and(|identity| identity == process_identity)
+        && linux_descriptor_directory_identity(&fd_directory)
+            .is_ok_and(|identity| identity == fd_identity)
+        && matches!(
+            linux_descriptor_entry_is_absent(&fd_directory, descriptor, read_dir),
+            Ok(true)
+        )
+        && linux_descriptor_directory_identity(process)
+            .is_ok_and(|identity| identity == process_identity)
+        && linux_descriptor_directory_identity(&fd_directory)
+            .is_ok_and(|identity| identity == fd_identity)
 }
 
 #[cfg(target_os = "linux")]
@@ -4874,26 +5028,132 @@ fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
 ) -> Result<ExternalWriterEvidence, String> {
+    linux_descriptor_scan_with(path, proc_root, linux_descriptor_read_dir, |descriptor| {
+        std::fs::read_link(descriptor)
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+#[cfg(target_os = "linux")]
+fn linux_descriptor_scan_with(
+    path: &Path,
+    proc_root: &Path,
+    mut read_dir: impl FnMut(&Path) -> std::io::Result<LinuxDescriptorEntries>,
+    mut read_link: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+) -> Result<ExternalWriterEvidence, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
+    let indeterminate = |operation: &str, path: &Path, error: &std::io::Error| {
+        format!(
+            "indeterminate Linux descriptor inspection: {operation} for {}: {error}",
+            path.display()
+        )
     };
-    for process in processes.flatten().filter(|process| {
-        process
-            .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
-    }) {
-        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
-            continue;
+    let processes = read_dir(proc_root)
+        .map_err(|error| indeterminate("enumerate processes", proc_root, &error))?;
+    for process in processes {
+        let process =
+            process.map_err(|error| indeterminate("read process entry", proc_root, &error))?;
+        let Some(name) = process.file_name() else {
+            return Err("indeterminate Linux descriptor inspection: unnamed process".to_string());
         };
-        for descriptor in descriptors.flatten() {
-            if linux_descriptor_target_is_within(std::fs::read_link(descriptor.path()), &canonical)
-            {
-                return Ok(ExternalWriterEvidence::PositiveWriterFound);
+        if name.as_encoded_bytes().is_empty()
+            || !name.as_encoded_bytes().iter().all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let process_identity = match linux_descriptor_directory_identity(&process) {
+            Ok(identity) => identity,
+            Err(error) => {
+                if matches!(
+                    linux_descriptor_entry_is_absent(proc_root, &process, &mut read_dir),
+                    Ok(true)
+                ) {
+                    continue;
+                }
+                return Err(indeterminate(
+                    "identify process directory",
+                    &process,
+                    &error,
+                ));
+            }
+        };
+        let fd_directory = process.join("fd");
+        let fd_identity = match linux_descriptor_directory_identity(&fd_directory) {
+            Ok(identity) => identity,
+            Err(error) => {
+                if linux_descriptor_failure_is_vanished(
+                    proc_root,
+                    &process,
+                    process_identity,
+                    None,
+                    &mut read_dir,
+                ) {
+                    continue;
+                }
+                return Err(indeterminate(
+                    "identify descriptor directory",
+                    &fd_directory,
+                    &error,
+                ));
+            }
+        };
+        let descriptors = match read_dir(&fd_directory) {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                if linux_descriptor_failure_is_vanished(
+                    proc_root,
+                    &process,
+                    process_identity,
+                    None,
+                    &mut read_dir,
+                ) {
+                    continue;
+                }
+                return Err(indeterminate(
+                    "enumerate descriptors",
+                    &fd_directory,
+                    &error,
+                ));
+            }
+        };
+        for descriptor in descriptors {
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    if linux_descriptor_failure_is_vanished(
+                        proc_root,
+                        &process,
+                        process_identity,
+                        None,
+                        &mut read_dir,
+                    ) {
+                        break;
+                    }
+                    return Err(indeterminate(
+                        "read descriptor entry",
+                        &fd_directory,
+                        &error,
+                    ));
+                }
+            };
+            match read_link(&descriptor) {
+                Ok(target) if path_is_within(&target, &canonical) => {
+                    return Ok(ExternalWriterEvidence::PositiveWriterFound);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if !linux_descriptor_failure_is_vanished(
+                        proc_root,
+                        &process,
+                        process_identity,
+                        Some((&descriptor, fd_identity)),
+                        &mut read_dir,
+                    ) {
+                        return Err(indeterminate("read descriptor link", &descriptor, &error));
+                    }
+                }
             }
         }
     }
@@ -6113,7 +6373,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn retained_quarantine_retry(conflicting_incarnation: bool) {
+    async fn retained_quarantine_retry(conflicting_incarnation: bool, bound_tombstone: bool) {
         use super::{CloseAttemptId, ClosePhase, CloseRetirementError, RuntimeManager};
         use crate::db::{
             CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
@@ -6276,6 +6536,21 @@ mod tests {
             .unwrap();
         let quarantine = worktree_quarantine_path(&identity).unwrap();
         std::fs::rename(&linked, &quarantine).unwrap();
+        #[cfg(unix)]
+        if bound_tombstone {
+            bound_tombstone_dispatched_absence_retry(
+                &mut manager,
+                &attempt,
+                &scope,
+                &source_snapshot,
+                &resource,
+                &identity,
+            )
+            .await;
+            return;
+        }
+        #[cfg(not(unix))]
+        assert!(!bound_tombstone);
         manager
             .route_close_attempt_to_repair::<()>(
                 &attempt,
@@ -6362,14 +6637,163 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    async fn bound_tombstone_dispatched_absence_retry(
+        manager: &mut super::RuntimeManager,
+        attempt: &super::CloseAttemptId,
+        scope: &super::WorkScopeId,
+        source_snapshot: &super::CloseRetirementSnapshot,
+        resource: &super::RetiredResourceIdentity,
+        identity: &WorktreeIdentity,
+    ) {
+        use crate::db::{
+            BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
+        };
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::{Arc, Mutex};
+
+        let quarantine = worktree_quarantine_path(identity).unwrap();
+        let root = quarantine.with_extension("private-tombstone");
+        super::reserve_private_tombstone(&root, "test worktree").unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        let mut tombstone = CloseWorktreeFinalTombstone {
+            root,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            object_device: None,
+            object_inode: None,
+        };
+        manager
+            .db()
+            .bind_close_worktree_final_tombstone(BindCloseWorktreeFinalTombstoneRequest {
+                attempt_id: attempt.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+                tombstone: tombstone.clone(),
+            })
+            .await
+            .unwrap();
+        let object = tombstone.root.join("object");
+        std::fs::rename(&quarantine, &object).unwrap();
+        std::fs::write(
+            object.join("writer-residual"),
+            "preserve until writer exits\n",
+        )
+        .unwrap();
+        let metadata = std::fs::symlink_metadata(&object).unwrap();
+        tombstone.object_device = Some(metadata.dev());
+        tombstone.object_inode = Some(metadata.ino());
+        manager
+            .db()
+            .bind_close_worktree_final_tombstone_object(
+                BindCloseWorktreeFinalTombstoneObjectRequest {
+                    attempt_id: attempt.clone(),
+                    scope: scope.clone(),
+                    snapshot: source_snapshot.clone(),
+                    resource: resource.clone(),
+                    object_device: metadata.dev(),
+                    object_inode: metadata.ino(),
+                },
+            )
+            .await
+            .unwrap();
+        let expected_plan = manager
+            .db()
+            .close_worktree_cleanup_plan(attempt, scope, source_snapshot, resource)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expected_plan.final_tombstone.as_ref(), Some(&tombstone));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let writer_observations = observations.clone();
+        manager.test_ambient_writer_observer = Some(Arc::new(move |path| {
+            writer_observations.lock().unwrap().push(path.to_path_buf());
+            Ok(true)
+        }));
+        manager
+            .retire_close_worktrees_and_scopes(attempt, source_snapshot)
+            .await
+            .unwrap_err();
+        for _ in 0..2 {
+            manager.db().retry_close_retirement(attempt).await.unwrap();
+            manager
+                .inspect_close_retirement(attempt.clone())
+                .await
+                .unwrap_err();
+            let obligation = manager
+                .db()
+                .get_close_obligation(attempt.as_str())
+                .await
+                .unwrap();
+            assert_eq!(obligation.phase(), super::ClosePhase::NeedsRepair);
+            let snapshot = obligation.snapshot().unwrap();
+            assert_ne!(snapshot.generation(), source_snapshot.generation());
+            assert_eq!(
+                manager
+                    .db()
+                    .close_worktree_cleanup_plan(attempt, scope, snapshot, resource)
+                    .await
+                    .unwrap(),
+                Some(expected_plan.clone()),
+            );
+            assert!(object.join("writer-residual").is_file());
+            assert!(expected_plan.administrative_dir.exists());
+            assert!(
+                both_worktree_paths_absent(&super::worktree_path(identity), &quarantine).unwrap()
+            );
+            let absence_proofs: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM close_retirement_resources
+                 WHERE attempt_id=?1 AND resource_kind='worktree' AND proof_kind='absence_adopted'",
+            )
+            .bind(attempt.as_str())
+            .fetch_one(manager.db().pool())
+            .await
+            .unwrap();
+            assert_eq!(absence_proofs, 0);
+        }
+        assert_eq!(*observations.lock().unwrap(), vec![object.clone(); 3]);
+        manager.test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
+        manager.db().retry_close_retirement(attempt).await.unwrap();
+        let completed_snapshot = manager
+            .inspect_close_retirement(attempt.clone())
+            .await
+            .unwrap();
+        assert!(!tombstone.root.exists());
+        assert!(!expected_plan.administrative_dir.exists());
+        assert_eq!(
+            manager
+                .db()
+                .close_worktree_cleanup_plan(attempt, scope, &completed_snapshot, resource)
+                .await
+                .unwrap(),
+            Some(expected_plan),
+        );
+        let lineage_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1",
+        )
+        .bind(attempt.as_str())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(lineage_count, 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatched_absence_retry_preserves_populated_tombstone_until_writer_exits() {
+        retained_quarantine_retry(false, true).await;
+    }
+
     #[tokio::test]
     async fn runtime_adopts_exact_retained_quarantine_plan_across_retry_generation() {
-        retained_quarantine_retry(false).await;
+        retained_quarantine_retry(false, false).await;
     }
 
     #[tokio::test]
     async fn runtime_adoption_conflict_routes_exact_scope_to_durable_repair_without_deletion() {
-        retained_quarantine_retry(true).await;
+        retained_quarantine_retry(true, false).await;
     }
 
     #[test]
@@ -8154,39 +8578,278 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn descriptor_scan_skips_unreadable_links() {
-        let worktree = Path::new("/quarantine/worktree");
-        for kind in [
-            std::io::ErrorKind::NotFound,
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::InvalidData,
-        ] {
-            assert!(!super::linux_descriptor_target_is_within(
-                Err(std::io::Error::from(kind)),
-                worktree,
-            ));
-        }
-        assert!(super::linux_descriptor_target_is_within(
-            Ok(worktree.join("open-file")),
-            worktree,
-        ));
+    fn descriptor_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("1273");
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        (temp, quarantine, proc_root, process)
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_ignores_ambient_failures_and_finds_readable_writer() {
-        let temp = tempfile::tempdir().unwrap();
-        let quarantine = temp.path().join("quarantine");
-        let proc_root = temp.path().join("proc");
-        let ambient = proc_root.join("1273");
-        let writer = proc_root.join("1274");
-        std::fs::create_dir_all(&ambient).unwrap();
-        std::fs::create_dir_all(writer.join("fd")).unwrap();
-        std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
-        std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
+    fn descriptor_scan_rejects_missing_non_directory_and_unreadable_proc() {
+        let (temp, quarantine, proc_root, _) = descriptor_fixture();
+        let missing = temp.path().join("missing-proc");
+        let not_directory = temp.path().join("file-proc");
+        std::fs::write(&not_directory, b"not a directory").unwrap();
+        for root in [&missing, &not_directory] {
+            assert!(super::quarantine_has_open_descriptors_in(&quarantine, root).is_err());
+        }
+        let result = super::linux_descriptor_scan_with(
+            &quarantine,
+            &proc_root,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_| unreachable!(),
+        );
+        assert!(result.unwrap_err().contains("enumerate processes"));
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_rejects_missing_non_directory_and_unreadable_fd_directory() {
+        let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+        let fd = process.join("fd");
+        let result = super::linux_descriptor_scan_with(
+            &quarantine,
+            &proc_root,
+            |path| {
+                if path == fd {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    super::linux_descriptor_read_dir(path)
+                }
+            },
+            |_| unreachable!(),
+        );
+        assert!(result.unwrap_err().contains("enumerate descriptors"));
+        std::fs::remove_dir(&fd).unwrap();
+        assert!(super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).is_err());
+        std::fs::write(&fd, b"not a directory").unwrap();
+        assert!(super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_numeric_non_directory_process_is_indeterminate() {
+        let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+        std::fs::remove_dir_all(&process).unwrap();
+        std::fs::write(&process, b"not a process directory").unwrap();
+        assert!(super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_proc_iterator_failure_is_indeterminate() {
+        let (_temp, quarantine, proc_root, _) = descriptor_fixture();
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let result = super::linux_descriptor_scan_with(
+                &quarantine,
+                &proc_root,
+                |_| Ok(Box::new(std::iter::once(Err(std::io::Error::from(kind))))),
+                |_| unreachable!(),
+            );
+            assert!(result.unwrap_err().contains("read process entry"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_fd_failures_require_revalidated_process_disappearance() {
+        for iterator_failure in [false, true] {
+            for vanished in [false, true] {
+                let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+                let fd = process.join("fd");
+                let result = super::linux_descriptor_scan_with(
+                    &quarantine,
+                    &proc_root,
+                    |path| {
+                        if path == fd {
+                            if vanished {
+                                std::fs::remove_dir_all(&process).unwrap();
+                            }
+                            let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+                            if iterator_failure {
+                                Ok(Box::new(std::iter::once(Err(error)))
+                                    as super::LinuxDescriptorEntries)
+                            } else {
+                                Err(error)
+                            }
+                        } else {
+                            super::linux_descriptor_read_dir(path)
+                        }
+                    },
+                    |_| unreachable!(),
+                );
+                if vanished {
+                    assert_eq!(
+                        result.unwrap(),
+                        super::ExternalWriterEvidence::NoPositiveEvidence
+                    );
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_link_failures_require_exact_disappearance() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            for disappearance in ["none", "descriptor", "process", "fd-directory"] {
+                let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+                let descriptor = process.join("fd/3");
+                std::os::unix::fs::symlink(quarantine.join("open-file"), &descriptor).unwrap();
+                let result = super::linux_descriptor_scan_with(
+                    &quarantine,
+                    &proc_root,
+                    super::linux_descriptor_read_dir,
+                    |path| {
+                        assert_eq!(path, descriptor);
+                        match disappearance {
+                            "descriptor" => std::fs::remove_file(path).unwrap(),
+                            "process" => std::fs::remove_dir_all(&process).unwrap(),
+                            "fd-directory" => std::fs::remove_dir_all(process.join("fd")).unwrap(),
+                            _ => {}
+                        }
+                        Err(std::io::Error::from(kind))
+                    },
+                );
+                if matches!(disappearance, "descriptor" | "process") {
+                    assert_eq!(
+                        result.unwrap(),
+                        super::ExternalWriterEvidence::NoPositiveEvidence
+                    );
+                } else {
+                    assert!(result.is_err(), "{kind:?}: {disappearance}");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_absence_revalidation_must_be_readable_and_complete() {
+        for iterator_failure in [false, true] {
+            let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+            let descriptor = process.join("fd/3");
+            std::os::unix::fs::symlink(quarantine.join("open-file"), &descriptor).unwrap();
+            let mut fd_reads = 0;
+            let result = super::linux_descriptor_scan_with(
+                &quarantine,
+                &proc_root,
+                |path| {
+                    if path == process.join("fd") {
+                        fd_reads += 1;
+                        if fd_reads > 1 {
+                            let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+                            return if iterator_failure {
+                                Ok(Box::new(std::iter::once(Err(error)))
+                                    as super::LinuxDescriptorEntries)
+                            } else {
+                                Err(error)
+                            };
+                        }
+                    }
+                    super::linux_descriptor_read_dir(path)
+                },
+                |path| {
+                    std::fs::remove_file(path).unwrap();
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                },
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_replaced_process_or_fd_directory_does_not_prove_disappearance() {
+        for replace_process in [false, true] {
+            let (temp, quarantine, proc_root, process) = descriptor_fixture();
+            let descriptor = process.join("fd/3");
+            std::os::unix::fs::symlink(quarantine.join("open-file"), &descriptor).unwrap();
+            let result = super::linux_descriptor_scan_with(
+                &quarantine,
+                &proc_root,
+                super::linux_descriptor_read_dir,
+                |_| {
+                    let replaced = if replace_process {
+                        process.clone()
+                    } else {
+                        process.join("fd")
+                    };
+                    std::fs::rename(&replaced, temp.path().join("old-directory")).unwrap();
+                    std::fs::create_dir_all(process.join("fd")).unwrap();
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                },
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_process_disappearance_requires_complete_proc_revalidation() {
+        for iterator_failure in [false, true] {
+            let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+            let mut proc_reads = 0;
+            let result = super::linux_descriptor_scan_with(
+                &quarantine,
+                &proc_root,
+                |path| {
+                    if path == process.join("fd") {
+                        std::fs::remove_dir_all(&process).unwrap();
+                        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                    }
+                    proc_reads += 1;
+                    if proc_reads > 1 {
+                        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+                        return if iterator_failure {
+                            Ok(Box::new(std::iter::once(Err(error)))
+                                as super::LinuxDescriptorEntries)
+                        } else {
+                            Err(error)
+                        };
+                    }
+                    super::linux_descriptor_read_dir(path)
+                },
+                |_| unreachable!(),
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_non_link_still_live_is_indeterminate() {
+        let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+        std::fs::write(process.join("fd/3"), b"not a descriptor link").unwrap();
+        assert!(super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_read_only_links_are_observational_positive_evidence() {
+        let (_temp, quarantine, proc_root, process) = descriptor_fixture();
+        let file_path = quarantine.join("read-only");
+        std::fs::write(&file_path, b"read-only").unwrap();
+        let _reader = std::fs::File::open(&file_path).unwrap();
+        std::os::unix::fs::symlink(&file_path, process.join("fd/3")).unwrap();
         assert_eq!(
             super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
             super::ExternalWriterEvidence::PositiveWriterFound,
@@ -8195,25 +8858,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_reports_no_evidence_for_unavailable_or_unrelated_inventory() {
-        let temp = tempfile::tempdir().unwrap();
-        let quarantine = temp.path().join("quarantine");
-        let proc_root = temp.path().join("proc");
-        std::fs::create_dir(&quarantine).unwrap();
-
-        assert_eq!(
-            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
-            super::ExternalWriterEvidence::NoPositiveEvidence,
-        );
-
-        let descriptors = proc_root.join("1273/fd");
-        std::fs::create_dir_all(&descriptors).unwrap();
-        std::os::unix::fs::symlink(temp.path().join("outside"), descriptors.join("3")).unwrap();
-        std::os::unix::fs::symlink(temp.path().join("missing"), descriptors.join("4")).unwrap();
+    fn descriptor_scan_reports_no_evidence_for_readable_unrelated_inventory() {
+        let (temp, quarantine, proc_root, process) = descriptor_fixture();
+        std::os::unix::fs::symlink(temp.path().join("outside"), process.join("fd/3")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing"), process.join("fd/4")).unwrap();
         std::fs::create_dir_all(proc_root.join("self/fd")).unwrap();
         std::os::unix::fs::symlink(quarantine.join("ignored"), proc_root.join("self/fd/5"))
             .unwrap();
-
         assert_eq!(
             super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
             super::ExternalWriterEvidence::NoPositiveEvidence,
@@ -8261,6 +8912,231 @@ mod tests {
         cwd_fixture_task(&process, "123", temp.path());
         std::os::unix::fs::symlink(temp.path(), process.join("cwd")).unwrap();
         (temp, quarantine, proc_root, process)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_mount_id_parser_accepts_kernel_fdinfo() {
+        assert_eq!(
+            super::linux_cwd_parse_mount_id(
+                "pos:\t0\nflags:\t012000000\nmnt_id:\t12345\nino:\t99\n"
+            )
+            .unwrap(),
+            12345,
+        );
+        assert_eq!(
+            super::linux_cwd_parse_mount_id("mnt_id: 18446744073709551615\n").unwrap(),
+            u64::MAX,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_mount_id_parser_fails_closed() {
+        for fdinfo in [
+            "",
+            "ino:\t123\n",
+            "mnt_id:\n",
+            "mnt_id: -1\n",
+            "mnt_id: +1\n",
+            "mnt_id: 1 2\n",
+            "mnt_id: 1x\n",
+            "mnt_id: 18446744073709551616\n",
+            "mnt_id: 1\nmnt_id: 1\n",
+            "mnt_id: 1\nmnt_id: 2\n",
+            "mnt_id 1\n",
+        ] {
+            assert!(
+                matches!(
+                    super::linux_cwd_parse_mount_id(fdinfo),
+                    Err(super::LinuxCwdScanError::Indeterminate(_)),
+                ),
+                "{fdinfo:?}",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_same_device_different_mount_without_mount_privilege() {
+        let (temp, quarantine, proc_root, _process) = cwd_fixture();
+        let target = super::linux_cwd_directory_identity(
+            &super::linux_cwd_open_directory(&quarantine).unwrap(),
+        )
+        .unwrap();
+        let outside = super::linux_cwd_directory_identity(
+            &super::linux_cwd_open_directory(temp.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(target.device, outside.device);
+        assert_ne!(target.inode, outside.inode);
+        let target_fdinfo = temp.path().join("target-fdinfo");
+        let cwd_fdinfo = temp.path().join("cwd-fdinfo");
+        std::fs::write(&target_fdinfo, "mnt_id:\t11\n").unwrap();
+        for (cwd_mount, clean) in [(11, true), (12, false)] {
+            std::fs::write(&cwd_fdinfo, format!("mnt_id:\t{cwd_mount}\n")).unwrap();
+            let scan = super::linux_namespace_cwd_scan_with_fdinfo(
+                &quarantine,
+                &proc_root,
+                |_| {},
+                || {},
+                |directory| {
+                    if super::linux_cwd_directory_identity(directory).unwrap() == target {
+                        target_fdinfo.clone()
+                    } else {
+                        cwd_fdinfo.clone()
+                    }
+                },
+            );
+            if clean {
+                assert_eq!(scan.unwrap(), super::LinuxNamespaceCwdEvidence::Clean);
+            } else {
+                assert!(scan.unwrap_err().to_string().contains("another mount"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_retains_ancestry_positive_across_mount_ids() {
+        let (temp, quarantine, _proc_root, process) = cwd_fixture();
+        cwd_fixture_task(&process, "124", &quarantine.join("nested"));
+        let target = super::LinuxCwdMountedIdentity {
+            directory: super::linux_cwd_directory_identity(
+                &super::linux_cwd_open_directory(&quarantine).unwrap(),
+            )
+            .unwrap(),
+            mount_id: 11,
+        };
+        let fdinfo = temp.path().join("cwd-fdinfo");
+        std::fs::write(&fdinfo, "mnt_id:\t12\n").unwrap();
+        let observation = super::linux_cwd_observe(
+            &process.join("task/124/cwd"),
+            &temp.path().join("unrelated-target-path"),
+            target,
+            &|_| fdinfo.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            observation.evidence,
+            super::LinuxNamespaceCwdEvidence::Inside
+        );
+        assert_eq!(observation.mount_id, 12);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_fails_closed_on_target_and_cwd_fdinfo_errors() {
+        for fail_target in [true, false] {
+            for failure in ["missing", "unreadable", "malformed"] {
+                let (temp, quarantine, proc_root, _process) = cwd_fixture();
+                let target = super::linux_cwd_directory_identity(
+                    &super::linux_cwd_open_directory(&quarantine).unwrap(),
+                )
+                .unwrap();
+                let valid = temp.path().join("valid-fdinfo");
+                let invalid = temp.path().join("invalid-fdinfo");
+                std::fs::write(&valid, "mnt_id:\t11\n").unwrap();
+                match failure {
+                    "unreadable" => std::fs::create_dir(&invalid).unwrap(),
+                    "malformed" => std::fs::write(&invalid, "mnt_id:\tinvalid\n").unwrap(),
+                    _ => {}
+                }
+                let scan = super::linux_namespace_cwd_scan_with_fdinfo(
+                    &quarantine,
+                    &proc_root,
+                    |_| {},
+                    || {},
+                    |directory| {
+                        let is_target =
+                            super::linux_cwd_directory_identity(directory).unwrap() == target;
+                        if is_target == fail_target {
+                            invalid.clone()
+                        } else {
+                            valid.clone()
+                        }
+                    },
+                );
+                assert!(
+                    matches!(scan, Err(super::LinuxCwdScanError::Indeterminate(_))),
+                    "{failure}, target={fail_target}",
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_observation_rejects_mount_change_when_reopening_same_inode() {
+        let (temp, quarantine, _proc_root, process) = cwd_fixture();
+        let target = super::LinuxCwdMountedIdentity {
+            directory: super::linux_cwd_directory_identity(
+                &super::linux_cwd_open_directory(&quarantine).unwrap(),
+            )
+            .unwrap(),
+            mount_id: 11,
+        };
+        let before_fdinfo = temp.path().join("before-fdinfo");
+        let after_fdinfo = temp.path().join("after-fdinfo");
+        std::fs::write(&before_fdinfo, "mnt_id:\t11\n").unwrap();
+        std::fs::write(&after_fdinfo, "mnt_id:\t12\n").unwrap();
+        let reads = std::cell::Cell::new(0);
+        let error =
+            super::linux_cwd_observe(&process.join("task/123/cwd"), &quarantine, target, &|_| {
+                let read = reads.get();
+                reads.set(read + 1);
+                if read == 0 {
+                    before_fdinfo.clone()
+                } else {
+                    after_fdinfo.clone()
+                }
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("task cwd changed while reading"));
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_revalidates_mount_identity_without_path_or_inode_change() {
+        for change_target in [true, false] {
+            let (temp, quarantine, proc_root, _process) = cwd_fixture();
+            let target = super::linux_cwd_directory_identity(
+                &super::linux_cwd_open_directory(&quarantine).unwrap(),
+            )
+            .unwrap();
+            let target_fdinfo = temp.path().join("target-fdinfo");
+            let cwd_fdinfo = temp.path().join("cwd-fdinfo");
+            std::fs::write(&target_fdinfo, "mnt_id:\t11\n").unwrap();
+            std::fs::write(&cwd_fdinfo, "mnt_id:\t11\n").unwrap();
+            let scan = super::linux_namespace_cwd_scan_with_fdinfo(
+                &quarantine,
+                &proc_root,
+                |_| {},
+                || {
+                    let changed = if change_target {
+                        &target_fdinfo
+                    } else {
+                        &cwd_fdinfo
+                    };
+                    std::fs::write(changed, "mnt_id:\t12\n").unwrap();
+                },
+                |directory| {
+                    if super::linux_cwd_directory_identity(directory).unwrap() == target {
+                        target_fdinfo.clone()
+                    } else {
+                        cwd_fdinfo.clone()
+                    }
+                },
+            );
+            let error = scan.unwrap_err().to_string();
+            let expected = if change_target {
+                "target directory identity changed"
+            } else {
+                "another mount"
+            };
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -8773,8 +9649,14 @@ mod tests {
         assert_ne!(mapping, libc::MAP_FAILED);
         drop(file);
 
+        let proc_inventory = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            format!("/proc/{}", std::process::id()),
+            proc_inventory.path().join(std::process::id().to_string()),
+        )
+        .unwrap();
         assert_eq!(
-            super::quarantine_has_open_descriptors(temp.path()).unwrap(),
+            super::quarantine_has_open_descriptors_in(temp.path(), proc_inventory.path()).unwrap(),
             super::ExternalWriterEvidence::NoPositiveEvidence,
         );
         assert!(super::quarantine_has_writable_mappings(temp.path()).unwrap());
