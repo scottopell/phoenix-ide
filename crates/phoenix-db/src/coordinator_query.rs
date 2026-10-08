@@ -156,6 +156,11 @@ pub fn execute_coordinator_query(
     unsafe {
         ffi::sqlite3_extended_result_codes(connection.0, 1);
         ffi::sqlite3_limit(connection.0, ffi::SQLITE_LIMIT_COLUMN, MAX_COLUMNS);
+        ffi::sqlite3_limit(
+            connection.0,
+            ffi::SQLITE_LIMIT_LENGTH,
+            c_int::try_from(MAX_BYTES).expect("byte limit fits SQLite's integer range"),
+        );
         ffi::sqlite3_set_authorizer(connection.0, Some(authorize), (&raw mut *authorizer).cast());
         ffi::sqlite3_progress_handler(
             connection.0,
@@ -937,6 +942,53 @@ mod tests {
     }
 
     #[test]
+    fn bounds_printf_and_zeroblob_before_materializing_results() {
+        let (_dir, path) = fixture();
+        assert_eq!(MAX_BYTES, 65_536);
+        let printf = execute_coordinator_query(
+            path.to_str().unwrap(),
+            "SELECT length(printf('%.*c', 65535, 'x'))",
+        )
+        .unwrap();
+        assert!(matches!(
+            printf.rows[0][0],
+            CoordinatorCell::Integer(65_535)
+        ));
+
+        let blob =
+            execute_coordinator_query(path.to_str().unwrap(), "SELECT zeroblob(65536)").unwrap();
+        assert!(matches!(
+            blob.rows[0][0],
+            CoordinatorCell::Blob { bytes: 65_536 }
+        ));
+        assert!(!blob.truncated);
+
+        // printf's accumulator also budgets the trailing NUL byte;
+        // the bundled SQLite returns NULL when that accumulator exceeds its limit.
+        for sql in [
+            "SELECT printf('%.*c', 65536, 'x')",
+            "SELECT printf('%.*c', 65537, 'x')",
+            "SELECT printf('%.*c', 70000, 'x')",
+        ] {
+            let result = execute_coordinator_query(path.to_str().unwrap(), sql).unwrap();
+            assert_eq!(result.rows.len(), 1, "{sql}");
+            assert!(matches!(result.rows[0][0], CoordinatorCell::Null), "{sql}");
+            assert!(!result.truncated, "{sql}");
+        }
+
+        for sql in ["SELECT zeroblob(65537)", "SELECT length(zeroblob(65537))"] {
+            let error = execute_coordinator_query(path.to_str().unwrap(), sql).unwrap_err();
+            let CoordinatorQueryError::Sqlite(diagnostic) = error else {
+                panic!("expected SQLite length limit error for {sql}: {error}");
+            };
+            assert_eq!(diagnostic.phase, CoordinatorSqlitePhase::Execute, "{sql}");
+            assert_eq!(diagnostic.primary_code, ffi::SQLITE_TOOBIG, "{sql}");
+            assert_eq!(diagnostic.extended_code, ffi::SQLITE_TOOBIG, "{sql}");
+            assert_eq!(diagnostic.symbolic_code, "SQLITE_TOOBIG", "{sql}");
+        }
+    }
+
+    #[test]
     fn bounds_rows_bytes_and_recursive_work() {
         let (_dir, path) = fixture();
         let rows = execute_coordinator_query(
@@ -947,13 +999,13 @@ mod tests {
         assert_eq!(rows.rows.len(), MAX_ROWS);
         assert!(rows.truncated);
 
-        let bytes =
-            execute_coordinator_query(path.to_str().unwrap(), "SELECT printf('%.*c', 70000, 'x')")
-                .unwrap();
-        assert!(!bytes
-            .rows
-            .iter()
-            .flatten()
-            .any(|cell| matches!(cell, CoordinatorCell::Text(value) if value.len() > MAX_BYTES)));
+        let bytes = execute_coordinator_query(
+            path.to_str().unwrap(),
+            "SELECT printf('%.*c', 40000, 'x') UNION ALL SELECT printf('%.*c', 40000, 'x')",
+        )
+        .unwrap();
+        assert_eq!(bytes.rows.len(), 1);
+        assert!(bytes.truncated);
+        assert!(serde_json::to_vec(&bytes).unwrap().len() <= MAX_BYTES);
     }
 }
