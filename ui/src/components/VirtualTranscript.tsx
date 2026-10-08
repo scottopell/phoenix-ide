@@ -56,6 +56,7 @@ export interface VirtualTranscriptHandle {
     targetSelector?: VirtualTranscriptTarget,
   ): void;
   scrollToTail(): void;
+  scrollBy(delta: number): void;
   /** Grant or withdraw tail-following. The scroll policy owns this intent;
    *  the physical layer only executes it when the viewport is at the tail. */
   setTailFollowAllowed(allowed: boolean): void;
@@ -835,6 +836,13 @@ function VirtualTranscriptInner<T>(
       if (!current) return;
       current.activeAnchor = null;
       setScrollerScrollTop(current, totalPhysicalExtent(current));
+      recompute(current);
+      publish();
+    },
+    scrollBy(delta) {
+      const current = storeRef.current;
+      if (!current?.scroller || !Number.isFinite(delta) || delta === 0) return;
+      setScrollerScrollTop(current, current.scroller.scrollTop + delta);
       recompute(current);
       publish();
     },

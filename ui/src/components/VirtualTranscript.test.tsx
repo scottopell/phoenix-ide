@@ -296,6 +296,18 @@ describe('VirtualTranscript', () => {
     expect(rowIndexes()).toEqual([14, 15, 16, 17, 18, 19]);
   });
 
+  it('marks scrollBy as programmatic for the scroll-policy echo', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    render(
+      <VirtualTranscript ariaLabel="Transcript" ref={ref} items={makeItems(20, 10)} getKey={(item) => item.id} estimatedExtent={10} overscan={0} initialTail renderItem={renderRow} scrollerRef={(element) => { scroller = element; }} />,
+    );
+    expect(scrollTopOf(scroller)).toBe(100);
+    act(() => ref.current?.scrollBy(-35));
+    expect(scrollTopOf(scroller)).toBe(65);
+    expect(ref.current?.isProgrammaticScroll(65)).toBe(true);
+  });
+
   it('positions an intra-row target through the transcript executor', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;

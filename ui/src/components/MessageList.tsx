@@ -1904,6 +1904,7 @@ function MessageListImpl({
         messages={messages}
         destination={reactionDestination}
         returnToSource={returnToReactionSource}
+        scrollTranscriptBy={(delta) => transcriptRef.current?.scrollBy(delta)}
       />
       <MessageContextMenu
         messages={messages}

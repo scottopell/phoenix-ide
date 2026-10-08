@@ -17,6 +17,7 @@ interface Props {
   messages: Message[];
   destination?: ReactionDraftDestination | undefined;
   returnToSource?: ((source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>) | undefined;
+  scrollTranscriptBy?: ((delta: number) => void) | undefined;
 }
 
 export function InlineMessageReaction(props: Props) {
@@ -24,7 +25,7 @@ export function InlineMessageReaction(props: Props) {
   return store ? <ReactionSession key={props.scopeKey} {...props} store={store} /> : null;
 }
 
-function ReactionSession({ scopeKey, messages, destination, returnToSource, store }: Props & { store: InlineReactionStore }) {
+function ReactionSession({ scopeKey, messages, destination, returnToSource, scrollTranscriptBy, store }: Props & { store: InlineReactionStore }) {
   const subscribe = useCallback((listener: () => void) => store.subscribe(scopeKey, listener), [scopeKey, store]);
   const getSnapshot = useCallback(() => store.getSnapshot(scopeKey), [scopeKey, store]);
   const reaction = useSyncExternalStore(subscribe, getSnapshot);
@@ -140,6 +141,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
             store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: reaction.presentation });
           }}
           returnToSource={returnToSource}
+          scrollTranscriptBy={scrollTranscriptBy}
           body={reaction.body}
           available={Boolean(destination)}
           onChange={(body) => store.dispatch(scopeKey, { type: 'edit', body })}
@@ -158,6 +160,7 @@ export interface ReactionPillProps {
   sourceRange?: Range | null;
   touchDocked?: boolean;
   captureSource?: () => void;
+  scrollTranscriptBy?: ((delta: number) => void) | undefined;
   returnToSource?: ((source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>) | undefined;
   bubbleRef: React.RefObject<HTMLDivElement>;
   scopeId: string;

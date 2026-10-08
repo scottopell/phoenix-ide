@@ -5,7 +5,7 @@ import { restoreReactionRange } from './reactionRange';
 import { useFocusScope, useKeyboardRouterShortcut, useRegisterFocusScope } from '../hooks/useFocusScope';
 import './ReactionPill.css';
 
-export function ReactionPill({ source, sourceRange, touchDocked = false, captureSource, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
+export function ReactionPill({ source, sourceRange, touchDocked = false, captureSource, scrollTranscriptBy, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
   useRegisterFocusScope(scopeId);
   const { activeScope } = useFocusScope();
   const [sourceDocked, setSourceDocked] = useState(false);
@@ -149,7 +149,9 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         observedObstructions = nextObstructions;
         y = Math.min(bottom, obstructionTop) - height - 12;
         if (visible && rect && rect.bottom > y - 12) {
-          observedScroller.scrollTop += rect.bottom - (y - 12);
+          const delta = rect.bottom - (y - 12);
+          if (scrollTranscriptBy) scrollTranscriptBy(delta);
+          else observedScroller.scrollTop += delta;
         }
       } else if (visible && rect) {
         x = rect.left;
@@ -185,7 +187,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       window.visualViewport?.removeEventListener('resize', schedule);
       window.visualViewport?.removeEventListener('scroll', schedule);
     };
-  }, [source, sourceRange, touchDocked, bubbleRef]);
+  }, [source, sourceRange, touchDocked, scrollTranscriptBy, bubbleRef]);
 
   useEffect(() => {
     if (!sourceDocked) setError('');

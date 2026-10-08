@@ -305,12 +305,15 @@ describe('reaction pill', () => {
     vi.spyOn(window, 'addEventListener').mockImplementation((type, listener) => {
       if (typeof listener === 'function') listeners.set(type, listener);
     });
-    render(<Fixture touchDocked body="" />);
-    const scroller = document.getElementById('messages')!;
-    await waitFor(() => expect(scroller.scrollTop).toBe(98));
+    const scrollTranscriptBy = vi.fn();
+    render(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
+      <ReactionPill source={source} touchDocked scrollTranscriptBy={scrollTranscriptBy} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    await waitFor(() => expect(scrollTranscriptBy).toHaveBeenCalledWith(98));
     rangeBottom = 620;
     act(() => listeners.get('scroll')?.(new Event('scroll')));
-    await waitFor(() => expect(scroller.scrollTop).toBe(216));
+    await waitFor(() => expect(scrollTranscriptBy).toHaveBeenLastCalledWith(118));
     expect(screen.getByRole('textbox')).not.toHaveFocus();
   });
 

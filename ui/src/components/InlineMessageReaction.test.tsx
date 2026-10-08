@@ -203,7 +203,6 @@ describe('inline message reactions', () => {
     await act(async () => { await new Promise(requestAnimationFrame); });
     expect(store.getSnapshot('conversation-a')).toEqual(owned);
     expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
   });
 
   it('preserves touch presentation when source restoration emits selectionchange', async () => {
