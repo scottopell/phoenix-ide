@@ -9745,7 +9745,7 @@ mod tests {
         let ExactWorktreeRemoval::Residual { detail } = outcome else {
             panic!("open descriptor must preserve quarantine");
         };
-        assert!(detail.contains("open descriptors"));
+        assert!(detail.contains("external process can still write"));
         assert!(!closing.exists());
         let quarantine = worktree_quarantine_path(&identity).unwrap();
         assert_eq!(
