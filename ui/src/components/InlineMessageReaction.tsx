@@ -34,6 +34,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
   const pillFocusPending = useRef(false);
   const selecting = useRef(false);
   const selectionInput = useRef<'touch' | 'fine' | null>(null);
+  const selectionChangedDuringGesture = useRef(false);
   const { activeScope } = useFocusScope();
   const focusScope = `inline-reaction:${scopeKey}`;
   const [notice, setNotice] = useState('');
@@ -57,13 +58,15 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
           && current.source.textAnchor?.start.offset === selected.source.textAnchor?.start.offset
           && current.source.textAnchor?.end.fragmentId === selected.source.textAnchor?.end.fragmentId
           && current.source.textAnchor?.end.offset === selected.source.textAnchor?.end.offset;
-        const touchDocked = sameSource
+        const gesturePresentation = selectionChangedDuringGesture.current && selectionInput.current !== null
+          ? selectionInput.current === 'touch'
+          : null;
+        const touchDocked = gesturePresentation ?? (sameSource
           ? current.presentation === 'touch-docked'
-          : selectionInput.current !== null
-            ? selectionInput.current === 'touch'
-            : window.matchMedia?.('(any-pointer: coarse)').matches ?? false;
+          : window.matchMedia?.('(any-pointer: coarse)').matches ?? false);
         store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: touchDocked ? 'touch-docked' : 'floating' });
         selectionInput.current = null;
+        selectionChangedDuringGesture.current = false;
         setNotice('');
       } else if (current && (current.presentation === 'floating'
         || Boolean(nativeSelection && nativeSelection.rangeCount > 0 && !nativeSelection.isCollapsed)
@@ -78,20 +81,25 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
     const down = (event: PointerEvent) => {
       if (bubbleRef.current?.contains(event.target as Node)) return;
       selectionInput.current = event.pointerType === 'touch' ? 'touch' : 'fine';
+      selectionChangedDuringGesture.current = false;
       selecting.current = event.pointerType !== 'touch';
     };
     const up = () => { selecting.current = false; schedule(); };
     const keydown = (event: KeyboardEvent) => {
       if (event.shiftKey || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a')) selectionInput.current = 'fine';
     };
-    document.addEventListener('selectionchange', schedule);
+    const selectionChange = () => {
+      if (selectionInput.current !== null) selectionChangedDuringGesture.current = true;
+      schedule();
+    };
+    document.addEventListener('selectionchange', selectionChange);
     document.addEventListener('keydown', keydown, true);
     document.addEventListener('pointerdown', down, { passive: true });
     document.addEventListener('pointerup', up, { passive: true });
     document.addEventListener('pointercancel', up, { passive: true });
     return () => {
       cancelAnimationFrame(frame);
-      document.removeEventListener('selectionchange', schedule);
+      document.removeEventListener('selectionchange', selectionChange);
       document.removeEventListener('keydown', keydown, true);
       document.removeEventListener('pointerdown', down);
       document.removeEventListener('pointerup', up);

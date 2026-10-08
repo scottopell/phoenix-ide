@@ -159,6 +159,22 @@ describe('inline message reactions', () => {
     expect(screen.getByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
   });
 
+  it('uses the current gesture when the same range is deliberately reselected', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'mouse' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'mouse' });
+    expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+  });
+
   it('keeps keyboard selection in the floating pill on a hybrid device', async () => {
     setCoarsePointer(true);
     render(<Harness store={new InlineReactionStore()} append={vi.fn()} />);
