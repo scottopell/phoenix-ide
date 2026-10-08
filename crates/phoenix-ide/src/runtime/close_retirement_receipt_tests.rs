@@ -115,8 +115,14 @@ async fn successful_receipt_work_scope_retry(
         .unwrap();
     assert_eq!(admitted.phase(), ClosePhase::AwaitingRetirementInspection);
     if let Some(index) = race_path_index {
+        let replacement_generation = format!("{}-receipt-race", source.generation());
         let target = runtime
-            .inspect_close_retirement_only(attempt.clone())
+            .db()
+            .resume_close_retirement_after_dispatched_absence(
+                attempt,
+                source,
+                &replacement_generation,
+            )
             .await
             .unwrap();
         runtime
