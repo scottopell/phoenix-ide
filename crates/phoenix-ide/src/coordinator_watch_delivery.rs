@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_db::{CloseFailureStop, PendingWatchEvent, WatchEventRoute};
@@ -38,14 +38,18 @@ fn notification(event: &PendingWatchEvent) -> String {
         stop,
     } = &event.route
     {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             " Scope: {scope}. Resource kind: {resource_kind}. Identity ({identity_kind}, {identity_codec}): {identity_value}. Detail: {detail}."
-        ));
+        );
         match stop {
             CloseFailureStop::ConversationAndProcessesStopped {
                 confirmed_at_unix_us,
             } => {
-                text.push_str(&format!(" Conversation and processes stopped, confirmed at (Unix microseconds): {confirmed_at_unix_us}. Cleanup needs attention."));
+                let _ = write!(
+                    text,
+                    " Conversation and processes stopped, confirmed at (Unix microseconds): {confirmed_at_unix_us}. Cleanup needs attention."
+                );
             }
             CloseFailureStop::ShutdownUncertain => {
                 text.push_str(" Shutdown uncertain. Close incomplete.");
