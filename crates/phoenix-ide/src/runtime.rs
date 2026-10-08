@@ -3405,8 +3405,7 @@ impl RuntimeManager {
         .await
     }
 
-    /// Replays exact runtime-resource permits for sealed Close retirements. It
-    /// never finalizes product lifecycle or unblocks History.
+    /// Resumes retirement only for Close attempts still requesting retirement.
     pub async fn resume_pending_close_runtime_retirements(
         self: &Arc<Self>,
     ) -> Result<usize, String> {
@@ -3431,8 +3430,31 @@ impl RuntimeManager {
                 {
                     Ok(()) => Ok(true),
                     Err(error) => {
+                        if let Some(scope) = error.scope() {
+                            let _execution = manager
+                                .close_retirement_execution
+                                .lock(obligation.attempt_id().as_str())
+                                .await;
+                            let authoritative = manager
+                                .db()
+                                .get_close_obligation(obligation.attempt_id().as_str())
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            if authoritative.phase()
+                                == phoenix_core::domain::close::ClosePhase::RetirementRequested
+                            {
+                                manager
+                                    .persist_close_error_repair(
+                                        obligation.attempt_id(),
+                                        scope,
+                                        &error,
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
                         tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
-                            "Close runtime-resource retirement remains in repair state");
+                            "Close runtime-resource retirement could not complete");
                         Ok(false)
                     }
                 }
@@ -9076,7 +9098,7 @@ mod scope_liveness_tests {
                 scope: scope.clone(),
                 residual: resource.clone(),
                 reason: RetirementFailureReason::ManualRepairRequired,
-                detail: "cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed"
+                detail: "Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed"
                     .to_string(),
             })
             .await
@@ -9090,7 +9112,7 @@ mod scope_liveness_tests {
                  (SELECT COUNT(*) FROM close_retirement_resources
                   WHERE attempt_id=?1 AND inspection_generation=?2 AND proof_kind='residual'
                     AND residual_reason='manual_repair_required'
-                    AND detail LIKE '%(code: 787) FOREIGN KEY constraint failed%'),
+                    AND detail='Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed'),
                  (SELECT COUNT(*) FROM close_retirement_inventories
                   WHERE attempt_id=?1 AND inspection_generation=?2 AND sealed=1),
                  (SELECT COUNT(*) FROM close_retirement_resource_dispatches
@@ -9242,6 +9264,366 @@ mod scope_liveness_tests {
         );
     }
 
+    async fn prepare_worktree_only_close(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        CloseAttemptId,
+        WorkScopeId,
+        std::path::PathBuf,
+    ) {
+        let repository = tempfile::tempdir().unwrap();
+        let git = |arguments: &[&str]| {
+            let output = phoenix_core::git::command()
+                .args(arguments)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "Close Test")
+                .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Close Test")
+                .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {arguments:?}: {output:?}");
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repository.path().join("tracked"), "initial\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        let worktree = repository.path().join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            conversation_id,
+            worktree.to_str().unwrap(),
+        ]);
+        let ResourceScopeKey::Work(scope) =
+            create_handleless_work_conv(manager, conversation_id, worktree.to_str().unwrap(), None)
+                .await
+        else {
+            unreachable!()
+        };
+        sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+            .bind(conversation_id)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+        let conversation = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        let attempt_id = prepare_existing_close_attempt_ready_for_completion(
+            manager,
+            &conversation,
+            &format!("{conversation_id}-attempt"),
+        )
+        .await;
+        let targets = manager
+            .db()
+            .list_close_expected_retirement_resources(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|target| matches!(
+            target.resource.kind(),
+            phoenix_core::domain::close::RetiredResourceKind::Worktree
+                | phoenix_core::domain::close::RetiredResourceKind::WorkScope
+        )));
+        (repository, attempt_id, scope, worktree)
+    }
+
+    #[tokio::test]
+    async fn queued_runtime_retirement_reloads_needs_repair_before_any_work() {
+        use phoenix_core::domain::close::ClosePhase;
+        let mut manager = test_manager().await;
+        let sockets = tempfile::tempdir().unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let (_repository, attempt_id, scope, worktree) =
+            prepare_worktree_only_close(&manager, "queued-retirement").await;
+        let execution = manager
+            .close_retirement_execution
+            .lock(attempt_id.as_str())
+            .await;
+        let mut queued = Box::pin(manager.retire_close_runtime_resources(attempt_id.clone()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut queued)
+                .await
+                .is_err()
+        );
+        manager
+            .route_close_attempt_to_repair::<()>(
+                &attempt_id,
+                &scope,
+                phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+                "first retirement requires repair",
+            )
+            .await
+            .unwrap_err();
+        let before = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(before.phase(), ClosePhase::NeedsRepair);
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        drop(execution);
+        queued.await.unwrap();
+        assert_eq!(
+            manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            manager
+                .db()
+                .list_close_retirement_evidence(attempt_id.as_str())
+                .await
+                .unwrap(),
+            evidence
+        );
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        let key = ResourceScopeKey::Work(scope);
+        manager.terminals.reserve_spawn(&key).unwrap();
+        manager.terminals.release_spawn(&key);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked")).unwrap(),
+            "initial\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_sealed_worktree_retirement_reacquires_scope_lease_and_completes() {
+        use phoenix_core::domain::close::ClosePhase;
+        let mut manager = test_manager().await;
+        let sockets = tempfile::tempdir().unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let (_repository, attempt_id, scope, worktree) =
+            prepare_worktree_only_close(&manager, "startup-sealed-retirement").await;
+        manager
+            .cancel_close_resource_leases(&attempt_id)
+            .await
+            .unwrap();
+        // A fresh registry has no process-local permits, while durable inventory remains sealed.
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let terminals = manager.terminals.clone();
+        let key = ResourceScopeKey::Work(scope);
+        let observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&observations);
+        manager.test_ambient_writer_observer = Some(Arc::new(move |_| {
+            assert!(
+                matches!(
+                    terminals.reserve_spawn(&key),
+                    Err(phoenix_terminal::session::ActiveTerminalInsertError::RetirementFenced)
+                ),
+                "scope must be leased before filesystem retirement"
+            );
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(false)
+        }));
+        let manager = Arc::new(manager);
+        assert_eq!(
+            manager
+                .resume_pending_close_runtime_retirements()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::Completed
+        );
+        assert!(observations.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert!(!worktree.exists());
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_scoped_lease_failure_persists_repair_once() {
+        use phoenix_core::domain::close::{ClosePhase, RetirementOutcome};
+        let mut manager = test_manager().await;
+        let sockets = tempfile::tempdir().unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let (_repository, attempt_id, scope, worktree) =
+            prepare_worktree_only_close(&manager, "startup-scoped-failure").await;
+        manager
+            .cancel_close_resource_leases(&attempt_id)
+            .await
+            .unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let socket = phoenix_tools::tmux::registry::socket_path_for_worktree(
+            sockets.path(),
+            std::path::Path::new(scope.as_str()),
+        );
+        std::fs::write(&socket, "not a tmux socket").unwrap();
+        let manager = Arc::new(manager);
+        assert_eq!(
+            manager
+                .resume_pending_close_runtime_retirements()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::NeedsRepair
+        );
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].scope, scope);
+        assert!(matches!(
+            evidence[0].outcome,
+            RetirementOutcome::Residual { .. }
+        ));
+        assert!(evidence[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("tmux identity is ambiguous"));
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        let key = ResourceScopeKey::Work(scope);
+        manager.terminals.reserve_spawn(&key).unwrap();
+        manager.terminals.release_spawn(&key);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked")).unwrap(),
+            "initial\n"
+        );
+        assert_eq!(
+            manager
+                .resume_pending_close_runtime_retirements()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .db()
+                .list_close_retirement_evidence(attempt_id.as_str())
+                .await
+                .unwrap(),
+            evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_retirement_does_not_reroute_an_already_persisted_residual() {
+        use phoenix_core::domain::close::{ClosePhase, RetirementFailureReason, RetirementOutcome};
+        let mut manager = test_manager().await;
+        let sockets = tempfile::tempdir().unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let (_repository, attempt_id, scope, worktree) =
+            prepare_worktree_only_close(&manager, "startup-persisted-residual").await;
+        manager
+            .cancel_close_resource_leases(&attempt_id)
+            .await
+            .unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        std::fs::remove_file(worktree.join(".git")).unwrap();
+        let manager = Arc::new(manager);
+        assert_eq!(
+            manager
+                .resume_pending_close_runtime_retirements()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::NeedsRepair
+        );
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].scope, scope);
+        assert_eq!(
+            evidence[0].outcome,
+            RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::IdentityNotProven,
+            }
+        );
+        assert!(evidence[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("worktree cannot be reinspected"));
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked")).unwrap(),
+            "initial\n"
+        );
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resource_history WHERE attempt_id = ?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            history_count, 1,
+            "startup must not append a second repair receipt"
+        );
+    }
+
     #[tokio::test]
     async fn startup_runtime_retirement_does_not_retry_needs_repair() {
         use phoenix_core::domain::close::{
@@ -9249,21 +9631,26 @@ mod scope_liveness_tests {
             RetiredResourceKind, RetirementFailureReason,
         };
 
-        let manager = Arc::new(test_manager().await);
+        let mut manager = test_manager().await;
+        let sockets = tempfile::tempdir().unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
         let conversation_id = "startup-needs-repair";
-        let attempt_id = prepare_close_attempt_ready_for_completion(
-            &manager,
-            conversation_id,
-            "startup-needs-repair-attempt",
-        )
-        .await;
-        let scope = manager
-            .db()
-            .get_conversation(conversation_id)
+        let (_repository, attempt_id, scope, worktree) =
+            prepare_worktree_only_close(&manager, conversation_id).await;
+        manager
+            .cancel_close_resource_leases(&attempt_id)
             .await
-            .unwrap()
-            .attached_work_scope_id
             .unwrap();
+        manager.tmux_registry = Arc::new(
+            phoenix_tools::tmux::registry::TmuxRegistry::with_socket_dir(
+                sockets.path().to_path_buf(),
+            ),
+        );
+        let manager = Arc::new(manager);
         manager
             .db()
             .route_close_attempt_to_repair(phoenix_db::RouteCloseAttemptToRepairRequest {
@@ -9291,6 +9678,16 @@ mod scope_liveness_tests {
             .await
             .unwrap();
 
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        let scope_key = ResourceScopeKey::Work(scope);
+        manager.terminals.reserve_spawn(&scope_key).unwrap();
+        manager.terminals.release_spawn(&scope_key);
+        assert!(manager
+            .tmux_registry()
+            .get_existing(&scope_key)
+            .await
+            .is_none());
+
         for _ in 0..2 {
             assert_eq!(
                 manager
@@ -9314,6 +9711,18 @@ mod scope_liveness_tests {
                     .await
                     .unwrap(),
                 evidence
+            );
+            assert!(manager.close_retirement_leases.lock().await.is_empty());
+            manager.terminals.reserve_spawn(&scope_key).unwrap();
+            manager.terminals.release_spawn(&scope_key);
+            assert!(manager
+                .tmux_registry()
+                .get_existing(&scope_key)
+                .await
+                .is_none());
+            assert_eq!(
+                std::fs::read_to_string(worktree.join("tracked")).unwrap(),
+                "initial\n"
             );
             assert!(
                 !manager

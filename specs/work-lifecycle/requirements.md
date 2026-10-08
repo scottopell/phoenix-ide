@@ -324,7 +324,7 @@ THE SYSTEM MAY resume that same pair as `RetirementRequested` only when all of t
 - At least one captured scope owns a worktree, and the total retained per-scope inspection count equals the captured worktree-owning scope count.
 - Every captured scope has a sealed retirement inventory for the retained active pair, with no missing or extra active inventory.
 - The active pair's residual-resource count equals the captured worktree-owning scope count; each such scope has its exact worktree residual with resource and identity kind `worktree`, identity codec `worktree_id_v1`, captured identity value, and reason `manual_repair_required`.
-- Each exact residual detail contains the discriminator `(code: 787) FOREIGN KEY constraint failed`.
+- Each exact residual detail equals the complete retained diagnostic `Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed`; a prefix, suffix, generic FK-787 message, or cleanup-plan-prefixed message does not match.
 - The active pair has no dispatch and no worktree cleanup plan for the attempt.
 - Every captured worktree-owning scope has a cleanup plan and matching dispatch from a different generation/fingerprint pair of this same attempt, scope, and exact worktree resource identity.
 

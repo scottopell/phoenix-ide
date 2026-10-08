@@ -247,7 +247,6 @@ entity CloseObligation {
         retirement_requested -> awaiting_retirement_inspection
         needs_repair -> awaiting_retirement_inspection
         retirement_requested -> completed
-        needs_repair -> completed
         terminal: completed
     }
 }
@@ -2015,7 +2014,7 @@ rule ChangedInspectionInvalidatesOutstandingConfirmation {
 
 rule CloseRetirementCompletionFinalizesAggregateHistory {
     when: ResourceRetirementCompleted(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { retirement_requested, needs_repair }
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
     requires: product_conversation.lifecycle = open
     ensures: CloseOutcomeSystemMessagePersisted(product_conversation, attempt_id)
     ensures: product_conversation.lifecycle = history

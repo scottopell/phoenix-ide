@@ -661,13 +661,6 @@ impl RuntimeManager {
         Ok(resources)
     }
 
-    async fn discard_close_resource_leases(&self, attempt_id: &CloseAttemptId) {
-        self.close_retirement_leases
-            .lock()
-            .await
-            .retain(|(candidate, _), _| candidate != attempt_id.as_str());
-    }
-
     pub(crate) async fn cancel_close_resource_leases(
         &self,
         attempt_id: &CloseAttemptId,
@@ -868,10 +861,7 @@ impl RuntimeManager {
             .get_close_obligation(attempt_id.as_str())
             .await
             .map_err(map_close_retirement_db_error)?;
-        if !matches!(
-            obligation.phase(),
-            ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
-        ) {
+        if obligation.phase() != ClosePhase::RetirementRequested {
             return Ok(());
         }
         let snapshot = obligation
@@ -886,6 +876,22 @@ impl RuntimeManager {
         if !inventory_is_complete {
             self.capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
                 .await?;
+        }
+        let captured_scopes = self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(map_close_retirement_db_error)?;
+        for captured in &captured_scopes {
+            if let Err(reason) = self
+                .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
+                .await
+            {
+                self.cancel_close_resource_leases(&attempt_id)
+                    .await
+                    .map_err(|error| CloseRetirementError::from(error).in_scope(&captured.scope))?;
+                return Err(CloseRetirementError::from(reason).in_scope(&captured.scope));
+            }
         }
         let targets = self
             .db()
@@ -939,140 +945,6 @@ impl RuntimeManager {
                 .filter(|target| target.scope == scope)
                 .map(|target| target.resource.clone())
                 .collect::<Vec<_>>();
-            let has_lease = self
-                .close_retirement_leases
-                .lock()
-                .await
-                .contains_key(&(attempt_id.as_str().to_string(), scope.clone()));
-            if !has_lease {
-                for resource in &expected {
-                    let LossItemIdentity::Opaque(identity) = resource.identity() else {
-                        return self
-                            .record_close_residual(
-                                &attempt_id,
-                                &snapshot,
-                                &scope,
-                                resource.clone(),
-                                RetirementFailureReason::IdentityNotProven,
-                                "sealed durable tmux identity was not opaque",
-                            )
-                            .await;
-                    };
-                    let Some(instance) =
-                        TmuxServerInstanceIdentity::parse_stable_identity(identity.as_str())
-                    else {
-                        return self
-                            .record_close_residual(
-                                &attempt_id,
-                                &snapshot,
-                                &scope,
-                                resource.clone(),
-                                RetirementFailureReason::IdentityNotProven,
-                                "sealed durable tmux identity was malformed",
-                            )
-                            .await;
-                    };
-                    self.db()
-                        .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
-                            attempt_id: attempt_id.clone(),
-                            scope: scope.clone(),
-                            snapshot: snapshot.clone(),
-                            resource: resource.clone(),
-                        })
-                        .await
-                        .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?;
-                    let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
-                    match self
-                        .tmux_registry()
-                        .rehydrate_retirement(
-                            &ResourceScopeKey::Work(scope.clone()),
-                            &instance,
-                            tmux_expires,
-                        )
-                        .await
-                    {
-                        Ok(TmuxRetirementRehydration::Permit(permit)) => {
-                            let outcome = self
-                                .tmux_registry()
-                                .complete_retirement(&permit)
-                                .await
-                                .map_err(|error| {
-                                CloseRetirementError::from(error.to_string()).in_scope(&scope)
-                            })?;
-                            match tmux_retirement_outcome(outcome) {
-                                Ok(RetirementOutcome::Retired) => {
-                                    self.record_close_retired(
-                                        &attempt_id,
-                                        &snapshot,
-                                        &scope,
-                                        resource.clone(),
-                                        "exact durable tmux rehydration",
-                                    )
-                                    .await?;
-                                }
-                                Ok(RetirementOutcome::AbsenceAdopted { .. }) => {
-                                    self.record_close_absence_adopted(
-                                        &attempt_id,
-                                        &snapshot,
-                                        &scope,
-                                        resource.clone(),
-                                        "exact durable tmux absence after dispatch",
-                                    )
-                                    .await?;
-                                }
-                                Ok(RetirementOutcome::Residual { .. }) => unreachable!(),
-                                Err((reason, detail)) => {
-                                    return self
-                                        .record_close_residual(
-                                            &attempt_id,
-                                            &snapshot,
-                                            &scope,
-                                            resource.clone(),
-                                            reason,
-                                            &detail,
-                                        )
-                                        .await;
-                                }
-                            }
-                        }
-                        Ok(TmuxRetirementRehydration::AbsenceVerified) => {
-                            self.record_close_absence_adopted(
-                                &attempt_id,
-                                &snapshot,
-                                &scope,
-                                resource.clone(),
-                                "exact durable tmux absence after dispatch",
-                            )
-                            .await?;
-                        }
-                        Ok(TmuxRetirementRehydration::Residual { reason }) => {
-                            return self
-                                .record_close_residual(
-                                    &attempt_id,
-                                    &snapshot,
-                                    &scope,
-                                    resource.clone(),
-                                    RetirementFailureReason::IdentityNotProven,
-                                    &reason,
-                                )
-                                .await;
-                        }
-                        Err(error) => {
-                            return self
-                                .record_close_residual(
-                                    &attempt_id,
-                                    &snapshot,
-                                    &scope,
-                                    resource.clone(),
-                                    RetirementFailureReason::IdentityNotProven,
-                                    &format!("durable tmux rehydration failed: {error}"),
-                                )
-                                .await;
-                        }
-                    }
-                }
-                continue;
-            }
             for resource in &expected {
                 self.db()
                     .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
@@ -1085,7 +957,7 @@ impl RuntimeManager {
                     .map_err(|error| map_close_retirement_db_error(error).in_scope(&scope))?;
             }
             let resources = match self
-                .complete_close_resource_lease(&attempt_id, &scope)
+                .complete_close_resource_lease(&attempt_id, &scope, &expected)
                 .await
             {
                 Ok(resources) => resources,
@@ -1192,7 +1064,7 @@ impl RuntimeManager {
             .await?;
         self.complete_close_retirement_and_publish(&attempt_id)
             .await?;
-        self.discard_close_resource_leases(&attempt_id).await;
+        self.cancel_close_resource_leases(&attempt_id).await?;
         for captured in self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
@@ -2125,6 +1997,7 @@ impl RuntimeManager {
         &self,
         attempt_id: &CloseAttemptId,
         scope: &WorkScopeId,
+        expected: &[RetiredResourceIdentity],
     ) -> Result<Vec<CompletedCloseResource>, CloseLeaseFailure> {
         let key = (attempt_id.as_str().to_string(), scope.clone());
         let lease = self.close_retirement_leases.lock().await.remove(&key);
@@ -2135,22 +2008,114 @@ impl RuntimeManager {
             });
         };
         let result = async {
+            let tmux_identity = opaque_resource(
+                RetiredResourceKind::TmuxServer,
+                lease.tmux.instance.stable_identity(),
+            );
+            let expected_tmux = expected
+                .iter()
+                .filter(|resource| resource.kind() == RetiredResourceKind::TmuxServer)
+                .collect::<Vec<_>>();
+            let mut absent_tmux = Vec::new();
+            for resource in &expected_tmux {
+                if **resource == tmux_identity {
+                    continue;
+                }
+                let LossItemIdentity::Opaque(identity) = resource.identity() else {
+                    return Err(CloseLeaseFailure::Tmux {
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail: "sealed durable tmux identity was not opaque".to_string(),
+                    });
+                };
+                let instance = TmuxServerInstanceIdentity::parse_stable_identity(identity.as_str())
+                    .ok_or_else(|| CloseLeaseFailure::Tmux {
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail: "sealed durable tmux identity was malformed".to_string(),
+                    })?;
+                match self
+                    .tmux_registry()
+                    .rehydrate_retirement(
+                        &ResourceScopeKey::Work(scope.clone()),
+                        &instance,
+                        phoenix_tools::tmux::registry::close_deadline(),
+                    )
+                    .await
+                    .map_err(|error| CloseLeaseFailure::Tmux {
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail: error.to_string(),
+                    })? {
+                    TmuxRetirementRehydration::AbsenceVerified => {
+                        absent_tmux.push((*resource).clone())
+                    }
+                    TmuxRetirementRehydration::Residual { reason } => {
+                        return Err(CloseLeaseFailure::Tmux {
+                            reason: RetirementFailureReason::IdentityNotProven,
+                            detail: reason,
+                        });
+                    }
+                    TmuxRetirementRehydration::Permit(permit) => {
+                        self.tmux_registry()
+                            .cancel_retirement(permit)
+                            .await
+                            .map_err(|error| CloseLeaseFailure::Tmux {
+                                reason: RetirementFailureReason::IdentityNotProven,
+                                detail: error.to_string(),
+                            })?;
+                        return Err(CloseLeaseFailure::Tmux {
+                            reason: RetirementFailureReason::IdentityNotProven,
+                            detail: "live tmux lease differs from sealed inventory".to_string(),
+                        });
+                    }
+                }
+            }
+            let mut retire_tmux = !lease.tmux.had_entry()
+                || expected_tmux
+                    .iter()
+                    .any(|resource| **resource == tmux_identity);
+            if !retire_tmux && expected_tmux.is_empty() {
+                retire_tmux = matches!(
+                    self.tmux_registry()
+                        .rehydrate_retirement(
+                            &ResourceScopeKey::Work(scope.clone()),
+                            &lease.tmux.instance,
+                            phoenix_tools::tmux::registry::close_deadline(),
+                        )
+                        .await
+                        .map_err(|error| CloseLeaseFailure::Tmux {
+                            reason: RetirementFailureReason::IdentityNotProven,
+                            detail: error.to_string(),
+                        })?,
+                    TmuxRetirementRehydration::AbsenceVerified
+                );
+                if !retire_tmux {
+                    return Err(CloseLeaseFailure::Tmux {
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail: "live tmux lease has no sealed inventory target".to_string(),
+                    });
+                }
+            }
             require_absent(self.bash_handles().complete_retirement(&lease.bash).await).map_err(
                 |reason| CloseLeaseFailure::ProcessEpoch {
                     kind: RetiredResourceKind::BashProcessGroup,
                     reason,
                 },
             )?;
-            let tmux_outcome = self
-                .tmux_registry()
-                .complete_retirement(&lease.tmux)
-                .await
-                .map_err(|error| CloseLeaseFailure::Tmux {
-                    reason: RetirementFailureReason::IdentityNotProven,
-                    detail: error.to_string(),
-                })?;
-            let tmux_outcome = tmux_retirement_outcome(tmux_outcome)
-                .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?;
+            let tmux_outcome = if retire_tmux {
+                let outcome = self
+                    .tmux_registry()
+                    .complete_retirement(&lease.tmux)
+                    .await
+                    .map_err(|error| CloseLeaseFailure::Tmux {
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail: error.to_string(),
+                    })?;
+                tmux_retirement_outcome(outcome)
+                    .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?
+            } else {
+                RetirementOutcome::AbsenceAdopted {
+                    absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+                }
+            };
             require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)
                 .map_err(|reason| CloseLeaseFailure::ProcessEpoch {
                     kind: RetiredResourceKind::PtySession,
@@ -2168,6 +2133,9 @@ impl RuntimeManager {
             Ok(lease
                 .resources
                 .iter()
+                .filter(|identity| {
+                    retire_tmux || identity.kind() != RetiredResourceKind::TmuxServer
+                })
                 .cloned()
                 .map(|identity| CompletedCloseResource {
                     outcome: if identity.kind() == RetiredResourceKind::TmuxServer {
@@ -2177,6 +2145,16 @@ impl RuntimeManager {
                     },
                     identity,
                 })
+                .chain(
+                    absent_tmux
+                        .into_iter()
+                        .map(|identity| CompletedCloseResource {
+                            identity,
+                            outcome: RetirementOutcome::AbsenceAdopted {
+                                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+                            },
+                        }),
+                )
                 .collect())
         }
         .await;
@@ -3558,6 +3536,59 @@ where
 }
 
 #[cfg(unix)]
+fn validate_final_tombstone_root(
+    tombstone: &CloseWorktreeFinalTombstone,
+    descriptor: &std::os::fd::OwnedFd,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let live = std::fs::symlink_metadata(&tombstone.root)
+        .map_err(|error| format!("cannot revalidate recorded final tombstone root: {error}"))?;
+    if (live.dev(), live.ino()) != (tombstone.device, tombstone.inode) {
+        return Err(
+            "recorded final tombstone root was replaced; preserved for manual repair".to_string(),
+        );
+    }
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !live.is_dir() || live.uid() != uid || live.mode() & 0o077 != 0 {
+        return Err(
+            "recorded final tombstone root is not an owner-only directory owned by the current user; preserved for manual repair".to_string(),
+        );
+    }
+    let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: descriptor is open and fstat initializes opened on success.
+    if unsafe { libc::fstat(descriptor.as_raw_fd(), opened.as_mut_ptr()) } < 0 {
+        return Err(format!(
+            "cannot revalidate opened final tombstone root: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fstat succeeded.
+    let opened = unsafe { opened.assume_init() };
+    #[allow(
+        clippy::useless_conversion,
+        reason = "libc stat device width differs across supported Unix targets"
+    )]
+    let opened_device = u64::try_from(opened.st_dev).ok();
+    if (opened_device, opened.st_ino) != (Some(tombstone.device), tombstone.inode) {
+        return Err(
+            "recorded final tombstone root was replaced before descriptor binding; preserved for manual repair".to_string(),
+        );
+    }
+    if opened.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || opened.st_uid != uid
+        || opened.st_mode & 0o077 != 0
+    {
+        return Err(
+            "opened final tombstone root is not an owner-only directory owned by the current user; preserved for manual repair".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 #[allow(
     clippy::useless_conversion,
     reason = "libc stat device width differs across supported Unix targets"
@@ -3649,28 +3680,8 @@ where
     }
     // SAFETY: fd is newly owned on success above.
     let root_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-    let mut root_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: root_fd is open and fstat initializes root_stat on success.
-    if unsafe { libc::fstat(root_fd.as_raw_fd(), root_stat.as_mut_ptr()) } < 0 {
-        return FinalTombstoneRecovery::Residual(format!(
-            "cannot identify recorded final tombstone: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: fstat succeeded.
-    let root_stat = unsafe { root_stat.assume_init() };
-    let root_device = match u64::try_from(root_stat.st_dev) {
-        Ok(device) => device,
-        Err(error) => {
-            return FinalTombstoneRecovery::Residual(format!(
-                "final tombstone root device is invalid: {error}"
-            ))
-        }
-    };
-    if (root_device, root_stat.st_ino) != (tombstone.device, tombstone.inode) {
-        return FinalTombstoneRecovery::Residual(
-            "recorded final tombstone root was replaced; preserved for manual repair".to_string(),
-        );
+    if let Err(detail) = validate_final_tombstone_root(tombstone, &root_fd) {
+        return FinalTombstoneRecovery::Residual(detail);
     }
     let name = CString::new("object").expect("static name contains no NUL");
     let (expected_object_device, expected_object_inode) = match (
@@ -3739,8 +3750,8 @@ where
                                 "final tombstone recovery source contains NUL".to_string(),
                             );
                         };
-                        if tombstone_identity(&tombstone.root).ok() != Some((tombstone.device, tombstone.inode)) {
-                            return FinalTombstoneRecovery::Residual("recorded final tombstone root changed before resumed rename; preserved for manual repair".to_string());
+                        if let Err(detail) = validate_final_tombstone_root(tombstone, &root_fd) {
+                            return FinalTombstoneRecovery::Residual(detail);
                         }
                         // SAFETY: the destination is rooted in the verified descriptor; exclusive rename preserves an existing object.
                         if unsafe { renameat_exclusive(root_fd.as_raw_fd(), source_name.as_ptr(), name.as_ptr()) } < 0 {
@@ -3837,8 +3848,8 @@ where
     if observe_worktree_fingerprint(&object).as_deref() != Some(expected_identity) {
         return FinalTombstoneRecovery::Residual("recorded final tombstone object does not match captured worktree identity; preserved for manual repair".to_string());
     }
-    if tombstone_identity(&tombstone.root).ok() != Some((tombstone.device, tombstone.inode)) {
-        return FinalTombstoneRecovery::Residual("recorded final tombstone root changed during writer inspection; preserved for manual repair".to_string());
+    if let Err(detail) = validate_final_tombstone_root(tombstone, &root_fd) {
+        return FinalTombstoneRecovery::Residual(detail);
     }
     let mut live_object = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: the fixed object name is inspected without following links through the verified root descriptor.
@@ -3865,12 +3876,18 @@ where
     if let Err(detail) = remove_directory_contents_at(&object_fd) {
         return FinalTombstoneRecovery::Residual(detail);
     }
+    if let Err(detail) = validate_final_tombstone_root(tombstone, &root_fd) {
+        return FinalTombstoneRecovery::Residual(detail);
+    }
     // SAFETY: unlinkat is rooted at verified root and targets its fixed object name.
     if unsafe { libc::unlinkat(root_fd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
         return FinalTombstoneRecovery::Residual(format!(
             "cannot remove recorded final tombstone object: {}",
             std::io::Error::last_os_error()
         ));
+    }
+    if let Err(detail) = validate_final_tombstone_root(tombstone, &root_fd) {
+        return FinalTombstoneRecovery::Residual(detail);
     }
     match std::fs::remove_dir(&tombstone.root) {
         Ok(()) => FinalTombstoneRecovery::Completed,
@@ -4318,6 +4335,11 @@ fn linux_cwd_process_inventory(
             inventory.insert(name);
         }
     }
+    if inventory.is_empty() {
+        return Err(LinuxCwdScanError::Indeterminate(
+            "empty process inventory during cwd inspection".to_string(),
+        ));
+    }
     Ok(inventory)
 }
 
@@ -4353,31 +4375,246 @@ fn linux_cwd_task_inventory(process: &Path) -> Result<LinuxCwdTaskInventory, Lin
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxCwdDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_directory_identity(
+    directory: &std::fs::File,
+) -> Result<LinuxCwdDirectoryIdentity, LinuxCwdScanError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = directory.metadata().map_err(|error| {
+        LinuxCwdScanError::Indeterminate(format!("read cwd directory identity: {error}"))
+    })?;
+    Ok(LinuxCwdDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_open_directory(path: &Path) -> Result<std::fs::File, LinuxCwdScanError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| LinuxCwdScanError::from_process_io(path, "open cwd directory", &error))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_mount_identity(directory: &std::fs::File) -> Result<u64, LinuxCwdScanError> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut metadata = std::mem::MaybeUninit::<libc::statx>::uninit();
+    // SAFETY: directory is live, the empty path is NUL-terminated, and metadata is writable.
+    if unsafe {
+        libc::statx(
+            directory.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_MNT_ID,
+            metadata.as_mut_ptr(),
+        )
+    } < 0
+    {
+        return Err(LinuxCwdScanError::Indeterminate(format!(
+            "read cwd mount identity: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: statx initialized metadata on success.
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(LinuxCwdScanError::Indeterminate(
+            "cwd mount identity is unavailable".to_string(),
+        ));
+    }
+    Ok(metadata.stx_mnt_id)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, PartialEq)]
+struct LinuxCwdObservation {
+    path: std::path::PathBuf,
+    ancestry: Vec<LinuxCwdDirectoryIdentity>,
+    mount: u64,
+    evidence: LinuxNamespaceCwdEvidence,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_classify(
+    path: &Path,
+    canonical: &Path,
+    target: LinuxCwdDirectoryIdentity,
+    ancestry: &[LinuxCwdDirectoryIdentity],
+) -> LinuxNamespaceCwdEvidence {
+    if ancestry.contains(&target) || path_is_within(path, canonical) {
+        LinuxNamespaceCwdEvidence::Inside
+    } else {
+        LinuxNamespaceCwdEvidence::Clean
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_observe(
+    cwd: &Path,
+    canonical: &Path,
+    target: LinuxCwdDirectoryIdentity,
+) -> Result<LinuxCwdObservation, LinuxCwdScanError> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let path = std::fs::read_link(cwd)
+        .map_err(|error| LinuxCwdScanError::from_process_io(cwd, "read task cwd", &error))?;
+    if !path.is_absolute() {
+        return Err(LinuxCwdScanError::Indeterminate(format!(
+            "task cwd is not absolute for {}",
+            cwd.display()
+        )));
+    }
+    let mut directory = linux_cwd_open_directory(cwd)?;
+    let identity = linux_cwd_directory_identity(&directory)?;
+    let mount = linux_cwd_mount_identity(&directory)?;
+    let target_mount = linux_cwd_mount_identity(&linux_cwd_open_directory(canonical)?)?;
+    let mut ancestry = vec![identity];
+    loop {
+        // SAFETY: directory is an owned directory descriptor and the literal is NUL-terminated.
+        let parent = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c"..".as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if parent < 0 {
+            return Err(LinuxCwdScanError::from_process_io(
+                cwd,
+                "open cwd ancestor",
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: openat returned a new descriptor owned by this call.
+        let parent = unsafe { std::fs::File::from_raw_fd(parent) };
+        let parent_identity = linux_cwd_directory_identity(&parent)?;
+        if ancestry.last() == Some(&parent_identity) {
+            break;
+        }
+        if ancestry.contains(&parent_identity) || ancestry.len() >= 4096 {
+            return Err(LinuxCwdScanError::Indeterminate(
+                "cwd ancestry did not reach a stable root".to_string(),
+            ));
+        }
+        ancestry.push(parent_identity);
+        directory = parent;
+    }
+    if std::fs::read_link(cwd)
+        .map_err(|error| LinuxCwdScanError::from_process_io(cwd, "re-read task cwd path", &error))?
+        != path
+    {
+        return Err(LinuxCwdScanError::Indeterminate(format!(
+            "task cwd changed while reading {}",
+            cwd.display()
+        )));
+    }
+    let after = linux_cwd_open_directory(cwd)?;
+    if linux_cwd_directory_identity(&after)? != identity
+        || linux_cwd_mount_identity(&after)? != mount
+    {
+        return Err(LinuxCwdScanError::Indeterminate(format!(
+            "task cwd changed while reading {}",
+            cwd.display()
+        )));
+    }
+    let evidence = linux_cwd_classify(&path, canonical, target, &ancestry);
+    if evidence == LinuxNamespaceCwdEvidence::Clean && mount != target_mount {
+        return Err(LinuxCwdScanError::Indeterminate(
+            "cwd is on another mount; a bind-mounted descendant cannot be excluded".to_string(),
+        ));
+    }
+    Ok(LinuxCwdObservation {
+        path,
+        ancestry,
+        mount,
+        evidence,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LinuxCwdTaskSnapshot {
+    inventory: LinuxCwdTaskInventory,
+    cwds: std::collections::BTreeMap<std::ffi::OsString, LinuxCwdObservation>,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cwd_revalidate_tasks(
+    process: &Path,
+    canonical: &Path,
+    target: LinuxCwdDirectoryIdentity,
+    before: &LinuxCwdTaskSnapshot,
+) -> Result<(), LinuxCwdScanError> {
+    if linux_cwd_task_inventory(process)? != before.inventory {
+        return Err(LinuxCwdScanError::Indeterminate(format!(
+            "task inventory changed for {}",
+            process.display()
+        )));
+    }
+    for (task, observation) in &before.cwds {
+        if linux_cwd_observe(
+            &process.join("task").join(task).join("cwd"),
+            canonical,
+            target,
+        )? != *observation
+        {
+            return Err(LinuxCwdScanError::Indeterminate(format!(
+                "task cwd changed for {}",
+                process.join("task").join(task).display()
+            )));
+        }
+    }
+    if linux_cwd_task_inventory(process)? != before.inventory {
+        return Err(LinuxCwdScanError::Indeterminate(format!(
+            "task inventory changed for {}",
+            process.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn linux_cwd_process_tasks(
     process: &Path,
     canonical: &Path,
+    target: LinuxCwdDirectoryIdentity,
     after_task_reads: &mut impl FnMut(&Path),
-) -> Result<(LinuxNamespaceCwdEvidence, LinuxCwdTaskInventory), LinuxCwdScanError> {
+) -> Result<(LinuxNamespaceCwdEvidence, LinuxCwdTaskSnapshot), LinuxCwdScanError> {
     let scan = (|| {
-        let before = linux_cwd_task_inventory(process)?;
-        for task in before.keys() {
-            let cwd = std::fs::read_link(process.join("task").join(task).join("cwd")).map_err(
-                |error| LinuxCwdScanError::from_process_io(process, "read task cwd", &error),
+        let mut before = LinuxCwdTaskSnapshot {
+            inventory: linux_cwd_task_inventory(process)?,
+            cwds: std::collections::BTreeMap::new(),
+        };
+        for task in before.inventory.keys() {
+            let observation = linux_cwd_observe(
+                &process.join("task").join(task).join("cwd"),
+                canonical,
+                target,
             )?;
-            if path_is_within(&cwd, canonical) {
+            if observation.evidence == LinuxNamespaceCwdEvidence::Inside {
                 return Ok((LinuxNamespaceCwdEvidence::Inside, before));
             }
+            before.cwds.insert(task.clone(), observation);
         }
         Ok((LinuxNamespaceCwdEvidence::Clean, before))
     })();
     after_task_reads(process);
     let (evidence, before) = scan?;
-    if evidence == LinuxNamespaceCwdEvidence::Clean && linux_cwd_task_inventory(process)? != before
-    {
-        return Err(LinuxCwdScanError::Indeterminate(format!(
-            "task inventory changed for {}",
-            process.display()
-        )));
+    if evidence == LinuxNamespaceCwdEvidence::Clean {
+        linux_cwd_revalidate_tasks(process, canonical, target, &before)?;
     }
     Ok((evidence, before))
 }
@@ -4386,8 +4623,20 @@ fn linux_cwd_process_tasks(
 fn linux_namespace_cwd_scan(
     canonical: &Path,
     proc_root: &Path,
-    mut after_task_reads: impl FnMut(&Path),
+    after_task_reads: impl FnMut(&Path),
 ) -> Result<LinuxNamespaceCwdEvidence, LinuxCwdScanError> {
+    linux_namespace_cwd_scan_with_hooks(canonical, proc_root, after_task_reads, || {})
+}
+
+#[cfg(target_os = "linux")]
+fn linux_namespace_cwd_scan_with_hooks(
+    canonical: &Path,
+    proc_root: &Path,
+    mut after_task_reads: impl FnMut(&Path),
+    mut after_final_pid_inventory: impl FnMut(),
+) -> Result<LinuxNamespaceCwdEvidence, LinuxCwdScanError> {
+    let target_directory = linux_cwd_open_directory(canonical)?;
+    let target = linux_cwd_directory_identity(&target_directory)?;
     let before = linux_cwd_process_inventory(proc_root)?;
     let mut incarnations = std::collections::BTreeMap::new();
     for name in &before {
@@ -4399,7 +4648,7 @@ fn linux_namespace_cwd_scan(
     let mut task_inventories = std::collections::BTreeMap::new();
     for (name, before_incarnation) in &incarnations {
         let process = proc_root.join(name);
-        let scan = linux_cwd_process_tasks(&process, canonical, &mut after_task_reads);
+        let scan = linux_cwd_process_tasks(&process, canonical, target, &mut after_task_reads);
         if matches!(scan, Ok((LinuxNamespaceCwdEvidence::Inside, _))) {
             return Ok(LinuxNamespaceCwdEvidence::Inside);
         }
@@ -4425,16 +4674,33 @@ fn linux_namespace_cwd_scan(
                 process.display()
             )));
         }
-        if linux_cwd_task_inventory(&process)? != task_inventories[name] {
-            return Err(LinuxCwdScanError::Indeterminate(format!(
-                "task inventory changed for {}",
-                process.display()
-            )));
-        }
+        linux_cwd_revalidate_tasks(&process, canonical, target, &task_inventories[name])?;
     }
     if linux_cwd_process_inventory(proc_root)? != before {
         return Err(LinuxCwdScanError::Indeterminate(
             "process inventory changed during cwd revalidation".to_string(),
+        ));
+    }
+    after_final_pid_inventory();
+    for (name, before_incarnation) in &incarnations {
+        let process = proc_root.join(name);
+        if linux_cwd_process_incarnation(&process)? != *before_incarnation {
+            return Err(LinuxCwdScanError::Indeterminate(format!(
+                "process incarnation changed for {}",
+                process.display()
+            )));
+        }
+        linux_cwd_revalidate_tasks(&process, canonical, target, &task_inventories[name])?;
+        if linux_cwd_process_incarnation(&process)? != *before_incarnation {
+            return Err(LinuxCwdScanError::Indeterminate(format!(
+                "process incarnation changed for {}",
+                process.display()
+            )));
+        }
+    }
+    if linux_cwd_directory_identity(&linux_cwd_open_directory(canonical)?)? != target {
+        return Err(LinuxCwdScanError::Indeterminate(
+            "target directory identity changed during cwd inspection".to_string(),
         ));
     }
     Ok(LinuxNamespaceCwdEvidence::Clean)
@@ -6665,6 +6931,130 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn recorded_final_tombstone_root_chmod_preserves_source_and_object() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        for object_bound in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target");
+            initialize_repository(&target);
+            std::fs::write(target.join("marker"), "preserve\n").unwrap();
+            let identity = inspection_identity(&target);
+            let root = temp.path().join("private-tombstone");
+            super::reserve_private_tombstone(&root, "test directory").unwrap();
+            let metadata = std::fs::symlink_metadata(&root).unwrap();
+            assert_eq!(metadata.mode() & 0o077, 0);
+            let object = root.join("object");
+            let object_identity = if object_bound {
+                std::fs::rename(&target, &object).unwrap();
+                let metadata = std::fs::symlink_metadata(&object).unwrap();
+                Some((metadata.dev(), metadata.ino()))
+            } else {
+                None
+            };
+            let recorded = CloseWorktreeFinalTombstone {
+                root,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                object_device: object_identity.map(|(device, _)| device),
+                object_inode: object_identity.map(|(_, inode)| inode),
+            };
+            std::fs::set_permissions(&recorded.root, std::fs::Permissions::from_mode(0o770))
+                .unwrap();
+            assert_eq!(
+                super::tombstone_identity(&recorded.root).unwrap(),
+                (recorded.device, recorded.inode)
+            );
+            let recovery = super::resume_final_worktree_tombstone_with_writer_inspection(
+                &recorded,
+                &identity,
+                |_, _| panic!("untrusted root must not bind an object"),
+                |_| panic!("untrusted root must not inspect its source or object"),
+            );
+            assert!(matches!(
+                recovery,
+                FinalTombstoneRecovery::Residual(detail) if detail.contains("owner-only")
+            ));
+            let preserved = if object_bound { &object } else { &target };
+            assert_eq!(
+                std::fs::read_to_string(preserved.join("marker")).unwrap(),
+                "preserve\n"
+            );
+            assert_eq!(target.exists(), !object_bound);
+            assert_eq!(object.exists(), object_bound);
+            assert_eq!(
+                super::tombstone_identity(&recorded.root).unwrap(),
+                (recorded.device, recorded.inode)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_final_tombstone_root_chmod_during_writer_inspection_blocks_mutation() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        for object_bound in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target");
+            initialize_repository(&target);
+            std::fs::write(target.join("marker"), "preserve\n").unwrap();
+            let identity = inspection_identity(&target);
+            let root = temp.path().join("private-tombstone");
+            super::reserve_private_tombstone(&root, "test directory").unwrap();
+            let metadata = std::fs::symlink_metadata(&root).unwrap();
+            let object = root.join("object");
+            let object_identity = if object_bound {
+                std::fs::rename(&target, &object).unwrap();
+                let metadata = std::fs::symlink_metadata(&object).unwrap();
+                Some((metadata.dev(), metadata.ino()))
+            } else {
+                None
+            };
+            let recorded = CloseWorktreeFinalTombstone {
+                root,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                object_device: object_identity.map(|(device, _)| device),
+                object_inode: object_identity.map(|(_, inode)| inode),
+            };
+            let mut inspected = false;
+            let recovery = super::resume_final_worktree_tombstone_with_writer_inspection(
+                &recorded,
+                &identity,
+                |_, _| panic!("chmod before rename must not bind an object"),
+                |path| {
+                    assert_eq!(path, if object_bound { &object } else { &target });
+                    std::fs::set_permissions(
+                        &recorded.root,
+                        std::fs::Permissions::from_mode(0o707),
+                    )
+                    .unwrap();
+                    inspected = true;
+                    Ok(false)
+                },
+            );
+            assert!(inspected);
+            assert!(matches!(
+                recovery,
+                FinalTombstoneRecovery::Residual(detail) if detail.contains("owner-only")
+            ));
+            let preserved = if object_bound { &object } else { &target };
+            assert_eq!(
+                std::fs::read_to_string(preserved.join("marker")).unwrap(),
+                "preserve\n"
+            );
+            assert_eq!(target.exists(), !object_bound);
+            assert_eq!(object.exists(), object_bound);
+            assert_eq!(
+                super::tombstone_identity(&recorded.root).unwrap(),
+                (recorded.device, recorded.inode)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recorded_final_tombstone_root_only_resumes_pre_rename() {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -6673,7 +7063,7 @@ mod tests {
         initialize_repository(&target);
         let identity = inspection_identity(&target);
         let root = temp.path().join("private-tombstone");
-        std::fs::create_dir(&root).unwrap();
+        super::reserve_private_tombstone(&root, "test directory").unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
         let recorded = CloseWorktreeFinalTombstone {
             root,
@@ -6710,7 +7100,7 @@ mod tests {
         std::fs::rename(&target, &quarantine).unwrap();
         let source = std::fs::symlink_metadata(&quarantine).unwrap();
         let root = temp.path().join("private-tombstone");
-        std::fs::create_dir(&root).unwrap();
+        super::reserve_private_tombstone(&root, "test directory").unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
         let recorded = CloseWorktreeFinalTombstone {
             root,
@@ -6757,7 +7147,7 @@ mod tests {
         std::fs::write(target.join("marker"), "preserve\n").unwrap();
         let identity = inspection_identity(&target);
         let root = temp.path().join("private-tombstone");
-        std::fs::create_dir(&root).unwrap();
+        super::reserve_private_tombstone(&root, "test directory").unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
         let object = root.join("object");
         std::fs::rename(&target, &object).unwrap();
@@ -6797,7 +7187,7 @@ mod tests {
         initialize_repository(&target);
         let identity = inspection_identity(&target);
         let root = temp.path().join("private-tombstone");
-        std::fs::create_dir(&root).unwrap();
+        super::reserve_private_tombstone(&root, "test directory").unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
         let recorded = CloseWorktreeFinalTombstone {
             root,
@@ -7868,6 +8258,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn cwd_fixture_task(process: &Path, tid: &str, cwd: &Path) {
+        std::fs::create_dir_all(cwd).unwrap();
         let task = process.join("task").join(tid);
         std::fs::create_dir_all(&task).unwrap();
         cwd_fixture_stat(&task, 42);
@@ -7927,6 +8318,112 @@ mod tests {
             super::linux_namespace_cwd_scan(&quarantine, &proc_root, |_| {}).unwrap(),
             super::LinuxNamespaceCwdEvidence::Clean,
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_empty_process_inventory() {
+        let (_temp, quarantine, proc_root, process) = cwd_fixture();
+        std::fs::remove_dir_all(process).unwrap();
+        let error = super::linux_namespace_cwd_scan(&quarantine, &proc_root, |_| {}).unwrap_err();
+        assert!(error.to_string().contains("empty process inventory"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_rejects_stable_task_changing_cwd_after_read() {
+        for inside in [true, false] {
+            let (temp, quarantine, proc_root, _process) = cwd_fixture();
+            let destination = if inside {
+                quarantine.clone()
+            } else {
+                temp.path().join("outside")
+            };
+            std::fs::create_dir_all(&destination).unwrap();
+            let error = super::linux_namespace_cwd_scan(&quarantine, &proc_root, |process| {
+                let cwd = process.join("task/123/cwd");
+                std::fs::remove_file(&cwd).unwrap();
+                std::os::unix::fs::symlink(&destination, cwd).unwrap();
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("task cwd changed"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_classifies_bind_alias_by_synthetic_object_identity() {
+        let target = super::LinuxCwdDirectoryIdentity {
+            device: 7,
+            inode: 11,
+        };
+        let child = super::LinuxCwdDirectoryIdentity {
+            device: 7,
+            inode: 12,
+        };
+        let unrelated = super::LinuxCwdDirectoryIdentity {
+            device: 8,
+            inode: 11,
+        };
+        for ancestry in [vec![target], vec![child, target]] {
+            assert_eq!(
+                super::linux_cwd_classify(
+                    Path::new("/alias/nested"),
+                    Path::new("/quarantine"),
+                    target,
+                    &ancestry,
+                ),
+                super::LinuxNamespaceCwdEvidence::Inside
+            );
+        }
+        assert_eq!(
+            super::linux_cwd_classify(
+                Path::new("/outside"),
+                Path::new("/quarantine"),
+                target,
+                &[unrelated],
+            ),
+            super::LinuxNamespaceCwdEvidence::Clean
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_revalidates_after_final_pid_inventory() {
+        for change in ["pid", "tid", "task-set", "cwd"] {
+            let (temp, quarantine, proc_root, process) = cwd_fixture();
+            let error = super::linux_namespace_cwd_scan_with_hooks(
+                &quarantine,
+                &proc_root,
+                |_| {},
+                || match change {
+                    "pid" => {
+                        std::fs::rename(&process, proc_root.join("retired-process")).unwrap();
+                        cwd_fixture_task(&process, "123", temp.path());
+                        cwd_fixture_stat(&process, 42);
+                    }
+                    "tid" => {
+                        let task = process.join("task/123");
+                        std::fs::rename(&task, process.join("retired-task")).unwrap();
+                        cwd_fixture_task(&process, "123", temp.path());
+                    }
+                    "task-set" => cwd_fixture_task(&process, "124", &quarantine),
+                    "cwd" => {
+                        let cwd = process.join("task/123/cwd");
+                        std::fs::remove_file(&cwd).unwrap();
+                        std::os::unix::fs::symlink(&quarantine, cwd).unwrap();
+                    }
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap_err();
+            let expected = match change {
+                "pid" => "process incarnation changed",
+                "tid" | "task-set" => "task inventory changed",
+                _ => "task cwd changed",
+            };
+            assert!(error.to_string().contains(expected), "{change}: {error}");
+        }
     }
 
     #[cfg(target_os = "linux")]

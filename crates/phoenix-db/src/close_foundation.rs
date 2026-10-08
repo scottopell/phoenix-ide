@@ -3141,7 +3141,7 @@ impl Database {
                          AND residual.identity_value=target.captured_worktree_identity
                          AND residual.proof_kind='residual'
                          AND residual.residual_reason='manual_repair_required'
-                         AND residual.detail = 'cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed'
+                         AND residual.detail = 'Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed'
                    )
              )
              AND NOT EXISTS (
@@ -11103,10 +11103,20 @@ mod tests {
             scope: residual_scope,
             residual: residual.clone(),
             reason: RetirementFailureReason::ManualRepairRequired,
-            detail: if residual_shape == "unrelated generic 787" {
-                "unrelated persistence: (code: 787) FOREIGN KEY constraint failed"
-            } else {
-                "cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed"
+            detail: match residual_shape {
+                "prefixed diagnostic" => {
+                    "prefix: Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed"
+                }
+                "suffixed diagnostic" => {
+                    "Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed suffix"
+                }
+                "unrelated generic 787" => "(code: 787) FOREIGN KEY constraint failed",
+                "cleanup-plan prefix" => {
+                    "cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed"
+                }
+                _ => {
+                    "Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed"
+                }
             }
             .to_string(),
         })
@@ -11118,7 +11128,7 @@ mod tests {
                 scope: scope.clone(),
                 residual,
                 reason: RetirementFailureReason::ManualRepairRequired,
-                detail: "cleanup-plan persistence: (code: 787) FOREIGN KEY constraint failed"
+                detail: "Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed"
                     .to_string(),
             })
             .await
@@ -11251,20 +11261,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_fk787_resume_rejects_unrelated_generic_787() {
-        let (db, attempt, _, _) = legacy_fk787_fixture("unrelated generic 787").await;
-        let before = db.get_close_obligation(attempt.as_str()).await.unwrap();
-        let rows = legacy_fk787_retained_rows(&db).await;
-        assert!(db
-            .resume_legacy_fk787_close_retirement_generation(&attempt)
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            db.get_close_obligation(attempt.as_str()).await.unwrap(),
-            before
-        );
-        assert_eq!(legacy_fk787_retained_rows(&db).await, rows);
+    async fn legacy_fk787_resume_rejects_near_miss_diagnostics() {
+        for shape in [
+            "prefixed diagnostic",
+            "suffixed diagnostic",
+            "unrelated generic 787",
+            "cleanup-plan prefix",
+        ] {
+            let (db, attempt, _, _) = legacy_fk787_fixture(shape).await;
+            let before = db.get_close_obligation(attempt.as_str()).await.unwrap();
+            let rows = legacy_fk787_retained_rows(&db).await;
+            assert!(
+                db.resume_legacy_fk787_close_retirement_generation(&attempt)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{shape}"
+            );
+            assert_eq!(
+                db.get_close_obligation(attempt.as_str()).await.unwrap(),
+                before,
+                "{shape}"
+            );
+            assert_eq!(legacy_fk787_retained_rows(&db).await, rows, "{shape}");
+        }
     }
 
     #[tokio::test]

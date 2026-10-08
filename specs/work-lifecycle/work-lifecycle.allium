@@ -943,11 +943,13 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       count, and exactly one sealed active-pair inventory per captured scope.
 --       Active-pair residual count equals worktree scope count; each is the exact
 --       captured worktree resource (kind and identity kind worktree, worktree_id_v1
---       codec, captured value), manual_repair_required reason, and detail containing
---       '(code: 787) FOREIGN KEY constraint failed'. No active-pair dispatch or plan
---       exists. Each worktree scope has an exact plan plus matching dispatch in a
---       different pair of the same attempt. Every conjunct is required; arbitrary
---       manual repair or SQLite errors do not satisfy it. This predicate is false
+--       codec, captured value), manual_repair_required reason, and detail equal to
+--       'Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed'.
+--       Prefixes, suffixes, generic FK-787 and cleanup-plan-prefixed messages do not
+--       match. No active-pair dispatch or plan exists. Each worktree scope has an
+--       exact plan plus matching dispatch in a different pair of the same attempt.
+--       Every conjunct is required; arbitrary manual repair or SQLite errors do
+--       not satisfy it. This predicate is false
 --       in needs_repair, including startup before an explicit retry.
 --   retained_close_evidence_unchanged(product_conversation, attempt_id) -> Boolean
 --       All retained row payloads, bindings and generation/fingerprint pairs are

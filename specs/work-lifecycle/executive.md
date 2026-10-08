@@ -10,7 +10,7 @@ The work lifecycle spec now describes the intended user-facing **Close conversat
 
 PR #865 adds exact same-attempt dispatch/cleanup-plan adoption, the supported FK-787 partial-generation recognizer, Linux all-process/all-task cwd inspection, and writer-safe final-tombstone recovery. These are candidate changes, not a claim that the full retirement implementation or retained production cleanup has shipped. Migration 118 preserves existing Close rows and installs lineage constraints without performing retry, adoption backfill, or filesystem deletion. No production retry, database surgery, quarantine deletion, deployment, or release is authorized by these artifacts.
 
-`NeedsRepair` requires explicit retry; startup recovery remains permitted for an attempt already in `RetirementRequested`. The corresponding bedrock `CloseNeedsRepairRetriesThroughReinspection` guidance still describes startup as a repair retry and requires integration alignment outside this bounded specification edit. Existing broad lifecycle status below is retained rather than requalified by this candidate.
+`NeedsRepair` requires explicit retry; startup recovery remains permitted for an attempt already in `RetirementRequested`. Bedrock's retry guidance preserves that boundary, and aggregate completion requires `RetirementRequested`, not `NeedsRepair`. The retained-row recognizer requires the complete diagnostic `Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed` together with every REQ-WL-005 row-shape condition. Existing broad lifecycle status below is retained rather than requalified by this candidate.
 
 ### Broader lifecycle status
 
@@ -46,10 +46,10 @@ Current normative authority is `requirements.md`, `work-lifecycle.allium`, `spec
 | REQ-WL-002 | Partially implemented | Legacy flows already inspect/capture worktree state for cleanup paths, but the exact Close loss-inventory contract is not the shipped user flow |
 | REQ-WL-002a | Not implemented | No shipped fingerprint-bound discard confirmation for the unified Close obligation |
 | REQ-WL-002b | Partially implemented | Durable Close retirement idempotently retires attached WorkScope resources and completes with one outcome plus aggregate History; legacy entry and cleanup edges remain |
-| REQ-WL-002c | Candidate; cross-spec alignment pending | Explicit retry contract and retirement-only dispatch guards are specified; bedrock startup guidance must be aligned; runtime restart/no-delete qualification belongs to PR #865 |
+| REQ-WL-002c | Candidate; successor qualification pending | Bedrock and Work lifecycle require explicit retry and retirement-only completion; hosted predecessor evidence below does not qualify successor runtime guards |
 | REQ-WL-002d | Existing contract; not requalified here | Sealed tmux socket/token authority remains outside the bounded adoption delta |
 | REQ-WL-004 | Candidate; not qualified by this spec edit | `Database::adopt_close_worktree_cleanup_plan`; atomic rollback, repeated lineage adoption and completed-History hard-delete regressions required |
-| REQ-WL-005 | Candidate; not qualified by this spec edit | `Database::resume_legacy_fk787_close_retirement_generation`; exact and near-miss row-shape, preservation, rollback and live replacement regressions required |
+| REQ-WL-005 | Candidate; exact-diagnostic successor unqualified | `Database::resume_legacy_fk787_close_retirement_generation`; runtime-independent DB fixture uses the complete retained diagnostic; prefix/suffix/generic/cleanup-plan near misses assert no retained-row or obligation changes; new Rust regressions have not been executed here |
 | REQ-WL-006 | Candidate; Linux execution not performed here | `linux_namespace_cwd_scan`; non-leader/cross-UID tasks, unreadability, inventory churn, PID/TID reuse and exec identity regressions required |
 | REQ-WL-007 | Candidate; not qualified by this spec edit | `resume_final_worktree_tombstone_with_writer_inspection`; persisted writer, indeterminate scan, replacement, pre-rename and unbound-object crash regressions required |
 | REQ-WL-008 | Candidate; not qualified by this spec edit | `MIGRATION_118`; preservation and relational immutability constraints require migration regression execution |
@@ -67,9 +67,13 @@ The following legacy surfaces are still current reality and must remain called o
 
 ## Validation Notes
 
+### Hosted predecessor evidence
+
+[Hosted CI run 37726503390](https://github.com/scottopell/phoenix-ide/actions/runs/37726503390) completed successfully for exact head `2aa9052a4975138bdabac7d520ceeb9420720756`: the e2e, clippy, ui/specs, rust, and task-validation check jobs were green. This is predecessor evidence only. It does not qualify the successor exact retained-diagnostic recognizer/fixture correction, completion transition alignment, or successor runtime safety changes. Green CI is not independent review, release, deployment, or production cleanup authority.
+
 ### Bounded candidate specification validation
 
-The specification pass reads `specs/AUTHORING.md`, the roadmap and PR scope, and the candidate symbols named above. It performs Allium and lightweight artifact-shape validation only; no Rust/UI build, code tests, production operation or git action is part of this pass. Baseline single-file Allium checking reports no error diagnostics but returns nonzero for structural warnings, including import paths outside its check set. The candidate specification is reviewed against the exact SQL recognizer and full adoption payload rather than using a generic FK-error recovery claim.
+The specification pass reads `specs/AUTHORING.md`, the roadmap and PR scope, and the candidate symbols named above. Validation is limited to Allium and lightweight checks; no Rust/UI build, Rust test execution, production operation or git action is part of this pass. Single-file Allium checking reports zero errors for Work lifecycle (3 warnings) and Bedrock (13 warnings), returning nonzero for structural warnings including imports outside the check set. The pure `dev.py` spEARS v2 shape validator reports zero errors. A lightweight SQLite smoke check executes the extracted recognizer query against an independent in-memory row fixture: the complete diagnostic matches, while prefix, suffix, generic FK-787 and cleanup-plan-prefixed values do not. Cross-artifact checks confirm exact diagnostic alignment and retirement-only Bedrock completion. This pass changes the recognizer's exact diagnostic and focused DB fixtures; those Rust regressions remain unexecuted pending successor hosted qualification.
 
 Focused code regressions found in the candidate include `retry_generation_atomically_adopts_prior_dispatch_and_cleanup_plan`, `repeated_retry_adopts_newest_cleanup_plan_lineage_idempotently`, the `legacy_fk787_resume_*` tests, `migration_118_preserves_plans_and_enforces_exact_immutable_adoption`, `persisted_tombstone_writer_or_indeterminate_scan_blocks_deletion`, and the `cwd_scan_*` inventory/identity tests. Naming these is coverage inventory, not a claim that they were run by this specification pass.
 

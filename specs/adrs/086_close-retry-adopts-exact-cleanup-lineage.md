@@ -8,7 +8,7 @@
 
 PR #865 extracts a bounded Close repair from the unmerged broader retirement work. The retained foreign-key failure leaves one attempt with a newer sealed inventory and exact worktree residuals but cleanup dispatch/plan authority in an older inspection pair. A retry must not invent a new attempt or treat a path as ownership. Copying only a dispatch can fail its plan's exact-generation foreign key; copying only a plan leaves destructive dispatch unproven.
 
-The incident's retained inspection phase is distinguishable from arbitrary repair by its exact row shape and SQLite error discriminator. Startup retry of every `NeedsRepair` attempt would also bypass the explicitly coordinated sole-executor cleanup: external repair becoming possible is not permission to delete.
+The incident's retained inspection phase is distinguishable from arbitrary repair by its exact row shape and complete retained diagnostic value. Startup retry of every `NeedsRepair` attempt would also bypass the explicitly coordinated sole-executor cleanup: external repair becoming possible is not permission to delete.
 
 ## Options considered
 
@@ -20,7 +20,7 @@ The incident's retained inspection phase is distinguishable from arbitrary repai
 
 Choose option 3. Require explicit `CloseRetirementRetryRequested` to leave `NeedsRepair`. An interrupted attempt already in `RetirementRequested` may recover at startup, but still reacquires scope leases and checks live identity and writer safety.
 
-Support only the partial-generation conjunction in REQ-WL-005: retained pair in `awaiting_retirement_inspection`, captured worktree scopes with the exact inspection/residual counts, sealed active inventories for every scope, exact `worktree_id_v1` residuals with `manual_repair_required` and `(code: 787) FOREIGN KEY constraint failed`, no active-pair dispatch or plan, and exact prior-pair dispatch/plan authority for every captured worktree. Recognition changes only the phase, in one transaction. It does not rewrite observations or itself permit removal.
+Support only the partial-generation conjunction in REQ-WL-005: retained pair in `awaiting_retirement_inspection`, captured worktree scopes with the exact inspection/residual counts, sealed active inventories for every scope, exact `worktree_id_v1` residuals with `manual_repair_required` and detail equal to the complete retained diagnostic `Database error: error returned from database: (code: 787) FOREIGN KEY constraint failed`, no active-pair dispatch or plan, and exact prior-pair dispatch/plan authority for every captured worktree. Diagnostic equality is exact: prefixed, suffixed, generic FK-787, and cleanup-plan-prefixed messages are not compatible values. Recognition changes only the phase, in one transaction. It does not rewrite observations or itself permit removal.
 
 Adoption uses the exact attempt/scope/pair/resource identity and fresh administrative locator/incarnation. Select the newest eligible unconsumed source by inventory capture time then plan row order. Commit target dispatch, full target plan and source-to-target lineage atomically. Identical replay revalidates and returns existing authority; conflict rolls every write back. Each source has at most one outgoing edge and each target one incoming edge. Lineage and adopted-source payloads are immutable during repair/retry. Completed aggregate hard deletion is a separate authority, allowed to erase dependencies only after all transcript members are removed.
 

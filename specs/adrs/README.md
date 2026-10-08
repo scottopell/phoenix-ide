@@ -100,7 +100,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [084](084_tool-policy-is-independent-of-provider-history.md) | Tool policy is independent of provider history | Accepted | REQ-LLM-004i, REQ-LLM-005; provider continuation |
 | [085](085_codex-continuation-requires-an-identified-account.md) | Codex continuation requires an identified account | Accepted | REQ-LLM-004h, REQ-LLM-004i; account-bound route admission |
 | [086](086_mcp-credential-removal-has-durable-intent.md) | MCP credential removal has durable intent | Accepted | REQ-MCP-012; credential-removal recovery |
-| [086](086_close-retry-adopts-exact-cleanup-lineage.md) | Close retry adopts exact cleanup lineage without automatic repair dispatch | Accepted | REQ-WL-002c/004/005/008, REQ-COMP-001/002; cleanup dispatch, plan and adoption lineage |
+| [086](086_close-retry-adopts-exact-cleanup-lineage.md) | Close retry adopts exact cleanup lineage without automatic repair dispatch | Accepted | REQ-WL-002c/004/005/008, REQ-COMP-001/002; exact retained FK-787 diagnostic conjunction, cleanup dispatch, plan and adoption lineage |
 | [087](087_close-tombstone-recovery-reinspects-all-linux-tasks.md) | Close tombstone recovery reinspects writers across all Linux tasks | Accepted | REQ-WL-002b/002c/006/007; tombstone recovery and Linux cwd inventory |
 
 ## For agents: which decisions bind your task
