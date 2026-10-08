@@ -1097,6 +1097,7 @@ impl RuntimeManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn validate_close_worktrees_before_runtime_retirement(
         &self,
         attempt_id: &CloseAttemptId,
@@ -5203,6 +5204,7 @@ fn linux_writer_classify_object(
     target: LinuxCwdMountedIdentity,
 ) -> Result<bool, String> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
 
     if object.directory == target.directory {
         return Ok(true);
@@ -5222,7 +5224,6 @@ fn linux_writer_classify_object(
             "indeterminate Linux writer inspection: referenced object has no parent".to_string()
         })?;
         let directory = linux_cwd_open_directory(parent).map_err(|error| error.to_string())?;
-        use std::os::unix::ffi::OsStrExt as _;
         let name = namespace_path.file_name().ok_or_else(|| {
             "indeterminate Linux writer inspection: referenced object has no name".to_string()
         })?;
@@ -8087,10 +8088,10 @@ mod tests {
                 "nonempty" => std::fs::write(root.join("marker"), "preserve\n").unwrap(),
                 "captured" => std::fs::create_dir(&target).unwrap(),
                 "quarantine" => {
-                    std::fs::create_dir(worktree_quarantine_path(&identity).unwrap()).unwrap()
+                    std::fs::create_dir(worktree_quarantine_path(&identity).unwrap()).unwrap();
                 }
                 "dangling-captured" => {
-                    std::os::unix::fs::symlink(temp.path().join("missing"), &target).unwrap()
+                    std::os::unix::fs::symlink(temp.path().join("missing"), &target).unwrap();
                 }
                 "dangling-quarantine" => std::os::unix::fs::symlink(
                     temp.path().join("missing"),
@@ -8098,7 +8099,8 @@ mod tests {
                 )
                 .unwrap(),
                 "public-root" => {
-                    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap()
+                    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770))
+                        .unwrap();
                 }
                 "replaced-root" => {
                     std::fs::rename(&root, temp.path().join("displaced-root")).unwrap();
@@ -9433,7 +9435,7 @@ mod tests {
                             "descriptor" => std::fs::remove_file(path).unwrap(),
                             "process" => std::fs::remove_dir_all(&process).unwrap(),
                             "fd-directory" => {
-                                std::fs::remove_dir_all(process.join("task/1273/fd")).unwrap()
+                                std::fs::remove_dir_all(process.join("task/1273/fd")).unwrap();
                             }
                             _ => {}
                         }
