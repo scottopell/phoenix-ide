@@ -4049,6 +4049,7 @@ impl ExternalWriterEvidence {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
     Ok(quarantine_has_open_descriptors(path)?.found()
         || quarantine_has_process_cwd(path)?
@@ -4207,6 +4208,7 @@ fn quarantine_has_writable_mappings(_path: &Path) -> Result<bool, String> {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(test, allow(dead_code))]
 fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     quarantine_has_process_cwd_in(path, Path::new("/proc"))
 }
@@ -5008,6 +5010,7 @@ fn linux_descriptor_failure_is_vanished(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(test, allow(dead_code))]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
     quarantine_has_open_descriptors_in(path, Path::new("/proc"))
 }
@@ -9733,7 +9736,7 @@ mod tests {
             },
             move |path| {
                 super::quarantine_has_open_descriptors_in(path, proc_inventory.path())
-                    .map(|evidence| evidence.found())
+                    .map(ExternalWriterEvidence::found)
             },
         )
         .await
