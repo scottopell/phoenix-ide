@@ -100,6 +100,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [084](084_tool-policy-is-independent-of-provider-history.md) | Tool policy is independent of provider history | Accepted | REQ-LLM-004i, REQ-LLM-005; provider continuation |
 | [085](085_codex-continuation-requires-an-identified-account.md) | Codex continuation requires an identified account | Accepted | REQ-LLM-004h, REQ-LLM-004i; account-bound route admission |
 | [086](086_mcp-credential-removal-has-durable-intent.md) | MCP credential removal has durable intent | Accepted | REQ-MCP-012; credential-removal recovery |
+| [087](087_tmux-effects-go-through-a-backend-seam.md) | Tmux effects go through a backend seam, and tests use an in-memory fake | Accepted | tmux registry and `tmux_run`; Close retirement of tmux servers |
 
 ## For agents: which decisions bind your task
 

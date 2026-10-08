@@ -40,36 +40,20 @@ pub enum ProbeResult {
 /// fails (spawn/IO error). A non-zero exit from `tmux ls` returns a typed
 /// non-live probe result, not an I/O error.
 pub async fn probe(socket_path: &Path) -> std::io::Result<ProbeResult> {
-    probe_with_binary(socket_path, Path::new("tmux")).await
+    probe_inner(socket_path, None)
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "tmux probe timed out"))
 }
 
 pub(crate) async fn probe_until(
     socket_path: &Path,
     expires: Instant,
 ) -> std::io::Result<Option<ProbeResult>> {
-    probe_with_binary_until(socket_path, Path::new("tmux"), expires).await
+    probe_inner(socket_path, Some(expires)).await
 }
 
-pub(crate) async fn probe_with_binary(
+async fn probe_inner(
     socket_path: &Path,
-    binary: &Path,
-) -> std::io::Result<ProbeResult> {
-    probe_with_binary_inner(socket_path, binary, None)
-        .await?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "tmux probe timed out"))
-}
-
-pub(crate) async fn probe_with_binary_until(
-    socket_path: &Path,
-    binary: &Path,
-    expires: Instant,
-) -> std::io::Result<Option<ProbeResult>> {
-    probe_with_binary_inner(socket_path, binary, Some(expires)).await
-}
-
-async fn probe_with_binary_inner(
-    socket_path: &Path,
-    binary: &Path,
     expires: Option<Instant>,
 ) -> std::io::Result<Option<ProbeResult>> {
     match std::fs::symlink_metadata(socket_path) {
@@ -82,7 +66,7 @@ async fn probe_with_binary_inner(
         }
         Err(error) => return Err(error),
     }
-    let mut command = Command::new(binary);
+    let mut command = Command::new("tmux");
     command
         .args(["-S", &socket_path.to_string_lossy(), "ls"])
         .env_remove("TMUX")
@@ -117,7 +101,15 @@ async fn run_command_output(
     cancelled: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<Option<Output>> {
     command.kill_on_drop(true);
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
+    child_output(child, expires, cancelled).await
+}
+
+async fn child_output(
+    mut child: tokio::process::Child,
+    expires: Option<Instant>,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> std::io::Result<Option<Output>> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut stdout_reader = tokio::spawn(async move {
@@ -210,31 +202,6 @@ fn classify_output(success: bool, stderr: &[u8], socket_path: &Path) -> ProbeRes
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn probe_sync(socket_path: &Path) -> ProbeResult {
-    match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) if !metadata.file_type().is_socket() => {
-            return ProbeResult::DeadSocket;
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ProbeResult::NoSocket;
-        }
-        Err(_) => return ProbeResult::DeadSocket,
-    }
-    let output = std::process::Command::new("tmux")
-        .args(["-S", &socket_path.to_string_lossy(), "ls"])
-        .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output();
-    match output {
-        Ok(output) => classify_output(output.status.success(), &output.stderr, socket_path),
-        Err(_) => ProbeResult::DeadSocket,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,69 +236,47 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn successful_listing_proves_a_live_server() {
+        assert_eq!(
+            classify_output(true, b"", Path::new("/tmp/example.sock")),
+            ProbeResult::Live
+        );
+    }
+
+    /// An expired deadline is the only ready branch, so the outcome is causal:
+    /// the child must already be killed and reaped when `child_output` returns.
     #[tokio::test]
-    async fn deadline_kills_and_reaps_probe_child() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::new().unwrap();
-        let pid_path = tmp.path().join("probe.pid");
-        let binary = tmp.path().join("tmux");
-        std::fs::write(
-            &binary,
-            format!(
-                "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
-                pid_path.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let mut command = Command::new(&binary);
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-        let result = command_output(
-            command,
-            Some(Instant::now() + std::time::Duration::from_millis(500)),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result, None);
-
-        let pid = std::fs::read_to_string(&pid_path)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
-        let status = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
+    async fn expired_deadline_kills_and_reaps_the_child() {
+        let mut command = Command::new("sleep");
+        command
+            .arg("30")
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let identity =
+            phoenix_core::process_identity::current_process_identity(child.id().unwrap())
+                .expect("capture the child's exact identity while it runs");
+
+        let result = child_output(child, Some(Instant::now()), std::future::pending())
+            .await
             .unwrap();
-        assert!(!status.success(), "timed-out probe child {pid} survived");
+
+        assert_eq!(result, None);
+        assert!(
+            !phoenix_core::process_identity::process_identity_matches(identity),
+            "timed-out child {identity:?} survived"
+        );
     }
 
     #[tokio::test]
     async fn probe_returns_ambiguous_for_orphan_file() {
-        // A regular file existing at the socket path is not proof that the
-        // token-bound endpoint is absent.
-        if which::which("tmux").is_err() {
-            return;
-        }
+        // A regular file at the socket path is not proof that the token-bound
+        // endpoint is absent. The metadata check answers before any tmux call.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("orphan.sock");
         std::fs::write(&path, b"not a real tmux socket").unwrap();
         assert_eq!(probe(&path).await.unwrap(), ProbeResult::DeadSocket);
-    }
-
-    #[tokio::test]
-    async fn probe_returns_no_server_for_orphan_socket() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("orphan.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(listener);
-        assert_eq!(probe(&path).await.unwrap(), ProbeResult::NoServer);
     }
 }

@@ -9,7 +9,7 @@ description = "Tool implementations for Phoenix IDE: bash, patch, browser, tmux,
 path = "src/lib.rs"
 
 [features]
-test-support = ["dep:tempfile"]
+test-support = []
 
 [dependencies]
 phoenix-svg = { path = "../phoenix-svg" }
@@ -91,7 +91,6 @@ which = "8"
 libc = "0.2"
 nono = { version = "0.53", default-features = false }
 taskmd-core = ">=1.3,<2"
-tempfile = { version = "3", optional = true }
 
 # Typed errors.
 thiserror = "2"
