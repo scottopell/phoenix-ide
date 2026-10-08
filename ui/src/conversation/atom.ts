@@ -685,6 +685,15 @@ function currentStreamingRequestId(atom: ConversationAtom): string | null {
   return atom.firstByteRequestId ?? atom.streamingBuffer?.requestId ?? null;
 }
 
+function phaseAcceptsStreamingTokens(phase: ConversationState): boolean {
+  return phase.type === 'llm_requesting'
+    || (phase.type === 'server_overload_retrying' && phase.retryAt === null);
+}
+
+function phaseIsTerminalFailure(phase: ConversationState): boolean {
+  return phase.type === 'error' || phase.type === 'recoverable_continuation_failure';
+}
+
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
@@ -768,10 +777,8 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     case 'sse_state_change': {
       const phase =
         action.phase.type === 'error' && action.error ? { ...action.phase, error: action.error } : action.phase;
-      const terminalOverload =
-        (phase.type === 'error' || phase.type === 'recoverable_continuation_failure')
-        && phase.error_kind === 'server_overloaded';
-      const leavingLlmRequesting = atom.phase.type === 'llm_requesting' && action.phase.type !== 'llm_requesting';
+      const leavingStreamingPhase = phaseAcceptsStreamingTokens(atom.phase)
+        && !phaseAcceptsStreamingTokens(phase);
       const next = {
 
         ...atom,
@@ -779,10 +786,10 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         phaseLastAppliedEventSeq: action.sequenceId,
         phaseStateUpdatedAt: action.stateUpdatedAt,
         firstByteRequestId: null,
-        turnRetryContext: terminalOverload ? null : atom.turnRetryContext,
+        turnRetryContext: phaseIsTerminalFailure(phase) ? null : atom.turnRetryContext,
         toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
       };
-      return leavingLlmRequesting
+      return leavingStreamingPhase
         ? clearStreamingBufferIfAffected(next, currentStreamingRequestId(atom))
         : next;
     }
@@ -817,10 +824,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     case 'sse_sequence_consumed':
       return atom;
     case 'sse_token': {
-      if (
-        atom.phase.type !== 'llm_requesting'
-        && !(atom.phase.type === 'server_overload_retrying' && atom.phase.retryAt === null)
-      ) return atom;
+      if (!phaseAcceptsStreamingTokens(atom.phase)) return atom;
       const sameRequest = atom.streamingBuffer?.requestId === action.requestId;
       return {
         ...atom,
@@ -1346,7 +1350,7 @@ export function conversationReducer(
       const initPhaseAuthoritySeq = Math.max(phase1Floor, p.lastAppliedEventSeq);
       // streamingBuffer policy: fresh-connect always clears (atom had no
       // buffer to preserve). Reconnect preserves the existing buffer when
-      // the snapshot phase is still llm_requesting AND the ring did not
+      // the snapshot phase still accepts streaming tokens AND the ring did not
       // overflow — pending tokens with seq > floor extend it via the
       // sse_token reducer, tokens at or below are dropped as replays.
       // Clearing on reconnect unconditionally would create a blank-UI
@@ -1362,7 +1366,7 @@ export function conversationReducer(
       const phase1StreamingBuffer =
         !isFreshConnect
         && !streamIncarnationChanged
-        && p.phase.type === 'llm_requesting'
+        && phaseAcceptsStreamingTokens(p.phase)
         && !p.pendingTruncated
           ? atom.streamingBuffer
           : null;

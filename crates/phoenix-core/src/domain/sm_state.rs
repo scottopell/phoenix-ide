@@ -2324,8 +2324,8 @@ impl ConvState {
     /// Mirror of the Allium-defined `is_busy` derivation in
     /// `specs/bedrock/bedrock.allium`:
     ///
-    /// > `is_busy: core_status in { llm_requesting, executing_tools,
-    /// >                            awaiting_sub_agents, cancelling_tool,
+    /// > `is_busy: core_status in { llm_requesting, server_overload_retrying,
+    /// >                            executing_tools, awaiting_sub_agents, cancelling_tool,
     /// >                            cancelling_sub_agents }`
     ///
     /// Used by REQ-BED-032's `RejectHardDeleteWhileBusy` rule. The
@@ -2336,6 +2336,7 @@ impl ConvState {
         matches!(
             self,
             ConvState::LlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying { .. }
                 | ConvState::SeededLlmRequesting { .. }
                 | ConvState::Provisioning { .. }
                 | ConvState::ToolExecuting { .. }

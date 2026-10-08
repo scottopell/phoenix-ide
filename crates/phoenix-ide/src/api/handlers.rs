@@ -14807,6 +14807,43 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(state.db.get_conversation("cb-b").await.is_ok());
     }
 
+    #[tokio::test]
+    async fn hard_delete_rejects_server_overload_retry() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-overload-delete", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let now = chrono::Utc::now();
+        let retrying = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: now + chrono::Duration::seconds(4),
+                },
+                attempt: 2,
+                started_at: now,
+                deadline_at: now + chrono::Duration::seconds(120),
+            },
+        };
+        state
+            .db
+            .update_conversation_state("c-overload-delete", &retrying)
+            .await
+            .expect("set overload retry");
+
+        let error = run_hard_delete_cascade(&state, "c-overload-delete")
+            .await
+            .expect_err("overload retry must remain owned");
+
+        assert!(matches!(
+            error,
+            AppError::Conflict(detail) if detail.error_type == "cancel_first"
+        ));
+        assert!(state.db.get_conversation("c-overload-delete").await.is_ok());
+    }
+
     /// Archive cascade rejects a busy conversation with the same
     /// `cancel_first` 409 as hard-delete, leaves the row unarchived,
     /// then succeeds once the conversation settles to idle.
@@ -14862,6 +14899,48 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("row preserved");
         assert!(conv.archived, "archived flag must be set after archive");
+    }
+
+    #[tokio::test]
+    async fn archive_rejects_server_overload_retry() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-overload-archive", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let now = chrono::Utc::now();
+        let retrying = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                attempt: 2,
+                started_at: now,
+                deadline_at: now + chrono::Duration::seconds(120),
+            },
+        };
+        state
+            .db
+            .update_conversation_state("c-overload-archive", &retrying)
+            .await
+            .expect("set overload retry");
+
+        let error = run_archive_cascade(&state, "c-overload-archive")
+            .await
+            .expect_err("overload retry must remain owned");
+
+        assert!(matches!(
+            error,
+            AppError::Conflict(detail) if detail.error_type == "cancel_first"
+        ));
+        assert!(
+            !state
+                .db
+                .get_conversation("c-overload-archive")
+                .await
+                .expect("row remains")
+                .archived
+        );
     }
 
     #[allow(clippy::too_many_lines)]

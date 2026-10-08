@@ -70,7 +70,6 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
-| [084](084_bounded-selected-model-overload-retry.md) | Selected-model overload uses a durable bounded retry window | Accepted | REQ-LLM-006/006b, REQ-LRV-002/005/008, REQ-BED-006/007 |
 | [059](059_anthropic-private-replay-uses-active-opaque-state.md) | Anthropic private replay uses active opaque state | Accepted | REQ-LLM-004, REQ-LLM-005, REQ-LLM-006 |
 | [060](060_model-qualified-parallel-work-admission.md) | Parallel Work admission is explicitly model-qualified | Accepted | REQ-SA-001/003–005, REQ-PROJ-008, REQ-BED-008/018, REQ-LLM-003 |
 | [061](061_gpt-6-sol-is-manually-qualified-for-parallel-work.md) | GPT-6 Sol is manually qualified for parallel Work | Accepted | REQ-SA-001, REQ-PROJ-008 |
@@ -100,6 +99,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [083](083_federation-instance-identity-and-known-credential-query-exclusions.md) | Federation establishes stable instance identity and excludes known credentials from agent SQL | Accepted | REQ-GR-011A; federation instance identity |
 | [084](084_tool-policy-is-independent-of-provider-history.md) | Tool policy is independent of provider history | Accepted | REQ-LLM-004i, REQ-LLM-005; provider continuation |
 | [085](085_codex-continuation-requires-an-identified-account.md) | Codex continuation requires an identified account | Accepted | REQ-LLM-004h, REQ-LLM-004i; account-bound route admission |
+| [086](086_bounded-selected-model-overload-retry.md) | Selected-model overload uses a durable bounded retry window | Accepted | REQ-LLM-006/006b, REQ-LRV-002/005/008, REQ-BED-006/007 |
 
 
 ## For agents: which decisions bind your task
@@ -203,7 +203,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-025 (Continuation compaction is an idempotent durable operation)
       │   ├── ADR-045 (Provider prompts use persisted generation-fenced projections)
       │   │   └── ADR-054 (Automatic continuation admission binds consent and context authority)
-      │   └── ADR-084 (Selected-model overload uses a durable bounded retry window; also qualifies ADR-048)
+      │   └── ADR-086 (Selected-model overload uses a durable bounded retry window; also qualifies ADR-048)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)

@@ -10468,6 +10468,20 @@ async fn apply_migration_body(
     Ok(())
 }
 
+async fn apply_pool_scoped_migration(pool: &SqlitePool, migration: &Migration) -> DbResult<bool> {
+    match migration.version {
+        68 => retire_commission_review::run(pool, migration.version, migration.name).await?,
+        69 => {
+            retire_commission_review::backfill_settlements(pool, migration.version, migration.name)
+                .await?;
+        }
+        96 => run_migration_096(pool, migration).await?,
+        118 => run_migration_118(pool, migration).await?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -10512,27 +10526,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             "Applying database migration"
         );
 
-        if migration.version == 68 {
-            retire_commission_review::run(pool, migration.version, migration.name).await?;
-            applied += 1;
-            continue;
-        }
-
-        if migration.version == 69 {
-            retire_commission_review::backfill_settlements(pool, migration.version, migration.name)
-                .await?;
-            applied += 1;
-            continue;
-        }
-
-        if migration.version == 96 {
-            run_migration_096(pool, migration).await?;
-            applied += 1;
-            continue;
-        }
-
-        if migration.version == 118 {
-            run_migration_118(pool, migration).await?;
+        if apply_pool_scoped_migration(pool, migration).await? {
             applied += 1;
             continue;
         }

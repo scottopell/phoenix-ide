@@ -687,6 +687,7 @@ fn trusted_request_continues(state: &ConvState) -> bool {
     matches!(
         state,
         ConvState::LlmRequesting { .. }
+            | ConvState::ServerOverloadRetrying { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
@@ -3793,7 +3794,10 @@ where
                     .iter()
                     .any(|effect| matches!(effect, Effect::AbortLlm)))
                 || (matches!(old_state, ConvState::AwaitingRecovery { .. })
-                    && !matches!(result.new_state, ConvState::LlmRequesting { .. }));
+                    && !matches!(
+                        result.new_state,
+                        ConvState::LlmRequesting { .. } | ConvState::ServerOverloadRetrying { .. }
+                    ));
         let mut pending_trusted_cleared = false;
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
@@ -20953,6 +20957,15 @@ mod steer_drain_detector_tests {
                 recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
                 resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ConversationTurn,
             },
+            ConvState::ServerOverloadRetrying {
+                retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                    target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                    phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                    attempt: 2,
+                    started_at: Utc::now(),
+                    deadline_at: Utc::now() + chrono::Duration::seconds(120),
+                },
+            },
             ConvState::AwaitingTaskApproval {
                 task_file: "tasks/1.md".into(),
                 title: "task".into(),
@@ -21112,6 +21125,54 @@ mod steer_drain_detector_tests {
                 output: "authenticated payload".to_string(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_survives_overload_retry_after_credential_recovery() {
+        let now = Utc::now();
+        let retry = phoenix_core::domain::sm_state::ServerOverloadRetry {
+            target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+            phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+            attempt: 1,
+            started_at: now,
+            deadline_at: now + chrono::Duration::seconds(120),
+        };
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-overload-auth-recovery",
+            ConvState::AwaitingRecovery {
+                message: "credential helper active".to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                    retry,
+                },
+            },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+            output: "authenticated payload".to_string(),
+        }];
+
+        rt.process_event(Event::CredentialBecameAvailable { observed_at: now })
+            .await
+            .expect("resume ordinary overload retry");
+
+        assert!(matches!(
+            rt.state,
+            ConvState::ServerOverloadRetrying {
+                retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                    target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                    phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                    attempt: 2,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
+        if let Some(task) = rt.llm_task_handle.take() {
+            task.abort();
+        }
     }
 
     #[tokio::test]
