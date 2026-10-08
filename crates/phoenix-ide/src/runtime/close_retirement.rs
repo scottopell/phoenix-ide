@@ -5884,7 +5884,7 @@ mod tests {
         use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
         use std::sync::Arc;
 
-        let manager = RuntimeManager::new(
+        let mut manager = RuntimeManager::new(
             crate::db::Database::open_in_memory().await.unwrap(),
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),
             phoenix_core::platform::PlatformCapability::None {
@@ -5894,6 +5894,9 @@ mod tests {
             None,
         );
         let temp = tempfile::tempdir().unwrap();
+        if !conflicting_incarnation {
+            manager.test_ambient_writer_observer = Some(Arc::new(|_| Ok(false)));
+        }
         let repository = temp.path().join("repository");
         let linked = temp.path().join("linked");
         initialize_repository(&repository);
