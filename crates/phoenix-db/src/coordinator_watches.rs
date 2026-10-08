@@ -429,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn durable_question_wait_is_emitted_once_per_request_without_settling_turn() {
-        use phoenix_core::domain::sm_state::{QuestionRequestAuthority, UserQuestion};
+        use phoenix_core::domain::sm_state::{ConvState, QuestionRequestAuthority, UserQuestion};
         let db = Database::open_in_memory().await.unwrap();
         let source = db
             .create_conversation("watch-wait", "watch-wait", "/tmp", true, None, None)
@@ -438,7 +438,7 @@ mod tests {
         db.watch_product_conversation(&source.product_conversation_id)
             .await
             .unwrap();
-        let turn_id = create_turn(&db, &source.id, "active-question-turn").await;
+        let turn_id = source_turn(&db, &source.id, "active-question-turn").await;
         let waiting = |authority| ConvState::AwaitingUserInput {
             tool_use_id: "provider-reused-tool-id".into(),
             request_authority: authority,
@@ -483,7 +483,7 @@ mod tests {
         );
         let terminal: Option<String> =
             sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
-                .bind(&turn_id)
+                .bind(i64::try_from(turn_id).unwrap())
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
