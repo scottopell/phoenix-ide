@@ -661,6 +661,13 @@ impl RuntimeManager {
         Ok(resources)
     }
 
+    async fn discard_close_resource_leases(&self, attempt_id: &CloseAttemptId) {
+        self.close_retirement_leases
+            .lock()
+            .await
+            .retain(|(candidate, _), _| candidate != attempt_id.as_str());
+    }
+
     pub(crate) async fn cancel_close_resource_leases(
         &self,
         attempt_id: &CloseAttemptId,
@@ -1064,7 +1071,7 @@ impl RuntimeManager {
             .await?;
         self.complete_close_retirement_and_publish(&attempt_id)
             .await?;
-        self.cancel_close_resource_leases(&attempt_id).await?;
+        self.discard_close_resource_leases(&attempt_id).await;
         for captured in self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
@@ -2113,6 +2120,9 @@ impl RuntimeManager {
                 tmux_retirement_outcome(outcome)
                     .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?
             } else {
+                self.tmux_registry()
+                    .reopen_after_repair(&ResourceScopeKey::Work(scope.clone()))
+                    .await;
                 RetirementOutcome::AbsenceAdopted {
                     absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
                 }
