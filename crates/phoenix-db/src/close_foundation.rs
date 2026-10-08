@@ -12363,11 +12363,12 @@ mod tests {
         db.return_close_attempt_to_reinspection(&attempt_id)
             .await
             .unwrap();
+        let replacement_generation = format!("{}-retry", source.generation());
         let target = db
             .resume_close_retirement_after_dispatched_absence(
                 &attempt_id,
                 &source,
-                "repair-retry-generation",
+                &replacement_generation,
             )
             .await
             .unwrap();
