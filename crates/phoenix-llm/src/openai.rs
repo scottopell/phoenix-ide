@@ -945,7 +945,7 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
                 .and_then(serde_json::Value::as_str)
                 .and_then(|error_type| classify_known_responses_error(error_type, message))
             {
-                return Some(classified);
+                return Some(overload_retry_guidance(classified, &headers));
             }
         }
         Some(responses_http_error(status, &body))
@@ -3765,6 +3765,44 @@ mod tests {
         assert_eq!(
             error.retry_after(),
             Some(crate::RetryAfter::WithinLimit(Duration::from_secs(12)))
+        );
+    }
+
+    #[test]
+    fn wrapped_websocket_type_capacity_preserves_retry_after() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status": 503,
+            "error": {
+                "type": "server_is_overloaded",
+                "message": "at capacity"
+            },
+            "headers": { "retry-after": "12" }
+        }))
+        .expect("wrapped overload type");
+
+        assert_eq!(
+            error.retry_after(),
+            Some(crate::RetryAfter::WithinLimit(Duration::from_secs(12)))
+        );
+    }
+
+    #[test]
+    fn wrapped_websocket_type_capacity_preserves_over_limit_retry_after() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status": 503,
+            "error": {
+                "type": "server_is_overloaded",
+                "message": "at capacity"
+            },
+            "headers": { "retry-after": "31" }
+        }))
+        .expect("wrapped overload type");
+
+        assert_eq!(
+            error.retry_after(),
+            Some(crate::RetryAfter::ExceedsLimit(Duration::from_secs(31)))
         );
     }
 
