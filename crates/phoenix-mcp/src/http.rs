@@ -4500,9 +4500,9 @@ mod tests {
         let outcome = manager
             .refresh_authorized_server("remote", &handle, &permit, None)
             .await;
-        assert!(matches!(outcome, crate::RefreshServerOutcome::Refreshed));
+        assert!(matches!(outcome, crate::RefreshServerOutcome::Refreshed(_)));
         manager
-            .finish_oauth_refresh("remote", &handle, &permit, outcome, None)
+            .finish_oauth_refresh("remote", &handle, &permit, outcome)
             .await
             .unwrap();
         assert!(handle.snapshot().is_ready());
@@ -4801,7 +4801,7 @@ mod tests {
         let outcome = manager
             .refresh_authorized_server("remote", &handle, &permit, None)
             .await;
-        assert!(matches!(outcome, crate::RefreshServerOutcome::Refreshed));
+        assert!(matches!(outcome, crate::RefreshServerOutcome::Refreshed(_)));
         let mut rejected = json_doc(&serde_json::json!({"error": "invalid_grant"}));
         rejected.status = 400;
         server.route("/token", rejected);
@@ -4810,7 +4810,7 @@ mod tests {
         replacement[2] = unauthorized(&server);
         server.push_responses(replacement);
         assert!(manager
-            .finish_oauth_refresh("remote", &handle, &permit, outcome, None)
+            .finish_oauth_refresh("remote", &handle, &permit, outcome)
             .await
             .is_err());
         assert_eq!(
@@ -5130,10 +5130,10 @@ mod tests {
                     if transient {
                         vec![
                             status_response(503, &[]),
-                            token_response("at-2", Some("rt-2"), None),
+                            token_response("at-2", Some("rt-2"), Some("mcp.read")),
                         ]
                     } else {
-                        vec![token_response("at-2", Some("rt-2"), None)]
+                        vec![token_response("at-2", Some("rt-2"), Some("mcp.read"))]
                     },
                 );
                 let manager = McpClientManager::new();
@@ -5151,7 +5151,7 @@ mod tests {
                         &server,
                         "at-1",
                         Some("rt-1"),
-                        &["mcp.read"],
+                        &["mcp.read", "mcp.granted"],
                         1,
                     ))
                     .await
@@ -5174,9 +5174,15 @@ mod tests {
                     params["scope"]
                         .split_whitespace()
                         .collect::<std::collections::BTreeSet<_>>(),
-                    ["mcp.read", "mcp.write", "mcp.cleanup", "mcp.extra"]
-                        .into_iter()
-                        .collect()
+                    [
+                        "mcp.read",
+                        "mcp.write",
+                        "mcp.cleanup",
+                        "mcp.extra",
+                        "mcp.granted"
+                    ]
+                    .into_iter()
+                    .collect()
                 );
                 assert_eq!(
                     server.recorded_for_path("/token").len(),

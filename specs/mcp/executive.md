@@ -192,3 +192,5 @@ challenge metadata and scope union survive refresh rejection and reauthorization
 `ready_removal_cleanup_reauthorization_retains_prior_scopes` covers immediate
 and background cleanup rejection after refresh narrows the grant's scopes; the
 retry preserves previously required scopes and the latest DELETE challenge.
+The retained-refresh continuation matrix explicitly narrows the refreshed grant
+and verifies the replacement authorization still includes prior required scopes.

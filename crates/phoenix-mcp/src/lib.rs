@@ -386,7 +386,7 @@ fn merge_oauth_challenges<'a>(challenges: impl IntoIterator<Item = &'a str>) -> 
 
 struct OAuthHandshakeCleanup {
     server: McpServer,
-    www_authenticate: Option<String>,
+    plan: OAuthRetryPlan,
     action: OAuthHandshakeAction,
 }
 
@@ -464,14 +464,15 @@ impl HandshakeFailure {
         self,
         caller: Option<McpServer>,
         action: OAuthHandshakeAction,
-        prior_challenge: Option<&str>,
+        prior_plan: Option<&OAuthRetryPlan>,
     ) -> ConnectFailure {
         let message = self.to_string();
         let mut challenges = Vec::new();
         self.authorization_challenges(&mut challenges);
         let unauthorized = !challenges.is_empty();
         let www_authenticate = merge_oauth_challenges(
-            prior_challenge
+            prior_plan
+                .and_then(|plan| plan.www_authenticate.as_deref())
                 .into_iter()
                 .chain(challenges.into_iter().filter_map(|value| value.as_deref())),
         );
@@ -482,7 +483,11 @@ impl HandshakeFailure {
                     if oauth_resource_url(&server.config).is_some() && unauthorized {
                         ConnectTeardown::OAuth(OAuthHandshakeCleanup {
                             server,
-                            www_authenticate,
+                            plan: OAuthRetryPlan {
+                                scopes: prior_plan
+                                    .map_or_else(Vec::new, |plan| plan.scopes.clone()),
+                                www_authenticate,
+                            },
                             action,
                         })
                     } else {
@@ -1788,7 +1793,7 @@ fn oauth_recovery_kind_parts(
 
 /// Outcome of refreshing an authorized server's token mid-recovery.
 enum RefreshServerOutcome {
-    Refreshed,
+    Refreshed(OAuthRetryPlan),
     Failed(String),
     Superseded,
     /// The refresh could not be attempted/completed for a reason that says
@@ -2352,12 +2357,15 @@ impl McpClientManager {
         {
             return RefreshServerOutcome::Superseded;
         }
+        let Some(plan) = handle.oauth_retry_plan(permit.epoch).await else {
+            return RefreshServerOutcome::Superseded;
+        };
         match oauth_refresh(&self.oauth, name, &url, www_authenticate, &token).await {
             Ok(access_token) => match handle
                 .finish_oauth_cleanup(permit.epoch, access_token)
                 .await
             {
-                Ok(true) => RefreshServerOutcome::Refreshed,
+                Ok(true) => RefreshServerOutcome::Refreshed(plan),
                 Ok(false) => RefreshServerOutcome::Superseded,
                 Err(error) => RefreshServerOutcome::Failed(error),
             },
@@ -2658,7 +2666,7 @@ impl McpClientManager {
         handle: &'a SupervisorHandle,
         epoch: u64,
         action: OAuthHandshakeAction,
-        prior_challenge: Option<&'a str>,
+        prior_plan: Option<&'a OAuthRetryPlan>,
     ) -> futures::future::BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let pending = &self.pending_oauth_urls;
@@ -2669,7 +2677,7 @@ impl McpClientManager {
                 Arc::clone(pending),
                 Arc::clone(oauth),
                 action,
-                prior_challenge,
+                prior_plan,
             )
             .await
             {
@@ -2734,22 +2742,20 @@ impl McpClientManager {
     ) -> Result<(), String> {
         let OAuthHandshakeCleanup {
             server,
-            www_authenticate,
+            mut plan,
             action: failure_action,
         } = cleanup;
         let mut scopes = configured_oauth_scopes(config).to_vec();
+        extend_unique(&mut scopes, plan.scopes.iter().map(String::as_str));
         if let Ok(Some(token)) = self.oauth.store().token(name).await {
             extend_unique(&mut scopes, token.scopes.iter().map(String::as_str));
         }
-        if let Some(challenge) = www_authenticate.as_deref() {
+        if let Some(challenge) = plan.www_authenticate.as_deref() {
             if let Some(scope) = oauth::parse_bearer_challenge(challenge).get("scope") {
                 extend_unique(&mut scopes, scope.split_whitespace());
             }
         }
-        let plan = OAuthRetryPlan {
-            scopes,
-            www_authenticate,
-        };
+        plan.scopes = scopes;
         if !handle
             .retain_oauth_handshake_failure(epoch, error.clone(), server, plan.clone())
             .await
@@ -2779,14 +2785,14 @@ impl McpClientManager {
             .await
         };
         match outcome {
-            RefreshServerOutcome::Refreshed => {
+            RefreshServerOutcome::Refreshed(refreshed_plan) => {
                 self.connect_actor_owned(
                     name,
                     config,
                     handle,
                     epoch,
                     OAuthHandshakeAction::Authorize,
-                    plan.www_authenticate.as_deref(),
+                    Some(&refreshed_plan),
                 )
                 .await
             }
@@ -3279,14 +3285,8 @@ impl McpClientManager {
                     );
                     return Err(McpToolCallError::Failed(error));
                 }
-                self.finish_oauth_refresh(
-                    server_name,
-                    handle,
-                    &permit,
-                    outcome,
-                    www_authenticate.as_deref(),
-                )
-                .await
+                self.finish_oauth_refresh(server_name, handle, &permit, outcome)
+                    .await
             }
             OAuthRecoveryKind::StepUp { www_authenticate } => {
                 if let Err(error) = self
@@ -3334,7 +3334,6 @@ impl McpClientManager {
                         &permit,
                         outcome,
                         action,
-                        www_authenticate.as_deref(),
                     )
                     .await;
                 return;
@@ -3348,7 +3347,6 @@ impl McpClientManager {
         handle: &SupervisorHandle,
         permit: &RecoveryPermit,
         outcome: RefreshServerOutcome,
-        prior_challenge: Option<&str>,
     ) -> Result<(), McpToolCallError> {
         self.finish_oauth_refresh_with_action(
             server_name,
@@ -3356,7 +3354,6 @@ impl McpClientManager {
             permit,
             outcome,
             OAuthHandshakeAction::Refresh,
-            prior_challenge,
         )
         .await
     }
@@ -3368,7 +3365,6 @@ impl McpClientManager {
         permit: &RecoveryPermit,
         outcome: RefreshServerOutcome,
         action: OAuthHandshakeAction,
-        prior_challenge: Option<&str>,
     ) -> Result<(), McpToolCallError> {
         let gate = self.oauth.mutation_gate(server_name);
         let _mutations = gate.lock().await;
@@ -3378,7 +3374,7 @@ impl McpClientManager {
             ));
         }
         match outcome {
-            RefreshServerOutcome::Refreshed => {
+            RefreshServerOutcome::Refreshed(plan) => {
                 if matches!(handle.snapshot().recovery_target, RecoveryTarget::Remove) {
                     handle.remove().await.map_err(McpToolCallError::Failed)?;
                     self.oauth
@@ -3388,7 +3384,7 @@ impl McpClientManager {
                     self.remove_current_handle(server_name, handle).await;
                     return Ok(());
                 }
-                let (config, epoch, prior_challenge) = if let RecoveryTarget::Reconfigure(config) =
+                let (config, epoch, prior_plan) = if let RecoveryTarget::Reconfigure(config) =
                     handle.snapshot().recovery_target
                 {
                     self.invalidate_oauth_on_config_change(server_name, &permit.config, &config)
@@ -3399,18 +3395,11 @@ impl McpClientManager {
                         .map_err(McpToolCallError::Failed)?;
                     (config, epoch, None)
                 } else {
-                    (permit.config.clone(), permit.epoch, prior_challenge)
+                    (permit.config.clone(), permit.epoch, Some(&plan))
                 };
-                self.connect_actor_owned(
-                    server_name,
-                    &config,
-                    handle,
-                    epoch,
-                    action,
-                    prior_challenge,
-                )
-                .await
-                .map_err(McpToolCallError::Failed)
+                self.connect_actor_owned(server_name, &config, handle, epoch, action, prior_plan)
+                    .await
+                    .map_err(McpToolCallError::Failed)
             }
             RefreshServerOutcome::Reprompt(error)
             | RefreshServerOutcome::Transient(error)
@@ -3523,7 +3512,7 @@ impl McpClientManager {
                         .finish_oauth_cleanup(permit.epoch, token.access_token.clone())
                         .await
                     {
-                        Ok(true) => RefreshServerOutcome::Refreshed,
+                        Ok(true) => RefreshServerOutcome::Refreshed(plan.clone()),
                         Ok(false) => RefreshServerOutcome::Superseded,
                         Err(error) => RefreshServerOutcome::Failed(error),
                     }
@@ -3547,7 +3536,7 @@ impl McpClientManager {
             .await
         };
         Some(match outcome {
-            RefreshServerOutcome::Refreshed => match handle.remove().await {
+            RefreshServerOutcome::Refreshed(_) => match handle.remove().await {
                 Ok(()) => match self.oauth.delete_token(name).await {
                     Ok(()) => {
                         self.remove_current_handle(name, handle).await;
@@ -3877,7 +3866,7 @@ impl McpClientManager {
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
         oauth_rt: Arc<OAuthRuntime>,
         action: OAuthHandshakeAction,
-        prior_challenge: Option<&str>,
+        prior_plan: Option<&OAuthRetryPlan>,
     ) -> Result<McpServer, ConnectFailure> {
         // A pre-configured client (Claude Code's `oauth` shape) is seeded only
         // once discovery resolves the authorization server's issuer, since the
@@ -3950,7 +3939,7 @@ impl McpClientManager {
             return Err(failure.into_connect_failure(
                 Some(server),
                 OAuthHandshakeAction::Refresh,
-                prior_challenge,
+                prior_plan,
             ));
         }
         let HandshakeFailure::Unauthorized {
@@ -3961,9 +3950,12 @@ impl McpClientManager {
             return Err(failure.to_string().into());
         };
         www_authenticate = merge_oauth_challenges(
-            [prior_challenge, www_authenticate.as_deref()]
-                .into_iter()
-                .flatten(),
+            [
+                prior_plan.and_then(|plan| plan.www_authenticate.as_deref()),
+                www_authenticate.as_deref(),
+            ]
+            .into_iter()
+            .flatten(),
         );
         // StaticAuthRejected: there is no interactive flow to recover a
         // rejected config credential into (REQ-MCP-008). Stdio cannot 401.
@@ -3975,6 +3967,9 @@ impl McpClientManager {
         // half expired offline refreshes on this first 401 (REQ-MCP-012).
         let stored = oauth_rt.store().token(name).await.unwrap_or_default();
         let mut prior_scopes = configured_oauth_scopes(entry).to_vec();
+        if let Some(plan) = prior_plan {
+            extend_unique(&mut prior_scopes, plan.scopes.iter().map(String::as_str));
+        }
         if let Some(token) = stored {
             extend_unique(&mut prior_scopes, token.scopes.iter().map(String::as_str));
             if matches!(action, OAuthHandshakeAction::Refresh) && token.refresh_token.is_some() {
@@ -4001,7 +3996,10 @@ impl McpClientManager {
                                 return Err(other.into_connect_failure(
                                     None,
                                     OAuthHandshakeAction::Authorize,
-                                    www_authenticate.as_deref(),
+                                    Some(&OAuthRetryPlan {
+                                        scopes: prior_scopes,
+                                        www_authenticate,
+                                    }),
                                 ))
                             }
                         }
@@ -4013,7 +4011,10 @@ impl McpClientManager {
                             ),
                             teardown_retry: Some(ConnectTeardown::OAuth(OAuthHandshakeCleanup {
                                 server,
-                                www_authenticate,
+                                plan: OAuthRetryPlan {
+                                    scopes: prior_scopes,
+                                    www_authenticate,
+                                },
                                 action: OAuthHandshakeAction::Refresh,
                             })),
                         });

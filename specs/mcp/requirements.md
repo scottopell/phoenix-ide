@@ -391,7 +391,8 @@ or owned reauthorization. Failed removal retries SHALL retain that ownership.
 Recovered removal grants SHALL remain persisted until cleanup succeeds. A failed
 removal callback cleanup SHALL retain its complete authorization retry plan so
 expired recovered credentials cannot prevent explicit reauthorization.
-Successful refresh continuations SHALL preserve that challenge for
+Successful refresh continuations SHALL preserve the complete authorization plan,
+including previously required scopes when the returned grant narrows, for
 replacement connection recovery while the configuration remains unchanged.
 Transient refresh or token persistence failures after successful handshake
 teardown SHALL retain recovery ownership and retry without manual reload.
