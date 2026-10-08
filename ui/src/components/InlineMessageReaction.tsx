@@ -20,6 +20,16 @@ interface Props {
   scrollTranscriptBy?: ((delta: number) => void) | undefined;
 }
 
+function sameReactionSource(a: ReactionSource | undefined, b: ReactionSource): boolean {
+  return a?.messageId === b.messageId
+    && a.occurrenceToken === b.occurrenceToken
+    && a.quote === b.quote
+    && a.textAnchor?.start.fragmentId === b.textAnchor?.start.fragmentId
+    && a.textAnchor?.start.offset === b.textAnchor?.start.offset
+    && a.textAnchor?.end.fragmentId === b.textAnchor?.end.fragmentId
+    && a.textAnchor?.end.offset === b.textAnchor?.end.offset;
+}
+
 export function InlineMessageReaction(props: Props) {
   const store = useContext(InlineReactionContext);
   return store ? <ReactionSession key={props.scopeKey} {...props} store={store} /> : null;
@@ -57,21 +67,15 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       const selected = readReactionSelection(nativeSelection, messages);
       if (selected) {
         selectedRange.current = selected.range.cloneRange();
-        const sameSource = current?.source.messageId === selected.source.messageId
-          && current.source.occurrenceToken === selected.source.occurrenceToken
-          && current.source.quote === selected.source.quote
-          && current.source.textAnchor?.start.fragmentId === selected.source.textAnchor?.start.fragmentId
-          && current.source.textAnchor?.start.offset === selected.source.textAnchor?.start.offset
-          && current.source.textAnchor?.end.fragmentId === selected.source.textAnchor?.end.fragmentId
-          && current.source.textAnchor?.end.offset === selected.source.textAnchor?.end.offset;
+        const sameSource = sameReactionSource(current?.source, selected.source);
         const gesturePresentation = selectionChangedDuringGesture.current && selectionInput.current !== null
           ? selectionInput.current === 'touch'
           : null;
         const touchDocked = gesturePresentation ?? (sameSource
-          ? current.presentation === 'touch-docked'
+          ? current?.presentation === 'touch-docked'
           : window.matchMedia?.('(any-pointer: coarse)').matches ?? false);
         const presentation = touchDocked ? 'touch-docked' : 'floating';
-        if (!sameSource || current.presentation !== presentation) {
+        if (!sameSource || current?.presentation !== presentation) {
           store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation });
         }
         selectionInput.current = null;
@@ -159,7 +163,9 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
             const selected = readReactionSelection(window.getSelection(), messages);
             if (!selected) return;
             selectedRange.current = selected.range.cloneRange();
-            store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: reaction.presentation });
+            if (!sameReactionSource(reaction.source, selected.source)) {
+              store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: reaction.presentation });
+            }
           }}
           returnToSource={returnToSource}
           scrollTranscriptBy={scrollTranscriptBy}

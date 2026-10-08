@@ -136,18 +136,21 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       let y = Math.min(visibleBottom, bottom) - height - 12;
       let x = transcript.right - pillWidth - 12;
       if (dockActive) {
-        let obstructionTop = composer?.getBoundingClientRect().top ?? bottom;
-        const composerOwner = composer?.closest('.conversation-column') ?? layoutOwner;
-        const composerChild = childWithin(composer, composerOwner);
-        const transcriptChild = composerOwner.contains(scroller) ? childWithin(scroller, composerOwner) : null;
+        let obstructionTop = composer?.getBoundingClientRect().top ?? transcript.bottom;
         const nextObstructions = new Set<Element>();
-        for (let sibling = transcriptChild?.nextElementSibling ?? composerOwner.firstElementChild;
-          sibling && sibling !== composerChild;
-          sibling = sibling.nextElementSibling) {
-          const siblingRect = sibling.getBoundingClientRect();
-          if (siblingRect.height > 0) {
-            obstructionTop = Math.min(obstructionTop, siblingRect.top);
-            nextObstructions.add(sibling);
+        if (composer) {
+          const composerOwner = composer.closest('.conversation-column') ?? layoutOwner;
+          const composerChild = childWithin(composer, composerOwner);
+          const transcriptChild = composerOwner.contains(scroller) ? childWithin(scroller, composerOwner) : null;
+          for (let sibling = transcriptChild?.nextElementSibling ?? composerOwner.firstElementChild;
+            sibling && sibling !== composerChild;
+            sibling = sibling.nextElementSibling) {
+            if (sibling === el || sibling.contains(el)) continue;
+            const siblingRect = sibling.getBoundingClientRect();
+            if (siblingRect.height > 0) {
+              obstructionTop = Math.min(obstructionTop, siblingRect.top);
+              nextObstructions.add(sibling);
+            }
           }
         }
         for (const obstruction of observedObstructions) {

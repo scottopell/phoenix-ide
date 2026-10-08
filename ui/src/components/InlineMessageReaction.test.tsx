@@ -92,6 +92,23 @@ describe('inline message reactions', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Added to draft');
   });
 
+  it('does not replace an unchanged source when tapping or focusing the reaction editor', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    const input = await screen.findByRole('textbox', { name: 'Your reaction' });
+    const source = store.getSnapshot('conversation-a')?.source;
+    expect(source).toBeDefined();
+    const dispatch = vi.spyOn(store, 'dispatch');
+    fireEvent.pointerDown(input, { pointerType: 'touch' });
+    input.focus();
+    expect(store.getSnapshot('conversation-a')?.source).toBe(source);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
   it('uses the mobile dock for coarse-pointer selection without autofocus and captures before focus clears selection', async () => {
     setCoarsePointer(true);
     const store = new InlineReactionStore();
@@ -111,9 +128,13 @@ describe('inline message reactions', () => {
     adjusted.setEnd(text, 13);
     window.getSelection()!.removeAllRanges();
     window.getSelection()!.addRange(adjusted);
+    const original = store.getSnapshot('conversation-a')?.source;
+    const dispatch = vi.spyOn(store, 'dispatch');
     fireEvent.pointerDown(input, { pointerType: 'touch' });
     const captured = store.getSnapshot('conversation-a')?.source;
     expect(captured?.quote).toBe('Deterministic');
+    expect(captured).not.toBe(original);
+    expect(dispatch).toHaveBeenCalledWith('conversation-a', expect.objectContaining({ type: 'select', source: captured }));
     window.getSelection()?.removeAllRanges();
     fireEvent(document, new Event('selectionchange'));
     await act(async () => { await new Promise(requestAnimationFrame); });

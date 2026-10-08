@@ -1,4 +1,5 @@
 import { createRef } from 'react';
+import { createPortal } from 'react-dom';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReactionPill } from './ReactionPill';
@@ -265,6 +266,27 @@ describe('reaction pill', () => {
     act(() => listeners.get('resize')?.(new Event('resize')));
     await waitFor(() => expect(dock).toHaveStyle({ top: '434px' }));
     expect(input).not.toHaveFocus();
+  });
+
+  it('anchors a portaled touch dock to the transcript when the composer is absent', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'messages') return new DOMRect(0, 0, 390, 620);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, Number.parseFloat(this.style.top) || 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<FocusScopeProvider>
+      <div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div>
+      {createPortal(<ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="Retained" available={false} onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />, document.body)}
+    </FocusScopeProvider>);
+    const dock = screen.getByRole('region', { name: 'Docked reaction' });
+    expect(dock.parentElement).toBe(document.body);
+    expect(dock).toHaveStyle({ top: '554px' });
+    expect(document.getElementById('messages')).toHaveClass('reaction-dock-reserved');
+    for (let i = 0; i < 3; i++) {
+      fireEvent.scroll(window);
+      await act(async () => { await new Promise(requestAnimationFrame); });
+      expect(dock).toHaveStyle({ top: '554px' });
+    }
   });
 
   it('stays above visible controls between the transcript and composer', async () => {
