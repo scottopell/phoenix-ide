@@ -2480,6 +2480,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn product_message_anchor_checks_owner_and_rejects_foreign_messages() {
+        let (service, product, _, _) = continued_scope_fixture().await;
+        let root_message = service
+            .db
+            .add_message(
+                "root-scope",
+                crate::db::MessageType::User,
+                &crate::db::MessageContent::Text("historical prompt".into()),
+                Some("root:message"),
+            )
+            .await
+            .unwrap();
+        service
+            .db
+            .create_conversation("foreign-anchor", "foreign-anchor", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        service
+            .db
+            .add_message(
+                "foreign-anchor",
+                crate::db::MessageType::User,
+                &crate::db::MessageContent::Text("foreign prompt".into()),
+                Some("foreign-message"),
+            )
+            .await
+            .unwrap();
+        for prefix in ["/c/", "/product-conversations/"] {
+            let found = service
+                .resolve_reference(&format!("{prefix}{product}#message-root%3Amessage"))
+                .await
+                .unwrap();
+            assert_eq!(found.id, root_message.message_id);
+            assert!(found.href.unwrap().contains("source_transcript=root-scope"));
+            assert!(service
+                .resolve_reference(&format!("{prefix}{product}#message-foreign-message"))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_product_pin_rejects_child_with_shared_product_identity() {
+        let (service, product, _, _) = continued_scope_fixture().await;
+        let child = service
+            .db
+            .create_conversation(
+                "child-pin",
+                "child-pin",
+                "/tmp",
+                false,
+                Some("root-scope"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(child.parent_conversation_id.is_some());
+        for prefix in ["/c/", "/product-conversations/"] {
+            assert!(service
+                .resolve_reference(&format!("{prefix}{product}?source_transcript=child-pin"))
+                .await
+                .is_err());
+        }
+        assert!(service
+            .resolve_reference("/global/child-pin")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn stable_resolution_keeps_current_member_and_scope_from_one_point_in_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stable-resolution.sqlite");

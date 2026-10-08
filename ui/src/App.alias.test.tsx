@@ -122,7 +122,7 @@ describe('ProductConversationAliasRedirect', () => {
   it('pins an explicit transcript source on direct load instead of rendering the latest aggregate', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
       product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
-      latest_transcript_row_id: 'successor', requested_transcript_row_id: 'historical',
+      latest_transcript_row_id: 'successor', writable_transcript_row_id: 'successor', requested_transcript_row_id: 'historical',
     } as never);
     renderAlias('historical', '/c/historical?source_transcript=historical&source_tool=send#message-source');
     await screen.findByTestId('embedded-fallback');
