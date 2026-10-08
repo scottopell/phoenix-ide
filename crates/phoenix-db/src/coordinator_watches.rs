@@ -17,6 +17,47 @@ pub struct WatchSnapshot {
     pub project_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchOutcome {
+    Completed,
+    Failed { reason: String },
+    Cancelled,
+    AwaitingUserResponse,
+}
+
+impl WatchOutcome {
+    fn decode(kind: String, reason: Option<String>) -> DbResult<Self> {
+        match (kind.as_str(), reason) {
+            ("completed", None) => Ok(Self::Completed),
+            ("failed", Some(reason)) => Ok(Self::Failed { reason }),
+            ("cancelled", None) => Ok(Self::Cancelled),
+            ("awaiting_user_response", Some(reason)) if reason == "question_request" => {
+                Ok(Self::AwaitingUserResponse)
+            }
+            _ => Err(DbError::Serialization(
+                "invalid watch outcome/reason pair".into(),
+            )),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed { .. } => "failed",
+            Self::Cancelled => "cancelled",
+            Self::AwaitingUserResponse => "awaiting_user_response",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed { reason } => Some(reason),
+            Self::AwaitingUserResponse => Some("question_request"),
+            Self::Completed | Self::Cancelled => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingWatchEvent {
     pub event_id: String,
@@ -25,8 +66,7 @@ pub struct PendingWatchEvent {
     pub source_occurrence_kind: String,
     pub source_occurrence_id: String,
     pub source_generation: i64,
-    pub terminal_kind: String,
-    pub terminal_reason: Option<String>,
+    pub outcome: WatchOutcome,
     pub occurred_at_us: i64,
 }
 
@@ -181,8 +221,10 @@ impl Database {
                     source_occurrence_kind: row.try_get("source_occurrence_kind")?,
                     source_occurrence_id: row.try_get("source_occurrence_id")?,
                     source_generation: row.try_get("source_generation")?,
-                    terminal_kind: row.try_get("terminal_kind")?,
-                    terminal_reason: row.try_get("terminal_reason")?,
+                    outcome: WatchOutcome::decode(
+                        row.try_get("terminal_kind")?,
+                        row.try_get("terminal_reason")?,
+                    )?,
                     occurred_at_us: row.try_get("occurred_at_us")?,
                 })
             })
@@ -519,11 +561,8 @@ mod tests {
             1,
             "one durable request must produce one wait event"
         );
-        assert_eq!(events[0].terminal_kind, "awaiting_user_response");
-        assert_eq!(
-            events[0].terminal_reason.as_deref(),
-            Some("question_request")
-        );
+        assert_eq!(events[0].outcome.label(), "awaiting_user_response");
+        assert_eq!(events[0].outcome.reason(), Some("question_request"));
         db.update_conversation_state(&source.id, &waiting(QuestionRequestAuthority::new()))
             .await
             .unwrap();
@@ -606,8 +645,8 @@ mod tests {
         tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_kind, "cancelled");
-        assert_eq!(events[0].terminal_reason, None);
+        assert_eq!(events[0].outcome.label(), "cancelled");
+        assert_eq!(events[0].outcome.reason(), None);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_cancel_observations")
                 .fetch_one(db.pool())
@@ -668,7 +707,7 @@ mod tests {
         tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_reason.as_deref(), Some("model failed"));
+        assert_eq!(events[0].outcome.reason(), Some("model failed"));
         assert!(db.unwatch_product_conversation(&id).await.unwrap());
         assert!(!db.unwatch_product_conversation(&id).await.unwrap());
         assert!(db
@@ -764,11 +803,8 @@ mod tests {
         assert_eq!(delivered[0].source_occurrence_kind, "direct_turn");
         assert_eq!(delivered[0].source_occurrence_id, turn.to_string());
         assert_eq!(delivered[0].source_generation, 0);
-        assert_eq!(delivered[0].terminal_kind, "failed");
-        assert_eq!(
-            delivered[0].terminal_reason.as_deref(),
-            Some("context exhausted")
-        );
+        assert_eq!(delivered[0].outcome.label(), "failed");
+        assert_eq!(delivered[0].outcome.reason(), Some("context exhausted"));
         assert_eq!(delivered[0].source_transcript_id, source.id);
     }
 
@@ -1102,7 +1138,7 @@ mod tests {
         assert_eq!(exposed.len(), 1);
         assert_eq!(exposed[0].source_occurrence_kind, "direct_turn");
         assert_eq!(exposed[0].source_occurrence_id, turn.to_string());
-        assert_eq!(exposed[0].terminal_kind, "cancelled");
+        assert_eq!(exposed[0].outcome.label(), "cancelled");
     }
 
     #[tokio::test]
