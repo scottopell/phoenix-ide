@@ -243,3 +243,7 @@ authorization follows the same atomic completion contract.
 intent survives grant rotation and reopening, failed completion rolls back token
 deletion, and cancellation preserves the grant. Migration 118 adds durable
 removal intents; ADR-086 bounds restart recovery to stored credentials and intent.
+
+`startup_readdition_cancellation_failure_remains_visible_until_retry` covers
+failed removal cancellation at startup: status stays failed, the grant and intent
+remain intact, and retry reconnects without a duplicate status entry.

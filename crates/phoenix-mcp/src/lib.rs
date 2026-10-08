@@ -4255,6 +4255,12 @@ impl McpClientManager {
             let gate = self.oauth.mutation_gate(&name);
             let mutations = gate.lock().await;
             if let Err(error) = self.oauth.store().cancel_removal(&name).await {
+                if !self.servers.read().await.contains_key(&name) {
+                    self.removal_errors
+                        .write()
+                        .await
+                        .insert(name.clone(), error.clone());
+                }
                 failed.push(McpReloadFailure {
                     server: name,
                     action: "restart".to_owned(),

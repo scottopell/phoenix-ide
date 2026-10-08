@@ -4844,6 +4844,7 @@ mod tests {
                         manager.set_oauth_store(Arc::new(FailOnceDeleteStore {
                             inner: Arc::clone(&store),
                             fail_next: std::sync::atomic::AtomicBool::new(true),
+                            fail_cancellation: false,
                         }));
                     }
                     if let Some(outcome) = outcome {
@@ -5208,6 +5209,7 @@ mod tests {
     struct FailOnceDeleteStore {
         inner: Arc<dyn crate::OAuthStore>,
         fail_next: std::sync::atomic::AtomicBool,
+        fail_cancellation: bool,
     }
 
     #[async_trait]
@@ -5219,6 +5221,9 @@ mod tests {
             self.inner.pending_removals().await
         }
         async fn cancel_removal(&self, name: &str) -> Result<(), String> {
+            if self.fail_cancellation && self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err("injected removal cancellation failure".into());
+            }
             self.inner.cancel_removal(name).await
         }
         async fn complete_removal(&self, name: &str) -> Result<(), String> {
@@ -6707,6 +6712,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_readdition_cancellation_failure_remains_visible_until_retry() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let config = manager
+            .servers
+            .read()
+            .await
+            .get("remote")
+            .unwrap()
+            .snapshot()
+            .config;
+        let durable = manager.oauth.store();
+        durable.record_removal("remote").await.unwrap();
+        *server.routes.delete_bearer.lock().unwrap() = None;
+        server.push_responses(vec![delete_ack()]);
+        manager.shutdown().await;
+        let restarted = Arc::new(McpClientManager::new());
+        restarted.set_oauth_store(Arc::new(FailOnceDeleteStore {
+            inner: Arc::clone(&durable),
+            fail_next: std::sync::atomic::AtomicBool::new(true),
+            fail_cancellation: true,
+        }));
+        let result = restarted
+            .reload_from_configs(vec![("remote".into(), config.clone())])
+            .await;
+        assert_eq!(result.failed.len(), 1);
+        assert!(restarted.servers.read().await.is_empty());
+        let statuses = restarted.status().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, crate::McpConnState::Failed);
+        assert_eq!(statuses[0].tool_count, 0);
+        assert!(statuses[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("cancellation"));
+        assert_eq!(durable.pending_removals().await.unwrap(), vec!["remote"]);
+        assert_eq!(
+            durable.token("remote").await.unwrap().unwrap().access_token,
+            "at-1"
+        );
+        server.push_responses(handshake_responses("sess-2"));
+        assert!(restarted
+            .reload_from_configs(vec![("remote".into(), config)])
+            .await
+            .failed
+            .is_empty());
+        restarted.await_background_tasks().await;
+        assert_eq!(restarted.status().await.len(), 1);
+        assert_eq!(
+            restarted.status().await[0].state,
+            crate::McpConnState::Ready
+        );
+        assert!(durable.pending_removals().await.unwrap().is_empty());
+        assert_eq!(
+            durable.token("remote").await.unwrap().unwrap().access_token,
+            "at-1"
+        );
+        server.push_responses(vec![delete_ack()]);
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn denied_removal_keeps_failed_credential_completion_visible() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = ready_refreshable_manager(&server).await;
@@ -6741,6 +6809,7 @@ mod tests {
         manager.set_oauth_store(Arc::new(FailOnceDeleteStore {
             inner: Arc::clone(&durable),
             fail_next: std::sync::atomic::AtomicBool::new(true),
+            fail_cancellation: false,
         }));
         *server.routes.delete_bearer.lock().unwrap() = None;
         server.push_responses(vec![delete_ack()]);
@@ -6793,6 +6862,7 @@ mod tests {
             manager.set_oauth_store(Arc::new(FailOnceDeleteStore {
                 inner: Arc::clone(&durable),
                 fail_next: std::sync::atomic::AtomicBool::new(true),
+                fail_cancellation: false,
             }));
             assert!(manager
                 .finish_oauth_refresh("remote", &handle, &permit, outcome)
@@ -6834,6 +6904,7 @@ mod tests {
                     retried.set_oauth_store(Arc::new(FailOnceDeleteStore {
                         inner: Arc::clone(&durable),
                         fail_next: std::sync::atomic::AtomicBool::new(true),
+                        fail_cancellation: false,
                     }));
                     assert_eq!(retried.reload_from_configs(vec![]).await.failed.len(), 1);
                     assert_eq!(retried.status().await[0].state, crate::McpConnState::Failed);
@@ -6883,6 +6954,7 @@ mod tests {
         manager.set_oauth_store(Arc::new(FailOnceDeleteStore {
             inner: manager.oauth.store(),
             fail_next: std::sync::atomic::AtomicBool::new(true),
+            fail_cancellation: false,
         }));
         server.route("/token", token_response("at-2", Some("rt-2"), None));
         server.push_responses(vec![delete_ack()]);
