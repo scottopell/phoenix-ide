@@ -8348,7 +8348,7 @@ mod tests {
                 descriptor.flush().unwrap();
                 std::mem::forget(descriptor);
             },
-            quarantine_has_external_writer,
+            super::quarantine_has_external_writer,
         )
         .await
         .unwrap();
