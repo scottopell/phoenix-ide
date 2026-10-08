@@ -9015,7 +9015,7 @@ mod scope_liveness_tests {
             RouteCloseAttemptToRepairRequest,
         };
 
-        let mut manager = test_manager().await;
+        let manager = test_manager().await;
         let writer_observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observations = Arc::clone(&writer_observations);
         manager.set_test_ambient_writer_observer(Arc::new(move |_| {

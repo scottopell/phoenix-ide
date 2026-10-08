@@ -1384,26 +1384,15 @@ impl RuntimeManager {
                             };
                             #[cfg(test)]
                             let tombstone_recovery =
-                                if let Some(inspect_writer) = test_writer_observer {
-                                    resume_final_worktree_tombstone_with_writer_inspection(
-                                        cleanup_plan
-                                            .final_tombstone
-                                            .as_ref()
-                                            .expect("filtered above"),
-                                        &identity,
-                                        bind_object,
-                                        |path| inspect_writer(path),
-                                    )
-                                } else {
-                                    resume_final_worktree_tombstone(
-                                        cleanup_plan
-                                            .final_tombstone
-                                            .as_ref()
-                                            .expect("filtered above"),
-                                        &identity,
-                                        bind_object,
-                                    )
-                                };
+                                resume_final_worktree_tombstone_with_writer_inspection(
+                                    cleanup_plan
+                                        .final_tombstone
+                                        .as_ref()
+                                        .expect("filtered above"),
+                                    &identity,
+                                    bind_object,
+                                    move |path| test_writer_observer(path),
+                                );
                             #[cfg(not(test))]
                             let tombstone_recovery = resume_final_worktree_tombstone(
                                 cleanup_plan
@@ -1702,9 +1691,10 @@ impl RuntimeManager {
                                     },
                                     move |path| {
                                         #[cfg(test)]
-                                        if let Some(observer) = &test_writer_observer {
-                                            return observer(path);
+                                        {
+                                            return test_writer_observer(path);
                                         }
+                                        #[cfg(not(test))]
                                         quarantine_has_external_writer(path)
                                     },
                                 )
