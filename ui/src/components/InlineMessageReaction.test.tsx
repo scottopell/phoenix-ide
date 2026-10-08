@@ -144,19 +144,19 @@ describe('inline message reactions', () => {
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('floating');
   });
 
-  it('uses the latest gesture when the same quote is reselected on a hybrid device', async () => {
+  it('does not let unrelated touch scrolling retarget an unchanged mouse selection', async () => {
     setCoarsePointer(true);
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} />);
     const text = screen.getByTestId('old').firstChild!;
-    fireEvent.pointerDown(text, { pointerType: 'touch' });
-    select(text);
-    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     fireEvent.pointerDown(text, { pointerType: 'mouse' });
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'mouse' });
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId('unrelated'), { pointerType: 'touch' });
+    fireEvent.pointerUp(screen.getByTestId('unrelated'), { pointerType: 'touch' });
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('floating');
+    expect(screen.getByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
   });
 
   it('keeps keyboard selection in the floating pill on a hybrid device', async () => {

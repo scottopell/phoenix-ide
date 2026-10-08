@@ -52,11 +52,15 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
         selectedRange.current = selected.range.cloneRange();
         const sameSource = current?.source.messageId === selected.source.messageId
           && current.source.occurrenceToken === selected.source.occurrenceToken
-          && current.source.quote === selected.source.quote;
-        const touchDocked = selectionInput.current !== null
-          ? selectionInput.current === 'touch'
-          : sameSource
-            ? current.presentation === 'touch-docked'
+          && current.source.quote === selected.source.quote
+          && current.source.textAnchor?.start.fragmentId === selected.source.textAnchor?.start.fragmentId
+          && current.source.textAnchor?.start.offset === selected.source.textAnchor?.start.offset
+          && current.source.textAnchor?.end.fragmentId === selected.source.textAnchor?.end.fragmentId
+          && current.source.textAnchor?.end.offset === selected.source.textAnchor?.end.offset;
+        const touchDocked = sameSource
+          ? current.presentation === 'touch-docked'
+          : selectionInput.current !== null
+            ? selectionInput.current === 'touch'
             : window.matchMedia?.('(any-pointer: coarse)').matches ?? false;
         store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: touchDocked ? 'touch-docked' : 'floating' });
         selectionInput.current = null;
