@@ -5212,6 +5212,21 @@ mod tests {
 
     #[async_trait]
     impl crate::OAuthStore for FailOnceDeleteStore {
+        async fn record_removal(&self, name: &str) -> Result<(), String> {
+            self.inner.record_removal(name).await
+        }
+        async fn pending_removals(&self) -> Result<Vec<String>, String> {
+            self.inner.pending_removals().await
+        }
+        async fn cancel_removal(&self, name: &str) -> Result<(), String> {
+            self.inner.cancel_removal(name).await
+        }
+        async fn complete_removal(&self, name: &str) -> Result<(), String> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err("injected token deletion failure".into());
+            }
+            self.inner.complete_removal(name).await
+        }
         async fn registration(
             &self,
             issuer: &str,
@@ -5246,6 +5261,18 @@ mod tests {
 
     #[async_trait]
     impl crate::OAuthStore for FailingRefreshStore {
+        async fn record_removal(&self, name: &str) -> Result<(), String> {
+            self.inner.record_removal(name).await
+        }
+        async fn pending_removals(&self) -> Result<Vec<String>, String> {
+            self.inner.pending_removals().await
+        }
+        async fn cancel_removal(&self, name: &str) -> Result<(), String> {
+            self.inner.cancel_removal(name).await
+        }
+        async fn complete_removal(&self, name: &str) -> Result<(), String> {
+            self.inner.complete_removal(name).await
+        }
         async fn registration(
             &self,
             issuer: &str,
@@ -6634,6 +6661,15 @@ mod tests {
                 !cleanup_succeeds
             );
             assert!(pending_auth_url(&manager).await.is_none());
+            if cleanup_succeeds {
+                assert!(manager
+                    .oauth
+                    .store()
+                    .pending_removals()
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
             if !cleanup_succeeds {
                 assert!(matches!(
                     handle.snapshot().state,
@@ -6667,6 +6703,158 @@ mod tests {
                 server.push_responses(vec![delete_ack()]);
                 manager.shutdown().await;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_removal_keeps_failed_credential_completion_visible() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = ready_refreshable_manager(&server).await;
+        let durable = manager.oauth.store();
+        let token = durable.token("remote").await.unwrap().unwrap();
+        let handle = manager.servers.read().await.get("remote").unwrap().clone();
+        let crate::supervisor::RecoveryClaim::Leader(permit) = handle.claim_oauth_recovery(0).await
+        else {
+            panic!("OAuth recovery owner");
+        };
+        manager
+            .step_up_authorization(
+                "remote",
+                &handle,
+                &permit,
+                "Bearer error=\"insufficient_scope\", scope=\"write\"",
+            )
+            .await
+            .unwrap();
+        let state = query_params(&pending_auth_url(&manager).await.unwrap())
+            .remove("state")
+            .unwrap();
+        assert_eq!(manager.reload_from_configs(vec![]).await.failed.len(), 1);
+        let prior_deletes = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.http_method() == "DELETE")
+            .count();
+        durable.upsert_token(&token).await.unwrap();
+        manager.set_oauth_store(Arc::new(FailOnceDeleteStore {
+            inner: Arc::clone(&durable),
+            fail_next: std::sync::atomic::AtomicBool::new(true),
+        }));
+        *server.routes.delete_bearer.lock().unwrap() = None;
+        server.push_responses(vec![delete_ack()]);
+        assert_eq!(
+            manager
+                .fail_oauth_authorization(&state, "access_denied")
+                .await,
+            Some("remote".into())
+        );
+        assert_eq!(manager.status().await[0].state, crate::McpConnState::Failed);
+        assert!(manager.servers.read().await.contains_key("remote"));
+        assert!(durable.token("remote").await.unwrap().is_some());
+        assert_eq!(durable.pending_removals().await.unwrap(), vec!["remote"]);
+        assert!(manager.reload_from_configs(vec![]).await.failed.is_empty());
+        assert!(manager.status().await.is_empty());
+        assert!(durable.token("remote").await.unwrap().is_none());
+        assert!(durable.pending_removals().await.unwrap().is_empty());
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.http_method() == "DELETE")
+                .count(),
+            prior_deletes + 1
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn deferred_removal_token_failure_stays_visible_and_resumes_after_restart() {
+        for resume in ["live", "restart", "readd"] {
+            let server = TestServer::start(handshake_responses("sess-1")).await;
+            let manager = ready_refreshable_manager(&server).await;
+            let handle = manager.servers.read().await.get("remote").unwrap().clone();
+            let config = handle.snapshot().config;
+            let crate::supervisor::RecoveryClaim::Leader(permit) =
+                handle.claim_oauth_recovery(handle.snapshot().epoch).await
+            else {
+                panic!("refresh owner")
+            };
+            assert!(handle.defer_oauth_removal().await);
+            server.route("/token", token_response("at-2", Some("rt-2"), None));
+            server.push_responses(vec![delete_ack()]);
+            let outcome = manager
+                .refresh_authorized_server("remote", &handle, &permit, None)
+                .await;
+            let durable = manager.oauth.store();
+            manager.set_oauth_store(Arc::new(FailOnceDeleteStore {
+                inner: Arc::clone(&durable),
+                fail_next: std::sync::atomic::AtomicBool::new(true),
+            }));
+            assert!(manager
+                .finish_oauth_refresh("remote", &handle, &permit, outcome)
+                .await
+                .is_err());
+            assert!(matches!(
+                handle.snapshot().state,
+                crate::supervisor::SupervisorState::Failed
+            ));
+            assert_eq!(manager.status().await[0].state, crate::McpConnState::Failed);
+            assert_eq!(
+                durable.token("remote").await.unwrap().unwrap().access_token,
+                "at-2"
+            );
+            assert_eq!(durable.pending_removals().await.unwrap(), vec!["remote"]);
+            let retried = if resume == "live" {
+                manager.clone()
+            } else {
+                let restarted = Arc::new(McpClientManager::new());
+                restarted.set_oauth_store(Arc::clone(&durable));
+                restarted
+            };
+            if resume == "readd" {
+                server.push_responses(handshake_responses("sess-2"));
+                let result = retried
+                    .reload_from_configs(vec![("remote".into(), config)])
+                    .await;
+                assert!(result.failed.is_empty());
+                retried.await_background_tasks().await;
+                assert_eq!(retried.status().await[0].state, crate::McpConnState::Ready);
+                assert_eq!(
+                    durable.token("remote").await.unwrap().unwrap().access_token,
+                    "at-2"
+                );
+                server.push_responses(vec![delete_ack()]);
+                retried.shutdown().await;
+            } else {
+                if resume == "restart" {
+                    retried.set_oauth_store(Arc::new(FailOnceDeleteStore {
+                        inner: Arc::clone(&durable),
+                        fail_next: std::sync::atomic::AtomicBool::new(true),
+                    }));
+                    assert_eq!(retried.reload_from_configs(vec![]).await.failed.len(), 1);
+                    assert_eq!(retried.status().await[0].state, crate::McpConnState::Failed);
+                    assert!(retried.servers.read().await.is_empty());
+                }
+                let result = retried.reload_from_configs(vec![]).await;
+                assert_eq!(result.removed, vec!["remote"]);
+                assert!(retried.status().await.is_empty());
+                assert!(durable.token("remote").await.unwrap().is_none());
+            }
+            assert!(durable.pending_removals().await.unwrap().is_empty());
+            assert_eq!(
+                server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.http_method() == "DELETE")
+                    .count(),
+                1 + usize::from(resume == "readd")
+            );
         }
     }
 
@@ -6705,7 +6893,7 @@ mod tests {
         assert!(error.contains("injected token deletion failure"));
         assert!(matches!(
             handle.snapshot().state,
-            crate::supervisor::SupervisorState::Removed
+            crate::supervisor::SupervisorState::Failed
         ));
         *server.routes.delete_bearer.lock().unwrap() = None;
         server.push_responses(handshake_responses("sess-2"));

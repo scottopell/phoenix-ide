@@ -371,6 +371,13 @@ and recovery epoch until authenticated cleanup finishes, then delete the token
 and forget the server without reconnecting. Re-adding the same configuration
 SHALL restore reconnect intent. A rejected grant during deferred removal SHALL
 transfer cleanup-only intent to the new authorization flow.
+Removal intent SHALL be persisted before admitting credential cleanup. A token
+deletion failure SHALL retain a visible, non-callable cleanup owner and SHALL
+not report completed removal. Startup and reload SHALL retry persisted credential
+removals whose server name remains absent from configuration; re-adding the name
+SHALL cancel that intent without deleting the grant. Token deletion and durable
+removal completion SHALL commit atomically. This restart recovery covers stored
+credentials and removal intent; it does not recover volatile HTTP session identifiers.
 A changed configuration requested during owned OAuth cleanup SHALL queue the
 new configuration while retaining the old resource's grant and cleanup plan.
 THE SYSTEM SHALL finish authenticated cleanup before invalidating that grant

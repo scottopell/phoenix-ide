@@ -233,3 +233,13 @@ configuration; explicit retry invalidates the grant before new authorization.
 `expired_cleanup_retry_preserves_challenge_discovery_and_completed_step_up`
 requires challenge-only discovery for expired cleanup retry after refresh or
 completed scope upgrade, covering both reconnect and removal without repeat sign-in.
+
+`deferred_removal_token_failure_stays_visible_and_resumes_after_restart` covers
+credential deletion failure after authenticated cleanup, visible failed ownership,
+live retry, startup retry failure and success, and cancellation on re-addition.
+`denied_removal_keeps_failed_credential_completion_visible` verifies denied
+authorization follows the same atomic completion contract.
+`mcp_removal_intent_survives_restart_and_commits_atomically` verifies SQLite
+intent survives grant rotation and reopening, failed completion rolls back token
+deletion, and cancellation preserves the grant. Migration 118 adds durable
+removal intents; ADR-086 bounds restart recovery to stored credentials and intent.

@@ -1962,6 +1962,7 @@ pub struct McpClientManager {
     /// cleared when the server connects or its flow is cancelled. This is the
     /// structured `pending_auth_url` the status API serves (REQ-MCP-013).
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+    removal_errors: Arc<RwLock<HashMap<String, String>>>,
     #[cfg(test)]
     background_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// OAuth lifecycle state: the token/registration store, the local
@@ -1986,6 +1987,7 @@ impl McpClientManager {
             disabled_servers: Arc::new(RwLock::new(std::collections::HashSet::new())),
             reload_serial: Arc::new(tokio::sync::Mutex::new(())),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+            removal_errors: Arc::default(),
             #[cfg(test)]
             background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             oauth: Arc::new(OAuthRuntime::default()),
@@ -2265,7 +2267,10 @@ impl McpClientManager {
                     handle.deny_oauth(epoch, error.clone(), plan).await;
                     return Err(error);
                 }
-                match handle.remove_after_oauth(epoch, record.access_token).await {
+                match handle
+                    .finish_oauth_cleanup(epoch, record.access_token)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(format!(
@@ -2277,8 +2282,7 @@ impl McpClientManager {
                         return Err(error);
                     }
                 }
-                self.oauth.delete_token(&name).await?;
-                self.remove_current_handle(&name, &handle).await;
+                self.complete_server_removal(&name, &handle).await?;
                 return Ok(name);
             }
         };
@@ -2412,23 +2416,15 @@ impl McpClientManager {
                     .await;
             }
             Some(OAuthFlowOwner::Remove(handle, epoch)) if handle.snapshot().epoch == epoch => {
-                match handle.remove().await {
-                    Ok(()) => match self.oauth.delete_token(&name).await {
-                        Ok(()) => self.remove_current_handle(&name, &handle).await,
-                        Err(error) => {
-                            tracing::warn!(server = %name, %error, "OAuth denial removal token cleanup failed");
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(server = %name, %error, "OAuth denial removal session cleanup failed");
-                        handle
-                            .deny_oauth(
-                                handle.snapshot().epoch,
-                                format!("authorization failed: {error}"),
-                                plan,
-                            )
-                            .await;
-                    }
+                if let Err(error) = self.complete_server_removal(&name, &handle).await {
+                    tracing::warn!(server = %name, %error, "OAuth denial removal cleanup failed");
+                    handle
+                        .deny_oauth_cleanup(
+                            handle.snapshot().epoch,
+                            format!("authorization failed: {error}"),
+                            plan,
+                        )
+                        .await;
                 }
             }
             Some(OAuthFlowOwner::Remove(_, _)) | None => {}
@@ -3301,6 +3297,20 @@ impl McpClientManager {
                     .flatten(),
             });
         }
+        for (name, error) in self.removal_errors.read().await.iter() {
+            statuses.push(McpServerStatus {
+                name: name.clone(),
+                state: McpConnState::Failed,
+                transport: McpTransportKind::Http,
+                auth: McpAuthKind::Oauth,
+                tool_count: 0,
+                tools: vec![],
+                enabled: !disabled.contains(name),
+                pending_oauth_url: None,
+                last_error: Some(error.clone()),
+                auth_redirect_warning: None,
+            });
+        }
         statuses
     }
 
@@ -3896,12 +3906,9 @@ impl McpClientManager {
         match outcome {
             RefreshServerOutcome::Refreshed(plan) => {
                 if matches!(handle.snapshot().recovery_target, RecoveryTarget::Remove) {
-                    handle.remove().await.map_err(McpToolCallError::Failed)?;
-                    self.oauth
-                        .delete_token(server_name)
+                    self.complete_server_removal(server_name, handle)
                         .await
                         .map_err(McpToolCallError::Failed)?;
-                    self.remove_current_handle(server_name, handle).await;
                     return Ok(());
                 }
                 let reconfigured = matches!(
@@ -3976,6 +3983,30 @@ impl McpClientManager {
                 }
             }
         }
+    }
+
+    async fn complete_server_removal(
+        &self,
+        name: &str,
+        handle: &SupervisorHandle,
+    ) -> Result<(), String> {
+        if let Err(error) = self.oauth.store().record_removal(name).await {
+            handle.fail(handle.snapshot().epoch, error.clone()).await;
+            return Err(error);
+        }
+        let epoch = handle.prepare_removal().await?;
+        if let Err(error) = self.oauth.store().complete_removal(name).await {
+            handle.fail(epoch, error.clone()).await;
+            return Err(error);
+        }
+        self.oauth
+            .unpersisted_refresh_tokens
+            .lock()
+            .unwrap()
+            .remove(name);
+        handle.remove().await?;
+        self.remove_current_handle(name, handle).await;
+        Ok(())
     }
 
     pub async fn reload(&self) -> McpReloadResult {
@@ -4079,16 +4110,7 @@ impl McpClientManager {
                 .await
             };
         Some(match outcome {
-            RefreshServerOutcome::Refreshed(_) => match handle.remove().await {
-                Ok(()) => match self.oauth.delete_token(name).await {
-                    Ok(()) => {
-                        self.remove_current_handle(name, handle).await;
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(error),
-            },
+            RefreshServerOutcome::Refreshed(_) => self.complete_server_removal(name, handle).await,
             RefreshServerOutcome::Transient(error) => {
                 self.spawn_refresh_retry(
                     name.to_owned(),
@@ -4130,11 +4152,49 @@ impl McpClientManager {
         let mut failed = Vec::new();
         let mut removed = Vec::new();
         let mut pending_removals = Vec::new();
+        match self.oauth.store().pending_removals().await {
+            Ok(names) => {
+                for name in names {
+                    if desired.contains_key(&name) || self.servers.read().await.contains_key(&name)
+                    {
+                        continue;
+                    }
+                    let gate = self.oauth.mutation_gate(&name);
+                    let _mutations = gate.lock().await;
+                    match self.oauth.store().complete_removal(&name).await {
+                        Ok(()) => {
+                            self.removal_errors.write().await.remove(&name);
+                            removed.push(name);
+                        }
+                        Err(error) => {
+                            self.removal_errors
+                                .write()
+                                .await
+                                .insert(name.clone(), error.clone());
+                            failed.push(McpReloadFailure {
+                                server: name,
+                                action: "remove".to_owned(),
+                                error,
+                            });
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "Cannot read pending MCP credential removals"),
+        }
         for name in removed_names {
             let gate = self.oauth.mutation_gate(&name);
             let _mutations = gate.lock().await;
             let handle = { self.servers.read().await.get(&name).cloned() };
             if let Some(handle) = handle {
+                if let Err(error) = self.oauth.store().record_removal(&name).await {
+                    failed.push(McpReloadFailure {
+                        server: name,
+                        action: "remove".to_owned(),
+                        error,
+                    });
+                    continue;
+                }
                 if handle.defer_oauth_removal().await {
                     pending_removals.push(name);
                     continue;
@@ -4151,10 +4211,7 @@ impl McpClientManager {
                     continue;
                 }
                 let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
-                let removal = match handle.remove().await {
-                    Ok(()) => self.oauth.delete_token(&name).await,
-                    Err(error) => Err(error),
-                };
+                let removal = self.complete_server_removal(&name, &handle).await;
                 match removal {
                     Ok(()) => {
                         self.remove_current_handle(&name, &handle).await;
@@ -4197,6 +4254,15 @@ impl McpClientManager {
         for (name, config) in desired {
             let gate = self.oauth.mutation_gate(&name);
             let mutations = gate.lock().await;
+            if let Err(error) = self.oauth.store().cancel_removal(&name).await {
+                failed.push(McpReloadFailure {
+                    server: name,
+                    action: "restart".to_owned(),
+                    error,
+                });
+                continue;
+            }
+            self.removal_errors.write().await.remove(&name);
             let existing = self.servers.read().await.get(&name).cloned();
             if existing.is_none() {
                 let stale_flow = self.oauth.pending.lock().unwrap().remove(&name);

@@ -295,16 +295,6 @@ impl SupervisorHandle {
             .await
     }
 
-    pub(crate) async fn remove_after_oauth(
-        &self,
-        epoch: u64,
-        access_token: String,
-    ) -> Result<bool, String> {
-        self.oauth_cleanup(epoch, access_token, OAuthCleanupNext::Remove)
-            .await
-            .map(|epoch| epoch.is_some())
-    }
-
     async fn oauth_cleanup(
         &self,
         epoch: u64,
@@ -497,6 +487,17 @@ impl SupervisorHandle {
         receive.await.ok().flatten()
     }
 
+    pub(crate) async fn prepare_removal(&self) -> Result<u64, String> {
+        let (reply, receive) = oneshot::channel();
+        self.mailbox
+            .send(Command::PrepareRemoval { reply })
+            .await
+            .map_err(|_| "MCP supervisor stopped".to_owned())?;
+        receive
+            .await
+            .map_err(|_| "MCP supervisor stopped".to_owned())?
+    }
+
     pub(crate) async fn defer_oauth_removal(&self) -> bool {
         self.defer_oauth_transition(RecoveryTarget::Remove).await
     }
@@ -622,7 +623,6 @@ pub(crate) enum RecoveryClaim {
 }
 
 enum OAuthCleanupNext {
-    Remove,
     Recovering,
     Reconnect(McpServerConfig),
 }
@@ -651,6 +651,9 @@ enum OAuthFailureCause {
 }
 
 enum Command {
+    PrepareRemoval {
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
     OAuthRetryPlan {
         epoch: u64,
         reply: oneshot::Sender<Option<OAuthRetryPlan>>,
@@ -1338,11 +1341,6 @@ impl Actor {
                 match self.stop_server().await {
                     Ok(()) => {
                         match next {
-                            OAuthCleanupNext::Remove => {
-                                self.epoch = self.epoch.wrapping_add(1);
-                                self.recovery_from = None;
-                                self.state = SupervisorState::Removed;
-                            }
                             OAuthCleanupNext::Recovering => {
                                 self.state = SupervisorState::Recovering;
                             }
@@ -1491,6 +1489,21 @@ impl Actor {
                         .await;
                 }
                 let _ = reply.send(current);
+            }
+            Command::PrepareRemoval { reply } => {
+                for cancellation in self.active_calls.values() {
+                    cancellation.cancel();
+                }
+                self.active_calls.clear();
+                self.epoch = self.epoch.wrapping_add(1);
+                self.snapshot.recovery_target = RecoveryTarget::Remove;
+                let result = self.stop_server().await;
+                self.recovery_from = None;
+                if result.is_ok() {
+                    self.state = SupervisorState::Recovering;
+                }
+                self.publish_snapshot(result.as_ref().err().cloned(), None);
+                let _ = reply.send(result.map(|()| self.epoch));
             }
             Command::Remove { reply } | Command::Shutdown { reply } => {
                 for cancellation in self.active_calls.values() {

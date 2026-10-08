@@ -87,4 +87,29 @@ impl OAuthStore for DbOAuthStore {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn record_removal(&self, name: &str) -> Result<(), String> {
+        self.db
+            .record_mcp_oauth_removal(name)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn pending_removals(&self) -> Result<Vec<String>, String> {
+        self.db
+            .pending_mcp_oauth_removals()
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn cancel_removal(&self, name: &str) -> Result<(), String> {
+        self.db
+            .cancel_mcp_oauth_removal(name)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn complete_removal(&self, name: &str) -> Result<(), String> {
+        self.db
+            .complete_mcp_oauth_removal(name)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }

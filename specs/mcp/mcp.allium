@@ -88,6 +88,10 @@ entity OAuthRegistration {
     token_endpoint_auth_method: String
 }
 
+entity OAuthTokenRemoval {
+    server_name: String
+}
+
 -- Persisted OAuth tokens (plaintext in SQLite, consistent with existing
 -- operator-state storage). Looked up by server_name but audience-bound to
 -- `resource` (the canonical resource URI): a stored, unexpired token is reused
@@ -674,6 +678,9 @@ rule RemovedServerTokenRefreshed {
         -- Refresh and transfer the bearer before authenticated cleanup. Forget
         -- the token and handle after cleanup succeeds, without initializing a
         -- replacement. Cleanup failure retains ownership and the recovered bearer.
+        -- Persist removal intent before admitting cleanup. Keep the owner
+        -- non-callable until token deletion and intent completion commit together;
+        -- a failed commit settles visibly as failed and retains retry ownership.
 }
 
 -- Refresh failed: discard the stale token so it cannot be reused or
@@ -827,7 +834,7 @@ rule ReloadClearsHttpSession {
 -- or its config moved away from OAuth
 -- (to static/none) without changing the URL. Either way the stored token must
 -- not survive -- discard it and cancel any pending flow so
--- TokenImpliesOAuthServer is not violated (REQ-MCP-011, REQ-MCP-012). The new
+-- TokenHasOAuthOwner is not violated (REQ-MCP-011, REQ-MCP-012). The new
 -- auth_scheme is applied by ReloadRestartsServer; this rule does not set it.
 -- Fires alongside ReloadRestartsServer.
 rule ReloadInvalidatesOAuth {
@@ -916,7 +923,7 @@ rule ReloadRetriesDeniedAuthorization {
 
 -- Reload found a server gone from config: disconnect and forget it, including
 -- its stored token (otherwise it would orphan a token with no owning server,
--- violating TokenImpliesOAuthServer). The shared OAuthRegistration is NOT
+-- violating TokenHasOAuthOwner). The shared OAuthRegistration is NOT
 -- deleted -- it is keyed by authorization server and may back other servers.
 rule ReloadRemovesServer {
     when: ReloadRemovedServer(srv)
@@ -930,6 +937,10 @@ rule ReloadRemovesServer {
         -- per-authorization-server registration in place for servers that still
         -- share it. HTTP session teardown is the sibling rule below.
         -- Failed teardown retains cleanup ownership.
+        -- Durable removal intent survives grant rejection or rotation. Startup
+        -- and reload retry credential deletion for names still absent from config;
+        -- re-added names cancel the intent before restoring reconnect ownership.
+        -- Restart recovery does not reconstruct volatile HTTP session identifiers.
         -- Cleanup retries use a retained unexpired access token unless DELETE
         -- supplied an authorization challenge. Expiry or authorization rejection
         -- follows the refresh or scope-upgrade path before retrying DELETE.
@@ -1050,9 +1061,10 @@ invariant AuthorizedImpliesToken {
             implies exists t in OAuthTokens where t.server_name = s.name
 }
 
-invariant TokenImpliesOAuthServer {
+invariant TokenHasOAuthOwner {
     for t in OAuthTokens:
         exists s in McpServers where s.name = t.server_name and s.auth_scheme = oauth
+        or exists r in OAuthTokenRemovals where r.server_name = t.server_name
 }
 
 -- Exactly one token per server: refresh-failure and step-up discard the old

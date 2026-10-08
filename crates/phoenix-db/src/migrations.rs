@@ -601,6 +601,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_conversation_tool_policy",
         sql: MIGRATION_117,
     },
+    Migration {
+        version: 118,
+        name: "persist_mcp_token_removals",
+        sql: "CREATE TABLE mcp_oauth_removals (server_name TEXT PRIMARY KEY NOT NULL);",
+    },
 ];
 
 const MIGRATION_117: &str = concat!(
@@ -11890,8 +11895,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(7).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
             vec![
+                (118, "persist_mcp_token_removals"),
                 (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),
