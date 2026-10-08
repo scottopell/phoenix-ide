@@ -2370,7 +2370,7 @@ impl RuntimeManager {
             terminals: crate::terminal::ActiveTerminals::new(),
             close_retirement_leases: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
-            test_ambient_writer_observer: None,
+            test_ambient_writer_observer: Some(Arc::new(|_| Ok(false))),
             close_retirement_execution: ConversationMutexGates::default(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
