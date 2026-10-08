@@ -5864,7 +5864,7 @@ mod tests {
             name: "remote".into(),
             transport: transport.clone(),
             config: http_config(&server.url, HttpAuth::None),
-            tools: std::sync::RwLock::new(Vec::new()),
+            tools: <_>::default(),
             tools_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
             oauth_bearer: bearer,
