@@ -450,7 +450,7 @@ final class AppModel {
     }
 
     private func startAggregateRecoveryIfForeground() {
-        guard isForeground, let api else { return }
+        guard aggregateRecoveryStartupTask == nil, isForeground, let api else { return }
         let generation = apiGeneration
         aggregateRecoveryStartupTask = Task { [weak self] in
             defer { self?.aggregateRecoveryStartupTask = nil }
@@ -591,11 +591,7 @@ final class AppModel {
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
-        guard let api else { return }
-        startAggregateEventStream(
-            api: api,
-            generation: apiGeneration,
-            reconcileOnOpen: true)
+        startAggregateRecoveryIfForeground()
     }
 
     private func startAggregateEventStream(
@@ -1704,7 +1700,9 @@ final class AppModel {
         credentialGeneration: UUID = ConversationSession.defaultTestingCredentialGeneration
     ) {
         apiGeneration &+= 1
-        aggregateRecoveryAllowedGeneration = apiGeneration
+        aggregateRecoveryAllowedGeneration = nil
+        aggregateRecoveryStartupTask?.cancel()
+        aggregateRecoveryStartupTask = nil
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
@@ -1713,6 +1711,15 @@ final class AppModel {
         credential = testCredential
         credentialLoadFailed = false
         api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)
+    }
+
+    func installAPIAndAwaitRecoveryForTesting(
+        baseURL: URL = URL(string: "http://127.0.0.1:1")!,
+        credentialGeneration: UUID = ConversationSession.defaultTestingCredentialGeneration
+    ) async {
+        installAPIForTesting(baseURL: baseURL, credentialGeneration: credentialGeneration)
+        startAggregateRecoveryIfForeground()
+        await aggregateRecoveryStartupTask?.value
     }
 
     var apiGenerationForTesting: Int { apiGeneration }
@@ -1768,9 +1775,9 @@ final class AppModel {
         aggregateRecoveryStartupGeneration
     }
 
-    func startAggregateEventStreamForTesting() {
-        guard let api else { return }
-        startAggregateEventStream(api: api, generation: apiGeneration)
+    func startAggregateEventStreamForTesting() async {
+        startAggregateRecoveryIfForeground()
+        await aggregateRecoveryStartupTask?.value
     }
 
     func fenceProductCloseForTesting(
@@ -1976,12 +1983,7 @@ final class AppModel {
 
     func foregrounded() {
         isForeground = true
-        if let api {
-            startAggregateEventStream(
-                api: api,
-                generation: apiGeneration,
-                reconcileOnOpen: true)
-        }
+        startAggregateRecoveryIfForeground()
     }
 
     private func locallyOwnedOrdinaryAggregates() -> [String: Set<String>] {
@@ -2232,9 +2234,26 @@ final class AppModel {
                 // Open sessions already drain via their own triggers.
                 continue
             }
-            guard let entries = DiskStore.loadVersioned(
-                [OutboxEntry].self, name: name, version: Outbox.schemaVersion),
-                  entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
+            let currentScope = ConversationSession.persistenceScope(
+                for: api, credentialGeneration: credential?.generation)
+            let entries: [OutboxEntry]
+            if let stored = DiskStore.loadVersioned(
+                Outbox.ScopedEntries.self, name: name, version: Outbox.schemaVersion),
+               stored.persistenceScope == currentScope
+            {
+                entries = stored.entries
+            } else if let legacyEntries = DiskStore.loadVersioned(
+                [OutboxEntry].self, name: name, version: 2),
+                ConversationSession.hasAuthoritativeSnapshot(
+                    conversationId: conversationId, persistenceScope: currentScope),
+                Outbox.migrateV2(
+                    conversationId: conversationId,
+                    persistenceScope: currentScope,
+                    entries: legacyEntries)
+            {
+                entries = legacyEntries
+            } else { continue }
+            guard entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
             else { continue }
             let drainSession: ConversationSession
             if let existing = drainSessions[conversationId] {

@@ -42,6 +42,13 @@ final class OutboxTests: XCTestCase {
             attemptCount: 0)
     }
 
+    @MainActor
+    private func persist(_ entries: [OutboxEntry], conversationId: String) {
+        XCTAssertTrue(DiskStore.saveVersioned(
+            Outbox.ScopedEntries(persistenceScope: "testing", entries: entries),
+            name: "outbox-\(conversationId)", version: Outbox.schemaVersion))
+    }
+
     // MARK: - EnqueueLocalMessage
 
     @MainActor
@@ -226,8 +233,7 @@ final class OutboxTests: XCTestCase {
         let entry = makeEntry(
             conversationId: "c1", status: .recoverableInconsistency,
             acceptedByServer: true)
-        DiskStore.saveVersioned(
-            [entry], name: "outbox-c1", version: Outbox.schemaVersion)
+        persist([entry], conversationId: "c1")
         let outbox = Outbox(conversationId: "c1")
 
         outbox.reconcile(authoritativeMessageIds: ["c1:\(entry.localId)"])
@@ -276,7 +282,7 @@ final class OutboxTests: XCTestCase {
         freshDiskStore()
         let foreign = makeEntry(conversationId: "other")
         let mine = makeEntry(conversationId: "c1")
-        DiskStore.save([foreign, mine], name: "outbox-c1")
+        persist([foreign, mine], conversationId: "c1")
         let outbox = Outbox(conversationId: "c1")
         XCTAssertEqual(outbox.entries.map(\.localId), [mine.localId])
     }
@@ -300,7 +306,7 @@ final class OutboxTests: XCTestCase {
             conversationId: "c1", status: .pending, acceptedByServer: true,
             createdAt: Date().addingTimeInterval(-300),
             acceptedAt: Date().addingTimeInterval(-120))
-        DiskStore.save([stale], name: "outbox-c1")
+        persist([stale], conversationId: "c1")
         let outbox = Outbox(conversationId: "c1")
         outbox.surfaceStaleAcceptedEntries(window: 60)
         XCTAssertEqual(outbox.entries[0].status, .recoverableInconsistency)
@@ -316,7 +322,7 @@ final class OutboxTests: XCTestCase {
             conversationId: "c1", status: .pending, acceptedByServer: true,
             createdAt: Date().addingTimeInterval(-3600),
             acceptedAt: Date())
-        DiskStore.save([justAccepted], name: "outbox-c1")
+        persist([justAccepted], conversationId: "c1")
         let outbox = Outbox(conversationId: "c1")
         outbox.surfaceStaleAcceptedEntries(window: 60)
         XCTAssertEqual(outbox.entries[0].status, .pending)
@@ -329,7 +335,7 @@ final class OutboxTests: XCTestCase {
         let steering = makeEntry(
             conversationId: "c1", status: .steeringQueued, acceptedByServer: true,
             createdAt: Date().addingTimeInterval(-3600))
-        DiskStore.save([steering], name: "outbox-c1")
+        persist([steering], conversationId: "c1")
         let outbox = Outbox(conversationId: "c1")
         outbox.surfaceStaleAcceptedEntries(window: 60)
         XCTAssertEqual(outbox.entries[0].status, .steeringQueued)
@@ -343,7 +349,7 @@ final class OutboxTests: XCTestCase {
         let offline = makeEntry(
             conversationId: "c1", status: .pending, acceptedByServer: false,
             createdAt: Date().addingTimeInterval(-3600))
-        DiskStore.save([offline], name: "outbox-c1")
+        persist([offline], conversationId: "c1")
         let outbox = Outbox(conversationId: "c1")
         outbox.surfaceStaleAcceptedEntries(window: 60)
         XCTAssertEqual(outbox.entries[0].status, .pending)
@@ -383,7 +389,7 @@ final class OutboxTests: XCTestCase {
         freshDiskStore()
         let conversationId = "c1"
         let historical = makeEntry(conversationId: conversationId)
-        XCTAssertTrue(DiskStore.save([historical], name: "outbox-\(conversationId)"))
+        persist([historical], conversationId: conversationId)
 
         let outbox = Outbox(conversationId: conversationId)
         XCTAssertEqual(outbox.visibleEntries.map(\.localId), [historical.localId])
@@ -403,7 +409,7 @@ final class OutboxTests: XCTestCase {
         let stale = makeEntry(
             conversationId: "c1", status: .recoverableInconsistency, acceptedByServer: true,
             createdAt: Date().addingTimeInterval(-120))
-        DiskStore.save([stale], name: "outbox-c1")
+        persist([stale], conversationId: "c1")
 
         let outbox = Outbox(conversationId: "c1")
         outbox.retry(stale.localId)

@@ -76,27 +76,35 @@ final class Outbox {
     private let writer: VersionedDiskWriter
     private var latestPersistenceRevision = 0
 
-    /// v2 identifies entries written after persistence-scope authority was introduced.
-    static let schemaVersion = 2
+    struct ScopedEntries: Codable {
+        let persistenceScope: String
+        let entries: [OutboxEntry]
+    }
+
+    static let schemaVersion = 3
     private static let legacySchemaVersion = 1
+    private let persistenceScope: String?
 
     private var storeName: String { "outbox-\(conversationId)" }
 
-    init(conversationId: String) {
+    init(conversationId: String, persistenceScope: String? = "testing") {
         self.conversationId = conversationId
+        self.persistenceScope = persistenceScope
         self.writer = DiskStore.versionedWriter(
             name: "outbox-\(conversationId)", version: Self.schemaVersion)
-        // Rehydrate only entries tagged with this conversation — a foreign
-        // entry can never reconcile here and must not render (spec rule
-        // RehydrateQueueForConversationOnly).
-        switch DiskStore.loadVersionedResult(
-            [OutboxEntry].self, name: storeName, version: Self.schemaVersion)
-        {
-        case .missing:
+        guard let persistenceScope else {
             entries = []
-        case .value(let loaded):
-            entries = loaded.filter { $0.conversationId == conversationId && $0.isVisible }
-        case .incompatible, .unreadable:
+            persistenceHealthy = false
+            storageWritable = false
+            return
+        }
+        switch DiskStore.loadVersionedResult(
+            ScopedEntries.self, name: storeName, version: Self.schemaVersion)
+        {
+        case .missing: entries = []
+        case let .value(stored) where stored.persistenceScope == persistenceScope:
+            entries = stored.entries.filter { $0.conversationId == conversationId && $0.isVisible }
+        case .value, .incompatible, .unreadable:
             entries = []
             persistenceHealthy = false
             storageWritable = false
@@ -124,15 +132,25 @@ final class Outbox {
         }
     }
 
+    static func migrateV2(
+        conversationId: String,
+        persistenceScope: String,
+        entries: [OutboxEntry]
+    ) -> Bool {
+        DiskStore.saveVersioned(
+            ScopedEntries(persistenceScope: persistenceScope, entries: entries),
+            name: "outbox-\(conversationId)", version: Self.schemaVersion)
+    }
+
     static func storedContents(conversationId: String) -> StoredContents {
         let name = "outbox-\(conversationId)"
         switch DiskStore.loadVersionedResult(
-            [OutboxEntry].self, name: name, version: Self.schemaVersion)
+            ScopedEntries.self, name: name, version: Self.schemaVersion)
         {
         case .missing:
             return .empty
-        case .value(let entries):
-            return entries.contains {
+        case let .value(stored):
+            return stored.entries.contains {
                 $0.conversationId == conversationId && $0.isVisible
             } ? .hasVisibleEntries : .empty
         case .incompatible, .unreadable:
@@ -148,7 +166,9 @@ final class Outbox {
         }
         let revision = writer.reserveRevision()
         latestPersistenceRevision = revision
-        let snapshot = entries.filter(\.isVisible)
+        guard let persistenceScope else { return false }
+        let snapshot = ScopedEntries(
+            persistenceScope: persistenceScope, entries: entries.filter(\.isVisible))
         let saved = await writer.save(snapshot, revision: revision)
         if latestPersistenceRevision == revision {
             persistenceHealthy = saved
@@ -163,7 +183,9 @@ final class Outbox {
         }
         let revision = writer.reserveRevision()
         latestPersistenceRevision = revision
-        let snapshot = entries.filter(\.isVisible)
+        guard let persistenceScope else { return }
+        let snapshot = ScopedEntries(
+            persistenceScope: persistenceScope, entries: entries.filter(\.isVisible))
         Task {
             let saved = await writer.save(snapshot, revision: revision)
             guard latestPersistenceRevision == revision else { return }

@@ -132,18 +132,24 @@ final class ConversationSessionReducerTests: XCTestCase {
             .appendingPathComponent("phoenix-session-foreign-v2-\(UUID().uuidString)")
         let api = PhoenixAPI(
             baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        let foreignGeneration = UUID()
+        let currentGeneration = UUID()
         XCTAssertTrue(DiskStore.saveVersioned(
             ScopedSnapshot(
-                persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: UUID()),
+                persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: foreignGeneration),
                 conversation: try conversation(), messages: [], lastSequenceId: 2,
                 transcriptGeneration: 1, syncedAt: Date()),
             name: "conv-c1", version: 2))
-        let entry = await Outbox(conversationId: "c1").enqueue(text: "keep but do not send")
+        let entry = await Outbox(
+            conversationId: "c1",
+            persistenceScope: ConversationSession.persistenceScope(
+                for: api, credentialGeneration: currentGeneration))
+            .enqueue(text: "keep but do not send")
         XCTAssertNotNil(entry)
 
         let session = ConversationSession(
             conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
-            credentialGeneration: UUID())
+            credentialGeneration: currentGeneration)
 
         session.drainOutbox()
         await session.awaitOutboxDrainForTesting()

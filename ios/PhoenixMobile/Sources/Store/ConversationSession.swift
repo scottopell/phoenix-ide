@@ -107,6 +107,15 @@ final class ConversationSession {
         var syncedAt: Date?
     }
 
+    static func hasAuthoritativeSnapshot(
+        conversationId: String,
+        persistenceScope: String
+    ) -> Bool {
+        DiskStore.loadVersioned(
+            Snapshot.self, name: "conv-\(conversationId)", version: snapshotSchemaVersion)?
+            .persistenceScope == persistenceScope
+    }
+
     static func hasAnyCachedSnapshot(conversationId: String) -> Bool {
         DiskStore.loadVersioned(
             Snapshot.self, name: "conv-\(conversationId)", version: snapshotSchemaVersion)?.syncedAt != nil
@@ -202,7 +211,8 @@ final class ConversationSession {
         self.credentialGeneration = credentialGeneration
         self.onConversationUpdate = onConversationUpdate
         self.onHardDeleted = onHardDeleted
-        self.outbox = Outbox(conversationId: conversationId)
+        let scope = Self.persistenceScope(for: api, credentialGeneration: credentialGeneration)
+        self.outbox = Outbox(conversationId: conversationId, persistenceScope: scope)
         self.snapshotWriter = DiskStore.versionedWriter(
             name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)
 

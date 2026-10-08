@@ -511,6 +511,10 @@ migration hook that rewrites the old key domain using authoritative current
 state available at load time
 AND SHALL NOT rely on an indefinite mixed-key fallback during normal runtime
 
+WHEN an outbox migration requires persistence authority that its older payload does not carry
+THE SYSTEM SHALL rewrite it only when a matching authoritative companion snapshot proves that authority
+AND SHALL quarantine unprovable queued entries without delivery, deletion, or overwrite
+
 Changing any persisted struct requires either a version bump plus a
 migration branch, or a field-level note that the change is
 additive-optional (old files decode it as nil/default).

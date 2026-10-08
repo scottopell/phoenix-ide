@@ -55,7 +55,10 @@ final class AppModelProductConversationTests: XCTestCase {
             runtime_role: runtimeRole)
     }
 
-    private func persistReadableSnapshot(conversation: Conversation) {
+    private func persistReadableSnapshot(
+        conversation: Conversation,
+        credentialGeneration: UUID = ConversationSession.defaultTestingCredentialGeneration
+    ) {
         struct Snapshot: Codable {
             var persistenceScope: String
             var conversation: Conversation?
@@ -69,7 +72,8 @@ final class AppModelProductConversationTests: XCTestCase {
 
         DiskStore.saveVersioned(
             Snapshot(
-                persistenceScope: ConversationSession.persistenceScope(for: api),
+                persistenceScope: ConversationSession.persistenceScope(
+                    for: api, credentialGeneration: credentialGeneration),
                 conversation: conversation,
                 messages: [],
                 lastSequenceId: 0,
@@ -234,10 +238,27 @@ final class AppModelProductConversationTests: XCTestCase {
             startupGeneration + 1)
     }
 
-    func testInstallAPIForTestingInvalidatesInheritedAPIWorkBeforeReplacement() {
+    func testForegroundRetriesRecoveryAfterUnreadableFenceIsRepaired() async throws {
+        let aggregateId = "pc-retry-fence"
+        let fenceName = ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId)
+        try Data("not a fence".utf8).write(to: DiskStore.url(for: fenceName))
+        let model = model()
+        model.serverURLString = "http://127.0.0.1:1"
+        _ = await model.awaitAggregateRecoveryStartupForTesting()
+        XCTAssertEqual(model.aggregateRecoveryStartupGenerationForTesting, 0)
+
+        DiskStore.remove(name: fenceName)
+        model.backgrounded()
+        model.foregrounded()
+        let completed = await model.awaitAggregateRecoveryStartupForTesting()
+
+        XCTAssertEqual(completed, 1)
+    }
+
+    func testInstallAPIForTestingInvalidatesInheritedAPIWorkBeforeReplacement() async {
         let model = model()
         let inheritedGeneration = model.apiGenerationForTesting
-        model.startAggregateEventStreamForTesting()
+        await model.startAggregateEventStreamForTesting()
         _ = model.prepareAggregateReconciliationForTesting()
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
         XCTAssertNotNil(model.aggregateReconciliationId)
@@ -249,17 +270,17 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(model.aggregateReconciliationId)
     }
 
-    func testConnectivityRestoreDefersReconciliationUntilStreamIsOpen() {
+    func testConnectivityRestoreReclassifiesBeforeStartingReconciliation() async {
         let model = model()
         model.installAPIForTesting()
         model.connectivity.setOnlineForTesting(false)
-        model.startAggregateEventStreamForTesting()
+        await model.startAggregateEventStreamForTesting()
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
 
         model.connectivity.setOnlineForTesting(true)
 
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
-        XCTAssertNil(model.aggregateReconciliationId)
+        XCTAssertNotNil(model.aggregateReconciliationId)
     }
 
     func testProductConversationDeleteOutcomeCarriesEveryAuthoritativeMember() throws {
@@ -274,15 +295,16 @@ final class AppModelProductConversationTests: XCTestCase {
             .deleted(conversationIds: ["root", "agent"]))
     }
 
-    func testForegroundRestoreDefersReconciliationUntilStreamIsReady() {
+    func testForegroundRestoreReclassifiesBeforeStreamAdmission() async {
         let model = model()
         model.installAPIForTesting()
         model.backgrounded()
 
         model.foregrounded()
+        _ = await model.awaitAggregateRecoveryStartupForTesting()
 
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
-        XCTAssertNil(model.aggregateReconciliationId)
+        XCTAssertNotNil(model.aggregateReconciliationId)
     }
 
     func testStaleAggregateReconciliationCannotOverwriteNewerAppliedList() async {
@@ -740,7 +762,8 @@ final class AppModelProductConversationTests: XCTestCase {
         let model = model()
         model.listStore.replaceAndPersistForTesting([deletedRow])
         XCTAssertTrue(DiskStore.saveVersioned(
-            [unrelated], name: "outbox-unrelated-owner", version: Outbox.schemaVersion))
+            Outbox.ScopedEntries(persistenceScope: "testing", entries: [unrelated]),
+            name: "outbox-unrelated-owner", version: Outbox.schemaVersion))
         model.listStore.persistCacheOverrideForTesting = { false }
 
         let removed = await model.removeProductHistoryLocallyForTesting(
@@ -756,6 +779,53 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(restarted.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
         XCTAssertFalse(ConversationListStore().conversations.contains { $0.aggregateIdentity == aggregateId })
         XCTAssertEqual(Outbox(conversationId: "unrelated-owner").visibleEntries.map(\.text), ["retain me"])
+    }
+
+    func testUnscopedV2OutboxWithoutSnapshotIsNotAdmittedAcrossCredentialChange() async throws {
+        let conversationId = "v2-cross-credential"
+        let queued = OutboxEntry(
+            localId: "v2-entry", conversationId: conversationId, text: "must remain quarantined",
+            images: [], status: .pending, acceptedByServer: false, createdAt: Date(),
+            acceptedAt: nil, lastError: nil, attemptCount: 0)
+        XCTAssertTrue(DiskStore.saveVersioned(
+            [queued], name: "outbox-\(conversationId)", version: 2))
+
+        let model = self.model()
+        await model.installAPIAndAwaitRecoveryForTesting(
+            baseURL: URL(string: "http://127.0.0.1:1")!, credentialGeneration: UUID())
+        model.drainPersistedOutboxesForTesting()
+
+        XCTAssertNil(model.drainSessionForTesting(conversationId: conversationId))
+        XCTAssertTrue(DiskStore.loadVersioned(
+            [OutboxEntry].self, name: "outbox-\(conversationId)", version: 2)?.contains {
+                $0.localId == queued.localId
+            } == true)
+    }
+
+    func testAuthoritativeSnapshotMigratesV2OutboxToScopedV3() async throws {
+        let conversationId = "v2-authoritative"
+        let queued = OutboxEntry(
+            localId: "v2-authoritative-entry", conversationId: conversationId,
+            text: "migrate only with authority", images: [], status: .pending,
+            acceptedByServer: false, createdAt: Date(), acceptedAt: nil, lastError: nil,
+            attemptCount: 0)
+        let credentialGeneration = UUID()
+        let conversation = self.conversation(id: conversationId)
+        persistReadableSnapshot(
+            conversation: conversation, credentialGeneration: credentialGeneration)
+        XCTAssertTrue(DiskStore.saveVersioned(
+            [queued], name: "outbox-\(conversationId)", version: 2))
+
+        let model = self.model()
+        await model.installAPIAndAwaitRecoveryForTesting(
+            baseURL: URL(string: "http://127.0.0.1:1")!, credentialGeneration: credentialGeneration)
+        model.drainPersistedOutboxesForTesting()
+
+        let owner = try XCTUnwrap(model.drainSessionForTesting(conversationId: conversationId))
+        XCTAssertEqual(owner.outbox.visibleEntries.map(\.text), ["migrate only with authority"])
+        let migrated = DiskStore.loadVersioned(
+            Outbox.ScopedEntries.self, name: "outbox-\(conversationId)", version: 3)
+        XCTAssertEqual(migrated?.entries.map(\.localId), [queued.localId])
     }
 
     func testLegacyOutboxWithoutReadableSnapshotIsNotAdmittedByPersistedSweep() async throws {
@@ -792,13 +862,21 @@ final class AppModelProductConversationTests: XCTestCase {
 
     func testPersistedOutboxIsEnumeratedAndReloadedByItsOwner() async throws {
         let conversationId = "c1"
-        let writer = Outbox(conversationId: conversationId)
+        let baseURL = URL(string: "http://127.0.0.1:1")!
+        let api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)!
+        let credentialGeneration = UUID()
+        let writer = Outbox(
+            conversationId: conversationId,
+            persistenceScope: ConversationSession.persistenceScope(
+                for: api, credentialGeneration: credentialGeneration))
         _ = await writer.enqueue(text: "deliver after restart")
         let persisted = await writer.flushPersistence()
         XCTAssertTrue(persisted)
         XCTAssertTrue(DiskStore.names(withPrefix: "outbox-").contains("outbox-\(conversationId)"))
 
         let model = self.model()
+        await model.installAPIAndAwaitRecoveryForTesting(
+            baseURL: baseURL, credentialGeneration: credentialGeneration)
         model.drainPersistedOutboxesForTesting()
 
         let owner = try XCTUnwrap(model.drainSessionForTesting(conversationId: conversationId))
