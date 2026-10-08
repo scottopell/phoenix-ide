@@ -37,6 +37,8 @@
 //!
 
 mod anthropic;
+#[cfg(feature = "test-support")]
+pub use anthropic::render_anthropic_request_for_test;
 pub mod codex_credential;
 pub mod codex_login;
 pub mod credential_helper;
@@ -185,6 +187,10 @@ pub trait LlmService: Send + Sync {
 
     /// Get the model ID
     fn model_id(&self) -> &str;
+
+    fn continuation_route_key(&self) -> String {
+        self.model_id().to_owned()
+    }
 
     /// True if this service routes through the ChatGPT-backend codex bridge.
     /// Consumed by [`crate::ModelSpec::context_window_for`] to apply the
@@ -518,6 +524,10 @@ impl LlmService for LoggingService {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn continuation_route_key(&self) -> String {
+        self.inner.continuation_route_key()
     }
 
     fn uses_codex_bridge(&self) -> bool {

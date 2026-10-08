@@ -330,28 +330,25 @@ pub struct CodexCredential {
 /// instead of pairing one account's token with another account's model list.
 pub(crate) struct AccountBoundCodexCredential {
     source: Arc<CodexCredential>,
-    account_id: Option<String>,
+    account_id: String,
 }
 
 impl AccountBoundCodexCredential {
     #[must_use]
-    pub(crate) fn new(source: Arc<CodexCredential>, account_id: Option<String>) -> Self {
-        Self { source, account_id }
+    pub(crate) fn new(source: Arc<CodexCredential>, account_id: String) -> Option<Self> {
+        (!account_id.trim().is_empty()).then_some(Self { source, account_id })
     }
 
     #[must_use]
-    pub(crate) fn account_id(&self) -> Option<String> {
-        self.account_id.clone()
+    pub(crate) fn account_id(&self) -> &str {
+        &self.account_id
     }
 }
 
 impl std::fmt::Debug for AccountBoundCodexCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AccountBoundCodexCredential")
-            .field(
-                "account_id",
-                &self.account_id.as_ref().map(|_| "[redacted]"),
-            )
+            .field("account_id", &"[redacted]")
             .finish_non_exhaustive()
     }
 }
@@ -360,7 +357,7 @@ impl std::fmt::Debug for AccountBoundCodexCredential {
 impl CredentialSource for AccountBoundCodexCredential {
     async fn get(&self) -> Option<String> {
         let (token, account_id) = self.source.get_with_account_id().await?;
-        if account_id != self.account_id {
+        if account_id.as_deref() != Some(self.account_id.as_str()) {
             tracing::warn!(
                 "Codex account changed before its model catalog was published; withholding request"
             );
@@ -749,7 +746,7 @@ mod tests {
         )
         .unwrap();
         let (credential, account_id) = CodexCredential::load(path.clone()).unwrap();
-        let bound = AccountBoundCodexCredential::new(credential, account_id);
+        let bound = AccountBoundCodexCredential::new(credential, account_id.unwrap()).unwrap();
         assert_eq!(bound.get().await.as_deref(), Some(first_jwt.as_str()));
 
         let second_jwt = fake_jwt(now_unix() + 7200);
@@ -764,11 +761,11 @@ mod tests {
 
         assert_eq!(bound.get().await, None);
         assert!(!bound.invalidate().await);
-        assert_eq!(bound.account_id().as_deref(), Some("account-a"));
+        assert_eq!(bound.account_id(), "account-a");
     }
 
     #[tokio::test]
-    async fn account_bound_credential_without_account_id_supports_legacy_models() {
+    async fn unbound_credential_can_load_without_account_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let jwt = fake_jwt(now_unix() + 3600);
@@ -780,10 +777,8 @@ mod tests {
         )
         .unwrap();
         let (credential, account_id) = CodexCredential::load(path).unwrap();
-        let bound = AccountBoundCodexCredential::new(credential, account_id);
-
-        assert_eq!(bound.get().await.as_deref(), Some(jwt.as_str()));
-        assert!(!bound.invalidate().await);
+        assert!(account_id.is_none());
+        assert_eq!(credential.get().await.as_deref(), Some(jwt.as_str()));
     }
 
     #[tokio::test]

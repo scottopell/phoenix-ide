@@ -10,7 +10,7 @@
 use crate::state::{SubAgentOutcome, ToolCall};
 use phoenix_core::domain::db_schema::ToolResult;
 use phoenix_core::domain::llm_types::{ContentBlock, Usage};
-use phoenix_core::domain::provider_replay::AnthropicReplayUpdate;
+use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
 use phoenix_core::domain::quota_details::QuotaDetails;
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ pub enum LlmOutcome {
     /// LLM responded successfully
     Response {
         content: Vec<ContentBlock>,
-        provider_replay: Option<AnthropicReplayUpdate>,
+        provider_replay: Option<ProviderReplayUpdate>,
         tool_calls: Vec<ToolCall>,
         end_turn: bool,
         usage: Usage,

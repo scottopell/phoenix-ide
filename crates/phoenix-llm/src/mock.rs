@@ -1005,7 +1005,10 @@ mod tests {
                 }],
             }],
             provider_replay: None,
-            tools: vec![],
+            responses_replay: Vec::new(),
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,

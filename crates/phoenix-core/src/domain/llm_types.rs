@@ -647,7 +647,8 @@ pub struct LlmRequest {
     pub messages: Vec<LlmMessage>,
     /// Durable provider-private replay data for the active exchange, if any.
     pub provider_replay: Option<super::provider_replay::AnthropicReplayPayload>,
-    pub tools: Vec<ToolDefinition>,
+    pub responses_replay: Vec<super::responses_replay::ResponsesResponseSet>,
+    pub tool_availability: super::tool_availability::ToolAvailability,
     pub max_tokens: Option<u32>,
     pub effective_effort: EffectiveEffort,
     pub service_tier: EffectiveServiceTier,
@@ -927,7 +928,8 @@ pub enum ImageSource {
 }
 
 /// Tool definition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -943,7 +945,7 @@ pub struct LlmResponse {
     pub content: Vec<ContentBlock>,
     /// Private replay update returned beside public content. Never persisted as
     /// ordinary message content or serialized to clients.
-    pub provider_replay: Option<super::provider_replay::AnthropicReplayUpdate>,
+    pub provider_replay: Option<super::provider_replay::ProviderReplayUpdate>,
     pub end_turn: bool,
     pub usage: Usage,
     pub stream_telemetry: ProviderStreamTelemetry,
@@ -1066,7 +1068,8 @@ mod attempt_capture_tests {
             system: vec![],
             messages: vec![],
             provider_replay: None,
-            tools: vec![],
+            responses_replay: Vec::new(),
+            tool_availability: crate::domain::tool_availability::ToolAvailability::all(vec![]),
             max_tokens: Some(50),
             effective_effort: EffectiveEffort::native_known(ModelEffort::Max),
             service_tier: EffectiveServiceTier::Standard,

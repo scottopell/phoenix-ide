@@ -974,6 +974,19 @@ invariant SupersededCompletionCannotPublish {
     -- removed state or overwrite newer config.
 }
 
+invariant SchemaBoundInvocationsCannotRetarget {
+    -- At MCP invocation admission, a call carrying its originating request's
+    -- admitted schema selects one live supervisor handle. Tool advertisement
+    -- does not bind a supervisor incarnation across generation or restart.
+    -- Queuing, connection recovery, and retry retain that handle and schema.
+    -- Immediately before tools/call, the supervisor compares the admitted
+    -- schema with its serving connection's cached tool definition. Absence or
+    -- mismatch returns EUNAVAIL without provider I/O. Once the handle is
+    -- selected, reload cannot redirect that invocation to a replacement
+    -- supervisor or a different schema.
+    -- Callers without a schema retain their own invocation contracts.
+}
+
 ------------------------------------------------------------
 -- Deferred
 ------------------------------------------------------------
@@ -998,7 +1011,9 @@ deferred ReAuthCallRetry    -- see: crates/phoenix-tools/src/mcp.rs
     -- and re-issues the same request, so the LLM never sees the interruption.
     -- The ConnState/OAuthPhase machine models the re-authorization/refresh;
     -- holding and replaying the specific call belongs to the tool-execution
-    -- path. Location: crates/phoenix-tools/src/mcp.rs (McpTool::run / call_tool)
+    -- path. Schema-bound calls re-check their admitted definition after recovery
+    -- and return unavailable instead of replaying against a changed definition.
+    -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run / call_tool)
 
 ------------------------------------------------------------
 -- Open Questions

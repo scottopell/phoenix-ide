@@ -444,6 +444,8 @@ function RecallPanel({
     const handleEvent = (evt: ChainSseEventData) => {
       if (evt.type === 'chain_qa_token') {
         dispatch({ type: 'TOKEN_APPENDED', chainQaId: evt.chain_qa_id, delta: evt.delta });
+      } else if (evt.type === 'chain_qa_answer_reset') {
+        dispatch({ type: 'ANSWER_RESET', chainQaId: evt.chain_qa_id });
       } else if (evt.type === 'chain_qa_completed') {
         dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
         void refreshChain(chainRootId);

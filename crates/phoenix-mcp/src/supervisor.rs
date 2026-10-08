@@ -166,11 +166,22 @@ impl SupervisorHandle {
         receive.await.map_err(|_| stopped())?
     }
 
+    #[cfg(test)]
     pub(crate) async fn call(
         &self,
         tool: String,
         arguments: Value,
         cancel: CancellationToken,
+    ) -> Result<CallOutcome, String> {
+        self.call_with_schema(tool, arguments, cancel, None).await
+    }
+
+    pub(crate) async fn call_with_schema(
+        &self,
+        tool: String,
+        arguments: Value,
+        cancel: CancellationToken,
+        expected_schema: Option<Value>,
     ) -> Result<CallOutcome, String> {
         let (reply, receive) = oneshot::channel();
         let deadline = tokio::time::Instant::now()
@@ -178,6 +189,7 @@ impl SupervisorHandle {
             .ok_or_else(|| "MCP tool call timeout exceeds platform deadline range".to_string())?;
         let call_cancel = cancel.child_token();
         let command = Command::Call {
+            expected_schema,
             tool,
             arguments,
             cancel: call_cancel.clone(),
@@ -346,6 +358,7 @@ pub(crate) enum RecoveryClaim {
 }
 
 struct QueuedCall {
+    expected_schema: Option<Value>,
     epoch: u64,
     context: CallContext,
     call_id: u64,
@@ -365,6 +378,7 @@ enum Command {
         reply: oneshot::Sender<Result<u64, String>>,
     },
     Call {
+        expected_schema: Option<Value>,
         tool: String,
         arguments: Value,
         cancel: CancellationToken,
@@ -478,6 +492,7 @@ impl Actor {
                 }
             }
             Command::Call {
+                expected_schema,
                 tool,
                 arguments,
                 cancel,
@@ -498,7 +513,14 @@ impl Actor {
                         return;
                     };
                     tokio::spawn(async move {
-                        let result = context.call_tool(&tool, arguments, &cancel).await;
+                        let result = context
+                            .call_tool_with_schema(
+                                &tool,
+                                arguments,
+                                &cancel,
+                                expected_schema.as_ref(),
+                            )
+                            .await;
                         if let Err(error) = mailbox
                             .send(Command::CallCompleted {
                                 call_id,
@@ -525,6 +547,7 @@ impl Actor {
                         let _ = mailbox.send(Command::CancelQueued { call_id }).await;
                     });
                     self.stdio_queue.push_back(QueuedCall {
+                        expected_schema,
                         epoch,
                         context,
                         call_id,
@@ -774,7 +797,12 @@ impl Actor {
             tokio::spawn(async move {
                 let result = call
                     .context
-                    .call_tool(&call.tool, call.arguments, &call.cancel)
+                    .call_tool_with_schema(
+                        &call.tool,
+                        call.arguments,
+                        &call.cancel,
+                        call.expected_schema.as_ref(),
+                    )
                     .await;
                 if let Err(error) = mailbox
                     .send(Command::CallCompleted {
@@ -946,7 +974,7 @@ mod epoch_tests {
                     attempts: Arc::clone(&attempts),
                     failures_remaining: AtomicUsize::new(failures),
                 }),
-                tools: std::sync::RwLock::new(Vec::new()),
+                tools: Arc::new(std::sync::RwLock::new(Vec::new())),
                 config: stdio_config(),
                 tools_changed: Arc::new(AtomicBool::new(false)),
                 pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
@@ -1003,7 +1031,7 @@ mod epoch_tests {
                     started,
                     releases: Arc::clone(&releases),
                 }),
-                tools: std::sync::RwLock::new(Vec::new()),
+                tools: Arc::new(std::sync::RwLock::new(Vec::new())),
                 config,
                 tools_changed: Arc::new(AtomicBool::new(false)),
                 pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
@@ -1030,6 +1058,61 @@ mod epoch_tests {
             env: HashMap::new(),
             tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
+    }
+
+    #[tokio::test]
+    async fn queued_bound_call_rechecks_actor_schema_at_actual_dispatch() {
+        let (server, mut started, releases) = server(stdio_config());
+        let tools = Arc::clone(&server.tools);
+        let original = serde_json::json!({"type":"object"});
+        *tools.write().unwrap() = vec![crate::McpToolDef {
+            name: "report".into(),
+            description: String::new(),
+            input_schema: original.clone(),
+        }];
+        let handle = SupervisorHandle::connected(server);
+        let first_handle = handle.clone();
+        let first = tokio::spawn(async move {
+            first_handle
+                .call(
+                    "report".into(),
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (reply, receive) = oneshot::channel();
+        handle
+            .mailbox
+            .send(Command::Call {
+                expected_schema: Some(original),
+                tool: "report".into(),
+                arguments: serde_json::json!({}),
+                cancel: CancellationToken::new(),
+                reply,
+            })
+            .await
+            .map_err(|_| "actor mailbox closed")
+            .unwrap();
+        handle.status().await.unwrap();
+        tools.write().unwrap()[0].input_schema =
+            serde_json::json!({"type":"object","required":["new"]});
+        releases.add_permits(2);
+        first.await.unwrap().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), receive)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result.result,Err(McpRequestError::Other(message)) if message.contains("EUNAVAIL"))
+        );
+        assert!(started.try_recv().is_err());
+        handle.remove().await.unwrap();
     }
 
     #[tokio::test]

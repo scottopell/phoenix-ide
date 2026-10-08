@@ -42,7 +42,13 @@ impl Tool for McpTool {
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         let result = self
             .manager
-            .call_tool_cancellable(&self.server_name, &self.tool_name, input, ctx.cancel)
+            .call_tool_cancellable_with_schema(
+                &self.server_name,
+                &self.tool_name,
+                input,
+                ctx.cancel,
+                self.input_schema.clone(),
+            )
             .await;
         match result {
             Ok(text) => ToolOutput::success(text),
@@ -59,12 +65,23 @@ pub async fn create_mcp_tool_by_name(
     manager: &Arc<McpClientManager>,
     full_name: &str,
 ) -> Option<Box<dyn Tool>> {
+    create_mcp_tool_by_name_with_schema(manager, full_name, None).await
+}
+
+pub async fn create_mcp_tool_by_name_with_schema(
+    manager: &Arc<McpClientManager>,
+    full_name: &str,
+    expected_schema: Option<&Value>,
+) -> Option<Box<dyn Tool>> {
     let (server_name, tool_name) = full_name.split_once("__")?;
     let defs = manager.tool_definitions().await;
     let (srv, def) = defs
         .into_iter()
         .find(|(s, d)| s == server_name && d.name == tool_name)?;
 
+    if expected_schema.is_some_and(|expected| *expected != def.input_schema) {
+        return None;
+    }
     let name = format!("{srv}__{}", def.name);
     Some(Box::new(McpTool {
         server_name: srv,
