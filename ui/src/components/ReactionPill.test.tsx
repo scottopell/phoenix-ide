@@ -342,11 +342,16 @@ describe('reaction pill', () => {
       if (typeof listener === 'function') listeners.set(type, listener);
     });
     const scrollTranscriptBy = vi.fn();
-    render(<FocusScopeProvider>
+    const stableBubbleRef = createRef<HTMLDivElement>();
+    const view = render(<FocusScopeProvider>
       <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
-      <ReactionPill source={source} touchDocked scrollTranscriptBy={scrollTranscriptBy} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+      <ReactionPill source={source} touchDocked scrollTranscriptBy={scrollTranscriptBy} bubbleRef={stableBubbleRef} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
     </FocusScopeProvider>);
     await waitFor(() => expect(scrollTranscriptBy).toHaveBeenCalledWith(98));
+    view.rerender(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
+      <ReactionPill source={source} touchDocked scrollTranscriptBy={scrollTranscriptBy} bubbleRef={stableBubbleRef} scopeId="test" body="rerendered" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
     rangeBottom = 620;
     act(() => listeners.get('scroll')?.(new Event('scroll')));
     await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
