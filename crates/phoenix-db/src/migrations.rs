@@ -19649,8 +19649,14 @@ mod tests {
                 "{forbidden}"
             );
         }
-        sqlx::query("INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'prior', 'prior-fp', 'next', 'next-fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree')")
-            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO close_retirement_resource_dispatches VALUES ('attempt', 'scope', 'aggregate', 'fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO close_worktree_cleanup_adoptions VALUES ('attempt', 'scope', 'prior', 'prior-fp', 'aggregate', 'fp', 'worktree', 'worktree', 'worktree_id_v1', 'worktree')")
+            .execute(&pool)
+            .await
+            .unwrap();
         let fabricated: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM close_retained_retirement_inspections")
                 .fetch_one(&pool)
