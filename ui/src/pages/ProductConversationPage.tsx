@@ -1267,8 +1267,14 @@ function ProductConversationPageInner() {
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
-      {isOpen && !closeIncomplete && snapshot.latest_transcript_row_id ? (
-        <div className="product-conversation-page__composer" data-testid="product-conversation-composer">
+      {isOpen && snapshot.latest_transcript_row_id && (
+        <div
+          className="product-conversation-page__composer"
+          data-testid={closeIncomplete
+            ? 'product-conversation-close-live-update-owner'
+            : 'product-conversation-composer'}
+          hidden={closeIncomplete}
+        >
           <EmbeddedConversationPage
             slug={snapshot.latest_transcript_row_id}
             showTranscript={false}
@@ -1282,7 +1288,8 @@ function ProductConversationPageInner() {
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
         </div>
-      ) : (
+      )}
+      {(!isOpen || closeIncomplete) && (
         <div className="product-conversation-page__composer-placeholder" data-testid={closeIncomplete ? 'product-conversation-close-incomplete' : 'product-conversation-history'}>
           {closeIncomplete ? 'Conversation controls are disabled until shutdown is resolved.' : 'History is read-only.'}
         </div>

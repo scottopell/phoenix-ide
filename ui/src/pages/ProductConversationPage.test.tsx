@@ -1389,7 +1389,17 @@ describe('ProductConversationPage', () => {
         expect(resources[index]).toHaveTextContent(text);
       }
       expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
-      expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
+      if (outcome === 'close_incomplete') {
+        expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
+        expect(embeddedConversationPageSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({
+          slug: 'row-2',
+          mutationEnabled: false,
+          aggregateLifecycleOpen: true,
+        }));
+      } else {
+        expect(screen.queryByTestId('product-conversation-close-live-update-owner')).not.toBeInTheDocument();
+        expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
+      }
       expect(screen.queryByRole('button', { name: /Retry exact Close/ })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
       await waitFor(() => expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true));
@@ -1403,6 +1413,7 @@ describe('ProductConversationPage', () => {
       await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
       expect(screen.getByRole('alert', { name: 'Close status' })).toHaveTextContent(label);
       expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
+      expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
     }
   });
 
