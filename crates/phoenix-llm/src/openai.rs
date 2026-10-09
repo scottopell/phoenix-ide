@@ -278,6 +278,7 @@ struct ResponsesStreamAccumulator {
     /// classify the wire shape next time the success path stops working.
     logged_empty_dispatch: bool,
     telemetry: StreamTelemetryRecorder,
+    observed_visible_output: bool,
 }
 
 impl ResponsesStreamAccumulator {
@@ -300,6 +301,7 @@ impl ResponsesStreamAccumulator {
                     .as_ref()
                     .map(|t| t.attempt_capture.clone()),
             ),
+            observed_visible_output: false,
         }
     }
 
@@ -333,6 +335,7 @@ impl ResponsesStreamAccumulator {
                         self.telemetry
                             .record_generation_event_at(now, GenerationKind::Text);
                         self.telemetry.record_visible_text_at(now);
+                        self.observed_visible_output = true;
                         let _ = emit.send(super::TokenChunk::Text(delta.to_string())).await;
                     }
                 }
@@ -604,25 +607,28 @@ impl ResponsesStreamAccumulator {
             "responses_api stream accumulator finalizing"
         );
         let telemetry = self.telemetry;
-        let mut response = normalize_responses_api_response(ResponsesApiResponse {
-            id: self.response_id,
-            model: self.model,
-            status: "completed".to_string(),
-            output: self.output_items.into_values().collect(),
-            usage: ResponsesApiUsage {
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                input_tokens_details: ResponsesApiInputTokensDetails {
-                    cached_tokens: self.cached_tokens,
-                    cache_write_tokens: self.cache_write_tokens,
+        let mut response = normalize_responses_api_response_with_evidence(
+            ResponsesApiResponse {
+                id: self.response_id,
+                model: self.model,
+                status: "completed".to_string(),
+                output: self.output_items.into_values().collect(),
+                usage: ResponsesApiUsage {
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
+                    input_tokens_details: ResponsesApiInputTokensDetails {
+                        cached_tokens: self.cached_tokens,
+                        cache_write_tokens: self.cache_write_tokens,
+                    },
+                    output_tokens_details: self.reasoning_tokens.map(|reasoning_tokens| {
+                        ResponsesApiOutputTokensDetails {
+                            reasoning_tokens: Some(reasoning_tokens),
+                        }
+                    }),
                 },
-                output_tokens_details: self.reasoning_tokens.map(|reasoning_tokens| {
-                    ResponsesApiOutputTokensDetails {
-                        reasoning_tokens: Some(reasoning_tokens),
-                    }
-                }),
             },
-        })?;
+            self.observed_visible_output,
+        )?;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -1255,9 +1261,7 @@ async fn complete_codex_websocket(
             ResponsesBackendRequest::Platform(request) => &request.model,
             ResponsesBackendRequest::CodexLite(request) => &request.model,
         };
-        let response =
-            bind_responses_model(acc.into_response().map_err(CodexWsError::backend)?, model)
-                .map_err(CodexWsError::backend)?;
+        let response = finalize_websocket_response(acc, model)?;
         Ok::<_, CodexWsError>((response, id, server_output))
     }
     .await;
@@ -1331,6 +1335,14 @@ async fn complete_codex_websocket(
             Err(error)
         }
     }
+}
+
+fn finalize_websocket_response(
+    acc: ResponsesStreamAccumulator,
+    model: &str,
+) -> Result<LlmResponse, CodexWsError> {
+    bind_responses_model(acc.into_response().map_err(CodexWsError::backend)?, model)
+        .map_err(CodexWsError::backend)
 }
 
 fn finalize_responses_stream(
@@ -2107,24 +2119,43 @@ fn validate_responses_terminal_content(
         return Ok(());
     }
 
-    let count = |kind| {
-        output_items
-            .iter()
-            .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some(kind))
-            .count()
-    };
     let output_item_count = output_items.len();
-    let reasoning_item_count = count("reasoning");
-    let message_item_count = count("message");
-    let function_call_item_count = count("function_call");
+    let reasoning_items: Vec<ResponsesReasoningOutputView> = output_items
+        .iter()
+        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .collect();
+    let reasoning_item_count = reasoning_items.len();
+    let message_item_count = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("message"))
+        .count();
+    let function_call_item_count = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("function_call"))
+        .count();
     let reasoning_tokens = usage
         .output_tokens_details
         .as_ref()
         .and_then(|details| details.reasoning_tokens);
+    let valid_reasoning_items = reasoning_items.iter().all(|item| {
+        item.r#type == "reasoning"
+            && !item.id.is_empty()
+            && item
+                .status
+                .as_deref()
+                .is_none_or(|value| value == "completed")
+            && item
+                .summary
+                .iter()
+                .all(|summary| summary.r#type == "summary_text")
+    });
+    let has_reasoning_usage =
+        reasoning_tokens.is_some_and(|tokens| tokens > 0 && tokens <= usage.output_tokens);
     let completed_reasoning_only = status == "completed"
         && output_item_count > 0
         && reasoning_item_count == output_item_count
-        && reasoning_tokens == Some(usage.output_tokens);
+        && valid_reasoning_items
+        && has_reasoning_usage;
 
     if completed_reasoning_only {
         tracing::debug!(
@@ -2155,6 +2186,13 @@ fn validate_responses_terminal_content(
 
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
 fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
+    normalize_responses_api_response_with_evidence(resp, false)
+}
+
+fn normalize_responses_api_response_with_evidence(
+    resp: ResponsesApiResponse,
+    observed_visible_output: bool,
+) -> Result<LlmResponse, LlmError> {
     let output_items: Vec<serde_json::Value> =
         resp.output.iter().map(|item| item.0.clone()).collect();
     let mut content = Vec::new();
@@ -2225,8 +2263,24 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
         &resp.status,
         &resp.usage,
         &output_items,
-        content.is_empty(),
+        content.is_empty() && !observed_visible_output,
     )?;
+    if observed_visible_output && content.is_empty() {
+        tracing::error!(
+            output_tokens = resp.usage.output_tokens,
+            reasoning_tokens = resp
+                .usage
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+            output_item_count = output_items.len(),
+            status = %resp.status,
+            "responses_api lost observed visible output before terminal assembly"
+        );
+        return Err(LlmError::server_error(
+            "OpenAI streamed visible output without a completed message item",
+        ));
+    }
 
     let mut response = LlmResponse::non_streaming(content, end_turn, {
         // Both detail buckets are subsets of OpenAI's inclusive
@@ -2737,6 +2791,22 @@ impl ResponsesApiOutput {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesReasoningOutputView {
+    r#type: String,
+    id: String,
+    #[serde(default)]
+    status: Option<String>,
+    summary: Vec<ResponsesReasoningSummaryView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesReasoningSummaryView {
+    r#type: String,
+    #[allow(dead_code)]
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6691,7 +6761,8 @@ mod tests {
                 "type": "reasoning",
                 "id": "reasoning-1",
                 "summary": [{"type": "summary_text", "text": "bounded fixture"}],
-                "encrypted_content": "fixture-ciphertext"
+                "encrypted_content": "fixture-ciphertext",
+                "status": "completed"
             }))],
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -6701,7 +6772,7 @@ mod tests {
                     cache_write_tokens: 0,
                 },
                 output_tokens_details: Some(ResponsesApiOutputTokensDetails {
-                    reasoning_tokens: Some(18),
+                    reasoning_tokens: Some(16),
                 }),
             },
         })
@@ -6710,7 +6781,7 @@ mod tests {
         assert!(response.content.is_empty());
         assert!(response.end_turn);
         assert_eq!(response.usage.output_tokens, 18);
-        assert_eq!(response.usage.reasoning_tokens, Some(18));
+        assert_eq!(response.usage.reasoning_tokens, Some(16));
         assert_eq!(response.provider_replay, Some(ProviderReplayUpdate::Clear));
     }
 
@@ -6741,8 +6812,94 @@ mod tests {
         assert!(err.kind.is_auto_retryable());
     }
 
+    fn reasoning_only_response(
+        output: Vec<serde_json::Value>,
+        output_tokens: u32,
+        reasoning_tokens: Option<u32>,
+    ) -> ResponsesApiResponse {
+        ResponsesApiResponse {
+            id: "resp-reasoning-fixture".to_string(),
+            model: "gpt-test".to_string(),
+            status: "completed".to_string(),
+            output: output.into_iter().map(ResponsesApiOutput).collect(),
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                output_tokens_details: reasoning_tokens.map(|reasoning_tokens| {
+                    ResponsesApiOutputTokensDetails {
+                        reasoning_tokens: Some(reasoning_tokens),
+                    }
+                }),
+            },
+        }
+    }
+
     #[tokio::test]
-    async fn reasoning_only_terminal_has_websocket_sse_accumulator_parity() {
+    async fn malformed_or_incomplete_reasoning_items_remain_retryable_errors() {
+        for item in [
+            serde_json::json!({"type": "reasoning", "id": "", "summary": []}),
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "reasoning-1",
+                "summary": [],
+                "status": "incomplete"
+            }),
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "reasoning-1",
+                "summary": [{"type": "unknown", "text": "fixture"}]
+            }),
+        ] {
+            let err =
+                normalize_responses_api_response(reasoning_only_response(vec![item], 18, Some(16)))
+                    .expect_err("malformed reasoning must not prove a quiet completion");
+            assert_eq!(err.kind, crate::LlmErrorKind::ServerError);
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_usage_without_items_or_with_mixed_output_remains_retryable() {
+        let empty = normalize_responses_api_response(reasoning_only_response(vec![], 18, Some(16)))
+            .expect_err("usage without a reasoning item is not terminal evidence");
+        assert_eq!(empty.kind, crate::LlmErrorKind::ServerError);
+
+        let mixed = normalize_responses_api_response(reasoning_only_response(
+            vec![
+                serde_json::json!({"type": "reasoning", "id": "r1", "summary": []}),
+                serde_json::json!({"type": "message", "id": "m1", "content": []}),
+            ],
+            18,
+            Some(16),
+        ))
+        .expect_err("a lost message beside reasoning is not a quiet completion");
+        assert_eq!(mixed.kind, crate::LlmErrorKind::ServerError);
+    }
+
+    #[tokio::test]
+    async fn observed_visible_output_without_completed_message_remains_retryable() {
+        let err = normalize_responses_api_response_with_evidence(
+            reasoning_only_response(
+                vec![serde_json::json!({
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": []
+                })],
+                18,
+                Some(16),
+            ),
+            true,
+        )
+        .expect_err("observed visible output cannot disappear at the terminal boundary");
+        assert_eq!(err.kind, crate::LlmErrorKind::ServerError);
+        assert!(err.kind.is_auto_retryable());
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_terminal_has_websocket_sse_finalizer_parity() {
         let request = empty_request();
         let terminal = serde_json::json!({
             "type": "response.completed",
@@ -6753,7 +6910,7 @@ mod tests {
                 "usage": {
                     "input_tokens": 1000,
                     "output_tokens": 18,
-                    "output_tokens_details": {"reasoning_tokens": 18}
+                    "output_tokens_details": {"reasoning_tokens": 16}
                 }
             }
         })
@@ -6765,13 +6922,13 @@ mod tests {
             .process_event("response.completed", &terminal, &chunk_tx)
             .await
             .unwrap();
-        let websocket = websocket.into_response().unwrap();
+        let websocket = finalize_websocket_response(websocket, "gpt-test").unwrap();
 
         let mut sse = ResponsesStreamAccumulator::new(Instant::now(), &request);
         sse.process_event("response.completed", &terminal, &chunk_tx)
             .await
             .unwrap();
-        let sse = sse.into_response().unwrap();
+        let sse = finalize_responses_stream(sse, "gpt-test").unwrap();
 
         assert!(websocket.content.is_empty());
         assert_eq!(websocket.content, sse.content);

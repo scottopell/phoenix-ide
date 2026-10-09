@@ -539,11 +539,12 @@ THE SYSTEM SHALL reject the incomplete stream as an invalid response
 
 #### REQ-LLM-009a: Responses Terminal Classification
 
-WHEN a Responses transport receives an authenticated `response.completed` terminal event whose complete output consists only of reasoning items
-AND the provider classifies every billed output token as a reasoning token
+WHEN a Responses transport receives an authenticated `response.completed` terminal event whose complete output consists only of structurally valid, non-incomplete reasoning items
+AND the provider reports a positive reasoning-token subset of the billed output tokens
+AND the stream did not previously emit visible output
 THEN Phoenix SHALL settle the request as a valid quiet end turn without fabricating visible assistant text.
 
-WHEN billed output has no terminal model-visible content and the terminal shape does not prove that all output was reasoning
+WHEN billed output has no terminal model-visible content and the terminal shape does not prove a completed reasoning-only response
 THEN Phoenix SHALL classify the result as a retryable provider failure rather than silently persisting an empty agent turn.
 
 WHEN an HTTP/SSE Responses stream ends before a terminal event
