@@ -741,8 +741,8 @@ rule ResponsesFinalizedVisibleOutputObserved {
     ensures: stream.observed_non_reasoning_output = true
 }
 
--- A named function-call item or non-empty incremental or finalized argument
--- event proves that tool output existed even if terminal assembly loses the item.
+-- Any function-call item or function-call argument event proves that tool output
+-- existed even if terminal assembly later loses or replaces the item.
 rule ResponsesFunctionCallOutputObserved {
     when: ResponsesFunctionCallOutput(stream)
 

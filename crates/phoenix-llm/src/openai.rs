@@ -426,26 +426,13 @@ impl ResponsesStreamAccumulator {
                 }
             }
             "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
-                let field = if dispatch_type == "response.function_call_arguments.done" {
-                    "arguments"
-                } else {
-                    "delta"
-                };
-                if v.get(field)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|arguments| !arguments.is_empty())
-                {
-                    self.telemetry
-                        .record_generation_event_at(now, GenerationKind::Tool);
-                    self.observed_non_reasoning_output = true;
-                }
+                self.telemetry
+                    .record_generation_event_at(now, GenerationKind::Tool);
+                self.observed_non_reasoning_output = true;
             }
             "response.output_item.added" => {
                 let observed_tool = v.pointer("/item/type").and_then(serde_json::Value::as_str)
-                    == Some("function_call")
-                    && v.pointer("/item/name")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|name| !name.is_empty());
+                    == Some("function_call");
                 let observed_text = has_streamed_visible_output(dispatch_type, &v);
                 if observed_tool {
                     self.telemetry
@@ -621,6 +608,8 @@ impl ResponsesStreamAccumulator {
                     .pointer("/response/output")
                     .and_then(serde_json::Value::as_array)
                 {
+                    self.observed_non_reasoning_output |=
+                        items.iter().any(output_item_has_non_reasoning_output);
                     self.complete_output_items(items);
                 }
                 self.done = true;
@@ -3127,8 +3116,16 @@ pub(crate) struct ResponsesApiInputTokensDetails {
     pub(crate) cache_write_tokens: u32,
 }
 
+fn deserialize_optional_u32_nonnull<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u32::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiOutputTokensDetails {
+    #[serde(default, deserialize_with = "deserialize_optional_u32_nonnull")]
     pub(crate) reasoning_tokens: Option<u32>,
 }
 
@@ -7474,6 +7471,76 @@ mod tests {
                 assert!(error.kind.is_auto_retryable());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_visible_output_cannot_be_hidden_by_an_earlier_empty_item() {
+        let request = empty_request();
+        let empty = serde_json::json!({
+            "type": "message", "id": "same", "status": "completed",
+            "role": "assistant", "content": []
+        });
+        let visible = serde_json::json!({
+            "type": "message", "id": "same", "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "terminal answer"}]
+        });
+        let done = serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0, "item": empty
+        })
+        .to_string();
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-terminal-visible", "status": "completed",
+                "output": [visible],
+                "usage": {"input_tokens": 1000, "output_tokens": 4,
+                    "output_tokens_details": {"reasoning_tokens": 0}}
+            }
+        })
+        .to_string();
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
+
+        for websocket in [true, false] {
+            let mut accumulator = ResponsesStreamAccumulator::new(Instant::now(), &request);
+            accumulator
+                .process_event("response.output_item.done", &done, &chunk_tx)
+                .await
+                .unwrap();
+            accumulator
+                .process_event("response.completed", &terminal, &chunk_tx)
+                .await
+                .unwrap();
+            let error = if websocket {
+                let CodexWsError::Backend(error) =
+                    finalize_websocket_response(accumulator, "gpt-test").unwrap_err()
+                else {
+                    panic!("terminal output loss must remain a provider error");
+                };
+                error
+            } else {
+                finalize_responses_stream(accumulator, "gpt-test").unwrap_err()
+            };
+            assert_eq!(error.kind, crate::LlmErrorKind::ServerError);
+            assert!(error.kind.is_auto_retryable());
+        }
+    }
+
+    #[test]
+    fn explicit_null_reasoning_usage_is_not_absent_in_typed_response() {
+        let response = serde_json::json!({
+            "id": "resp-null-usage", "model": "gpt-test", "status": "completed",
+            "output": [{
+                "type": "message", "id": "quiet", "status": "completed",
+                "role": "assistant", "content": []
+            }],
+            "usage": {"input_tokens": 1000, "output_tokens": 4,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": null}}
+        });
+
+        serde_json::from_value::<ResponsesApiResponse>(response)
+            .expect_err("explicit null reasoning usage is malformed, not absent");
     }
 
     #[tokio::test]
