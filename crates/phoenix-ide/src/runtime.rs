@@ -9062,7 +9062,7 @@ mod scope_liveness_tests {
         #![allow(clippy::too_many_lines)]
         use phoenix_core::domain::close::{
             CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome, ClosePhase,
-            RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
+            CloseRunRef, RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
         };
 
         let manager = test_manager().await;
@@ -9177,7 +9177,7 @@ mod scope_liveness_tests {
             "SELECT COUNT(*) FROM coordinator_watch_events
              WHERE mandatory_failure_occurrence_id = ?1",
         )
-        .bind(format!("close-cleanup-failure:{attempt_id}:0"))
+        .bind(CloseRunRef::initial(attempt_id.clone()).failure_occurrence_id())
         .fetch_one(manager.db().pool())
         .await
         .unwrap();
