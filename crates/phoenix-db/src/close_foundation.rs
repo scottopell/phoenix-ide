@@ -5850,6 +5850,51 @@ impl Database {
                     "remaining resources differ from the complete unresolved expected inventory",
                 ));
             }
+            for supplied in request.remaining_resources.iter().filter(|supplied| {
+                !expected.iter().any(|target| {
+                    target.scope == supplied.scope && target.resource == supplied.resource
+                })
+            }) {
+                if !matches!(
+                    supplied.resource.kind(),
+                    RetiredResourceKind::BashProcessGroup
+                        | RetiredResourceKind::PtySession
+                        | RetiredResourceKind::BrowserSession
+                        | RetiredResourceKind::EquivalentLiveResource
+                ) {
+                    return Err(close_precondition(
+                        "remaining resources expand the complete unresolved expected inventory",
+                    ));
+                }
+                let identity = supplied.resource.identity();
+                let already_succeeded: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM close_retirement_resources retired
+                        WHERE retired.attempt_id = ?1 AND retired.scope = ?2
+                          AND retired.resource_kind = ?3 AND retired.identity_kind = ?4
+                          AND retired.identity_codec = ?5 AND retired.identity_value = ?6
+                          AND retired.proof_kind IN ('retired', 'absence_adopted')
+                        UNION ALL
+                        SELECT 1 FROM close_process_step_successes success
+                        WHERE success.attempt_id = ?1 AND success.scope = ?2
+                          AND success.resource_kind = ?3 AND success.identity_kind = ?4
+                          AND success.identity_codec = ?5 AND success.identity_value = ?6
+                    )",
+                )
+                .bind(request.attempt_id.as_str())
+                .bind(supplied.scope.as_str())
+                .bind(supplied.resource.kind().as_str())
+                .bind(identity.identity_kind())
+                .bind(identity.codec())
+                .bind(identity.value())
+                .fetch_one(&mut **tx)
+                .await?;
+                if already_succeeded {
+                    return Err(close_precondition(
+                        "remaining resources include an already successful process identity",
+                    ));
+                }
+            }
         }
         if let Some(snapshot) = snapshot.filter(|_| initial) {
             sqlx::query(
@@ -12583,7 +12628,7 @@ mod tests {
                 .occurrence,
             request
         );
-        let run = db
+        assert!(db
             .admit_close_safe_retry(&AdmitCloseSafeRetryRequest {
                 failed_run: CloseRunRef::initial(request.attempt_id.clone()),
                 requested_by: CloseRetryRequestedBy::User,
@@ -12591,48 +12636,18 @@ mod tests {
                 precondition_resolution: "live permit verified".into(),
                 safety_evidence: "original browser target only".into(),
                 remaining_effects: vec![CloseSafeRetryEffect {
-                    scope: root_scope.clone(),
-                    resource: later.clone(),
+                    scope: root_scope,
+                    resource: later,
                 }],
             })
             .await
-            .unwrap();
-        let retry_remaining = db
-            .expected_close_cleanup_failure_resources("attempt-multi", &root_scope, &later)
-            .await
-            .unwrap();
-        assert!(retry_remaining
-            .iter()
-            .any(|target| target.resource == failed
-                && target.disposition == CloseCleanupResourceDisposition::Residual));
-        let retry_failure = TerminalizeInitialCloseCleanupFailureRequest {
-            failure_occurrence_id: run.failure_occurrence_id(),
-            authority: CloseCleanupFailureAuthority::ExpectedResource {
-                scope: root_scope.clone(),
-                snapshot,
-                resource: later,
-            },
-            remaining_resources: retry_remaining,
-            ..request.clone()
-        };
-        db.terminalize_close_run_cleanup_failure(&run, &retry_failure)
-            .await
-            .unwrap();
-        db.terminalize_close_run_cleanup_failure(&run, &retry_failure)
-            .await
-            .unwrap();
-        let retained = db
-            .list_close_cleanup_failures("attempt-multi")
-            .await
-            .unwrap();
-        assert_eq!(retained[0].occurrence, request);
-        assert_eq!(retained[1].occurrence, retry_failure);
+            .is_err());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
                 .fetch_one(db.pool())
                 .await
                 .unwrap(),
-            2
+            1
         );
     }
 
