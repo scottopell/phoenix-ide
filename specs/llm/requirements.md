@@ -539,9 +539,9 @@ THE SYSTEM SHALL reject the incomplete stream as an invalid response
 
 #### REQ-LLM-009a: Responses Terminal Classification
 
-WHEN a Responses transport receives an authenticated `response.completed` terminal event whose complete output consists of one or more structurally valid, non-incomplete reasoning items
-AND any remaining terminal items are structurally completed assistant messages containing no public content
-AND the provider reports a positive reasoning-token subset of the billed output tokens
+WHEN a Responses transport receives an authenticated `response.completed` terminal event whose complete nonempty output consists only of structurally completed assistant messages containing no public content and structurally valid, non-incomplete reasoning items
+AND every reasoning item, when present, has a positive reasoning-token subset of the billed output tokens
+AND no reasoning tokens are reported when reasoning items are absent
 AND the stream did not previously expose non-empty visible output or a function call in stream events
 THEN Phoenix SHALL settle the request as a valid quiet end turn without fabricating visible assistant text.
 

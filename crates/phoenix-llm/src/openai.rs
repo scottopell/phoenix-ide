@@ -2177,36 +2177,25 @@ fn validate_responses_terminal_content(
     if !content_is_empty {
         return Ok(());
     }
-    if observed_non_reasoning_output {
-        tracing::error!(
-            output_tokens = usage.output_tokens,
-            reasoning_tokens = usage
-                .output_tokens_details
-                .as_ref()
-                .and_then(|details| details.reasoning_tokens),
-            output_item_count = output_items.len(),
-            status,
-            "responses_api lost observed non-reasoning output before terminal assembly"
-        );
-        return Err(LlmError::server_error(
-            "OpenAI streamed non-reasoning output without a completed terminal item",
-        ));
-    }
-    if usage.output_tokens == 0 && output_items.is_empty() {
-        return Ok(());
-    }
-
     let output_item_count = output_items.len();
     let reasoning_items: Vec<ResponsesReasoningOutputView> = output_items
         .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
         .filter_map(|item| serde_json::from_value(item.clone()).ok())
         .collect();
-    let reasoning_item_count = reasoning_items.len();
-    let message_items: Vec<ResponsesEmptyMessageOutputView> = output_items
+    let reasoning_item_count = output_items
         .iter()
-        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+        .count();
+    let message_values: Vec<&serde_json::Value> = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("message"))
         .collect();
-    let message_item_count = message_items.len();
+    let message_item_count = message_values.len();
+    let message_items: Vec<ResponsesEmptyMessageOutputView> = message_values
+        .iter()
+        .filter_map(|item| serde_json::from_value((*item).clone()).ok())
+        .collect();
     let function_call_item_count = output_items
         .iter()
         .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("function_call"))
@@ -2215,52 +2204,61 @@ fn validate_responses_terminal_content(
         .output_tokens_details
         .as_ref()
         .and_then(|details| details.reasoning_tokens);
-    let valid_reasoning_items = reasoning_items.iter().all(|item| {
-        item.r#type == "reasoning"
-            && !item.id.is_empty()
-            && item
-                .status
-                .as_deref()
-                .is_none_or(|value| value == "completed")
-            && item
-                .summary
-                .iter()
-                .all(|summary| summary.r#type == "summary_text")
-    });
-    let has_reasoning_usage =
-        reasoning_tokens.is_some_and(|tokens| tokens > 0 && tokens <= usage.output_tokens);
-    let valid_empty_messages = message_items
-        .iter()
-        .all(ResponsesEmptyMessageOutputView::is_completed_empty_assistant_message);
-    let completed_quiet_reasoning = status == "completed"
-        && reasoning_item_count > 0
-        && reasoning_item_count + message_item_count == output_item_count
-        && valid_reasoning_items
-        && valid_empty_messages
-        && has_reasoning_usage;
-
-    if completed_quiet_reasoning {
-        tracing::debug!(
-            output_tokens = usage.output_tokens,
-            reasoning_tokens,
-            output_item_count,
-            status,
-            message_item_count,
-            "responses_api completed a quiet reasoning turn"
-        );
-        return Ok(());
-    }
-
-    tracing::error!(
-        output_tokens = usage.output_tokens,
+    let diagnostics = ResponsesTerminalDiagnostics {
+        output_tokens: usage.output_tokens,
         reasoning_tokens,
         output_item_count,
         reasoning_item_count,
         message_item_count,
         function_call_item_count,
-        status,
-        "responses_api returned no terminal content with output tokens billed"
-    );
+        message: ResponsesMessageShape::from_messages(&message_values),
+    };
+
+    if observed_non_reasoning_output {
+        diagnostics.log_lost_output(status);
+        return Err(LlmError::server_error(
+            "OpenAI streamed non-reasoning output without a completed terminal item",
+        ));
+    }
+    if usage.output_tokens == 0 && output_items.is_empty() {
+        return Ok(());
+    }
+
+    let valid_reasoning_items = reasoning_items.len() == reasoning_item_count
+        && reasoning_items.iter().all(|item| {
+            item.r#type == "reasoning"
+                && !item.id.is_empty()
+                && item
+                    .status
+                    .as_deref()
+                    .is_none_or(|value| value == "completed")
+                && item
+                    .summary
+                    .iter()
+                    .all(|summary| summary.r#type == "summary_text")
+        });
+    let valid_reasoning_usage = if reasoning_item_count == 0 {
+        reasoning_tokens.unwrap_or(0) == 0
+    } else {
+        reasoning_tokens.is_some_and(|tokens| tokens > 0 && tokens <= usage.output_tokens)
+    };
+    let valid_empty_messages = message_items.len() == message_item_count
+        && message_items
+            .iter()
+            .all(ResponsesEmptyMessageOutputView::is_completed_empty_assistant_message);
+    let completed_quiet_turn = status == "completed"
+        && output_item_count > 0
+        && reasoning_item_count + message_item_count == output_item_count
+        && valid_reasoning_items
+        && valid_reasoning_usage
+        && valid_empty_messages;
+
+    if completed_quiet_turn {
+        diagnostics.log_quiet_turn(status);
+        return Ok(());
+    }
+
+    diagnostics.log_invalid_terminal(status);
     Err(LlmError::server_error(format!(
         "OpenAI returned empty response ({} output tokens billed, status={status})",
         usage.output_tokens
@@ -2880,23 +2878,177 @@ struct ResponsesReasoningSummaryView {
 #[derive(Debug, Deserialize)]
 struct ResponsesEmptyMessageOutputView {
     r#type: String,
-    id: String,
-    status: String,
-    role: String,
-    content: Vec<ResponsesApiContent>,
+    id: Option<String>,
+    status: Option<String>,
+    role: Option<String>,
+    content: Option<Vec<ResponsesApiContent>>,
 }
 
 impl ResponsesEmptyMessageOutputView {
     fn is_completed_empty_assistant_message(&self) -> bool {
         self.r#type == "message"
-            && !self.id.is_empty()
-            && self.status == "completed"
-            && self.role == "assistant"
-            && self.content.iter().all(|part| match part.r#type.as_str() {
-                "output_text" => part.text.as_deref() == Some("") && part.refusal.is_none(),
-                "refusal" => part.refusal.as_deref() == Some("") && part.text.is_none(),
-                _ => false,
+            && self.id.as_deref().is_some_and(|id| !id.is_empty())
+            && self.status.as_deref() == Some("completed")
+            && self.role.as_deref() == Some("assistant")
+            && self.content.as_ref().is_some_and(|content| {
+                content.iter().all(|part| match part.r#type.as_str() {
+                    "output_text" => part.text.as_deref() == Some("") && part.refusal.is_none(),
+                    "refusal" => part.refusal.as_deref() == Some("") && part.text.is_none(),
+                    _ => false,
+                })
             })
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResponsesMessageShape {
+    id_present_count: usize,
+    id_nonempty_count: usize,
+    status_present_count: usize,
+    completed_status_count: usize,
+    role_present_count: usize,
+    assistant_role_count: usize,
+    content_present_count: usize,
+    content_part_count: usize,
+    output_text_part_count: usize,
+    refusal_part_count: usize,
+    unknown_part_count: usize,
+    nonempty_part_count: usize,
+}
+
+impl ResponsesMessageShape {
+    fn from_messages(messages: &[&serde_json::Value]) -> Self {
+        let mut shape = Self::default();
+        for message in messages {
+            shape.id_present_count += message.get("id").is_some() as usize;
+            shape.id_nonempty_count += message
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty()) as usize;
+            shape.status_present_count += message.get("status").is_some() as usize;
+            shape.completed_status_count +=
+                (message.get("status").and_then(serde_json::Value::as_str) == Some("completed"))
+                    as usize;
+            shape.role_present_count += message.get("role").is_some() as usize;
+            shape.assistant_role_count += (message.get("role").and_then(serde_json::Value::as_str)
+                == Some("assistant")) as usize;
+            let Some(content) = message.get("content").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            shape.content_present_count += 1;
+            for part in content {
+                shape.content_part_count += 1;
+                match part.get("type").and_then(serde_json::Value::as_str) {
+                    Some("output_text") => {
+                        shape.output_text_part_count += 1;
+                        shape.nonempty_part_count += part
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                            as usize;
+                    }
+                    Some("refusal") => {
+                        shape.refusal_part_count += 1;
+                        shape.nonempty_part_count += part
+                            .get("refusal")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|refusal| !refusal.is_empty())
+                            as usize;
+                    }
+                    _ => shape.unknown_part_count += 1,
+                }
+            }
+        }
+        shape
+    }
+}
+
+struct ResponsesTerminalDiagnostics {
+    output_tokens: u32,
+    reasoning_tokens: Option<u32>,
+    output_item_count: usize,
+    reasoning_item_count: usize,
+    message_item_count: usize,
+    function_call_item_count: usize,
+    message: ResponsesMessageShape,
+}
+
+impl ResponsesTerminalDiagnostics {
+    fn log_lost_output(&self, status: &str) {
+        tracing::error!(
+            output_tokens = self.output_tokens,
+            reasoning_tokens = self.reasoning_tokens,
+            output_item_count = self.output_item_count,
+            reasoning_item_count = self.reasoning_item_count,
+            message_item_count = self.message_item_count,
+            function_call_item_count = self.function_call_item_count,
+            observed_non_reasoning_output = true,
+            message_id_present_count = self.message.id_present_count,
+            message_id_nonempty_count = self.message.id_nonempty_count,
+            message_status_present_count = self.message.status_present_count,
+            message_role_present_count = self.message.role_present_count,
+            message_completed_status_count = self.message.completed_status_count,
+            message_assistant_role_count = self.message.assistant_role_count,
+            message_content_present_count = self.message.content_present_count,
+            message_content_part_count = self.message.content_part_count,
+            message_output_text_part_count = self.message.output_text_part_count,
+            message_refusal_part_count = self.message.refusal_part_count,
+            message_unknown_part_count = self.message.unknown_part_count,
+            message_nonempty_part_count = self.message.nonempty_part_count,
+            status,
+            "responses_api lost observed non-reasoning output before terminal assembly"
+        );
+    }
+
+    fn log_quiet_turn(&self, status: &str) {
+        tracing::info!(
+            output_tokens = self.output_tokens,
+            reasoning_tokens = self.reasoning_tokens,
+            output_item_count = self.output_item_count,
+            reasoning_item_count = self.reasoning_item_count,
+            message_item_count = self.message_item_count,
+            observed_non_reasoning_output = false,
+            message_id_present_count = self.message.id_present_count,
+            message_id_nonempty_count = self.message.id_nonempty_count,
+            message_status_present_count = self.message.status_present_count,
+            message_role_present_count = self.message.role_present_count,
+            message_completed_status_count = self.message.completed_status_count,
+            message_assistant_role_count = self.message.assistant_role_count,
+            message_content_present_count = self.message.content_present_count,
+            message_content_part_count = self.message.content_part_count,
+            message_output_text_part_count = self.message.output_text_part_count,
+            message_refusal_part_count = self.message.refusal_part_count,
+            message_unknown_part_count = self.message.unknown_part_count,
+            message_nonempty_part_count = self.message.nonempty_part_count,
+            status,
+            "responses_api completed a structurally valid quiet turn"
+        );
+    }
+
+    fn log_invalid_terminal(&self, status: &str) {
+        tracing::error!(
+            output_tokens = self.output_tokens,
+            reasoning_tokens = self.reasoning_tokens,
+            output_item_count = self.output_item_count,
+            reasoning_item_count = self.reasoning_item_count,
+            message_item_count = self.message_item_count,
+            function_call_item_count = self.function_call_item_count,
+            observed_non_reasoning_output = false,
+            message_id_present_count = self.message.id_present_count,
+            message_id_nonempty_count = self.message.id_nonempty_count,
+            message_status_present_count = self.message.status_present_count,
+            message_role_present_count = self.message.role_present_count,
+            message_completed_status_count = self.message.completed_status_count,
+            message_assistant_role_count = self.message.assistant_role_count,
+            message_content_present_count = self.message.content_present_count,
+            message_content_part_count = self.message.content_part_count,
+            message_output_text_part_count = self.message.output_text_part_count,
+            message_refusal_part_count = self.message.refusal_part_count,
+            message_unknown_part_count = self.message.unknown_part_count,
+            message_nonempty_part_count = self.message.nonempty_part_count,
+            status,
+            "responses_api returned no structurally valid terminal content"
+        );
     }
 }
 
@@ -6877,6 +7029,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_empty_assistant_message_is_valid_quiet_turn_without_reasoning() {
+        let output = vec![serde_json::json!({
+            "type": "message",
+            "id": "message-only",
+            "status": "completed",
+            "role": "assistant",
+            "content": []
+        })];
+
+        for reasoning_tokens in [None, Some(0)] {
+            let response = normalize_responses_api_response(reasoning_only_response(
+                output.clone(),
+                4,
+                reasoning_tokens,
+            ))
+            .expect("a structurally completed empty assistant message is a quiet turn");
+
+            assert!(response.content.is_empty());
+            assert!(response.end_turn);
+            assert_eq!(response.usage.output_tokens, 4);
+            assert_eq!(response.usage.reasoning_tokens, reasoning_tokens);
+            assert_eq!(response.provider_replay, Some(ProviderReplayUpdate::Clear));
+        }
+    }
+
+    #[tokio::test]
     async fn completed_reasoning_with_empty_message_companion_is_valid_quiet_turn() {
         let output = vec![
             serde_json::json!({
@@ -6908,6 +7086,13 @@ mod tests {
     #[tokio::test]
     async fn malformed_empty_message_companions_remain_retryable_errors() {
         for message in [
+            serde_json::json!({
+                "type": "message", "content": []
+            }),
+            serde_json::json!({
+                "type": "message", "id": "message-1", "status": "completed",
+                "role": "assistant"
+            }),
             serde_json::json!({
                 "type": "message", "id": "message-1", "status": "incomplete",
                 "role": "assistant", "content": []
@@ -7033,6 +7218,21 @@ mod tests {
         let empty = normalize_responses_api_response(reasoning_only_response(vec![], 18, Some(16)))
             .expect_err("usage without a reasoning item is not terminal evidence");
         assert_eq!(empty.kind, crate::LlmErrorKind::ServerError);
+
+        let unexplained_reasoning_usage =
+            normalize_responses_api_response(reasoning_only_response(
+                vec![serde_json::json!({
+                    "type": "message", "id": "message-1", "status": "completed",
+                    "role": "assistant", "content": []
+                })],
+                18,
+                Some(16),
+            ))
+            .expect_err("reasoning usage without a reasoning item is not terminal evidence");
+        assert_eq!(
+            unexplained_reasoning_usage.kind,
+            crate::LlmErrorKind::ServerError
+        );
 
         let mixed = normalize_responses_api_response(reasoning_only_response(
             vec![
@@ -7163,9 +7363,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quiet_reasoning_terminals_have_websocket_sse_finalizer_parity() {
+    async fn structurally_quiet_terminals_have_websocket_sse_finalizer_parity() {
         let request = empty_request();
         let cases = [
+            (
+                serde_json::json!([{
+                    "type": "message", "id": "message-only", "status": "completed",
+                    "role": "assistant", "content": []
+                }]),
+                4,
+                0,
+            ),
             (
                 serde_json::json!([
                     {"type": "reasoning", "id": "reasoning-only", "summary": []}
@@ -7183,6 +7391,17 @@ mod tests {
                 ]),
                 50,
                 44,
+            ),
+            (
+                serde_json::json!([
+                    {"type": "reasoning", "id": "observed-quiet-reasoning", "summary": []},
+                    {
+                        "type": "message", "id": "observed-message", "status": "completed",
+                        "role": "assistant", "content": []
+                    }
+                ]),
+                53,
+                47,
             ),
         ];
         let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
