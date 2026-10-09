@@ -1897,7 +1897,7 @@ impl TmuxRegistry {
                 if authority != TmuxRetirementAuthority::ExactServer
                     && server.retirement_fenced =>
             {
-                (authority, None)
+                (TmuxRetirementAuthority::ServerAbsenceVerified, None)
             }
             Some((_, None, token))
                 if authority == TmuxRetirementAuthority::ServerAbsenceVerified
