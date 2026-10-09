@@ -2902,60 +2902,63 @@ impl ResponsesEmptyMessageOutputView {
 
 #[derive(Debug, Default)]
 struct ResponsesMessageShape {
-    id_present_count: usize,
-    id_nonempty_count: usize,
-    status_present_count: usize,
-    completed_status_count: usize,
-    role_present_count: usize,
-    assistant_role_count: usize,
-    content_present_count: usize,
-    content_part_count: usize,
-    output_text_part_count: usize,
-    refusal_part_count: usize,
-    unknown_part_count: usize,
-    nonempty_part_count: usize,
+    ids_present: usize,
+    ids_nonempty: usize,
+    statuses_present: usize,
+    statuses_completed: usize,
+    roles_present: usize,
+    roles_assistant: usize,
+    contents_present: usize,
+    parts: usize,
+    output_text_parts: usize,
+    refusal_parts: usize,
+    unknown_parts: usize,
+    nonempty_parts: usize,
 }
 
 impl ResponsesMessageShape {
     fn from_messages(messages: &[&serde_json::Value]) -> Self {
         let mut shape = Self::default();
         for message in messages {
-            shape.id_present_count += message.get("id").is_some() as usize;
-            shape.id_nonempty_count += message
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| !id.is_empty()) as usize;
-            shape.status_present_count += message.get("status").is_some() as usize;
-            shape.completed_status_count +=
-                (message.get("status").and_then(serde_json::Value::as_str) == Some("completed"))
-                    as usize;
-            shape.role_present_count += message.get("role").is_some() as usize;
-            shape.assistant_role_count += (message.get("role").and_then(serde_json::Value::as_str)
-                == Some("assistant")) as usize;
+            shape.ids_present += usize::from(message.get("id").is_some());
+            shape.ids_nonempty += usize::from(
+                message
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| !id.is_empty()),
+            );
+            shape.statuses_present += usize::from(message.get("status").is_some());
+            shape.statuses_completed += usize::from(
+                message.get("status").and_then(serde_json::Value::as_str) == Some("completed"),
+            );
+            shape.roles_present += usize::from(message.get("role").is_some());
+            shape.roles_assistant += usize::from(
+                message.get("role").and_then(serde_json::Value::as_str) == Some("assistant"),
+            );
             let Some(content) = message.get("content").and_then(serde_json::Value::as_array) else {
                 continue;
             };
-            shape.content_present_count += 1;
+            shape.contents_present += 1;
             for part in content {
-                shape.content_part_count += 1;
+                shape.parts += 1;
                 match part.get("type").and_then(serde_json::Value::as_str) {
                     Some("output_text") => {
-                        shape.output_text_part_count += 1;
-                        shape.nonempty_part_count += part
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|text| !text.is_empty())
-                            as usize;
+                        shape.output_text_parts += 1;
+                        shape.nonempty_parts += usize::from(
+                            part.get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|text| !text.is_empty()),
+                        );
                     }
                     Some("refusal") => {
-                        shape.refusal_part_count += 1;
-                        shape.nonempty_part_count += part
-                            .get("refusal")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|refusal| !refusal.is_empty())
-                            as usize;
+                        shape.refusal_parts += 1;
+                        shape.nonempty_parts += usize::from(
+                            part.get("refusal")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|refusal| !refusal.is_empty()),
+                        );
                     }
-                    _ => shape.unknown_part_count += 1,
+                    _ => shape.unknown_parts += 1,
                 }
             }
         }
@@ -2983,18 +2986,18 @@ impl ResponsesTerminalDiagnostics {
             message_item_count = self.message_item_count,
             function_call_item_count = self.function_call_item_count,
             observed_non_reasoning_output = true,
-            message_id_present_count = self.message.id_present_count,
-            message_id_nonempty_count = self.message.id_nonempty_count,
-            message_status_present_count = self.message.status_present_count,
-            message_role_present_count = self.message.role_present_count,
-            message_completed_status_count = self.message.completed_status_count,
-            message_assistant_role_count = self.message.assistant_role_count,
-            message_content_present_count = self.message.content_present_count,
-            message_content_part_count = self.message.content_part_count,
-            message_output_text_part_count = self.message.output_text_part_count,
-            message_refusal_part_count = self.message.refusal_part_count,
-            message_unknown_part_count = self.message.unknown_part_count,
-            message_nonempty_part_count = self.message.nonempty_part_count,
+            message_ids_present = self.message.ids_present,
+            message_ids_nonempty = self.message.ids_nonempty,
+            message_statuses_present = self.message.statuses_present,
+            message_roles_present = self.message.roles_present,
+            message_statuses_completed = self.message.statuses_completed,
+            message_roles_assistant = self.message.roles_assistant,
+            message_contents_present = self.message.contents_present,
+            message_parts = self.message.parts,
+            message_output_text_parts = self.message.output_text_parts,
+            message_refusal_parts = self.message.refusal_parts,
+            message_unknown_parts = self.message.unknown_parts,
+            message_nonempty_parts = self.message.nonempty_parts,
             status,
             "responses_api lost observed non-reasoning output before terminal assembly"
         );
@@ -3008,18 +3011,18 @@ impl ResponsesTerminalDiagnostics {
             reasoning_item_count = self.reasoning_item_count,
             message_item_count = self.message_item_count,
             observed_non_reasoning_output = false,
-            message_id_present_count = self.message.id_present_count,
-            message_id_nonempty_count = self.message.id_nonempty_count,
-            message_status_present_count = self.message.status_present_count,
-            message_role_present_count = self.message.role_present_count,
-            message_completed_status_count = self.message.completed_status_count,
-            message_assistant_role_count = self.message.assistant_role_count,
-            message_content_present_count = self.message.content_present_count,
-            message_content_part_count = self.message.content_part_count,
-            message_output_text_part_count = self.message.output_text_part_count,
-            message_refusal_part_count = self.message.refusal_part_count,
-            message_unknown_part_count = self.message.unknown_part_count,
-            message_nonempty_part_count = self.message.nonempty_part_count,
+            message_ids_present = self.message.ids_present,
+            message_ids_nonempty = self.message.ids_nonempty,
+            message_statuses_present = self.message.statuses_present,
+            message_roles_present = self.message.roles_present,
+            message_statuses_completed = self.message.statuses_completed,
+            message_roles_assistant = self.message.roles_assistant,
+            message_contents_present = self.message.contents_present,
+            message_parts = self.message.parts,
+            message_output_text_parts = self.message.output_text_parts,
+            message_refusal_parts = self.message.refusal_parts,
+            message_unknown_parts = self.message.unknown_parts,
+            message_nonempty_parts = self.message.nonempty_parts,
             status,
             "responses_api completed a structurally valid quiet turn"
         );
@@ -3034,18 +3037,18 @@ impl ResponsesTerminalDiagnostics {
             message_item_count = self.message_item_count,
             function_call_item_count = self.function_call_item_count,
             observed_non_reasoning_output = false,
-            message_id_present_count = self.message.id_present_count,
-            message_id_nonempty_count = self.message.id_nonempty_count,
-            message_status_present_count = self.message.status_present_count,
-            message_role_present_count = self.message.role_present_count,
-            message_completed_status_count = self.message.completed_status_count,
-            message_assistant_role_count = self.message.assistant_role_count,
-            message_content_present_count = self.message.content_present_count,
-            message_content_part_count = self.message.content_part_count,
-            message_output_text_part_count = self.message.output_text_part_count,
-            message_refusal_part_count = self.message.refusal_part_count,
-            message_unknown_part_count = self.message.unknown_part_count,
-            message_nonempty_part_count = self.message.nonempty_part_count,
+            message_ids_present = self.message.ids_present,
+            message_ids_nonempty = self.message.ids_nonempty,
+            message_statuses_present = self.message.statuses_present,
+            message_roles_present = self.message.roles_present,
+            message_statuses_completed = self.message.statuses_completed,
+            message_roles_assistant = self.message.roles_assistant,
+            message_contents_present = self.message.contents_present,
+            message_parts = self.message.parts,
+            message_output_text_parts = self.message.output_text_parts,
+            message_refusal_parts = self.message.refusal_parts,
+            message_unknown_parts = self.message.unknown_parts,
+            message_nonempty_parts = self.message.nonempty_parts,
             status,
             "responses_api returned no structurally valid terminal content"
         );
@@ -7049,7 +7052,10 @@ mod tests {
             assert!(response.content.is_empty());
             assert!(response.end_turn);
             assert_eq!(response.usage.output_tokens, 4);
-            assert_eq!(response.usage.reasoning_tokens, reasoning_tokens);
+            assert_eq!(
+                response.usage.reasoning_tokens,
+                reasoning_tokens.map(u64::from)
+            );
             assert_eq!(response.provider_replay, Some(ProviderReplayUpdate::Clear));
         }
     }
