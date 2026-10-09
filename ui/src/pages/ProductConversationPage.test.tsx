@@ -27,6 +27,31 @@ const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
 const viewerSpy = vi.fn();
 const chainQaColumnSpy = vi.fn();
+class FakeCloseEventSource {
+  static readonly OPEN = 1;
+  static readonly CLOSED = 2;
+  static instances: FakeCloseEventSource[] = [];
+  readonly listeners = new Map<string, Array<(event: MessageEvent) => void>>();
+  readyState = FakeCloseEventSource.OPEN;
+
+  constructor(readonly url: string) {
+    FakeCloseEventSource.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    const callback = listener as (event: MessageEvent) => void;
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), callback]);
+  }
+
+  close(): void {
+    this.readyState = FakeCloseEventSource.CLOSED;
+  }
+
+  emit(type: string, payload: unknown): void {
+    const event = new MessageEvent(type, { data: JSON.stringify(payload) });
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
 const viewportFlags = vi.hoisted(() => ({ isWideDesktop: true }));
 const chainStream = vi.hoisted(() => {
   const close = vi.fn();
@@ -367,10 +392,13 @@ beforeEach(() => {
   chainStream.close.mockClear();
   chainStream.subscribe.mockClear();
   viewportFlags.isWideDesktop = true;
+  FakeCloseEventSource.instances = [];
+  vi.stubGlobal('EventSource', FakeCloseEventSource);
 });
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 async function waitForPageReady() {
@@ -1389,17 +1417,8 @@ describe('ProductConversationPage', () => {
         expect(resources[index]).toHaveTextContent(text);
       }
       expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
-      if (outcome === 'close_incomplete') {
-        expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
-        expect(embeddedConversationPageSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({
-          slug: 'row-2',
-          mutationEnabled: false,
-          aggregateLifecycleOpen: true,
-        }));
-      } else {
-        expect(screen.queryByTestId('product-conversation-close-live-update-owner')).not.toBeInTheDocument();
-        expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
-      }
+      expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
+      expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
       expect(screen.queryByRole('button', { name: /Retry exact Close/ })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
       await waitFor(() => expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true));
@@ -1408,13 +1427,82 @@ describe('ProductConversationPage', () => {
         ? 'product-conversation-history' : 'product-conversation-close-incomplete')).toBeVisible();
     }
     expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
-    if (outcome === 'close_incomplete') {
-      act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
-      await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
-      expect(screen.getByRole('alert', { name: 'Close status' })).toHaveTextContent(label);
-      expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
-      expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
-    }
+  });
+
+  it('refreshes cleanup-attention History to archived through the mounted conversation stream', async () => {
+    const { api } = await import('../api');
+    const failure = {
+      occurrence_id: 'close-failure:2:stopped-close',
+      reason: 'identity_not_proven' as const,
+      detail: 'Exact cleanup failure',
+      stop_certainty: {
+        kind: 'conversation_and_processes_stopped' as const,
+        confirmed_at_us: '1234567890123456',
+      },
+      remaining_resources: [
+        {
+          scope: 'scope-1',
+          resource_kind: 'worktree' as const,
+          identity: 'worktree:retained',
+          disposition: 'failed' as const,
+        },
+      ],
+    };
+    const cleanupAttention = makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+      close: {
+        attempt_id: 'stopped-close',
+        phase: 'completed',
+        outcome: 'archived_cleanup_attention',
+        run_ordinal: '2',
+        run_status: 'stopped',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+        failure,
+      },
+    });
+    const archived = makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+      close: {
+        attempt_id: 'stopped-close',
+        phase: 'completed',
+        outcome: 'archived',
+        run_ordinal: '3',
+        run_status: 'completed',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+        failure: null,
+      },
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(cleanupAttention)
+      .mockResolvedValueOnce(archived);
+
+    renderPage();
+    expect(await screen.findByRole('alert', { name: 'Close status' }))
+      .toHaveTextContent('Closed — cleanup needs attention');
+    expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
+    expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
+    const stream = FakeCloseEventSource.instances.at(-1);
+    expect(stream?.url).toContain('/api/conversations/row-2/stream');
+
+    act(() => stream?.emit('conversation_update', {
+      sequence_id: 1,
+      conversation: { archived: true },
+    }));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(screen.queryByRole('alert', { name: 'Close status' })).not.toBeInTheDocument();
+      expect(screen.queryByTestId('product-conversation-close-live-update-owner')).not.toBeInTheDocument();
+      expect(screen.getByTestId('product-conversation-history')).toBeVisible();
+    });
   });
 
   it('disables the ordinary composer while Close is active', async () => {

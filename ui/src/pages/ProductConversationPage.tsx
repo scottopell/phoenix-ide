@@ -25,6 +25,8 @@ import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '..
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
+import { useConnection } from '../hooks/useConnection';
+import type { SSEAction } from '../conversation/atom';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import {
   getProductConversationSnapshotChangeSequence,
@@ -53,6 +55,15 @@ const ChainQaColumn = lazy(() =>
   import('./ChainPage').then((m) => ({ default: m.ChainQaColumn })),
 );
 
+
+const discardCloseLiveUpdateAction = (_action: SSEAction): void => {
+  void _action;
+};
+
+function CloseLiveUpdateOwner({ conversationId }: { conversationId: string }) {
+  useConnection({ conversationId, dispatch: discardCloseLiveUpdateAction });
+  return null;
+}
 
 async function fetchOlderSnapshotWithFreshCursor(
   productConversationId: string,
@@ -978,9 +989,11 @@ function ProductConversationPageInner() {
     ].filter((id): id is string => Boolean(id)));
     if (notificationIds.size === 0) return;
     const refresh = (source: 'close' | 'stream') => {
-      const closeIsActive = snapshot?.close != null
-        && (snapshot.close.phase !== 'completed' || snapshot.close.outcome === 'close_incomplete');
-      if (source === 'close' || closeIsActive) setSnapshotRetry((retry) => retry + 1);
+      const closeNeedsLiveRefresh = snapshot?.close != null
+        && (snapshot.close.phase !== 'completed'
+          || snapshot.close.outcome === 'close_incomplete'
+          || snapshot.close.outcome === 'archived_cleanup_attention');
+      if (source === 'close' || closeNeedsLiveRefresh) setSnapshotRetry((retry) => retry + 1);
     };
     const unsubscribes = [...notificationIds].map((id) =>
       subscribeCloseSnapshotChanged(id, refresh));
@@ -1097,6 +1110,8 @@ function ProductConversationPageInner() {
 
   const messages = aggregateMessages;
   const closeIncomplete = snapshot?.close?.outcome === 'close_incomplete';
+  const cleanupAttention = snapshot?.close?.outcome === 'archived_cleanup_attention';
+  const closeNeedsLiveUpdateOwner = closeIncomplete || cleanupAttention;
   const closeInProgress = snapshot?.close != null && (snapshot.close.phase !== 'completed' || closeIncomplete);
   const convState = useMemo(
     () => snapshot?.ordinary_lifecycle === 'history' || closeInProgress
@@ -1267,13 +1282,10 @@ function ProductConversationPageInner() {
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
-      {isOpen && snapshot.latest_transcript_row_id && (
+      {isOpen && !closeIncomplete && snapshot.latest_transcript_row_id && (
         <div
           className="product-conversation-page__composer"
-          data-testid={closeIncomplete
-            ? 'product-conversation-close-live-update-owner'
-            : 'product-conversation-composer'}
-          hidden={closeIncomplete}
+          data-testid="product-conversation-composer"
         >
           <EmbeddedConversationPage
             slug={snapshot.latest_transcript_row_id}
@@ -1287,6 +1299,11 @@ function ProductConversationPageInner() {
             onProjectionChange={setLatestProjection}
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
+        </div>
+      )}
+      {closeNeedsLiveUpdateOwner && snapshot.latest_transcript_row_id && (
+        <div data-testid="product-conversation-close-live-update-owner" hidden>
+          <CloseLiveUpdateOwner conversationId={snapshot.latest_transcript_row_id} />
         </div>
       )}
       {(!isOpen || closeIncomplete) && (
