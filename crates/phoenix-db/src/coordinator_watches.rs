@@ -375,7 +375,25 @@ pub(crate) async fn record_wait_entry_tx(
         ConvState::AwaitingTaskApproval { .. } => {
             ("task_approval_wait", "awaiting_task_approval", None)
         }
-        _ => return Ok(()),
+        ConvState::Idle
+        | ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::CreationCancelled { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::Error { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::RecoverableContinuationFailure { .. }
+        | ConvState::ContextExhausted { .. }
+        | ConvState::HandedOff { .. }
+        | ConvState::Terminal => return Ok(()),
     };
     let previous: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
         .bind(transcript_id)
@@ -646,6 +664,59 @@ mod tests {
         assert!(
             terminal.is_none(),
             "waiting must not settle the active turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_outbox_and_state_rollback_together_before_delivery() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("rollback-wait", "rollback-wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let mut tx = db.pool().begin().await.unwrap();
+        record_wait_entry_tx(&mut tx, &source.id, &waiting)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?3 WHERE id = ?2")
+            .bind(serde_json::to_string(&waiting).unwrap())
+            .bind(&source.id)
+            .bind(crate::conv_state_kind(&waiting))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let inside: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_events")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(inside, 1);
+        tx.rollback().await.unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        let state: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+            .bind(&source.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_ne!(serde_json::from_str::<ConvState>(&state).unwrap(), waiting);
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
         );
     }
 
