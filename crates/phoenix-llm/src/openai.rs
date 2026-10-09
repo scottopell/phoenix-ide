@@ -2114,8 +2114,27 @@ fn validate_responses_terminal_content(
     usage: &ResponsesApiUsage,
     output_items: &[serde_json::Value],
     content_is_empty: bool,
+    observed_visible_output: bool,
 ) -> Result<(), LlmError> {
-    if !content_is_empty || usage.output_tokens == 0 {
+    if !content_is_empty {
+        return Ok(());
+    }
+    if observed_visible_output {
+        tracing::error!(
+            output_tokens = usage.output_tokens,
+            reasoning_tokens = usage
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+            output_item_count = output_items.len(),
+            status,
+            "responses_api lost observed visible output before terminal assembly"
+        );
+        return Err(LlmError::server_error(
+            "OpenAI streamed visible output without a completed message item",
+        ));
+    }
+    if usage.output_tokens == 0 {
         return Ok(());
     }
 
@@ -2263,24 +2282,9 @@ fn normalize_responses_api_response_with_evidence(
         &resp.status,
         &resp.usage,
         &output_items,
-        content.is_empty() && !observed_visible_output,
+        content.is_empty(),
+        observed_visible_output,
     )?;
-    if observed_visible_output && content.is_empty() {
-        tracing::error!(
-            output_tokens = resp.usage.output_tokens,
-            reasoning_tokens = resp
-                .usage
-                .output_tokens_details
-                .as_ref()
-                .and_then(|details| details.reasoning_tokens),
-            output_item_count = output_items.len(),
-            status = %resp.status,
-            "responses_api lost observed visible output before terminal assembly"
-        );
-        return Err(LlmError::server_error(
-            "OpenAI streamed visible output without a completed message item",
-        ));
-    }
 
     let mut response = LlmResponse::non_streaming(content, end_turn, {
         // Both detail buckets are subsets of OpenAI's inclusive
