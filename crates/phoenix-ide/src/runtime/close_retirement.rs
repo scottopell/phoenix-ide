@@ -3385,9 +3385,10 @@ async fn observe_detached_head_and_submodules(
     let observed = tokio::task::spawn_blocking(move || -> Result<WorktreeObservation, String> {
         let mut visited = std::collections::HashSet::new();
         visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
-        let symbolic = phoenix_core::git::command()
+        let mut symbolic = phoenix_core::git::command();
+        bind_git_command_to_worktree(&mut symbolic, &path)?;
+        let symbolic = symbolic
             .args(["symbolic-ref", "-q", "HEAD"])
-            .current_dir(&path)
             .output()
             .map_err(|error| error.to_string())?;
         let mut result = Vec::new();
@@ -3397,9 +3398,10 @@ async fn observe_detached_head_and_submodules(
                 symbolic.stdout.trim_ascii().to_vec(),
             ));
         } else {
-            let head = phoenix_core::git::command()
+            let mut head = phoenix_core::git::command();
+            bind_git_command_to_worktree(&mut head, &path)?;
+            let head = head
                 .args(["rev-parse", "--verify", "HEAD"])
-                .current_dir(&path)
                 .output()
                 .map_err(|error| error.to_string())?;
             if !head.status.success() {
@@ -3468,18 +3470,20 @@ fn detached_head_is_unreachable(
     observation: &mut WorktreeObservation,
     relative_path: &[u8],
 ) -> Result<bool, String> {
-    let detached = !phoenix_core::git::command()
+    let mut symbolic = phoenix_core::git::command();
+    bind_git_command_to_worktree(&mut symbolic, repository)?;
+    let detached = !symbolic
         .args(["symbolic-ref", "-q", "HEAD"])
-        .current_dir(repository)
         .status()
         .map_err(|error| error.to_string())?
         .success();
     if !detached {
         return Ok(false);
     }
-    let head = phoenix_core::git::command()
+    let mut head = phoenix_core::git::command();
+    bind_git_command_to_worktree(&mut head, repository)?;
+    let head = head
         .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(repository)
         .output()
         .map_err(|error| error.to_string())?;
     if !head.status.success() {
@@ -3499,23 +3503,23 @@ fn detached_unreachable_commits(
     head_oid: &[u8],
 ) -> Result<Vec<Vec<u8>>, String> {
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let stash_exists = phoenix_core::git::command()
+    let mut stash = phoenix_core::git::command();
+    bind_git_command_to_worktree(&mut stash, repository)?;
+    let stash_exists = stash
         .args(["show-ref", "--verify", "--quiet", "refs/stash"])
-        .current_dir(repository)
         .status()
         .map_err(|error| error.to_string())?
         .success();
     let mut command = phoenix_core::git::command();
-    command
-        .args([
-            "rev-list",
-            head_text,
-            "--not",
-            "--branches",
-            "--remotes",
-            "--tags",
-        ])
-        .current_dir(repository);
+    bind_git_command_to_worktree(&mut command, repository)?;
+    command.args([
+        "rev-list",
+        head_text,
+        "--not",
+        "--branches",
+        "--remotes",
+        "--tags",
+    ]);
     if stash_exists {
         command.arg("refs/stash");
     }
@@ -3533,7 +3537,9 @@ fn detached_unreachable_commits(
 
 fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<Vec<u8>, String> {
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let reachable = phoenix_core::git::command()
+    let mut reachable = phoenix_core::git::command();
+    bind_git_command_to_worktree(&mut reachable, repository)?;
+    let reachable = reachable
         .args([
             "for-each-ref",
             "--contains",
@@ -3544,7 +3550,6 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
             "refs/tags",
             "refs/stash",
         ])
-        .current_dir(repository)
         .output()
         .map_err(|error| error.to_string())?;
     if !reachable.status.success() {
@@ -3556,9 +3561,10 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
         return Ok(reachable.stdout);
     }
     let _ = head_oid;
-    let listing = phoenix_core::git::command()
+    let mut listing = phoenix_core::git::command();
+    bind_git_command_to_worktree(&mut listing, repository)?;
+    let listing = listing
         .args(["worktree", "list", "--porcelain", "-z"])
-        .current_dir(repository)
         .output()
         .map_err(|error| error.to_string())?;
     if !listing.status.success() {
@@ -3567,9 +3573,10 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
     let repository = repository
         .canonicalize()
         .map_err(|error| format!("cannot canonicalize inspected worktree: {error}"))?;
-    let git_dir = phoenix_core::git::command()
+    let mut git_dir = phoenix_core::git::command();
+    bind_git_command_to_worktree(&mut git_dir, &repository)?;
+    let git_dir = git_dir
         .args(["rev-parse", "--absolute-git-dir"])
-        .current_dir(&repository)
         .output()
         .map_err(|error| error.to_string())?;
     if !git_dir.status.success() {
@@ -3595,6 +3602,82 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
     Ok(Vec::new())
 }
 
+fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
+    let dot_git = repository.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git).map_err(|error| {
+        format!(
+            "cannot inspect Git metadata at {}: {error}",
+            dot_git.display()
+        )
+    })?;
+    if metadata.is_dir() {
+        return dot_git
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve Git directory: {error}"));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "Git metadata at {} is not a file or directory",
+            dot_git.display()
+        ));
+    }
+    let pointer = std::fs::read(&dot_git)
+        .map_err(|error| format!("cannot read Git metadata at {}: {error}", dot_git.display()))?;
+    let pointer = pointer
+        .strip_prefix(b"gitdir: ")
+        .map(<[u8]>::trim_ascii_end)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Git metadata at {} has no gitdir pointer",
+                dot_git.display()
+            )
+        })?;
+    let pointer = path_buf_from_git_bytes(pointer);
+    let candidate = if pointer.is_absolute() {
+        pointer
+    } else {
+        repository.join(pointer)
+    };
+    if let Ok(candidate) = candidate.canonicalize() {
+        return Ok(candidate);
+    }
+
+    let parent_repository = repository
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join(".git").exists())
+        .ok_or_else(|| {
+            format!(
+                "cannot resolve moved Git directory for {}",
+                repository.display()
+            )
+        })?;
+    let relative = repository
+        .strip_prefix(parent_repository)
+        .map_err(|error| error.to_string())?;
+    let candidate = git_directory_for_worktree(parent_repository)?
+        .join("modules")
+        .join(relative);
+    candidate.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve moved Git directory {}: {error}",
+            candidate.display()
+        )
+    })
+}
+
+fn bind_git_command_to_worktree(
+    command: &mut std::process::Command,
+    repository: &Path,
+) -> Result<(), String> {
+    command
+        .env("GIT_DIR", git_directory_for_worktree(repository)?)
+        .env("GIT_WORK_TREE", repository)
+        .current_dir(repository);
+    Ok(())
+}
+
 fn run_bounded_git_status(repository: &Path) -> Result<std::process::Output, String> {
     run_bounded_git_status_until(
         repository,
@@ -3607,6 +3690,7 @@ fn run_bounded_git_status_until(
     deadline: std::time::Instant,
 ) -> Result<std::process::Output, String> {
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    bind_git_command_to_worktree(&mut command, repository)?;
     command
         .args([
             "status",
@@ -3635,9 +3719,9 @@ fn run_bounded_git_command_until(
     operation: &str,
 ) -> Result<std::process::Output, String> {
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    bind_git_command_to_worktree(&mut command, repository)?;
     command
         .args(arguments)
-        .current_dir(repository)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     if let Some(index) = index {
@@ -3662,10 +3746,10 @@ fn run_bounded_git_paths_until(
 ) -> Result<std::process::Output, String> {
     // `Command::args` accepts path OsStrings, preserving bytes on Unix.
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    bind_git_command_to_worktree(&mut command, repository)?;
     command
         .args(arguments)
         .args(paths.iter().map(|path| path_buf_from_git_bytes(path)))
-        .current_dir(repository)
         .env("GIT_INDEX_FILE", index)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -3901,14 +3985,16 @@ fn observe_initialized_submodules(
             submodule_status,
         ));
 
-        let symbolic_head = phoenix_core::git::command()
+        let mut symbolic_head = phoenix_core::git::command();
+        bind_git_command_to_worktree(&mut symbolic_head, &submodule_path)?;
+        let symbolic_head = symbolic_head
             .args(["symbolic-ref", "-q", "HEAD"])
-            .current_dir(&submodule_path)
             .output()
             .map_err(|error| error.to_string())?;
-        let submodule_head = phoenix_core::git::command()
+        let mut submodule_head = phoenix_core::git::command();
+        bind_git_command_to_worktree(&mut submodule_head, &submodule_path)?;
+        let submodule_head = submodule_head
             .args(["rev-parse", "--verify", "HEAD"])
-            .current_dir(&submodule_path)
             .output()
             .map_err(|error| error.to_string())?;
         if !submodule_head.status.success() && symbolic_head.status.success() {
@@ -4186,6 +4272,7 @@ where
     ensure_no_ignored_content(inspection_path)?;
     runtime.block_on(quarantine_and_remove_exact_worktree(
         identity,
+        confirmed_snapshot,
         administrative_dir.to_path_buf(),
         administrative_dir_incarnation.to_string(),
         final_tombstone.cloned(),
@@ -5814,6 +5901,7 @@ fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
 #[allow(clippy::too_many_lines)]
 async fn quarantine_and_remove_exact_worktree<F, B>(
     identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
     planned_administrative_dir: PathBuf,
     planned_administrative_dir_incarnation: String,
     final_tombstone: Option<CloseWorktreeFinalTombstone>,
@@ -5826,6 +5914,7 @@ where
 {
     quarantine_and_remove_exact_worktree_with_stop(
         identity,
+        confirmed_snapshot,
         planned_administrative_dir,
         planned_administrative_dir_incarnation,
         final_tombstone,
@@ -5839,6 +5928,7 @@ where
 #[allow(clippy::too_many_lines)]
 async fn quarantine_and_remove_exact_worktree_with_stop<F, B, S>(
     identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
     planned_administrative_dir: PathBuf,
     planned_administrative_dir_incarnation: String,
     final_tombstone: Option<CloseWorktreeFinalTombstone>,
@@ -5858,6 +5948,8 @@ where
         return Err("captured worktree path is absent without an exact prior receipt".to_string());
     }
     let expected = identity.fingerprint().as_str().to_string();
+    let inspection_identity = identity.clone();
+    let confirmed_fingerprint = confirmed_snapshot.fingerprint().to_string();
     tokio::task::spawn_blocking(move || {
         let inspection_path = if resuming_quarantine {
             &quarantine
@@ -5905,6 +5997,24 @@ where
 
         if let Err(detail) = stop(inspection_path) {
             return Ok(ExactWorktreeRemoval::StopFailed { detail });
+        }
+        let verification_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let verify_confirmed_snapshot = |candidate: &Path| -> Result<(), String> {
+            let (fresh, _) = verification_runtime
+                .block_on(inspect_worktree_at(&inspection_identity, candidate.to_path_buf()))?;
+            if fresh.fingerprint() != confirmed_fingerprint {
+                return Err(
+                    "worktree changed after Close inspection confirmation; fresh confirmation is required"
+                        .to_string(),
+                );
+            }
+            ensure_no_ignored_content(candidate)
+        };
+        if let Err(detail) = verify_confirmed_snapshot(inspection_path) {
+            return Ok(ExactWorktreeRemoval::ReinspectionRequired { detail });
         }
         if !resuming_quarantine {
             if quarantine
@@ -5955,7 +6065,9 @@ where
                 ),
             });
         }
-        ensure_no_ignored_content(&quarantine)?;
+        if let Err(detail) = verify_confirmed_snapshot(&quarantine) {
+            return Ok(ExactWorktreeRemoval::ReinspectionRequired { detail });
+        }
         let administrative_dir = exact_worktree_administrative_dir(&quarantine, &common)?;
         if administrative_dir != planned_administrative_dir {
             return Err(
@@ -5979,7 +6091,7 @@ where
             },
             |_| {},
             bind_tombstone,
-            |_, object| ensure_no_ignored_content(object),
+            |_, object| verify_confirmed_snapshot(object),
             "quarantined worktree",
         )?;
         remove_exact_worktree_administrative_dir(
@@ -6309,8 +6421,8 @@ fn git_sparse_checkout_selected_paths(
     deadline: std::time::Instant,
 ) -> Result<Vec<Vec<u8>>, String> {
     let mut command = phoenix_core::git::command();
+    bind_git_command_to_worktree(&mut command, repository)?;
     command
-        .current_dir(repository)
         .arg("sparse-checkout")
         .arg("check-rules")
         .arg("-z")
@@ -6484,6 +6596,7 @@ fn staged_index_entries_for_paths(
     let mut entries = std::collections::BTreeMap::new();
     for batch in paths.chunks(256) {
         let mut command = phoenix_core::git::command();
+        bind_git_command_to_worktree(&mut command, repository)?;
         command.args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"]);
         for path in batch {
             command.arg(path_buf_from_git_bytes(path));
@@ -8058,9 +8171,11 @@ mod tests {
         let unrelated_admin = exact_worktree_administrative_dir(&unrelated, &bare).unwrap();
         std::fs::remove_dir_all(&unrelated).unwrap();
         let administrative_dir = exact_worktree_administrative_dir(&linked, &bare).unwrap();
+        let confirmed = inspect_worktree(&identity).await.unwrap().0;
 
         let outcome = quarantine_and_remove_exact_worktree(
             &identity,
+            &confirmed,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
             None,
@@ -8509,6 +8624,25 @@ mod tests {
         let fresh = test_worktree_snapshot(&identity, &target);
         assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
         assert!(target.join("nested/build/unique").exists());
+        std::fs::remove_dir_all(target.join("nested/build")).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let outcome = super::inspect_and_remove_exact_worktree(
+            runtime.handle(),
+            &identity,
+            &confirmed,
+            &administrative,
+            &observe_administrative_dir_incarnation(&administrative).unwrap(),
+            None,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]
@@ -8551,9 +8685,11 @@ mod tests {
         let common = super::exact_worktree_common_git_dir(&target).unwrap();
         let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
         let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
+        let confirmed = inspect_worktree(&identity).await.unwrap().0;
         let later_effect = target.with_extension("later-effect");
         let result = super::quarantine_and_remove_exact_worktree_with_stop(
             &identity,
+            &confirmed,
             administrative.clone(),
             incarnation,
             None,
@@ -8578,13 +8714,172 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn retry_writer_probe_rejects_before_admission() {
-        use std::io::Read as _;
+    #[tokio::test]
+    async fn write_completed_during_fsmonitor_stop_requires_reinspection_before_quarantine() {
         let temp = tempfile::tempdir().unwrap();
         let target = linked_close_worktree(&temp);
+        let tracked = target.join("tracked");
+        std::fs::write(&tracked, "confirmed\n").unwrap();
+        run_git(&target, &["add", "tracked"]);
+        run_git(&target, &["commit", "--quiet", "-m", "tracked"]);
+        let identity = inspection_identity(&target);
+        let confirmed = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let result = super::quarantine_and_remove_exact_worktree_with_stop(
+            &identity,
+            &confirmed,
+            administrative,
+            observe_administrative_dir_incarnation(
+                &super::exact_worktree_administrative_dir(&target, &common).unwrap(),
+            )
+            .unwrap(),
+            None,
+            |_, _, _| panic!("must not bind a tombstone"),
+            |_| panic!("must not quarantine a changed worktree"),
+            move |_| {
+                std::fs::write(&tracked, "changed while stopping\n").unwrap();
+                Ok(super::FsmonitorStop::Stopped)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            ExactWorktreeRemoval::ReinspectionRequired { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(target.join("tracked")).unwrap(),
+            "changed while stopping\n"
+        );
+        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn safe_retry_writer_rejection_does_not_allocate_an_ordinal() {
+        use super::*;
+        use phoenix_core::domain::close::TranscriptConversationId;
+        use std::io::Read as _;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        std::fs::write(target.join("held"), "stable\n").unwrap();
+        run_git(&target, &["add", "held"]);
+        run_git(&target, &["commit", "--quiet", "-m", "held"]);
+        let target_text = target.to_string_lossy().into_owned();
+        let identity = inspection_identity(&target);
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "writer-retry",
+                "writer-retry",
+                &target_text,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let scope = conversation.attached_work_scope_id.unwrap();
+        sqlx::query("UPDATE work_scopes SET environment_kind='allocated_worktree', worktree_path=?1, worktree_id=?2, worktree_fingerprint=?3, branch_name='close-target', base_branch='main' WHERE id=?4")
+            .bind(&target_text)
+            .bind(identity.id().as_str())
+            .bind(identity.fingerprint().as_str())
+            .bind(scope.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse("writer-retry-attempt").unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &TranscriptConversationId::parse(&conversation.id).unwrap(),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        db.advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        let confirmed = inspect_worktree(&identity).await.unwrap().0;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: confirmed.clone(),
+                losses: vec![],
+            }],
+        })
+        .await
+        .unwrap();
+        let snapshot = db
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
+        db.capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+            attempt_id: attempt_id.clone(),
+            snapshot: snapshot.clone(),
+            scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                scope: scope.clone(),
+                inventory: CloseOwnedResourceInventory {
+                    worktree: Some(identity.clone()),
+                    work_scopes: BTreeSet::new(),
+                    bash_process_groups: BTreeSet::new(),
+                    tmux_servers: BTreeSet::new(),
+                    pty_sessions: BTreeSet::new(),
+                    browser_sessions: BTreeSet::new(),
+                    equivalent_live_resources: BTreeSet::new(),
+                },
+            }],
+        })
+        .await
+        .unwrap();
+        let manager = RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        );
+        manager
+            .acquire_close_resource_lease(&attempt_id, scope.clone())
+            .await
+            .unwrap();
+        let worktree = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(identity),
+        )
+        .unwrap();
+        let detail = "injected initial worktree cleanup failure";
+        assert_eq!(
+            manager
+                .record_close_cleanup_failure::<()>(
+                    &CloseRunRef::initial(attempt_id.clone()),
+                    &snapshot,
+                    &scope,
+                    worktree,
+                    RetirementFailureReason::RemovalFailed,
+                    detail,
+                )
+                .await,
+            Err(detail.into())
+        );
+
         let mut child = std::process::Command::new("sh")
-            .args(["-c", "exec 3>held; printf ready; exec sleep 15"])
+            .args(["-c", "exec 3<>held; printf ready; exec sleep 15"])
             .current_dir(&target)
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -8597,15 +8892,40 @@ mod tests {
             .read_exact(&mut ready)
             .unwrap();
         assert_eq!(&ready, b"ready");
-        let result = super::probe_retry_worktree_writers(
-            &target,
-            &target.with_extension("quarantine"),
-            None,
+        let initial = CloseRunRef::initial(attempt_id.clone());
+        assert!(manager
+            .retry_close_runtime_resources(initial.clone())
+            .await
+            .unwrap_err()
+            .contains("external writer"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id=?1"
+            )
+            .bind(attempt_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            1
         );
+
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(result.unwrap_err().contains("external writer"));
-        assert!(target.exists());
+        manager
+            .retry_close_runtime_resources(initial)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id=?1"
+            )
+            .bind(attempt_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            2
+        );
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]
@@ -9681,7 +10001,7 @@ mod tests {
         );
 
         let identity = inspection_identity(&closing);
-        let (_, losses) = inspect_worktree(&identity).await.unwrap();
+        let (confirmed, losses) = inspect_worktree(&identity).await.unwrap();
         assert!(losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
@@ -9689,18 +10009,18 @@ mod tests {
         let administrative_dir = exact_worktree_administrative_dir(&closing, &common).unwrap();
         let outcome = quarantine_and_remove_exact_worktree(
             &identity,
+            &confirmed,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
             None,
             |_, _, _| Ok(()),
             |_| {},
         )
-        .await;
-        assert!(
-            matches!(outcome, Err(ref detail) if detail.contains("cannot inspect ignored content"))
-        );
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
         assert!(!closing.exists());
-        assert!(worktree_quarantine_path(&identity).unwrap().exists());
+        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
     }
 
     #[test]
@@ -10019,6 +10339,7 @@ mod tests {
         run_git(&closing, &["add", "tracked"]);
         run_git(&closing, &["commit", "--quiet", "-m", "tracked"]);
         let identity = inspection_identity(&closing);
+        let confirmed = inspect_worktree(&identity).await.unwrap().0;
         let mut descriptor = std::fs::OpenOptions::new()
             .append(true)
             .open(&tracked)
@@ -10027,6 +10348,7 @@ mod tests {
         let administrative_dir = closing.join(".git");
         let outcome = quarantine_and_remove_exact_worktree(
             &identity,
+            &confirmed,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
             None,
