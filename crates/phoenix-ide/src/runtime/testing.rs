@@ -2565,7 +2565,9 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
         let llm = Arc::new(self.llm.unwrap_or_else(|| MockLlmClient::new("test-model")));
         let tools = Arc::new(self.tools.unwrap_or_default());
 
-        let context = ConvContext::new(&self.conv_id, self.working_dir, "test-model", 200_000);
+        let model_id = llm.model_id().to_string();
+        let context = ConvContext::new(&self.conv_id, self.working_dir, model_id, 200_000);
+
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = crate::runtime::SseBroadcaster::new(128, 0);
         let broadcast_rx = broadcaster.subscribe();

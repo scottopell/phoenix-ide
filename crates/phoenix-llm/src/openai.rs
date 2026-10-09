@@ -281,6 +281,28 @@ struct ResponsesStreamAccumulator {
     observed_visible_output: bool,
 }
 
+fn has_finalized_visible_output(event_type: &str, event: &serde_json::Value) -> bool {
+    let nonempty = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    };
+
+    match event_type {
+        "response.output_text.done" => nonempty(event.get("text")),
+        "response.refusal.done" => nonempty(event.get("refusal")),
+        "response.content_part.done" => match event
+            .pointer("/part/type")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("output_text") => nonempty(event.pointer("/part/text")),
+            Some("refusal") => nonempty(event.pointer("/part/refusal")),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 impl ResponsesStreamAccumulator {
     fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
         Self {
@@ -338,6 +360,16 @@ impl ResponsesStreamAccumulator {
                         self.observed_visible_output = true;
                         let _ = emit.send(super::TokenChunk::Text(delta.to_string())).await;
                     }
+                }
+            }
+            "response.output_text.done"
+            | "response.refusal.done"
+            | "response.content_part.done" => {
+                if has_finalized_visible_output(dispatch_type, &v) {
+                    self.telemetry
+                        .record_generation_event_at(now, GenerationKind::Text);
+                    self.telemetry.record_visible_text_at(now);
+                    self.observed_visible_output = true;
                 }
             }
             "response.reasoning.delta"
@@ -6900,6 +6932,74 @@ mod tests {
         .expect_err("observed visible output cannot disappear at the terminal boundary");
         assert_eq!(err.kind, crate::LlmErrorKind::ServerError);
         assert!(err.kind.is_auto_retryable());
+    }
+
+    #[tokio::test]
+    async fn finalized_visible_output_loss_is_retryable_on_websocket_and_sse() {
+        let request = empty_request();
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-lost-visible-output",
+                "status": "completed",
+                "output": [{"type": "reasoning", "id": "reasoning-1", "summary": []}],
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 18,
+                    "output_tokens_details": {"reasoning_tokens": 16}
+                }
+            }
+        })
+        .to_string();
+        let finalized_events = [
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "text": "final answer"
+            }),
+            serde_json::json!({
+                "type": "response.refusal.done",
+                "refusal": "final refusal"
+            }),
+            serde_json::json!({
+                "type": "response.content_part.done",
+                "part": {"type": "output_text", "text": "final content part"}
+            }),
+        ];
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
+
+        for finalized in finalized_events {
+            let event_type = finalized["type"].as_str().unwrap();
+            let finalized = finalized.to_string();
+
+            let mut websocket = ResponsesStreamAccumulator::new(Instant::now(), &request);
+            websocket
+                .process_event(event_type, &finalized, &chunk_tx)
+                .await
+                .unwrap();
+            websocket
+                .process_event("response.completed", &terminal, &chunk_tx)
+                .await
+                .unwrap();
+            let websocket_error = finalize_websocket_response(websocket, "gpt-test")
+                .expect_err("finalized visible output cannot disappear on WebSocket");
+            let CodexWsError::Backend(websocket_error) = websocket_error else {
+                panic!("visible-output loss must remain a provider error");
+            };
+            assert_eq!(websocket_error.kind, crate::LlmErrorKind::ServerError);
+            assert!(websocket_error.kind.is_auto_retryable());
+
+            let mut sse = ResponsesStreamAccumulator::new(Instant::now(), &request);
+            sse.process_event(event_type, &finalized, &chunk_tx)
+                .await
+                .unwrap();
+            sse.process_event("response.completed", &terminal, &chunk_tx)
+                .await
+                .unwrap();
+            let sse_error = finalize_responses_stream(sse, "gpt-test")
+                .expect_err("finalized visible output cannot disappear on SSE");
+            assert_eq!(sse_error.kind, crate::LlmErrorKind::ServerError);
+            assert!(sse_error.kind.is_auto_retryable());
+        }
     }
 
     #[tokio::test]
