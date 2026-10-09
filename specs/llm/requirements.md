@@ -639,7 +639,7 @@ AND SHALL ignore a configured request-addressing override when the resolved rout
 WHEN an operator configures `PHOENIX_LLM_REQUEST_MODELS` as an inline JSON map of backend route to Phoenix model ID to request spelling
 THE SYSTEM SHALL accept only the three backend-route keys corresponding to Anthropic, OpenAI Responses, and OpenAI Chat Completions
 AND SHALL reject the Codex bridge as a route key
-AND SHALL reject an unknown route, an unknown model ID, a model ID whose backend does not match its route key, a blank request spelling, and malformed JSON
+AND SHALL reject an unknown route, an unknown model ID, a model ID whose backend does not match its route key, a blank request spelling, duplicate route or model keys, and malformed JSON
 AND SHALL validate the entire map atomically before any entry takes effect, so a single invalid entry discards the whole configured map rather than applying a partial one
 
 WHEN a request-addressing override changes which spelling is sent on the wire

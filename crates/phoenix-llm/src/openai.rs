@@ -2176,7 +2176,10 @@ fn is_known_gpt_6(spec: &ModelSpec) -> bool {
 }
 
 fn supports_modern_responses(spec: &ModelSpec) -> bool {
-    spec.id == "gpt-5.6" || spec.id.starts_with("gpt-5.6-") || is_known_gpt_6(spec)
+    matches!(
+        spec.id.as_str(),
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-luna" | "gpt-5.6-terra" | "gpt-5.6-2026-07-01"
+    ) || is_known_gpt_6(spec)
 }
 
 pub(crate) fn supports_responses_lite(spec: &ModelSpec) -> bool {
@@ -6793,6 +6796,24 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 200);
         assert_eq!(resp.usage.cache_creation_tokens, 200);
         assert_eq!(resp.usage.context_window_used(), 1050);
+    }
+
+    #[test]
+    fn arbitrary_canonical_suffix_does_not_grant_modern_responses_features() {
+        let mut spec = test_model_spec("gpt-5.6-legacy");
+        spec.source = super::super::models::ModelSource::External;
+        spec.default_request_name = "gpt-5.5".into();
+        assert!(!supports_responses_lite(&spec));
+        assert!(!supports_explicit_prompt_cache(&spec));
+        let wire = serde_json::to_value(translate_to_responses_request_for_model(
+            &spec,
+            spec.default_request_name.as_str(),
+            &empty_request(),
+            false,
+            true,
+        ))
+        .unwrap();
+        assert!(wire.get("prompt_cache_options").is_none());
     }
 
     #[tokio::test]
