@@ -348,6 +348,13 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
+    /// # Panics
+    ///
+    /// Panics if `PHOENIX_LLM_REQUEST_MODELS` is set but fails to parse or
+    /// validate (unknown route/model, backend mismatch, blank name, or a
+    /// Codex-bridge override). The map is rejected atomically before any
+    /// request can use it, so a malformed override must fail startup rather
+    /// than silently fall back to defaults.
     #[allow(clippy::too_many_lines)]
     pub fn from_env(runtime_env: Arc<PhoenixRuntimeEnvironment>) -> Self {
         let credential_helper = std::env::var("LLM_API_KEY_HELPER")
