@@ -4071,7 +4071,8 @@ mod tests {
             restarted.backend().process_state(server_process),
             ExactProcessState::DeadOrReused
         );
-        assert!(restarted.get_existing(&work_scope).await.is_none());
+        assert!(restarted.get_existing(&work_scope).await.is_some());
+        assert!(restarted.is_retirement_fenced(&work_scope).await);
     }
 
     /// REQ-WL-002d: a replacement at the reused socket proves the persisted
@@ -4222,7 +4223,8 @@ mod tests {
             TmuxRetirementOutcome::Retired
         );
         assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
-        assert!(reg.get_existing(&work_scope).await.is_none());
+        assert!(reg.get_existing(&work_scope).await.is_some());
+        assert!(reg.is_retirement_fenced(&work_scope).await);
     }
 
     /// REQ-TMUX-005: a live server at the scope socket is reused, not
