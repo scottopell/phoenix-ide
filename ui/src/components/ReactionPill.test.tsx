@@ -12,13 +12,13 @@ const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
-function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, composerKey = 'composer', composerTop }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; composerKey?: string; composerTop?: number }) {
+function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, composerAvailable = true, composerKey = 'composer', composerTop }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; composerAvailable?: boolean; composerKey?: string; composerTop?: number }) {
   return <FocusScopeProvider>
     <div className="conversation-column">
     <div id="messages">
       {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>}
     </div>
-    <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />
+    {composerAvailable && <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />}
     </div>
     <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
@@ -242,7 +242,7 @@ describe('reaction pill', () => {
     expect(screen.getByRole('textbox')).toHaveFocus();
   });
 
-  it('re-resolves composer geometry after the composer remounts', async () => {
+  it('re-resolves composer geometry after an unavailable composer remounts and the keyboard resizes the viewport', async () => {
     const listeners = new Map<string, EventListener>();
     const viewport = {
       offsetLeft: 0, offsetTop: 0, width: 390, height: 700,
@@ -261,11 +261,21 @@ describe('reaction pill', () => {
     expect(dock).toHaveStyle({ top: '554px' });
     expect(input).not.toHaveFocus();
     const originalComposer = document.getElementById('input-area')!;
-    view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={500} />);
+
+    view.rerender(<Fixture touchDocked body="Retained" composerAvailable={false} />);
+    await waitFor(() => expect(document.getElementById('input-area')).toBeNull());
+    expect(input).toHaveValue('Retained');
+    expect(input).not.toHaveFocus();
+
+    viewport.height = 420;
+    view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={340} />);
     expect(document.getElementById('input-area')).not.toBe(originalComposer);
     act(() => listeners.get('resize')?.(new Event('resize')));
-    await waitFor(() => expect(dock).toHaveStyle({ top: '434px' }));
+    await waitFor(() => expect(dock).toHaveStyle({ top: '274px' }));
+    expect(input).toHaveValue('Retained');
     expect(input).not.toHaveFocus();
+    expect(add).not.toHaveBeenCalled();
+    viewport.height = 700;
   });
 
   it('anchors a portaled touch dock to the transcript when the composer is absent', async () => {
