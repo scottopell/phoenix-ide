@@ -1062,7 +1062,7 @@ mod tests {
             .with_request_name(alias.into());
             assert_eq!(service.spec.effort_capabilities, before);
             assert!(service.complete(&request_with_capture().0).await.is_err());
-            let (body, provider) = rx.recv().await.unwrap();
+            let (body, provider) = rx.try_recv().expect("request captured before HTTP reply");
             assert_eq!(body["model"], alias);
             assert_eq!(provider, None);
         }
