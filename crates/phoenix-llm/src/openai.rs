@@ -1333,6 +1333,18 @@ async fn complete_codex_websocket(
     }
 }
 
+fn finalize_responses_stream(
+    acc: ResponsesStreamAccumulator,
+    model: &str,
+) -> Result<LlmResponse, LlmError> {
+    if !acc.done {
+        return Err(LlmError::network(
+            "Responses stream ended before a terminal event",
+        ));
+    }
+    bind_responses_model(acc.into_response()?, model)
+}
+
 /// Complete with streaming, emitting `TokenChunk::Text` events via `chunk_tx`.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
@@ -1521,7 +1533,7 @@ pub async fn complete_streaming(
             .await?;
     }
 
-    bind_responses_model(acc.into_response()?, &spec.api_name)
+    finalize_responses_stream(acc, &spec.api_name)
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
@@ -2085,9 +2097,66 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
         .for_each(InputMessageContent::mark_last_block);
 }
 
+fn validate_responses_terminal_content(
+    status: &str,
+    usage: &ResponsesApiUsage,
+    output_items: &[serde_json::Value],
+    content_is_empty: bool,
+) -> Result<(), LlmError> {
+    if !content_is_empty || usage.output_tokens == 0 {
+        return Ok(());
+    }
+
+    let count = |kind| {
+        output_items
+            .iter()
+            .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some(kind))
+            .count()
+    };
+    let output_item_count = output_items.len();
+    let reasoning_item_count = count("reasoning");
+    let message_item_count = count("message");
+    let function_call_item_count = count("function_call");
+    let reasoning_tokens = usage
+        .output_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens);
+    let completed_reasoning_only = status == "completed"
+        && output_item_count > 0
+        && reasoning_item_count == output_item_count
+        && reasoning_tokens == Some(usage.output_tokens);
+
+    if completed_reasoning_only {
+        tracing::debug!(
+            output_tokens = usage.output_tokens,
+            reasoning_tokens,
+            output_item_count,
+            status,
+            "responses_api completed a reasoning-only quiet turn"
+        );
+        return Ok(());
+    }
+
+    tracing::error!(
+        output_tokens = usage.output_tokens,
+        reasoning_tokens,
+        output_item_count,
+        reasoning_item_count,
+        message_item_count,
+        function_call_item_count,
+        status,
+        "responses_api returned no terminal content with output tokens billed"
+    );
+    Err(LlmError::server_error(format!(
+        "OpenAI returned empty response ({} output tokens billed, status={status})",
+        usage.output_tokens
+    )))
+}
+
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
 fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
-    let output_items = resp.output.iter().map(|item| item.0.clone()).collect();
+    let output_items: Vec<serde_json::Value> =
+        resp.output.iter().map(|item| item.0.clone()).collect();
     let mut content = Vec::new();
 
     for output in resp.output {
@@ -2152,23 +2221,12 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
         .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     let end_turn = resp.status == "completed" && !has_tool_calls;
 
-    // Billed-but-empty guard: OpenAI reported output tokens but the
-    // assembled response carried no content block — the message was
-    // lost, most often a gateway dropping the output array. Surface a
-    // retryable server error instead of persisting an empty agent turn
-    // the user was billed for. Complements the response.completed
-    // output-recovery fallback, which handles the partial-loss case.
-    if content.is_empty() && resp.usage.output_tokens > 0 {
-        tracing::error!(
-            output_tokens = resp.usage.output_tokens,
-            status = %resp.status,
-            "responses_api returned empty content with output tokens billed"
-        );
-        return Err(LlmError::server_error(format!(
-            "OpenAI returned empty response ({} output tokens billed, status={})",
-            resp.usage.output_tokens, resp.status
-        )));
-    }
+    validate_responses_terminal_content(
+        &resp.status,
+        &resp.usage,
+        &output_items,
+        content.is_empty(),
+    )?;
 
     let mut response = LlmResponse::non_streaming(content, end_turn, {
         // Both detail buckets are subsets of OpenAI's inclusive
@@ -6621,6 +6679,117 @@ mod tests {
             err.kind.is_auto_retryable(),
             "a lost-message response must be retryable so the executor retries"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_reasoning_only_item_is_valid_quiet_turn() {
+        let response = normalize_responses_api_response(ResponsesApiResponse {
+            id: "resp-reasoning-only".to_string(),
+            model: "gpt-test".to_string(),
+            status: "completed".to_string(),
+            output: vec![ResponsesApiOutput(serde_json::json!({
+                "type": "reasoning",
+                "id": "reasoning-1",
+                "summary": [{"type": "summary_text", "text": "bounded fixture"}],
+                "encrypted_content": "fixture-ciphertext"
+            }))],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 18,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                output_tokens_details: Some(ResponsesApiOutputTokensDetails {
+                    reasoning_tokens: Some(18),
+                }),
+            },
+        })
+        .expect("a completed reasoning-only response is a valid quiet turn");
+
+        assert!(response.content.is_empty());
+        assert!(response.end_turn);
+        assert_eq!(response.usage.output_tokens, 18);
+        assert_eq!(response.usage.reasoning_tokens, Some(18));
+        assert_eq!(response.provider_replay, Some(ProviderReplayUpdate::Clear));
+    }
+
+    #[tokio::test]
+    async fn reasoning_item_without_complete_reasoning_usage_remains_retryable_error() {
+        let err = normalize_responses_api_response(ResponsesApiResponse {
+            id: "resp-ambiguous-reasoning".to_string(),
+            model: "gpt-test".to_string(),
+            status: "completed".to_string(),
+            output: vec![ResponsesApiOutput(serde_json::json!({
+                "type": "reasoning",
+                "id": "reasoning-1",
+                "summary": []
+            }))],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 18,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                output_tokens_details: None,
+            },
+        })
+        .expect_err("ambiguous billed output must not be inferred to be a quiet turn");
+
+        assert_eq!(err.kind, crate::LlmErrorKind::ServerError);
+        assert!(err.kind.is_auto_retryable());
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_terminal_has_websocket_sse_accumulator_parity() {
+        let request = empty_request();
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-reasoning-only",
+                "status": "completed",
+                "output": [{"type": "reasoning", "id": "reasoning-1", "summary": []}],
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 18,
+                    "output_tokens_details": {"reasoning_tokens": 18}
+                }
+            }
+        })
+        .to_string();
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
+
+        let mut websocket = ResponsesStreamAccumulator::new(Instant::now(), &request);
+        websocket
+            .process_event("response.completed", &terminal, &chunk_tx)
+            .await
+            .unwrap();
+        let websocket = websocket.into_response().unwrap();
+
+        let mut sse = ResponsesStreamAccumulator::new(Instant::now(), &request);
+        sse.process_event("response.completed", &terminal, &chunk_tx)
+            .await
+            .unwrap();
+        let sse = sse.into_response().unwrap();
+
+        assert!(websocket.content.is_empty());
+        assert_eq!(websocket.content, sse.content);
+        assert_eq!(websocket.end_turn, sse.end_turn);
+        assert_eq!(websocket.usage, sse.usage);
+        assert_eq!(websocket.provider_replay, sse.provider_replay);
+    }
+
+    #[test]
+    fn responses_sse_preterminal_eof_is_retryable_network_error() {
+        let request = empty_request();
+        let acc = ResponsesStreamAccumulator::new(Instant::now(), &request);
+
+        let err = finalize_responses_stream(acc, "gpt-test")
+            .expect_err("pre-terminal EOF must not fabricate completed status");
+
+        assert_eq!(err.kind, crate::LlmErrorKind::Network);
+        assert!(err.kind.is_auto_retryable());
     }
 
     /// A `refusal` message part is the model's actual reply — it declined.

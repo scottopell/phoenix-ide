@@ -537,6 +537,22 @@ THE SYSTEM SHALL reject the incomplete stream as an invalid response
 
 **Rationale:** Token-by-token streaming enables progressive display of LLM output (REQ-BED-025). The provider layer must deliver partial content while still producing the same final response type for the state machine.
 
+#### REQ-LLM-009a: Responses Terminal Classification
+
+WHEN a Responses transport receives an authenticated `response.completed` terminal event whose complete output consists only of reasoning items
+AND the provider classifies every billed output token as a reasoning token
+THEN Phoenix SHALL settle the request as a valid quiet end turn without fabricating visible assistant text.
+
+WHEN billed output has no terminal model-visible content and the terminal shape does not prove that all output was reasoning
+THEN Phoenix SHALL classify the result as a retryable provider failure rather than silently persisting an empty agent turn.
+
+WHEN an HTTP/SSE Responses stream ends before a terminal event
+THEN Phoenix SHALL classify the attempt as an interrupted retryable network failure and SHALL NOT fabricate completed status from partial output.
+
+The HTTP/SSE and WebSocket transports SHALL apply the same terminal normalization to equivalent authenticated terminal events.
+
+**Rationale:** Reasoning is authentic private provider output, not public transcript text. A completed reasoning-only turn is legitimate when usage and terminal shape prove it, while missing terminal content and pre-terminal EOF remain evidence of transport/provider loss.
+
 ---
 
 ### REQ-LLM-010: Native Codex Authentication
