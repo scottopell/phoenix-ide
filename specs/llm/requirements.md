@@ -614,3 +614,47 @@ AND SHALL admit `timed_out`
 AND SHALL continue rejecting undeclared outcome values
 
 The migration is forward-only internal persistence under the project compatibility policy. It does not establish downgrade compatibility or a stable cross-version SQLite schema contract.
+
+---
+
+### REQ-LLM-014: Canonical Model Identity Is Distinct From Request Addressing
+
+THE SYSTEM SHALL treat a model's Phoenix ID as the sole canonical identity for the picker, persistence, continuation, agent/worker selection, and every capability or transport check
+
+THE SYSTEM SHALL represent the wire spelling used to address a provider request as a separate typed value, scoped to serialization, discovery-name matching, and replay/continuation binding only
+
+AND SHALL NOT accept that typed request-addressing value anywhere a feature, capability, or transport check reads canonical model identity
+
+AND SHALL NOT introduce a third identity field that duplicates either the canonical ID or the request-addressing value
+
+WHEN a configured model declares a wire model name
+THE SYSTEM SHALL preserve that configured name as the model's default request spelling
+AND SHALL NOT mutate the model's canonical spec to apply a deployment-specific request-addressing override
+
+WHEN resolving the request spelling for an outbound call
+THE SYSTEM SHALL first resolve the model's actual backend route
+AND SHALL then resolve the request spelling for that route
+AND SHALL ignore a configured request-addressing override when the resolved route is the native Codex bridge
+
+WHEN an operator configures `PHOENIX_LLM_REQUEST_MODELS` as an inline JSON map of backend route to Phoenix model ID to request spelling
+THE SYSTEM SHALL accept only the three backend-route keys corresponding to Anthropic, OpenAI Responses, and OpenAI Chat Completions
+AND SHALL reject the Codex bridge as a route key
+AND SHALL reject an unknown route, an unknown model ID, a model ID whose backend does not match its route key, a blank request spelling, and malformed JSON
+AND SHALL validate the entire map atomically before any entry takes effect, so a single invalid entry discards the whole configured map rather than applying a partial one
+
+WHEN a request-addressing override changes which spelling is sent on the wire
+THE SYSTEM SHALL change the derived continuation/route key accordingly
+AND SHALL NOT change the model's canonical ID, capability classification, or the continuation/route key produced in the absence of an override
+
+THE SYSTEM SHALL NOT automatically inject a `provider` request header inferred from model or route identity
+AND SHALL continue to honor explicitly configured custom headers and the headers required for native Codex account binding and protocol framing
+
+WHEN normalizing an OpenAI Responses API reply, whether delivered as a single JSON body or reassembled from a stream
+THE SYSTEM SHALL bind the normalized response's model field to the request spelling that was sent
+AND SHALL NOT bind it to the physical model name the provider reports in its reply, which may legitimately differ from the request spelling under a gateway or alias
+
+WHEN matching a model against provider-reported model-list discovery
+THE SYSTEM SHALL match using the model's resolved request spelling for its actual route, plus its canonical ID and normative backend-prefixed legacy aliases
+AND SHALL continue to treat the Codex advisory catalog as non-binding: absence from it SHALL NOT deregister a supported built-in, and presence in it SHALL NOT register a model absent from the built-in or operator-configured catalog
+
+**Rationale:** Conflating canonical identity with wire spelling forced every capability and transport check to special-case gateway-rewritten model names, and made an automatically inferred `provider` header silently wrong whenever a deployment's request spelling didn't match its actual provider. Splitting the two lets the picker, persistence, and capability checks stay keyed on a value that never changes under a gateway, while the wire spelling can be remapped per deployment through one validated, atomic configuration surface that native Codex — which owns its own account-bound addressing — is structurally excluded from.
