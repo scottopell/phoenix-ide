@@ -558,6 +558,25 @@ pub trait StateStore: Send + Sync {
     /// The clearing pressure signal (specs/stale-tool-results, REQ-STR-001).
     async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String>;
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_tool_availability(
+        &self,
+        conversation_id: &str,
+        route_key: &str,
+        anchor_message_id: Option<&str>,
+        live_definitions: &[phoenix_llm::ToolDefinition],
+        callable_names: &std::collections::BTreeSet<String>,
+        visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
+        historical_tool_references: &[(String, String)],
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String>;
+    async fn load_responses_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String>;
     async fn load_provider_replay_state(
         &self,
         conversation_id: &str,
@@ -567,7 +586,7 @@ pub trait StateStore: Send + Sync {
         conversation_id: &str,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String>;
     #[allow(clippy::too_many_arguments)]
     async fn persist_tool_round_state_and_provider_replay(
@@ -577,7 +596,7 @@ pub trait StateStore: Send + Sync {
         tool_results: &[Message],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String>;
 
     #[allow(clippy::too_many_arguments)]
@@ -634,6 +653,12 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError>;
+
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
+        Ok(self.model_id().to_owned())
+    }
+
     /// Complete an LLM request (non-streaming)
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
 
@@ -1247,6 +1272,41 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).get_last_turn_prompt_tokens(conv_id).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_tool_availability(
+        &self,
+        conversation_id: &str,
+        route_key: &str,
+        anchor_message_id: Option<&str>,
+        live_definitions: &[phoenix_llm::ToolDefinition],
+        callable_names: &std::collections::BTreeSet<String>,
+        visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
+        historical_tool_references: &[(String, String)],
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        (**self)
+            .prepare_tool_availability(
+                conversation_id,
+                route_key,
+                anchor_message_id,
+                live_definitions,
+                callable_names,
+                visible_messages,
+                historical_tool_references,
+            )
+            .await
+    }
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        (**self).load_tool_admission_policy(conversation_id).await
+    }
+    async fn load_responses_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+        (**self).load_responses_replay_state(conversation_id).await
+    }
     async fn load_provider_replay_state(
         &self,
         conversation_id: &str,
@@ -1258,7 +1318,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         conversation_id: &str,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         (**self)
             .update_state_and_provider_replay(conversation_id, state, state_updated_at, update)
@@ -1272,7 +1332,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         tool_results: &[Message],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         (**self)
             .persist_tool_round_state_and_provider_replay(
@@ -1367,6 +1427,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
 #[async_trait]
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        T::freeze_for_request(Arc::clone(self.as_ref()))
+    }
+
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
+        (**self).continuation_route_key()
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         (**self).complete(request).await
     }
@@ -2497,6 +2565,48 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_tool_availability(
+        &self,
+        conversation_id: &str,
+        route_key: &str,
+        anchor_message_id: Option<&str>,
+        live_definitions: &[phoenix_llm::ToolDefinition],
+        callable_names: &std::collections::BTreeSet<String>,
+        visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
+        historical_tool_references: &[(String, String)],
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        self.db
+            .prepare_tool_availability(
+                conversation_id,
+                route_key,
+                anchor_message_id,
+                live_definitions,
+                callable_names,
+                visible_messages,
+                historical_tool_references,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        self.db
+            .load_tool_admission_policy(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn load_responses_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+        self.db
+            .load_responses_replay_state(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
     async fn load_provider_replay_state(
         &self,
         conversation_id: &str,
@@ -2511,10 +2621,10 @@ impl StateStore for DatabaseStorage {
         conversation_id: &str,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         self.db
-            .update_state_and_provider_replay(conversation_id, state, state_updated_at, update)
+            .update_state_and_replay(conversation_id, state, state_updated_at, update)
             .await
             .map_err(|error| error.to_string())
     }
@@ -2526,10 +2636,10 @@ impl StateStore for DatabaseStorage {
         tool_results: &[Message],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         self.db
-            .persist_tool_round_state_and_provider_replay(
+            .persist_tool_round_state_and_replay(
                 conversation_id,
                 assistant,
                 tool_results,
@@ -2672,6 +2782,17 @@ impl RegistryLlmClient {
 
 #[async_trait]
 impl LlmClient for RegistryLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(Arc::new(FrozenServiceClient {
+            service: self.service()?,
+        }))
+    }
+
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
+        self.service()
+            .map(|service| service.continuation_route_key())
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let llm = self.service()?;
         llm.complete(request).await
@@ -2695,6 +2816,41 @@ impl LlmClient for RegistryLlmClient {
             phoenix_llm::ContinuationRequestLimits::TokenWindowOnly,
             |llm| llm.continuation_request_limits(),
         )
+    }
+}
+
+struct FrozenServiceClient {
+    service: Arc<dyn phoenix_llm::LlmService>,
+}
+
+#[async_trait]
+impl LlmClient for FrozenServiceClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
+    fn continuation_route_key(&self) -> Result<String, LlmError> {
+        Ok(self.service.continuation_route_key())
+    }
+
+    async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.service.complete(request).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        self.service.complete_streaming(request, chunk_tx).await
+    }
+
+    fn model_id(&self) -> &str {
+        self.service.model_id()
+    }
+
+    fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
+        self.service.continuation_request_limits()
     }
 }
 
@@ -2777,7 +2933,7 @@ impl ToolRegistryExecutor {
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
     async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
-        let (name, input) = call.into_parts();
+        let (name, input, expected_schema) = call.into_bound_parts();
         // Look up the tool while holding the read lock, then drop the guard
         // before the async .run() call (RwLockReadGuard is !Send).
         let tool = {
@@ -2788,18 +2944,35 @@ impl ToolExecutor for ToolRegistryExecutor {
             registry.find_tool(&name)
         };
         if let Some(t) = tool {
+            if expected_schema
+                .as_ref()
+                .is_some_and(|expected| *expected != t.input_schema())
+            {
+                return Some(ToolOutput::error(
+                    "EUNAVAIL: tool input schema changed before execution",
+                ));
+            }
             return Some(t.run(input, ctx).await);
         }
 
         // Fall back to live MCP tool resolution.
         if let Some(ref manager) = self.mcp_manager {
-            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name(manager, &name).await
+            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name_with_schema(
+                manager,
+                &name,
+                expected_schema.as_ref(),
+            )
+            .await
             {
                 return Some(mcp_tool.run(input, ctx).await);
             }
         }
 
-        None
+        expected_schema.map(|_| {
+            ToolOutput::error(
+                "EUNAVAIL: tool is unavailable or its input schema changed before execution",
+            )
+        })
     }
 
     fn coordinator_skill_catalog(
@@ -2960,6 +3133,128 @@ mod tool_registry_executor_tests {
 mod registry_llm_client_tests {
     use super::*;
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn frozen_request_cannot_send_prepared_private_replay_through_reloaded_account() {
+        use phoenix_core::domain::{
+            llm_types::{EffectiveEffort, EffectiveServiceTier, PromptCacheKey},
+            provider_replay::ProviderReplayUpdate,
+            responses_replay::ResponsesResponseSet,
+        };
+        use phoenix_llm::CredentialSource;
+
+        let directory = tempfile::tempdir().unwrap();
+        let write_account = |name: &str| {
+            let path = directory.path().join(format!("{name}.json"));
+            std::fs::write(&path, format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9.","refresh_token":"test","account_id":"{name}"}}}}"#,
+            )).unwrap();
+            path
+        };
+        let first_path = write_account("account-a");
+        let first_credential = phoenix_llm::CodexCredential::load(first_path).unwrap().0;
+        let registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(Arc::clone(&first_credential)),
+            ..Default::default()
+        }));
+        let client = Arc::new(Arc::new(
+            RegistryLlmClient::new(Arc::clone(&registry), "gpt-5.6-sol".into())
+                .with_connection(Some("codex".into())),
+        ));
+        let frozen = Arc::clone(&client).freeze_for_request().unwrap();
+        let first_route = frozen.continuation_route_key().unwrap();
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("frozen", "frozen", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let policy = db
+            .prepare_tool_availability(
+                "frozen",
+                &first_route,
+                None,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        let replay = ResponsesResponseSet {
+            response_id: "response-a".into(),
+            model: "gpt-5.6-sol".into(),
+            owner_message_id: "owner-a".into(),
+            public_content: vec![],
+            output_items: vec![serde_json::json!({
+                "type":"reasoning", "id":"reason-a", "encrypted_content":"account-a-private",
+            })],
+        };
+        db.update_state_and_replay(
+            "frozen",
+            &ConvState::LlmRequesting { attempt: 1 },
+            Utc::now(),
+            &ProviderReplayUpdate::Responses(replay.clone()),
+        )
+        .await
+        .unwrap();
+        let request = LlmRequest {
+            system: vec![],
+            messages: vec![],
+            provider_replay: None,
+            responses_replay: db.load_responses_replay_state("frozen").await.unwrap(),
+            tool_availability: policy.clone(),
+            max_tokens: Some(100),
+            effective_effort: EffectiveEffort::native_unknown(),
+            service_tier: EffectiveServiceTier::Standard,
+            telemetry: None,
+            cache_key: PromptCacheKey::ephemeral(),
+        };
+        assert_eq!(request.responses_replay, vec![replay.clone()]);
+        first_credential.revoke().await;
+        let second_path = write_account("account-b");
+        assert!(
+            registry
+                .reload_codex_credential_with(Some(second_path))
+                .credential_loaded
+        );
+        assert!(registry
+            .current_codex_credential()
+            .unwrap()
+            .get()
+            .await
+            .is_some());
+        let second = Arc::clone(&client).freeze_for_request().unwrap();
+        assert_ne!(second.continuation_route_key().unwrap(), first_route);
+        assert_eq!(frozen.continuation_route_key().unwrap(), first_route);
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(1);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            frozen.complete_streaming(&request, &chunk_tx),
+        )
+        .await
+        .expect("revoked originating credential must fail before transport")
+        .unwrap_err();
+        assert_eq!(error.kind, phoenix_llm::LlmErrorKind::Auth);
+        assert!(error.message.contains("credential signed out"));
+        assert_eq!(
+            db.load_responses_replay_state("frozen").await.unwrap(),
+            vec![replay]
+        );
+        let retained = db
+            .prepare_tool_availability(
+                "frozen",
+                &first_route,
+                None,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained.continuation_id(), policy.continuation_id());
+    }
+
     fn codex_registry() -> (tempfile::TempDir, Arc<ModelRegistry>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
@@ -2986,6 +3281,7 @@ mod registry_llm_client_tests {
             panic!("must not substitute Codex for the selected direct connection");
         };
         assert_eq!(error.kind, phoenix_llm::LlmErrorKind::InvalidRequest);
+        assert!(client.continuation_route_key().is_err());
         assert!(!error.kind.is_auto_retryable());
         assert!(error.message.contains("openai_responses"));
         assert!(
@@ -2996,6 +3292,62 @@ mod registry_llm_client_tests {
         );
         let unpinned = RegistryLlmClient::new(registry, "missing-model".to_string());
         assert!(unpinned.service().err().unwrap().kind.is_auto_retryable());
+    }
+
+    #[tokio::test]
+    async fn unavailable_pinned_route_preserves_durable_policy_and_replay_until_restored() {
+        let (directory, registry) = codex_registry();
+        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.6-sol".into())
+            .with_connection(Some("codex".into()));
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("pinned", "pinned", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let route = client.continuation_route_key().unwrap();
+        let before = db
+            .prepare_tool_availability(
+                "pinned",
+                &route,
+                None,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO active_provider_replay_state (conversation_id,provider,model,response_id,payload) VALUES ('pinned','anthropic','model','response','{}')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO active_responses_replay_sets (conversation_id,response_id,ordinal,model,owner_message_id,public_content) VALUES ('pinned','response',0,'gpt','owner','[]')").execute(db.pool()).await.unwrap();
+        registry.reload_codex_credential_with(None);
+        let error = client.continuation_route_key().unwrap_err();
+        assert_eq!(error.kind, phoenix_llm::LlmErrorKind::InvalidRequest);
+        let stored: String = sqlx::query_scalar(
+            "SELECT continuation_id FROM conversation_tool_contexts WHERE conversation_id='pinned'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(before.continuation_id(), Some(stored.as_str()));
+        let count: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM active_provider_replay_state) + (SELECT COUNT(*) FROM active_responses_replay_sets)").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(count, 2);
+        registry.reload_codex_credential_with(Some(directory.path().join("auth.json")));
+        let restored_route = client.continuation_route_key().unwrap();
+        assert_eq!(restored_route, route);
+        let restored = db
+            .prepare_tool_availability(
+                "pinned",
+                &restored_route,
+                None,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.continuation_id(), restored.continuation_id());
+        let count: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM active_provider_replay_state) + (SELECT COUNT(*) FROM active_responses_replay_sets)").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

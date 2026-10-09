@@ -596,7 +596,22 @@ const MIGRATIONS: &[Migration] = &[
         name: "federation_peer_connections",
         sql: MIGRATION_116,
     },
+    Migration {
+        version: 117,
+        name: "persist_conversation_tool_policy",
+        sql: MIGRATION_117,
+    },
+    Migration {
+        version: 118,
+        name: "persist_mcp_token_removals",
+        sql: "CREATE TABLE mcp_oauth_removals (server_name TEXT PRIMARY KEY NOT NULL);",
+    },
 ];
+
+const MIGRATION_117: &str = concat!(
+    include_str!("tool_availability.sql"),
+    include_str!("responses_replay.sql")
+);
 
 const MIGRATION_113: &str = "";
 
@@ -11880,15 +11895,16 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(7).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
             vec![
+                (118, "persist_mcp_token_removals"),
+                (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),
                 (114, "persist_instance_identity"),
                 (113, "settle_historical_continuation_openings"),
                 (112, "input_source_tool_call"),
                 (111, "coordinator_conversation_watches"),
-                (110, "trusted_input_origin"),
             ]
         );
     }

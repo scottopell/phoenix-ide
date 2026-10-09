@@ -9,4 +9,4 @@
  * [`ChainSseEvent`] case; the conversion lives in `From<ChainSseEvent>`
  * below. The SSE `event:` label is the variant's `snake_case` tag.
  */
-export type ChainSseWireEvent = { "type": "chain_qa_token", chain_qa_id: string, delta: string, } | { "type": "chain_qa_completed", chain_qa_id: string, full_answer: string, } | { "type": "chain_qa_failed", chain_qa_id: string, error: string, partial_answer: string | null, };
+export type ChainSseWireEvent = { "type": "chain_qa_token", chain_qa_id: string, delta: string, } | { "type": "chain_qa_answer_reset", chain_qa_id: string, } | { "type": "chain_qa_completed", chain_qa_id: string, full_answer: string, } | { "type": "chain_qa_failed", chain_qa_id: string, error: string, partial_answer: string | null, };

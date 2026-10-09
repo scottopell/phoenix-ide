@@ -20,6 +20,8 @@ pub use svg_artifacts::SvgArtifact;
 mod migrations;
 mod product_creation;
 mod provider_replay;
+mod responses_replay;
+mod tool_availability;
 pub use product_creation::*;
 mod prompt_projection;
 pub use prompt_projection::{
@@ -3783,6 +3785,60 @@ impl Database {
             .bind(server_name)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Persist removal intent independently of the grant.
+    ///
+    /// # Errors
+    /// Returns a database error when the intent cannot be recorded.
+    pub async fn record_mcp_oauth_removal(&self, name: &str) -> DbResult<()> {
+        sqlx::query("INSERT INTO mcp_oauth_removals (server_name) VALUES (?1) ON CONFLICT(server_name) DO NOTHING")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// List durable MCP credential removals.
+    ///
+    /// # Errors
+    /// Returns a database error when the intents cannot be read.
+    pub async fn pending_mcp_oauth_removals(&self) -> DbResult<Vec<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT server_name FROM mcp_oauth_removals ORDER BY server_name")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Cancel removal without changing the grant.
+    ///
+    /// # Errors
+    /// Returns a database error when the intent cannot be deleted.
+    pub async fn cancel_mcp_oauth_removal(&self, name: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM mcp_oauth_removals WHERE server_name = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Commit token deletion and removal completion together.
+    ///
+    /// # Errors
+    /// Returns a database error when the transaction cannot commit.
+    pub async fn complete_mcp_oauth_removal(&self, name: &str) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM mcp_oauth_tokens WHERE server_name = ?1")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM mcp_oauth_removals WHERE server_name = ?1")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -10498,6 +10554,14 @@ impl Database {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM conversation_tool_contexts WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
             .bind(id)
             .execute(&mut *tx)
@@ -18052,6 +18116,59 @@ mod tests {
                 .unwrap(),
             Some(confidential)
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_removal_intent_survives_restart_and_commits_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oauth.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        let token = McpOAuthTokenRow {
+            server_name: "remote".into(),
+            resource_uri: "https://mcp.example/mcp".into(),
+            scopes: "read".into(),
+            access_token: "at-1".into(),
+            refresh_token: Some("rt-1".into()),
+            expires_at: 1_900_000_000,
+        };
+        db.upsert_mcp_oauth_token(&token).await.unwrap();
+        db.record_mcp_oauth_removal("remote").await.unwrap();
+        db.delete_mcp_oauth_token("remote").await.unwrap();
+        db.upsert_mcp_oauth_token(&token).await.unwrap();
+        assert_eq!(
+            db.pending_mcp_oauth_removals().await.unwrap(),
+            vec!["remote"]
+        );
+        db.pool().close().await;
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        assert_eq!(
+            db.pending_mcp_oauth_removals().await.unwrap(),
+            vec!["remote"]
+        );
+        sqlx::raw_sql("CREATE TRIGGER fail_removal BEFORE DELETE ON mcp_oauth_removals BEGIN SELECT RAISE(ABORT, 'retry'); END;")
+            .execute(db.pool()).await.unwrap();
+        assert!(db.complete_mcp_oauth_removal("remote").await.is_err());
+        assert_eq!(
+            db.get_mcp_oauth_token("remote").await.unwrap(),
+            Some(token.clone())
+        );
+        assert_eq!(
+            db.pending_mcp_oauth_removals().await.unwrap(),
+            vec!["remote"]
+        );
+        sqlx::raw_sql("DROP TRIGGER fail_removal")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.cancel_mcp_oauth_removal("remote").await.unwrap();
+        assert_eq!(db.get_mcp_oauth_token("remote").await.unwrap(), Some(token));
+        assert!(db.pending_mcp_oauth_removals().await.unwrap().is_empty());
+        db.record_mcp_oauth_removal("remote").await.unwrap();
+        db.complete_mcp_oauth_removal("remote").await.unwrap();
+        assert!(db.get_mcp_oauth_token("remote").await.unwrap().is_none());
+        assert!(db.pending_mcp_oauth_removals().await.unwrap().is_empty());
     }
 
     #[tokio::test]

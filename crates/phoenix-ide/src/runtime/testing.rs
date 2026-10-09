@@ -66,6 +66,10 @@ impl MockLlmClient {
 
 #[async_trait]
 impl LlmClient for MockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.requests.lock().unwrap().push(request.clone());
         self.request_count_tx.send_modify(|count| *count += 1);
@@ -149,6 +153,10 @@ impl StreamingMockLlmClient {
 
 #[async_trait]
 impl LlmClient for StreamingMockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         // Not used — complete_streaming is the intended path.
         Err(LlmError::network(
@@ -292,6 +300,10 @@ impl DelayedMockLlmClient {
 
 #[async_trait]
 impl LlmClient for DelayedMockLlmClient {
+    fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+        Ok(self)
+    }
+
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.inner.requests.lock().unwrap().push(request.clone());
         self.request_started.notify_waiters();
@@ -559,6 +571,8 @@ type StoredSvgArtifacts = HashMap<
 #[allow(dead_code)]
 pub struct InMemoryStorage {
     svg_artifacts: Mutex<StoredSvgArtifacts>,
+    tool_admission_policies:
+        Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -629,6 +643,9 @@ pub struct InMemoryStorage {
     metrics_write_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     metrics_write_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     llm_request_metrics: Mutex<Vec<phoenix_llm::LlmAttemptMetrics>>,
+    turn_usages: Mutex<Vec<(String, phoenix_llm::Usage)>>,
+    provider_replay_updates:
+        Mutex<Vec<phoenix_core::domain::provider_replay::ProviderReplayUpdate>>,
     metrics_written: tokio::sync::Notify,
     steering_drain_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
@@ -641,9 +658,21 @@ pub struct InMemoryStorage {
 
 #[allow(dead_code)]
 impl InMemoryStorage {
+    pub fn seed_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+        policy: phoenix_core::domain::tool_availability::ToolAvailability,
+    ) {
+        self.tool_admission_policies
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_owned(), policy);
+    }
+
     pub fn new() -> Self {
         Self {
             svg_artifacts: Mutex::new(HashMap::new()),
+            tool_admission_policies: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
@@ -700,6 +729,8 @@ impl InMemoryStorage {
             metrics_write_started: Mutex::new(None),
             metrics_write_release: Mutex::new(None),
             llm_request_metrics: Mutex::new(Vec::new()),
+            turn_usages: Mutex::new(Vec::new()),
+            provider_replay_updates: Mutex::new(Vec::new()),
             metrics_written: tokio::sync::Notify::new(),
             steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
@@ -2256,6 +2287,44 @@ impl StateStore for InMemoryStorage {
             .copied())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_tool_availability(
+        &self,
+        conversation_id: &str,
+        _route_key: &str,
+        _anchor_message_id: Option<&str>,
+        live_definitions: &[phoenix_llm::ToolDefinition],
+        callable_names: &std::collections::BTreeSet<String>,
+        _visible_messages: &[phoenix_core::domain::tool_availability::ToolPolicyMessage],
+        _historical_tool_references: &[(String, String)],
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        let policy = phoenix_core::domain::tool_availability::ToolAvailability::new(
+            live_definitions.to_vec(),
+            callable_names.clone(),
+        )?;
+        self.seed_tool_admission_policy(conversation_id, policy.clone());
+        Ok(policy)
+    }
+    async fn load_tool_admission_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<phoenix_core::domain::tool_availability::ToolAvailability, String> {
+        Ok(self
+            .tool_admission_policies
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                phoenix_core::domain::tool_availability::ToolAvailability::all(vec![])
+            }))
+    }
+    async fn load_responses_replay_state(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::responses_replay::ResponsesResponseSet>, String> {
+        Ok(Vec::new())
+    }
     async fn load_provider_replay_state(
         &self,
         _conversation_id: &str,
@@ -2267,8 +2336,12 @@ impl StateStore for InMemoryStorage {
         conversation_id: &str,
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
-        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
+        self.provider_replay_updates
+            .lock()
+            .unwrap()
+            .push(update.clone());
         self.update_state(conversation_id, state, state_updated_at)
             .await
     }
@@ -2280,7 +2353,7 @@ impl StateStore for InMemoryStorage {
         tool_results: &[crate::db::Message],
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
-        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+        _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
         self.persist_tool_round_and_state(
             conversation_id,
@@ -2322,12 +2395,16 @@ impl StateStore for InMemoryStorage {
         &self,
         _conversation_id: &str,
         _root_conversation_id: &str,
-        _model: &str,
+        model: &str,
         _effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
         _service_tier: phoenix_core::domain::llm_types::ServiceTier,
-        _usage: &phoenix_llm::Usage,
+        usage: &phoenix_llm::Usage,
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
+        self.turn_usages
+            .lock()
+            .unwrap()
+            .push((model.to_string(), usage.clone()));
         Ok(())
     }
 
@@ -2488,7 +2565,9 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
         let llm = Arc::new(self.llm.unwrap_or_else(|| MockLlmClient::new("test-model")));
         let tools = Arc::new(self.tools.unwrap_or_default());
 
-        let context = ConvContext::new(&self.conv_id, self.working_dir, "test-model", 200_000);
+        let model_id = llm.model_id().to_string();
+        let context = ConvContext::new(&self.conv_id, self.working_dir, model_id, 200_000);
+
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = crate::runtime::SseBroadcaster::new(128, 0);
         let broadcast_rx = broadcaster.subscribe();
@@ -2595,6 +2674,16 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     pub fn messages(&self) -> Vec<Message> {
         self.storage.get_all_messages("test-conv")
     }
+
+    pub fn turn_usages(&self) -> Vec<(String, phoenix_llm::Usage)> {
+        self.storage.turn_usages.lock().unwrap().clone()
+    }
+
+    pub fn provider_replay_updates(
+        &self,
+    ) -> Vec<phoenix_core::domain::provider_replay::ProviderReplayUpdate> {
+        self.storage.provider_replay_updates.lock().unwrap().clone()
+    }
 }
 
 // ============================================================================
@@ -2680,9 +2769,12 @@ mod tests {
 
         let request = LlmRequest {
             provider_replay: None,
+            responses_replay: Vec::new(),
             system: vec![],
             messages: vec![],
-            tools: vec![],
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
             max_tokens: Some(100),
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
 
@@ -2772,6 +2864,106 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].message_type, MessageType::User);
         assert_eq!(msgs[1].message_type, MessageType::Agent);
+    }
+
+    #[tokio::test]
+    async fn quiet_reasoning_end_turn_settles_and_allows_next_same_model_turn() {
+        let llm = MockLlmClient::new("gpt-6-astra");
+        llm.queue_response(LlmResponse {
+            provider_replay: Some(
+                phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+            ),
+            content: vec![],
+            end_turn: true,
+            usage: Usage {
+                input_tokens: 1000,
+                output_tokens: 18,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                reasoning_tokens: Some(18),
+            },
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("next turn succeeded")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+
+        let mut runtime = TestRuntime::new().llm(llm).build();
+        runtime.send_message("finish privately").await;
+        assert!(runtime.wait_for_done(Duration::from_secs(2)).await);
+
+        let first_turn_messages = runtime.messages();
+        assert_eq!(first_turn_messages.len(), 1);
+        assert_eq!(first_turn_messages[0].message_type, MessageType::User);
+        assert!(matches!(
+            runtime.storage.get_current_state("test-conv"),
+            Some(ConvState::Idle)
+        ));
+        assert_eq!(runtime.llm.recorded_requests().len(), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.turn_usages().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quiet-turn usage should be persisted");
+        let first_usage = runtime.turn_usages();
+        assert_eq!(first_usage[0].0, "gpt-6-astra");
+        assert_eq!(first_usage[0].1.output_tokens, 18);
+        assert_eq!(first_usage[0].1.reasoning_tokens, Some(18));
+        assert_eq!(
+            runtime.provider_replay_updates(),
+            vec![phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear]
+        );
+
+        runtime.send_message("continue on the same model").await;
+        assert!(runtime.wait_for_done(Duration::from_secs(2)).await);
+
+        let messages = runtime.messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].message_type, MessageType::User);
+        assert_eq!(messages[2].message_type, MessageType::Agent);
+        assert_eq!(runtime.llm.recorded_requests().len(), 2);
+        assert_eq!(runtime.turn_usages()[0].0, "gpt-6-astra");
+    }
+
+    #[tokio::test]
+    async fn unavailable_call_reaches_next_request_with_error_without_execution() {
+        let llm = MockLlmClient::new("test-model");
+        llm.queue_response(LlmResponse::non_streaming(
+            vec![ContentBlock::ToolUse {
+                id: "unavailable-call".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"must not execute"}),
+            }],
+            false,
+            Usage::default(),
+        ));
+        llm.queue_response(LlmResponse::non_streaming(
+            vec![ContentBlock::text("done")],
+            true,
+            Usage::default(),
+        ));
+        let mut runtime = TestRuntime::new().llm(llm).build();
+        runtime.send_message("continue").await;
+        assert!(runtime.wait_for_done(Duration::from_secs(5)).await);
+        assert!(runtime.tools.recorded_executions().is_empty());
+        let requests = runtime.llm.recorded_requests();
+        assert_eq!(requests.len(), 2);
+        let next = &requests[1];
+        assert!(next
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block,
+            ContentBlock::ToolUse {id,name,..} if id == "unavailable-call" && name == "bash")));
+        let errors: Vec<_> = next.messages.iter().flat_map(|message| &message.content).filter(|block| matches!(block,
+            ContentBlock::ToolResult {tool_use_id,is_error:true,content,..} if tool_use_id == "unavailable-call" && content.contains("EUNAVAIL"))).collect();
+        assert_eq!(errors.len(), 1);
     }
 
     /// Integration test: tool execution cycle

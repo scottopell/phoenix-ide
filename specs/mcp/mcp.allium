@@ -88,6 +88,10 @@ entity OAuthRegistration {
     token_endpoint_auth_method: String
 }
 
+entity OAuthTokenRemoval {
+    server_name: String
+}
+
 -- Persisted OAuth tokens (plaintext in SQLite, consistent with existing
 -- operator-state storage). Looked up by server_name but audience-bound to
 -- `resource` (the canonical resource URI): a stored, unexpired token is reused
@@ -273,6 +277,7 @@ rule OAuthFlowFailed {
     when: OAuthFlowFailed(srv, error)
 
     requires: srv.oauth_phase in { discovering, registering, awaiting_user }
+    requires: not authorization_removes_server(srv)
 
     ensures: srv.state = failed
     ensures: srv.last_error = error
@@ -282,6 +287,28 @@ rule OAuthFlowFailed {
         -- Cancelling the pending flow clears any surfaced authorization URL, so
         -- PendingUrlOnlyWhileUnauthorized holds once the server is `failed` and
         -- status/UI consumers do not see a stale authorize link for a dead flow.
+        -- A denied reconnect authorization retains its session cleanup owner
+        -- and requested scopes. An explicit unchanged-configuration reload
+        -- reserves a new epoch and requests those scopes with the preserved
+        -- discovery challenge before session DELETE.
+        -- Failure to quiesce an owned stream settles the supervisor as failed,
+        -- retaining teardown ownership without a pending authorization URL.
+}
+
+rule RemovedServerAuthorizationDenied {
+    when: OAuthFlowFailed(srv, error)
+
+    requires: authorization_removes_server(srv)
+
+    ensures: PendingAuthorizationCancelled(srv)
+
+    @guidance
+        -- Retry session cleanup without reconnecting. Successful cleanup and
+        -- token deletion forget the server; either failure retains non-callable
+        -- ownership for a later removal or same-config re-addition to retry.
+        -- Failed session cleanup retains the denied flow's scopes and discovery
+        -- challenge on its OAuth owner. Same-config re-addition requests fresh
+        -- authorization before retrying deletion with recovered credentials.
 }
 
 ------------------------------------------------------------
@@ -458,6 +485,7 @@ rule OAuthClientRegistered {
 rule OAuthAuthorized {
     when: OperatorCompletedAuthorization(srv, code)
 
+    requires: not authorization_removes_server(srv)
     requires: srv.oauth_phase = awaiting_user
     requires: callback_state_matches(srv, code)
     requires: redirect_issuer_valid(srv, code)
@@ -487,6 +515,29 @@ rule OAuthAuthorized {
         -- the resource URI, clear the pending URL, and re-enter connecting so
         -- HttpConnected drives the now-authorized handshake to ready
         -- (REQ-MCP-011, REQ-MCP-012).
+        -- Callback cleanup and restart are one epoch-checked supervisor
+        -- operation. A config reload supersedes the callback rather than
+        -- allowing its old config to overwrite the reload after cleanup.
+}
+
+rule RemovedServerAuthorized {
+    when: OperatorCompletedAuthorization(srv, code)
+
+    requires: authorization_removes_server(srv)
+    requires: srv.oauth_phase = awaiting_user
+    requires: callback_state_matches(srv, code)
+    requires: redirect_issuer_valid(srv, code)
+
+    ensures: SessionDeleted(srv)
+    ensures: not exists OAuthToken{server_name: srv.name}
+    ensures: not exists srv
+
+    @guidance
+        -- Exchange the code, apply its access token only to the retained OAuth
+        -- transport, and finish DELETE without creating a replacement. Session
+        -- cleanup failure retains retry ownership. If token deletion fails
+        -- after the session is gone, same-config re-addition reconnects the
+        -- retained removed handle instead of classifying it as unchanged.
 }
 
 -- A 401 on a previously authorized server: the access token expired or was
@@ -498,6 +549,78 @@ rule TokenRefreshNeeded {
     requires: srv.oauth_phase = authorized
 
     ensures: srv.oauth_phase = refreshing
+
+    @guidance
+        -- Reserve one recovery epoch and retain the old transport as
+        -- non-callable cleanup ownership. Do not require its session DELETE
+        -- to succeed before refreshing: the expired bearer can also be
+        -- rejected on DELETE. Concurrent recovery requests join that epoch.
+        -- Concurrent insufficient-scope followers merge their challenge into
+        -- the owned plan. Before replay, each scope follower verifies the
+        -- recovered grant covers its challenge; a narrow refresh is followed
+        -- by owned authorization, including challenges arriving after cleanup.
+        -- If transport recovery won first and its DELETE failed, an OAuth
+        -- failure observed on the same original epoch upgrades that retained
+        -- cleanup owner and reserves a fresh recovery epoch. Config supersession
+        -- clears this provenance, so unrelated cleanup cannot receive a bearer.
+        -- A handshake whose tools/list rejects authorization after initialize
+        -- retains that typed challenge even if its session DELETE also fails.
+        -- Admit the failed handshake transport as OAuth cleanup ownership before
+        -- silently refreshing its restored token. Startup and replacement
+        -- recovery share the refresh, retry, authorization, and cleanup paths.
+        -- A handshake rejected after its silent refresh requests owned browser
+        -- authorization instead of repeating the grant indefinitely, carrying
+        -- the replacement handshake's discovery challenge.
+        -- DELETE authorization rejection also admits OAuth cleanup ownership
+        -- after a non-auth handshake failure. Merge required scopes from both
+        -- failures and retain the latest supplied discovery metadata when
+        -- later challenges omit it. Carry the merged challenge through both
+        -- immediate and background successful-refresh connection continuations.
+        -- Carry the complete scope plan in the refreshed outcome before cleanup
+        -- consumes the retained transport; a narrowed grant cannot replace it.
+        -- Clear inherited challenges when reconnecting a changed configuration.
+        -- Adopting the queued configuration clears the queued target; subsequent
+        -- refresh on that connection retains ordinary replay eligibility.
+        -- Ready OAuth removal with a stored grant reserves cleanup ownership;
+        -- refresh expired credentials before deleting the session or token.
+        -- Preserve DELETE authorization challenges on that owner and route
+        -- failed removal retries through refresh or owned reauthorization.
+        -- A DELETE 403 insufficient_scope retains its challenge and requests
+        -- owned reauthorization with the complete scope union, without another
+        -- refresh of the same insufficient grant. A plain 403 is not a step-up.
+        -- Removal callbacks persist the recovered grant before cleanup. If
+        -- cleanup or grant persistence fails, retain the authorization retry
+        -- plan on the failed owner until successful cleanup or reauthorization.
+        -- Successful teardown does not end ownership when refresh or token
+        -- persistence fails transiently: retain the closed transport as the
+        -- recovery owner and retry through the same fenced path.
+        -- Cancel active calls before retaining the old session for cleanup;
+        -- cancellation does not authorize replay of those other calls.
+        -- Stream-quiescence failure is a distinct cleanup failure. Stop shutdown
+        -- before DELETE and retain the session for explicit retry; handshake
+        -- authorization provenance cannot admit automatic recovery through it.
+        -- Preserve that cause through the actor handoff: retain ownership and
+        -- the OAuth retry plan in failed state without retrying shutdown.
+        -- Deferred removal reports a pending reload outcome and a removing
+        -- status until cleanup forgets its handle or requests authorization.
+        -- The panel awaits that outcome even when another server is ready.
+        -- Quiesce the server-initiated HTTP stream without deleting the session,
+        -- so retained ownership does not keep reconnecting with stale credentials.
+        -- A transient refresh failure retains the token and cleanup ownership
+        -- while the same epoch retries; it does not discard the session.
+        -- Once a refresh grant succeeds, retain its response until persistence
+        -- succeeds. Store failures retry that write instead of repeating the
+        -- grant with the replaced refresh token. Token invalidation discards
+        -- this unpersisted response under the same per-server mutation fence.
+        -- Reauthorization setup errors settle as failed with explicit retry
+        -- ownership; only token-refresh transport failures retry automatically.
+        -- Token persistence, invalidation, and re-prompt publication share the
+        -- per-server config-reconciliation mutation fence. Check the recovery epoch after
+        -- acquiring that fence, so a superseded retry cannot mutate credentials
+        -- or create a flow for its old config.
+        -- Bind a re-authorization flow to its cleanup owner and publish the
+        -- awaiting-authorization state before releasing the mutation fence,
+        -- so an immediate callback cannot resolve it as an unowned flow.
 }
 
 -- Refresh succeeded: update the stored token (including a rotated refresh
@@ -506,6 +629,7 @@ rule TokenRefreshed {
     when: OAuthTokenRefreshed(srv)
 
     requires: srv.oauth_phase = refreshing
+    requires: not recovery_removes_server(srv)
 
     ensures: OAuthToken{server_name: srv.name}.access_token = refreshed_access_token(srv)
     ensures: OAuthToken{server_name: srv.name}.refresh_token = refreshed_refresh_token(srv)
@@ -513,11 +637,50 @@ rule TokenRefreshed {
     ensures: srv.oauth_phase = authorized
 
     @guidance
+        -- Update the retained transport's bearer, finish its session DELETE,
+        -- then initialize and publish the replacement. Cleanup failure keeps
+        -- the old transport non-callable and retry-owned; no replacement is
+        -- published while cleanup remains unresolved.
+        -- The replacement handshake shares the credential mutation fence with
+        -- configuration changes. Check its epoch after acquiring the fence;
+        -- any connect-side refresh, token deletion, or authorization prompt
+        -- must finish before a newer configuration becomes authoritative.
+        -- Initial and replacement connections share authorization publication:
+        -- bind the pending flow to its epoch and expose unauthorized status.
+        -- A queued configuration applies only after old-resource cleanup,
+        -- invalidating the old grant before connecting the new resource.
+        -- Keep the refresh fence through bearer transfer and retained-session
+        -- cleanup so a queued removal cannot discard the new token while
+        -- retaining a transport that still uses the old credential.
+        -- Only transports retained by this OAuth recovery receive its new
+        -- bearer; unrelated stale teardown retries retain their credentials.
         -- The request whose 401 triggered the refresh (a tools/call or
         -- initialize) is replayed by the executor with the refreshed bearer
         -- once authorized, so a normal token expiry never surfaces as a tool
-        -- failure (see deferred ReAuthCallRetry). The state machine models the
+        -- failure (see deferred ReAuthCallRetry). Bind dispatch and replay to
+        -- the invocation's original configuration inside the supervisor;
+        -- applying a changed configuration supersedes that invocation.
+        -- The state machine models the
         -- refresh; holding and replaying the specific request is executor-level.
+}
+
+rule RemovedServerTokenRefreshed {
+    when: OAuthTokenRefreshed(srv)
+
+    requires: srv.oauth_phase = refreshing
+    requires: recovery_removes_server(srv)
+
+    ensures: SessionDeleted(srv)
+    ensures: not exists OAuthToken{server_name: srv.name}
+    ensures: not exists srv
+
+    @guidance
+        -- Refresh and transfer the bearer before authenticated cleanup. Forget
+        -- the token and handle after cleanup succeeds, without initializing a
+        -- replacement. Cleanup failure retains ownership and the recovered bearer.
+        -- Persist removal intent before admitting cleanup. Keep the owner
+        -- non-callable until token deletion and intent completion commit together;
+        -- a failed commit settles visibly as failed and retains retry ownership.
 }
 
 -- Refresh failed: discard the stale token so it cannot be reused or
@@ -538,6 +701,9 @@ rule TokenRefreshFailed {
         -- stale token still satisfies the token invariants and a later
         -- OAuthAuthorized would create a duplicate row for the same server
         -- (REQ-MCP-012).
+        -- Retain the old session as non-callable cleanup ownership while
+        -- browser authorization is pending. The newly authorized bearer
+        -- completes that cleanup before a replacement becomes callable.
 }
 
 -- A tool call on an authorized server returns 403 insufficient_scope: this is
@@ -556,6 +722,14 @@ rule InsufficientScopeStepUp {
     ensures: srv.pending_auth_url = authorization_url(srv)
 
     @guidance
+        -- Claim exclusive OAuth recovery without requiring DELETE with the
+        -- narrow bearer. Retain the old session as non-callable cleanup
+        -- ownership until authorization supplies the upgraded bearer, then
+        -- complete cleanup before publishing a replacement. Bind the flow
+        -- to the recovery epoch and publish awaiting-authorization under the
+        -- same mutation fence before admitting its callback.
+        -- If flow setup fails, settle failed and retain the requested scope
+        -- union with cleanup ownership for an explicit unchanged-config retry.
         -- 403 insufficient_scope + WWW-Authenticate carries the required
         -- scope. The authorization URL requests the UNION of the existing
         -- token's persisted `scopes` and the challenged scope (read before the
@@ -629,6 +803,7 @@ rule ReloadAddsServerWithStoredToken {
 -- initialize does not echo an old Mcp-Session-Id to the new/restarted endpoint.
 rule ReloadRestartsServer {
     when: ReloadServerConfigChanged(srv, new_auth_scheme)
+    requires: not reconfiguration_waits_for_cleanup(srv)
 
     ensures: srv.state = reconnecting
     ensures: srv.auth_scheme = new_auth_scheme
@@ -649,6 +824,7 @@ rule ReloadClearsHttpSession {
     when: ReloadServerConfigChanged(srv, new_auth_scheme)
 
     requires: srv.transport = http
+    requires: not reconfiguration_waits_for_cleanup(srv)
 
     ensures: srv.session_id = null
 }
@@ -658,7 +834,7 @@ rule ReloadClearsHttpSession {
 -- or its config moved away from OAuth
 -- (to static/none) without changing the URL. Either way the stored token must
 -- not survive -- discard it and cancel any pending flow so
--- TokenImpliesOAuthServer is not violated (REQ-MCP-011, REQ-MCP-012). The new
+-- TokenHasOAuthOwner is not violated (REQ-MCP-011, REQ-MCP-012). The new
 -- auth_scheme is applied by ReloadRestartsServer; this rule does not set it.
 -- Fires alongside ReloadRestartsServer.
 rule ReloadInvalidatesOAuth {
@@ -667,6 +843,7 @@ rule ReloadInvalidatesOAuth {
     requires: srv.transport = http
     requires: srv.auth_scheme = oauth
     requires: oauth_invalidated_by_reload(srv)
+    requires: not reconfiguration_waits_for_cleanup(srv)
 
     ensures: not exists OAuthToken{server_name: srv.name}
     ensures: PendingAuthorizationCancelled(srv)
@@ -683,11 +860,28 @@ rule ReloadInvalidatesOAuth {
         -- pre-repoint flow no longer satisfies callback_state_matches.
 }
 
--- Reload reconfigured a server that is mid-authorization (awaiting_user) with
--- no token persisted yet: the pending flow targets the old config and must be
--- cancelled even though there is no token to discard, or a delayed callback
--- from the old resource could satisfy the still-current flow (REQ-MCP-011).
--- The new auth_scheme is applied by ReloadRestartsServer.
+rule ReloadDefersConfigurationForOAuthCleanup {
+    when: ReloadServerConfigChanged(srv, new_auth_scheme)
+    requires: reconfiguration_waits_for_cleanup(srv)
+
+    ensures: CleanupOwnershipRetained(srv)
+
+    @guidance
+        -- Queue the latest desired configuration with the recovery owner.
+        -- An identical queued configuration leaves its live authorization nonce
+        -- and recovery epoch unchanged; a failed flow still supports explicit retry.
+        -- Preserve the old grant and epoch through transient refresh attempts.
+        -- If authorization is pending or denied, cancel its old nonce and
+        -- publish a new cleanup authorization with its challenge and scope union.
+        -- After authenticated cleanup, apply ReloadInvalidatesOAuth and
+        -- ReloadRestartsServer before connecting the queued configuration.
+        -- Token lookup or deletion failure blocks configuration adoption and
+        -- leaves the old configuration failed and explicitly retryable. A
+        -- same-resource client or scope change cannot restore the old grant.
+}
+
+-- A config change cancels the pending nonce, including when a new cleanup
+-- authorization must still target the old resource (REQ-MCP-011).
 rule ReloadCancelsPendingAuth {
     when: ReloadServerConfigChanged(srv, new_auth_scheme)
 
@@ -706,16 +900,34 @@ rule ReloadRetriesFailedServer {
     when: ReloadServerUnchanged(srv)
 
     requires: srv.state = failed
+    requires: not retry_requires_authorization(srv)
 
     ensures: srv.state = connecting
 }
 
+rule ReloadRetriesDeniedAuthorization {
+    when: ReloadServerUnchanged(srv)
+
+    requires: srv.state = failed
+    requires: retry_requires_authorization(srv)
+
+    ensures: srv.state = unauthorized
+    ensures: srv.oauth_phase = awaiting_user
+    ensures: srv.pending_auth_url = authorization_url(srv)
+
+    @guidance
+        -- Retain the old session and scope union, reserve a new epoch, and bind
+        -- a fresh authorization flow before DELETE. Discovery failure follows
+        -- OAuthFlowFailed and preserves the same explicit-retry plan.
+}
+
 -- Reload found a server gone from config: disconnect and forget it, including
 -- its stored token (otherwise it would orphan a token with no owning server,
--- violating TokenImpliesOAuthServer). The shared OAuthRegistration is NOT
+-- violating TokenHasOAuthOwner). The shared OAuthRegistration is NOT
 -- deleted -- it is keyed by authorization server and may back other servers.
 rule ReloadRemovesServer {
     when: ReloadRemovedServer(srv)
+    requires: not removal_waits_for_refresh(srv)
 
     ensures: not exists OAuthToken{server_name: srv.name}
     ensures: not exists srv
@@ -724,6 +936,32 @@ rule ReloadRemovesServer {
         -- terminate() the connection and discard the persisted token. Leave the
         -- per-authorization-server registration in place for servers that still
         -- share it. HTTP session teardown is the sibling rule below.
+        -- Failed teardown retains cleanup ownership.
+        -- Durable removal intent survives grant rejection or rotation. Startup
+        -- and reload retry credential deletion for names still absent from config;
+        -- re-added names cancel the intent before restoring reconnect ownership.
+        -- Restart recovery does not reconstruct volatile HTTP session identifiers.
+        -- Cleanup retries use a retained unexpired access token unless DELETE
+        -- supplied an authorization challenge. Expiry or authorization rejection
+        -- follows the refresh or scope-upgrade path before retrying DELETE.
+        -- A pending authorization flow is rebound to that epoch with removal intent; its callback
+        -- supplies credentials for DELETE and forgets the server and token
+        -- without reconnecting it. Re-adding the same configuration restores
+        -- reconnect intent before the callback is admitted.
+
+}
+
+rule ReloadDefersRemovalDuringRefresh {
+    when: ReloadRemovedServer(srv)
+    requires: removal_waits_for_refresh(srv)
+
+    ensures: srv.oauth_phase = refreshing
+
+    @guidance
+        -- Retain the grant and recovery epoch between transient refresh attempts.
+        -- Change the recovery's intent to cleanup-only. Same-config re-addition
+        -- restores reconnect intent before refresh completion. Definitive grant
+        -- rejection transfers removal intent into the pending authorization owner.
 }
 
 -- Removing a session-bearing HTTP server ends its remote session with a DELETE
@@ -735,6 +973,7 @@ rule ReloadDeletesRemovedHttpSession {
 
     requires: srv.transport = http
     requires: srv.session_id != null
+    requires: not removal_waits_for_refresh(srv)
 
     ensures: SessionDeleted(srv)
 }
@@ -822,9 +1061,10 @@ invariant AuthorizedImpliesToken {
             implies exists t in OAuthTokens where t.server_name = s.name
 }
 
-invariant TokenImpliesOAuthServer {
+invariant TokenHasOAuthOwner {
     for t in OAuthTokens:
         exists s in McpServers where s.name = t.server_name and s.auth_scheme = oauth
+        or exists r in OAuthTokenRemovals where r.server_name = t.server_name
 }
 
 -- Exactly one token per server: refresh-failure and step-up discard the old
@@ -840,6 +1080,26 @@ invariant OneTokenPerServer {
 -- Helpers
 ------------------------------------------------------------
 
+-- removal_waits_for_refresh(srv): Bool
+--   True when a non-callable OAuth cleanup owner is refreshing without a
+--   pending browser authorization; its grant and epoch must survive removal.
+-- recovery_removes_server(srv): Bool
+--   True when the active refresh owner has deferred removal intent.
+-- reconfiguration_waits_for_cleanup(srv): Bool
+--   True when OAuth recovery or its explicit authorization retry still owns
+--   old-resource teardown that requires recovered credentials.
+-- CleanupOwnershipRetained(srv): Bool
+--   The non-callable old transport and its credential recovery plan remain
+--   owned until authenticated cleanup finishes.
+
+-- authorization_removes_server(srv): Bool
+--   True iff the pending authorization owns cleanup for a removed configuration,
+--   rather than reconnection. Re-adding that configuration restores reconnect intent.
+--
+-- retry_requires_authorization(srv): Bool
+--   True when retained OAuth session cleanup owns a denied authorization's
+--   requested scopes and challenge, requiring authorization before deletion.
+--
 -- discovered_tools(srv): List<String>
 --   The tool names from the server's tools/list response (paginated).
 --
@@ -966,12 +1226,36 @@ invariant SingleRecoveryLeaderPerEpoch {
     -- The first recoverable failure for a serving epoch becomes leader; later
     -- callers follow the published lifecycle snapshot and never start a second
     -- recovery for that epoch.
+    -- A scope follower retains its own replay requirement. If the completed
+    -- epoch lacks the challenged scopes, it claims the serving replacement's
+    -- epoch for authorization before replaying; config changes reject the
+    -- original invocation and cannot inherit its scopes or discovery metadata.
+    -- Failed owned cleanup distinguishes authorization rejection from transient
+    -- teardown failure after fresh credentials were installed. Explicit retry
+    -- reuses a valid persisted bearer for the latter, refreshing on expiry;
+    -- authorization retries preserve the challenge and scope union for sign-in.
 }
 
 invariant SupersededCompletionCannotPublish {
     -- Reconfigure and remove advance the epoch before asynchronous work settles,
     -- so a late connect or recovery completion is discarded and cannot resurrect
     -- removed state or overwrite newer config.
+    -- Initialize and tools/list do not hold the credential mutation fence.
+    -- Their completions reacquire it and check the epoch before changing grants
+    -- or authorization flows. Superseded transports retain authoritative teardown.
+}
+
+invariant SchemaBoundInvocationsCannotRetarget {
+    -- At MCP invocation admission, a call carrying its originating request's
+    -- admitted schema selects one live supervisor handle. Tool advertisement
+    -- does not bind a supervisor incarnation across generation or restart.
+    -- Queuing, connection recovery, and retry retain that handle and schema.
+    -- Immediately before tools/call, the supervisor compares the admitted
+    -- schema with its serving connection's cached tool definition. Absence or
+    -- mismatch returns EUNAVAIL without provider I/O. Once the handle is
+    -- selected, reload cannot redirect that invocation to a replacement
+    -- supervisor or a different schema.
+    -- Callers without a schema retain their own invocation contracts.
 }
 
 ------------------------------------------------------------
@@ -998,7 +1282,9 @@ deferred ReAuthCallRetry    -- see: crates/phoenix-tools/src/mcp.rs
     -- and re-issues the same request, so the LLM never sees the interruption.
     -- The ConnState/OAuthPhase machine models the re-authorization/refresh;
     -- holding and replaying the specific call belongs to the tool-execution
-    -- path. Location: crates/phoenix-tools/src/mcp.rs (McpTool::run / call_tool)
+    -- path. Schema-bound calls re-check their admitted definition after recovery
+    -- and return unavailable instead of replaying against a changed definition.
+    -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run / call_tool)
 
 ------------------------------------------------------------
 -- Open Questions

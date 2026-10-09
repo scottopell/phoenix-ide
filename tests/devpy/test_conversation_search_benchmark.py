@@ -4,6 +4,7 @@ import hashlib
 import os
 import sqlite3
 import subprocess
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -348,7 +349,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             self.assertEqual(recorded["cargo_config_hashes"][str(config)], bench._hash(config))
             self.assertNotIn("opt-level", json.dumps(recorded))
 
-    def test_snapshot_captures_committed_wal_and_manifest(self):
+    def test_snapshot_captures_checkpointed_offline_database_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source.db"
@@ -361,7 +362,16 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             out = root / "fixture"
             args = type("Args", (), {"source": str(source), "artifacts": str(out),
                                       "offline_snapshot": True, "force": False, "retries": 2, "busy_timeout": 1.0})()
+            self.assertGreater(Path(f"{source}-wal").stat().st_size, 0)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            self.assertEqual(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
             conn.close()
+            offline = root / "offline.db"
+            shutil.copyfile(source, offline)
+            source = offline
+            args.source = str(offline)
+            self.assertFalse(Path(f"{source}-wal").exists())
+            self.assertFalse(Path(f"{source}-shm").exists())
             bench.snapshot(args)
             self.assertEqual(sqlite3.connect(out / "captured.db").execute(
                 "SELECT content FROM messages").fetchone()[0],
