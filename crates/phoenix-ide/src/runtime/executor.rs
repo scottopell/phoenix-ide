@@ -465,6 +465,8 @@ const CANCELLATION_DEADLINE: Duration = Duration::from_secs(3);
 /// real cancelled result wins the race in the common case, leaving this 6s as a
 /// true last resort for a sub-agent runtime that has genuinely vanished.
 const CANCELLING_SUBAGENTS_DEADLINE: Duration = Duration::from_secs(6);
+const BASH_WAIT_DEFAULT_SECONDS: u64 = 30;
+const BASH_WAIT_SETTLEMENT_GRACE: Duration = Duration::from_secs(5);
 const TERMINAL_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES: u8 = 3;
 
@@ -2674,8 +2676,12 @@ where
         // so this only matters when a runtime is constructed straight into a
         // waiting state — but arming here (not only on transition) is what makes
         // the backstop structural rather than dependent on the entry path.
-        if let Some(d) = Self::deadline_for(&self.state) {
-            self.deadline = Some(tokio::time::Instant::now() + d);
+        if let Some(duration) = Self::deadline_for(&self.state) {
+            let elapsed = Utc::now()
+                .signed_duration_since(self.state_updated_at)
+                .to_std()
+                .unwrap_or_default();
+            self.deadline = Some(tokio::time::Instant::now() + duration.saturating_sub(elapsed));
         }
 
         // Process events and outcomes in a loop - no recursion
@@ -3585,6 +3591,24 @@ where
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::large_futures)]
     async fn apply_transition_result(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+    ) -> Result<Vec<Event>, String> {
+        let remaining = self.bash_wait_transition_remaining(&result.new_state);
+        if let Some(remaining) = remaining {
+            return tokio::time::timeout(remaining, self.apply_transition_result_inner(result))
+                .await
+                .map_err(|_| {
+                    "bash wait transition exceeded its absolute settlement deadline; runtime fail-stop required"
+                        .to_string()
+                })?;
+        }
+        self.apply_transition_result_inner(result).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::large_futures)]
+    async fn apply_transition_result_inner(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
@@ -4937,12 +4961,46 @@ where
     /// backstop (2× the 3s sub-agent `CancellingTool` deadline) so real cancelled
     /// results win the drain before the parent presumes a vanished runtime dead.
     fn deadline_for(state: &ConvState) -> Option<Duration> {
+        const MAX_BASH_WAIT_SECONDS: i64 = 900;
         match state {
+            ConvState::ToolExecuting { current_tool, .. } => {
+                let ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    wait_seconds,
+                    ..
+                }) = &current_tool.input
+                else {
+                    return None;
+                };
+                let requested = wait_seconds
+                    .unwrap_or(i64::try_from(BASH_WAIT_DEFAULT_SECONDS).unwrap())
+                    .clamp(0, MAX_BASH_WAIT_SECONDS);
+                let requested = u64::try_from(requested).unwrap();
+                Some(Duration::from_secs(requested) + BASH_WAIT_SETTLEMENT_GRACE)
+            }
             ConvState::AwaitingSubAgents { .. } => Some(DEFAULT_SUBAGENT_TIMEOUT),
             ConvState::CancellingTool { .. } => Some(CANCELLATION_DEADLINE),
             ConvState::CancellingSubAgents { .. } => Some(CANCELLING_SUBAGENTS_DEADLINE),
             _ => None,
         }
+    }
+
+    fn bash_wait_transition_remaining(&self, next_state: &ConvState) -> Option<Duration> {
+        let state = if matches!(self.state, ConvState::ToolExecuting { .. }) {
+            &self.state
+        } else {
+            next_state
+        };
+        let bound = Self::deadline_for(state)?;
+        let entered_at = if matches!(self.state, ConvState::ToolExecuting { .. }) {
+            self.state_updated_at
+        } else {
+            Utc::now()
+        };
+        let elapsed = Utc::now()
+            .signed_duration_since(entered_at)
+            .to_std()
+            .unwrap_or_default();
+        Some(bound.saturating_sub(elapsed))
     }
 
     /// Manage the unified liveness deadline on every transition. Arm a fresh
@@ -4967,11 +5025,15 @@ where
             self.tool_task_handle = None;
         }
 
-        let variant_changed =
-            std::mem::discriminant(old_state) != std::mem::discriminant(&self.state);
+        let waiting_execution_changed = old_state != &self.state;
         match Self::deadline_for(&self.state) {
-            Some(duration) if variant_changed => {
-                self.deadline = Some(tokio::time::Instant::now() + duration);
+            Some(duration) if waiting_execution_changed => {
+                let elapsed = Utc::now()
+                    .signed_duration_since(self.state_updated_at)
+                    .to_std()
+                    .unwrap_or_default();
+                self.deadline =
+                    Some(tokio::time::Instant::now() + duration.saturating_sub(elapsed));
                 tracing::debug!(
                     state = self.state.variant_name(),
                     deadline_secs = duration.as_secs(),
@@ -4979,7 +5041,7 @@ where
                 );
             }
             Some(_) => {
-                // Same waiting variant — keep the in-flight deadline running.
+                // Same waiting execution — keep the in-flight deadline running.
             }
             None => {
                 self.deadline = None;
@@ -4994,6 +5056,14 @@ where
     async fn handle_deadline_expiry(&mut self) {
         self.deadline = None;
         match &self.state {
+            ConvState::ToolExecuting { current_tool, .. }
+                if matches!(
+                    current_tool.input,
+                    ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait { .. })
+                ) =>
+            {
+                self.handle_bash_wait_timeout().await;
+            }
             ConvState::AwaitingSubAgents { .. } => self.handle_sub_agent_timeout().await,
             ConvState::CancellingTool { .. } => self.handle_cancelling_tool_timeout().await,
             ConvState::CancellingSubAgents { .. } => {
@@ -5005,6 +5075,26 @@ where
                     "Liveness deadline fired but state has no backstop — ignoring"
                 );
             }
+        }
+    }
+
+    async fn handle_bash_wait_timeout(&mut self) {
+        let ConvState::ToolExecuting { current_tool, .. } = &self.state else {
+            return;
+        };
+        let tool_use_id = current_tool.id.clone();
+        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
+        if let Some(handle) = self.tool_task_handle.take() {
+            handle.abort();
+        }
+        if let Err(error) = self
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Failed {
+                tool_use_id,
+                error: "bash wait exceeded its bounded settlement deadline".to_string(),
+            }))
+            .await
+        {
+            tracing::error!(%error, "Failed to settle expired bash wait");
         }
     }
 
@@ -18400,6 +18490,334 @@ mod steer_drain_detector_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn bash_wait_executing_state(
+        tool_use_id: &str,
+        handle: &str,
+        wait_seconds: Option<i64>,
+    ) -> ConvState {
+        let input = serde_json::json!({
+            "op": "wait",
+            "handle": handle,
+            "wait_seconds": wait_seconds,
+        });
+        ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                tool_use_id,
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    handle: handle.to_string(),
+                    wait_seconds,
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage {
+                content: vec![ContentBlock::ToolUse {
+                    id: tool_use_id.to_string(),
+                    name: "bash".to_string(),
+                    input,
+                }],
+                ..AssistantMessage::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_wait_deadline_settles_once_and_allows_next_turn() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-deadline",
+            bash_wait_executing_state("wait-tool", "b-test", Some(600)),
+            vec![],
+        );
+        let independent = tokio::spawn(async { std::future::pending::<()>().await });
+        rt.tool_task_handle = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&rt.state),
+            Some(Duration::from_secs(605))
+        );
+        rt.handle_deadline_expiry().await;
+
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        let settled = storage.get_all_messages("bash-wait-deadline");
+        let tool_results: Vec<_> = settled
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::Tool(tool) if tool.tool_use_id == "wait-tool" => Some(tool),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 1);
+        assert!(tool_results[0].is_error);
+        assert_eq!(
+            tool_results[0].content,
+            "bash wait exceeded its bounded settlement deadline"
+        );
+        assert!(rt.tool_task_handle.is_none());
+        assert!(!independent.is_finished());
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+            provider_replay: None,
+            content: vec![ContentBlock::text("next turn completed")],
+            tool_calls: vec![],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "next-turn-response".to_string(),
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::Idle));
+        let after_next_turn = storage.get_all_messages("bash-wait-deadline");
+        assert_eq!(after_next_turn.len(), settled.len() + 1);
+        assert_eq!(
+            after_next_turn
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::Tool(tool) if tool.tool_use_id == "wait-tool"
+                ))
+                .count(),
+            1
+        );
+        rt.process_event(Event::UserMessage {
+            text: "subsequent admitted turn".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "subsequent-message".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(storage
+            .get_all_messages("bash-wait-deadline")
+            .iter()
+            .any(|message| matches!(
+                &message.content,
+                MessageContent::User(content)
+                    if content.text == "subsequent admitted turn"
+            )));
+        independent.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_scheduler_settles_bash_wait_when_timer_wins() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-scheduled",
+            bash_wait_executing_state("wait-scheduled", "b-scheduled", Some(0)),
+            vec![],
+        );
+        rt.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        rt.tool_task_handle = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+        let independent = tokio::spawn(async { std::future::pending::<()>().await });
+        let runtime = tokio::spawn(rt.run_inner());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let messages = storage.get_all_messages("bash-wait-scheduled");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::Tool(tool) if tool.tool_use_id == "wait-scheduled"
+                ))
+                .count(),
+            1
+        );
+        assert!(!independent.is_finished());
+        runtime.abort();
+        independent.abort();
+    }
+
+    #[tokio::test]
+    async fn bash_wait_completion_wins_before_deadline_without_duplicate_result() {
+        tokio::time::pause();
+        let wait = ToolCall::new(
+            "wait-race",
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                handle: "b-race".to_string(),
+                wait_seconds: Some(600),
+                lines: None,
+                since: None,
+            }),
+        );
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-race",
+            ConvState::ToolExecuting {
+                current_tool: wait,
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message: AssistantMessage {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "wait-race".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"op":"wait","handle":"b-race","wait_seconds":600}),
+                    }],
+                    ..AssistantMessage::default()
+                },
+            },
+            vec![],
+        );
+        rt.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(605));
+        tokio::time::advance(Duration::from_secs(604)).await;
+        rt.process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+            ToolResult::success("wait-race".to_string(), "process exited".to_string()),
+        )))
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.deadline.is_none());
+        rt.handle_deadline_expiry().await;
+        let messages = storage.get_all_messages("bash-wait-race");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::Tool(tool) if tool.tool_use_id == "wait-race"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bash_wait_cancellation_wins_without_later_timeout_result() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-cancel",
+            bash_wait_executing_state("wait-cancel", "b-cancel", Some(600)),
+            vec![],
+        );
+        rt.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(605));
+        rt.process_event(Event::UserCancel {
+            reason: Some("cancel wait".to_string()),
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::CancellingTool { .. }));
+        tokio::time::advance(Duration::from_secs(605)).await;
+        assert_eq!(
+            storage
+                .get_all_messages("bash-wait-cancel")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bash_wait_outcome_is_rejected_after_timeout_generation_fence() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-stale",
+            bash_wait_executing_state("wait-stale", "b-stale", Some(0)),
+            vec![],
+        );
+        let stale_generation = rt.tool_request_generation;
+        rt.handle_deadline_expiry().await;
+        assert!(rt.tool_outcome_is_stale(stale_generation));
+        assert_eq!(
+            storage
+                .get_all_messages("bash-wait-stale")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn only_bash_wait_tool_execution_has_a_deadline() {
+        let wait = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "wait",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    handle: "b-test".to_string(),
+                    wait_seconds: None,
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+        let zero = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "zero",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    handle: "b-zero".to_string(),
+                    wait_seconds: Some(0),
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+        let malformed = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "malformed",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    handle: "b-malformed".to_string(),
+                    wait_seconds: Some(-1),
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+        let command = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "run",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Run {
+                    cmd: "side effect".to_string(),
+                    target: phoenix_core::domain::bash_types::BashSpawnTarget::Context,
+                    label: None,
+                    wait_seconds: Some(30),
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&wait),
+            Some(Duration::from_secs(35))
+        );
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&zero),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&malformed),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&command),
+            None
+        );
     }
 
     #[tokio::test]
