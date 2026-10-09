@@ -548,7 +548,7 @@ THEN Phoenix SHALL settle the request as a valid quiet end turn without fabricat
 WHEN a Responses terminal includes reasoning items but does not report a positive reasoning-token subset of billed output
 THEN Phoenix SHALL classify the result as a retryable provider failure rather than treating it as an unbilled empty turn.
 
-WHEN billed output has no terminal model-visible content and the terminal shape does not prove a completed quiet reasoning response
+WHEN billed output has no terminal model-visible content and the terminal shape does not prove a structurally valid quiet terminal
 THEN Phoenix SHALL classify the result as a retryable provider failure rather than silently persisting an empty agent turn.
 
 WHEN an HTTP/SSE Responses stream ends before a terminal event
