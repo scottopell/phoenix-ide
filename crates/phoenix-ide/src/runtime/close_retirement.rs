@@ -97,15 +97,25 @@ impl std::fmt::Display for CloseLeaseFailure {
             Self::ProcessEpoch { resource, reason } => write!(
                 formatter,
                 "{} process-epoch teardown failed for {:?}: {reason}",
-                resource.kind().as_str(), resource.identity()
+                resource.kind().as_str(),
+                resource.identity()
             ),
-            Self::UnattributedProcessEpoch { kind, captured_resources, reason } => write!(
+            Self::UnattributedProcessEpoch {
+                kind,
+                captured_resources,
+                reason,
+            } => write!(
                 formatter,
                 "{} process-epoch teardown failed without an individually attributed target; captured resources {captured_resources:?}: {reason}",
                 kind.as_str()
             ),
-            Self::Unavailable => write!(formatter, "Close resource lease is unavailable; process-epoch identities cannot be rehydrated"),
-            Self::Persistence(detail) => write!(formatter, "Close step success persistence failed: {detail}"),
+            Self::Unavailable => write!(
+                formatter,
+                "Close resource lease is unavailable; process-epoch identities cannot be rehydrated"
+            ),
+            Self::Persistence(detail) => {
+                write!(formatter, "Close step success persistence failed: {detail}")
+            }
             Self::Tmux { detail, .. } => write!(formatter, "tmux teardown failed: {detail}"),
         }
     }
@@ -796,7 +806,7 @@ impl RuntimeManager {
                         inventory.tmux_servers.insert(identity.clone());
                     }
                     kind => {
-                        return Err(format!("unexpected durable permit resource kind {kind:?}"))
+                        return Err(format!("unexpected durable permit resource kind {kind:?}"));
                     }
                 }
             }
@@ -1289,6 +1299,37 @@ impl RuntimeManager {
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => {
                     let path = worktree_path(identity);
                     let quarantine = worktree_quarantine_path(identity)?;
+                    let cleanup_target = expected.iter().find(|target| {
+                        target.scope == *scope
+                            && target.resource.kind() == RetiredResourceKind::Worktree
+                    });
+                    let tombstone = if let Some(target) = cleanup_target {
+                        self.db()
+                            .close_worktree_cleanup_plan(
+                                attempt_id,
+                                scope,
+                                snapshot,
+                                &target.resource,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .and_then(|plan| plan.final_tombstone)
+                    } else {
+                        None
+                    };
+                    probe_retry_worktree_writers(&path, &quarantine, tombstone.as_ref())?;
+                    if let Some(tombstone) = &tombstone {
+                        let object = tombstone.root.join("object");
+                        if object.try_exists().map_err(|error| error.to_string())? {
+                            let confirmed = inspections
+                                .iter()
+                                .find(|inspection| inspection.target.scope == *scope)
+                                .ok_or_else(|| {
+                                    format!("scope {scope} lacks a confirmed worktree inspection")
+                                })?;
+                            verify_retained_worktree(identity, object, &confirmed.snapshot).await?;
+                        }
+                    }
                     let active = path.try_exists().map_err(|error| error.to_string())?;
                     let quarantined = quarantine.try_exists().map_err(|error| error.to_string())?;
                     if active && quarantined {
@@ -1319,6 +1360,7 @@ impl RuntimeManager {
                                 .ok_or_else(|| {
                                     format!("scope {scope} lacks a confirmed worktree inspection")
                                 })?;
+                            ensure_no_ignored_content(&path)?;
                             let (fresh, losses) = inspect_worktree_at(identity, path).await?;
                             if fresh.fingerprint() != confirmed.snapshot.fingerprint()
                                 || !losses.is_empty()
@@ -1376,7 +1418,9 @@ impl RuntimeManager {
                             .await
                             .map_err(|error| error.to_string())?;
                         if !prior_success && (!dispatched || cleanup.is_none()) {
-                            return Err(format!("scope {scope} absent worktree has no exact prior proof or cleanup authority"));
+                            return Err(format!(
+                                "scope {scope} absent worktree has no exact prior proof or cleanup authority"
+                            ));
                         }
                         observations.push(format!(
                             "{scope}: absence bound to original captured worktree"
@@ -1449,7 +1493,7 @@ impl RuntimeManager {
                             _ => {
                                 return Err(format!(
                                     "scope {scope} tmux identity differs or is ambiguous"
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1468,7 +1512,7 @@ impl RuntimeManager {
                             .push(format!("{scope}: original work-scope ownership checked"));
                     }
                     _ => {
-                        return Err("process-epoch retry effects require separate authority".into())
+                        return Err("process-epoch retry effects require separate authority".into());
                     }
                 }
             }
@@ -1935,6 +1979,18 @@ impl RuntimeManager {
                             .as_ref()
                             .filter(|plan| plan.final_tombstone.is_some())
                         {
+                            let confirmed = self
+                                .db()
+                                .list_close_retirement_inspections(attempt_id.as_str())
+                                .await
+                                .map_err(|error| error.to_string())?
+                                .into_iter()
+                                .find(|inspection| inspection.target.scope == scope)
+                                .ok_or_else(|| {
+                                    "final tombstone lacks confirmed worktree inspection"
+                                        .to_string()
+                                })?;
+                            let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
                             let cleanup_plan = cleanup_plan.clone();
                             let recovery = tokio::task::spawn_blocking(move || {
@@ -1944,6 +2000,7 @@ impl RuntimeManager {
                                         .as_ref()
                                         .expect("filtered above"),
                                     &identity,
+                                    &confirmed_snapshot,
                                 ) {
                                     FinalTombstoneRecovery::Completed => {}
                                     FinalTombstoneRecovery::Residual(detail) => return Err(detail),
@@ -2053,13 +2110,29 @@ impl RuntimeManager {
                                 )
                                 .await;
                             }
+                            let confirmed = self
+                                .db()
+                                .list_close_retirement_inspections(attempt_id.as_str())
+                                .await
+                                .map_err(|error| error.to_string())?
+                                .into_iter()
+                                .find(|inspection| inspection.target.scope == scope)
+                                .ok_or_else(|| {
+                                    "final tombstone lacks confirmed worktree inspection"
+                                        .to_string()
+                                })?;
+                            let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
                             let recovery = tokio::task::spawn_blocking(move || {
                                 if let Some(tombstone) = &cleanup_plan.final_tombstone {
-                                    match resume_final_worktree_tombstone(tombstone, &identity) {
+                                    match resume_final_worktree_tombstone(
+                                        tombstone,
+                                        &identity,
+                                        &confirmed_snapshot,
+                                    ) {
                                         FinalTombstoneRecovery::Completed => {}
                                         FinalTombstoneRecovery::Residual(detail) => {
-                                            return Err(detail)
+                                            return Err(detail);
                                         }
                                     }
                                 }
@@ -2180,34 +2253,35 @@ impl RuntimeManager {
                                     ))
                                 })
                                 .await;
-                                let discovered =
-                                    match discovered {
-                                        Ok(Ok(discovered)) => discovered,
-                                        Ok(Err(detail)) => {
-                                            return self
-                                                .record_close_cleanup_failure(
-                                                    run,
-                                                    snapshot,
-                                                    &scope,
-                                                    target.resource.clone(),
-                                                    RetirementFailureReason::IdentityNotProven,
-                                                    &detail,
-                                                )
-                                                .await;
-                                        }
-                                        Err(error) => {
-                                            return self
-                                        .record_close_cleanup_failure(
-                                            run,
-                                            snapshot,
-                                            &scope,
-                                            target.resource.clone(),
-                                            RetirementFailureReason::IdentityNotProven,
-                                            &format!("worktree cleanup-plan task failed: {error}"),
-                                        )
-                                        .await;
-                                        }
-                                    };
+                                let discovered = match discovered {
+                                    Ok(Ok(discovered)) => discovered,
+                                    Ok(Err(detail)) => {
+                                        return self
+                                            .record_close_cleanup_failure(
+                                                run,
+                                                snapshot,
+                                                &scope,
+                                                target.resource.clone(),
+                                                RetirementFailureReason::IdentityNotProven,
+                                                &detail,
+                                            )
+                                            .await;
+                                    }
+                                    Err(error) => {
+                                        return self
+                                            .record_close_cleanup_failure(
+                                                run,
+                                                snapshot,
+                                                &scope,
+                                                target.resource.clone(),
+                                                RetirementFailureReason::IdentityNotProven,
+                                                &format!(
+                                                    "worktree cleanup-plan task failed: {error}"
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                };
                                 self.db()
                                     .record_close_worktree_cleanup_plan(
                                         RecordCloseWorktreeCleanupPlanRequest {
@@ -2308,6 +2382,18 @@ impl RuntimeManager {
                                         )
                                         .await?;
                                         None
+                                    }
+                                    Ok(ExactWorktreeRemoval::StopFailed { detail }) => {
+                                        return self
+                                            .record_close_cleanup_failure(
+                                                run,
+                                                snapshot,
+                                                &scope,
+                                                target.resource.clone(),
+                                                RetirementFailureReason::RemovalFailed,
+                                                &detail,
+                                            )
+                                            .await;
                                     }
                                     Ok(ExactWorktreeRemoval::ReinspectionRequired { detail }) => {
                                         if run.ordinal != CloseRunOrdinal::INITIAL {
@@ -3661,12 +3747,17 @@ struct IndexedGitlink {
 
 type IndexedGitlinks = (Vec<u8>, Vec<IndexedGitlink>);
 
-fn index_gitlinks(repository: &Path) -> Result<IndexedGitlinks, String> {
-    let output = phoenix_core::git::command()
-        .args(["ls-files", "--stage", "-z", "--"])
-        .current_dir(repository)
-        .output()
-        .map_err(|error| error.to_string())?;
+fn index_gitlinks(
+    repository: &Path,
+    deadline: std::time::Instant,
+) -> Result<IndexedGitlinks, String> {
+    let output = run_bounded_git_command_until(
+        repository,
+        &["ls-files", "--stage", "-z", "--"],
+        None,
+        deadline,
+        "gitlink inspection",
+    )?;
     if !output.status.success() {
         return Err(format!(
             "cannot inspect index gitlinks: {}",
@@ -3723,7 +3814,7 @@ fn observe_initialized_submodules(
     if std::time::Instant::now() >= deadline {
         return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
     }
-    let (index_observation, gitlinks) = index_gitlinks(repository)?;
+    let (index_observation, gitlinks) = index_gitlinks(repository, deadline)?;
     observation.push((
         [b"SUBMODULE_GITLINK_INDEX\0".as_slice(), relative_prefix].concat(),
         index_observation,
@@ -3985,10 +4076,12 @@ fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, Stri
 
 enum ExactWorktreeRemoval {
     Retired,
+    StopFailed { detail: String },
     ReinspectionRequired { detail: String },
     Residual { detail: String },
 }
 
+#[derive(Debug)]
 enum FinalTombstoneRecovery {
     Completed,
     Residual(String),
@@ -4090,6 +4183,7 @@ where
                 .to_string(),
         });
     }
+    ensure_no_ignored_content(inspection_path)?;
     runtime.block_on(quarantine_and_remove_exact_worktree(
         identity,
         administrative_dir.to_path_buf(),
@@ -4588,6 +4682,23 @@ where
 }
 
 #[cfg(unix)]
+fn inspect_retained_before_deletion(
+    identity: &WorktreeIdentity,
+    object: &Path,
+    confirmed: &CloseRetirementSnapshot,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(verify_retained_worktree(
+        identity,
+        object.to_path_buf(),
+        confirmed,
+    ))
+}
+
+#[cfg(unix)]
 #[allow(
     clippy::useless_conversion,
     reason = "libc stat device width differs across supported Unix targets"
@@ -4599,6 +4710,7 @@ where
 fn resume_final_worktree_tombstone(
     tombstone: &CloseWorktreeFinalTombstone,
     identity: &WorktreeIdentity,
+    confirmed: &CloseRetirementSnapshot,
 ) -> FinalTombstoneRecovery {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -4632,15 +4744,15 @@ fn resume_final_worktree_tombstone(
             Err(error) => {
                 return FinalTombstoneRecovery::Residual(format!(
                     "cannot observe captured worktree path during final tombstone recovery: {error}"
-                ))
+                ));
             }
         };
         let quarantine_missing = match quarantine_path.try_exists() {
             Ok(exists) => !exists,
             Err(error) => {
                 return FinalTombstoneRecovery::Residual(format!(
-                "cannot observe quarantined worktree path during final tombstone recovery: {error}"
-            ))
+                    "cannot observe quarantined worktree path during final tombstone recovery: {error}"
+                ));
             }
         };
         return if root_missing && captured_missing && quarantine_missing {
@@ -4669,7 +4781,7 @@ fn resume_final_worktree_tombstone(
         Err(error) => {
             return FinalTombstoneRecovery::Residual(format!(
                 "final tombstone root device is invalid: {error}"
-            ))
+            ));
         }
     };
     if (root_device, root_stat.st_ino) != (tombstone.device, tombstone.inode) {
@@ -4685,21 +4797,21 @@ fn resume_final_worktree_tombstone(
         (Some(device), Some(inode)) => (device, inode),
         (None, None) => {
             let captured_exists = match captured_path.try_exists() {
-                    Ok(exists) => exists,
-                    Err(error) => {
-                        return FinalTombstoneRecovery::Residual(format!(
-                            "cannot observe captured worktree path during final tombstone recovery: {error}"
-                        ))
-                    }
-                };
+                Ok(exists) => exists,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot observe captured worktree path during final tombstone recovery: {error}"
+                    ));
+                }
+            };
             let quarantine_exists = match quarantine_path.try_exists() {
-                    Ok(exists) => exists,
-                    Err(error) => {
-                        return FinalTombstoneRecovery::Residual(format!(
-                            "cannot observe quarantined worktree path during final tombstone recovery: {error}"
-                        ))
-                    }
-                };
+                Ok(exists) => exists,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot observe quarantined worktree path during final tombstone recovery: {error}"
+                    ));
+                }
+            };
             match (captured_exists, quarantine_exists) {
                     (true, false) => {
                         if observe_worktree_fingerprint(&captured_path).as_deref()
@@ -4773,6 +4885,24 @@ fn resume_final_worktree_tombstone(
                 .to_string(),
         ),
     };
+    let object = tombstone.root.join("object");
+    match object.try_exists() {
+        Ok(true) => match quarantine_has_external_writer(&object) {
+            Ok(true) => {
+                return FinalTombstoneRecovery::Residual(
+                    "external writer holds final tombstone object; preserved".into(),
+                )
+            }
+            Ok(false) => {}
+            Err(detail) => return FinalTombstoneRecovery::Residual(detail),
+        },
+        Ok(false) => {}
+        Err(error) => {
+            return FinalTombstoneRecovery::Residual(format!(
+                "cannot probe final tombstone object: {error}"
+            ))
+        }
+    }
     // SAFETY: openat is rooted in the verified descriptor and O_NOFOLLOW rejects replacement links.
     let object_fd = unsafe {
         libc::openat(
@@ -4804,7 +4934,7 @@ fn resume_final_worktree_tombstone(
         Err(error) => {
             return FinalTombstoneRecovery::Residual(format!(
                 "final tombstone object device is invalid: {error}"
-            ))
+            ));
         }
     };
     if (object_device, object_stat.st_ino) != (expected_object_device, expected_object_inode) {
@@ -4815,6 +4945,9 @@ fn resume_final_worktree_tombstone(
     let object = tombstone.root.join("object");
     if observe_worktree_fingerprint(&object).as_deref() != Some(expected_identity) {
         return FinalTombstoneRecovery::Residual("recorded final tombstone object does not match captured worktree identity; preserved for manual repair".to_string());
+    }
+    if let Err(detail) = inspect_retained_before_deletion(identity, &object, confirmed) {
+        return FinalTombstoneRecovery::Residual(detail);
     }
     if let Err(detail) = remove_directory_contents_at(&object_fd) {
         return FinalTombstoneRecovery::Residual(detail);
@@ -4838,6 +4971,7 @@ fn resume_final_worktree_tombstone(
 fn resume_final_worktree_tombstone(
     _tombstone: &CloseWorktreeFinalTombstone,
     _identity: &WorktreeIdentity,
+    _confirmed: &CloseRetirementSnapshot,
 ) -> FinalTombstoneRecovery {
     FinalTombstoneRecovery::Residual(
         "recorded final tombstone deletion is unsupported on this platform".to_string(),
@@ -4940,34 +5074,59 @@ fn exact_worktree_administrative_dir(
     Ok(git_dir)
 }
 
-/// Best-effort, bounded stop of every Git fsmonitor daemon bound to the
-/// worktree at `path` or to any initialized submodule beneath it. A worktree
-/// with no running daemon is the common case and is not an error. On deadline
-/// the stop is abandoned; a daemon still holding the tree is then reported by
-/// the descriptor scan as typed residual state. Ordering relative to
-/// quarantine: see ADR-080 and work-lifecycle.allium.
-fn stop_bound_fsmonitor_daemons_best_effort(path: &Path) {
+#[derive(Debug, Eq, PartialEq)]
+enum FsmonitorStop {
+    Stopped,
+    NotRunning,
+}
+
+fn classify_fsmonitor_stop(output: &std::process::Output) -> Result<FsmonitorStop, String> {
+    if output.status.success() {
+        return Ok(FsmonitorStop::Stopped);
+    }
+    if output.status.code() == Some(128)
+        && output.stdout.is_empty()
+        && output.stderr.trim_ascii() == b"fatal: fsmonitor--daemon is not running"
+    {
+        return Ok(FsmonitorStop::NotRunning);
+    }
+    Err(format!(
+        "fsmonitor stop failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn stop_bound_fsmonitor_daemons(path: &Path) -> Result<FsmonitorStop, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let _ = run_bounded_git_command_until(
+    let submodules = run_bounded_git_command_until(
         path,
         &[
             "submodule",
             "foreach",
             "--quiet",
             "--recursive",
-            "git fsmonitor--daemon stop >/dev/null 2>&1 || true",
+            r#"output=$(git fsmonitor--daemon stop 2>&1); result=$?; if [ "$result" -eq 0 ] || { [ "$result" -eq 128 ] && [ "$output" = 'fatal: fsmonitor--daemon is not running' ]; }; then exit 0; fi; printf '%s\n' "$output" >&2; exit "$result""#,
         ],
         None,
         deadline,
         "submodule fsmonitor shutdown",
-    );
-    let _ = run_bounded_git_command_until(
+    )?;
+    if !submodules.status.success() {
+        return Err(format!(
+            "submodule fsmonitor shutdown failed ({}): {}",
+            submodules.status,
+            String::from_utf8_lossy(&submodules.stderr).trim()
+        ));
+    }
+    let worktree = run_bounded_git_command_until(
         path,
         &["fsmonitor--daemon", "stop"],
         None,
         deadline,
         "worktree fsmonitor shutdown",
-    );
+    )?;
+    classify_fsmonitor_stop(&worktree)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4980,6 +5139,45 @@ impl ExternalWriterEvidence {
     fn found(self) -> bool {
         matches!(self, Self::PositiveWriterFound)
     }
+}
+
+fn probe_retry_worktree_writers(
+    original: &Path,
+    quarantine: &Path,
+    tombstone: Option<&CloseWorktreeFinalTombstone>,
+) -> Result<(), String> {
+    let object = tombstone.map(|record| record.root.join("object"));
+    for path in [Some(original), Some(quarantine), object.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if path
+            .try_exists()
+            .map_err(|error| format!("cannot probe retry writer target: {error}"))?
+            && quarantine_has_external_writer(path)?
+        {
+            return Err(format!(
+                "external writer holds exact retry target {}; no new run admitted",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_retained_worktree(
+    identity: &WorktreeIdentity,
+    path: PathBuf,
+    confirmed: &CloseRetirementSnapshot,
+) -> Result<(), String> {
+    ensure_no_ignored_content(&path)?;
+    let (fresh, losses) = inspect_worktree_at(identity, path).await?;
+    if !losses.is_empty() || fresh.fingerprint() != confirmed.fingerprint() {
+        return Err(
+            "retained worktree is changed or not reconstructible; preserved for repair".into(),
+        );
+    }
+    Ok(())
 }
 
 fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
@@ -5626,6 +5824,33 @@ where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
+    quarantine_and_remove_exact_worktree_with_stop(
+        identity,
+        planned_administrative_dir,
+        planned_administrative_dir_incarnation,
+        final_tombstone,
+        bind_tombstone,
+        after_quarantine,
+        stop_bound_fsmonitor_daemons,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn quarantine_and_remove_exact_worktree_with_stop<F, B, S>(
+    identity: &WorktreeIdentity,
+    planned_administrative_dir: PathBuf,
+    planned_administrative_dir_incarnation: String,
+    final_tombstone: Option<CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
+    after_quarantine: F,
+    stop: S,
+) -> Result<ExactWorktreeRemoval, String>
+where
+    F: FnOnce(&Path) + Send + 'static,
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+    S: FnOnce(&Path) -> Result<FsmonitorStop, String> + Send + 'static,
+{
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
     let resuming_quarantine = !path.exists() && quarantine.exists();
@@ -5678,7 +5903,9 @@ where
             return Err("captured worktree administrative incarnation changed".to_string());
         }
 
-        stop_bound_fsmonitor_daemons_best_effort(inspection_path);
+        if let Err(detail) = stop(inspection_path) {
+            return Ok(ExactWorktreeRemoval::StopFailed { detail });
+        }
         if !resuming_quarantine {
             if quarantine
                 .try_exists()
@@ -5728,6 +5955,7 @@ where
                 ),
             });
         }
+        ensure_no_ignored_content(&quarantine)?;
         let administrative_dir = exact_worktree_administrative_dir(&quarantine, &common)?;
         if administrative_dir != planned_administrative_dir {
             return Err(
@@ -5751,7 +5979,7 @@ where
             },
             |_| {},
             bind_tombstone,
-            |_, _| Ok(()),
+            |_, object| ensure_no_ignored_content(object),
             "quarantined worktree",
         )?;
         remove_exact_worktree_administrative_dir(
@@ -5814,6 +6042,59 @@ where
     )?;
     after_quarantine_removal();
     remove_exact_worktree_administrative_dir(administrative_dir, administrative_dir_incarnation)
+}
+
+fn ensure_no_ignored_content(path: &Path) -> Result<(), String> {
+    fn inspect(
+        path: &Path,
+        deadline: std::time::Instant,
+        visited: &mut std::collections::HashSet<PathBuf>,
+    ) -> Result<(), String> {
+        if std::time::Instant::now() >= deadline {
+            return Err("ignored-content inspection exceeded its deadline".into());
+        }
+        let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+        if !visited.insert(canonical) {
+            return Err("initialized submodule graph contains a cycle".into());
+        }
+        let status = run_bounded_git_status_until(path, deadline)?;
+        if !status.status.success() {
+            return Err(format!(
+                "cannot inspect ignored content: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+        if status
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|row| row.starts_with(b"!! "))
+        {
+            return Err(format!(
+                "ignored content at {} has no exact discard authority; worktree preserved",
+                path.display()
+            ));
+        }
+        let (_, gitlinks) = index_gitlinks(path, deadline)?;
+        for gitlink in gitlinks {
+            if std::time::Instant::now() >= deadline {
+                return Err("ignored-content inspection exceeded its deadline".into());
+            }
+            let submodule = path.join(path_buf_from_git_bytes(gitlink.path.as_bytes()));
+            if submodule
+                .join(".git")
+                .try_exists()
+                .map_err(|error| error.to_string())?
+            {
+                inspect(&submodule, deadline, visited)?;
+            }
+        }
+        Ok(())
+    }
+    inspect(
+        path,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        &mut std::collections::HashSet::new(),
+    )
 }
 
 fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
@@ -8115,6 +8396,233 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn linked_close_worktree(temp: &tempfile::TempDir) -> std::path::PathBuf {
+        let repository = temp.path().join("repository");
+        initialize_repository(&repository);
+        let target = temp.path().join("linked");
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "close-target",
+                target.to_str().unwrap(),
+            ],
+        );
+        target
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_content_preserves_linked_worktree_without_a_loss_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        std::fs::write(target.join(".gitignore"), "cache/\n").unwrap();
+        run_git(&target, &["add", ".gitignore"]);
+        run_git(&target, &["commit", "--quiet", "-m", "ignore cache"]);
+        let identity = inspection_identity(&target);
+        let confirmed = test_worktree_snapshot(&identity, &target);
+        std::fs::create_dir(target.join("cache")).unwrap();
+        std::fs::write(target.join("cache/unique"), "preserve").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (fresh, losses) = runtime.block_on(inspect_worktree(&identity)).unwrap();
+        assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
+        assert!(losses.is_empty());
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
+        let error = super::inspect_and_remove_exact_worktree(
+            runtime.handle(),
+            &identity,
+            &confirmed,
+            &administrative,
+            &incarnation,
+            None,
+            |_, _, _| Ok(()),
+        )
+        .err()
+        .expect("ignored data must prevent deletion");
+        assert!(error.contains("ignored content"), "{error}");
+        assert!(target.join("cache/unique").exists());
+        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_submodule_ignored_content_preserves_linked_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let subrepo = temp.path().join("subrepo");
+        initialize_repository(&subrepo);
+        std::fs::write(subrepo.join(".gitignore"), "build/\n").unwrap();
+        run_git(&subrepo, &["add", ".gitignore"]);
+        run_git(&subrepo, &["commit", "--quiet", "-m", "ignore build"]);
+        let repository = temp.path().join("repository");
+        initialize_repository(&repository);
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                subrepo.to_str().unwrap(),
+                "nested",
+            ],
+        );
+        run_git(&repository, &["commit", "--quiet", "-am", "add submodule"]);
+        let target = temp.path().join("linked");
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "close-target",
+                target.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &target,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--quiet",
+            ],
+        );
+        let identity = inspection_identity(&target);
+        let confirmed = test_worktree_snapshot(&identity, &target);
+        std::fs::create_dir(target.join("nested/build")).unwrap();
+        std::fs::write(target.join("nested/build/unique"), "preserve").unwrap();
+        assert!(super::ensure_no_ignored_content(&target)
+            .unwrap_err()
+            .contains("ignored content"));
+        let fresh = test_worktree_snapshot(&identity, &target);
+        assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
+        assert!(target.join("nested/build/unique").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsmonitor_stop_only_accepts_proven_no_daemon_or_success() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = |code, stderr: &[u8]| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.to_vec(),
+        };
+        assert_eq!(
+            super::classify_fsmonitor_stop(&output(0, b"")).unwrap(),
+            super::FsmonitorStop::Stopped
+        );
+        assert_eq!(
+            super::classify_fsmonitor_stop(&output(
+                128,
+                b"fatal: fsmonitor--daemon is not running\n"
+            ))
+            .unwrap(),
+            super::FsmonitorStop::NotRunning
+        );
+        assert!(
+            super::classify_fsmonitor_stop(&output(128, b"fatal: permission denied\n")).is_err()
+        );
+        assert!(super::classify_fsmonitor_stop(&output(
+            1,
+            b"fatal: fsmonitor--daemon is not running\n"
+        ))
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_fsmonitor_stop_never_reaches_quarantine_or_later_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
+        let later_effect = target.with_extension("later-effect");
+        let result = super::quarantine_and_remove_exact_worktree_with_stop(
+            &identity,
+            administrative.clone(),
+            incarnation,
+            None,
+            |_, _, _| panic!("must not bind a tombstone"),
+            {
+                let later_effect = later_effect.clone();
+                move |_| {
+                    std::fs::write(later_effect, "ran").unwrap();
+                }
+            },
+            |_| Err("injected fsmonitor timeout".into()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, ExactWorktreeRemoval::StopFailed { detail } if detail.contains("injected fsmonitor timeout"))
+        );
+        assert!(target.exists());
+        assert!(administrative.exists());
+        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
+        assert!(!later_effect.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_writer_probe_rejects_before_admission() {
+        use std::io::Read as _;
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exec 3>held; printf ready; exec sleep 15"])
+            .current_dir(&target)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 5];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        let result = super::probe_retry_worktree_writers(
+            &target,
+            &target.with_extension("quarantine"),
+            None,
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(result.unwrap_err().contains("external writer"));
+        assert!(target.exists());
+    }
+
+    #[cfg(unix)]
+    fn test_worktree_snapshot(
+        identity: &WorktreeIdentity,
+        path: &Path,
+    ) -> phoenix_core::domain::close::CloseRetirementSnapshot {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::inspect_worktree_at(identity, path.to_path_buf()))
+            .unwrap()
+            .0
+    }
+
+    #[cfg(unix)]
     #[test]
     fn recorded_final_tombstone_resumes_after_failure_following_rename() {
         let temp = tempfile::tempdir().unwrap();
@@ -8124,6 +8632,7 @@ mod tests {
         run_git(&target, &["add", "original"]);
         run_git(&target, &["commit", "--quiet", "-m", "original"]);
         let identity = inspection_identity(&target);
+        let confirmed = test_worktree_snapshot(&identity, &target);
         let recorded = std::sync::Mutex::new(None::<CloseWorktreeFinalTombstone>);
 
         let error = remove_identity_bound_directory(
@@ -8161,11 +8670,32 @@ mod tests {
         assert!(!target.exists());
         let recorded = recorded.into_inner().unwrap().unwrap();
         assert!(recorded.root.join("object/original").is_file());
-
+        std::fs::write(
+            recorded.root.join("object/original"),
+            "changed after approval\n",
+        )
+        .unwrap();
         assert!(matches!(
-            resume_final_worktree_tombstone(&recorded, &identity),
-            FinalTombstoneRecovery::Completed
+            resume_final_worktree_tombstone(&recorded, &identity, &confirmed),
+            FinalTombstoneRecovery::Residual(_)
         ));
+        assert!(recorded.root.join("object/original").exists());
+        std::fs::write(recorded.root.join("object/original"), "original\n").unwrap();
+        std::fs::write(recorded.root.join("object/.gitignore"), "cache/\n").unwrap();
+        std::fs::create_dir(recorded.root.join("object/cache")).unwrap();
+        std::fs::write(recorded.root.join("object/cache/unique"), "unique").unwrap();
+        assert!(matches!(
+            resume_final_worktree_tombstone(&recorded, &identity, &confirmed),
+            FinalTombstoneRecovery::Residual(_)
+        ));
+        assert!(recorded.root.join("object/cache/unique").exists());
+        std::fs::remove_dir_all(recorded.root.join("object/cache")).unwrap();
+        std::fs::remove_file(recorded.root.join("object/.gitignore")).unwrap();
+        let recovery = resume_final_worktree_tombstone(&recorded, &identity, &confirmed);
+        assert!(
+            matches!(recovery, FinalTombstoneRecovery::Completed),
+            "{recovery:?}"
+        );
         assert!(!recorded.root.exists());
     }
 
@@ -8179,6 +8709,7 @@ mod tests {
         run_git(&target, &["add", "original"]);
         run_git(&target, &["commit", "--quiet", "-m", "original"]);
         let identity = inspection_identity(&target);
+        let confirmed = test_worktree_snapshot(&identity, &target);
         let recorded = std::sync::Mutex::new(None::<CloseWorktreeFinalTombstone>);
         let _ = remove_identity_bound_directory(
             &target,
@@ -8216,7 +8747,7 @@ mod tests {
         std::fs::create_dir(&recorded.root).unwrap();
         std::fs::write(recorded.root.join("replacement-marker"), "preserve\n").unwrap();
 
-        let recovery = resume_final_worktree_tombstone(&recorded, &identity);
+        let recovery = resume_final_worktree_tombstone(&recorded, &identity, &confirmed);
         assert!(matches!(
             recovery,
             FinalTombstoneRecovery::Residual(detail) if detail.contains("root was replaced")
@@ -8234,6 +8765,7 @@ mod tests {
         let target = temp.path().join("target");
         initialize_repository(&target);
         let identity = inspection_identity(&target);
+        let confirmed = test_worktree_snapshot(&identity, &target);
         let root = temp.path().join("private-tombstone");
         std::fs::create_dir(&root).unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
@@ -8245,10 +8777,11 @@ mod tests {
             object_inode: None,
         };
 
-        assert!(matches!(
-            resume_final_worktree_tombstone(&recorded, &identity),
-            FinalTombstoneRecovery::Completed
-        ));
+        let recovery = resume_final_worktree_tombstone(&recorded, &identity, &confirmed);
+        assert!(
+            matches!(recovery, FinalTombstoneRecovery::Completed),
+            "{recovery:?}"
+        );
         assert!(!target.exists());
         assert!(!recorded.root.exists());
     }
@@ -8262,6 +8795,7 @@ mod tests {
         let target = temp.path().join("target");
         initialize_repository(&target);
         let identity = inspection_identity(&target);
+        let confirmed = test_worktree_snapshot(&identity, &target);
         let root = temp.path().join("private-tombstone");
         std::fs::create_dir(&root).unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
@@ -8275,7 +8809,7 @@ mod tests {
         std::fs::rename(&target, recorded.root.join("object")).unwrap();
 
         assert!(matches!(
-            resume_final_worktree_tombstone(&recorded, &identity),
+            resume_final_worktree_tombstone(&recorded, &identity, &confirmed),
             FinalTombstoneRecovery::Residual(detail) if detail.contains("unbound object remains")
         ));
         assert!(recorded.root.join("object").exists());
@@ -8290,6 +8824,7 @@ mod tests {
         let target = temp.path().join("target");
         initialize_repository(&target);
         let identity = inspection_identity(&target);
+        let confirmed = test_worktree_snapshot(&identity, &target);
         let root = temp.path().join("private-tombstone");
         std::fs::create_dir(&root).unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
@@ -8303,10 +8838,11 @@ mod tests {
         std::fs::remove_dir_all(&target).unwrap();
         std::fs::remove_dir(&recorded.root).unwrap();
 
-        assert!(matches!(
-            resume_final_worktree_tombstone(&recorded, &identity),
-            FinalTombstoneRecovery::Completed
-        ));
+        let recovery = resume_final_worktree_tombstone(&recorded, &identity, &confirmed);
+        assert!(
+            matches!(recovery, FinalTombstoneRecovery::Completed),
+            "{recovery:?}"
+        );
     }
 
     #[test]
@@ -9159,11 +9695,12 @@ mod tests {
             |_, _, _| Ok(()),
             |_| {},
         )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
+        .await;
+        assert!(
+            matches!(outcome, Err(ref detail) if detail.contains("cannot inspect ignored content"))
+        );
         assert!(!closing.exists());
-        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
+        assert!(worktree_quarantine_path(&identity).unwrap().exists());
     }
 
     #[test]

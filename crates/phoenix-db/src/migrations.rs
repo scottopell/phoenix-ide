@@ -756,6 +756,31 @@ WHEN OLD.phase = 'completed'
     AND NOT EXISTS (SELECT 1 FROM close_attempt_participants participant JOIN conversations conversation
       ON conversation.id = participant.conversation_id
       WHERE participant.attempt_id = NEW.attempt_id AND conversation.archived <> 1))
+  AND NOT (OLD.close_outcome = 'close_incomplete'
+    AND NEW.phase = 'completed' AND NEW.close_outcome = 'archived_cleanup_attention'
+    AND NEW.attempt_id IS OLD.attempt_id AND NEW.product_conversation_id IS OLD.product_conversation_id
+    AND NEW.created_at IS OLD.created_at AND NEW.completed_at IS OLD.completed_at
+    AND NEW.inspection_generation IS OLD.inspection_generation
+    AND NEW.inspection_fingerprint IS OLD.inspection_fingerprint
+    AND EXISTS (SELECT 1 FROM close_runs run JOIN close_cleanup_failures failure
+      ON failure.attempt_id = run.attempt_id AND failure.cleanup_run_ordinal = run.run_ordinal
+      JOIN coordinator_watch_events event ON event.event_id = failure.failure_occurrence_id
+      WHERE run.attempt_id = NEW.attempt_id AND run.run_ordinal > 1 AND run.status = 'stopped'
+        AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = NEW.attempt_id)
+        AND failure.source_product_conversation_id = NEW.product_conversation_id
+        AND failure.stop_certainty = 'conversation_and_processes_stopped'
+        AND failure.confirmed_at_us IS NOT NULL AND failure.occurred_at_us = run.ended_at_us
+        AND event.route_kind = 'mandatory_close_failure'
+        AND EXISTS (SELECT 1 FROM messages message JOIN close_attempt_members member
+          ON member.conversation_id = message.conversation_id
+          WHERE member.attempt_id = NEW.attempt_id AND member.member_role IN ('latest', 'root_latest')
+            AND message.message_id = 'close-run-outcome:' || run.run_ordinal || ':' || NEW.attempt_id
+            AND message.message_type = 'system'))
+    AND EXISTS (SELECT 1 FROM product_conversations product WHERE product.id = NEW.product_conversation_id
+      AND product.kind = 'ordinary' AND product.ordinary_lifecycle = 'history')
+    AND NOT EXISTS (SELECT 1 FROM close_attempt_participants participant JOIN conversations conversation
+      ON conversation.id = participant.conversation_id
+      WHERE participant.attempt_id = NEW.attempt_id AND conversation.archived <> 1))
 BEGIN
     SELECT RAISE(ABORT, 'completed Close outcome is immutable without exact successful retry');
 END;
@@ -948,6 +973,7 @@ WHEN NOT EXISTS (
     WHERE obligation.attempt_id = NEW.attempt_id AND obligation.phase <> 'completed'
       AND NEW.cleanup_run_ordinal = 1
       AND (captured.scope IS NOT NULL OR (NEW.authority_kind = 'attempt_interrupted'
+          AND NEW.stop_certainty = 'shutdown_uncertain'
           AND NOT EXISTS (SELECT 1 FROM close_attempt_scopes WHERE attempt_id = NEW.attempt_id)))
       AND EXISTS (SELECT 1 FROM close_runs run WHERE run.attempt_id = NEW.attempt_id
           AND run.run_ordinal = NEW.cleanup_run_ordinal AND run.status = 'running')
@@ -1065,6 +1091,25 @@ WHEN NOT EXISTS (
       OR (run.retry_evidence_kind = 'verified_completion'
         AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
           WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal)))
+      AND (NEW.stop_certainty = 'shutdown_uncertain' OR NOT EXISTS (
+          SELECT 1 FROM close_expected_retirement_resources expected
+          LEFT JOIN close_retirement_resources retired
+            ON retired.attempt_id = expected.attempt_id AND retired.scope = expected.scope
+           AND retired.inspection_generation = expected.inspection_generation
+           AND retired.inspection_fingerprint = expected.inspection_fingerprint
+           AND retired.resource_kind = expected.resource_kind AND retired.identity_kind = expected.identity_kind
+           AND retired.identity_codec = expected.identity_codec AND retired.identity_value = expected.identity_value
+          WHERE expected.attempt_id = NEW.attempt_id
+            AND expected.resource_kind IN ('bash_process_group', 'tmux_server', 'pty_session', 'browser_session', 'equivalent_live_resource')
+            AND (retired.proof_kind IS NULL OR retired.proof_kind = 'residual')
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects prior
+                JOIN close_run_retry_successes success ON success.attempt_id = prior.attempt_id
+                  AND success.run_ordinal = prior.run_ordinal AND success.ordinal = prior.ordinal
+                WHERE prior.attempt_id = NEW.attempt_id
+                  AND prior.scope = expected.scope AND prior.resource_kind = expected.resource_kind
+                  AND prior.identity_kind = expected.identity_kind AND prior.identity_codec = expected.identity_codec
+                  AND prior.identity_value = expected.identity_value)
+      ))
 )
 BEGIN
     SELECT RAISE(ABORT, 'cleanup failure requires exact active expected-resource, captured-scope, or observed-process authority');
@@ -1215,6 +1260,16 @@ END;
 CREATE TRIGGER close_cleanup_failure_completion_requires_disposition
 BEFORE UPDATE OF phase, close_outcome ON close_obligations
 WHEN NEW.phase = 'completed' AND NEW.close_outcome IN ('archived_cleanup_attention', 'close_incomplete')
+AND NOT (OLD.phase = 'completed' AND OLD.close_outcome = 'close_incomplete'
+    AND NEW.close_outcome = 'archived_cleanup_attention'
+    AND EXISTS (SELECT 1 FROM close_runs run JOIN close_cleanup_failures failure
+      ON failure.attempt_id = run.attempt_id AND failure.cleanup_run_ordinal = run.run_ordinal
+      WHERE run.attempt_id = NEW.attempt_id AND run.run_ordinal > 1 AND run.status = 'stopped'
+        AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = NEW.attempt_id)
+        AND failure.source_product_conversation_id = NEW.product_conversation_id
+        AND failure.stop_certainty = 'conversation_and_processes_stopped'
+        AND failure.confirmed_at_us IS NOT NULL
+        AND failure.occurred_at_us = run.ended_at_us))
 AND (OLD.phase = 'completed' OR NOT EXISTS (
     SELECT 1 FROM close_cleanup_failures failure
     JOIN product_conversations product ON product.id = failure.source_product_conversation_id

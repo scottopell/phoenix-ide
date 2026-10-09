@@ -5707,7 +5707,10 @@ impl Database {
                 || obligation.phase() != ClosePhase::Completed
                 || (initial
                     && obligation.close_outcome()
-                        != Some(request.stop_certainty.completion_outcome()))
+                        != Some(request.stop_certainty.completion_outcome())
+                    && !(request.stop_certainty == CloseStopCertainty::ShutdownUncertain
+                        && obligation.close_outcome()
+                            == Some(CloseCompletionOutcome::ArchivedCleanupAttention)))
                 || snapshot.is_some_and(|snapshot| obligation.snapshot() != Some(snapshot))
                 || obligation.product_conversation_id() != &request.source_product_conversation_id
             {
@@ -6000,8 +6003,9 @@ impl Database {
             ));
         }
         let existing = sqlx::query(
-            "SELECT authority_kind, detail, occurred_at_us FROM close_cleanup_failures
-            WHERE attempt_id = ?1 AND cleanup_run_ordinal = ?2",
+            "SELECT failure_occurrence_id, source_product_conversation_id, authority_kind, reason,
+                    detail, stop_certainty, confirmed_at_us, occurred_at_us
+             FROM close_cleanup_failures WHERE attempt_id = ?1 AND cleanup_run_ordinal = ?2",
         )
         .bind(run.attempt_id.as_str())
         .bind(run.ordinal.get())
@@ -6010,8 +6014,16 @@ impl Database {
         if let Some(existing) = existing {
             if (run.ordinal != CloseRunOrdinal::INITIAL
                 && !verified_completion_source_tx(tx, run).await?)
+                || existing.try_get::<&str, _>("failure_occurrence_id")?
+                    != request.failure_occurrence_id
+                || existing.try_get::<&str, _>("source_product_conversation_id")?
+                    != request.source_product_conversation_id.as_str()
                 || existing.try_get::<&str, _>("authority_kind")? != "attempt_interrupted"
+                || existing.try_get::<&str, _>("reason")? != request.reason.as_str()
                 || existing.try_get::<&str, _>("detail")? != request.detail
+                || existing.try_get::<&str, _>("stop_certainty")? != request.stop_certainty.as_str()
+                || existing.try_get::<Option<i64>, _>("confirmed_at_us")?
+                    != request.stop_certainty.confirmed_at_us()
                 || existing.try_get::<i64, _>("occurred_at_us")? != request.occurred_at_us
                 || obligation.product_conversation_id() != &request.source_product_conversation_id
             {
@@ -6029,13 +6041,22 @@ impl Database {
                 "resource-free retry failure requires a nonempty fully successful running plan",
             ));
         }
-        sqlx::query("INSERT INTO close_cleanup_failures
+        sqlx::query(
+            "INSERT INTO close_cleanup_failures
             (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
-             authority_kind, reason, detail, stop_certainty, occurred_at_us)
-            VALUES (?1, ?2, ?3, ?4, 'attempt_interrupted', 'interrupted', ?5, 'shutdown_uncertain', ?6)")
-            .bind(&request.failure_occurrence_id).bind(run.attempt_id.as_str()).bind(run.ordinal.get())
-            .bind(request.source_product_conversation_id.as_str()).bind(&request.detail).bind(request.occurred_at_us)
-            .execute(&mut **tx).await?;
+             authority_kind, reason, detail, stop_certainty, confirmed_at_us, occurred_at_us)
+            VALUES (?1, ?2, ?3, ?4, 'attempt_interrupted', 'interrupted', ?5, ?6, ?7, ?8)",
+        )
+        .bind(&request.failure_occurrence_id)
+        .bind(run.attempt_id.as_str())
+        .bind(run.ordinal.get())
+        .bind(request.source_product_conversation_id.as_str())
+        .bind(&request.detail)
+        .bind(request.stop_certainty.as_str())
+        .bind(request.stop_certainty.confirmed_at_us())
+        .bind(request.occurred_at_us)
+        .execute(&mut **tx)
+        .await?;
         Self::finish_close_failure_tx(tx, run, request, obligation).await
     }
 
@@ -6067,9 +6088,22 @@ impl Database {
             request.stop_certainty,
             CloseStopCertainty::ConversationAndProcessesStopped { .. }
         );
-        let status = if !initial
-            && obligation.close_outcome() == Some(CloseCompletionOutcome::ArchivedCleanupAttention)
-        {
+        let promote = !initial
+            && archived
+            && obligation.close_outcome() == Some(CloseCompletionOutcome::CloseIncomplete);
+        let attention_in_history = !initial
+            && (promote
+                || obligation.close_outcome()
+                    == Some(CloseCompletionOutcome::ArchivedCleanupAttention));
+        if promote {
+            sqlx::query(
+                "UPDATE conversations SET archived = 1, updated_at = ?2
+                 WHERE id IN (SELECT conversation_id FROM close_attempt_participants WHERE attempt_id = ?1)",
+            ).bind(request.attempt_id.as_str()).bind(&occurred_at).execute(&mut **tx).await?;
+            sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1 AND kind = 'ordinary' AND ordinary_lifecycle = 'open'")
+                .bind(request.source_product_conversation_id.as_str()).execute(&mut **tx).await?;
+        }
+        let status = if attention_in_history {
             "Cleanup retry stopped — conversation remains in History; cleanup needs attention"
         } else if !initial {
             "Cleanup retry stopped — original Close remains incomplete; cleanup needs attention"
@@ -6094,6 +6128,18 @@ impl Database {
             else { format!("close-run-outcome:{}:{}", run.ordinal.get(), request.attempt_id) }).bind(&latest).bind(sequence)
         .bind(content).bind(&occurred_at).execute(&mut **tx).await?;
         if !initial {
+            if promote {
+                let updated = sqlx::query("UPDATE close_obligations
+                    SET close_outcome = 'archived_cleanup_attention', updated_at = ?2
+                    WHERE attempt_id = ?1 AND phase = 'completed' AND close_outcome = 'close_incomplete'")
+                    .bind(request.attempt_id.as_str()).bind(&occurred_at).execute(&mut **tx).await?;
+                if updated.rows_affected() != 1 {
+                    return Err(close_precondition(
+                        "confirmed retry failure lost incomplete Close authority",
+                    ));
+                }
+                return close_obligation_for_update(tx, request.attempt_id.as_str()).await;
+            }
             return Ok(obligation);
         }
         if archived {
@@ -11298,9 +11344,6 @@ mod tests {
         );
         changed.failure_occurrence_id = run_two.failure_occurrence_id();
         changed.detail = "retry run encountered a distinct failure".into();
-        changed.stop_certainty = CloseStopCertainty::ConversationAndProcessesStopped {
-            confirmed_at_us: Utc::now().timestamp_micros(),
-        };
         changed.occurred_at_us = Utc::now().timestamp_micros();
         assert_eq!(
             db.terminalize_close_run_cleanup_failure(&run_two, &changed)
@@ -11330,6 +11373,357 @@ mod tests {
                 .unwrap(),
             original
         );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn confirmed_retry_interruption_promotes_only_exact_stopped_run_and_replays_history() {
+        let db = Database::open_in_memory().await.unwrap();
+        let first =
+            initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+        let incomplete = db
+            .terminalize_initial_close_cleanup_failure(&first)
+            .await
+            .unwrap();
+        let original_completed_at: String =
+            sqlx::query_scalar("SELECT completed_at FROM close_obligations WHERE attempt_id = ?1")
+                .bind(first.attempt_id.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let retry = safe_retry_request(&first);
+        let run = db.admit_close_safe_retry(&retry).await.unwrap();
+        for effect in &retry.remaining_effects {
+            db.record_close_safe_retry_success(&run, effect, "retired")
+                .await
+                .unwrap();
+        }
+        let stopped_at = Utc::now().timestamp_micros();
+        let confirmed = CloseStopCertainty::ConversationAndProcessesStopped {
+            confirmed_at_us: stopped_at - 1,
+        };
+        let interruption = TerminalizeInitialCloseCleanupFailureRequest {
+            failure_occurrence_id: run.failure_occurrence_id(),
+            attempt_id: first.attempt_id.clone(),
+            source_product_conversation_id: first.source_product_conversation_id.clone(),
+            authority: CloseCleanupFailureAuthority::AttemptInterrupted,
+            remaining_resources: vec![],
+            reason: RetirementFailureReason::Interrupted,
+            detail: "all effects finished; finalization interrupted".into(),
+            stop_certainty: confirmed,
+            occurred_at_us: stopped_at,
+        };
+        assert!(sqlx::query("UPDATE close_obligations SET close_outcome = 'archived_cleanup_attention' WHERE attempt_id = ?1")
+            .bind(first.attempt_id.as_str()).execute(db.pool()).await.is_err());
+        let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let promoted =
+            Database::terminalize_close_run_cleanup_failure_tx(&mut tx, &run, &interruption)
+                .await
+                .unwrap();
+        assert_eq!(
+            promoted.close_outcome(),
+            Some(CloseCompletionOutcome::ArchivedCleanupAttention)
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            db.get_close_obligation(first.attempt_id.as_str())
+                .await
+                .unwrap(),
+            incomplete
+        );
+        assert_eq!(
+            db.get_close_run(&run).await.unwrap().status,
+            CloseRunStatus::Running
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        let promoted = db
+            .terminalize_close_run_cleanup_failure(&run, &interruption)
+            .await
+            .unwrap();
+        assert_eq!(
+            promoted.close_outcome(),
+            Some(CloseCompletionOutcome::ArchivedCleanupAttention)
+        );
+        assert_eq!(promoted.phase(), ClosePhase::Completed);
+        assert_eq!(promoted.snapshot(), incomplete.snapshot());
+        assert_eq!(promoted.attempt_id(), incomplete.attempt_id());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT completed_at FROM close_obligations WHERE attempt_id = ?1"
+            )
+            .bind(first.attempt_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            original_completed_at
+        );
+        for id in ["root", "latest", "participant"] {
+            assert!(db.get_conversation(id).await.unwrap().archived);
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT ordinary_lifecycle FROM product_conversations WHERE id = 'root'"
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            "history"
+        );
+        let failures = db
+            .list_close_cleanup_failures(first.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].occurrence, first);
+        assert_eq!(failures[1].occurrence, interruption);
+        assert_eq!(
+            db.close_cleanup_failure_timing(&run.failure_occurrence_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            (stopped_at, Some(stopped_at - 1))
+        );
+        assert_eq!(
+            db.terminalize_initial_close_cleanup_failure(&first)
+                .await
+                .unwrap(),
+            promoted
+        );
+        assert_eq!(
+            db.terminalize_close_run_cleanup_failure(&run, &interruption)
+                .await
+                .unwrap(),
+            promoted
+        );
+        for certainty in [
+            CloseStopCertainty::ShutdownUncertain,
+            CloseStopCertainty::ConversationAndProcessesStopped {
+                confirmed_at_us: stopped_at,
+            },
+        ] {
+            let mut conflict = interruption.clone();
+            conflict.stop_certainty = certainty;
+            assert!(db
+                .terminalize_close_run_cleanup_failure(&run, &conflict)
+                .await
+                .is_err());
+        }
+        let outcome: String =
+            sqlx::query_scalar("SELECT content FROM messages WHERE message_id = ?1")
+                .bind(format!("close-run-outcome:2:{}", first.attempt_id))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(outcome.contains("conversation remains in History"));
+        let events: Vec<String> =
+            sqlx::query_scalar("SELECT event_id FROM coordinator_watch_events ORDER BY event_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                first.failure_occurrence_id.clone(),
+                run.failure_occurrence_id()
+            ]
+        );
+        assert!(sqlx::query(
+            "UPDATE close_obligations SET close_outcome = 'close_incomplete' WHERE attempt_id = ?1"
+        )
+        .bind(first.attempt_id.as_str())
+        .execute(db.pool())
+        .await
+        .is_err());
+
+        let mut explicit = safe_retry_request(&first);
+        explicit.failed_run = run;
+        explicit.remaining_effects.clear();
+        explicit.requested_by = CloseRetryRequestedBy::Global;
+        explicit.precondition_resolution = "fresh read-only finalization review".into();
+        explicit.safety_evidence = "all prior effects reverified".into();
+        let completion = db.admit_close_safe_retry(&explicit).await.unwrap();
+        let mut next = interruption.clone();
+        next.failure_occurrence_id = completion.failure_occurrence_id();
+        next.detail = "completion-only interruption".into();
+        next.occurred_at_us = Utc::now().timestamp_micros();
+        next.stop_certainty = CloseStopCertainty::ConversationAndProcessesStopped {
+            confirmed_at_us: next.occurred_at_us - 2,
+        };
+        assert_eq!(
+            db.terminalize_close_run_cleanup_failure(&completion, &next)
+                .await
+                .unwrap(),
+            promoted
+        );
+        assert_eq!(
+            db.terminalize_close_run_cleanup_failure(&completion, &next)
+                .await
+                .unwrap(),
+            promoted
+        );
+        assert_eq!(
+            db.list_close_cleanup_failures(first.attempt_id.as_str())
+                .await
+                .unwrap()[2]
+                .occurrence,
+            next
+        );
+        assert_eq!(
+            db.close_cleanup_failure_timing(&completion.failure_occurrence_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            (next.occurred_at_us, next.stop_certainty.confirmed_at_us())
+        );
+        let mut conflict = next.clone();
+        conflict.stop_certainty = CloseStopCertainty::ShutdownUncertain;
+        assert!(db
+            .terminalize_close_run_cleanup_failure(&completion, &conflict)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM messages WHERE message_id LIKE 'close-run-outcome:%'"
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_resource_retry_failure_promotes_but_uncertain_retry_cannot() {
+        for confirmed in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let first =
+                initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+            let original = db
+                .terminalize_initial_close_cleanup_failure(&first)
+                .await
+                .unwrap();
+            let retry = safe_retry_request(&first);
+            let run = db.admit_close_safe_retry(&retry).await.unwrap();
+            let mut failure = first.clone();
+            failure.failure_occurrence_id = run.failure_occurrence_id();
+            failure.occurred_at_us = Utc::now().timestamp_micros();
+            failure.detail = "resource retry failed".into();
+            if confirmed {
+                failure.stop_certainty = CloseStopCertainty::ConversationAndProcessesStopped {
+                    confirmed_at_us: failure.occurred_at_us - 1,
+                };
+            }
+            let result = db
+                .terminalize_close_run_cleanup_failure(&run, &failure)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.close_outcome(),
+                Some(if confirmed {
+                    CloseCompletionOutcome::ArchivedCleanupAttention
+                } else {
+                    CloseCompletionOutcome::CloseIncomplete
+                })
+            );
+            assert_eq!(
+                db.get_conversation("latest").await.unwrap().archived,
+                confirmed
+            );
+            assert_eq!(
+                db.terminalize_close_run_cleanup_failure(&run, &failure)
+                    .await
+                    .unwrap(),
+                result
+            );
+            assert_eq!(
+                db.terminalize_initial_close_cleanup_failure(&first)
+                    .await
+                    .unwrap(),
+                result
+            );
+            assert_eq!(
+                db.list_close_cleanup_failures(first.attempt_id.as_str())
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+                2
+            );
+            if !confirmed {
+                assert_eq!(result, original);
+                assert!(sqlx::query("UPDATE close_obligations SET close_outcome = 'archived_cleanup_attention' WHERE attempt_id = ?1")
+                    .bind(first.attempt_id.as_str()).execute(db.pool()).await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_failure_in_history_retains_attention_without_rewriting_initial_evidence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let first = initial_cleanup_failure_fixture(
+            &db,
+            CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 },
+        )
+        .await;
+        let attention = db
+            .terminalize_initial_close_cleanup_failure(&first)
+            .await
+            .unwrap();
+        let run = db
+            .admit_close_safe_retry(&safe_retry_request(&first))
+            .await
+            .unwrap();
+        let mut failure = first.clone();
+        failure.failure_occurrence_id = run.failure_occurrence_id();
+        failure.stop_certainty = CloseStopCertainty::ShutdownUncertain;
+        failure.occurred_at_us = Utc::now().timestamp_micros();
+        failure.detail = "uncertain cleanup retry in History".into();
+        assert_eq!(
+            db.terminalize_close_run_cleanup_failure(&run, &failure)
+                .await
+                .unwrap(),
+            attention
+        );
+        assert_eq!(
+            db.terminalize_initial_close_cleanup_failure(&first)
+                .await
+                .unwrap(),
+            attention
+        );
+        assert_eq!(
+            db.list_close_cleanup_failures(first.attempt_id.as_str())
+                .await
+                .unwrap()[0]
+                .occurrence,
+            first
+        );
+        assert!(db.get_conversation("latest").await.unwrap().archived);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
                 .fetch_one(db.pool())
@@ -11453,6 +11847,15 @@ mod tests {
                 CloseCleanupFailureAuthority::AttemptInterrupted
             );
             assert!(failures[1].occurrence.remaining_resources.is_empty());
+            assert_eq!(failures[1].occurrence.stop_certainty, certainty);
+            assert_eq!(
+                db.close_cleanup_failure_timing(&run.failure_occurrence_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                certainty.confirmed_at_us()
+            );
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
                     .fetch_one(db.pool())
@@ -11780,6 +12183,17 @@ mod tests {
     async fn close_scope_free_interruption_is_atomic_exact_and_has_no_resource_children() {
         let db = Database::open_in_memory().await.unwrap();
         let run = scope_free_close_fixture(&db).await;
+        assert!(sqlx::query(
+            "INSERT INTO close_cleanup_failures
+            (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
+             authority_kind, reason, detail, stop_certainty, confirmed_at_us, occurred_at_us)
+            VALUES ('close-failure:1:scope-free', 'scope-free', 1, 'root',
+             'attempt_interrupted', 'interrupted', 'forged certainty',
+             'conversation_and_processes_stopped', 1, 2)"
+        )
+        .execute(db.pool())
+        .await
+        .is_err());
         sqlx::raw_sql("CREATE TRIGGER reject_scope_free_event BEFORE INSERT ON coordinator_watch_events BEGIN SELECT RAISE(ABORT, 'event failed'); END;")
             .execute(db.pool()).await.unwrap();
         assert!(db.classify_interrupted_close_run(&run).await.is_err());
