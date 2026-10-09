@@ -1,13 +1,16 @@
 //! Model registry for managing available LLM providers
 
 use super::codex_credential::AccountBoundCodexCredential;
+use super::models::RequestModelName;
 use super::{
     all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
     CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
     LoggingService, ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,6 +147,110 @@ pub struct ResolvedAuth {
     pub style: AuthStyle,
 }
 
+/// A `HashMap<String, V>` that rejects duplicate keys at deserialization time
+/// instead of silently keeping only the last occurrence. `serde_json`'s
+/// default `HashMap` support calls `insert` unconditionally per entry, so a
+/// duplicate key (legal in JSON, ambiguous in practice) would otherwise erase
+/// an earlier entry — including one that was invalid — before validation
+/// ever saw it.
+struct NoDupMap<V>(HashMap<String, V>);
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for NoDupMap<V> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NoDupVisitor<V>(PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for NoDupVisitor<V> {
+            type Value = HashMap<String, V>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object with unique keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((key, value)) = map.next_entry::<String, V>()? {
+                    if out.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer
+            .deserialize_map(NoDupVisitor(PhantomData))
+            .map(NoDupMap)
+    }
+}
+
+/// Exact route -> canonical model ID -> request spelling, validated at startup.
+#[derive(Debug, Clone, Default)]
+pub struct RequestModelOverrides(HashMap<ModelBackend, HashMap<String, RequestModelName>>);
+
+impl RequestModelOverrides {
+    /// Validation is purely a function of the configured catalog and
+    /// declared backend — it does not know which route is actually in use.
+    /// Codex auth being active never changes whether an entry is *valid*;
+    /// it only changes whether [`Self::resolve`] applies it (native Codex
+    /// built-ins always use their own default spelling, so a map entry for
+    /// one is accepted but stays dormant).
+    fn parse(raw: &str, specs: &[super::ModelSpec]) -> Result<Self, String> {
+        let routes: NoDupMap<NoDupMap<String>> =
+            serde_json::from_str(raw).map_err(|error| format!("invalid JSON map: {error}"))?;
+        let mut overrides = HashMap::new();
+        for (route, names) in routes.0 {
+            let backend = match route.as_str() {
+                "anthropic" => ModelBackend::Anthropic,
+                "openai_responses" => ModelBackend::OpenAIResponses,
+                "openai_chat_completions" => ModelBackend::OpenAIChatCompletions,
+                _ => return Err(format!("unknown route '{route}'")),
+            };
+            let mut mapped = HashMap::new();
+            for (id, name) in names.0 {
+                let spec = specs
+                    .iter()
+                    .find(|spec| spec.id == id)
+                    .ok_or_else(|| format!("unknown model ID '{id}' on route '{route}'"))?;
+                if spec.backend != backend {
+                    return Err(format!(
+                        "model '{id}' has a different backend from route '{route}'"
+                    ));
+                }
+                if name.trim().is_empty() {
+                    return Err(format!("blank request name for '{id}' on route '{route}'"));
+                }
+                mapped.insert(id, RequestModelName::from(name));
+            }
+            overrides.insert(backend, mapped);
+        }
+        Ok(Self(overrides))
+    }
+
+    fn resolve(&self, spec: &super::ModelSpec, use_codex_auth: bool) -> RequestModelName {
+        if use_codex_auth
+            && spec.backend == ModelBackend::OpenAIResponses
+            && spec.source == ModelSource::BuiltIn
+        {
+            return spec.default_request_name.clone();
+        }
+        self.0
+            .get(&spec.backend)
+            .and_then(|names| names.get(&spec.id))
+            .cloned()
+            .unwrap_or_else(|| spec.default_request_name.clone())
+    }
+
+    fn len(&self) -> usize {
+        self.0.values().map(HashMap::len).sum()
+    }
+}
+
 /// Configuration for LLM providers
 pub struct LlmConfig {
     pub anthropic_api_key: Option<String>,
@@ -164,8 +271,7 @@ pub struct LlmConfig {
     /// Direct URL override for the `OpenAI` Chat Completions endpoint.
     pub openai_chat_completions_base_url: Option<String>,
     /// Extra headers to inject on every LLM request (newline-separated "key: value").
-    /// Parsed from `LLM_CUSTOM_HEADERS` env var. A `provider` header is auto-injected
-    /// based on which provider is being called.
+    /// Parsed from `LLM_CUSTOM_HEADERS` env var. No provider header is inferred.
     pub custom_headers: Vec<(String, String)>,
     /// Free-form metadata pairs forwarded as a top-level `tags` object on
     /// every outbound LLM request routed through a base URL override. Parsed from
@@ -180,6 +286,7 @@ pub struct LlmConfig {
     /// These are additive only; duplicate IDs are ignored when merged with
     /// built-ins.
     pub external_models: Vec<super::ModelSpec>,
+    pub request_models: RequestModelOverrides,
     /// User has signed into the native `ChatGPT` bridge.
     /// When true, `OpenAI` models route through the bridge; when true but
     /// `codex_credential` is `None` (load failed), `OpenAI` models are
@@ -227,6 +334,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("request_tags", &self.request_tags)
             .field("auth_style", &self.auth_style)
             .field("external_models", &self.external_models.len())
+            .field("request_models", &self.request_models.len())
             .field("use_codex_auth", &self.use_codex_auth)
             .field("codex_credential", &self.codex_credential.is_some())
             .field("codex_credential_path", &self.codex_credential_path)
@@ -250,6 +358,7 @@ impl Clone for LlmConfig {
             request_tags: self.request_tags.clone(),
             auth_style: self.auth_style,
             external_models: self.external_models.clone(),
+            request_models: self.request_models.clone(),
             use_codex_auth: self.use_codex_auth,
             codex_credential: self.codex_credential.as_ref().map(Arc::clone),
             codex_credential_path: self.codex_credential_path.clone(),
@@ -273,6 +382,7 @@ impl Default for LlmConfig {
             request_tags: std::collections::BTreeMap::new(),
             auth_style: AuthStyle::ApiKey,
             external_models: Vec::new(),
+            request_models: RequestModelOverrides::default(),
             use_codex_auth: false,
             codex_credential: None,
             codex_credential_path: None,
@@ -282,6 +392,13 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
+    /// # Panics
+    ///
+    /// Panics if `PHOENIX_LLM_REQUEST_MODELS` is set but fails to parse or
+    /// validate (unknown route/model, backend mismatch, blank name, or
+    /// duplicate keys). The map is rejected atomically before any
+    /// request can use it, so a malformed override must fail startup rather
+    /// than silently fall back to defaults.
     #[allow(clippy::too_many_lines)]
     pub fn from_env(runtime_env: Arc<PhoenixRuntimeEnvironment>) -> Self {
         let credential_helper = std::env::var("LLM_API_KEY_HELPER")
@@ -362,6 +479,20 @@ impl LlmConfig {
             None => (None, None),
         };
         let use_codex_auth = active_auth_path.is_some();
+        let request_models = std::env::var("PHOENIX_LLM_REQUEST_MODELS")
+            .ok()
+            .map(|raw| {
+                let specs = merge_model_specs(all_models(), &external_models);
+                RequestModelOverrides::parse(&raw, &specs)
+                    .unwrap_or_else(|error| panic!("PHOENIX_LLM_REQUEST_MODELS: {error}"))
+            })
+            .unwrap_or_default();
+        if request_models.len() > 0 {
+            tracing::info!(
+                count = request_models.len(),
+                "validated PHOENIX_LLM_REQUEST_MODELS overrides"
+            );
+        }
 
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
@@ -383,6 +514,7 @@ impl LlmConfig {
                 AuthStyle::ApiKey
             },
             external_models,
+            request_models,
             use_codex_auth,
             codex_credential,
             codex_credential_path,
@@ -680,7 +812,8 @@ impl ModelRegistry {
 
         let codex_catalog = Self::discover_codex_catalog(config).await;
         let configured_specs = Self::model_specs(config);
-        let fallback_backends = Self::discovery_fallback_backends(&configured_specs, &discovered);
+        let fallback_backends =
+            Self::discovery_fallback_backends(&configured_specs, &discovered, config);
 
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
@@ -690,7 +823,7 @@ impl ModelRegistry {
                 && spec.backend == ModelBackend::OpenAIResponses
                 && spec.source == ModelSource::BuiltIn;
             let listed_backend_match = discovered.was_listed(spec.backend)
-                && Self::spec_matches_discovered_model(&spec, &discovered);
+                && Self::spec_matches_discovered_model(&spec, &discovered, config);
             let should_filter = !uses_codex_bridge
                 && discovered.was_listed(spec.backend)
                 && !fallback_backends.contains(&spec.backend);
@@ -737,6 +870,7 @@ impl ModelRegistry {
     fn discovery_fallback_backends(
         specs: &[super::ModelSpec],
         discovered: &DiscoveredModels,
+        config: &LlmConfig,
     ) -> HashSet<ModelBackend> {
         [
             ModelBackend::Anthropic,
@@ -748,7 +882,7 @@ impl ModelRegistry {
             discovered.was_listed(*backend)
                 && !specs.iter().any(|spec| {
                     spec.backend == *backend
-                        && Self::spec_matches_discovered_model(spec, discovered)
+                        && Self::spec_matches_discovered_model(spec, discovered, config)
                 })
         })
         .collect()
@@ -757,20 +891,23 @@ impl ModelRegistry {
     fn spec_matches_discovered_model(
         spec: &super::ModelSpec,
         discovered: &DiscoveredModels,
+        config: &LlmConfig,
     ) -> bool {
         let ids = discovered.ids_for_backend(spec.backend);
-        let route_provider = spec.provider_header_value();
-        let route_prefixed_id = format!("{route_provider}/{}", spec.id);
-        let route_prefixed_api = format!("{route_provider}/{}", spec.api_name);
+        let name = config.request_models.resolve(spec, config.use_codex_auth);
+        let request = name.as_str();
         let backend_provider = spec.backend.header_value();
         let backend_prefixed_id = format!("{backend_provider}/{}", spec.id);
-        let backend_prefixed_api = format!("{backend_provider}/{}", spec.api_name);
+        let backend_prefixed_request = format!("{backend_provider}/{request}");
+        // Preserve explicitly prefixed ID aliases, without inferring a provider header.
+        let route_prefixed_id = request
+            .split_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{}", spec.id));
         ids.contains(&spec.id)
-            || ids.contains(&spec.api_name)
-            || ids.contains(&route_prefixed_id)
-            || ids.contains(&route_prefixed_api)
+            || ids.contains(request)
             || ids.contains(&backend_prefixed_id)
-            || ids.contains(&backend_prefixed_api)
+            || ids.contains(&backend_prefixed_request)
+            || route_prefixed_id.is_some_and(|alias| ids.contains(&alias))
     }
 
     /// Build a `DiscoveryConfig` from credential-helper auth and base URL overrides.
@@ -906,7 +1043,7 @@ impl ModelRegistry {
     }
 
     fn observe_codex_catalog(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) {
-        if catalog.is_some_and(|models| !models.contains(&spec.api_name)) {
+        if catalog.is_some_and(|models| !models.contains(spec.default_request_name.as_str())) {
             tracing::debug!(
                 model = %spec.id,
                 "supported Codex model absent from advisory provider catalog"
@@ -1032,15 +1169,18 @@ impl ModelRegistry {
             }
         };
 
-        let service = Arc::new(LlmServiceImpl::new(
-            spec.clone(),
-            auth,
-            config.anthropic_base_url.clone(),
-            config.openai_responses_base_url.clone(),
-            config.openai_chat_completions_base_url.clone(),
-            config.custom_headers.clone(),
-            config.request_tags.clone(),
-        ));
+        let service = Arc::new(
+            LlmServiceImpl::new(
+                spec.clone(),
+                auth,
+                config.anthropic_base_url.clone(),
+                config.openai_responses_base_url.clone(),
+                config.openai_chat_completions_base_url.clone(),
+                config.custom_headers.clone(),
+                config.request_tags.clone(),
+            )
+            .with_request_name(config.request_models.resolve(spec, config.use_codex_auth)),
+        );
         let provider = spec.backend.header_value();
         let transport = match spec.backend {
             ModelBackend::Anthropic
@@ -1817,6 +1957,105 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn request_model_map_validates_exact_routes_and_catalog_identity() {
+        let specs = merge_model_specs(all_models(), &[external_gateway_model()]);
+        let valid = RequestModelOverrides::parse(
+            r#"{"anthropic":{"claude-sonnet-5":"anthropic/claude-sonnet-5"},"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"},"openai_chat_completions":{}}"#,
+            &specs,
+        ).unwrap();
+        assert_eq!(valid.len(), 2);
+        assert_eq!(
+            valid
+                .resolve(
+                    specs.iter().find(|s| s.id == "claude-sonnet-5").unwrap(),
+                    false
+                )
+                .as_str(),
+            "anthropic/claude-sonnet-5"
+        );
+        for (raw, reason) in [
+            ("not json", "invalid JSON map"),
+            ("[]", "invalid JSON map"),
+            (r#"{"codex":{"gpt-6.1-sol":"other"}}"#, "unknown route"),
+            (r#"{"anthropic":{"absent":"other"}}"#, "unknown model ID"),
+            (
+                r#"{"anthropic":{"gpt-6.1-sol":"other"}}"#,
+                "different backend",
+            ),
+            (
+                r#"{"anthropic":{"claude-sonnet-5":"  "}}"#,
+                "blank request name",
+            ),
+        ] {
+            let error = RequestModelOverrides::parse(raw, &specs).unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
+        let dormant = RequestModelOverrides::parse(
+            r#"{"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"}}"#,
+            &specs,
+        )
+        .unwrap();
+        let gpt = specs.iter().find(|s| s.id == "gpt-6.1-sol").unwrap();
+        assert_eq!(dormant.resolve(gpt, true).as_str(), "gpt-6.1-sol");
+        assert_eq!(dormant.resolve(gpt, false).as_str(), "gateway/gpt-sol");
+        assert_eq!(
+            valid
+                .resolve(specs.iter().find(|s| s.id == "gpt-6.1-sol").unwrap(), true)
+                .as_str(),
+            "gpt-6.1-sol"
+        );
+    }
+
+    #[test]
+    fn duplicate_request_name_keys_are_rejected_at_both_levels() {
+        for raw in [
+            r#"{"anthropic":{"claude-sonnet-5":"","claude-sonnet-5":"alias"}}"#,
+            r#"{"anthropic":{"absent":"alias"},"anthropic":{"claude-sonnet-5":"alias"}}"#,
+            r#"{"anthropic":{"claude-sonnet-5":"alias","claude-sonnet-5":"alias"}}"#,
+            r#"{"anthropic":{},"anthropic":{}}"#,
+        ] {
+            let error = RequestModelOverrides::parse(raw, &all_models()).unwrap_err();
+            assert!(error.contains("duplicate"), "{error}");
+        }
+    }
+
+    #[test]
+    fn request_override_changes_route_key_not_catalog_capabilities_or_default_key() {
+        let original = LlmConfig {
+            anthropic_api_key: Some("key".into()),
+            openai_api_key: Some("key".into()),
+            ..Default::default()
+        };
+        let overrides = RequestModelOverrides::parse(
+            r#"{"anthropic":{"claude-sonnet-5-5":"anthropic/claude-sonnet-5-5"},"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"}}"#,
+            &ModelRegistry::model_specs(&original),
+        ).unwrap();
+        let mapped = LlmConfig {
+            request_models: overrides,
+            ..original.clone()
+        };
+        let first = ModelRegistry::new(&original);
+        let second = ModelRegistry::new(&mapped);
+        for (id, expected_request) in [
+            ("claude-sonnet-5-5", "anthropic/claude-sonnet-5-5"),
+            ("gpt-6.1-sol", "gateway/gpt-sol"),
+        ] {
+            let before = first.get(id).unwrap().continuation_route_key();
+            let after = second.get(id).unwrap().continuation_route_key();
+            assert!(before.contains(&format!(":{id}:")));
+            assert!(after.contains(&format!(":{expected_request}:")));
+            assert_ne!(before, after);
+            let spec = second.specs.read().unwrap().get(id).unwrap().clone();
+            assert_eq!(spec.id, id);
+            assert_eq!(spec.default_request_name.as_str(), id);
+            assert_eq!(
+                second.effort_capabilities(id),
+                first.effort_capabilities(id)
+            );
+        }
+    }
+
+    #[test]
     fn codex_bridge_transport_is_websocket_across_registration_paths() {
         assert_eq!(codex_bridge_transport(), LlmTransport::Websocket);
     }
@@ -2198,7 +2437,46 @@ mod tests {
 
         assert!(ModelRegistry::spec_matches_discovered_model(
             &model,
-            &discovered
+            &discovered,
+            &LlmConfig::default()
+        ));
+    }
+
+    #[test]
+    fn discovery_matcher_uses_resolved_request_name_on_matching_backend() {
+        let model = all_models()
+            .into_iter()
+            .find(|model| model.id == "claude-sonnet-5")
+            .unwrap();
+        let config = LlmConfig {
+            request_models: RequestModelOverrides::parse(
+                r#"{"anthropic":{"claude-sonnet-5":"gateway/sonnet-alias"}}"#,
+                &all_models(),
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        let mut discovered = DiscoveredModels {
+            anthropic_listed: true,
+            anthropic: HashSet::from(["gateway/sonnet-alias".to_owned()]),
+            openai_responses_listed: true,
+            openai_responses: HashSet::new(),
+            openai_chat_completions_listed: false,
+            openai_chat_completions: HashSet::new(),
+        };
+        assert!(ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered,
+            &config
+        ));
+        discovered.anthropic.clear();
+        discovered
+            .openai_responses
+            .insert("gateway/sonnet-alias".to_owned());
+        assert!(!ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered,
+            &config
         ));
     }
 
@@ -2219,7 +2497,8 @@ mod tests {
 
         assert!(ModelRegistry::spec_matches_discovered_model(
             &model,
-            &discovered
+            &discovered,
+            &LlmConfig::default()
         ));
     }
 
@@ -2242,10 +2521,12 @@ mod tests {
         assert!(configured
             .iter()
             .all(|spec| !discovered.ids_for_backend(spec.backend).contains(&spec.id)));
-        assert!(
-            ModelRegistry::discovery_fallback_backends(&configured, &discovered)
-                .contains(&ModelBackend::OpenAIResponses)
-        );
+        assert!(ModelRegistry::discovery_fallback_backends(
+            &configured,
+            &discovered,
+            &LlmConfig::default()
+        )
+        .contains(&ModelBackend::OpenAIResponses));
         for retired in ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"] {
             assert!(configured.iter().all(|spec| spec.id != retired));
         }
@@ -2267,7 +2548,8 @@ mod tests {
 
         assert!(!ModelRegistry::spec_matches_discovered_model(
             &model,
-            &discovered
+            &discovered,
+            &LlmConfig::default()
         ));
     }
 
@@ -2285,7 +2567,8 @@ mod tests {
             ]),
         };
 
-        let fallback = ModelRegistry::discovery_fallback_backends(&specs, &discovered);
+        let fallback =
+            ModelRegistry::discovery_fallback_backends(&specs, &discovered, &LlmConfig::default());
 
         assert!(fallback.contains(&ModelBackend::Anthropic));
         assert!(!fallback.contains(&ModelBackend::OpenAIResponses));

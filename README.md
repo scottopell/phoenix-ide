@@ -183,9 +183,10 @@ you (prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy
 | `OPENAI_CHAT_COMPLETIONS_BASE_URL` | Exact endpoint for OpenAI Chat Completions-compatible models | — |
 | `DEFAULT_MODEL` | Preferred default model ID (used only if it actually registers) | first registered model |
 | `PHOENIX_LLM_MODELS` | Inline JSON array of additional model specs to add to the built-in registry | — |
+| `PHOENIX_LLM_REQUEST_MODELS` | Inline JSON map overriding the wire request spelling per backend route and Phoenix model ID | — |
 | `LLM_API_KEY_HELPER` | Command that prints a fresh API key/token on stdout (e.g. `claude` OAuth helper) | — |
 | `LLM_API_KEY_HELPER_TTL_MS` | How long a helper-produced credential is cached | `7200000` (2 h) |
-| `LLM_CUSTOM_HEADERS` | Extra request headers — newline-separated `Key: value` (literal `\n` accepted); a `provider` header is auto-injected | — |
+| `LLM_CUSTOM_HEADERS` | Extra request headers — newline-separated `Key: value` (literal `\n` accepted); no header is inferred or auto-injected | — |
 | `LLM_REQUEST_TAGS` | Comma-separated `key=value` request tags | — |
 | `LLM_AUTH_HEADER` | `bearer` → send the key as `Authorization: Bearer …`; anything else → provider's native API-key header | api-key style |
 | `PHOENIX_ENABLE_MOCK_MODEL` | `1` → register the deterministic mock provider (testing only) | off |
@@ -241,6 +242,22 @@ OPENAI_API_KEY=provider-api-key
 OPENAI_CHAT_COMPLETIONS_BASE_URL=https://provider.example/v1/chat/completions
 DEFAULT_MODEL=example/chat-model
 PHOENIX_LLM_MODELS=[{"id":"example/chat-model","api_name":"provider/example/chat-model","backend":"openai_chat_completions","family":"Google","description":"Example Chat Completions-compatible POC","context_window":128000,"max_output_tokens":8192,"recommended":false,"supports_tool_search":false}]
+```
+
+`PHOENIX_LLM_REQUEST_MODELS` remaps the wire spelling Phoenix sends for a
+model without changing its Phoenix ID, picker entry, persisted history, or
+capability checks — those are always keyed on `id`. It is a JSON object
+keyed by backend route (`anthropic`, `openai_responses`,
+`openai_chat_completions`); each route maps Phoenix model IDs on that route
+to the request spelling to send. The whole map is validated once at
+startup and rejected atomically — an unknown route, an unknown model ID, a
+model ID on the wrong route, a blank spelling, or duplicate keys fail startup rather than
+partially applying. The Codex bridge route is not a valid key: native
+ChatGPT/Codex-authenticated requests always use the model's own default
+spelling and ignore this map.
+
+```env
+PHOENIX_LLM_REQUEST_MODELS={"anthropic":{"claude-sonnet-5":"anthropic/claude-sonnet-5"},"openai_responses":{"gpt-6.1-sol":"openai/gpt-6.1-sol"}}
 ```
 
 ### TLS

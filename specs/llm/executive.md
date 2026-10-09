@@ -38,6 +38,7 @@ Tool availability is separated from retained declarations and historical calls. 
 | **REQ-LLM-011:** Absolute Provider-Attempt Deadline | ✅ Complete | One ten-minute service deadline covers credential resolution, WebSocket activity/recovery, HTTP/SSE fallback, body consumption, and normalization without renewal |
 | **REQ-LLM-012:** Total and Idempotent Attempt Outcomes | ✅ Complete | Timeout is distinct from cancellation/network failure; terminal capture and persistence are first-winner/idempotent |
 | **REQ-LLM-013:** Timeout Outcome Schema Migration | ✅ Complete | Forward migration preserves existing metrics, admits `timed_out`, and retains the closed outcome constraint |
+| **REQ-LLM-014:** Canonical Model Identity Is Distinct From Request Addressing | ✅ Complete | `ModelSpec.id` is the sole value read by capability/transport checks, the picker, and persistence; `RequestModelName` (default from configured `api_name`) carries only serialization, discovery matching, and replay/continuation binding. `PHOENIX_LLM_REQUEST_MODELS` validates its route→ID→spelling map atomically at startup, rejects the Codex route, and is ignored for native-Codex-routed built-ins. Automatic `provider` header inference is removed; explicit custom headers and native Codex account/protocol headers are unaffected. Responses replay and the normalized `model` field bind to the request spelling, not the provider's reported physical name. |
 
 **Progress:** All listed requirements complete.
 
