@@ -3596,12 +3596,17 @@ where
     ) -> Result<Vec<Event>, String> {
         let remaining = self.bash_wait_transition_remaining(&result.new_state);
         if let Some(remaining) = remaining {
-            return tokio::time::timeout(remaining, self.apply_transition_result_inner(result))
+            return match tokio::time::timeout(remaining, self.apply_transition_result_inner(result))
                 .await
-                .map_err(|_| {
-                    "bash wait transition exceeded its absolute settlement deadline; runtime fail-stop required"
-                        .to_string()
-                })?;
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.fatal_local_authority_fence
+                        .close("bash_wait_transition_deadline");
+                    Err("bash wait transition exceeded its absolute settlement deadline; fatal local authority fence closed"
+                        .to_string())
+                }
+            };
         }
         self.apply_transition_result_inner(result).await
     }
@@ -18862,7 +18867,9 @@ mod steer_drain_detector_tests {
             .await;
         assert!(result
             .unwrap_err()
-            .contains("absolute settlement deadline; runtime fail-stop required"));
+            .contains("absolute settlement deadline; fatal local authority fence closed"));
+        assert!(rt.fatal_local_authority_fence.is_closed());
+        assert!(rt.live_state_owner().is_err());
         assert!(storage
             .get_all_messages("bash-wait-transition-bound")
             .is_empty());
