@@ -383,10 +383,15 @@ impl ResponsesStreamAccumulator {
                         .record_generation_event_at(now, GenerationKind::Reasoning);
                 }
             }
-            "response.function_call_arguments.delta" => {
-                if v.get("delta")
+            "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
+                let field = if dispatch_type.ends_with(".done") {
+                    "arguments"
+                } else {
+                    "delta"
+                };
+                if v.get(field)
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|delta| !delta.is_empty())
+                    .is_some_and(|arguments| !arguments.is_empty())
                 {
                     self.telemetry
                         .record_generation_event_at(now, GenerationKind::Tool);
@@ -6988,6 +6993,10 @@ mod tests {
             serde_json::json!({
                 "type": "response.function_call_arguments.delta",
                 "delta": "{}"
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.done",
+                "arguments": "{}"
             }),
             serde_json::json!({
                 "type": "response.output_item.added",

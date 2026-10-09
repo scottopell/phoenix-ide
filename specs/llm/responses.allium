@@ -736,8 +736,8 @@ rule ResponsesFinalizedVisibleOutputObserved {
     ensures: stream.observed_non_reasoning_output = true
 }
 
--- A named function-call item or non-empty function-call argument delta proves
--- that tool output existed even if terminal assembly loses the completed item.
+-- A named function-call item or non-empty incremental or finalized argument
+-- event proves that tool output existed even if terminal assembly loses the item.
 rule ResponsesFunctionCallOutputObserved {
     when: ResponsesFunctionCallOutput(stream)
 
