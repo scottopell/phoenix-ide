@@ -11,7 +11,7 @@ mod coordinator_query;
 mod coordinator_watches;
 mod federation_enrollment;
 mod federation_peers;
-pub use coordinator_watches::{PendingWatchEvent, WatchSnapshot};
+pub use coordinator_watches::{PendingWatchEvent, WatchOutcome, WatchSnapshot};
 mod ddl;
 mod git_repository_reconciliation;
 mod message_attachments;
@@ -16640,10 +16640,11 @@ mod tests {
         .unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_kind, "failed");
         assert_eq!(
-            events[0].terminal_reason.as_deref(),
-            Some("context exhausted")
+            events[0].outcome,
+            WatchOutcome::Failed {
+                reason: "context exhausted".into()
+            }
         );
     }
 
@@ -16710,8 +16711,10 @@ mod tests {
         assert_eq!(summary.source_occurrence_id, "summary-operation");
         assert_eq!(summary.source_generation, 1);
         assert_eq!(
-            summary.terminal_reason.as_deref(),
-            Some("continuation summary failed")
+            summary.outcome,
+            WatchOutcome::Failed {
+                reason: "continuation summary failed".into()
+            }
         );
     }
 
@@ -16744,7 +16747,7 @@ mod tests {
             events[0].source_generation,
             i64::try_from(claim.generation).unwrap()
         );
-        assert_eq!(events[0].terminal_kind, "completed");
+        assert_eq!(events[0].outcome, WatchOutcome::Completed);
 
         assert_eq!(
             db.settle_conversation_creation_runtime(

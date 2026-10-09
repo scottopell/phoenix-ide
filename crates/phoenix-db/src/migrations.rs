@@ -619,7 +619,9 @@ const MIGRATIONS: &[Migration] = &[
 
 const MIGRATION_118: &str = r"
 PRAGMA defer_foreign_keys = ON;
-CREATE TABLE coordinator_watch_events_waits (
+CREATE TEMP TABLE coordinator_watch_events_waits AS SELECT * FROM coordinator_watch_events;
+DROP TABLE coordinator_watch_events;
+CREATE TABLE coordinator_watch_events (
     event_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(event_id)) > 0),
     watch_id INTEGER NOT NULL REFERENCES coordinator_watches(id),
     source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation', 'steering', 'wake', 'seeded_fork', 'interaction_response', 'continuation_summary', 'question_request')),
@@ -640,9 +642,8 @@ CREATE TABLE coordinator_watch_events_waits (
     CHECK ((source_occurrence_kind = 'question_request') = (terminal_kind = 'awaiting_user_response')),
     CHECK (terminal_kind != 'awaiting_user_response' OR terminal_reason = 'question_request')
 );
-INSERT INTO coordinator_watch_events_waits SELECT * FROM coordinator_watch_events;
-DROP TABLE coordinator_watch_events;
-ALTER TABLE coordinator_watch_events_waits RENAME TO coordinator_watch_events;
+INSERT INTO coordinator_watch_events SELECT * FROM coordinator_watch_events_waits;
+DROP TABLE coordinator_watch_events_waits;
 CREATE INDEX coordinator_watch_events_pending ON coordinator_watch_events(delivery_state, occurred_at_us);
 CREATE TEMP TABLE watch_event_fk_check (violations INTEGER CHECK (violations = 0));
 INSERT INTO watch_event_fk_check SELECT COUNT(*) FROM pragma_foreign_key_check;

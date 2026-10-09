@@ -26,8 +26,8 @@ pub enum WatchOutcome {
 }
 
 impl WatchOutcome {
-    fn decode(kind: String, reason: Option<String>) -> DbResult<Self> {
-        match (kind.as_str(), reason) {
+    fn decode(kind: &str, reason: Option<String>) -> DbResult<Self> {
+        match (kind, reason) {
             ("completed", None) => Ok(Self::Completed),
             ("failed", Some(reason)) => Ok(Self::Failed { reason }),
             ("cancelled", None) => Ok(Self::Cancelled),
