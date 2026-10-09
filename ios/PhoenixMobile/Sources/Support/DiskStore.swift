@@ -381,6 +381,23 @@ enum DiskStore {
         loadVersionedResult(type, source: url(for: name), version: version, migrate: migrate)
     }
 
+    enum NameDiscovery {
+        case names([String])
+        case unreadable
+    }
+
+    static func discoverNames(withPrefix prefix: String) -> NameDiscovery {
+        do {
+            let urls = try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)
+            return .names(urls.compactMap { url in
+                guard url.pathExtension == "json" else { return nil }
+                let name = url.deletingPathExtension().lastPathComponent
+                return name.hasPrefix(prefix) ? name : nil
+            })
+        } catch { return .unreadable }
+    }
+
     /// Names (without extension) of stored files matching a prefix. Used to
     /// discover persisted per-conversation outboxes independently of which
     /// sessions are currently open.
@@ -396,7 +413,7 @@ enum DiskStore {
         await VersionedDiskContext(rootDirectory: directory).removeAllAndWait()
     }
 
-    static func removeAllAndWait() async {
+    static func removeAllAndWait() async -> Bool {
         let rootDirectory = directory.standardizedFileURL
         let removals = versionedDestinations.values.compactMap { destination -> (VersionedDiskSink, Int)? in
             let destinationURL = destination.destinationURL.standardizedFileURL
@@ -406,6 +423,9 @@ enum DiskStore {
         for (sink, revision) in removals {
             await sink.remove(revision: revision)
         }
-        try? FileManager.default.removeItem(at: rootDirectory)
+        do {
+            try FileManager.default.removeItem(at: rootDirectory)
+        } catch CocoaError.fileNoSuchFile { return true } catch { return false }
+        return !FileManager.default.fileExists(atPath: rootDirectory.path)
     }
 }

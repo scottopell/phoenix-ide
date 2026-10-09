@@ -111,9 +111,12 @@ final class ConversationSession {
         conversationId: String,
         persistenceScope: String
     ) -> Bool {
-        DiskStore.loadVersioned(
-            Snapshot.self, name: "conv-\(conversationId)", version: snapshotSchemaVersion)?
-            .persistenceScope == persistenceScope
+        guard let snapshot = DiskStore.loadVersioned(
+            Snapshot.self, name: "conv-\(conversationId)", version: snapshotSchemaVersion)
+        else { return false }
+        return snapshot.persistenceScope == persistenceScope
+            && snapshot.syncedAt != nil
+            && snapshot.conversation != nil
     }
 
     static func hasAnyCachedSnapshot(conversationId: String) -> Bool {
@@ -212,6 +215,13 @@ final class ConversationSession {
         self.onConversationUpdate = onConversationUpdate
         self.onHardDeleted = onHardDeleted
         let scope = Self.persistenceScope(for: api, credentialGeneration: credentialGeneration)
+        if let entries = DiskStore.loadVersioned(
+            [OutboxEntry].self, name: "outbox-\(conversationId)", version: 2),
+           Self.hasAuthoritativeSnapshot(conversationId: conversationId, persistenceScope: scope)
+        {
+            _ = Outbox.migrateV2(
+                conversationId: conversationId, persistenceScope: scope, entries: entries)
+        }
         self.outbox = Outbox(conversationId: conversationId, persistenceScope: scope)
         self.snapshotWriter = DiskStore.versionedWriter(
             name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)

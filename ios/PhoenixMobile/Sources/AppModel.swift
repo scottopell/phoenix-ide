@@ -376,6 +376,14 @@ final class AppModel {
     #if DEBUG
     var historyRemovalOverrideForTesting: ((VersionedDiskWriter) async -> Void)?
     #endif
+
+    #if DEBUG
+    var beforePersistedOutboxDrainForTesting: (() -> Void)?
+    #endif
+
+    #if DEBUG
+    var cacheRemovalOverrideForTesting: (() async -> Bool)?
+    #endif
     private var aggregateReconciliationTask: Task<Bool, Never>?
     private(set) var aggregateReconciliationId: UUID?
     private var isForeground = true
@@ -2228,7 +2236,8 @@ final class AppModel {
         guard aggregateRecoveryAllowedGeneration == apiGeneration,
               let api
         else { return }
-        for name in DiskStore.names(withPrefix: "outbox-") {
+        guard case let .names(names) = DiskStore.discoverNames(withPrefix: "outbox-") else { return }
+        for name in names {
             let conversationId = String(name.dropFirst("outbox-".count))
             guard !conversationId.isEmpty, sessions[conversationId] == nil else {
                 // Open sessions already drain via their own triggers.
@@ -2272,6 +2281,14 @@ final class AppModel {
                     drainSession.setCloseAdmissionFenced(true)
                 }
             }
+            #if DEBUG
+            beforePersistedOutboxDrainForTesting?()
+            #endif
+            guard case let .fences(fences) = ProductHistoryDeletionFenceStore.discover(),
+                  !fences.contains(where: {
+                      $0.persistenceScope == currentScope && $0.transcriptIds.contains(conversationId)
+                  })
+            else { return }
             drainSession.drainOutbox()
         }
     }
@@ -2324,6 +2341,16 @@ final class AppModel {
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
+        #if DEBUG
+        let removed = if let cacheRemovalOverrideForTesting {
+            await cacheRemovalOverrideForTesting()
+        } else {
+            await DiskStore.removeAllAndWait()
+        }
+        #else
+        let removed = await DiskStore.removeAllAndWait()
+        #endif
+        guard removed else { return }
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
         for session in ownedSessions { session.stop() }
         for session in ownedSessions { await session.clearCachedSnapshotAndWait() }
@@ -2339,7 +2366,6 @@ final class AppModel {
         closeAdmissionFencedProductConversationIds.removeAll()
         closeAdmissionFencedTranscriptIds.removeAll()
         closeConfirmationReconciliationProductConversationIds.removeAll()
-        await DiskStore.removeAllAndWait()
         listStore.reset()
         deletedProductHistoryIds.removeAll()
         attention.reset()

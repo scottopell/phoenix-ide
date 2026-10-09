@@ -21,6 +21,18 @@ final class DiskStoreVersioningTests: XCTestCase {
     }
 
     @MainActor
+    func testNameDiscoveryReportsUnreadableDirectory() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-name-discovery-\(UUID().uuidString)")
+        try Data("not a directory".utf8).write(to: file)
+        DiskStore.baseDirectory = file
+
+        guard case .unreadable = DiskStore.discoverNames(withPrefix: "outbox-") else {
+            return XCTFail("file-backed persistence root must not look like an empty directory")
+        }
+    }
+
+    @MainActor
     func testSameVersionRoundTrips() {
         freshDiskStore()
         let value = [Record(name: "a", count: 1), Record(name: "b", count: 2)]

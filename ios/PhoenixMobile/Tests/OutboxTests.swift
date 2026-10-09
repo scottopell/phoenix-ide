@@ -404,6 +404,23 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
+    func testForeignScopedQueueIsPreservedAndRecoversWhenAuthorityReturns() async {
+        freshDiskStore()
+        let entry = makeEntry(conversationId: "c1")
+        persist([entry], conversationId: "c1")
+
+        let foreign = Outbox(conversationId: "c1", persistenceScope: "foreign")
+        XCTAssertTrue(foreign.entries.isEmpty)
+        let foreignPersisted = await foreign.flushPersistence()
+        XCTAssertFalse(foreignPersisted)
+
+        let restored = Outbox(conversationId: "c1", persistenceScope: "testing")
+        XCTAssertEqual(restored.visibleEntries.map(\.localId), [entry.localId])
+        let restoredPersisted = await restored.flushPersistence()
+        XCTAssertTrue(restoredPersisted)
+    }
+
+    @MainActor
     func testRecoverableEntryCanBeRetriedOrDismissed() async {
         freshDiskStore()
         let stale = makeEntry(

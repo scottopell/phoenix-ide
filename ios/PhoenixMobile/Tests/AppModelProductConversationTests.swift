@@ -860,6 +860,37 @@ final class AppModelProductConversationTests: XCTestCase {
         }
     }
 
+    func testFenceAppearingBeforeDrainPreventsPersistedOutboxAdmission() async throws {
+        let conversationId = "fenced-before-drain"
+        let baseURL = URL(string: "http://127.0.0.1:1")!
+        let api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)!
+        let credentialGeneration = UUID()
+        let scope = ConversationSession.persistenceScope(
+            for: api, credentialGeneration: credentialGeneration)
+        let writer = Outbox(conversationId: conversationId, persistenceScope: scope)
+        _ = await writer.enqueue(text: "do not drain after fence")
+        let persisted = await writer.flushPersistence()
+        XCTAssertTrue(persisted)
+        let model = self.model()
+        await model.installAPIAndAwaitRecoveryForTesting(
+            baseURL: baseURL, credentialGeneration: credentialGeneration)
+        model.beforePersistedOutboxDrainForTesting = {
+            let fence = PersistedProductHistoryDeletionFence(
+                persistenceScope: scope,
+                productConversationId: "pc-before-drain",
+                transcriptIds: [conversationId])
+            _ = DiskStore.saveVersioned(
+                fence,
+                name: ProductHistoryDeletionFenceStore.name(productConversationId: "pc-before-drain"),
+                version: ProductHistoryDeletionFenceStore.schemaVersion)
+        }
+        model.drainPersistedOutboxesForTesting()
+
+        let owner = try XCTUnwrap(model.drainSessionForTesting(conversationId: conversationId))
+        await owner.awaitOutboxDrainForTesting()
+        XCTAssertEqual(owner.outbox.entries.first?.attemptCount, 0)
+    }
+
     func testPersistedOutboxIsEnumeratedAndReloadedByItsOwner() async throws {
         let conversationId = "c1"
         let baseURL = URL(string: "http://127.0.0.1:1")!
@@ -1216,6 +1247,24 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertNil(model.pendingProductCloseConfirmation)
         XCTAssertFalse(model.isResolvingPendingProductClose)
+    }
+
+    func testClearCacheRetainsInMemoryStateWhenDirectoryRemovalFails() async {
+        let model = model()
+        model.installAPIForTesting()
+        XCTAssertNotNil(model.installDrainSessionForTesting(conversationId: "retain"))
+        let pending = PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: "latest",
+            close: closeSnapshot(phase: .awaiting_stop_work_confirmation))
+        model.installPendingProductCloseConfirmationForTesting(pending, resolving: true)
+        model.cacheRemovalOverrideForTesting = { false }
+
+        await model.clearCache()
+
+        XCTAssertNotNil(model.drainSessionForTesting(conversationId: "retain"))
+        XCTAssertNotNil(model.pendingProductCloseConfirmation)
+        XCTAssertTrue(model.isResolvingPendingProductClose)
     }
 
     func testRepairNotNowKeepsAggregateMessageAdmissionFenced() async throws {
