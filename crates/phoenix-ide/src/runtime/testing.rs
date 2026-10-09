@@ -2868,7 +2868,9 @@ mod tests {
     async fn quiet_reasoning_end_turn_settles_and_allows_next_same_model_turn() {
         let llm = MockLlmClient::new("gpt-6-astra");
         llm.queue_response(LlmResponse {
-            provider_replay: Some(ProviderReplayUpdate::Clear),
+            provider_replay: Some(
+                phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+            ),
             content: vec![],
             end_turn: true,
             usage: Usage {
@@ -2895,7 +2897,10 @@ mod tests {
         let first_turn_messages = runtime.messages();
         assert_eq!(first_turn_messages.len(), 1);
         assert_eq!(first_turn_messages[0].message_type, MessageType::User);
-        assert!(matches!(runtime.state(), ConvState::Idle));
+        assert!(matches!(
+            runtime.storage.get_current_state("test-conv"),
+            Some(ConvState::Idle)
+        ));
         assert_eq!(runtime.llm.recorded_requests().len(), 1);
         tokio::time::timeout(Duration::from_secs(1), async {
             while runtime.turn_usages().is_empty() {
@@ -2910,7 +2915,7 @@ mod tests {
         assert_eq!(first_usage[0].1.reasoning_tokens, Some(18));
         assert_eq!(
             runtime.provider_replay_updates(),
-            vec![ProviderReplayUpdate::Clear]
+            vec![phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear]
         );
 
         runtime.send_message("continue on the same model").await;
