@@ -624,25 +624,36 @@ CREATE TABLE close_runs (
     retry_observed_at_us INTEGER CHECK (retry_observed_at_us IS NULL OR (typeof(retry_observed_at_us) = 'integer' AND retry_observed_at_us >= 0)),
     precondition_resolution TEXT,
     safety_evidence TEXT,
+    retry_evidence_kind TEXT CHECK (retry_evidence_kind IN ('resource_plan', 'verified_completion')),
     PRIMARY KEY (attempt_id, run_ordinal),
     CHECK ((status = 'running') = (ended_at_us IS NULL)),
     CHECK ((run_ordinal = 1 AND retry_requested_by IS NULL AND retry_observed_at_us IS NULL
-            AND precondition_resolution IS NULL AND safety_evidence IS NULL)
+            AND precondition_resolution IS NULL AND safety_evidence IS NULL AND retry_evidence_kind IS NULL)
         OR (run_ordinal > 1 AND retry_requested_by IS NOT NULL AND retry_observed_at_us IS NOT NULL
+            AND retry_evidence_kind IS NOT NULL AND retry_evidence_kind IN ('resource_plan', 'verified_completion')
             AND precondition_resolution IS NOT NULL AND trim(precondition_resolution) <> ''
             AND safety_evidence IS NOT NULL AND trim(safety_evidence) <> ''))
 );
 CREATE UNIQUE INDEX close_runs_one_running ON close_runs(attempt_id) WHERE status = 'running';
 INSERT INTO close_runs (attempt_id, run_ordinal, status, created_at_us, ended_at_us)
 SELECT attempt_id, 1, CASE WHEN phase = 'completed' THEN 'completed' ELSE 'running' END,
-       CAST(strftime('%s', created_at) AS INTEGER) * 1000000,
-       CASE WHEN phase = 'completed' THEN CAST(strftime('%s', completed_at) AS INTEGER) * 1000000 END
+       CAST(strftime('%s', created_at) AS INTEGER) * 1000000
+         + CASE WHEN instr(created_at, '.') = 0 THEN 0
+             ELSE CAST(ROUND(('0.' || substr(created_at, instr(created_at, '.') + 1)) * 1000000.0) AS INTEGER) END,
+       CASE WHEN phase = 'completed' THEN
+         CAST(strftime('%s', completed_at) AS INTEGER) * 1000000
+           + CASE WHEN instr(completed_at, '.') = 0 THEN 0
+               ELSE CAST(ROUND(('0.' || substr(completed_at, instr(completed_at, '.') + 1)) * 1000000.0) AS INTEGER) END
+       END
 FROM close_obligations;
 CREATE TRIGGER close_obligations_create_initial_run
 AFTER INSERT ON close_obligations
 BEGIN
     INSERT INTO close_runs (attempt_id, run_ordinal, status, created_at_us)
-    VALUES (NEW.attempt_id, 1, 'running', CAST(strftime('%s', NEW.created_at) AS INTEGER) * 1000000);
+    VALUES (NEW.attempt_id, 1, 'running',
+        CAST(strftime('%s', NEW.created_at) AS INTEGER) * 1000000
+          + CASE WHEN instr(NEW.created_at, '.') = 0 THEN 0
+              ELSE CAST(ROUND(('0.' || substr(NEW.created_at, instr(NEW.created_at, '.') + 1)) * 1000000.0) AS INTEGER) END);
 END;
 CREATE TRIGGER close_runs_require_next_ordinal
 BEFORE INSERT ON close_runs
@@ -657,9 +668,31 @@ WHEN NEW.status <> 'running'
         AND NEW.retry_observed_at_us <= NEW.created_at_us
         AND obligation.phase = 'completed'
         AND obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
-        AND EXISTS (SELECT 1 FROM close_run_retry_effects effect
+        AND ((NEW.retry_evidence_kind = 'resource_plan'
+          AND EXISTS (SELECT 1 FROM close_run_retry_effects effect
             WHERE effect.attempt_id = NEW.attempt_id AND effect.run_ordinal = NEW.run_ordinal)
-  ))
+          AND (SELECT COUNT(*) FROM close_run_retry_effects effect
+            WHERE effect.attempt_id = NEW.attempt_id AND effect.run_ordinal = NEW.run_ordinal)
+            = (SELECT COUNT(*) FROM close_cleanup_failure_resources resource
+               WHERE resource.failure_occurrence_id = failure.failure_occurrence_id))
+          OR (NEW.retry_evidence_kind = 'verified_completion' AND prior.run_ordinal > 1
+            AND prior.retry_evidence_kind IN ('resource_plan', 'verified_completion')
+            AND failure.authority_kind = 'attempt_interrupted'
+            AND NOT EXISTS (SELECT 1 FROM close_cleanup_failure_resources child
+              WHERE child.failure_occurrence_id = failure.failure_occurrence_id)
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
+              WHERE effect.attempt_id = NEW.attempt_id AND effect.run_ordinal = NEW.run_ordinal)
+            AND ((prior.retry_evidence_kind = 'resource_plan'
+              AND EXISTS (SELECT 1 FROM close_run_retry_effects effect
+                WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal)
+              AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
+                WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal
+                  AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                    WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal)))
+            OR (prior.retry_evidence_kind = 'verified_completion'
+              AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
+                WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal))))
+  )))
 BEGIN
     SELECT RAISE(ABORT, 'Close run requires initial or fresh next stopped-run authority');
 END;
@@ -668,6 +701,7 @@ BEFORE UPDATE ON close_runs
 WHEN OLD.status <> 'running' OR NEW.attempt_id <> OLD.attempt_id OR NEW.run_ordinal <> OLD.run_ordinal
   OR NEW.created_at_us <> OLD.created_at_us OR NEW.retry_requested_by IS NOT OLD.retry_requested_by
   OR NEW.retry_observed_at_us IS NOT OLD.retry_observed_at_us
+  OR NEW.retry_evidence_kind IS NOT OLD.retry_evidence_kind
   OR NEW.precondition_resolution IS NOT OLD.precondition_resolution OR NEW.safety_evidence IS NOT OLD.safety_evidence
   OR NEW.status = 'running'
   OR (NEW.status = 'stopped' AND NOT EXISTS (SELECT 1 FROM close_cleanup_failures failure
@@ -679,6 +713,52 @@ WHEN OLD.status <> 'running' OR NEW.attempt_id <> OLD.attempt_id OR NEW.run_ordi
 BEGIN
     SELECT RAISE(ABORT, 'Close run identity and terminal disposition are immutable');
 END;
+DROP TRIGGER close_obligations_completed_outcome_is_immutable;
+CREATE TRIGGER close_obligations_completed_outcome_is_immutable
+BEFORE UPDATE OF phase, close_outcome, completed_at, updated_at ON close_obligations
+WHEN OLD.phase = 'completed'
+  AND (NEW.phase IS NOT OLD.phase OR NEW.close_outcome IS NOT OLD.close_outcome
+    OR NEW.completed_at IS NOT OLD.completed_at OR NEW.updated_at IS NOT OLD.updated_at)
+  AND NOT (OLD.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+    AND NEW.phase = 'completed' AND NEW.close_outcome = 'archived'
+    AND NEW.attempt_id = OLD.attempt_id AND NEW.product_conversation_id = OLD.product_conversation_id
+    AND NEW.inspection_generation IS OLD.inspection_generation
+    AND NEW.inspection_fingerprint IS OLD.inspection_fingerprint
+    AND NEW.completed_at IS OLD.completed_at
+    AND EXISTS (SELECT 1 FROM close_runs run WHERE run.attempt_id = NEW.attempt_id
+      AND run.run_ordinal > 1 AND run.status = 'running'
+      AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = NEW.attempt_id)
+      AND ((run.retry_evidence_kind = 'resource_plan'
+        AND EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal))
+        OR (run.retry_evidence_kind = 'verified_completion'
+          AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal)
+          AND EXISTS (SELECT 1 FROM close_runs prior JOIN close_cleanup_failures failure
+            ON failure.attempt_id = prior.attempt_id AND failure.cleanup_run_ordinal = prior.run_ordinal
+            WHERE prior.attempt_id = run.attempt_id AND prior.run_ordinal = run.run_ordinal - 1
+              AND prior.status = 'stopped' AND prior.retry_evidence_kind IN ('resource_plan', 'verified_completion')
+              AND failure.authority_kind = 'attempt_interrupted'
+              AND NOT EXISTS (SELECT 1 FROM close_cleanup_failure_resources child WHERE child.failure_occurrence_id = failure.failure_occurrence_id)
+              AND ((prior.retry_evidence_kind = 'resource_plan'
+                AND EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal)
+                AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal
+                  AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal)))
+              OR (prior.retry_evidence_kind = 'verified_completion'
+                AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal))))))
+      AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id
+        AND effect.run_ordinal = run.run_ordinal AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+          WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal))
+      AND EXISTS (SELECT 1 FROM messages message JOIN close_attempt_members member
+        ON member.conversation_id = message.conversation_id
+        WHERE member.attempt_id = NEW.attempt_id AND member.member_role IN ('latest', 'root_latest')
+          AND message.message_id = 'close-run-outcome:' || run.run_ordinal || ':' || NEW.attempt_id AND message.message_type = 'system'))
+    AND EXISTS (SELECT 1 FROM product_conversations product WHERE product.id = NEW.product_conversation_id
+      AND product.kind = 'ordinary' AND product.ordinary_lifecycle = 'history')
+    AND NOT EXISTS (SELECT 1 FROM close_attempt_participants participant JOIN conversations conversation
+      ON conversation.id = participant.conversation_id
+      WHERE participant.attempt_id = NEW.attempt_id AND conversation.archived <> 1))
+BEGIN
+    SELECT RAISE(ABORT, 'completed Close outcome is immutable without exact successful retry');
+END;
 CREATE TRIGGER close_runs_reject_standalone_delete
 BEFORE DELETE ON close_runs
 WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
@@ -686,10 +766,16 @@ BEGIN
     SELECT RAISE(ABORT, 'Close run must be retained with its authority');
 END;
 CREATE TRIGGER close_obligations_complete_running_run
-AFTER UPDATE OF phase ON close_obligations
+AFTER UPDATE OF phase, close_outcome ON close_obligations
 WHEN NEW.phase = 'completed' AND NEW.close_outcome IN ('archived', 'cancelled')
 BEGIN
-    UPDATE close_runs SET status = 'completed', ended_at_us = CAST(strftime('%s', NEW.completed_at) AS INTEGER) * 1000000
+    UPDATE close_runs SET status = 'completed', ended_at_us =
+        CAST(strftime('%s', CASE WHEN run_ordinal > 1 THEN NEW.updated_at ELSE NEW.completed_at END) AS INTEGER) * 1000000
+          + CASE WHEN instr(CASE WHEN run_ordinal > 1 THEN NEW.updated_at ELSE NEW.completed_at END, '.') = 0 THEN 0
+              ELSE CAST(ROUND(('0.' || substr(
+                  CASE WHEN run_ordinal > 1 THEN NEW.updated_at ELSE NEW.completed_at END,
+                  instr(CASE WHEN run_ordinal > 1 THEN NEW.updated_at ELSE NEW.completed_at END, '.') + 1
+              )) * 1000000.0) AS INTEGER) END
     WHERE attempt_id = NEW.attempt_id AND status = 'running';
 END;
 CREATE TABLE close_run_retry_effects (
@@ -710,11 +796,17 @@ BEFORE INSERT ON close_run_retry_effects
 WHEN EXISTS (SELECT 1 FROM close_runs WHERE attempt_id = NEW.attempt_id AND run_ordinal = NEW.run_ordinal)
   OR NOT EXISTS (
       SELECT 1 FROM close_runs prior JOIN close_obligations obligation ON obligation.attempt_id = prior.attempt_id
+      JOIN close_cleanup_failures failure ON failure.attempt_id = prior.attempt_id AND failure.cleanup_run_ordinal = prior.run_ordinal
+      JOIN close_cleanup_failure_resources remaining ON remaining.failure_occurrence_id = failure.failure_occurrence_id
+        AND remaining.ordinal = NEW.ordinal AND remaining.scope = NEW.scope
+        AND remaining.resource_kind = NEW.resource_kind AND remaining.identity_kind = NEW.identity_kind
+        AND remaining.identity_codec = NEW.identity_codec AND remaining.identity_value = NEW.identity_value
       JOIN close_expected_retirement_resources expected ON expected.attempt_id = prior.attempt_id
       JOIN close_retirement_inventories inventory ON inventory.attempt_id = expected.attempt_id
         AND inventory.scope = expected.scope AND inventory.inspection_generation = expected.inspection_generation
         AND inventory.inspection_fingerprint = expected.inspection_fingerprint AND inventory.sealed = 1
       WHERE prior.attempt_id = NEW.attempt_id AND prior.run_ordinal = NEW.run_ordinal - 1 AND prior.status = 'stopped'
+        AND NEW.resource_kind NOT IN ('bash_process_group', 'pty_session', 'browser_session', 'equivalent_live_resource')
         AND expected.scope = NEW.scope AND expected.resource_kind = NEW.resource_kind
         AND expected.identity_kind = NEW.identity_kind AND expected.identity_codec = NEW.identity_codec
         AND expected.identity_value = NEW.identity_value
@@ -730,6 +822,35 @@ WHEN EXISTS (SELECT 1 FROM close_runs WHERE attempt_id = NEW.attempt_id AND run_
 BEGIN
     SELECT RAISE(ABORT, 'safe retry effects require exact remaining original authority before run admission');
 END;
+CREATE TABLE close_run_retry_successes (
+    attempt_id TEXT NOT NULL,
+    run_ordinal INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    detail TEXT NOT NULL CHECK (trim(detail) <> ''),
+    observed_at_us INTEGER NOT NULL CHECK (typeof(observed_at_us) = 'integer' AND observed_at_us >= 0),
+    PRIMARY KEY (attempt_id, run_ordinal, ordinal),
+    FOREIGN KEY (attempt_id, run_ordinal, ordinal) REFERENCES close_run_retry_effects(attempt_id, run_ordinal, ordinal) ON DELETE CASCADE
+);
+CREATE TRIGGER close_run_retry_successes_require_running_plan
+BEFORE INSERT ON close_run_retry_successes
+WHEN NOT EXISTS (SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+    ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+    WHERE run.attempt_id = NEW.attempt_id AND run.run_ordinal = NEW.run_ordinal
+      AND effect.ordinal = NEW.ordinal AND run.status = 'running' AND run.retry_evidence_kind = 'resource_plan')
+BEGIN
+    SELECT RAISE(ABORT, 'retry success requires exact running planned resource');
+END;
+CREATE TRIGGER close_run_retry_successes_immutable
+BEFORE UPDATE ON close_run_retry_successes
+BEGIN
+    SELECT RAISE(ABORT, 'retry success evidence is immutable');
+END;
+CREATE TRIGGER close_run_retry_successes_reject_standalone_delete
+BEFORE DELETE ON close_run_retry_successes
+WHEN EXISTS (SELECT 1 FROM close_runs WHERE attempt_id = OLD.attempt_id AND run_ordinal = OLD.run_ordinal)
+BEGIN
+    SELECT RAISE(ABORT, 'retry success evidence must be retained');
+END;
 CREATE TRIGGER close_run_retry_effects_immutable
 BEFORE UPDATE ON close_run_retry_effects
 BEGIN
@@ -744,31 +865,70 @@ END;
 DROP INDEX close_obligations_one_active_per_product;
 CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id)
 WHERE phase <> 'completed' OR close_outcome = 'close_incomplete';
+CREATE TABLE close_process_step_successes (
+    attempt_id TEXT NOT NULL,
+    run_ordinal INTEGER NOT NULL,
+    scope TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('bash_process_group', 'pty_session', 'browser_session')),
+    identity_value TEXT NOT NULL CHECK (trim(identity_value) <> ''),
+    outcome TEXT NOT NULL CHECK (outcome IN ('retired', 'absence_verified')),
+    observed_at_us INTEGER NOT NULL CHECK (typeof(observed_at_us) = 'integer' AND observed_at_us >= 0),
+    PRIMARY KEY (attempt_id, run_ordinal, scope, resource_kind, identity_value),
+    FOREIGN KEY (attempt_id, run_ordinal) REFERENCES close_runs(attempt_id, run_ordinal) ON DELETE CASCADE,
+    FOREIGN KEY (attempt_id, scope) REFERENCES close_attempt_scopes(attempt_id, scope)
+);
+CREATE TRIGGER close_process_step_successes_require_running_run
+BEFORE INSERT ON close_process_step_successes
+WHEN NOT EXISTS (SELECT 1 FROM close_runs run WHERE run.attempt_id = NEW.attempt_id
+    AND run.run_ordinal = NEW.run_ordinal AND run.status = 'running')
+BEGIN
+    SELECT RAISE(ABORT, 'process success requires exact running Close run');
+END;
+CREATE TRIGGER close_process_step_successes_immutable
+BEFORE UPDATE ON close_process_step_successes
+BEGIN
+    SELECT RAISE(ABORT, 'process success is immutable');
+END;
+CREATE TRIGGER close_process_step_successes_reject_standalone_delete
+BEFORE DELETE ON close_process_step_successes
+WHEN EXISTS (SELECT 1 FROM close_runs WHERE attempt_id = OLD.attempt_id AND run_ordinal = OLD.run_ordinal)
+BEGIN
+    SELECT RAISE(ABORT, 'process success must be retained with its Close run');
+END;
 CREATE TABLE close_cleanup_failures (
     failure_occurrence_id TEXT PRIMARY KEY NOT NULL CHECK (trim(failure_occurrence_id) <> ''),
     attempt_id TEXT NOT NULL REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
     cleanup_run_ordinal INTEGER NOT NULL CHECK (typeof(cleanup_run_ordinal) = 'integer' AND cleanup_run_ordinal > 0),
     source_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id),
-    scope TEXT NOT NULL REFERENCES work_scopes(id),
+    scope TEXT REFERENCES work_scopes(id),
     inspection_generation TEXT,
     inspection_fingerprint TEXT,
-    resource_kind TEXT NOT NULL,
-    identity_kind TEXT NOT NULL,
-    identity_codec TEXT NOT NULL,
-    identity_value TEXT NOT NULL,
+    resource_kind TEXT,
+    identity_kind TEXT,
+    identity_codec TEXT,
+    identity_value TEXT,
     reason TEXT NOT NULL CHECK (reason IN ('removal_failed', 'still_shared_by_live_owner', 'residual_process_alive', 'identity_not_proven', 'interrupted', 'manual_repair_required')),
     detail TEXT NOT NULL,
     stop_certainty TEXT NOT NULL CHECK (stop_certainty IN ('conversation_and_processes_stopped', 'shutdown_uncertain')),
     confirmed_at_us INTEGER,
     occurred_at_us INTEGER NOT NULL CHECK (typeof(occurred_at_us) = 'integer' AND occurred_at_us >= 0),
-    authority_kind TEXT NOT NULL CHECK (authority_kind IN ('expected_resource', 'captured_scope', 'observed_process_resource')),
+    authority_kind TEXT NOT NULL CHECK (authority_kind IN ('expected_resource', 'captured_scope', 'observed_process_resource', 'attempt_interrupted')),
+    CHECK ((authority_kind = 'attempt_interrupted'
+        AND scope IS NULL AND resource_kind IS NULL AND identity_kind IS NULL
+        AND identity_codec IS NULL AND identity_value IS NULL
+        AND inspection_generation IS NULL AND inspection_fingerprint IS NULL
+        AND reason = 'interrupted')
+      OR (authority_kind <> 'attempt_interrupted'
+        AND scope IS NOT NULL AND resource_kind IS NOT NULL AND identity_kind IS NOT NULL
+        AND identity_codec IS NOT NULL AND identity_value IS NOT NULL)),
     UNIQUE (attempt_id, cleanup_run_ordinal),
     FOREIGN KEY (attempt_id, cleanup_run_ordinal) REFERENCES close_runs(attempt_id, run_ordinal),
     CHECK (failure_occurrence_id = 'close-failure:' || cleanup_run_ordinal || ':' || attempt_id),
     CHECK ((stop_certainty = 'conversation_and_processes_stopped' AND confirmed_at_us IS NOT NULL AND typeof(confirmed_at_us) = 'integer' AND confirmed_at_us >= 0)
         OR (stop_certainty = 'shutdown_uncertain' AND confirmed_at_us IS NULL)),
     CHECK (
-        (authority_kind = 'expected_resource' AND inspection_generation IS NOT NULL AND inspection_fingerprint IS NOT NULL)
+        authority_kind = 'attempt_interrupted'
+        OR (authority_kind = 'expected_resource' AND inspection_generation IS NOT NULL AND inspection_fingerprint IS NOT NULL)
         OR (authority_kind = 'captured_scope' AND inspection_generation IS NULL AND inspection_fingerprint IS NULL
             AND stop_certainty = 'shutdown_uncertain'
             AND ((resource_kind = 'work_scope' AND identity_kind = 'opaque' AND identity_codec = 'opaque_string_v1' AND identity_value = scope)
@@ -784,9 +944,11 @@ BEFORE INSERT ON close_cleanup_failures
 WHEN NOT EXISTS (
     SELECT 1 FROM close_obligations obligation
     JOIN product_conversations product ON product.id = obligation.product_conversation_id
-    JOIN close_attempt_scopes captured ON captured.attempt_id = obligation.attempt_id
+    LEFT JOIN close_attempt_scopes captured ON captured.attempt_id = obligation.attempt_id AND captured.scope = NEW.scope
     WHERE obligation.attempt_id = NEW.attempt_id AND obligation.phase <> 'completed'
-      AND NEW.cleanup_run_ordinal = 1 AND captured.scope = NEW.scope
+      AND NEW.cleanup_run_ordinal = 1
+      AND (captured.scope IS NOT NULL OR (NEW.authority_kind = 'attempt_interrupted'
+          AND NOT EXISTS (SELECT 1 FROM close_attempt_scopes WHERE attempt_id = NEW.attempt_id)))
       AND EXISTS (SELECT 1 FROM close_runs run WHERE run.attempt_id = NEW.attempt_id
           AND run.run_ordinal = NEW.cleanup_run_ordinal AND run.status = 'running')
       AND obligation.product_conversation_id = NEW.source_product_conversation_id
@@ -824,7 +986,7 @@ WHEN NOT EXISTS (
                 AND NEW.identity_value = captured.captured_worktree_identity
                 AND captured.captured_worktree_fingerprint IS NOT NULL
                 AND captured.captured_worktree_locator IS NOT NULL)))
-        OR (NEW.authority_kind = 'observed_process_resource')
+        OR (NEW.authority_kind IN ('observed_process_resource', 'attempt_interrupted'))
       )
       AND (NEW.stop_certainty = 'shutdown_uncertain' OR NOT EXISTS (
           SELECT 1 FROM close_expected_retirement_resources expected
@@ -859,6 +1021,9 @@ WHEN NOT EXISTS (
       AND effect.scope = NEW.scope AND effect.resource_kind = NEW.resource_kind
       AND effect.identity_kind = NEW.identity_kind AND effect.identity_codec = NEW.identity_codec
       AND effect.identity_value = NEW.identity_value
+      AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+          WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+            AND success.ordinal = effect.ordinal)
       AND NEW.inspection_generation = obligation.inspection_generation
       AND NEW.inspection_fingerprint = obligation.inspection_fingerprint
       AND (NEW.stop_certainty = 'shutdown_uncertain' OR NOT EXISTS (
@@ -872,10 +1037,46 @@ WHEN NOT EXISTS (
           WHERE expected.attempt_id = NEW.attempt_id
             AND expected.resource_kind IN ('bash_process_group', 'tmux_server', 'pty_session', 'browser_session', 'equivalent_live_resource')
             AND (retired.proof_kind IS NULL OR retired.proof_kind = 'residual')
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects prior
+                JOIN close_run_retry_successes success ON success.attempt_id = prior.attempt_id
+                  AND success.run_ordinal = prior.run_ordinal AND success.ordinal = prior.ordinal
+                WHERE prior.attempt_id = NEW.attempt_id
+                  AND prior.scope = expected.scope AND prior.resource_kind = expected.resource_kind
+                  AND prior.identity_kind = expected.identity_kind AND prior.identity_codec = expected.identity_codec
+                  AND prior.identity_value = expected.identity_value)
       ))
+) AND NOT EXISTS (
+    SELECT 1 FROM close_runs run
+    JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+    WHERE run.attempt_id = NEW.attempt_id AND run.run_ordinal = NEW.cleanup_run_ordinal
+      AND run.run_ordinal > 1 AND run.status = 'running'
+      AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+      AND obligation.product_conversation_id = NEW.source_product_conversation_id
+      AND obligation.phase = 'completed' AND obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+      AND NEW.authority_kind = 'attempt_interrupted'
+      AND ((run.retry_evidence_kind = 'resource_plan'
+        AND EXISTS (SELECT 1 FROM close_run_retry_effects effect
+          WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal)
+        AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
+          WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+              WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                AND success.ordinal = effect.ordinal)))
+      OR (run.retry_evidence_kind = 'verified_completion'
+        AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
+          WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal)))
 )
 BEGIN
     SELECT RAISE(ABORT, 'cleanup failure requires exact active expected-resource, captured-scope, or observed-process authority');
+END;
+CREATE TRIGGER close_cleanup_failures_reject_successful_process
+BEFORE INSERT ON close_cleanup_failures
+WHEN EXISTS (SELECT 1 FROM close_process_step_successes success
+    WHERE success.attempt_id = NEW.attempt_id AND success.run_ordinal = NEW.cleanup_run_ordinal
+      AND success.scope = NEW.scope AND success.resource_kind = NEW.resource_kind
+      AND success.identity_value = NEW.identity_value)
+BEGIN
+    SELECT RAISE(ABORT, 'successful process cannot be a Close failure');
 END;
 CREATE TRIGGER close_cleanup_failures_stop_run
 AFTER INSERT ON close_cleanup_failures
@@ -911,6 +1112,24 @@ CREATE TABLE close_cleanup_failure_resources (
 );
 CREATE UNIQUE INDEX close_cleanup_failure_one_failed_resource
 ON close_cleanup_failure_resources(failure_occurrence_id) WHERE disposition = 'failed';
+DROP TRIGGER close_obligations_require_topology_seal_before_phase_transition;
+CREATE TRIGGER close_obligations_require_topology_seal_before_phase_transition
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase <> NEW.phase
+  AND OLD.topology_sealed <> 1
+  AND NOT (
+    NEW.phase = 'completed'
+    AND EXISTS (
+      SELECT 1 FROM close_cleanup_failures failure
+      WHERE failure.attempt_id = NEW.attempt_id
+        AND failure.authority_kind = 'attempt_interrupted'
+    )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation phase transition requires sealed topology');
+END;
+
 CREATE TRIGGER close_cleanup_failure_resources_require_authority
 BEFORE INSERT ON close_cleanup_failure_resources
 WHEN NOT EXISTS (
@@ -918,7 +1137,28 @@ WHEN NOT EXISTS (
     JOIN close_attempt_scopes captured ON captured.attempt_id = failure.attempt_id AND captured.scope = NEW.scope
     WHERE failure.failure_occurrence_id = NEW.failure_occurrence_id
       AND NOT EXISTS (SELECT 1 FROM coordinator_watch_events WHERE event_id = NEW.failure_occurrence_id)
+      AND failure.authority_kind <> 'attempt_interrupted'
+      AND NOT EXISTS (SELECT 1 FROM close_process_step_successes success
+          WHERE success.attempt_id = failure.attempt_id AND success.run_ordinal = failure.cleanup_run_ordinal
+            AND success.scope = NEW.scope AND success.resource_kind = NEW.resource_kind
+            AND success.identity_value = NEW.identity_value)
       AND NEW.ordinal = (SELECT COUNT(*) FROM close_cleanup_failure_resources WHERE failure_occurrence_id = NEW.failure_occurrence_id)
+      AND (failure.cleanup_run_ordinal = 1 OR EXISTS (
+          SELECT 1 FROM close_run_retry_effects effect
+          WHERE effect.attempt_id = failure.attempt_id AND effect.run_ordinal = failure.cleanup_run_ordinal
+            AND effect.scope = NEW.scope AND effect.resource_kind = NEW.resource_kind
+            AND effect.identity_kind = NEW.identity_kind AND effect.identity_codec = NEW.identity_codec
+            AND effect.identity_value = NEW.identity_value
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                  AND success.ordinal = effect.ordinal)
+            AND NEW.ordinal = (SELECT COUNT(*) FROM close_run_retry_effects earlier
+                WHERE earlier.attempt_id = effect.attempt_id AND earlier.run_ordinal = effect.run_ordinal
+                  AND earlier.ordinal < effect.ordinal
+                  AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                      WHERE success.attempt_id = earlier.attempt_id AND success.run_ordinal = earlier.run_ordinal
+                        AND success.ordinal = earlier.ordinal))
+      ))
       AND (
         (failure.authority_kind = 'captured_scope'
           AND NEW.scope = failure.scope AND NEW.resource_kind = failure.resource_kind
@@ -998,6 +1238,18 @@ AND (OLD.phase = 'completed' OR NOT EXISTS (
           WHERE participant.attempt_id = NEW.attempt_id
             AND conversation.archived <> (NEW.close_outcome = 'archived_cleanup_attention')
       )
+      AND ((failure.authority_kind = 'attempt_interrupted'
+            AND NOT EXISTS (SELECT 1 FROM close_cleanup_failure_resources child
+                WHERE child.failure_occurrence_id = failure.failure_occurrence_id))
+        OR (failure.authority_kind <> 'attempt_interrupted'
+            AND EXISTS (SELECT 1 FROM close_cleanup_failure_resources child
+                WHERE child.failure_occurrence_id = failure.failure_occurrence_id
+                  AND child.scope = failure.scope
+                  AND child.resource_kind = failure.resource_kind
+                  AND child.identity_kind = failure.identity_kind
+                  AND child.identity_codec = failure.identity_codec
+                  AND child.identity_value = failure.identity_value
+                  AND child.disposition IN ('failed', 'residual', 'unknown'))))
       AND EXISTS (SELECT 1 FROM messages message
           JOIN close_attempt_members member ON member.conversation_id = message.conversation_id
           WHERE member.attempt_id = NEW.attempt_id AND member.member_role IN ('latest', 'root_latest')
@@ -1005,6 +1257,108 @@ AND (OLD.phase = 'completed' OR NOT EXISTS (
 ))
 BEGIN
     SELECT RAISE(ABORT, 'cleanup failure completion requires exact terminal disposition');
+END;
+DROP TRIGGER close_retirement_resource_dispatches_require_authority;
+CREATE TRIGGER close_retirement_resource_dispatches_require_authority
+BEFORE INSERT ON close_retirement_resource_dispatches
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN close_retirement_inventories inventory ON inventory.attempt_id = obligation.attempt_id
+      AND inventory.scope = NEW.scope AND inventory.inspection_generation = NEW.inspection_generation
+      AND inventory.inspection_fingerprint = NEW.inspection_fingerprint AND inventory.sealed = 1
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.inspection_generation = NEW.inspection_generation
+      AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
+      AND (obligation.phase IN ('retirement_requested', 'needs_repair') OR (
+          obligation.phase = 'completed'
+          AND obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+          AND NEW.resource_kind = 'worktree'
+          AND EXISTS (SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+              ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+              WHERE run.attempt_id = NEW.attempt_id AND run.status = 'running'
+                AND run.retry_evidence_kind = 'resource_plan'
+                AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                AND effect.scope = NEW.scope AND effect.resource_kind = NEW.resource_kind
+                AND effect.identity_kind = NEW.identity_kind AND effect.identity_codec = NEW.identity_codec
+                AND effect.identity_value = NEW.identity_value
+                AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                    WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                      AND success.ordinal = effect.ordinal))
+      ))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close retirement dispatch lacks exact active or retry authority');
+END;
+CREATE TRIGGER close_retry_failure_child_requires_pending_effect
+BEFORE INSERT ON close_cleanup_failure_resources
+WHEN EXISTS (SELECT 1 FROM close_cleanup_failures failure
+    WHERE failure.failure_occurrence_id = NEW.failure_occurrence_id AND failure.cleanup_run_ordinal > 1)
+ AND NOT EXISTS (SELECT 1 FROM close_cleanup_failures failure
+    JOIN close_run_retry_effects effect ON effect.attempt_id = failure.attempt_id
+      AND effect.run_ordinal = failure.cleanup_run_ordinal
+    WHERE failure.failure_occurrence_id = NEW.failure_occurrence_id
+      AND effect.scope = NEW.scope AND effect.resource_kind = NEW.resource_kind
+      AND effect.identity_kind = NEW.identity_kind AND effect.identity_codec = NEW.identity_codec
+      AND effect.identity_value = NEW.identity_value
+      AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+          WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+            AND success.ordinal = effect.ordinal)
+      AND NEW.ordinal = (SELECT COUNT(*) FROM close_run_retry_effects earlier
+          WHERE earlier.attempt_id = effect.attempt_id AND earlier.run_ordinal = effect.run_ordinal
+            AND earlier.ordinal < effect.ordinal
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                WHERE success.attempt_id = earlier.attempt_id AND success.run_ordinal = earlier.run_ordinal
+                  AND success.ordinal = earlier.ordinal)))
+BEGIN
+    SELECT RAISE(ABORT, 'retry failure child must be pending exact-run effect in order');
+END;
+CREATE TRIGGER close_worktree_cleanup_plan_require_retry_authority
+BEFORE INSERT ON close_worktree_cleanup_plans
+WHEN EXISTS (SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id AND obligation.phase = 'completed')
+ AND NOT EXISTS (SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+    ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+    JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+    WHERE run.attempt_id = NEW.attempt_id AND run.status = 'running'
+      AND run.retry_evidence_kind = 'resource_plan'
+      AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+      AND obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+      AND obligation.inspection_generation = NEW.inspection_generation
+      AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
+      AND effect.scope = NEW.scope AND effect.resource_kind = 'worktree'
+      AND effect.identity_kind = NEW.identity_kind AND effect.identity_codec = NEW.identity_codec
+      AND effect.identity_value = NEW.identity_value
+      AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+          WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+            AND success.ordinal = effect.ordinal))
+BEGIN
+    SELECT RAISE(ABORT, 'worktree cleanup plan requires pending exact retry authority');
+END;
+CREATE TRIGGER close_worktree_tombstone_require_retry_authority
+BEFORE UPDATE OF final_tombstone_root_codec, final_tombstone_root_value,
+    final_tombstone_root_device, final_tombstone_root_inode,
+    final_tombstone_object_device, final_tombstone_object_inode
+ON close_worktree_cleanup_plans
+WHEN EXISTS (SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id AND obligation.phase = 'completed')
+ AND NOT EXISTS (SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+    ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+    JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+    WHERE run.attempt_id = NEW.attempt_id AND run.status = 'running'
+      AND run.retry_evidence_kind = 'resource_plan'
+      AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+      AND obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+      AND obligation.inspection_generation = NEW.inspection_generation
+      AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
+      AND effect.scope = NEW.scope AND effect.resource_kind = 'worktree'
+      AND effect.identity_kind = NEW.identity_kind AND effect.identity_codec = NEW.identity_codec
+      AND effect.identity_value = NEW.identity_value
+      AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+          WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+            AND success.ordinal = effect.ordinal))
+BEGIN
+    SELECT RAISE(ABORT, 'worktree tombstone requires pending exact retry authority');
 END;
 ";
 
@@ -11654,6 +12008,19 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn migration_119_retains_retry_pending_plan_outbox_trigger_after_table_rebuild() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'close_retry_failure_event_requires_complete_pending_plan'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;

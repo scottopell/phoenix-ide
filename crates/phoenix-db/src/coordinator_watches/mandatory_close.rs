@@ -63,17 +63,25 @@ pub(super) async fn remaining_resources(
     .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MandatoryCloseFailureSubject {
+    Attempt,
+    Resource {
+        scope: String,
+        resource_kind: String,
+        identity_kind: String,
+        identity_codec: String,
+        identity_value: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum WatchEventRoute {
     Subscription,
     MandatoryCloseFailure {
         run_ordinal: CloseRunOrdinal,
         remaining_resources: Vec<CloseFailureRemainingResource>,
-        scope: String,
-        resource_kind: String,
-        identity_kind: String,
-        identity_codec: String,
-        identity_value: String,
+        subject: MandatoryCloseFailureSubject,
         detail: String,
         stop: CloseFailureStop,
     },
@@ -107,15 +115,23 @@ pub(super) fn decode_route(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchEvent
                     ))
                 }
             };
+            let authority_kind: String = row.try_get("authority_kind")?;
+            let subject = if authority_kind == "attempt_interrupted" {
+                MandatoryCloseFailureSubject::Attempt
+            } else {
+                MandatoryCloseFailureSubject::Resource {
+                    scope: row.try_get("scope")?,
+                    resource_kind: row.try_get("resource_kind")?,
+                    identity_kind: row.try_get("identity_kind")?,
+                    identity_codec: row.try_get("identity_codec")?,
+                    identity_value: row.try_get("identity_value")?,
+                }
+            };
             Ok(WatchEventRoute::MandatoryCloseFailure {
                 run_ordinal: CloseRunOrdinal::parse(row.try_get("cleanup_run_ordinal")?)
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
                 remaining_resources: Vec::new(),
-                scope: row.try_get("scope")?,
-                resource_kind: row.try_get("resource_kind")?,
-                identity_kind: row.try_get("identity_kind")?,
-                identity_codec: row.try_get("identity_codec")?,
-                identity_value: row.try_get("identity_value")?,
+                subject,
                 detail: row.try_get("detail")?,
                 stop,
             })

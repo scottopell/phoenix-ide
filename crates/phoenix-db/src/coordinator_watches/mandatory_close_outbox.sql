@@ -176,3 +176,19 @@ INSERT INTO mandatory_close_outbox_fk_barrier
     SELECT COUNT(*) FROM pragma_foreign_key_check;
 DROP TABLE mandatory_close_outbox_fk_barrier;
 PRAGMA defer_foreign_keys = OFF;
+CREATE TRIGGER close_retry_failure_event_requires_complete_pending_plan
+BEFORE INSERT ON coordinator_watch_events
+WHEN NEW.route_kind = 'mandatory_close_failure'
+ AND EXISTS (SELECT 1 FROM close_cleanup_failures failure
+    WHERE failure.failure_occurrence_id = NEW.mandatory_failure_occurrence_id
+      AND failure.cleanup_run_ordinal > 1
+      AND (SELECT COUNT(*) FROM close_cleanup_failure_resources child
+          WHERE child.failure_occurrence_id = failure.failure_occurrence_id) <>
+          (SELECT COUNT(*) FROM close_run_retry_effects effect
+           WHERE effect.attempt_id = failure.attempt_id AND effect.run_ordinal = failure.cleanup_run_ordinal
+             AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+               WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                 AND success.ordinal = effect.ordinal)))
+BEGIN
+    SELECT RAISE(ABORT, 'retry failure must include every pending exact-run effect');
+END;

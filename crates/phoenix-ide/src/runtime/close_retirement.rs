@@ -11,9 +11,9 @@ use sha2::{Digest, Sha256};
 use phoenix_core::domain::close::{
     AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome,
     CloseExpectedRetirementResource, CloseLossItem, CloseOwnedResourceInventory, ClosePhase,
-    CloseRetirementSnapshot, CloseStopCertainty, GitOidIdentity, GitPathIdentity, LossItemIdentity,
-    OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
-    RetirementOutcome, WorktreeIdentity,
+    CloseRetirementSnapshot, CloseRunOrdinal, CloseRunRef, CloseRunStatus, CloseStopCertainty,
+    GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+    RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
     ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -31,9 +31,11 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
-    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
-    CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
-    CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
+    AdmitCloseSafeRetryRequest, BindCloseWorktreeFinalTombstoneObjectRequest,
+    BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
+    CaptureCloseRetirementInventoryScopeRequest, CloseCleanupFailureAuthority,
+    CloseCleanupFailureResource, CloseCleanupResourceDisposition, CloseProcessResourceKind,
+    CloseProcessStepOutcome, CloseProcessStepSuccess, CloseRetryRequestedBy, CloseSafeRetryEffect,
     CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
     RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
     ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
@@ -50,11 +52,6 @@ pub(crate) struct CloseResourceLease {
     resources: Vec<RetiredResourceIdentity>,
 }
 
-struct CompletedCloseResource {
-    identity: RetiredResourceIdentity,
-    outcome: RetirementOutcome,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum CloseLeaseFailure {
     ProcessEpoch {
@@ -66,6 +63,7 @@ enum CloseLeaseFailure {
         captured_resources: Vec<RetiredResourceIdentity>,
         reason: String,
     },
+    Persistence(String),
     Unavailable,
     Tmux {
         reason: RetirementFailureReason,
@@ -107,9 +105,78 @@ impl std::fmt::Display for CloseLeaseFailure {
                 kind.as_str()
             ),
             Self::Unavailable => write!(formatter, "Close resource lease is unavailable; process-epoch identities cannot be rehydrated"),
+            Self::Persistence(detail) => write!(formatter, "Close step success persistence failed: {detail}"),
             Self::Tmux { detail, .. } => write!(formatter, "tmux teardown failed: {detail}"),
         }
     }
+}
+
+fn close_safe_retry_effects(
+    remaining_resources: &[CloseCleanupFailureResource],
+) -> Result<Vec<CloseSafeRetryEffect>, String> {
+    let plan = remaining_resources
+        .iter()
+        .map(|remaining| {
+            if remaining.disposition == CloseCleanupResourceDisposition::Unknown
+                || !matches!(
+                    remaining.resource.kind(),
+                    RetiredResourceKind::Worktree
+                        | RetiredResourceKind::WorkScope
+                        | RetiredResourceKind::TmuxServer
+                )
+            {
+                return Err(format!(
+                    "resource {:?} needs separate repair authority",
+                    remaining.resource
+                ));
+            }
+            Ok(CloseSafeRetryEffect {
+                scope: remaining.scope.clone(),
+                resource: remaining.resource.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if plan.is_empty()
+        || plan
+            .iter()
+            .enumerate()
+            .any(|(index, effect)| plan[..index].contains(effect))
+    {
+        return Err("safe retry requires distinct exact remaining resources".into());
+    }
+    Ok(plan)
+}
+
+fn process_step_successes_cover(
+    successes: &[CloseProcessStepSuccess],
+    scope: &WorkScopeId,
+    resource_kind: CloseProcessResourceKind,
+    identities: &[String],
+) -> bool {
+    !identities.is_empty()
+        && identities.iter().all(|identity| {
+            successes.iter().any(|success| {
+                success.scope == *scope
+                    && success.resource_kind == resource_kind
+                    && success.identity.as_str() == identity
+            })
+        })
+}
+
+enum CloseSafeRetryTmuxError {
+    Failed(String),
+    PersistenceOrUncertain(String),
+}
+
+fn close_safe_retry_execution_order(plan: &[CloseSafeRetryEffect]) -> Vec<usize> {
+    let mut indices = (0..plan.len()).collect::<Vec<_>>();
+    indices.sort_by_key(|&index| match plan[index].resource.kind() {
+        RetiredResourceKind::TmuxServer => 0,
+        RetiredResourceKind::Worktree => 1,
+        RetiredResourceKind::WorkScope => 2,
+        _ => 3,
+    });
+    indices
 }
 
 impl RuntimeManager {
@@ -488,7 +555,6 @@ impl RuntimeManager {
         self.bash_handles().fence_retirement_admission(&key).await;
         let terminal = self.terminals.begin_retirement(&key);
         let browser = self.browser_sessions().begin_retirement(&key).await;
-        self.tmux_registry().fence_retirement_admission(&key).await;
         let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
         let tmux_discovery = match self
             .tmux_registry()
@@ -496,7 +562,10 @@ impl RuntimeManager {
             .await
         {
             Ok(discovery) => discovery,
-            Err(error) => return Err(format!("tmux identity discovery failed: {error}")),
+            Err(error) => {
+                self.tmux_registry().fence_retirement_admission(&key).await;
+                return Err(format!("tmux identity discovery failed: {error}"));
+            }
         };
         let tmux = match tmux_discovery {
             discovery @ (PersistentTmuxDiscovery::EndpointAbsent
@@ -507,6 +576,7 @@ impl RuntimeManager {
             {
                 Ok(permit) => permit,
                 Err(outcome) => {
+                    self.tmux_registry().fence_retirement_admission(&key).await;
                     return Err(format!("tmux retirement fencing failed: {outcome:?}"));
                 }
             },
@@ -524,16 +594,22 @@ impl RuntimeManager {
                     {
                         Ok(permit) => permit,
                         Err(outcome) => {
+                            self.tmux_registry().fence_retirement_admission(&key).await;
                             return Err(format!("tmux retirement fencing failed: {outcome:?}"));
                         }
                     },
                     Ok(TmuxRetirementRehydration::Residual { reason }) => {
+                        self.tmux_registry().fence_retirement_admission(&key).await;
                         return Err(format!("tmux identity is ambiguous: {reason}"));
                     }
-                    Err(error) => return Err(format!("tmux rehydration failed: {error}")),
+                    Err(error) => {
+                        self.tmux_registry().fence_retirement_admission(&key).await;
+                        return Err(format!("tmux rehydration failed: {error}"));
+                    }
                 }
             }
             PersistentTmuxDiscovery::Ambiguous { reason } => {
+                self.tmux_registry().fence_retirement_admission(&key).await;
                 return Err(format!("tmux identity is ambiguous: {reason}"));
             }
         };
@@ -756,6 +832,7 @@ impl RuntimeManager {
         &self,
         attempt_id: CloseAttemptId,
     ) -> Result<(), String> {
+        let run = CloseRunRef::initial(attempt_id.clone());
         let _execution = self
             .close_retirement_execution
             .lock(attempt_id.as_str())
@@ -805,10 +882,7 @@ impl RuntimeManager {
             .map(|evidence| (evidence.scope, resource_key(&evidence.resource)))
             .collect::<std::collections::BTreeSet<_>>();
         self.validate_close_worktrees_before_runtime_retirement(
-            &attempt_id,
-            &snapshot,
-            &targets,
-            &retired,
+            &run, &snapshot, &targets, &retired,
         )
         .await?;
         let runtime_targets = targets
@@ -846,7 +920,7 @@ impl RuntimeManager {
                     let LossItemIdentity::Opaque(identity) = resource.identity() else {
                         return self
                             .record_close_residual(
-                                &attempt_id,
+                                &run,
                                 &snapshot,
                                 &scope,
                                 resource.clone(),
@@ -860,7 +934,7 @@ impl RuntimeManager {
                     else {
                         return self
                             .record_close_residual(
-                                &attempt_id,
+                                &run,
                                 &snapshot,
                                 &scope,
                                 resource.clone(),
@@ -897,7 +971,7 @@ impl RuntimeManager {
                             match tmux_retirement_outcome(outcome) {
                                 Ok(RetirementOutcome::Retired) => {
                                     self.record_close_retired(
-                                        &attempt_id,
+                                        &run,
                                         &snapshot,
                                         &scope,
                                         resource.clone(),
@@ -907,7 +981,7 @@ impl RuntimeManager {
                                 }
                                 Ok(RetirementOutcome::AbsenceAdopted { .. }) => {
                                     self.record_close_absence_adopted(
-                                        &attempt_id,
+                                        &run,
                                         &snapshot,
                                         &scope,
                                         resource.clone(),
@@ -919,7 +993,7 @@ impl RuntimeManager {
                                 Err((reason, detail)) => {
                                     return self
                                         .record_close_residual(
-                                            &attempt_id,
+                                            &run,
                                             &snapshot,
                                             &scope,
                                             resource.clone(),
@@ -932,7 +1006,7 @@ impl RuntimeManager {
                         }
                         Ok(TmuxRetirementRehydration::AbsenceVerified) => {
                             self.record_close_absence_adopted(
-                                &attempt_id,
+                                &run,
                                 &snapshot,
                                 &scope,
                                 resource.clone(),
@@ -943,7 +1017,7 @@ impl RuntimeManager {
                         Ok(TmuxRetirementRehydration::Residual { reason }) => {
                             return self
                                 .record_close_residual(
-                                    &attempt_id,
+                                    &run,
                                     &snapshot,
                                     &scope,
                                     resource.clone(),
@@ -955,7 +1029,7 @@ impl RuntimeManager {
                         Err(error) => {
                             return self
                                 .record_close_residual(
-                                    &attempt_id,
+                                    &run,
                                     &snapshot,
                                     &scope,
                                     resource.clone(),
@@ -979,16 +1053,17 @@ impl RuntimeManager {
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            let resources = match self
-                .complete_close_resource_lease(&attempt_id, &scope)
+            match self
+                .complete_close_resource_lease(&run, &snapshot, &scope, &expected)
                 .await
             {
-                Ok(resources) => resources,
+                Ok(()) => (),
+                Err(failure @ CloseLeaseFailure::Persistence(_)) => return Err(failure.to_string()),
                 Err(ref failure @ CloseLeaseFailure::ProcessEpoch { ref resource, .. }) => {
                     let detail = failure.to_string();
                     return self
                         .record_close_process_failure(
-                            &attempt_id,
+                            &run,
                             &scope,
                             Some(resource.clone()),
                             vec![],
@@ -1009,7 +1084,7 @@ impl RuntimeManager {
                     };
                     return self
                         .record_close_process_failure(
-                            &attempt_id,
+                            &run,
                             &scope,
                             None,
                             captured_resources,
@@ -1024,8 +1099,8 @@ impl RuntimeManager {
                         .cloned()
                     else {
                         return self
-                            .route_close_attempt_to_repair(
-                                &attempt_id,
+                            .route_close_run_to_repair(
+                                &run,
                                 &scope,
                                 reason,
                                 format!(
@@ -1035,71 +1110,12 @@ impl RuntimeManager {
                             .await;
                     };
                     return self
-                        .record_close_residual(
-                            &attempt_id,
-                            &snapshot,
-                            &scope,
-                            resource,
-                            reason,
-                            &detail,
-                        )
+                        .record_close_residual(&run, &snapshot, &scope, resource, reason, &detail)
                         .await;
                 }
             };
-            if expected.is_empty() {
-                continue;
-            }
-            let expected_keys = expected
-                .iter()
-                .map(resource_key)
-                .collect::<std::collections::BTreeSet<_>>();
-            let resources = resources
-                .into_iter()
-                .filter(|resource| expected_keys.contains(&resource_key(&resource.identity)))
-                .collect::<Vec<_>>();
-            let retired_keys = resources
-                .iter()
-                .map(|resource| resource_key(&resource.identity))
-                .collect::<std::collections::BTreeSet<_>>();
-            if expected_keys != retired_keys {
-                return self
-                    .record_close_residual(
-                        &attempt_id,
-                        &snapshot,
-                        &scope,
-                        expected[0].clone(),
-                        RetirementFailureReason::IdentityNotProven,
-                        "live Close lease differs from sealed unresolved inventory",
-                    )
-                    .await;
-            }
-            for resource in resources {
-                match resource.outcome {
-                    RetirementOutcome::Retired => {
-                        self.record_close_retired(
-                            &attempt_id,
-                            &snapshot,
-                            &scope,
-                            resource.identity,
-                            "exact registry permit retirement",
-                        )
-                        .await?;
-                    }
-                    RetirementOutcome::AbsenceAdopted { .. } => {
-                        self.record_close_absence_adopted(
-                            &attempt_id,
-                            &snapshot,
-                            &scope,
-                            resource.identity,
-                            "exact registry permit absence after dispatch",
-                        )
-                        .await?;
-                    }
-                    RetirementOutcome::Residual { .. } => unreachable!(),
-                }
-            }
         }
-        self.retire_close_worktrees_and_scopes(&attempt_id, &snapshot)
+        self.retire_close_worktrees_and_scopes(&run, &snapshot, None)
             .await?;
         self.complete_close_retirement_and_publish(&attempt_id)
             .await?;
@@ -1116,13 +1132,572 @@ impl RuntimeManager {
         Ok(())
     }
 
-    async fn validate_close_worktrees_before_runtime_retirement(
+    /// Explicit Global-only safe retry; callers must never use this as startup recovery.
+    #[allow(clippy::too_many_lines)]
+    pub async fn retry_close_runtime_resources(
+        &self,
+        failed_run: CloseRunRef,
+    ) -> Result<(), String> {
+        let attempt_id = failed_run.attempt_id.clone();
+        let _execution = self
+            .close_retirement_execution
+            .lock(attempt_id.as_str())
+            .await;
+        let failure = self
+            .db()
+            .list_close_cleanup_failures(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|failure| failure.run_ordinal == failed_run.ordinal)
+            .ok_or_else(|| {
+                format!(
+                    "Close run {} has no exact retained failure",
+                    failed_run.ordinal.get()
+                )
+            })?;
+        let completion_only = matches!(
+            failure.occurrence.authority,
+            CloseCleanupFailureAuthority::AttemptInterrupted
+        );
+        let plan = if completion_only {
+            if !self
+                .db()
+                .close_retry_verified_completion_eligible(&failed_run)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Err(
+                    "attempt-level interruption has no verified completion authority".into(),
+                );
+            }
+            Vec::new()
+        } else {
+            close_safe_retry_effects(&failure.occurrence.remaining_resources)?
+        };
+        let snapshot = self
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?
+            .snapshot()
+            .cloned()
+            .ok_or_else(|| "safe retry lacks original retirement snapshot".to_string())?;
+        let evidence = if completion_only {
+            "prior resource-plan run has exact durable success for every planned effect; this fresh run performs completion only".to_string()
+        } else {
+            self.validate_close_safe_retry(&attempt_id, &snapshot, &plan)
+                .await?
+        };
+        let request = AdmitCloseSafeRetryRequest {
+            failed_run,
+            requested_by: CloseRetryRequestedBy::Global,
+            observed_at_us: chrono::Utc::now().timestamp_micros(),
+            precondition_resolution: format!("fresh read-only exact resource checks: {evidence}"),
+            safety_evidence: evidence,
+            remaining_effects: plan,
+        };
+        let run = self
+            .db()
+            .admit_close_safe_retry(&request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let plan = self
+            .db()
+            .list_close_safe_retry_effects(&run)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !plan.is_empty() {
+            self.execute_close_safe_retry(&run, &snapshot, &plan)
+                .await?;
+        }
+        let broadcasters = self.close_retirement_broadcasters(&attempt_id).await?;
+        self.db()
+            .complete_close_safe_retry(&run)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.discard_close_resource_leases(&attempt_id).await;
+        Self::publish_close_retirement_updates(broadcasters, true);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn validate_close_safe_retry(
         &self,
         attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+        plan: &[CloseSafeRetryEffect],
+    ) -> Result<String, String> {
+        let scopes = self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let expected = self
+            .db()
+            .list_close_expected_retirement_resources(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let inspections = self
+            .db()
+            .list_close_retirement_inspections(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let retired = self
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        for effect in plan {
+            if !expected
+                .iter()
+                .any(|target| target.scope == effect.scope && target.resource == effect.resource)
+                || !scopes.iter().any(|captured| captured.scope == effect.scope)
+            {
+                return Err("retry effect lacks captured scope and sealed original target".into());
+            }
+        }
+        let mut observations = Vec::new();
+        for captured in &scopes {
+            let scope = &captured.scope;
+            if self
+                .db()
+                .work_scope_has_unresolved_product_ownership(scope)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Err(format!("scope {scope} has unresolved ownership"));
+            }
+            let planned = plan
+                .iter()
+                .filter(|effect| &effect.scope == scope)
+                .collect::<Vec<_>>();
+            for effect in &planned {
+                if !expected
+                    .iter()
+                    .any(|target| target.scope == *scope && target.resource == effect.resource)
+                {
+                    return Err(format!(
+                        "scope {scope} has a retry effect outside sealed original inventory"
+                    ));
+                }
+            }
+            match &captured.captured_worktree {
+                Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+                    return Err(format!("scope {scope} has unresolved worktree identity"));
+                }
+                Some(CapturedWorktreeIdentity::Resolved(identity)) => {
+                    let path = worktree_path(identity);
+                    let quarantine = worktree_quarantine_path(identity)?;
+                    let active = path.try_exists().map_err(|error| error.to_string())?;
+                    let quarantined = quarantine.try_exists().map_err(|error| error.to_string())?;
+                    if active && quarantined {
+                        return Err(format!("scope {scope} has ambiguous worktree locations"));
+                    }
+                    let selected = if active {
+                        Some(path)
+                    } else if quarantined {
+                        Some(quarantine)
+                    } else {
+                        None
+                    };
+                    if let Some(path) = selected {
+                        if observe_worktree_fingerprint(&path).as_deref()
+                            != Some(identity.fingerprint().as_str())
+                        {
+                            return Err(format!(
+                                "scope {scope} captured worktree fingerprint changed"
+                            ));
+                        }
+                        if planned
+                            .iter()
+                            .any(|effect| effect.resource.kind() == RetiredResourceKind::Worktree)
+                        {
+                            let confirmed = inspections
+                                .iter()
+                                .find(|inspection| inspection.target.scope == *scope)
+                                .ok_or_else(|| {
+                                    format!("scope {scope} lacks a confirmed worktree inspection")
+                                })?;
+                            let (fresh, losses) = inspect_worktree_at(identity, path).await?;
+                            if fresh.fingerprint() != confirmed.snapshot.fingerprint()
+                                || !losses.is_empty()
+                            {
+                                return Err(format!(
+                                    "scope {scope} worktree is not unchanged and reconstructible"
+                                ));
+                            }
+                        }
+                        observations.push(format!(
+                            "{scope}: captured worktree incarnation {} observed",
+                            identity.fingerprint().as_str()
+                        ));
+                    } else {
+                        let target = expected
+                            .iter()
+                            .find(|target| {
+                                target.scope == *scope
+                                    && target.resource.kind() == RetiredResourceKind::Worktree
+                            })
+                            .ok_or_else(|| {
+                                format!("scope {scope} lacks captured worktree target")
+                            })?;
+                        let prior_success = retired.iter().any(|proof| {
+                            proof.scope == *scope
+                                && proof.resource == target.resource
+                                && matches!(
+                                    proof.outcome,
+                                    RetirementOutcome::Retired
+                                        | RetirementOutcome::AbsenceAdopted { .. }
+                                )
+                        }) || self
+                            .db()
+                            .close_resource_has_retry_success(attempt_id, scope, &target.resource)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let dispatched = self
+                            .db()
+                            .close_retirement_resource_was_dispatched(
+                                attempt_id,
+                                scope,
+                                snapshot,
+                                &target.resource,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let cleanup = self
+                            .db()
+                            .close_worktree_cleanup_plan(
+                                attempt_id,
+                                scope,
+                                snapshot,
+                                &target.resource,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if !prior_success && (!dispatched || cleanup.is_none()) {
+                            return Err(format!("scope {scope} absent worktree has no exact prior proof or cleanup authority"));
+                        }
+                        observations.push(format!(
+                            "{scope}: absence bound to original captured worktree"
+                        ));
+                    }
+                }
+                None => {}
+            }
+            for effect in planned {
+                match effect.resource.kind() {
+                    RetiredResourceKind::Worktree => {
+                        if !matches!(&captured.captured_worktree, Some(CapturedWorktreeIdentity::Resolved(id))
+                            if effect.resource.identity() == &LossItemIdentity::Worktree(id.clone()))
+                        {
+                            return Err(format!(
+                                "scope {scope} worktree retry lacks its exact captured identity"
+                            ));
+                        }
+                    }
+                    RetiredResourceKind::TmuxServer => {
+                        let LossItemIdentity::Opaque(value) = effect.resource.identity() else {
+                            return Err("tmux identity must be opaque".into());
+                        };
+                        let identity =
+                            TmuxServerInstanceIdentity::parse_stable_identity(value.as_str())
+                                .ok_or_else(|| "malformed exact tmux identity".to_string())?;
+                        let legacy_path = match &captured.captured_worktree {
+                            Some(CapturedWorktreeIdentity::Resolved(id)) => Some(worktree_path(id)),
+                            _ => None,
+                        };
+                        let discovery = self
+                            .tmux_registry()
+                            .discover_persistent_identity(
+                                &ResourceScopeKey::Work(scope.clone()),
+                                legacy_path.as_deref(),
+                                None,
+                                phoenix_tools::tmux::registry::close_deadline(),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        match discovery {
+                            PersistentTmuxDiscovery::Exact(observed) if observed == identity => {
+                                observations.push(format!(
+                                    "{scope}: exact tmux {} observed",
+                                    value.as_str()
+                                ));
+                            }
+                            PersistentTmuxDiscovery::EndpointAbsent
+                            | PersistentTmuxDiscovery::ServerAbsent => {
+                                if !self
+                                    .db()
+                                    .close_retirement_resource_was_dispatched(
+                                        attempt_id,
+                                        scope,
+                                        snapshot,
+                                        &effect.resource,
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())?
+                                {
+                                    return Err(format!(
+                                        "scope {scope} tmux absence lacks original dispatch"
+                                    ));
+                                }
+                                observations.push(format!(
+                                    "{scope}: dispatched exact tmux {} absent",
+                                    value.as_str()
+                                ));
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "scope {scope} tmux identity differs or is ambiguous"
+                                ))
+                            }
+                        }
+                    }
+                    RetiredResourceKind::WorkScope => {
+                        if effect.resource.identity()
+                            != &LossItemIdentity::Opaque(
+                                OpaqueIdentity::parse(scope.as_str())
+                                    .map_err(|error| error.to_string())?,
+                            )
+                        {
+                            return Err(format!(
+                                "scope {scope} retry identity differs from captured scope"
+                            ));
+                        }
+                        observations
+                            .push(format!("{scope}: original work-scope ownership checked"));
+                    }
+                    _ => {
+                        return Err("process-epoch retry effects require separate authority".into())
+                    }
+                }
+            }
+        }
+        if observations.is_empty() {
+            return Err("safe retry has no verifiable scope observations".into());
+        }
+        Ok(observations.join("; "))
+    }
+
+    async fn execute_close_safe_retry(
+        &self,
+        run: &CloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
+        plan: &[CloseSafeRetryEffect],
+    ) -> Result<(), String> {
+        for index in close_safe_retry_execution_order(plan) {
+            let effect = &plan[index];
+            if effect.resource.kind() != RetiredResourceKind::TmuxServer {
+                continue;
+            }
+            match self.retry_close_tmux(run, snapshot, effect).await {
+                Ok(()) => {}
+                Err(CloseSafeRetryTmuxError::Failed(detail)) => {
+                    return self
+                        .terminalize_close_safe_retry_failure(run, snapshot, effect, &detail)
+                        .await;
+                }
+                Err(CloseSafeRetryTmuxError::PersistenceOrUncertain(detail)) => {
+                    return Err(format!(
+                        "retry tmux effect may have completed but exact success was not durably established; startup observation will classify the still-running run: {detail}"
+                    ));
+                }
+            }
+        }
+        let durable_plan = plan
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect.resource.kind(),
+                    RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if durable_plan.is_empty() {
+            return Ok(());
+        }
+        if let Err(detail) = self
+            .retire_close_worktrees_and_scopes(run, snapshot, Some(&durable_plan))
+            .await
+        {
+            let retained = self
+                .db()
+                .get_close_run(run)
+                .await
+                .map_err(|error| error.to_string())?;
+            if retained.status == CloseRunStatus::Running {
+                return Err(format!(
+                    "retry execution stopped before further effects; startup observation will classify the still-running exact run: {detail}"
+                ));
+            }
+            return Err(detail);
+        }
+        Ok(())
+    }
+
+    async fn retry_close_tmux(
+        &self,
+        run: &CloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
+        effect: &CloseSafeRetryEffect,
+    ) -> Result<(), CloseSafeRetryTmuxError> {
+        let LossItemIdentity::Opaque(value) = effect.resource.identity() else {
+            return Err(CloseSafeRetryTmuxError::Failed(
+                "tmux retry identity is not opaque".into(),
+            ));
+        };
+        let identity = TmuxServerInstanceIdentity::parse_stable_identity(value.as_str())
+            .ok_or_else(|| {
+                CloseSafeRetryTmuxError::Failed("tmux retry identity is malformed".to_string())
+            })?;
+        let key = ResourceScopeKey::Work(effect.scope.clone());
+        let captured = self
+            .db()
+            .list_close_attempt_scopes(run.attempt_id.as_str())
+            .await
+            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?
+            .into_iter()
+            .find(|captured| captured.scope == effect.scope)
+            .ok_or_else(|| {
+                CloseSafeRetryTmuxError::Failed("tmux retry scope was not captured".to_string())
+            })?;
+        let legacy_path = match captured.captured_worktree {
+            Some(CapturedWorktreeIdentity::Resolved(id)) => Some(worktree_path(&id)),
+            _ => None,
+        };
+        let discovery = self
+            .tmux_registry()
+            .discover_persistent_identity(
+                &key,
+                legacy_path.as_deref(),
+                None,
+                phoenix_tools::tmux::registry::close_deadline(),
+            )
+            .await
+            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?;
+        if !matches!(discovery, PersistentTmuxDiscovery::Exact(ref observed) if observed == &identity)
+            && !matches!(
+                discovery,
+                PersistentTmuxDiscovery::EndpointAbsent | PersistentTmuxDiscovery::ServerAbsent
+            )
+        {
+            return Err(CloseSafeRetryTmuxError::Failed(
+                "tmux retry discovery found an ambiguous or different server".into(),
+            ));
+        }
+        let rehydrated = self
+            .tmux_registry()
+            .rehydrate_retirement(
+                &key,
+                &identity,
+                phoenix_tools::tmux::registry::close_deadline(),
+            )
+            .await
+            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?;
+        match rehydrated {
+            TmuxRetirementRehydration::Permit(permit) => {
+                let outcome = self
+                    .tmux_registry()
+                    .complete_retirement(&permit)
+                    .await
+                    .map_err(|error| {
+                        CloseSafeRetryTmuxError::PersistenceOrUncertain(error.to_string())
+                    })?;
+                match tmux_retirement_outcome(outcome) {
+                    Ok(RetirementOutcome::Retired) => self
+                        .record_close_retired(
+                            run,
+                            snapshot,
+                            &effect.scope,
+                            effect.resource.clone(),
+                            "exact retry tmux permit retirement",
+                        )
+                        .await
+                        .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
+                    Ok(RetirementOutcome::AbsenceAdopted { .. }) => self
+                        .record_close_absence_adopted(
+                            run,
+                            snapshot,
+                            &effect.scope,
+                            effect.resource.clone(),
+                            "exact retry tmux permit absence",
+                        )
+                        .await
+                        .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
+                    Ok(RetirementOutcome::Residual { .. }) => Err(CloseSafeRetryTmuxError::Failed(
+                        "tmux retry remains residual".into(),
+                    )),
+                    Err((_, detail)) => Err(CloseSafeRetryTmuxError::Failed(detail)),
+                }
+            }
+            TmuxRetirementRehydration::AbsenceVerified => self
+                .record_close_absence_adopted(
+                    run,
+                    snapshot,
+                    &effect.scope,
+                    effect.resource.clone(),
+                    "exact retry tmux absence",
+                )
+                .await
+                .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
+            TmuxRetirementRehydration::Residual { reason } => {
+                Err(CloseSafeRetryTmuxError::Failed(reason))
+            }
+        }
+    }
+
+    async fn terminalize_close_safe_retry_failure(
+        &self,
+        run: &CloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
+        failed: &CloseSafeRetryEffect,
+        detail: &str,
+    ) -> Result<(), String> {
+        let progress = self
+            .db()
+            .close_safe_retry_progress(run)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !progress.pending.contains(failed) {
+            return Err("retry failure is not a pending exact-run effect".into());
+        }
+        let remaining_resources = progress
+            .pending
+            .iter()
+            .map(|effect| CloseCleanupFailureResource {
+                scope: effect.scope.clone(),
+                resource: effect.resource.clone(),
+                disposition: if effect == failed {
+                    CloseCleanupResourceDisposition::Failed
+                } else {
+                    CloseCleanupResourceDisposition::Unattempted
+                },
+            })
+            .collect();
+        self.terminalize_close_cleanup_failure(
+            run,
+            CloseCleanupFailureAuthority::ExpectedResource {
+                scope: failed.scope.clone(),
+                snapshot: snapshot.clone(),
+                resource: failed.resource.clone(),
+            },
+            remaining_resources,
+            RetirementFailureReason::IdentityNotProven,
+            detail,
+            CloseStopCertainty::ShutdownUncertain,
+        )
+        .await
+    }
+
+    async fn validate_close_worktrees_before_runtime_retirement(
+        &self,
+        run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
         targets: &[CloseExpectedRetirementResource],
         retired: &std::collections::BTreeSet<(WorkScopeId, (String, String))>,
     ) -> Result<(), String> {
+        let attempt_id = &run.attempt_id;
         let scopes = self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
@@ -1145,7 +1720,7 @@ impl RuntimeManager {
             else {
                 return self
                     .record_close_residual(
-                        attempt_id,
+                        run,
                         snapshot,
                         &captured.scope,
                         target.resource.clone(),
@@ -1160,7 +1735,7 @@ impl RuntimeManager {
                 Err(error) => {
                     return self
                         .record_close_residual(
-                            attempt_id,
+                            run,
                             snapshot,
                             &captured.scope,
                             target.resource.clone(),
@@ -1178,7 +1753,7 @@ impl RuntimeManager {
             else {
                 return self
                     .record_close_residual(
-                        attempt_id,
+                        run,
                         snapshot,
                         &captured.scope,
                         target.resource.clone(),
@@ -1192,7 +1767,7 @@ impl RuntimeManager {
                 Err(reason) => {
                     return self
                         .record_close_residual(
-                            attempt_id,
+                            run,
                             snapshot,
                             &captured.scope,
                             target.resource.clone(),
@@ -1222,9 +1797,11 @@ impl RuntimeManager {
     #[allow(clippy::too_many_lines)]
     async fn retire_close_worktrees_and_scopes(
         &self,
-        attempt_id: &CloseAttemptId,
+        run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
+        plan: Option<&[CloseSafeRetryEffect]>,
     ) -> Result<(), String> {
+        let attempt_id = &run.attempt_id;
         let targets = self
             .db()
             .list_close_expected_retirement_resources(attempt_id.as_str())
@@ -1252,8 +1829,17 @@ impl RuntimeManager {
             .map_err(|error| error.to_string())?;
         for captured in scopes {
             let scope = captured.scope.clone();
+            if plan.is_some_and(|plan| !plan.iter().any(|effect| effect.scope == scope)) {
+                continue;
+            }
             let worktree_target = targets.iter().find(|target| {
-                target.scope == scope && target.resource.kind() == RetiredResourceKind::Worktree
+                target.scope == scope
+                    && target.resource.kind() == RetiredResourceKind::Worktree
+                    && plan.is_none_or(|plan| {
+                        plan.iter().any(|effect| {
+                            effect.scope == scope && effect.resource == target.resource
+                        })
+                    })
             });
             if self
                 .db()
@@ -1277,7 +1863,7 @@ impl RuntimeManager {
                     .map_err(|error| error.to_string())?;
                 return self
                     .record_close_cleanup_failure(
-                        attempt_id,
+                        run,
                         snapshot,
                         &scope,
                         resource,
@@ -1287,25 +1873,28 @@ impl RuntimeManager {
                     .await;
             }
             if let Some(target) = worktree_target {
-                if !retired.contains(&(scope.clone(), resource_key(&target.resource))) {
-                    let identity = match &captured.captured_worktree {
-                        Some(CapturedWorktreeIdentity::Resolved(identity)) => identity,
-                        Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
-                            return self
+                'worktree_cleanup: {
+                    if plan.is_some()
+                        || !retired.contains(&(scope.clone(), resource_key(&target.resource)))
+                    {
+                        let identity = match &captured.captured_worktree {
+                            Some(CapturedWorktreeIdentity::Resolved(identity)) => identity,
+                            Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+                                return self
+                                    .record_close_cleanup_failure(
+                                        run,
+                                        snapshot,
+                                        &scope,
+                                        target.resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        "captured worktree identity is unresolved",
+                                    )
+                                    .await;
+                            }
+                            None => {
+                                return self
                                 .record_close_cleanup_failure(
-                                    attempt_id,
-                                    snapshot,
-                                    &scope,
-                                    target.resource.clone(),
-                                    RetirementFailureReason::IdentityNotProven,
-                                    "captured worktree identity is unresolved",
-                                )
-                                .await;
-                        }
-                        None => {
-                            return self
-                                .record_close_cleanup_failure(
-                                    attempt_id,
+                                    run,
                                     snapshot,
                                     &scope,
                                     target.resource.clone(),
@@ -1313,97 +1902,15 @@ impl RuntimeManager {
                                     "worktree target is not backed by a captured worktree identity",
                                 )
                                 .await;
-                        }
-                    };
-                    let captured_path = worktree_path(identity);
-                    let quarantine_path = match worktree_quarantine_path(identity) {
-                        Ok(path) => path,
-                        Err(detail) => {
-                            return self
-                                .record_close_cleanup_failure(
-                                    attempt_id,
-                                    snapshot,
-                                    &scope,
-                                    target.resource.clone(),
-                                    RetirementFailureReason::IdentityNotProven,
-                                    &detail,
-                                )
-                                .await;
-                        }
-                    };
-                    let existing_cleanup_plan = self
-                        .db()
-                        .close_worktree_cleanup_plan(attempt_id, &scope, snapshot, &target.resource)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    if let Some(cleanup_plan) = existing_cleanup_plan
-                        .as_ref()
-                        .filter(|plan| plan.final_tombstone.is_some())
-                    {
-                        let identity = identity.clone();
-                        let cleanup_plan = cleanup_plan.clone();
-                        let recovery = tokio::task::spawn_blocking(move || {
-                            match resume_final_worktree_tombstone(
-                                cleanup_plan
-                                    .final_tombstone
-                                    .as_ref()
-                                    .expect("filtered above"),
-                                &identity,
-                            ) {
-                                FinalTombstoneRecovery::Completed => {}
-                                FinalTombstoneRecovery::Residual(detail) => return Err(detail),
-                            }
-                            complete_persisted_worktree_administrative_cleanup(
-                                &identity,
-                                &cleanup_plan.administrative_dir,
-                                &cleanup_plan.administrative_dir_incarnation,
-                            )
-                        })
-                        .await;
-                        let recovery = match recovery {
-                            Ok(recovery) => recovery,
-                            Err(error) => {
-                                return self
-                                    .record_close_cleanup_failure(
-                                        attempt_id,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
-                                        &format!("worktree cleanup task failed: {error}"),
-                                    )
-                                    .await;
                             }
                         };
-                        if let Err(detail) = recovery {
-                            return self
-                                .record_close_cleanup_failure(
-                                    attempt_id,
-                                    snapshot,
-                                    &scope,
-                                    target.resource.clone(),
-                                    RetirementFailureReason::IdentityNotProven,
-                                    &detail,
-                                )
-                                .await;
-                        }
-                        self.record_close_absence_adopted(
-                            attempt_id,
-                            snapshot,
-                            &scope,
-                            target.resource.clone(),
-                            "resumed the exact recorded private final tombstone and administrative cleanup",
-                        )
-                        .await?;
-                        continue;
-                    }
-                    let worktree_absent =
-                        match both_worktree_paths_absent(&captured_path, &quarantine_path) {
-                            Ok(absent) => absent,
+                        let captured_path = worktree_path(identity);
+                        let quarantine_path = match worktree_quarantine_path(identity) {
+                            Ok(path) => path,
                             Err(detail) => {
                                 return self
                                     .record_close_cleanup_failure(
-                                        attempt_id,
+                                        run,
                                         snapshot,
                                         &scope,
                                         target.resource.clone(),
@@ -1413,18 +1920,7 @@ impl RuntimeManager {
                                     .await;
                             }
                         };
-                    if worktree_absent {
-                        let dispatched = self
-                            .db()
-                            .close_retirement_resource_was_dispatched(
-                                attempt_id,
-                                &scope,
-                                snapshot,
-                                &target.resource,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let planned_administrative_dir = self
+                        let existing_cleanup_plan = self
                             .db()
                             .close_worktree_cleanup_plan(
                                 attempt_id,
@@ -1434,22 +1930,120 @@ impl RuntimeManager {
                             )
                             .await
                             .map_err(|error| error.to_string())?;
-                        let Some(cleanup_plan) = planned_administrative_dir else {
-                            return self
-                                .record_close_cleanup_failure(
-                                    attempt_id,
-                                    snapshot,
-                                    &scope,
-                                    target.resource.clone(),
-                                    RetirementFailureReason::IdentityNotProven,
-                                    "absent worktree lacks an exact durable cleanup plan",
+                        if let Some(cleanup_plan) = existing_cleanup_plan
+                            .as_ref()
+                            .filter(|plan| plan.final_tombstone.is_some())
+                        {
+                            let identity = identity.clone();
+                            let cleanup_plan = cleanup_plan.clone();
+                            let recovery = tokio::task::spawn_blocking(move || {
+                                match resume_final_worktree_tombstone(
+                                    cleanup_plan
+                                        .final_tombstone
+                                        .as_ref()
+                                        .expect("filtered above"),
+                                    &identity,
+                                ) {
+                                    FinalTombstoneRecovery::Completed => {}
+                                    FinalTombstoneRecovery::Residual(detail) => return Err(detail),
+                                }
+                                complete_persisted_worktree_administrative_cleanup(
+                                    &identity,
+                                    &cleanup_plan.administrative_dir,
+                                    &cleanup_plan.administrative_dir_incarnation,
                                 )
-                                .await;
-                        };
-                        if !dispatched {
-                            return self
-                                .record_close_cleanup_failure(
+                            })
+                            .await;
+                            let recovery = match recovery {
+                                Ok(recovery) => recovery,
+                                Err(error) => {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            run,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            &format!("worktree cleanup task failed: {error}"),
+                                        )
+                                        .await;
+                                }
+                            };
+                            if let Err(detail) = recovery {
+                                return self
+                                    .record_close_cleanup_failure(
+                                        run,
+                                        snapshot,
+                                        &scope,
+                                        target.resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        &detail,
+                                    )
+                                    .await;
+                            }
+                            self.record_close_absence_adopted(
+                            run,
+                            snapshot,
+                            &scope,
+                            target.resource.clone(),
+                            "resumed the exact recorded private final tombstone and administrative cleanup",
+                        )
+                        .await?;
+                            break 'worktree_cleanup;
+                        }
+                        let worktree_absent =
+                            match both_worktree_paths_absent(&captured_path, &quarantine_path) {
+                                Ok(absent) => absent,
+                                Err(detail) => {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            run,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            &detail,
+                                        )
+                                        .await;
+                                }
+                            };
+                        if worktree_absent {
+                            let dispatched = self
+                                .db()
+                                .close_retirement_resource_was_dispatched(
                                     attempt_id,
+                                    &scope,
+                                    snapshot,
+                                    &target.resource,
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            let planned_administrative_dir = self
+                                .db()
+                                .close_worktree_cleanup_plan(
+                                    attempt_id,
+                                    &scope,
+                                    snapshot,
+                                    &target.resource,
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            let Some(cleanup_plan) = planned_administrative_dir else {
+                                return self
+                                    .record_close_cleanup_failure(
+                                        run,
+                                        snapshot,
+                                        &scope,
+                                        target.resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        "absent worktree lacks an exact durable cleanup plan",
+                                    )
+                                    .await;
+                            };
+                            if !dispatched {
+                                return self
+                                .record_close_cleanup_failure(
+                                    run,
                                     snapshot,
                                     &scope,
                                     target.resource.clone(),
@@ -1457,97 +2051,99 @@ impl RuntimeManager {
                                     "absent worktree lacks an exact durable retirement dispatch",
                                 )
                                 .await;
-                        }
-                        let identity = identity.clone();
-                        let recovery = tokio::task::spawn_blocking(move || {
-                            if let Some(tombstone) = &cleanup_plan.final_tombstone {
-                                match resume_final_worktree_tombstone(tombstone, &identity) {
-                                    FinalTombstoneRecovery::Completed => {}
-                                    FinalTombstoneRecovery::Residual(detail) => return Err(detail),
-                                }
                             }
-                            complete_persisted_worktree_administrative_cleanup(
-                                &identity,
-                                &cleanup_plan.administrative_dir,
-                                &cleanup_plan.administrative_dir_incarnation,
-                            )
-                        })
-                        .await;
-                        let recovery = match recovery {
-                            Ok(recovery) => recovery,
-                            Err(error) => {
+                            let identity = identity.clone();
+                            let recovery = tokio::task::spawn_blocking(move || {
+                                if let Some(tombstone) = &cleanup_plan.final_tombstone {
+                                    match resume_final_worktree_tombstone(tombstone, &identity) {
+                                        FinalTombstoneRecovery::Completed => {}
+                                        FinalTombstoneRecovery::Residual(detail) => {
+                                            return Err(detail)
+                                        }
+                                    }
+                                }
+                                complete_persisted_worktree_administrative_cleanup(
+                                    &identity,
+                                    &cleanup_plan.administrative_dir,
+                                    &cleanup_plan.administrative_dir_incarnation,
+                                )
+                            })
+                            .await;
+                            let recovery = match recovery {
+                                Ok(recovery) => recovery,
+                                Err(error) => {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            run,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            &format!("worktree cleanup task failed: {error}"),
+                                        )
+                                        .await;
+                                }
+                            };
+                            if let Err(detail) = recovery {
                                 return self
                                     .record_close_cleanup_failure(
-                                        attempt_id,
+                                        run,
                                         snapshot,
                                         &scope,
                                         target.resource.clone(),
                                         RetirementFailureReason::IdentityNotProven,
-                                        &format!("worktree cleanup task failed: {error}"),
+                                        &detail,
                                     )
                                     .await;
                             }
-                        };
-                        if let Err(detail) = recovery {
-                            return self
-                                .record_close_cleanup_failure(
-                                    attempt_id,
-                                    snapshot,
-                                    &scope,
-                                    target.resource.clone(),
-                                    RetirementFailureReason::IdentityNotProven,
-                                    &detail,
-                                )
-                                .await;
-                        }
-                        self.record_close_absence_adopted(
-                            attempt_id,
+                            self.record_close_absence_adopted(
+                            run,
                             snapshot,
                             &scope,
                             target.resource.clone(),
                             "validated exact persisted worktree cleanup plan; completed only its administrative-directory deletion",
                         )
                         .await?;
-                    } else {
-                        let inspections = self
-                            .db()
-                            .list_close_retirement_inspections(attempt_id.as_str())
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let Some(confirmed) = inspections
-                            .iter()
-                            .find(|inspection| inspection.target.scope == scope)
-                        else {
-                            return self
-                                .record_close_cleanup_failure(
-                                    attempt_id,
-                                    snapshot,
-                                    &scope,
-                                    target.resource.clone(),
-                                    RetirementFailureReason::IdentityNotProven,
-                                    "worktree removal has no confirmed inspection",
-                                )
-                                .await;
-                        };
-                        match worktree_path(identity).try_exists() {
-                            Ok(true) => {
-                                self.db()
-                                    .record_close_retirement_dispatch(
-                                        RecordCloseRetirementDispatchRequest {
-                                            attempt_id: attempt_id.clone(),
-                                            scope: scope.clone(),
-                                            snapshot: snapshot.clone(),
-                                            resource: target.resource.clone(),
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
+                        } else {
+                            let inspections = self
+                                .db()
+                                .list_close_retirement_inspections(attempt_id.as_str())
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            let Some(confirmed) = inspections
+                                .iter()
+                                .find(|inspection| inspection.target.scope == scope)
+                            else {
                                 return self
+                                    .record_close_cleanup_failure(
+                                        run,
+                                        snapshot,
+                                        &scope,
+                                        target.resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        "worktree removal has no confirmed inspection",
+                                    )
+                                    .await;
+                            };
+                            match worktree_path(identity).try_exists() {
+                                Ok(true) => {
+                                    self.db()
+                                        .record_close_retirement_dispatch(
+                                            RecordCloseRetirementDispatchRequest {
+                                                attempt_id: attempt_id.clone(),
+                                                scope: scope.clone(),
+                                                snapshot: snapshot.clone(),
+                                                resource: target.resource.clone(),
+                                            },
+                                        )
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    return self
                                 .record_close_cleanup_failure(
-                                    attempt_id,
+                                    run,
                                     snapshot,
                                     &scope,
                                     target.resource.clone(),
@@ -1557,46 +2153,51 @@ impl RuntimeManager {
                                     ),
                                 )
                                 .await;
-                            }
-                        }
-                        let cleanup_plan = if let Some(plan) = existing_cleanup_plan {
-                            plan
-                        } else {
-                            let identity = identity.clone();
-                            let discovered = tokio::task::spawn_blocking(move || {
-                                let path = worktree_path(&identity);
-                                let quarantine = worktree_quarantine_path(&identity)?;
-                                let inspection_path =
-                                    if path.exists() { &path } else { &quarantine };
-                                let common = exact_worktree_common_git_dir(inspection_path)?;
-                                let administrative_dir =
-                                    exact_worktree_administrative_dir(inspection_path, &common)?;
-                                let administrative_dir_incarnation =
-                                    observe_administrative_dir_incarnation(&administrative_dir)?;
-                                Ok::<_, String>((
-                                    administrative_dir,
-                                    administrative_dir_incarnation,
-                                ))
-                            })
-                            .await;
-                            let discovered = match discovered {
-                                Ok(Ok(discovered)) => discovered,
-                                Ok(Err(detail)) => {
-                                    return self
-                                        .record_close_cleanup_failure(
-                                            attempt_id,
-                                            snapshot,
-                                            &scope,
-                                            target.resource.clone(),
-                                            RetirementFailureReason::IdentityNotProven,
-                                            &detail,
-                                        )
-                                        .await;
                                 }
-                                Err(error) => {
-                                    return self
+                            }
+                            let cleanup_plan = if let Some(plan) = existing_cleanup_plan {
+                                plan
+                            } else {
+                                let identity = identity.clone();
+                                let discovered = tokio::task::spawn_blocking(move || {
+                                    let path = worktree_path(&identity);
+                                    let quarantine = worktree_quarantine_path(&identity)?;
+                                    let inspection_path =
+                                        if path.exists() { &path } else { &quarantine };
+                                    let common = exact_worktree_common_git_dir(inspection_path)?;
+                                    let administrative_dir = exact_worktree_administrative_dir(
+                                        inspection_path,
+                                        &common,
+                                    )?;
+                                    let administrative_dir_incarnation =
+                                        observe_administrative_dir_incarnation(
+                                            &administrative_dir,
+                                        )?;
+                                    Ok::<_, String>((
+                                        administrative_dir,
+                                        administrative_dir_incarnation,
+                                    ))
+                                })
+                                .await;
+                                let discovered =
+                                    match discovered {
+                                        Ok(Ok(discovered)) => discovered,
+                                        Ok(Err(detail)) => {
+                                            return self
+                                                .record_close_cleanup_failure(
+                                                    run,
+                                                    snapshot,
+                                                    &scope,
+                                                    target.resource.clone(),
+                                                    RetirementFailureReason::IdentityNotProven,
+                                                    &detail,
+                                                )
+                                                .await;
+                                        }
+                                        Err(error) => {
+                                            return self
                                         .record_close_cleanup_failure(
-                                            attempt_id,
+                                            run,
                                             snapshot,
                                             &scope,
                                             target.resource.clone(),
@@ -1604,38 +2205,37 @@ impl RuntimeManager {
                                             &format!("worktree cleanup-plan task failed: {error}"),
                                         )
                                         .await;
+                                        }
+                                    };
+                                self.db()
+                                    .record_close_worktree_cleanup_plan(
+                                        RecordCloseWorktreeCleanupPlanRequest {
+                                            attempt_id: attempt_id.clone(),
+                                            scope: scope.clone(),
+                                            snapshot: snapshot.clone(),
+                                            resource: target.resource.clone(),
+                                            administrative_dir: discovered.0.clone(),
+                                            administrative_dir_incarnation: discovered.1.clone(),
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                crate::db::CloseWorktreeCleanupPlan {
+                                    administrative_dir: discovered.0,
+                                    administrative_dir_incarnation: discovered.1,
+                                    final_tombstone: None,
                                 }
                             };
-                            self.db()
-                                .record_close_worktree_cleanup_plan(
-                                    RecordCloseWorktreeCleanupPlanRequest {
-                                        attempt_id: attempt_id.clone(),
-                                        scope: scope.clone(),
-                                        snapshot: snapshot.clone(),
-                                        resource: target.resource.clone(),
-                                        administrative_dir: discovered.0.clone(),
-                                        administrative_dir_incarnation: discovered.1.clone(),
-                                    },
-                                )
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            crate::db::CloseWorktreeCleanupPlan {
-                                administrative_dir: discovered.0,
-                                administrative_dir_incarnation: discovered.1,
-                                final_tombstone: None,
-                            }
-                        };
-                        let identity = identity.clone();
-                        let confirmed_snapshot = confirmed.snapshot.clone();
-                        let db = self.db().clone();
-                        let attempt = attempt_id.clone();
-                        let scope_for_tombstone = scope.clone();
-                        let resource_for_tombstone = target.resource.clone();
-                        let snapshot_for_tombstone = snapshot.clone();
-                        let runtime = tokio::runtime::Handle::current();
-                        let persistence_runtime = runtime.clone();
-                        let final_removal =
-                            tokio::task::spawn_blocking(move || {
+                            let identity = identity.clone();
+                            let confirmed_snapshot = confirmed.snapshot.clone();
+                            let db = self.db().clone();
+                            let attempt = attempt_id.clone();
+                            let scope_for_tombstone = scope.clone();
+                            let resource_for_tombstone = target.resource.clone();
+                            let snapshot_for_tombstone = snapshot.clone();
+                            let runtime = tokio::runtime::Handle::current();
+                            let persistence_runtime = runtime.clone();
+                            let final_removal = tokio::task::spawn_blocking(move || {
                                 inspect_and_remove_exact_worktree(
                                     &runtime,
                                     &identity,
@@ -1680,107 +2280,140 @@ impl RuntimeManager {
                                 )
                             })
                             .await;
-                        let final_removal = match final_removal {
-                            Ok(final_removal) => final_removal,
-                            Err(error) => {
-                                return self
-                                    .record_close_cleanup_failure(
-                                        attempt_id,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
-                                        &format!("worktree removal task failed: {error}"),
-                                    )
-                                    .await;
-                            }
-                        };
-                        let fresh_snapshot: Option<CloseRetirementSnapshot> = match final_removal {
-                            Ok(ExactWorktreeRemoval::Retired) => {
+                            let final_removal = match final_removal {
+                                Ok(final_removal) => final_removal,
+                                Err(error) => {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            run,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            &format!("worktree removal task failed: {error}"),
+                                        )
+                                        .await;
+                                }
+                            };
+                            let fresh_snapshot: Option<CloseRetirementSnapshot> =
+                                match final_removal {
+                                    Ok(ExactWorktreeRemoval::Retired) => {
+                                        self.record_close_retired(
+                                            run,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            "exact captured Git worktree removal",
+                                        )
+                                        .await?;
+                                        None
+                                    }
+                                    Ok(ExactWorktreeRemoval::ReinspectionRequired { detail }) => {
+                                        if run.ordinal != CloseRunOrdinal::INITIAL {
+                                            return self
+                                                .record_close_cleanup_failure(
+                                                    run,
+                                                    snapshot,
+                                                    &scope,
+                                                    target.resource.clone(),
+                                                    RetirementFailureReason::IdentityNotProven,
+                                                    &detail,
+                                                )
+                                                .await;
+                                        }
+                                        self.db()
+                                            .return_close_attempt_to_reinspection(attempt_id)
+                                            .await
+                                            .map_err(|error| error.to_string())?;
+                                        Box::pin(
+                                            self.inspect_close_retirement_only(attempt_id.clone()),
+                                        )
+                                        .await?;
+                                        return Err(detail);
+                                    }
+                                    Ok(ExactWorktreeRemoval::Residual { detail }) => {
+                                        return self
+                                            .record_close_cleanup_failure(
+                                                run,
+                                                snapshot,
+                                                &scope,
+                                                target.resource.clone(),
+                                                RetirementFailureReason::IdentityNotProven,
+                                                &detail,
+                                            )
+                                            .await;
+                                    }
+                                    Err(reason) => {
+                                        return self
+                                            .record_close_cleanup_failure(
+                                                run,
+                                                snapshot,
+                                                &scope,
+                                                target.resource.clone(),
+                                                RetirementFailureReason::IdentityNotProven,
+                                                &format!(
+                                        "worktree cannot be reinspected before removal: {reason}"
+                                    ),
+                                            )
+                                            .await;
+                                    }
+                                };
+                            if let Some(fresh_snapshot) = fresh_snapshot {
+                                if fresh_snapshot.fingerprint() != confirmed.snapshot.fingerprint()
+                                {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            run,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            "worktree changed after Close inspection confirmation",
+                                        )
+                                        .await;
+                                }
                                 self.record_close_retired(
-                                    attempt_id,
+                                    run,
                                     snapshot,
                                     &scope,
                                     target.resource.clone(),
                                     "exact captured Git worktree removal",
                                 )
                                 .await?;
-                                None
                             }
-                            Ok(ExactWorktreeRemoval::ReinspectionRequired { detail }) => {
-                                self.db()
-                                    .return_close_attempt_to_reinspection(attempt_id)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                                Box::pin(self.inspect_close_retirement_only(attempt_id.clone()))
-                                    .await?;
-                                return Err(detail);
-                            }
-                            Ok(ExactWorktreeRemoval::Residual { detail }) => {
-                                return self
-                                    .record_close_cleanup_failure(
-                                        attempt_id,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
-                                        &detail,
-                                    )
-                                    .await;
-                            }
-                            Err(reason) => {
-                                return self
-                                    .record_close_cleanup_failure(
-                                        attempt_id,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
-                                        &format!(
-                                        "worktree cannot be reinspected before removal: {reason}"
-                                    ),
-                                    )
-                                    .await;
-                            }
-                        };
-                        if let Some(fresh_snapshot) = fresh_snapshot {
-                            if fresh_snapshot.fingerprint() != confirmed.snapshot.fingerprint() {
-                                return self
-                                    .record_close_cleanup_failure(
-                                        attempt_id,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
-                                        "worktree changed after Close inspection confirmation",
-                                    )
-                                    .await;
-                            }
-                            self.record_close_retired(
-                                attempt_id,
-                                snapshot,
-                                &scope,
-                                target.resource.clone(),
-                                "exact captured Git worktree removal",
-                            )
-                            .await?;
                         }
                     }
                 }
             }
+            if plan.is_some_and(|plan| {
+                !plan.iter().any(|effect| {
+                    effect.scope == scope
+                        && effect.resource.kind() == RetiredResourceKind::WorkScope
+                })
+            }) {
+                continue;
+            }
             let Some(work_scope_target) = targets.iter().find(|target| {
-                target.scope == scope && target.resource.kind() == RetiredResourceKind::WorkScope
+                target.scope == scope
+                    && target.resource.kind() == RetiredResourceKind::WorkScope
+                    && plan.is_none_or(|plan| {
+                        plan.iter().any(|effect| {
+                            effect.scope == scope && effect.resource == target.resource
+                        })
+                    })
             }) else {
                 return self
-                    .route_close_attempt_to_repair(
-                        attempt_id,
+                    .route_close_run_to_repair(
+                        run,
                         &scope,
                         RetirementFailureReason::IdentityNotProven,
                         format!("Close scope {scope} lacks mandatory WorkScope target"),
                     )
                     .await;
             };
-            if retired.contains(&(scope.clone(), resource_key(&work_scope_target.resource))) {
+            if plan.is_none()
+                && retired.contains(&(scope.clone(), resource_key(&work_scope_target.resource)))
+            {
                 continue;
             }
             match self
@@ -1798,7 +2431,7 @@ impl RuntimeManager {
                 WorkScopeRetirementOutcome::Retired
                 | WorkScopeRetirementOutcome::AlreadyRetired => {
                     self.record_close_retired(
-                        attempt_id,
+                        run,
                         snapshot,
                         &scope,
                         work_scope_target.resource.clone(),
@@ -1809,7 +2442,7 @@ impl RuntimeManager {
                 WorkScopeRetirementOutcome::Blocked(blocker) => {
                     return self
                         .record_close_cleanup_failure(
-                            attempt_id,
+                            run,
                             snapshot,
                             &scope,
                             work_scope_target.resource.clone(),
@@ -1825,12 +2458,27 @@ impl RuntimeManager {
 
     async fn record_close_retired(
         &self,
-        attempt_id: &CloseAttemptId,
+        run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
         scope: &WorkScopeId,
         resource: RetiredResourceIdentity,
         detail: &str,
     ) -> Result<(), String> {
+        if run.ordinal != CloseRunOrdinal::INITIAL {
+            return self
+                .db()
+                .record_close_safe_retry_success(
+                    run,
+                    &CloseSafeRetryEffect {
+                        scope: scope.clone(),
+                        resource,
+                    },
+                    detail,
+                )
+                .await
+                .map_err(|error| error.to_string());
+        }
+        let attempt_id = &run.attempt_id;
         self.db()
             .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: attempt_id.clone(),
@@ -1846,12 +2494,27 @@ impl RuntimeManager {
 
     async fn record_close_absence_adopted(
         &self,
-        attempt_id: &CloseAttemptId,
+        run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
         scope: &WorkScopeId,
         resource: RetiredResourceIdentity,
         detail: &str,
     ) -> Result<(), String> {
+        if run.ordinal != CloseRunOrdinal::INITIAL {
+            return self
+                .db()
+                .record_close_safe_retry_success(
+                    run,
+                    &CloseSafeRetryEffect {
+                        scope: scope.clone(),
+                        resource,
+                    },
+                    detail,
+                )
+                .await
+                .map_err(|error| error.to_string());
+        }
+        let attempt_id = &run.attempt_id;
         self.db()
             .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: attempt_id.clone(),
@@ -1869,9 +2532,15 @@ impl RuntimeManager {
 
     async fn append_live_process_remaining_resources(
         &self,
-        attempt_id: &CloseAttemptId,
+        run: &CloseRunRef,
         remaining: &mut Vec<CloseCleanupFailureResource>,
-    ) {
+    ) -> Result<(), String> {
+        let attempt_id = &run.attempt_id;
+        let successes = self
+            .db()
+            .list_close_process_step_successes(run)
+            .await
+            .map_err(|error| error.to_string())?;
         let leases = self.close_retirement_leases.lock().await;
         for ((lease_attempt, scope), lease) in leases.iter() {
             if lease_attempt != attempt_id.as_str() {
@@ -1898,6 +2567,15 @@ impl RuntimeManager {
                 }
             }
         }
+        remaining.retain(|item| {
+            !successes.iter().any(|success| {
+                success.scope == item.scope
+                    && success.resource_kind.as_str() == item.resource.kind().as_str()
+                    && item.resource.identity()
+                        == &LossItemIdentity::Opaque(success.identity.clone())
+            })
+        });
+        Ok(())
     }
 
     fn order_close_failure_resources(
@@ -1927,24 +2605,32 @@ impl RuntimeManager {
 
     async fn record_close_process_failure<T>(
         &self,
-        attempt_id: &CloseAttemptId,
+        run: &CloseRunRef,
         scope: &WorkScopeId,
         failed_resource: Option<RetiredResourceIdentity>,
         captured_resources: Vec<RetiredResourceIdentity>,
         detail: &str,
     ) -> Result<T, String> {
+        let attempt_id = &run.attempt_id;
         let mut durable_remaining = self
             .db()
             .unresolved_expected_close_cleanup_resources(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        let authority_resource = failed_resource.clone().unwrap_or_else(|| {
+            opaque_resource(RetiredResourceKind::WorkScope, scope.as_str().to_string())
+        });
         let (authority, disposition) = match failed_resource {
             Some(resource) => (
-                CloseCleanupFailureAuthority::ObservedProcessResource { resource },
+                CloseCleanupFailureAuthority::ObservedProcessResource {
+                    scope: scope.clone(),
+                    resource,
+                },
                 CloseCleanupResourceDisposition::Failed,
             ),
             None => (
                 CloseCleanupFailureAuthority::CapturedScope {
+                    scope: scope.clone(),
                     resource: opaque_resource(
                         RetiredResourceKind::WorkScope,
                         scope.as_str().to_string(),
@@ -1955,9 +2641,12 @@ impl RuntimeManager {
         };
         let mut remaining_resources = vec![CloseCleanupFailureResource {
             scope: scope.clone(),
-            resource: authority.resource().clone(),
+            resource: authority_resource.clone(),
             disposition,
         }];
+        durable_remaining.retain(|remaining| {
+            remaining.scope != *scope || remaining.resource != authority_resource
+        });
         remaining_resources.append(&mut durable_remaining);
         for resource in captured_resources {
             if !remaining_resources
@@ -1971,12 +2660,11 @@ impl RuntimeManager {
                 });
             }
         }
-        self.append_live_process_remaining_resources(attempt_id, &mut remaining_resources)
-            .await;
-        Self::order_close_failure_resources(scope, authority.resource(), &mut remaining_resources);
+        self.append_live_process_remaining_resources(run, &mut remaining_resources)
+            .await?;
+        Self::order_close_failure_resources(scope, &authority_resource, &mut remaining_resources);
         self.terminalize_close_cleanup_failure(
-            attempt_id,
-            scope,
+            run,
             authority,
             remaining_resources,
             RetirementFailureReason::IdentityNotProven,
@@ -1993,7 +2681,57 @@ impl RuntimeManager {
         reason: RetirementFailureReason,
         detail: impl Into<String>,
     ) -> Result<T, String> {
+        self.route_close_run_to_repair(
+            &CloseRunRef::initial(attempt_id.clone()),
+            scope,
+            reason,
+            detail,
+        )
+        .await
+    }
+
+    async fn route_close_run_to_repair<T>(
+        &self,
+        run: &CloseRunRef,
+        scope: &WorkScopeId,
+        reason: RetirementFailureReason,
+        detail: impl Into<String>,
+    ) -> Result<T, String> {
         let detail = detail.into();
+        if run.ordinal != CloseRunOrdinal::INITIAL {
+            let progress = self
+                .db()
+                .close_safe_retry_progress(run)
+                .await
+                .map_err(|error| error.to_string())?;
+            let failed = progress
+                .pending
+                .iter()
+                .find(|effect| effect.scope == *scope)
+                .ok_or_else(|| {
+                    "retry repair has no exact pending effect in the scope".to_string()
+                })?;
+            let snapshot = self
+                .db()
+                .get_close_obligation(run.attempt_id.as_str())
+                .await
+                .map_err(|error| error.to_string())?
+                .snapshot()
+                .cloned()
+                .ok_or_else(|| "retry repair lacks original retirement snapshot".to_string())?;
+            return self
+                .terminalize_known_close_retry_failure(
+                    run,
+                    &snapshot,
+                    scope,
+                    failed.resource.clone(),
+                    reason,
+                    &detail,
+                    CloseStopCertainty::ShutdownUncertain,
+                )
+                .await;
+        }
+        let attempt_id = &run.attempt_id;
         let captured = self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
@@ -2019,6 +2757,7 @@ impl RuntimeManager {
         }
         .map_err(|error| error.to_string())?;
         let authority = CloseCleanupFailureAuthority::CapturedScope {
+            scope: scope.clone(),
             resource: residual.clone(),
         };
         let mut remaining_resources = self
@@ -2030,15 +2769,14 @@ impl RuntimeManager {
             .retain(|remaining| remaining.scope != *scope || remaining.resource != residual);
         remaining_resources.push(CloseCleanupFailureResource {
             scope: scope.clone(),
-            resource: residual,
+            resource: residual.clone(),
             disposition: CloseCleanupResourceDisposition::Failed,
         });
-        self.append_live_process_remaining_resources(attempt_id, &mut remaining_resources)
-            .await;
-        Self::order_close_failure_resources(scope, authority.resource(), &mut remaining_resources);
+        self.append_live_process_remaining_resources(run, &mut remaining_resources)
+            .await?;
+        Self::order_close_failure_resources(scope, &residual, &mut remaining_resources);
         self.terminalize_close_cleanup_failure(
-            attempt_id,
-            scope,
+            run,
             authority,
             remaining_resources,
             reason,
@@ -2048,27 +2786,91 @@ impl RuntimeManager {
         .await
     }
 
+    async fn terminalize_known_close_retry_failure<T>(
+        &self,
+        run: &CloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
+        scope: &WorkScopeId,
+        resource: RetiredResourceIdentity,
+        reason: RetirementFailureReason,
+        detail: &str,
+        stop_certainty: CloseStopCertainty,
+    ) -> Result<T, String> {
+        let progress = self
+            .db()
+            .close_safe_retry_progress(run)
+            .await
+            .map_err(|error| error.to_string())?;
+        let failed = CloseSafeRetryEffect {
+            scope: scope.clone(),
+            resource: resource.clone(),
+        };
+        if !progress.pending.contains(&failed) {
+            return Err("known retry failure is not an exact pending effect".into());
+        }
+        let remaining_resources = progress
+            .pending
+            .iter()
+            .map(|effect| CloseCleanupFailureResource {
+                scope: effect.scope.clone(),
+                resource: effect.resource.clone(),
+                disposition: if effect == &failed {
+                    CloseCleanupResourceDisposition::Failed
+                } else {
+                    CloseCleanupResourceDisposition::Unattempted
+                },
+            })
+            .collect();
+        self.terminalize_close_cleanup_failure(
+            run,
+            CloseCleanupFailureAuthority::ExpectedResource {
+                scope: scope.clone(),
+                snapshot: snapshot.clone(),
+                resource,
+            },
+            remaining_resources,
+            reason,
+            detail,
+            stop_certainty,
+        )
+        .await
+    }
+
     async fn record_close_residual<T>(
         &self,
-        attempt_id: &CloseAttemptId,
+        run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
         scope: &WorkScopeId,
         resource: RetiredResourceIdentity,
         reason: RetirementFailureReason,
         detail: &str,
     ) -> Result<T, String> {
+        if run.ordinal != CloseRunOrdinal::INITIAL {
+            return self
+                .terminalize_known_close_retry_failure(
+                    run,
+                    snapshot,
+                    scope,
+                    resource,
+                    reason,
+                    detail,
+                    CloseStopCertainty::ShutdownUncertain,
+                )
+                .await;
+        }
+        let attempt_id = &run.attempt_id;
         let mut remaining_resources = self
             .db()
             .expected_close_cleanup_failure_resources(attempt_id.as_str(), scope, &resource)
             .await
             .map_err(|error| error.to_string())?;
-        self.append_live_process_remaining_resources(attempt_id, &mut remaining_resources)
-            .await;
+        self.append_live_process_remaining_resources(run, &mut remaining_resources)
+            .await?;
         Self::order_close_failure_resources(scope, &resource, &mut remaining_resources);
         self.terminalize_close_cleanup_failure(
-            attempt_id,
-            scope,
+            run,
             CloseCleanupFailureAuthority::ExpectedResource {
+                scope: scope.clone(),
                 snapshot: snapshot.clone(),
                 resource,
             },
@@ -2082,25 +2884,41 @@ impl RuntimeManager {
 
     async fn record_close_cleanup_failure<T>(
         &self,
-        attempt_id: &CloseAttemptId,
+        run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
         scope: &WorkScopeId,
         resource: RetiredResourceIdentity,
         reason: RetirementFailureReason,
         detail: &str,
     ) -> Result<T, String> {
+        if run.ordinal != CloseRunOrdinal::INITIAL {
+            return self
+                .terminalize_known_close_retry_failure(
+                    run,
+                    snapshot,
+                    scope,
+                    resource,
+                    reason,
+                    detail,
+                    CloseStopCertainty::ConversationAndProcessesStopped {
+                        confirmed_at_us: chrono::Utc::now().timestamp_micros(),
+                    },
+                )
+                .await;
+        }
+        let attempt_id = &run.attempt_id;
         let mut remaining_resources = self
             .db()
             .expected_close_cleanup_failure_resources(attempt_id.as_str(), scope, &resource)
             .await
             .map_err(|error| error.to_string())?;
-        self.append_live_process_remaining_resources(attempt_id, &mut remaining_resources)
-            .await;
+        self.append_live_process_remaining_resources(run, &mut remaining_resources)
+            .await?;
         Self::order_close_failure_resources(scope, &resource, &mut remaining_resources);
         self.terminalize_close_cleanup_failure(
-            attempt_id,
-            scope,
+            run,
             CloseCleanupFailureAuthority::ExpectedResource {
+                scope: scope.clone(),
                 snapshot: snapshot.clone(),
                 resource,
             },
@@ -2117,22 +2935,20 @@ impl RuntimeManager {
     #[allow(clippy::too_many_arguments)]
     async fn terminalize_close_cleanup_failure<T>(
         &self,
-        attempt_id: &CloseAttemptId,
-        scope: &WorkScopeId,
+        run: &CloseRunRef,
         authority: CloseCleanupFailureAuthority,
         remaining_resources: Vec<CloseCleanupFailureResource>,
         reason: RetirementFailureReason,
         detail: &str,
         stop_certainty: CloseStopCertainty,
     ) -> Result<T, String> {
+        let attempt_id = &run.attempt_id;
         let obligation = self
             .db()
             .get_close_obligation(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
-        let failure_occurrence_id =
-            phoenix_core::domain::close::CloseRunRef::initial(attempt_id.clone())
-                .failure_occurrence_id();
+        let failure_occurrence_id = run.failure_occurrence_id();
         let persisted_timing = self
             .db()
             .close_cleanup_failure_timing(&failure_occurrence_id)
@@ -2148,23 +2964,26 @@ impl RuntimeManager {
             ) => CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us },
             (certainty, _) => certainty,
         };
-        self.commit_close_cleanup_failure(&TerminalizeInitialCloseCleanupFailureRequest {
-            failure_occurrence_id,
-            attempt_id: attempt_id.clone(),
-            source_product_conversation_id: obligation.product_conversation_id().clone(),
-            scope: scope.clone(),
-            authority,
-            remaining_resources,
-            reason,
-            detail: detail.to_string(),
-            stop_certainty,
-            occurred_at_us,
-        })
+        self.commit_close_cleanup_failure(
+            run,
+            &TerminalizeInitialCloseCleanupFailureRequest {
+                failure_occurrence_id,
+                attempt_id: attempt_id.clone(),
+                source_product_conversation_id: obligation.product_conversation_id().clone(),
+                authority,
+                remaining_resources,
+                reason,
+                detail: detail.to_string(),
+                stop_certainty,
+                occurred_at_us,
+            },
+        )
         .await
     }
 
     async fn commit_close_cleanup_failure<T>(
         &self,
+        run: &CloseRunRef,
         request: &TerminalizeInitialCloseCleanupFailureRequest,
     ) -> Result<T, String> {
         let broadcasters = self
@@ -2172,7 +2991,7 @@ impl RuntimeManager {
             .await?;
         let completed = self
             .db()
-            .terminalize_initial_close_cleanup_failure(request)
+            .terminalize_close_run_cleanup_failure(run, request)
             .await
             .map_err(|error| error.to_string())?;
         self.discard_close_resource_leases(&request.attempt_id)
@@ -2190,30 +3009,88 @@ impl RuntimeManager {
         Err(request.detail.clone())
     }
 
+    async fn persist_close_process_step(
+        &self,
+        run: &CloseRunRef,
+        scope: &WorkScopeId,
+        resource_kind: CloseProcessResourceKind,
+        identities: Vec<String>,
+        outcome: CloseProcessStepOutcome,
+    ) -> Result<(), CloseLeaseFailure> {
+        let observed_at_us = chrono::Utc::now().timestamp_micros();
+        for identity in identities {
+            self.db()
+                .record_close_process_step_success(&CloseProcessStepSuccess {
+                    run: run.clone(),
+                    scope: scope.clone(),
+                    resource_kind,
+                    identity: OpaqueIdentity::parse(identity)
+                        .expect("registry stable instance identity is non-empty"),
+                    outcome,
+                    observed_at_us,
+                })
+                .await
+                .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Completes one live lease.
+    #[allow(clippy::too_many_lines)]
     async fn complete_close_resource_lease(
         &self,
-        attempt_id: &CloseAttemptId,
+        run: &CloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
         scope: &WorkScopeId,
-    ) -> Result<Vec<CompletedCloseResource>, CloseLeaseFailure> {
-        let key = (attempt_id.as_str().to_string(), scope.clone());
+        expected: &[RetiredResourceIdentity],
+    ) -> Result<(), CloseLeaseFailure> {
+        let key = (run.attempt_id.as_str().to_string(), scope.clone());
         let lease = self.close_retirement_leases.lock().await.remove(&key);
         let Some(lease) = lease else {
             return Err(CloseLeaseFailure::Unavailable);
         };
         let result = async {
+            let prior_process_successes = self
+                .db()
+                .list_close_process_step_successes(run)
+                .await
+                .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
+            if expected.iter().any(|resource| {
+                resource.kind() != RetiredResourceKind::TmuxServer
+                    || !lease.resources.contains(resource)
+            }) {
+                return Err(CloseLeaseFailure::Tmux {
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail: "live Close lease differs from sealed unresolved inventory".to_string(),
+                });
+            }
+            let bash_identities = lease
+                .bash
+                .exact_process_groups
+                .iter()
+                .map(phoenix_tools::bash::registry::BashRetirementTarget::stable_resource_identity)
+                .collect::<Vec<_>>();
+            if !process_step_successes_cover(
+                &prior_process_successes,
+                scope,
+                CloseProcessResourceKind::BashProcessGroup,
+                &bash_identities,
+            ) {
             let bash_outcome = self.bash_handles().complete_retirement(&lease.bash).await;
+            let bash_generation_is_stale =
+                matches!(&bash_outcome, BashRetirementOutcome::StaleGeneration(_));
             let failed_bash_resources = lease
                 .bash
                 .exact_process_groups
                 .iter()
                 .filter(|target| {
-                    bash_outcome.report().kill_failures.iter().any(|(pid, _)| {
+                    bash_generation_is_stale
+                        || bash_outcome.report().kill_failures.iter().any(|(pid, _)| {
                         *pid == target.pgid
                             || u32::try_from(*pid)
                                 .ok()
                                 .is_some_and(|pid| target.pid == Some(pid))
-                    })
+                        })
                 })
                 .map(|target| {
                     opaque_resource(
@@ -2222,13 +3099,39 @@ impl RuntimeManager {
                     )
                 })
                 .collect();
-            require_absent(bash_outcome).map_err(|reason| {
+            let bash_success = require_absent(bash_outcome).map_err(|reason| {
                 CloseLeaseFailure::process_epoch(
                     RetiredResourceKind::BashProcessGroup,
                     failed_bash_resources,
                     reason,
                 )
             })?;
+            self.persist_close_process_step(
+                run,
+                scope,
+                CloseProcessResourceKind::BashProcessGroup,
+                bash_identities,
+                bash_success,
+            )
+            .await?;
+            }
+            let retired = self
+                .db()
+                .list_close_retirement_evidence(run.attempt_id.as_str())
+                .await
+                .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
+            let tmux_already_complete = expected.iter().all(|resource| {
+                retired.iter().any(|proof| {
+                    proof.scope == *scope
+                        && proof.resource == *resource
+                        && matches!(
+                            proof.outcome,
+                            RetirementOutcome::Retired
+                                | RetirementOutcome::AbsenceAdopted { .. }
+                        )
+                })
+            });
+            if !tmux_already_complete {
             let tmux_outcome = self
                 .tmux_registry()
                 .complete_retirement(&lease.tmux)
@@ -2239,20 +3142,70 @@ impl RuntimeManager {
                 })?;
             let tmux_outcome = tmux_retirement_outcome(tmux_outcome)
                 .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?;
-            require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)
-                .map_err(|reason| {
-                    CloseLeaseFailure::process_epoch(
-                        RetiredResourceKind::PtySession,
-                        lease
-                            .resources
-                            .iter()
-                            .filter(|resource| resource.kind() == RetiredResourceKind::PtySession)
-                            .cloned()
-                            .collect(),
-                        reason,
-                    )
-                })?;
-            require_browser_absent(
+            for resource in expected {
+                self.db()
+                    .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                        attempt_id: run.attempt_id.clone(),
+                        snapshot: snapshot.clone(),
+                        scope: scope.clone(),
+                        resource: resource.clone(),
+                        outcome: tmux_outcome.clone(),
+                        detail: Some("exact registry permit retirement".to_string()),
+                    })
+                    .await
+                    .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
+            }
+            }
+            let terminal_identities = lease
+                .terminal
+                .instance
+                .iter()
+                .map(phoenix_terminal::session::TerminalInstanceIdentity::stable_identity)
+                .collect::<Vec<_>>();
+            if !process_step_successes_cover(
+                &prior_process_successes,
+                scope,
+                CloseProcessResourceKind::PtySession,
+                &terminal_identities,
+            ) {
+            let terminal_success =
+                require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)
+                    .map_err(|reason| {
+                        CloseLeaseFailure::process_epoch(
+                            RetiredResourceKind::PtySession,
+                            lease
+                                .resources
+                                .iter()
+                                .filter(|resource| {
+                                    resource.kind() == RetiredResourceKind::PtySession
+                                })
+                                .cloned()
+                                .collect(),
+                            reason,
+                        )
+                    })?;
+            self.persist_close_process_step(
+                run,
+                scope,
+                CloseProcessResourceKind::PtySession,
+                terminal_identities,
+                terminal_success,
+            )
+            .await?;
+            }
+            let browser_identities = lease
+                .browser
+                .instances
+                .iter()
+                .map(phoenix_tools::browser::session::BrowserSessionInstanceIdentity::stable_identity)
+                .collect::<Vec<_>>();
+            if !process_step_successes_cover(
+                &prior_process_successes,
+                scope,
+                CloseProcessResourceKind::BrowserSession,
+                &browser_identities,
+            ) {
+            let browser_success = require_browser_absent(
                 self.browser_sessions()
                     .complete_retirement(&lease.browser)
                     .await,
@@ -2269,19 +3222,16 @@ impl RuntimeManager {
                     reason,
                 )
             })?;
-            Ok(lease
-                .resources
-                .iter()
-                .cloned()
-                .map(|identity| CompletedCloseResource {
-                    outcome: if identity.kind() == RetiredResourceKind::TmuxServer {
-                        tmux_outcome.clone()
-                    } else {
-                        RetirementOutcome::Retired
-                    },
-                    identity,
-                })
-                .collect())
+            self.persist_close_process_step(
+                run,
+                scope,
+                CloseProcessResourceKind::BrowserSession,
+                browser_identities,
+                browser_success,
+            )
+            .await?;
+            }
+            Ok(())
         }
         .await;
         self.close_retirement_leases.lock().await.insert(key, lease);
@@ -3779,7 +4729,31 @@ fn resume_final_worktree_tombstone(
                         #[cfg(not(unix))]
                         unreachable!()
                     }
-                    (false, false) => return FinalTombstoneRecovery::Completed,
+                    (false, false) => {
+                        let mut object_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                        // SAFETY: root_fd is a verified owned directory descriptor, name is a valid C string,
+                        // and object_stat points to writable storage.
+                        let status = unsafe {
+                            libc::fstatat(
+                                root_fd.as_raw_fd(),
+                                name.as_ptr(),
+                                object_stat.as_mut_ptr(),
+                                libc::AT_SYMLINK_NOFOLLOW,
+                            )
+                        };
+                        if status == 0 {
+                            return FinalTombstoneRecovery::Residual(
+                                "unbound object remains inside the exact final tombstone root; preserved for manual repair".to_string(),
+                            );
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::ENOENT) {
+                            return FinalTombstoneRecovery::Completed;
+                        }
+                        return FinalTombstoneRecovery::Residual(format!(
+                            "cannot inspect unbound final tombstone object: {error}"
+                        ));
+                    }
                     (true, true) => {
                         return FinalTombstoneRecovery::Residual(
                             "captured and quarantined worktree paths are both present during final tombstone recovery; preserved for manual repair".to_string(),
@@ -5375,12 +6349,16 @@ fn opaque_resource(kind: RetiredResourceKind, value: String) -> RetiredResourceI
     .expect("registry resource kind accepts opaque stable identity")
 }
 
-fn require_absent(outcome: BashRetirementOutcome) -> Result<(), String> {
+fn require_absent(outcome: BashRetirementOutcome) -> Result<CloseProcessStepOutcome, String> {
     match outcome {
-        BashRetirementOutcome::Retired(report) | BashRetirementOutcome::AbsenceVerified(report)
-            if report.kill_failures.is_empty() =>
-        {
-            Ok(())
+        BashRetirementOutcome::StaleGeneration(_) => {
+            Err("bash retirement generation is stale".to_string())
+        }
+        BashRetirementOutcome::Retired(report) if report.kill_failures.is_empty() => {
+            Ok(CloseProcessStepOutcome::Retired)
+        }
+        BashRetirementOutcome::AbsenceVerified(report) if report.kill_failures.is_empty() => {
+            Ok(CloseProcessStepOutcome::AbsenceVerified)
         }
         BashRetirementOutcome::Retired(report) | BashRetirementOutcome::AbsenceVerified(report) => {
             Err(format!(
@@ -5408,16 +6386,22 @@ fn tmux_retirement_outcome(
     }
 }
 
-fn require_terminal_absent(outcome: TerminalRetirementOutcome) -> Result<(), String> {
+fn require_terminal_absent(
+    outcome: TerminalRetirementOutcome,
+) -> Result<CloseProcessStepOutcome, String> {
     match outcome {
-        TerminalRetirementOutcome::Retired | TerminalRetirementOutcome::AbsenceVerified => Ok(()),
+        TerminalRetirementOutcome::Retired => Ok(CloseProcessStepOutcome::Retired),
+        TerminalRetirementOutcome::AbsenceVerified => Ok(CloseProcessStepOutcome::AbsenceVerified),
         TerminalRetirementOutcome::Residual { reason } => Err(reason),
     }
 }
 
-fn require_browser_absent(outcome: BrowserRetirementOutcome) -> Result<(), String> {
+fn require_browser_absent(
+    outcome: BrowserRetirementOutcome,
+) -> Result<CloseProcessStepOutcome, String> {
     match outcome {
-        BrowserRetirementOutcome::Retired | BrowserRetirementOutcome::AbsenceVerified => Ok(()),
+        BrowserRetirementOutcome::Retired => Ok(CloseProcessStepOutcome::Retired),
+        BrowserRetirementOutcome::AbsenceVerified => Ok(CloseProcessStepOutcome::AbsenceVerified),
         BrowserRetirementOutcome::Residual { reason } => Err(reason),
     }
 }
@@ -5437,7 +6421,7 @@ mod tests {
         staged_index_entries_by_path, staged_index_entries_for_paths, worktree_quarantine_path,
         CloseLeaseFailure, ExactWorktreeRemoval, FinalTombstoneRecovery,
     };
-    use crate::db::CloseWorktreeFinalTombstone;
+    use crate::db::{CloseCleanupResourceDisposition, CloseWorktreeFinalTombstone};
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
@@ -5445,6 +6429,88 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::io::{BufRead as _, Read as _};
     use std::path::Path;
+
+    #[test]
+    fn empty_process_identity_sets_require_fresh_registry_absence_verification() {
+        let scope = phoenix_core::work_scope::WorkScopeId::parse("empty-process-scope").unwrap();
+        assert!(!super::process_step_successes_cover(
+            &[],
+            &scope,
+            crate::db::CloseProcessResourceKind::BashProcessGroup,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn safe_retry_plan_rejects_process_equivalent_unknown_and_duplicate_effects() {
+        use crate::db::{
+            CloseCleanupFailureResource, CloseCleanupResourceDisposition as Disposition,
+        };
+        use phoenix_core::domain::close::RetiredResourceKind as Kind;
+        let scope = phoenix_core::work_scope::WorkScopeId::parse("retry-scope").unwrap();
+        let target = CloseCleanupFailureResource {
+            scope: scope.clone(),
+            resource: super::opaque_resource(Kind::WorkScope, scope.as_str().to_string()),
+            disposition: Disposition::Failed,
+        };
+        assert!(super::close_safe_retry_effects(&[]).is_err());
+        assert_eq!(
+            super::close_safe_retry_effects(std::slice::from_ref(&target)).unwrap()[0].resource,
+            target.resource
+        );
+        assert!(super::close_safe_retry_effects(&[target.clone(), target.clone()]).is_err());
+        let mut unknown = target.clone();
+        unknown.disposition = Disposition::Unknown;
+        assert!(super::close_safe_retry_effects(&[unknown]).is_err());
+        for kind in [
+            Kind::BashProcessGroup,
+            Kind::PtySession,
+            Kind::BrowserSession,
+            Kind::EquivalentLiveResource,
+        ] {
+            let process = CloseCleanupFailureResource {
+                resource: super::opaque_resource(kind, format!("process-{kind:?}")),
+                ..target.clone()
+            };
+            assert!(super::close_safe_retry_effects(&[process]).is_err());
+        }
+    }
+
+    #[test]
+    fn safe_retry_executes_tmux_and_worktree_before_scope_despite_failure_child_order() {
+        use phoenix_core::domain::close::{
+            LossItemIdentity, RetiredResourceIdentity, RetiredResourceKind as Kind,
+        };
+        let scope = phoenix_core::work_scope::WorkScopeId::parse("retry-scope").unwrap();
+        let worktree = RetiredResourceIdentity::parse(
+            Kind::Worktree,
+            LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+                WorktreeId::parse("retry-worktree").unwrap(),
+                WorktreeFingerprint::parse("original-incarnation").unwrap(),
+                GitPathIdentity::from_bytes(b"/tmp/retry-worktree".to_vec()),
+            )),
+        )
+        .unwrap();
+        let effect = |resource| crate::db::CloseSafeRetryEffect {
+            scope: scope.clone(),
+            resource,
+        };
+        let plan = [
+            effect(super::opaque_resource(
+                Kind::WorkScope,
+                scope.as_str().to_string(),
+            )),
+            effect(worktree),
+            effect(super::opaque_resource(
+                Kind::TmuxServer,
+                "persisted-tmux".into(),
+            )),
+        ];
+        assert_eq!(
+            super::close_safe_retry_execution_order(&plan),
+            vec![2, 1, 0]
+        );
+    }
 
     async fn assert_close_admission_fenced(
         manager: &super::RuntimeManager,
@@ -5760,7 +6826,7 @@ mod tests {
             .execute(db.pool()).await.unwrap();
         let error = manager
             .record_close_cleanup_failure::<()>(
-                &attempt_id,
+                &super::CloseRunRef::initial(attempt_id.clone()),
                 &snapshot,
                 &scope,
                 resource.clone(),
@@ -5792,7 +6858,7 @@ mod tests {
             assert_eq!(
                 manager
                     .record_close_cleanup_failure::<()>(
-                        &attempt_id,
+                        &super::CloseRunRef::initial(attempt_id.clone()),
                         &snapshot,
                         &scope,
                         resource.clone(),
@@ -5955,7 +7021,7 @@ mod tests {
             assert_eq!(
                 manager
                     .record_close_process_failure::<()>(
-                        &attempt_id,
+                        &super::CloseRunRef::initial(attempt_id.clone()),
                         &scope,
                         failed.clone(),
                         candidates,
@@ -5981,9 +7047,11 @@ mod tests {
                 occurrence.authority,
                 match &failed {
                     Some(resource) => CloseCleanupFailureAuthority::ObservedProcessResource {
+                        scope: scope.clone(),
                         resource: resource.clone()
                     },
                     None => CloseCleanupFailureAuthority::CapturedScope {
+                        scope: scope.clone(),
                         resource: authority_resource.clone()
                     },
                 }
@@ -6040,6 +7108,497 @@ mod tests {
             ));
             assert!(manager.close_retirement_leases.lock().await.is_empty());
         }
+    }
+
+    struct ProcessStepFixture {
+        manager: super::RuntimeManager,
+        run: super::CloseRunRef,
+        scopes: Vec<super::WorkScopeId>,
+        bash: Vec<super::RetiredResourceIdentity>,
+        sockets: Vec<std::path::PathBuf>,
+        fake: std::sync::Arc<phoenix_tools::tmux::fake_backend::FakeTmuxBackend>,
+        terminal: std::sync::Arc<phoenix_terminal::session::TerminalHandle>,
+        _relay: tokio::sync::OwnedSemaphorePermit,
+        _socket_dir: tempfile::TempDir,
+    }
+
+    impl Drop for ProcessStepFixture {
+        fn drop(&mut self) {
+            // The fixture retains relay authority, so Close cannot reap this child.
+            let _ =
+                nix::sys::signal::kill(self.terminal.child_pid, nix::sys::signal::Signal::SIGKILL);
+            let child_pid = self.terminal.child_pid;
+            if matches!(
+                nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+                Ok(nix::sys::wait::WaitStatus::StillAlive)
+            ) {
+                // PTY master fds are dropped after this fixture's Drop returns.
+                std::thread::spawn(move || {
+                    let _ = nix::sys::wait::waitpid(child_pid, None);
+                });
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn process_step_fixture(two_scopes: bool) -> ProcessStepFixture {
+        use super::*;
+        use phoenix_core::domain::close::TranscriptConversationId;
+        use phoenix_terminal::{
+            session::Dims,
+            spawn::{spawn_pty, PtyExecPlan},
+        };
+        use phoenix_tools::bash::handle::{FinalCause, Handle};
+        use std::sync::Arc;
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("process-steps", "process-steps", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut scopes = vec![source.attached_work_scope_id.clone().unwrap()];
+        let mut latest_id = source.id.clone();
+        if two_scopes {
+            db.update_conversation_state(
+                &source.id,
+                &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+                    summary: "continue".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let crate::db::ContinueOutcome::Created(latest) =
+                db.continue_conversation(&source.id).await.unwrap()
+            else {
+                panic!("expected continuation");
+            };
+            let later_scope = WorkScopeId::parse("z-process-step-later-scope").unwrap();
+            sqlx::query("INSERT INTO work_scopes (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at) SELECT ?1, 'work', 'active', 'unowned_cwd', '/tmp', created_at, updated_at FROM work_scopes WHERE id=?2")
+                .bind(later_scope.as_str()).bind(scopes[0].as_str()).execute(db.pool()).await.unwrap();
+            sqlx::query("UPDATE conversations SET work_scope_id=?1 WHERE id=?2")
+                .bind(later_scope.as_str())
+                .bind(&latest.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            scopes.push(later_scope);
+            latest_id = latest.id;
+        }
+        scopes.sort();
+        let run = CloseRunRef::initial(CloseAttemptId::parse("process-step-run").unwrap());
+        db.begin_close_foundation(
+            &source.product_conversation_id,
+            &TranscriptConversationId::parse(latest_id).unwrap(),
+            run.attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work(run.attempt_id.as_str())
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement(run.attempt_id.as_str())
+            .await
+            .unwrap();
+        db.advance_close_settlement_when_quiescent(run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let fake = phoenix_tools::tmux::fake_backend::FakeTmuxBackend::new();
+        let mut manager = RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::platform::PlatformCapability::None {
+                details: "process step tests".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        );
+        manager.tmux_registry =
+            Arc::new(phoenix_tools::tmux::registry::TmuxRegistry::with_backend(
+                socket_dir.path().to_path_buf(),
+                fake.clone(),
+                None,
+            ));
+        let mut children = Vec::new();
+        let mut sockets = Vec::new();
+        for scope in &scopes {
+            let key = ResourceScopeKey::Work(scope.clone());
+            let child = tokio::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            let mut reservation = manager.bash_handles().reserve_spawn(&key).await.unwrap();
+            let handle = Handle::new_live(
+                key.clone(),
+                reservation.handle_id().clone(),
+                "sleep 60".into(),
+                None,
+                PathBuf::from("/tmp"),
+                i32::try_from(pid).unwrap(),
+                pid,
+                1024,
+            );
+            manager
+                .bash_handles()
+                .commit_spawn(&mut reservation, handle.clone())
+                .await
+                .unwrap();
+            children.push((child, handle));
+            let server = manager
+                .tmux_registry()
+                .ensure_live(&key, Path::new("/tmp"), None, None)
+                .await
+                .unwrap();
+            sockets.push(server.read().await.socket_path.clone());
+        }
+        let terminal_scope = ResourceScopeKey::Work(scopes.last().unwrap().clone());
+        let terminal = manager
+            .terminals
+            .try_insert_exact(
+                terminal_scope.clone(),
+                tokio::task::spawn_blocking(|| {
+                    spawn_pty(
+                        Path::new("/tmp"),
+                        Dims::try_new(80, 24).unwrap(),
+                        PtyExecPlan::Shell,
+                    )
+                    .unwrap()
+                })
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+        let relay = terminal
+            .attach_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let snapshot = manager
+            .inspect_close_retirement_only(run.attempt_id.clone())
+            .await
+            .unwrap();
+        manager
+            .capture_close_retirement_inventory(run.attempt_id.clone(), snapshot)
+            .await
+            .unwrap();
+        let mut leases = manager.close_retirement_leases.lock().await;
+        let bash = scopes
+            .iter()
+            .map(|scope| {
+                leases[&(run.attempt_id.as_str().to_string(), scope.clone())]
+                    .resources
+                    .iter()
+                    .find(|resource| resource.kind() == RetiredResourceKind::BashProcessGroup)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        leases
+            .get_mut(&(
+                run.attempt_id.as_str().to_string(),
+                scopes.last().unwrap().clone(),
+            ))
+            .unwrap()
+            .terminal = manager
+            .terminals
+            .begin_retirement_by(&terminal_scope, tokio::time::Instant::now());
+        drop(leases);
+        for (mut child, handle) in children {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+            handle
+                .transition_to_terminal(
+                    FinalCause::Killed {
+                        exit_code: None,
+                        signal_number: Some(libc::SIGKILL),
+                    },
+                    std::time::Duration::ZERO,
+                    std::time::SystemTime::now(),
+                    0,
+                )
+                .await;
+        }
+        ProcessStepFixture {
+            manager,
+            run,
+            scopes,
+            bash,
+            sockets,
+            fake,
+            terminal,
+            _relay: relay,
+            _socket_dir: socket_dir,
+        }
+    }
+
+    async fn assert_process_step_successes(fixture: &ProcessStepFixture, expected: usize) {
+        let successes = fixture
+            .manager
+            .db()
+            .list_close_process_step_successes(&fixture.run)
+            .await
+            .unwrap();
+        assert_eq!(successes.len(), expected, "{successes:?}");
+        for (scope, bash) in fixture.scopes.iter().zip(&fixture.bash).take(expected) {
+            assert!(successes.iter().any(|success| success.run == fixture.run
+                && success.scope == *scope
+                && success.resource_kind == super::CloseProcessResourceKind::BashProcessGroup
+                && super::LossItemIdentity::Opaque(success.identity.clone()) == *bash.identity()
+                && success.outcome == super::CloseProcessStepOutcome::Retired));
+        }
+    }
+
+    async fn assert_process_step_failure_omits_successes(fixture: &ProcessStepFixture) {
+        let failures = fixture
+            .manager
+            .db()
+            .list_close_cleanup_failures(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].occurrence.failure_occurrence_id,
+            fixture.run.failure_occurrence_id()
+        );
+        for bash in &fixture.bash {
+            assert!(!failures[0]
+                .occurrence
+                .remaining_resources
+                .iter()
+                .any(|remaining| remaining.resource == *bash));
+        }
+    }
+
+    #[tokio::test]
+    async fn process_step_stale_bash_generation_cannot_mint_success() {
+        let fixture = process_step_fixture(false).await;
+        let key = super::ResourceScopeKey::Work(fixture.scopes[0].clone());
+        let _newer = fixture.manager.bash_handles().begin_retirement(&key).await;
+        let error = fixture
+            .manager
+            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("generation is stale"), "{error}");
+        assert_process_step_successes(&fixture, 0).await;
+        let failures = fixture
+            .manager
+            .db()
+            .list_close_cleanup_failures(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(failures[0]
+            .occurrence
+            .remaining_resources
+            .iter()
+            .any(|item| item.resource == fixture.bash[0]
+                && item.disposition == CloseCleanupResourceDisposition::Failed));
+        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 0);
+        assert_eq!(
+            *fixture.terminal.stop_tx.borrow(),
+            phoenix_terminal::session::StopReason::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn process_step_bash_success_survives_tmux_failure() {
+        let fixture = process_step_fixture(false).await;
+        fixture.fake.stall(
+            &fixture.sockets[0],
+            phoenix_tools::tmux::fake_backend::Stall::AfterProbe,
+        );
+        let error = fixture
+            .manager
+            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("tmux"), "{error}");
+        assert_process_step_successes(&fixture, 1).await;
+        assert_process_step_failure_omits_successes(&fixture).await;
+        assert_eq!(
+            *fixture.terminal.stop_tx.borrow(),
+            phoenix_terminal::session::StopReason::Running
+        );
+        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 0);
+    }
+
+    #[tokio::test]
+    async fn process_step_bash_and_tmux_success_survive_pty_failure() {
+        let fixture = process_step_fixture(false).await;
+        let error = fixture
+            .manager
+            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("terminal relay"), "{error}");
+        assert_process_step_successes(&fixture, 1).await;
+        assert_process_step_failure_omits_successes(&fixture).await;
+        let evidence = fixture
+            .manager
+            .db()
+            .list_close_retirement_evidence(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(evidence
+            .iter()
+            .any(|evidence| evidence.scope == fixture.scopes[0]
+                && evidence.resource.kind() == super::RetiredResourceKind::TmuxServer
+                && evidence.outcome == super::RetirementOutcome::Retired));
+        let failures = fixture
+            .manager
+            .db()
+            .list_close_cleanup_failures(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(!failures[0]
+            .occurrence
+            .remaining_resources
+            .iter()
+            .any(|resource| resource.resource.kind() == super::RetiredResourceKind::TmuxServer));
+        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 1);
+    }
+
+    #[tokio::test]
+    async fn process_step_earlier_scope_success_survives_later_scope_failure() {
+        let fixture = process_step_fixture(true).await;
+        fixture.fake.stall(
+            &fixture.sockets[1],
+            phoenix_tools::tmux::fake_backend::Stall::AfterProbe,
+        );
+        let error = fixture
+            .manager
+            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("tmux"), "{error}");
+        assert_process_step_successes(&fixture, 2).await;
+        assert_process_step_failure_omits_successes(&fixture).await;
+        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 1);
+        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[1]), 0);
+        assert_eq!(
+            *fixture.terminal.stop_tx.borrow(),
+            phoenix_terminal::session::StopReason::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn process_step_persistence_failure_stops_before_next_registry() {
+        for fail_tmux_evidence in [false, true] {
+            let fixture = process_step_fixture(false).await;
+            let trigger = if fail_tmux_evidence {
+                "CREATE TRIGGER reject_step_success BEFORE INSERT ON close_retirement_resources BEGIN SELECT RAISE(ABORT, 'injected step persistence failure'); END"
+            } else {
+                "CREATE TRIGGER reject_step_success BEFORE INSERT ON close_process_step_successes BEGIN SELECT RAISE(ABORT, 'injected step persistence failure'); END"
+            };
+            sqlx::query(trigger)
+                .execute(fixture.manager.db().pool())
+                .await
+                .unwrap();
+            let error = fixture
+                .manager
+                .retire_close_runtime_resources(fixture.run.attempt_id.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("injected step persistence failure"),
+                "{error}"
+            );
+            assert_process_step_successes(&fixture, usize::from(fail_tmux_evidence)).await;
+            assert_eq!(
+                fixture.fake.kill_server_count(&fixture.sockets[0]),
+                usize::from(fail_tmux_evidence)
+            );
+            assert_eq!(
+                *fixture.terminal.stop_tx.borrow(),
+                phoenix_terminal::session::StopReason::Running
+            );
+            assert!(fixture
+                .manager
+                .db()
+                .list_close_cleanup_failures(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn process_step_successes_survive_failure_transaction_rollback() {
+        let fixture = process_step_fixture(false).await;
+        sqlx::query("CREATE TRIGGER reject_step_failure_event BEFORE INSERT ON coordinator_watch_events BEGIN SELECT RAISE(ABORT, 'injected failure transaction rollback'); END")
+            .execute(fixture.manager.db().pool()).await.unwrap();
+        let error = fixture
+            .manager
+            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("injected failure transaction rollback"),
+            "{error}"
+        );
+        assert_process_step_successes(&fixture, 1).await;
+        let evidence = fixture
+            .manager
+            .db()
+            .list_close_retirement_evidence(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].resource.kind(),
+            super::RetiredResourceKind::TmuxServer
+        );
+        assert!(fixture
+            .manager
+            .db()
+            .list_close_cleanup_failures(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                .fetch_one(fixture.manager.db().pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            fixture.manager.close_retirement_leases.lock().await.len(),
+            1
+        );
+        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 1);
+        sqlx::query("DROP TRIGGER reject_step_failure_event")
+            .execute(fixture.manager.db().pool())
+            .await
+            .unwrap();
+        let obligation = fixture
+            .manager
+            .db()
+            .get_close_obligation(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let snapshot = obligation.snapshot().unwrap().clone();
+        let expected = fixture
+            .manager
+            .db()
+            .list_close_expected_retirement_resources(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|target| target.scope == fixture.scopes[0])
+            .map(|target| target.resource)
+            .collect::<Vec<_>>();
+        let replay = fixture
+            .manager
+            .complete_close_resource_lease(&fixture.run, &snapshot, &fixture.scopes[0], &expected)
+            .await;
+        assert!(!format!("{replay:?}").contains("process step success payload mismatch"));
+        assert_process_step_successes(&fixture, 1).await;
+        assert_close_admission_fenced(&fixture.manager, &fixture.scopes[0]).await;
     }
 
     #[test]
@@ -6690,6 +8249,34 @@ mod tests {
         ));
         assert!(!target.exists());
         assert!(!recorded.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_final_tombstone_root_only_preserves_unbound_object() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        initialize_repository(&target);
+        let identity = inspection_identity(&target);
+        let root = temp.path().join("private-tombstone");
+        std::fs::create_dir(&root).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        let recorded = CloseWorktreeFinalTombstone {
+            root,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            object_device: None,
+            object_inode: None,
+        };
+        std::fs::rename(&target, recorded.root.join("object")).unwrap();
+
+        assert!(matches!(
+            resume_final_worktree_tombstone(&recorded, &identity),
+            FinalTombstoneRecovery::Residual(detail) if detail.contains("unbound object remains")
+        ));
+        assert!(recorded.root.join("object").exists());
     }
 
     #[cfg(unix)]

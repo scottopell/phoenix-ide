@@ -1,7 +1,9 @@
 use std::{fmt::Write as _, sync::Arc};
 
 use phoenix_core::domain::db_schema::InputOrigin;
-use phoenix_db::{CloseFailureStop, PendingWatchEvent, WatchEventRoute};
+use phoenix_db::{
+    CloseFailureStop, MandatoryCloseFailureSubject, PendingWatchEvent, WatchEventRoute,
+};
 
 use crate::runtime::RuntimeManager;
 use crate::send_chat_service::{
@@ -31,20 +33,32 @@ fn notification(event: &PendingWatchEvent) -> String {
     if let WatchEventRoute::MandatoryCloseFailure {
         run_ordinal,
         remaining_resources,
-        scope,
-        resource_kind,
-        identity_kind,
-        identity_codec,
-        identity_value,
+        subject,
         detail,
         stop,
     } = &event.route
     {
-        let _ = write!(
-            text,
-            " Cleanup run ordinal: {}. Failed resource — Scope: {scope}. Resource kind: {resource_kind}. Identity ({identity_kind}, {identity_codec}): {identity_value}. Detail: {detail}.",
-            run_ordinal.get(),
-        );
+        let _ = write!(text, " Cleanup run ordinal: {}.", run_ordinal.get());
+        match subject {
+            MandatoryCloseFailureSubject::Attempt => {
+                text.push_str(
+                    " Failure subject: Close attempt interruption with no captured resource.",
+                );
+            }
+            MandatoryCloseFailureSubject::Resource {
+                scope,
+                resource_kind,
+                identity_kind,
+                identity_codec,
+                identity_value,
+            } => {
+                let _ = write!(
+                    text,
+                    " Failed resource — Scope: {scope}. Resource kind: {resource_kind}. Identity ({identity_kind}, {identity_codec}): {identity_value}."
+                );
+            }
+        }
+        let _ = write!(text, " Detail: {detail}.");
         match stop {
             CloseFailureStop::ConversationAndProcessesStopped {
                 confirmed_at_unix_us,
@@ -142,11 +156,13 @@ mod tests {
             route: WatchEventRoute::MandatoryCloseFailure {
                 run_ordinal: phoenix_core::domain::close::CloseRunOrdinal::parse(2).unwrap(),
                 remaining_resources: Vec::new(),
-                scope: "scope-1".into(),
-                resource_kind: "worktree".into(),
-                identity_kind: "path".into(),
-                identity_codec: "utf8".into(),
-                identity_value: "/preserved/worktree".into(),
+                subject: MandatoryCloseFailureSubject::Resource {
+                    scope: "scope-1".into(),
+                    resource_kind: "worktree".into(),
+                    identity_kind: "path".into(),
+                    identity_codec: "utf8".into(),
+                    identity_value: "/preserved/worktree".into(),
+                },
                 detail: "resource preserved".into(),
                 stop,
             },
@@ -188,6 +204,18 @@ mod tests {
         }
         assert!(!text.contains("Watched conversation"));
         assert!(!text.contains("Close incomplete"));
+    }
+
+    #[test]
+    fn attempt_interruption_message_does_not_invent_a_resource() {
+        let mut event = failure(CloseFailureStop::ShutdownUncertain);
+        let WatchEventRoute::MandatoryCloseFailure { subject, .. } = &mut event.route else {
+            unreachable!();
+        };
+        *subject = MandatoryCloseFailureSubject::Attempt;
+        let text = notification(&event);
+        assert!(text.contains("Close attempt interruption with no captured resource"));
+        assert!(!text.contains("Failed resource"));
     }
 
     #[test]

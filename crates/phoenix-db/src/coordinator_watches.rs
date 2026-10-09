@@ -1,7 +1,8 @@
 mod mandatory_close;
 use mandatory_close::decode_route;
 pub use mandatory_close::{
-    append_mandatory_close_failure_event_tx, CloseFailureStop, WatchEventRoute,
+    append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
+    WatchEventRoute,
 };
 
 use chrono::Utc;
@@ -169,7 +170,7 @@ impl Database {
                   COALESCE(w.source_product_conversation_id, f.source_product_conversation_id) AS source_product_conversation_id,
                   e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
                   e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
-                  f.scope, f.resource_kind, f.identity_kind, f.identity_codec, f.identity_value,
+                  f.authority_kind, f.scope, f.resource_kind, f.identity_kind, f.identity_codec, f.identity_value,
                   f.detail, f.cleanup_run_ordinal, f.stop_certainty, f.confirmed_at_us AS stop_confirmed_at_unix_us
              FROM coordinator_watch_events e
              LEFT JOIN coordinator_watches w ON w.id = e.watch_id
@@ -1095,8 +1096,8 @@ mod tests {
             failure_occurrence_id: "close-failure:1:watch-failure".into(),
             attempt_id: CloseAttemptId::parse("watch-failure").unwrap(),
             source_product_conversation_id: source.product_conversation_id.clone(),
-            scope,
             authority: CloseCleanupFailureAuthority::ObservedProcessResource {
+                scope,
                 resource: resources[0].resource.clone(),
             },
             remaining_resources: resources.clone(),

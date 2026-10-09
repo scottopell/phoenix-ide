@@ -12,8 +12,8 @@ mod coordinator_watches;
 mod federation_enrollment;
 mod federation_peers;
 pub use coordinator_watches::{
-    append_mandatory_close_failure_event_tx, CloseFailureStop, PendingWatchEvent, WatchEventRoute,
-    WatchSnapshot,
+    append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
+    PendingWatchEvent, WatchEventRoute, WatchSnapshot,
 };
 mod ddl;
 mod git_repository_reconciliation;
@@ -2200,9 +2200,22 @@ impl Database {
                      JOIN close_attempt_scopes captured
                        ON captured.attempt_id = obligation.attempt_id
                      WHERE obligation.attempt_id = ?1
-                       AND obligation.phase <> 'completed'
                        AND obligation.topology_sealed = 1
                        AND captured.scope = ?2
+                       AND (obligation.phase <> 'completed' OR (
+                           obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+                           AND EXISTS (SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+                               ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+                               WHERE run.attempt_id = obligation.attempt_id AND run.status = 'running'
+                                 AND run.retry_evidence_kind = 'resource_plan'
+                                 AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                                 AND effect.scope = captured.scope AND effect.resource_kind = 'work_scope'
+                                 AND effect.identity_kind = 'opaque' AND effect.identity_codec = 'opaque_string_v1'
+                                 AND effect.identity_value = captured.scope
+                                 AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                                     WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                                       AND success.ordinal = effect.ordinal))
+                       ))
                  )",
             )
             .bind(attempt_id.as_str())
@@ -2225,17 +2238,24 @@ impl Database {
                      WHERE expected.attempt_id = ?1
                        AND expected.scope = ?2
                        AND expected.resource_kind <> 'work_scope'
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM close_retirement_resources receipt
-                           WHERE receipt.attempt_id = expected.attempt_id
-                             AND receipt.scope = expected.scope
-                             AND receipt.inspection_generation = expected.inspection_generation
-                             AND receipt.inspection_fingerprint = expected.inspection_fingerprint
-                             AND receipt.resource_kind = expected.resource_kind
-                             AND receipt.identity_kind = expected.identity_kind
-                             AND receipt.identity_value = expected.identity_value
-                             AND receipt.proof_kind IN ('retired', 'absence_adopted')
+                       AND NOT (
+                           EXISTS (
+                               SELECT 1 FROM close_run_retry_effects effect
+                               JOIN close_run_retry_successes success ON success.attempt_id = effect.attempt_id
+                                 AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal
+                               WHERE effect.attempt_id = expected.attempt_id
+                                 AND effect.scope = expected.scope AND effect.resource_kind = expected.resource_kind
+                                 AND effect.identity_kind = expected.identity_kind AND effect.identity_codec = expected.identity_codec
+                                 AND effect.identity_value = expected.identity_value
+                           ) OR EXISTS (
+                               SELECT 1 FROM close_retirement_resources receipt
+                               WHERE receipt.attempt_id = expected.attempt_id AND receipt.scope = expected.scope
+                                 AND receipt.inspection_generation = expected.inspection_generation
+                                 AND receipt.inspection_fingerprint = expected.inspection_fingerprint
+                                 AND receipt.resource_kind = expected.resource_kind AND receipt.identity_kind = expected.identity_kind
+                                 AND receipt.identity_codec = expected.identity_codec AND receipt.identity_value = expected.identity_value
+                                 AND receipt.proof_kind IN ('retired', 'absence_adopted')
+                           )
                        )
                  )",
             )

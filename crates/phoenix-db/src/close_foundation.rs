@@ -734,14 +734,18 @@ pub struct RecordCloseRetirementEvidenceRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseCleanupFailureAuthority {
+    AttemptInterrupted,
     ExpectedResource {
+        scope: WorkScopeId,
         snapshot: CloseRetirementSnapshot,
         resource: RetiredResourceIdentity,
     },
     CapturedScope {
+        scope: WorkScopeId,
         resource: RetiredResourceIdentity,
     },
     ObservedProcessResource {
+        scope: WorkScopeId,
         resource: RetiredResourceIdentity,
     },
 }
@@ -750,6 +754,7 @@ impl CloseCleanupFailureAuthority {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::AttemptInterrupted => "attempt_interrupted",
             Self::ExpectedResource { .. } => "expected_resource",
             Self::CapturedScope { .. } => "captured_scope",
             Self::ObservedProcessResource { .. } => "observed_process_resource",
@@ -757,11 +762,22 @@ impl CloseCleanupFailureAuthority {
     }
 
     #[must_use]
-    pub fn resource(&self) -> &RetiredResourceIdentity {
+    pub fn resource(&self) -> Option<&RetiredResourceIdentity> {
         match self {
+            Self::AttemptInterrupted => None,
             Self::ExpectedResource { resource, .. }
-            | Self::CapturedScope { resource }
-            | Self::ObservedProcessResource { resource } => resource,
+            | Self::CapturedScope { resource, .. }
+            | Self::ObservedProcessResource { resource, .. } => Some(resource),
+        }
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> Option<&WorkScopeId> {
+        match self {
+            Self::AttemptInterrupted => None,
+            Self::ExpectedResource { scope, .. }
+            | Self::CapturedScope { scope, .. }
+            | Self::ObservedProcessResource { scope, .. } => Some(scope),
         }
     }
 }
@@ -804,7 +820,6 @@ pub struct TerminalizeInitialCloseCleanupFailureRequest {
     pub failure_occurrence_id: String,
     pub attempt_id: CloseAttemptId,
     pub source_product_conversation_id: ProductConversationId,
-    pub scope: WorkScopeId,
     pub authority: CloseCleanupFailureAuthority,
     pub remaining_resources: Vec<CloseCleanupFailureResource>,
     pub reason: RetirementFailureReason,
@@ -825,6 +840,34 @@ fn parse_cleanup_resource_identity(row: &SqliteRow) -> DbResult<RetiredResourceI
         )?,
     )
     .map_err(|error| DbError::Serialization(error.to_string()))
+}
+
+fn parse_cleanup_failure_authority(row: &SqliteRow) -> DbResult<CloseCleanupFailureAuthority> {
+    let kind: &str = row.try_get("authority_kind")?;
+    if kind == "attempt_interrupted" {
+        return Ok(CloseCleanupFailureAuthority::AttemptInterrupted);
+    }
+    let scope = WorkScopeId::parse(row.try_get::<String, _>("scope")?)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let resource = parse_cleanup_resource_identity(row)?;
+    match kind {
+        "expected_resource" => Ok(CloseCleanupFailureAuthority::ExpectedResource {
+            scope,
+            snapshot: CloseRetirementSnapshot::parse(
+                row.try_get::<String, _>("inspection_generation")?,
+                row.try_get::<String, _>("inspection_fingerprint")?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
+            resource,
+        }),
+        "captured_scope" => Ok(CloseCleanupFailureAuthority::CapturedScope { scope, resource }),
+        "observed_process_resource" => {
+            Ok(CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource })
+        }
+        other => Err(DbError::Serialization(format!(
+            "unknown cleanup failure authority {other}"
+        ))),
+    }
 }
 
 async fn close_cleanup_failure_resources_tx(
@@ -904,8 +947,13 @@ async fn unresolved_expected_close_cleanup_resources_tx(
         return Ok(Vec::new());
     }
     let expected = list_close_expected_retirement_resources_tx(tx, attempt_id).await?;
+    let run = parse_close_run_row(sqlx::query("SELECT attempt_id, run_ordinal, status FROM close_runs WHERE attempt_id = ?1 ORDER BY run_ordinal DESC LIMIT 1")
+        .bind(attempt_id).fetch_one(&mut **tx).await?)?.run;
     let mut remaining = Vec::new();
     for target in expected {
+        if close_process_step_succeeded_tx(tx, &run, &target.scope, &target.resource).await? {
+            continue;
+        }
         let identity = target.resource.identity();
         let proof: Option<String> = sqlx::query_scalar(
             "SELECT proof_kind FROM close_retirement_resources
@@ -945,8 +993,13 @@ async fn expected_close_cleanup_failure_resources_tx(
     failed_resource: &RetiredResourceIdentity,
 ) -> DbResult<Vec<CloseCleanupFailureResource>> {
     let expected = list_close_expected_retirement_resources_tx(tx, attempt_id).await?;
+    let run = parse_close_run_row(sqlx::query("SELECT attempt_id, run_ordinal, status FROM close_runs WHERE attempt_id = ?1 ORDER BY run_ordinal DESC LIMIT 1")
+        .bind(attempt_id).fetch_one(&mut **tx).await?)?.run;
     let mut remaining = Vec::new();
     for target in expected {
+        if close_process_step_succeeded_tx(tx, &run, &target.scope, &target.resource).await? {
+            continue;
+        }
         let identity = target.resource.identity();
         let proof: Option<String> = sqlx::query_scalar(
             "SELECT proof_kind FROM close_retirement_resources
@@ -1047,15 +1100,233 @@ async fn validate_cleanup_observed_resource_tx(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseProcessResourceKind {
+    BashProcessGroup,
+    PtySession,
+    BrowserSession,
+}
+
+impl CloseProcessResourceKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BashProcessGroup => "bash_process_group",
+            Self::PtySession => "pty_session",
+            Self::BrowserSession => "browser_session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseProcessStepOutcome {
+    Retired,
+    AbsenceVerified,
+}
+
+impl CloseProcessStepOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retired => "retired",
+            Self::AbsenceVerified => "absence_verified",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseProcessStepSuccess {
+    pub run: CloseRunRef,
+    pub scope: WorkScopeId,
+    pub resource_kind: CloseProcessResourceKind,
+    pub identity: OpaqueIdentity,
+    pub outcome: CloseProcessStepOutcome,
+    pub observed_at_us: i64,
+}
+
+async fn close_process_step_succeeded_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run: &CloseRunRef,
+    scope: &WorkScopeId,
+    resource: &RetiredResourceIdentity,
+) -> DbResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM close_process_step_successes
+        WHERE attempt_id = ?1 AND run_ordinal = ?2 AND scope = ?3
+          AND resource_kind = ?4 AND identity_value = ?5)",
+    )
+    .bind(run.attempt_id.as_str())
+    .bind(run.ordinal.get())
+    .bind(scope.as_str())
+    .bind(resource.kind().as_str())
+    .bind(resource.identity().value())
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+const VERIFIED_COMPLETION_SOURCE: &str = "SELECT EXISTS(SELECT 1 FROM close_runs run
+    JOIN close_cleanup_failures failure ON failure.attempt_id = run.attempt_id
+      AND failure.cleanup_run_ordinal = run.run_ordinal
+    WHERE run.attempt_id = ?1 AND run.run_ordinal = ?2 AND run.run_ordinal > 1
+      AND run.status = 'stopped' AND failure.authority_kind = 'attempt_interrupted'
+      AND NOT EXISTS (SELECT 1 FROM close_cleanup_failure_resources child
+        WHERE child.failure_occurrence_id = failure.failure_occurrence_id)
+      AND ((run.retry_evidence_kind = 'resource_plan'
+        AND EXISTS (SELECT 1 FROM close_run_retry_effects effect
+          WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal)
+        AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
+          WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+              WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                AND success.ordinal = effect.ordinal)))
+      OR (run.retry_evidence_kind = 'verified_completion'
+        AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
+          WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal))))";
+
+async fn verified_completion_source_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run: &CloseRunRef,
+) -> DbResult<bool> {
+    Ok(sqlx::query_scalar(VERIFIED_COMPLETION_SOURCE)
+        .bind(run.attempt_id.as_str())
+        .bind(run.ordinal.get())
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
+async fn verified_completion_running_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run: &CloseRunRef,
+) -> DbResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM close_runs run
+        JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+        WHERE run.attempt_id = ?1 AND run.run_ordinal = ?2 AND run.run_ordinal > 1
+          AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+          AND run.status = 'running'
+          AND obligation.phase = 'completed' AND obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+          AND ((run.retry_evidence_kind = 'resource_plan'
+            AND EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal)
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+              AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal)))
+          OR (run.retry_evidence_kind = 'verified_completion'
+            AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal))))")
+        .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut **tx).await?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseRetryRequestedBy {
     User,
     Global,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseSafeRetryEffect {
     pub scope: WorkScopeId,
     pub resource: RetiredResourceIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseSafeRetryProgress {
+    pub successful: Vec<CloseSafeRetryEffect>,
+    pub pending: Vec<CloseSafeRetryEffect>,
+}
+
+async fn close_safe_retry_progress_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run: &CloseRunRef,
+) -> DbResult<CloseSafeRetryProgress> {
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2
+         AND run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = ?1)
+         AND status = 'running' AND retry_evidence_kind = 'resource_plan')",
+    )
+    .bind(run.attempt_id.as_str())
+    .bind(run.ordinal.get())
+    .fetch_one(&mut **tx)
+    .await?;
+    if !valid {
+        return Err(close_precondition(
+            "retry progress requires the exact latest running resource plan",
+        ));
+    }
+    let rows = sqlx::query(
+        "SELECT effect.*, captured.captured_worktree_fingerprint, captured.captured_worktree_locator,
+                success.ordinal AS success_ordinal
+         FROM close_run_retry_effects effect
+         JOIN close_attempt_scopes captured ON captured.attempt_id = effect.attempt_id AND captured.scope = effect.scope
+         LEFT JOIN close_run_retry_successes success ON success.attempt_id = effect.attempt_id
+           AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal
+         WHERE effect.attempt_id = ?1 AND effect.run_ordinal = ?2 ORDER BY effect.ordinal",
+    )
+    .bind(run.attempt_id.as_str())
+    .bind(run.ordinal.get())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut progress = CloseSafeRetryProgress {
+        successful: Vec::new(),
+        pending: Vec::new(),
+    };
+    for row in rows {
+        let effect = CloseSafeRetryEffect {
+            scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+            resource: parse_cleanup_resource_identity(&row)?,
+        };
+        if row.try_get::<Option<i64>, _>("success_ordinal")?.is_some() {
+            progress.successful.push(effect);
+        } else {
+            progress.pending.push(effect);
+        }
+    }
+    if progress.successful.is_empty() && progress.pending.is_empty() {
+        return Err(close_precondition("retry resource plan is empty"));
+    }
+    Ok(progress)
+}
+
+async fn retry_failure_resources_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run: &CloseRunRef,
+    progress: &CloseSafeRetryProgress,
+    failed: &CloseSafeRetryEffect,
+) -> DbResult<Vec<CloseCleanupFailureResource>> {
+    if !progress.pending.contains(failed) {
+        return Err(close_precondition(
+            "retry failure requires a pending exact-run effect",
+        ));
+    }
+    let mut remaining = Vec::with_capacity(progress.pending.len());
+    for effect in &progress.pending {
+        let identity = effect.resource.identity();
+        let proof: Option<String> = sqlx::query_scalar(
+            "SELECT receipt.proof_kind FROM close_retirement_resources receipt
+             JOIN close_obligations obligation ON obligation.attempt_id = receipt.attempt_id
+             WHERE receipt.attempt_id = ?1 AND receipt.scope = ?2
+               AND receipt.inspection_generation = obligation.inspection_generation
+               AND receipt.inspection_fingerprint = obligation.inspection_fingerprint
+               AND receipt.resource_kind = ?3 AND receipt.identity_kind = ?4
+               AND receipt.identity_codec = ?5 AND receipt.identity_value = ?6",
+        )
+        .bind(run.attempt_id.as_str())
+        .bind(effect.scope.as_str())
+        .bind(effect.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&mut **tx)
+        .await?;
+        remaining.push(CloseCleanupFailureResource {
+            scope: effect.scope.clone(),
+            resource: effect.resource.clone(),
+            disposition: if effect == failed {
+                CloseCleanupResourceDisposition::Failed
+            } else if proof.as_deref() == Some("residual") {
+                CloseCleanupResourceDisposition::Residual
+            } else {
+                CloseCleanupResourceDisposition::Unattempted
+            },
+        });
+    }
+    Ok(remaining)
 }
 
 /// Read-only safety evidence supplied by the explicit user/Global retry command.
@@ -1955,30 +2226,10 @@ impl Database {
         }
     }
 
-    pub async fn advance_close_settlement_when_quiescent(
-        &self,
+    async fn require_close_participants_quiescent_tx(
+        tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
-    ) -> DbResult<CloseObligation> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
-        match obligation.phase() {
-            ClosePhase::AwaitingRetirementInspection | ClosePhase::Completed => {
-                tx.commit().await?;
-                return Ok(obligation);
-            }
-            ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {}
-            phase @ (ClosePhase::AwaitingBlockerResolution
-            | ClosePhase::AwaitingStopWorkConfirmation
-            | ClosePhase::AwaitingLossConfirmation
-            | ClosePhase::RetirementRequested
-            | ClosePhase::NeedsRepair) => {
-                return Err(close_precondition(format!(
-                    "attempt {attempt_id} phase {} is not settling active work",
-                    phase.as_str()
-                )));
-            }
-        }
-        Self::reconcile_close_direct_turn_settlement_receipts_tx(&mut tx, attempt_id).await?;
+    ) -> DbResult<()> {
         let active_members: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM close_attempt_participants captured
@@ -2025,13 +2276,41 @@ impl Database {
                )",
         )
         .bind(attempt_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if active_members != 0 {
             return Err(close_precondition(format!(
                 "attempt {attempt_id} still has {active_members} active durable member obligation(s)"
             )));
         }
+        Ok(())
+    }
+
+    pub async fn advance_close_settlement_when_quiescent(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        match obligation.phase() {
+            ClosePhase::AwaitingRetirementInspection | ClosePhase::Completed => {
+                tx.commit().await?;
+                return Ok(obligation);
+            }
+            ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {}
+            phase @ (ClosePhase::AwaitingBlockerResolution
+            | ClosePhase::AwaitingStopWorkConfirmation
+            | ClosePhase::AwaitingLossConfirmation
+            | ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair) => {
+                return Err(close_precondition(format!(
+                    "attempt {attempt_id} phase {} is not settling active work",
+                    phase.as_str()
+                )));
+            }
+        }
+        Self::reconcile_close_direct_turn_settlement_receipts_tx(&mut tx, attempt_id).await?;
+        Self::require_close_participants_quiescent_tx(&mut tx, attempt_id).await?;
         if obligation.phase() == ClosePhase::CancelRequestedDuringSettlement {
             sqlx::query(
                 "UPDATE close_obligations
@@ -3799,17 +4078,45 @@ impl Database {
     ) -> DbResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current = close_obligation_for_update(&mut tx, request.attempt_id.as_str()).await?;
-        if !matches!(
+        let identity = request.resource.identity();
+        let retry_authorized = if current.phase() == ClosePhase::Completed
+            && matches!(
+                current.close_outcome(),
+                Some(
+                    CloseCompletionOutcome::CloseIncomplete
+                        | CloseCompletionOutcome::ArchivedCleanupAttention
+                )
+            )
+            && request.resource.kind() == RetiredResourceKind::Worktree
+        {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+                   ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+                 WHERE run.attempt_id = ?1 AND run.status = 'running' AND run.retry_evidence_kind = 'resource_plan'
+                   AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                   AND effect.scope = ?2 AND effect.resource_kind = ?3 AND effect.identity_kind = ?4
+                   AND effect.identity_codec = ?5 AND effect.identity_value = ?6
+                   AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                     WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                       AND success.ordinal = effect.ordinal))",
+            )
+            .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
+            .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
+            .bind(identity.codec()).bind(identity.value()).fetch_one(&mut *tx).await?
+        } else {
+            false
+        };
+        if !(matches!(
             current.phase(),
             ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
-        ) || current.snapshot() != Some(&request.snapshot)
+        ) || retry_authorized)
+            || current.snapshot() != Some(&request.snapshot)
         {
             return Err(close_precondition(format!(
                 "attempt {} dispatch lacks the exact active retirement authority",
                 request.attempt_id
             )));
         }
-        let identity = request.resource.identity();
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO close_retirement_resource_dispatches (
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
@@ -4500,6 +4807,83 @@ impl Database {
             .map(|row| parse_close_run_row(row).map(|run| run.run)).collect()
     }
 
+    /// # Errors
+    /// Rejects conflicting evidence or a new success for a non-running run.
+    pub async fn record_close_process_step_success(
+        &self,
+        success: &CloseProcessStepSuccess,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let retained: Option<(String, i64)> = sqlx::query_as("SELECT outcome, observed_at_us FROM close_process_step_successes
+            WHERE attempt_id = ?1 AND run_ordinal = ?2 AND scope = ?3 AND resource_kind = ?4 AND identity_value = ?5")
+            .bind(success.run.attempt_id.as_str()).bind(success.run.ordinal.get()).bind(success.scope.as_str())
+            .bind(success.resource_kind.as_str()).bind(success.identity.as_str()).fetch_optional(&mut *tx).await?;
+        if let Some(retained) = retained {
+            if retained != (success.outcome.as_str().to_owned(), success.observed_at_us) {
+                return Err(close_precondition(
+                    "process success replay conflicts with immutable evidence",
+                ));
+            }
+        } else {
+            sqlx::query("INSERT INTO close_process_step_successes
+                (attempt_id, run_ordinal, scope, resource_kind, identity_value, outcome, observed_at_us)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+                .bind(success.run.attempt_id.as_str()).bind(success.run.ordinal.get()).bind(success.scope.as_str())
+                .bind(success.resource_kind.as_str()).bind(success.identity.as_str()).bind(success.outcome.as_str())
+                .bind(success.observed_at_us).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns persistence or decoding errors without dropping malformed evidence.
+    pub async fn list_close_process_step_successes(
+        &self,
+        run: &CloseRunRef,
+    ) -> DbResult<Vec<CloseProcessStepSuccess>> {
+        sqlx::query(
+            "SELECT scope, resource_kind, identity_value, outcome, observed_at_us
+            FROM close_process_step_successes WHERE attempt_id = ?1 AND run_ordinal = ?2
+            ORDER BY scope, resource_kind, identity_value",
+        )
+        .bind(run.attempt_id.as_str())
+        .bind(run.ordinal.get())
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(CloseProcessStepSuccess {
+                run: run.clone(),
+                scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                resource_kind: match row.try_get::<&str, _>("resource_kind")? {
+                    "bash_process_group" => CloseProcessResourceKind::BashProcessGroup,
+                    "pty_session" => CloseProcessResourceKind::PtySession,
+                    "browser_session" => CloseProcessResourceKind::BrowserSession,
+                    other => {
+                        return Err(DbError::Serialization(format!(
+                            "unknown process kind {other}"
+                        )))
+                    }
+                },
+                identity: OpaqueIdentity::parse(row.try_get::<String, _>("identity_value")?)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                outcome: match row.try_get::<&str, _>("outcome")? {
+                    "retired" => CloseProcessStepOutcome::Retired,
+                    "absence_verified" => CloseProcessStepOutcome::AbsenceVerified,
+                    other => {
+                        return Err(DbError::Serialization(format!(
+                            "unknown process outcome {other}"
+                        )))
+                    }
+                },
+                observed_at_us: row.try_get("observed_at_us")?,
+            })
+        })
+        .collect()
+    }
+
     /// Admits a fresh bounded run; performs no settlement, inspection, or cleanup.
     ///
     /// # Errors
@@ -4526,7 +4910,6 @@ impl Database {
             || request.observed_at_us > now
             || request.precondition_resolution.trim().is_empty()
             || request.safety_evidence.trim().is_empty()
-            || request.remaining_effects.is_empty()
         {
             return Err(close_precondition("safe retry requires fresh read-only precondition and safety evidence and exact remaining effects"));
         }
@@ -4544,6 +4927,12 @@ impl Database {
         if !eligible {
             return Err(close_precondition(
                 "safe retry requires the latest stopped run, fresh evidence, and no running run",
+            ));
+        }
+        let completion_only = request.remaining_effects.is_empty();
+        if completion_only && !verified_completion_source_tx(tx, &request.failed_run).await? {
+            return Err(close_precondition(
+                "completion-only retry requires an interrupted fully successful retry plan",
             ));
         }
         let run = CloseRunRef {
@@ -4584,13 +4973,229 @@ impl Database {
         }
         sqlx::query(
             "INSERT INTO close_runs (attempt_id, run_ordinal, status, created_at_us, retry_requested_by,
-                 retry_observed_at_us, precondition_resolution, safety_evidence)
-             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7)",
+                 retry_observed_at_us, precondition_resolution, safety_evidence, retry_evidence_kind)
+             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?8)",
         ).bind(run.attempt_id.as_str()).bind(run.ordinal.get()).bind(now)
             .bind(match request.requested_by { CloseRetryRequestedBy::User => "user", CloseRetryRequestedBy::Global => "global" })
             .bind(request.observed_at_us).bind(&request.precondition_resolution).bind(&request.safety_evidence)
+            .bind(if completion_only { "verified_completion" } else { "resource_plan" })
             .execute(&mut **tx).await?;
         Ok(run)
+    }
+
+    /// Reports whether the latest stopped run permits an explicit completion-only retry.
+    /// # Errors
+    /// Returns a database error if retained proof cannot be read.
+    pub async fn close_retry_verified_completion_eligible(
+        &self,
+        failed_run: &CloseRunRef,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        let eligible = verified_completion_source_tx(&mut tx, failed_run).await?
+            && sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM close_runs run
+                JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+                WHERE run.attempt_id = ?1 AND run.run_ordinal = ?2
+                  AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                  AND obligation.phase = 'completed' AND obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention'))")
+                .bind(failed_run.attempt_id.as_str()).bind(failed_run.ordinal.get()).fetch_one(&mut *tx).await?;
+        Ok(eligible)
+    }
+
+    /// Returns whether a prior retry run durably established this exact resource success.
+    pub async fn close_resource_has_retry_success(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_run_retry_successes success
+             JOIN close_run_retry_effects effect ON effect.attempt_id = success.attempt_id
+               AND effect.run_ordinal = success.run_ordinal AND effect.ordinal = success.ordinal
+             WHERE success.attempt_id = ?1 AND effect.scope = ?2
+               AND effect.resource_kind = ?3 AND effect.identity_kind = ?4
+               AND effect.identity_codec = ?5 AND effect.identity_value = ?6)",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(resource.kind().as_str())
+        .bind(resource.identity().identity_kind())
+        .bind(resource.identity().codec())
+        .bind(resource.identity().value())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Lists the immutable retry plan for this exact run in failure-child ordinal order.
+    ///
+    /// # Errors
+    /// Rejects absent/non-retry runs or malformed retained identities.
+    pub async fn list_close_safe_retry_effects(
+        &self,
+        run: &CloseRunRef,
+    ) -> DbResult<Vec<CloseSafeRetryEffect>> {
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2 AND retry_evidence_kind IN ('resource_plan', 'verified_completion'))")
+            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&self.pool).await?;
+        if !valid {
+            return Err(close_precondition(
+                "safe retry plan requires an exact retry run",
+            ));
+        }
+        sqlx::query("SELECT effect.*, captured.captured_worktree_fingerprint, captured.captured_worktree_locator
+            FROM close_run_retry_effects effect
+            JOIN close_attempt_scopes captured ON captured.attempt_id = effect.attempt_id AND captured.scope = effect.scope
+            WHERE effect.attempt_id = ?1 AND effect.run_ordinal = ?2 ORDER BY effect.ordinal")
+            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_all(&self.pool).await?
+            .into_iter().map(|row| Ok(CloseSafeRetryEffect {
+                scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                resource: parse_cleanup_resource_identity(&row)?,
+            })).collect()
+    }
+
+    /// Reads successful and pending effects of the exact latest running resource plan.
+    ///
+    /// # Errors
+    /// Rejects stale, stopped, or malformed plans.
+    pub async fn close_safe_retry_progress(
+        &self,
+        run: &CloseRunRef,
+    ) -> DbResult<CloseSafeRetryProgress> {
+        let mut tx = self.pool.begin().await?;
+        close_safe_retry_progress_tx(&mut tx, run).await
+    }
+
+    /// Persists successful retirement of one exact-run planned resource.
+    ///
+    /// # Errors
+    /// Rejects empty evidence, unplanned resources, stopped runs, and duplicate success.
+    pub async fn record_close_safe_retry_success(
+        &self,
+        run: &CloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        detail: &str,
+    ) -> DbResult<()> {
+        if detail.trim().is_empty() {
+            return Err(close_precondition("retry success requires evidence"));
+        }
+        let identity = effect.resource.identity();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let retained: Option<String> = sqlx::query_scalar(
+                "SELECT success.detail FROM close_run_retry_successes success
+                 JOIN close_run_retry_effects planned ON planned.attempt_id = success.attempt_id
+                   AND planned.run_ordinal = success.run_ordinal AND planned.ordinal = success.ordinal
+                 JOIN close_runs run ON run.attempt_id = planned.attempt_id AND run.run_ordinal = planned.run_ordinal
+                 WHERE run.retry_evidence_kind = 'resource_plan'
+                   AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                   AND success.attempt_id = ?1 AND success.run_ordinal = ?2 AND planned.scope = ?3
+                   AND planned.resource_kind = ?4 AND planned.identity_kind = ?5
+                   AND planned.identity_codec = ?6 AND planned.identity_value = ?7",
+            )
+            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).bind(effect.scope.as_str())
+            .bind(effect.resource.kind().as_str()).bind(identity.identity_kind()).bind(identity.codec())
+            .bind(identity.value()).fetch_optional(&mut *tx).await?;
+        if let Some(retained) = retained {
+            if retained == detail {
+                return Ok(());
+            }
+            return Err(close_precondition(
+                "retry success replay conflicts with retained detail",
+            ));
+        }
+        let progress = close_safe_retry_progress_tx(&mut tx, run).await?;
+        if !progress.pending.contains(effect) {
+            return Err(close_precondition(
+                "retry success requires a pending exact-run effect",
+            ));
+        }
+        let inserted = sqlx::query("INSERT INTO close_run_retry_successes (attempt_id, run_ordinal, ordinal, detail, observed_at_us)
+            SELECT effect.attempt_id, effect.run_ordinal, effect.ordinal, ?8, ?9 FROM close_run_retry_effects effect
+            JOIN close_runs run ON run.attempt_id = effect.attempt_id AND run.run_ordinal = effect.run_ordinal
+            WHERE effect.attempt_id = ?1 AND effect.run_ordinal = ?2 AND effect.scope = ?3 AND effect.resource_kind = ?4
+              AND effect.identity_kind = ?5 AND effect.identity_codec = ?6 AND effect.identity_value = ?7
+              AND run.status = 'running' AND run.retry_evidence_kind = 'resource_plan'")
+            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).bind(effect.scope.as_str())
+            .bind(effect.resource.kind().as_str()).bind(identity.identity_kind()).bind(identity.codec())
+            .bind(identity.value()).bind(detail).bind(Utc::now().timestamp_micros())
+            .execute(&mut *tx).await?;
+        if inserted.rows_affected() != 1 {
+            return Err(close_precondition(
+                "retry success requires exact running planned resource",
+            ));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically archives the original outcome after complete exact-run retry proof.
+    ///
+    /// # Errors
+    /// Rejects incomplete, stopped, stale, or unauthorized scope-free retry runs.
+    pub async fn complete_close_safe_retry(&self, run: &CloseRunRef) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM close_runs run
+            JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+            WHERE run.attempt_id = ?1 AND run.run_ordinal = ?2 AND run.run_ordinal > 1
+              AND run.status = 'running' AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+              AND obligation.phase = 'completed' AND obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+              AND ((run.retry_evidence_kind = 'resource_plan'
+              AND EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal))
+              OR (run.retry_evidence_kind = 'verified_completion'
+              AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal)
+              AND EXISTS (SELECT 1 FROM close_runs prior JOIN close_cleanup_failures failure
+                ON failure.attempt_id = prior.attempt_id AND failure.cleanup_run_ordinal = prior.run_ordinal
+                WHERE prior.attempt_id = run.attempt_id AND prior.run_ordinal = run.run_ordinal - 1
+                  AND prior.status = 'stopped' AND prior.retry_evidence_kind IN ('resource_plan', 'verified_completion')
+                  AND failure.authority_kind = 'attempt_interrupted'
+                  AND NOT EXISTS (SELECT 1 FROM close_cleanup_failure_resources child WHERE child.failure_occurrence_id = failure.failure_occurrence_id)
+                  AND ((prior.retry_evidence_kind = 'resource_plan'
+                    AND EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal)
+                    AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal
+                      AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal)))
+                  OR (prior.retry_evidence_kind = 'verified_completion'
+                    AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = prior.attempt_id AND effect.run_ordinal = prior.run_ordinal))))))
+              AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect WHERE effect.attempt_id = run.attempt_id
+                AND effect.run_ordinal = run.run_ordinal AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                  WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal)))")
+            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut *tx).await?;
+        if !eligible {
+            return Err(close_precondition(
+                "retry completion requires exact running run and complete successful plan",
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let latest: String = sqlx::query_scalar("SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')")
+            .bind(run.attempt_id.as_str()).fetch_one(&mut *tx).await?;
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(&latest)
+        .fetch_one(&mut *tx)
+        .await?;
+        let content = MessageContent::system(format!("Close retry run {} for attempt {} completed; cleanup retired and conversation archived in History.", run.ordinal.get(), run.attempt_id));
+        let content = serde_json::to_string(&content.to_stored_json())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
+            VALUES (?1, ?2, ?3, 'system', ?4, ?5)")
+            .bind(format!("close-run-outcome:{}:{}", run.ordinal.get(), run.attempt_id))
+            .bind(&latest).bind(sequence).bind(content).bind(&now).execute(&mut *tx).await?;
+        sqlx::query("UPDATE conversations SET archived = 1, updated_at = ?2
+            WHERE id IN (SELECT conversation_id FROM close_attempt_participants WHERE attempt_id = ?1)")
+            .bind(run.attempt_id.as_str()).bind(&now).execute(&mut *tx).await?;
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history'
+            WHERE id = (SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1) AND kind = 'ordinary'")
+            .bind(run.attempt_id.as_str()).execute(&mut *tx).await?;
+        let changed = sqlx::query("UPDATE close_obligations SET close_outcome = 'archived', updated_at = ?2
+            WHERE attempt_id = ?1 AND phase = 'completed' AND close_outcome IN ('close_incomplete', 'archived_cleanup_attention')")
+            .bind(run.attempt_id.as_str()).bind(&now).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Err(close_precondition(
+                "retry completion lost terminal authority",
+            ));
+        }
+        let obligation = close_obligation_for_update(&mut tx, run.attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(obligation)
     }
 
     /// Records interrupted-run uncertainty and one mandatory event without executing cleanup.
@@ -4612,79 +5217,85 @@ impl Database {
             tx.commit().await?;
             return Ok(obligation);
         }
-        let (scope, authority) = if run.ordinal == CloseRunOrdinal::INITIAL {
+        let completion_only_running: bool = if run.ordinal == CloseRunOrdinal::INITIAL {
+            false
+        } else {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2
+                 AND status = 'running' AND retry_evidence_kind = 'verified_completion')",
+            )
+            .bind(run.attempt_id.as_str())
+            .bind(run.ordinal.get())
+            .fetch_one(&mut *tx)
+            .await?
+        };
+        let authority = if run.ordinal == CloseRunOrdinal::INITIAL {
             let unresolved =
                 unresolved_expected_close_cleanup_resources_tx(&mut tx, run.attempt_id.as_str())
                     .await?;
             if let Some(first) = unresolved.first() {
-                (
-                    first.scope.as_str().to_string(),
-                    CloseCleanupFailureAuthority::ExpectedResource {
-                        snapshot: obligation.snapshot().cloned().ok_or_else(|| {
-                            close_precondition(
-                                "interrupted sealed inventory requires its retained snapshot",
-                            )
-                        })?,
-                        resource: first.resource.clone(),
-                    },
-                )
+                CloseCleanupFailureAuthority::ExpectedResource {
+                    scope: first.scope.clone(),
+                    snapshot: obligation.snapshot().cloned().ok_or_else(|| {
+                        close_precondition(
+                            "interrupted sealed inventory requires its retained snapshot",
+                        )
+                    })?,
+                    resource: first.resource.clone(),
+                }
             } else {
                 let scope: Option<String> = sqlx::query_scalar("SELECT scope FROM close_attempt_scopes WHERE attempt_id = ?1 ORDER BY scope LIMIT 1")
                     .bind(run.attempt_id.as_str()).fetch_optional(&mut *tx).await?;
-                let scope = scope.ok_or_else(|| close_precondition("interrupted Close classification requires captured scope authority; scope-free failures need an outbox contract"))?;
-                let resource = RetiredResourceIdentity::parse(
-                    RetiredResourceKind::WorkScope,
-                    LossItemIdentity::Opaque(
-                        OpaqueIdentity::parse(&scope)
+                if let Some(scope) = scope {
+                    let resource = RetiredResourceIdentity::parse(
+                        RetiredResourceKind::WorkScope,
+                        LossItemIdentity::Opaque(
+                            OpaqueIdentity::parse(&scope)
+                                .map_err(|error| close_precondition(error.to_string()))?,
+                        ),
+                    )
+                    .map_err(|error| close_precondition(error.to_string()))?;
+                    CloseCleanupFailureAuthority::CapturedScope {
+                        scope: WorkScopeId::parse(scope)
                             .map_err(|error| close_precondition(error.to_string()))?,
-                    ),
-                )
-                .map_err(|error| close_precondition(error.to_string()))?;
-                (
-                    scope,
-                    CloseCleanupFailureAuthority::CapturedScope { resource },
-                )
+                        resource,
+                    }
+                } else {
+                    CloseCleanupFailureAuthority::AttemptInterrupted
+                }
             }
+        } else if completion_only_running {
+            CloseCleanupFailureAuthority::AttemptInterrupted
         } else {
-            let row = sqlx::query(
-                "SELECT effect.*, captured.captured_worktree_fingerprint, captured.captured_worktree_locator
-                 FROM close_run_retry_effects effect JOIN close_attempt_scopes captured
-                   ON captured.attempt_id = effect.attempt_id AND captured.scope = effect.scope
-                 WHERE effect.attempt_id = ?1 AND effect.run_ordinal = ?2 ORDER BY effect.ordinal LIMIT 1",
-            ).bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut *tx).await?;
-            let identity = parse_loss_item_identity(
-                &row.try_get::<String, _>("identity_kind")?,
-                &row.try_get::<String, _>("identity_codec")?,
-                &row.try_get::<String, _>("identity_value")?,
-                row.try_get("captured_worktree_fingerprint")?,
-                row.try_get("captured_worktree_locator")?,
-            )?;
-            let resource = RetiredResourceIdentity::parse(
-                parse_retired_resource_kind(&row.try_get::<String, _>("resource_kind")?)?,
-                identity,
-            )
-            .map_err(|error| close_precondition(error.to_string()))?;
-            (
-                row.try_get("scope")?,
-                CloseCleanupFailureAuthority::ExpectedResource {
+            let progress = close_safe_retry_progress_tx(&mut tx, run).await?;
+            match progress.pending.first() {
+                Some(first) => CloseCleanupFailureAuthority::ExpectedResource {
+                    scope: first.scope.clone(),
                     snapshot: obligation.snapshot().cloned().ok_or_else(|| {
                         close_precondition("retry requires original retirement snapshot")
                     })?,
-                    resource,
+                    resource: first.resource.clone(),
                 },
-            )
+                None => CloseCleanupFailureAuthority::AttemptInterrupted,
+            }
         };
-        let scope =
-            WorkScopeId::parse(scope).map_err(|error| close_precondition(error.to_string()))?;
-        let remaining_resources = if matches!(
-            &authority,
-            CloseCleanupFailureAuthority::ExpectedResource { .. }
-        ) {
+        let remaining_resources = if completion_only_running {
+            Vec::new()
+        } else if run.ordinal != CloseRunOrdinal::INITIAL {
+            let progress = close_safe_retry_progress_tx(&mut tx, run).await?;
+            match progress.pending.first() {
+                Some(first) => retry_failure_resources_tx(&mut tx, run, &progress, first).await?,
+                None => Vec::new(),
+            }
+        } else if let CloseCleanupFailureAuthority::ExpectedResource {
+            scope, resource, ..
+        } = &authority
+        {
             expected_close_cleanup_failure_resources_tx(
                 &mut tx,
                 run.attempt_id.as_str(),
-                &scope,
-                authority.resource(),
+                scope,
+                resource,
             )
             .await?
         } else {
@@ -4707,7 +5318,7 @@ impl Database {
                         ),
                     )
                     .map_err(|error| close_precondition(error.to_string()))?,
-                    disposition: if captured == scope {
+                    disposition: if authority.scope() == Some(&captured) {
                         CloseCleanupResourceDisposition::Failed
                     } else {
                         CloseCleanupResourceDisposition::Unknown
@@ -4721,7 +5332,6 @@ impl Database {
             failure_occurrence_id: run.failure_occurrence_id(),
             attempt_id: run.attempt_id.clone(),
             source_product_conversation_id: obligation.product_conversation_id().clone(),
-            scope,
             authority,
             remaining_resources,
             reason: RetirementFailureReason::Interrupted,
@@ -4785,32 +5395,13 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let rows = sqlx::query(
             "SELECT failure.*, captured.captured_worktree_fingerprint, captured.captured_worktree_locator
-             FROM close_cleanup_failures failure JOIN close_attempt_scopes captured
+             FROM close_cleanup_failures failure LEFT JOIN close_attempt_scopes captured
                ON captured.attempt_id = failure.attempt_id AND captured.scope = failure.scope
              WHERE failure.attempt_id = ?1 ORDER BY failure.cleanup_run_ordinal",
         ).bind(attempt_id).fetch_all(&mut *tx).await?;
         let mut failures = Vec::with_capacity(rows.len());
         for row in rows {
-            let resource = parse_cleanup_resource_identity(&row)?;
-            let authority = match row.try_get::<&str, _>("authority_kind")? {
-                "expected_resource" => CloseCleanupFailureAuthority::ExpectedResource {
-                    snapshot: CloseRetirementSnapshot::parse(
-                        row.try_get::<String, _>("inspection_generation")?,
-                        row.try_get::<String, _>("inspection_fingerprint")?,
-                    )
-                    .map_err(|error| DbError::Serialization(error.to_string()))?,
-                    resource,
-                },
-                "captured_scope" => CloseCleanupFailureAuthority::CapturedScope { resource },
-                "observed_process_resource" => {
-                    CloseCleanupFailureAuthority::ObservedProcessResource { resource }
-                }
-                other => {
-                    return Err(DbError::Serialization(format!(
-                        "unknown cleanup failure authority {other}"
-                    )))
-                }
-            };
+            let authority = parse_cleanup_failure_authority(&row)?;
             let stop_certainty = match row.try_get::<&str, _>("stop_certainty")? {
                 "shutdown_uncertain" => CloseStopCertainty::ShutdownUncertain,
                 "conversation_and_processes_stopped" => {
@@ -4838,8 +5429,6 @@ impl Database {
                         row.try_get::<String, _>("source_product_conversation_id")?,
                     )
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
-                    scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
-                        .map_err(|error| DbError::Serialization(error.to_string()))?,
                     authority,
                     remaining_resources,
                     reason: parse_retirement_failure_reason(&row.try_get::<String, _>("reason")?)?,
@@ -4939,18 +5528,23 @@ impl Database {
         {
             return Err(close_precondition("cleanup failure requires nonnegative timestamps and a nonempty occurrence identity"));
         }
-        let (resource, snapshot) = match &request.authority {
-            CloseCleanupFailureAuthority::ExpectedResource { snapshot, resource } => {
-                (resource, Some(snapshot))
+        let (scope, resource, snapshot) = match &request.authority {
+            CloseCleanupFailureAuthority::AttemptInterrupted => {
+                return Self::terminalize_scope_free_interruption_tx(tx, run, request).await;
             }
-            CloseCleanupFailureAuthority::CapturedScope { resource }
-            | CloseCleanupFailureAuthority::ObservedProcessResource { resource } => {
+            CloseCleanupFailureAuthority::ExpectedResource {
+                scope,
+                snapshot,
+                resource,
+            } => (scope, resource, Some(snapshot)),
+            CloseCleanupFailureAuthority::CapturedScope { scope, resource }
+            | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
                 if request.stop_certainty != CloseStopCertainty::ShutdownUncertain {
                     return Err(close_precondition(
                         "captured-scope failure authority only permits shutdown-uncertain disposition",
                     ));
                 }
-                (resource, None)
+                (scope, resource, None)
             }
         };
         let occurred_at = DateTime::from_timestamp_micros(request.occurred_at_us)
@@ -4964,7 +5558,7 @@ impl Database {
             "SELECT EXISTS(SELECT 1 FROM close_attempt_scopes WHERE attempt_id=?1 AND scope=?2)",
         )
         .bind(request.attempt_id.as_str())
-        .bind(request.scope.as_str())
+        .bind(scope.as_str())
         .fetch_one(&mut **tx)
         .await?;
         if !captured_scope {
@@ -4979,7 +5573,7 @@ impl Database {
                    AND captured_worktree_fingerprint = ?4 AND captured_worktree_locator = ?5)",
             )
             .bind(request.attempt_id.as_str())
-            .bind(request.scope.as_str())
+            .bind(scope.as_str())
             .bind(worktree.id().as_str())
             .bind(worktree.fingerprint().as_str())
             .bind(worktree.locator().encode())
@@ -4996,7 +5590,7 @@ impl Database {
             CloseCleanupFailureAuthority::CapturedScope { .. }
         ) && !matches!(identity, LossItemIdentity::Worktree(_))
             && !(resource.kind() == RetiredResourceKind::WorkScope
-                && matches!(identity, LossItemIdentity::Opaque(value) if value.as_str() == request.scope.as_str()))
+                && matches!(identity, LossItemIdentity::Opaque(value) if value.as_str() == scope.as_str()))
         {
             return Err(close_precondition(
                 "captured-scope failure requires the captured worktree or exact WorkScope identity",
@@ -5018,10 +5612,22 @@ impl Database {
             &request.authority,
             CloseCleanupFailureAuthority::CapturedScope { .. }
         );
+        if close_process_step_succeeded_tx(tx, run, scope, resource).await? {
+            return Err(close_precondition(
+                "successful process cannot be the failure authority",
+            ));
+        }
         let mut authority_resource_present = false;
         for (ordinal, remaining) in request.remaining_resources.iter().enumerate() {
+            if close_process_step_succeeded_tx(tx, run, &remaining.scope, &remaining.resource)
+                .await?
+            {
+                return Err(close_precondition(
+                    "remaining resources cannot contain a successful process",
+                ));
+            }
             let is_authority_resource =
-                remaining.scope == request.scope && &remaining.resource == resource;
+                &remaining.scope == scope && &remaining.resource == resource;
             let valid_disposition = if is_authority_resource {
                 remaining.disposition == CloseCleanupResourceDisposition::Failed
                     || (captured_scope_authority
@@ -5075,7 +5681,7 @@ impl Database {
             .bind(&request.failure_occurrence_id)
             .bind(request.attempt_id.as_str())
             .bind(request.source_product_conversation_id.as_str())
-            .bind(request.scope.as_str())
+            .bind(scope.as_str())
             .bind(snapshot.map(CloseRetirementSnapshot::generation))
             .bind(snapshot.map(CloseRetirementSnapshot::fingerprint))
             .bind(resource.kind().as_str())
@@ -5109,6 +5715,19 @@ impl Database {
             append_mandatory_close_failure_event_tx(tx, &request.failure_occurrence_id).await?;
             return Ok(obligation);
         }
+        if !initial {
+            let progress = close_safe_retry_progress_tx(tx, run).await?;
+            let failed = CloseSafeRetryEffect {
+                scope: scope.clone(),
+                resource: resource.clone(),
+            };
+            let expected = retry_failure_resources_tx(tx, run, &progress, &failed).await?;
+            if request.remaining_resources != expected {
+                return Err(close_precondition(
+                    "retry failure children must equal pending exact-run plan",
+                ));
+            }
+        }
         let running: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2 AND status = 'running')",
         ).bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut **tx).await?;
@@ -5124,6 +5743,15 @@ impl Database {
         }
         if let Some(snapshot) = snapshot {
             if (initial && obligation.phase() != ClosePhase::RetirementRequested)
+                || (!initial
+                    && (obligation.phase() != ClosePhase::Completed
+                        || !matches!(
+                            obligation.close_outcome(),
+                            Some(
+                                CloseCompletionOutcome::CloseIncomplete
+                                    | CloseCompletionOutcome::ArchivedCleanupAttention
+                            )
+                        )))
                 || obligation.snapshot() != Some(snapshot)
             {
                 return Err(close_precondition(
@@ -5149,7 +5777,7 @@ impl Database {
                    AND inventory.sealed = 1)",
             )
             .bind(request.attempt_id.as_str())
-            .bind(request.scope.as_str())
+            .bind(scope.as_str())
             .bind(snapshot.generation())
             .bind(snapshot.fingerprint())
             .bind(resource.kind().as_str())
@@ -5184,7 +5812,15 @@ impl Database {
                        'bash_process_group', 'tmux_server', 'pty_session',
                        'browser_session', 'equivalent_live_resource'
                    )
-                   AND (retired.proof_kind IS NULL OR retired.proof_kind='residual')",
+                   AND (retired.proof_kind IS NULL OR retired.proof_kind='residual')
+                   AND NOT EXISTS (SELECT 1 FROM close_run_retry_effects effect
+                       JOIN close_run_retry_successes success ON success.attempt_id = effect.attempt_id
+                         AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal
+                WHERE effect.attempt_id = expected.attempt_id
+                  AND effect.scope = expected.scope AND effect.resource_kind = expected.resource_kind
+
+                         AND effect.identity_kind = expected.identity_kind AND effect.identity_codec = expected.identity_codec
+                         AND effect.identity_value = expected.identity_value)",
             )
             .bind(request.attempt_id.as_str())
             .fetch_one(&mut **tx)
@@ -5195,18 +5831,17 @@ impl Database {
                 ));
             }
         }
-        if snapshot.is_some() {
+        if initial && snapshot.is_some() {
             let expected = expected_close_cleanup_failure_resources_tx(
                 tx,
                 request.attempt_id.as_str(),
-                &request.scope,
+                scope,
                 resource,
             )
             .await?;
-            if expected.len() != request.remaining_resources.len()
-                || expected
-                    .iter()
-                    .any(|target| !request.remaining_resources.contains(target))
+            if expected
+                .iter()
+                .any(|target| !request.remaining_resources.contains(target))
             {
                 return Err(close_precondition(
                     "remaining resources differ from the complete unresolved expected inventory",
@@ -5222,7 +5857,7 @@ impl Database {
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11, ?11)",
             )
             .bind(request.attempt_id.as_str())
-            .bind(request.scope.as_str())
+            .bind(scope.as_str())
             .bind(snapshot.generation())
             .bind(snapshot.fingerprint())
             .bind(resource.kind().as_str())
@@ -5242,7 +5877,7 @@ impl Database {
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11)",
             )
             .bind(request.attempt_id.as_str())
-            .bind(request.scope.as_str())
+            .bind(scope.as_str())
             .bind(snapshot.generation())
             .bind(snapshot.fingerprint())
             .bind(resource.kind().as_str())
@@ -5264,7 +5899,7 @@ impl Database {
              ) VALUES (?1, ?2, ?16, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17)",
         )
         .bind(&request.failure_occurrence_id).bind(request.attempt_id.as_str())
-        .bind(request.source_product_conversation_id.as_str()).bind(request.scope.as_str())
+        .bind(request.source_product_conversation_id.as_str()).bind(scope.as_str())
         .bind(snapshot.map(CloseRetirementSnapshot::generation))
         .bind(snapshot.map(CloseRetirementSnapshot::fingerprint))
         .bind(resource.kind().as_str()).bind(identity.identity_kind())
@@ -5283,6 +5918,90 @@ impl Database {
                 .bind(identity.identity_kind()).bind(identity.codec()).bind(identity.value())
                 .bind(remaining.disposition.as_str()).execute(&mut **tx).await?;
         }
+        Self::finish_close_failure_tx(tx, run, request, obligation).await
+    }
+
+    async fn terminalize_scope_free_interruption_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+        request: &TerminalizeInitialCloseCleanupFailureRequest,
+    ) -> DbResult<CloseObligation> {
+        if request.reason != RetirementFailureReason::Interrupted
+            || !request.remaining_resources.is_empty()
+            || (run.ordinal == CloseRunOrdinal::INITIAL
+                && (request.stop_certainty != CloseStopCertainty::ShutdownUncertain
+                    || sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1",
+                    )
+                    .bind(run.attempt_id.as_str())
+                    .fetch_one(&mut **tx)
+                    .await?
+                        != 0))
+        {
+            return Err(close_precondition(
+                "attempt interruption requires exact resource-free authority",
+            ));
+        }
+
+        let obligation = close_obligation_for_update(tx, run.attempt_id.as_str()).await?;
+        if request.failure_occurrence_id != run.failure_occurrence_id()
+            || request.attempt_id != run.attempt_id
+            || request.source_product_conversation_id != *obligation.product_conversation_id()
+        {
+            return Err(close_precondition(
+                "attempt interruption must name the exact run and product",
+            ));
+        }
+        let existing = sqlx::query(
+            "SELECT authority_kind, detail, occurred_at_us FROM close_cleanup_failures
+            WHERE attempt_id = ?1 AND cleanup_run_ordinal = ?2",
+        )
+        .bind(run.attempt_id.as_str())
+        .bind(run.ordinal.get())
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(existing) = existing {
+            if (run.ordinal != CloseRunOrdinal::INITIAL
+                && !verified_completion_source_tx(tx, run).await?)
+                || existing.try_get::<&str, _>("authority_kind")? != "attempt_interrupted"
+                || existing.try_get::<&str, _>("detail")? != request.detail
+                || existing.try_get::<i64, _>("occurred_at_us")? != request.occurred_at_us
+                || obligation.product_conversation_id() != &request.source_product_conversation_id
+            {
+                return Err(close_precondition(
+                    "scope-free failure replay conflicts with retained occurrence",
+                ));
+            }
+            append_mandatory_close_failure_event_tx(tx, &request.failure_occurrence_id).await?;
+            return Ok(obligation);
+        }
+        if run.ordinal != CloseRunOrdinal::INITIAL
+            && !verified_completion_running_tx(tx, run).await?
+        {
+            return Err(close_precondition(
+                "resource-free retry failure requires a nonempty fully successful running plan",
+            ));
+        }
+        sqlx::query("INSERT INTO close_cleanup_failures
+            (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
+             authority_kind, reason, detail, stop_certainty, occurred_at_us)
+            VALUES (?1, ?2, ?3, ?4, 'attempt_interrupted', 'interrupted', ?5, 'shutdown_uncertain', ?6)")
+            .bind(&request.failure_occurrence_id).bind(run.attempt_id.as_str()).bind(run.ordinal.get())
+            .bind(request.source_product_conversation_id.as_str()).bind(&request.detail).bind(request.occurred_at_us)
+            .execute(&mut **tx).await?;
+        Self::finish_close_failure_tx(tx, run, request, obligation).await
+    }
+
+    async fn finish_close_failure_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+        request: &TerminalizeInitialCloseCleanupFailureRequest,
+        obligation: CloseObligation,
+    ) -> DbResult<CloseObligation> {
+        let initial = run.ordinal == CloseRunOrdinal::INITIAL;
+        let occurred_at = DateTime::from_timestamp_micros(request.occurred_at_us)
+            .ok_or_else(|| close_precondition("failure timestamp out of range"))?
+            .to_rfc3339();
         append_mandatory_close_failure_event_tx(tx, &request.failure_occurrence_id).await?;
         let latest: String = sqlx::query_scalar(
             "SELECT conversation_id FROM close_attempt_members
@@ -10161,10 +10880,6 @@ mod tests {
     fn safe_retry_request(
         failure: &TerminalizeInitialCloseCleanupFailureRequest,
     ) -> AdmitCloseSafeRetryRequest {
-        let CloseCleanupFailureAuthority::ExpectedResource { resource, .. } = &failure.authority
-        else {
-            panic!("expected resource fixture")
-        };
         AdmitCloseSafeRetryRequest {
             failed_run: CloseRunRef::initial(failure.attempt_id.clone()),
             requested_by: CloseRetryRequestedBy::User,
@@ -10174,10 +10889,14 @@ mod tests {
             safety_evidence:
                 "exact retained worktree identity remains reconstructible under original authority"
                     .into(),
-            remaining_effects: vec![CloseSafeRetryEffect {
-                scope: failure.scope.clone(),
-                resource: resource.clone(),
-            }],
+            remaining_effects: failure
+                .remaining_resources
+                .iter()
+                .map(|remaining| CloseSafeRetryEffect {
+                    scope: remaining.scope.clone(),
+                    resource: remaining.resource.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -10339,6 +11058,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_runs_safe_retry_requires_complete_run_bound_success_to_archive() {
+        for certainty in [
+            CloseStopCertainty::ShutdownUncertain,
+            CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 },
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let failure = initial_cleanup_failure_fixture(&db, certainty).await;
+            let original = db
+                .terminalize_initial_close_cleanup_failure(&failure)
+                .await
+                .unwrap();
+            let request = safe_retry_request(&failure);
+            let run = db.admit_close_safe_retry(&request).await.unwrap();
+            assert_eq!(
+                db.list_close_safe_retry_effects(&run).await.unwrap(),
+                request.remaining_effects
+            );
+            assert_eq!(
+                db.close_safe_retry_progress(&run).await.unwrap(),
+                CloseSafeRetryProgress {
+                    successful: vec![],
+                    pending: request.remaining_effects.clone(),
+                }
+            );
+            assert!(db
+                .close_safe_retry_progress(&request.failed_run)
+                .await
+                .is_err());
+            assert!(db
+                .list_close_safe_retry_effects(&request.failed_run)
+                .await
+                .is_err());
+            assert!(db.complete_close_safe_retry(&run).await.is_err());
+            assert_eq!(
+                db.get_close_obligation(run.attempt_id.as_str())
+                    .await
+                    .unwrap(),
+                original
+            );
+            assert!(db
+                .record_close_safe_retry_success(
+                    &request.failed_run,
+                    &request.remaining_effects[0],
+                    "not this run"
+                )
+                .await
+                .is_err());
+            db.record_close_safe_retry_success(
+                &run,
+                &request.remaining_effects[0],
+                "verified exact scope retired",
+            )
+            .await
+            .unwrap();
+            db.record_close_safe_retry_success(
+                &run,
+                &request.remaining_effects[0],
+                "verified exact scope retired",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                db.close_safe_retry_progress(&run).await.unwrap(),
+                CloseSafeRetryProgress {
+                    successful: vec![request.remaining_effects[0].clone()],
+                    pending: request.remaining_effects[1..].to_vec(),
+                }
+            );
+            assert!(db
+                .record_close_safe_retry_success(&run, &request.remaining_effects[0], "duplicate")
+                .await
+                .is_err());
+            assert!(db.complete_close_safe_retry(&run).await.is_err());
+            for effect in request.remaining_effects.iter().skip(1) {
+                db.record_close_safe_retry_success(&run, effect, "verified exact resource retired")
+                    .await
+                    .unwrap();
+            }
+            let result = db.complete_close_safe_retry(&run).await.unwrap();
+            assert_eq!(
+                result.close_outcome(),
+                Some(CloseCompletionOutcome::Archived)
+            );
+            assert_eq!(
+                db.get_close_run(&run).await.unwrap().status,
+                CloseRunStatus::Completed
+            );
+            assert_eq!(
+                db.get_close_run(&request.failed_run).await.unwrap().status,
+                CloseRunStatus::Stopped
+            );
+            assert_eq!(db.get_conversation("latest").await.unwrap().archived, true);
+            assert_eq!(
+                db.get_conversation("participant").await.unwrap().archived,
+                true
+            );
+            assert!(db.complete_close_safe_retry(&run).await.is_err());
+            assert!(db.admit_close_safe_retry(&request).await.is_err());
+            assert_eq!(
+                db.list_close_cleanup_failures(failure.attempt_id.as_str())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                    .bind(format!("close-run-outcome:2:{}", run.attempt_id))
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn close_runs_safe_retry_rejects_stale_expanded_or_duplicate_plan_and_rolls_back() {
         let db = Database::open_in_memory().await.unwrap();
         let failure =
@@ -10459,6 +11295,282 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_interruption_uses_pending_effect_not_successful_prior_resource() {
+        let db = Database::open_in_memory().await.unwrap();
+        let failure =
+            initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        let request = safe_retry_request(&failure);
+        assert!(request.remaining_effects.len() >= 2);
+        let run = db.admit_close_safe_retry(&request).await.unwrap();
+        db.record_close_safe_retry_success(&run, &request.remaining_effects[0], "worktree removed")
+            .await
+            .unwrap();
+        assert!(db
+            .record_close_safe_retry_success(
+                &run,
+                &request.remaining_effects[0],
+                "different detail"
+            )
+            .await
+            .is_err());
+        db.record_close_safe_retry_success(&run, &request.remaining_effects[0], "worktree removed")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.close_safe_retry_progress(&run).await.unwrap().pending,
+            request.remaining_effects[1..]
+        );
+        let original = db.classify_interrupted_close_run(&run).await.unwrap();
+        assert_eq!(
+            original.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        let failures = db
+            .list_close_cleanup_failures(failure.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(
+            failures[1].occurrence.remaining_resources.len(),
+            request.remaining_effects.len() - 1
+        );
+        assert_eq!(
+            failures[1]
+                .occurrence
+                .remaining_resources
+                .iter()
+                .map(|remaining| &remaining.resource)
+                .collect::<Vec<_>>(),
+            request.remaining_effects[1..]
+                .iter()
+                .map(|effect| &effect.resource)
+                .collect::<Vec<_>>()
+        );
+        assert!(db.close_safe_retry_progress(&run).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_interruption_after_all_successes_stops_until_explicit_completion_only_run() {
+        for certainty in [
+            CloseStopCertainty::ShutdownUncertain,
+            CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 },
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let failure = initial_cleanup_failure_fixture(&db, certainty).await;
+            let original = db
+                .terminalize_initial_close_cleanup_failure(&failure)
+                .await
+                .unwrap();
+            let request = safe_retry_request(&failure);
+            let run = db.admit_close_safe_retry(&request).await.unwrap();
+            assert!(!db
+                .close_retry_verified_completion_eligible(&run)
+                .await
+                .unwrap());
+            for effect in &request.remaining_effects {
+                db.record_close_safe_retry_success(&run, effect, "retired")
+                    .await
+                    .unwrap();
+            }
+            assert!(db
+                .close_safe_retry_progress(&run)
+                .await
+                .unwrap()
+                .pending
+                .is_empty());
+            assert_eq!(
+                db.classify_interrupted_close_run(&run).await.unwrap(),
+                original
+            );
+            assert_eq!(
+                db.classify_interrupted_close_run(&run).await.unwrap(),
+                original
+            );
+            assert_eq!(
+                db.get_close_run(&run).await.unwrap().status,
+                CloseRunStatus::Stopped
+            );
+            assert_eq!(
+                db.get_conversation("latest").await.unwrap().archived,
+                certainty.confirmed_at_us().is_some()
+            );
+            let failures = db
+                .list_close_cleanup_failures(failure.attempt_id.as_str())
+                .await
+                .unwrap();
+            assert_eq!(failures.len(), 2);
+            assert_eq!(
+                failures[1].occurrence.authority,
+                CloseCleanupFailureAuthority::AttemptInterrupted
+            );
+            assert!(failures[1].occurrence.remaining_resources.is_empty());
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM close_run_retry_successes WHERE run_ordinal = 2"
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+                request.remaining_effects.len() as i64
+            );
+            assert!(db
+                .close_retry_verified_completion_eligible(&run)
+                .await
+                .unwrap());
+            assert!(!db
+                .close_retry_verified_completion_eligible(&request.failed_run)
+                .await
+                .unwrap());
+            assert!(db.complete_close_safe_retry(&run).await.is_err());
+            let mut explicit = safe_retry_request(&failure);
+            explicit.failed_run = run.clone();
+            explicit.remaining_effects.clear();
+            explicit.requested_by = CloseRetryRequestedBy::Global;
+            explicit.precondition_resolution =
+                "fresh read-only check confirms finalization is safe".into();
+            explicit.safety_evidence = "exact completed retry effect proofs reverified".into();
+            assert!(db
+                .admit_close_safe_retry(&safe_retry_request(&failure))
+                .await
+                .is_err());
+            let mut stale = explicit.clone();
+            stale.observed_at_us = failures[1].occurrence.occurred_at_us;
+            assert!(db.admit_close_safe_retry(&stale).await.is_err());
+            let completion = db.admit_close_safe_retry(&explicit).await.unwrap();
+            assert_eq!(completion.ordinal.get(), 3);
+            assert!(db
+                .list_close_safe_retry_effects(&completion)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(sqlx::query_scalar::<_, String>("SELECT retry_evidence_kind FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 3")
+            .bind(failure.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), "verified_completion");
+            assert!(db.admit_close_safe_retry(&explicit).await.is_err());
+            assert!(!db
+                .close_retry_verified_completion_eligible(&run)
+                .await
+                .unwrap());
+            assert_eq!(
+                db.complete_close_safe_retry(&completion)
+                    .await
+                    .unwrap()
+                    .close_outcome(),
+                Some(CloseCompletionOutcome::Archived)
+            );
+            assert_eq!(
+                db.get_close_run(&completion).await.unwrap().status,
+                CloseRunStatus::Completed
+            );
+            assert_eq!(
+                db.get_close_run(&run).await.unwrap().status,
+                CloseRunStatus::Stopped
+            );
+            assert!(db.complete_close_safe_retry(&completion).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_only_retry_rejects_initial_missing_capture_and_incomplete_retry_plan() {
+        let db = Database::open_in_memory().await.unwrap();
+        let initial = scope_free_close_fixture(&db).await;
+        db.classify_interrupted_close_run(&initial).await.unwrap();
+        assert!(!db
+            .close_retry_verified_completion_eligible(&initial)
+            .await
+            .unwrap());
+        let missing_capture = AdmitCloseSafeRetryRequest {
+            failed_run: initial,
+            requested_by: CloseRetryRequestedBy::User,
+            observed_at_us: Utc::now().timestamp_micros(),
+            precondition_resolution: "fresh read-only review".into(),
+            safety_evidence: "no retirement plan exists".into(),
+            remaining_effects: vec![],
+        };
+        assert!(db.admit_close_safe_retry(&missing_capture).await.is_err());
+
+        let db = Database::open_in_memory().await.unwrap();
+        let failure =
+            initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        let request = safe_retry_request(&failure);
+        let run = db.admit_close_safe_retry(&request).await.unwrap();
+        db.record_close_safe_retry_success(&run, &request.remaining_effects[0], "retired")
+            .await
+            .unwrap();
+        let forged = TerminalizeInitialCloseCleanupFailureRequest {
+            failure_occurrence_id: run.failure_occurrence_id(),
+            attempt_id: run.attempt_id.clone(),
+            source_product_conversation_id: failure.source_product_conversation_id.clone(),
+            authority: CloseCleanupFailureAuthority::AttemptInterrupted,
+            remaining_resources: vec![],
+            reason: RetirementFailureReason::Interrupted,
+            detail: "cannot erase pending effect".into(),
+            stop_certainty: CloseStopCertainty::ShutdownUncertain,
+            occurred_at_us: Utc::now().timestamp_micros(),
+        };
+        assert!(db
+            .terminalize_close_run_cleanup_failure(&run, &forged)
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_close_run(&run).await.unwrap().status,
+            CloseRunStatus::Running
+        );
+        let stopped = db.classify_interrupted_close_run(&run).await.unwrap();
+        assert_eq!(
+            stopped.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        assert!(!db
+            .close_retry_verified_completion_eligible(&run)
+            .await
+            .unwrap());
+        let mut empty = safe_retry_request(&failure);
+        empty.failed_run = run;
+        empty.remaining_effects.clear();
+        assert!(db.admit_close_safe_retry(&empty).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn close_runs_retry_rejects_omitted_or_process_epoch_effects() {
+        let db = Database::open_in_memory().await.unwrap();
+        let failure =
+            observed_cleanup_failure_fixture(&db, RetiredResourceKind::BashProcessGroup).await;
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        let request = safe_retry_request(&failure);
+        assert!(failure.remaining_resources.len() > 1);
+        let mut omitted = request.clone();
+        omitted.remaining_effects.pop();
+        assert!(db.admit_close_safe_retry(&omitted).await.is_err());
+        assert!(db.admit_close_safe_retry(&request).await.is_err());
+        assert_eq!(
+            db.get_close_run(&request.failed_run).await.unwrap().status,
+            CloseRunStatus::Stopped
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_runs")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn close_runs_safe_retry_rejects_completed_effects() {
         let db = Database::open_in_memory().await.unwrap();
         let process = RetiredResourceIdentity::parse(
@@ -10478,7 +11590,7 @@ mod tests {
         };
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: failure.attempt_id.clone(),
-            scope: failure.scope.clone(),
+            scope: failure.authority.scope().unwrap().clone(),
             snapshot: snapshot.clone(),
             resource: process.clone(),
             outcome: RetirementOutcome::Retired,
@@ -10489,8 +11601,8 @@ mod tests {
         failure.remaining_resources = db
             .expected_close_cleanup_failure_resources(
                 failure.attempt_id.as_str(),
-                &failure.scope,
-                failure.authority.resource(),
+                failure.authority.scope().unwrap(),
+                failure.authority.resource().unwrap(),
             )
             .await
             .unwrap();
@@ -10499,7 +11611,7 @@ mod tests {
             .unwrap();
         let mut request = safe_retry_request(&failure);
         request.remaining_effects.push(CloseSafeRetryEffect {
-            scope: failure.scope.clone(),
+            scope: failure.authority.scope().unwrap().clone(),
             resource: process,
         });
         assert!(db.admit_close_safe_retry(&request).await.is_err());
@@ -10572,6 +11684,380 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(event_id, run.failure_occurrence_id());
+    }
+
+    async fn scope_free_close_fixture(db: &Database) -> CloseRunRef {
+        create_root(db, "root").await;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        sqlx::query(
+            "INSERT INTO close_obligations (
+                attempt_id, product_conversation_id, phase, topology_sealed,
+                created_at, updated_at)
+             VALUES ('scope-free', 'root', 'awaiting_blocker_resolution', 0, ?1, ?1)",
+        )
+        .bind(&now_text)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_attempt_participants (
+                attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros)
+             VALUES ('scope-free', 'root', 'root', ?1)",
+        )
+        .bind(now.timestamp_micros())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_attempt_members (
+                attempt_id, conversation_id, member_role, continuation_ordinal,
+                captured_continued_in_conv_id, captured_state_kind, captured_runtime_role,
+                captured_work_scope_id, captured_at)
+             SELECT 'scope-free', id, 'root_latest', 0, continued_in_conv_id,
+                    state_kind, runtime_role, work_scope_id, ?1
+             FROM conversations WHERE id = 'root'",
+        )
+        .bind(&now_text)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .list_close_attempt_scopes("scope-free")
+            .await
+            .unwrap()
+            .is_empty());
+        CloseRunRef::initial(CloseAttemptId::parse("scope-free").unwrap())
+    }
+
+    #[tokio::test]
+    async fn close_scope_free_interruption_is_atomic_exact_and_has_no_resource_children() {
+        let db = Database::open_in_memory().await.unwrap();
+        let run = scope_free_close_fixture(&db).await;
+        sqlx::raw_sql("CREATE TRIGGER reject_scope_free_event BEFORE INSERT ON coordinator_watch_events BEGIN SELECT RAISE(ABORT, 'event failed'); END;")
+            .execute(db.pool()).await.unwrap();
+        assert!(db.classify_interrupted_close_run(&run).await.is_err());
+        assert_eq!(
+            db.get_close_run(&run).await.unwrap().status,
+            CloseRunStatus::Running
+        );
+        assert!(db
+            .list_close_cleanup_failures("scope-free")
+            .await
+            .unwrap()
+            .is_empty());
+        sqlx::raw_sql("DROP TRIGGER reject_scope_free_event")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let stopped = db.classify_interrupted_close_run(&run).await.unwrap();
+        assert_eq!(
+            stopped.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        assert_eq!(
+            db.classify_interrupted_close_run(&run).await.unwrap(),
+            stopped
+        );
+        let failures = db.list_close_cleanup_failures("scope-free").await.unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].occurrence.authority,
+            CloseCleanupFailureAuthority::AttemptInterrupted
+        );
+        assert!(failures[0].occurrence.remaining_resources.is_empty());
+        assert_eq!(
+            db.terminalize_initial_close_cleanup_failure(&failures[0].occurrence)
+                .await
+                .unwrap(),
+            stopped
+        );
+        let mut conflicting = failures[0].occurrence.clone();
+        conflicting.detail.push_str(" changed");
+        assert!(db
+            .terminalize_initial_close_cleanup_failure(&conflicting)
+            .await
+            .is_err());
+        let counts: (i64, i64, i64) = sqlx::query_as("SELECT
+            (SELECT COUNT(*) FROM coordinator_watch_events WHERE event_id = 'close-failure:1:scope-free'),
+            (SELECT COUNT(*) FROM close_cleanup_failure_resources),
+            (SELECT COUNT(*) FROM close_retirement_resources)")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(counts, (1, 0, 0));
+        let shape: bool = sqlx::query_scalar(
+            "SELECT scope IS NULL AND resource_kind IS NULL
+            AND identity_kind IS NULL AND identity_codec IS NULL AND identity_value IS NULL
+            FROM close_cleanup_failures",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(shape);
+    }
+
+    #[tokio::test]
+    async fn close_scope_free_failure_check_rejects_partial_resource_shapes() {
+        let db = Database::open_in_memory().await.unwrap();
+        scope_free_close_fixture(&db).await;
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::raw_sql("DROP TRIGGER close_cleanup_failures_require_initial_authority;")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for (kind, scope, resource, identity_kind, codec, value, reason) in [
+            (
+                "attempt_interrupted",
+                None,
+                Some("browser_session"),
+                None,
+                None,
+                None,
+                "interrupted",
+            ),
+            (
+                "attempt_interrupted",
+                None,
+                None,
+                Some("opaque"),
+                None,
+                None,
+                "interrupted",
+            ),
+            (
+                "attempt_interrupted",
+                None,
+                None,
+                None,
+                Some("opaque_string_v1"),
+                None,
+                "interrupted",
+            ),
+            (
+                "attempt_interrupted",
+                None,
+                None,
+                None,
+                None,
+                Some("epoch:id"),
+                "interrupted",
+            ),
+            (
+                "attempt_interrupted",
+                Some("invented"),
+                None,
+                None,
+                None,
+                None,
+                "interrupted",
+            ),
+            (
+                "attempt_interrupted",
+                None,
+                None,
+                None,
+                None,
+                None,
+                "removal_failed",
+            ),
+            (
+                "observed_process_resource",
+                None,
+                Some("browser_session"),
+                Some("opaque"),
+                Some("opaque_string_v1"),
+                Some("epoch:id"),
+                "interrupted",
+            ),
+            (
+                "captured_scope",
+                None,
+                None,
+                None,
+                None,
+                None,
+                "interrupted",
+            ),
+            (
+                "expected_resource",
+                None,
+                None,
+                None,
+                None,
+                None,
+                "interrupted",
+            ),
+        ] {
+            assert!(sqlx::query("INSERT INTO close_cleanup_failures
+                (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
+                 authority_kind, scope, resource_kind, identity_kind, identity_codec, identity_value, reason,
+                 detail, stop_certainty, occurred_at_us)
+                VALUES ('close-failure:1:scope-free', 'scope-free', 1, 'root', ?1, ?2, ?3, ?4, ?5, ?6, ?7, '', 'shutdown_uncertain', 1)")
+                .bind(kind).bind(scope).bind(resource).bind(identity_kind).bind(codec).bind(value).bind(reason)
+                .execute(&mut *tx).await.is_err(), "accepted invalid {kind} shape");
+        }
+        tx.rollback().await.unwrap();
+        db.classify_interrupted_close_run(&CloseRunRef::initial(
+            CloseAttemptId::parse("scope-free").unwrap(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_process_success_exact_replay_conflict_stopped_fence_and_failure_subtraction() {
+        for (kind, resource_kind) in [
+            (
+                CloseProcessResourceKind::BashProcessGroup,
+                RetiredResourceKind::BashProcessGroup,
+            ),
+            (
+                CloseProcessResourceKind::PtySession,
+                RetiredResourceKind::PtySession,
+            ),
+            (
+                CloseProcessResourceKind::BrowserSession,
+                RetiredResourceKind::BrowserSession,
+            ),
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let mut failure = observed_cleanup_failure_fixture(&db, resource_kind).await;
+            let run = CloseRunRef::initial(failure.attempt_id.clone());
+            let success = CloseProcessStepSuccess {
+                run: run.clone(),
+                scope: failure.authority.scope().unwrap().clone(),
+                resource_kind: kind,
+                identity: OpaqueIdentity::parse("epoch-A:target-18").unwrap(),
+                outcome: CloseProcessStepOutcome::Retired,
+                observed_at_us: 1,
+            };
+            db.record_close_process_step_success(&success)
+                .await
+                .unwrap();
+            db.record_close_process_step_success(&success)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.list_close_process_step_successes(&run).await.unwrap(),
+                vec![success.clone()]
+            );
+            let mut conflict = success.clone();
+            conflict.outcome = CloseProcessStepOutcome::AbsenceVerified;
+            assert!(db
+                .record_close_process_step_success(&conflict)
+                .await
+                .is_err());
+            conflict = success.clone();
+            conflict.observed_at_us += 1;
+            assert!(db
+                .record_close_process_step_success(&conflict)
+                .await
+                .is_err());
+            assert!(db
+                .terminalize_initial_close_cleanup_failure(&failure)
+                .await
+                .is_err());
+            failure
+                .remaining_resources
+                .retain(|target| target.resource.identity().value() != "epoch-A:target-18");
+            db.terminalize_initial_close_cleanup_failure(&failure)
+                .await
+                .unwrap();
+            db.record_close_process_step_success(&success)
+                .await
+                .unwrap();
+            conflict = success.clone();
+            conflict.identity = OpaqueIdentity::parse("epoch-A:new-target").unwrap();
+            assert!(db
+                .record_close_process_step_success(&conflict)
+                .await
+                .is_err());
+            assert!(sqlx::query(
+                "UPDATE close_process_step_successes SET outcome = 'absence_verified'"
+            )
+            .execute(db.pool())
+            .await
+            .is_err());
+            assert!(sqlx::query("DELETE FROM close_process_step_successes")
+                .execute(db.pool())
+                .await
+                .is_err());
+            assert_eq!(
+                db.list_close_cleanup_failures(failure.attempt_id.as_str())
+                    .await
+                    .unwrap()[0]
+                    .occurrence
+                    .remaining_resources
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn close_process_success_excludes_sealed_inventory_and_failed_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        let process =
+            cleanup_process_resource(RetiredResourceKind::BrowserSession, "epoch:retired-browser");
+        let mut failure = initial_cleanup_failure_fixture_with_resources(
+            &db,
+            CloseStopCertainty::ShutdownUncertain,
+            vec![process.clone()],
+        )
+        .await;
+        let run = CloseRunRef::initial(failure.attempt_id.clone());
+        let scope = failure.authority.scope().unwrap().clone();
+        let success = CloseProcessStepSuccess {
+            run,
+            scope: scope.clone(),
+            resource_kind: CloseProcessResourceKind::BrowserSession,
+            identity: OpaqueIdentity::parse("epoch:retired-browser").unwrap(),
+            outcome: CloseProcessStepOutcome::AbsenceVerified,
+            observed_at_us: 1,
+        };
+        db.record_close_process_step_success(&success)
+            .await
+            .unwrap();
+        assert!(!db
+            .unresolved_expected_close_cleanup_resources(failure.attempt_id.as_str())
+            .await
+            .unwrap()
+            .iter()
+            .any(|target| target.resource == process));
+        assert!(db
+            .expected_close_cleanup_failure_resources(failure.attempt_id.as_str(), &scope, &process)
+            .await
+            .is_err());
+        let mut wrong = failure.clone();
+        wrong.authority = CloseCleanupFailureAuthority::ObservedProcessResource {
+            scope: scope.clone(),
+            resource: process.clone(),
+        };
+        wrong.remaining_resources = vec![CloseCleanupFailureResource {
+            scope: scope.clone(),
+            resource: process,
+            disposition: CloseCleanupResourceDisposition::Failed,
+        }];
+        assert!(db
+            .terminalize_initial_close_cleanup_failure(&wrong)
+            .await
+            .is_err());
+        failure.remaining_resources = db
+            .expected_close_cleanup_failure_resources(
+                failure.attempt_id.as_str(),
+                &scope,
+                failure.authority.resource().unwrap(),
+            )
+            .await
+            .unwrap();
+        db.terminalize_initial_close_cleanup_failure(&failure)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.list_close_process_step_successes(&success.run)
+                .await
+                .unwrap(),
+            vec![success]
+        );
     }
 
     async fn initial_cleanup_failure_fixture(
@@ -10651,8 +12137,11 @@ mod tests {
                 .expected_close_cleanup_failure_resources("attempt-failure", &scope, &resource)
                 .await
                 .unwrap(),
-            scope,
-            authority: CloseCleanupFailureAuthority::ExpectedResource { snapshot, resource },
+            authority: CloseCleanupFailureAuthority::ExpectedResource {
+                scope,
+                snapshot,
+                resource,
+            },
             reason: RetirementFailureReason::RemovalFailed,
             detail: "exact cleanup detail".into(),
             stop_certainty,
@@ -10702,8 +12191,7 @@ mod tests {
                     disposition: CloseCleanupResourceDisposition::Unattempted,
                 },
             ],
-            scope,
-            authority: CloseCleanupFailureAuthority::ObservedProcessResource { resource },
+            authority: CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource },
             reason: RetirementFailureReason::ResidualProcessAlive,
             detail: "process permit could not confirm shutdown".into(),
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
@@ -10801,13 +12289,15 @@ mod tests {
                 match invalid {
                     0 => {
                         changed.authority = CloseCleanupFailureAuthority::CapturedScope {
-                            resource: request.authority.resource().clone(),
+                            scope: request.authority.scope().unwrap().clone(),
+                            resource: request.authority.resource().unwrap().clone(),
                         }
                     }
                     1 => {
                         changed.authority = CloseCleanupFailureAuthority::ExpectedResource {
+                            scope: request.authority.scope().unwrap().clone(),
                             snapshot: CloseRetirementSnapshot::parse("fake", "fake").unwrap(),
-                            resource: request.authority.resource().clone(),
+                            resource: request.authority.resource().unwrap().clone(),
                         }
                     }
                     2 => {
@@ -10830,8 +12320,8 @@ mod tests {
                     precondition_resolution: "observed stopped".into(),
                     safety_evidence: "diagnostic identity only".into(),
                     remaining_effects: vec![CloseSafeRetryEffect {
-                        scope: request.scope.clone(),
-                        resource: request.authority.resource().clone()
+                        scope: request.authority.scope().unwrap().clone(),
+                        resource: request.authority.resource().unwrap().clone()
                     }],
                 })
                 .await
@@ -10866,7 +12356,7 @@ mod tests {
                 None,
                 None,
                 "bash_process_group",
-                request.scope.as_str(),
+                request.authority.scope().unwrap().as_str(),
                 "shutdown_uncertain",
                 None,
             ),
@@ -10875,7 +12365,7 @@ mod tests {
                 None,
                 None,
                 "bash_process_group",
-                request.scope.as_str(),
+                request.authority.scope().unwrap().as_str(),
                 "shutdown_uncertain",
                 None,
             ),
@@ -10884,7 +12374,7 @@ mod tests {
                 Some("fake"),
                 Some("fake"),
                 "bash_process_group",
-                request.scope.as_str(),
+                request.authority.scope().unwrap().as_str(),
                 "shutdown_uncertain",
                 None,
             ),
@@ -10893,7 +12383,7 @@ mod tests {
                 Some("fake"),
                 Some("fake"),
                 "bash_process_group",
-                request.scope.as_str(),
+                request.authority.scope().unwrap().as_str(),
                 "shutdown_uncertain",
                 None,
             ),
@@ -10902,7 +12392,7 @@ mod tests {
                 None,
                 None,
                 "tmux_server",
-                request.scope.as_str(),
+                request.authority.scope().unwrap().as_str(),
                 "shutdown_uncertain",
                 None,
             ),
@@ -10911,7 +12401,7 @@ mod tests {
                 None,
                 None,
                 "work_scope",
-                request.scope.as_str(),
+                request.authority.scope().unwrap().as_str(),
                 "shutdown_uncertain",
                 None,
             ),
@@ -10929,7 +12419,7 @@ mod tests {
                 None,
                 None,
                 "bash_process_group",
-                request.scope.as_str(),
+                request.authority.scope().unwrap().as_str(),
                 "conversation_and_processes_stopped",
                 Some(1),
             ),
@@ -11030,8 +12520,8 @@ mod tests {
             failure_occurrence_id: "close-failure:1:attempt-multi".into(),
             attempt_id: CloseAttemptId::parse("attempt-multi").unwrap(),
             source_product_conversation_id: product_id("root"),
-            scope: root_scope.clone(),
             authority: CloseCleanupFailureAuthority::ExpectedResource {
+                scope: root_scope.clone(),
                 snapshot: snapshot.clone(),
                 resource: failed.clone(),
             },
@@ -11115,6 +12605,7 @@ mod tests {
         let retry_failure = TerminalizeInitialCloseCleanupFailureRequest {
             failure_occurrence_id: run.failure_occurrence_id(),
             authority: CloseCleanupFailureAuthority::ExpectedResource {
+                scope: root_scope.clone(),
                 snapshot,
                 resource: later,
             },
@@ -11202,8 +12693,7 @@ mod tests {
                             disposition: CloseCleanupResourceDisposition::Unknown,
                         },
                     ],
-                    scope,
-                    authority: CloseCleanupFailureAuthority::CapturedScope { resource },
+                    authority: CloseCleanupFailureAuthority::CapturedScope { scope, resource },
                     reason: RetirementFailureReason::IdentityNotProven,
                     detail: "failed before inventory".into(),
                     stop_certainty: CloseStopCertainty::ShutdownUncertain,
@@ -11218,10 +12708,14 @@ mod tests {
                     .is_err());
                 for (kind, value) in [
                     (RetiredResourceKind::WorkScope, "wrong-scope"),
-                    (RetiredResourceKind::BrowserSession, request.scope.as_str()),
+                    (
+                        RetiredResourceKind::BrowserSession,
+                        request.authority.scope().unwrap().as_str(),
+                    ),
                 ] {
                     invalid = request.clone();
                     invalid.authority = CloseCleanupFailureAuthority::CapturedScope {
+                        scope: request.authority.scope().unwrap().clone(),
                         resource: RetiredResourceIdentity::parse(
                             kind,
                             LossItemIdentity::Opaque(OpaqueIdentity::parse(value).unwrap()),
@@ -11239,7 +12733,7 @@ mod tests {
                         Some("partial"),
                         "work_scope",
                         "opaque_string_v1",
-                        request.scope.as_str(),
+                        request.authority.scope().unwrap().as_str(),
                         "shutdown_uncertain",
                         None,
                     ),
@@ -11248,7 +12742,7 @@ mod tests {
                         None,
                         "work_scope",
                         "opaque_string_v1",
-                        request.scope.as_str(),
+                        request.authority.scope().unwrap().as_str(),
                         "shutdown_uncertain",
                         None,
                     ),
@@ -11257,7 +12751,7 @@ mod tests {
                         Some("invented"),
                         "work_scope",
                         "opaque_string_v1",
-                        request.scope.as_str(),
+                        request.authority.scope().unwrap().as_str(),
                         "shutdown_uncertain",
                         None,
                     ),
@@ -11266,7 +12760,7 @@ mod tests {
                         None,
                         "work_scope",
                         "wrong_codec",
-                        request.scope.as_str(),
+                        request.authority.scope().unwrap().as_str(),
                         "shutdown_uncertain",
                         None,
                     ),
@@ -11284,7 +12778,7 @@ mod tests {
                         None,
                         "browser_session",
                         "opaque_string_v1",
-                        request.scope.as_str(),
+                        request.authority.scope().unwrap().as_str(),
                         "shutdown_uncertain",
                         None,
                     ),
@@ -11293,7 +12787,7 @@ mod tests {
                         None,
                         "work_scope",
                         "opaque_string_v1",
-                        request.scope.as_str(),
+                        request.authority.scope().unwrap().as_str(),
                         "conversation_and_processes_stopped",
                         Some(1),
                     ),
@@ -11305,7 +12799,7 @@ mod tests {
                          stop_certainty, confirmed_at_us, occurred_at_us, authority_kind)
                          VALUES ('close-failure:1:attempt-captured', 'attempt-captured', 1, 'root', ?1, ?2, ?3, ?4, 'opaque', ?5, ?6,
                          'identity_not_proven', 'invalid authority', ?7, ?8, 1, 'captured_scope')",
-                    ).bind(request.scope.as_str()).bind(generation).bind(fingerprint).bind(kind).bind(codec)
+                    ).bind(request.authority.scope().unwrap().as_str()).bind(generation).bind(fingerprint).bind(kind).bind(codec)
                         .bind(value).bind(certainty).bind(confirmed).execute(db.pool()).await.is_err());
                 }
                 let completed = db
@@ -11354,11 +12848,13 @@ mod tests {
                     "open"
                 );
                 let mut conflicting = request.clone();
-                let CloseCleanupFailureAuthority::CapturedScope { resource } = &request.authority
+                let CloseCleanupFailureAuthority::CapturedScope { resource, .. } =
+                    &request.authority
                 else {
                     unreachable!()
                 };
                 conflicting.authority = CloseCleanupFailureAuthority::ExpectedResource {
+                    scope: request.authority.scope().unwrap().clone(),
                     snapshot: CloseRetirementSnapshot::parse("invented", "invented").unwrap(),
                     resource: resource.clone(),
                 };
@@ -11380,12 +12876,15 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let mut request =
             initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
-        let CloseCleanupFailureAuthority::ExpectedResource { snapshot, resource } =
-            request.authority
+        let CloseCleanupFailureAuthority::ExpectedResource {
+            scope,
+            snapshot,
+            resource,
+        } = request.authority
         else {
             unreachable!()
         };
-        request.authority = CloseCleanupFailureAuthority::CapturedScope { resource };
+        request.authority = CloseCleanupFailureAuthority::CapturedScope { scope, resource };
         let completed = db
             .terminalize_initial_close_cleanup_failure(&request)
             .await
@@ -11437,7 +12936,7 @@ mod tests {
             };
             db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: request.attempt_id.clone(),
-                scope: request.scope.clone(),
+                scope: request.authority.scope().unwrap().clone(),
                 snapshot: snapshot.clone(),
                 resource: process,
                 outcome: RetirementOutcome::Retired,
@@ -11448,8 +12947,8 @@ mod tests {
             request.remaining_resources = db
                 .expected_close_cleanup_failure_resources(
                     request.attempt_id.as_str(),
-                    &request.scope,
-                    request.authority.resource(),
+                    request.authority.scope().unwrap(),
+                    request.authority.resource().unwrap(),
                 )
                 .await
                 .unwrap();
@@ -11534,10 +13033,12 @@ mod tests {
                     certainty.confirmed_at_us(),
                     request.occurred_at_us,
                     match &request.authority {
+                        CloseCleanupFailureAuthority::AttemptInterrupted => unreachable!(),
                         CloseCleanupFailureAuthority::ExpectedResource { resource, .. }
-                        | CloseCleanupFailureAuthority::CapturedScope { resource }
-                        | CloseCleanupFailureAuthority::ObservedProcessResource { resource } =>
-                            resource.identity().codec().into(),
+                        | CloseCleanupFailureAuthority::CapturedScope { resource, .. }
+                        | CloseCleanupFailureAuthority::ObservedProcessResource {
+                            resource, ..
+                        } => resource.identity().codec().into(),
                     }
                 )
             );
@@ -11769,12 +13270,14 @@ mod tests {
         let request =
             initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
         let mut changed = request.clone();
-        let CloseCleanupFailureAuthority::ExpectedResource { snapshot, resource } =
-            &request.authority
+        let CloseCleanupFailureAuthority::ExpectedResource {
+            snapshot, resource, ..
+        } = &request.authority
         else {
             panic!("expected inventory authority")
         };
         changed.authority = CloseCleanupFailureAuthority::ExpectedResource {
+            scope: request.authority.scope().unwrap().clone(),
             snapshot: CloseRetirementSnapshot::parse("stale", "stale").unwrap(),
             resource: resource.clone(),
         };
@@ -11784,6 +13287,7 @@ mod tests {
             .is_err());
         changed = request.clone();
         changed.authority = CloseCleanupFailureAuthority::ExpectedResource {
+            scope: request.authority.scope().unwrap().clone(),
             snapshot: snapshot.clone(),
             resource: RetiredResourceIdentity::parse(
                 RetiredResourceKind::BrowserSession,

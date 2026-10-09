@@ -1301,8 +1301,8 @@ mod tests {
                 failure_occurrence_id: "close-failure:2:durable-close".into(),
                 attempt_id: CloseAttemptId::parse("durable-close").unwrap(),
                 source_product_conversation_id: ProductConversationId::parse("product").unwrap(),
-                scope: resources[0].scope.clone(),
                 authority: CloseCleanupFailureAuthority::ObservedProcessResource {
+                    scope: resources[0].scope.clone(),
                     resource: resources[0].resource.clone(),
                 },
                 remaining_resources: resources,
@@ -1346,6 +1346,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn close_failure_view_projects_attempt_interruption_without_remaining_resources() {
+        use crate::db::CloseCleanupFailureAuthority;
+        use phoenix_core::domain::close::RetirementFailureReason;
+        let mut failure = close_failure_fixture();
+        failure.occurrence.authority = CloseCleanupFailureAuthority::AttemptInterrupted;
+        failure.occurrence.remaining_resources.clear();
+        failure.occurrence.reason = RetirementFailureReason::Interrupted;
+        failure.occurrence.detail = "Close was interrupted before resource capture".into();
+        let wire = serde_json::to_value(close_failure_view(failure)).unwrap();
+        assert_eq!(wire["reason"], "interrupted");
+        assert_eq!(wire["remaining_resources"], serde_json::json!([]));
+    }
+
     #[tokio::test]
     async fn snapshot_projects_preinventory_process_and_captured_failures_read_only() {
         use crate::db::{
@@ -1375,7 +1389,6 @@ mod tests {
             let mut failure = close_failure_fixture().occurrence;
             failure.failure_occurrence_id = "close-failure:1:durable-close".into();
             failure.source_product_conversation_id = root.product_conversation_id.clone();
-            failure.scope = scope.clone();
             let resource = RetiredResourceIdentity::parse(
                 if captured {
                     RetiredResourceKind::WorkScope
@@ -1394,10 +1407,12 @@ mod tests {
             .unwrap();
             failure.authority = if captured {
                 CloseCleanupFailureAuthority::CapturedScope {
+                    scope: scope.clone(),
                     resource: resource.clone(),
                 }
             } else {
                 CloseCleanupFailureAuthority::ObservedProcessResource {
+                    scope: scope.clone(),
                     resource: resource.clone(),
                 }
             };

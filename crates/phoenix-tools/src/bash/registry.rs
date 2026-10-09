@@ -163,13 +163,16 @@ impl BashRetirementPermit {
 pub enum BashRetirementOutcome {
     Retired(CascadeBashReport),
     AbsenceVerified(CascadeBashReport),
+    StaleGeneration(CascadeBashReport),
 }
 
 impl BashRetirementOutcome {
     #[must_use]
     pub fn report(&self) -> &CascadeBashReport {
         match self {
-            Self::Retired(report) | Self::AbsenceVerified(report) => report,
+            Self::Retired(report)
+            | Self::AbsenceVerified(report)
+            | Self::StaleGeneration(report) => report,
         }
     }
 
@@ -177,6 +180,10 @@ impl BashRetirementOutcome {
     pub fn into_report(self) -> CascadeBashReport {
         match self {
             Self::Retired(report) | Self::AbsenceVerified(report) => report,
+            Self::StaleGeneration(report) => {
+                tracing::warn!(generation = ?report.teardown_generation, "bash retirement did not run: stale generation");
+                report
+            }
         }
     }
 }
@@ -878,7 +885,7 @@ impl BashHandleRegistry {
                 BashRetirementOutcome::AbsenceVerified(report)
             }
         } else {
-            BashRetirementOutcome::AbsenceVerified(report)
+            BashRetirementOutcome::StaleGeneration(report)
         }
     }
 
@@ -930,7 +937,7 @@ impl BashHandleRegistry {
         {
             let table = permit.entry.write().await;
             if !table.teardown_started || table.teardown_generation != permit.generation().0 {
-                return BashRetirementOutcome::AbsenceVerified(report);
+                return BashRetirementOutcome::StaleGeneration(report);
             }
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
@@ -968,6 +975,10 @@ impl BashHandleRegistry {
             BashRetirementOutcome::AbsenceVerified(verification) => {
                 report.kill_failures.extend(verification.kill_failures);
                 BashRetirementOutcome::AbsenceVerified(report)
+            }
+            BashRetirementOutcome::StaleGeneration(verification) => {
+                report.kill_failures.extend(verification.kill_failures);
+                BashRetirementOutcome::StaleGeneration(report)
             }
         }
     }
@@ -1833,7 +1844,7 @@ mod tests {
 
         assert!(matches!(
             registry.complete_retirement(&stale).await,
-            BashRetirementOutcome::AbsenceVerified(_)
+            BashRetirementOutcome::StaleGeneration(_)
         ));
         assert!(matches!(
             registry.reserve_spawn(&owner).await,
@@ -2193,7 +2204,7 @@ mod tests {
         let stale_outcome = registry.complete_retirement(&stale).await;
         assert!(matches!(
             stale_outcome,
-            BashRetirementOutcome::AbsenceVerified(_)
+            BashRetirementOutcome::StaleGeneration(_)
         ));
         assert!(
             replacement_child

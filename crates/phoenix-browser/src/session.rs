@@ -2436,6 +2436,17 @@ impl BrowserSessionManager {
         permit: &BrowserRetirementPermit,
     ) -> BrowserRetirementOutcome {
         let state = self.state.read().await;
+        if !state
+            .retirements
+            .get(&Self::permit_fence_key(permit))
+            .is_some_and(|retirement| {
+                retirement.fenced && retirement.generation == permit.generation.get()
+            })
+        {
+            return BrowserRetirementOutcome::Residual {
+                reason: "browser retirement generation is stale".to_string(),
+            };
+        }
         if permit.instances.is_empty() {
             if let Some(actor_key) = &permit.actor_session_key {
                 if state.sessions.contains_key(actor_key) {
@@ -3382,7 +3393,9 @@ mod lifecycle_hook_tests {
         assert_eq!(current.generation().get(), 2);
         assert_eq!(
             manager.complete_retirement(&stale).await,
-            super::BrowserRetirementOutcome::AbsenceVerified
+            super::BrowserRetirementOutcome::Residual {
+                reason: "browser retirement generation is stale".to_string()
+            }
         );
         assert!(manager.is_retirement_fenced(&scope).await);
         assert!(matches!(
