@@ -138,6 +138,7 @@ async fn observe_running_close_runs(
     Ok(classified)
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod close_startup_tests {
     use super::*;

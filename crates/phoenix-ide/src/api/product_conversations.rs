@@ -622,6 +622,7 @@ fn close_action_view(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn snapshot_view(
     state: &AppState,
     mut aggregate: ProductConversationAggregate,
@@ -1061,6 +1062,7 @@ fn close_failure_view(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn close_view(
     projection: crate::db::CloseProjection,
     failures: Vec<crate::db::CloseCleanupFailure>,
