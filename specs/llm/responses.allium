@@ -1068,13 +1068,14 @@ invariant ResponsesCacheDetailsSubsetOfInput {
 ------------------------------------------------------------
 -- Scope Notes
 ------------------------------------------------------------
--- Billed-but-empty normalization is modelled directly in
--- ResponsesResponseNormalized: a completed response with no content block but
--- raw_output_tokens > 0 yields a retryable server_error unless the authenticated
--- terminal output consists only of structurally valid reasoning items, usage
--- reports a positive reasoning-token subset of raw_output_tokens, and no visible
--- output was observed. That proven case and a genuinely empty zero-token turn
--- are valid quiet llm/LlmResponse values.
+-- Empty normalization is modelled directly in ResponsesResponseNormalized: a
+-- completed response with no content block but output items or positive output
+-- usage yields a retryable server_error unless the authenticated terminal output
+-- contains structurally valid reasoning items and only structurally completed
+-- empty assistant-message companions, usage reports a positive reasoning-token
+-- subset of raw_output_tokens, and no visible or tool output was observed. That
+-- proven case and a genuinely empty zero-token turn are valid quiet
+-- llm/LlmResponse values.
 --
 -- Responses reasoning output is not public transcript content. Required
 -- replay is governed by ResponsesToolContinuation independently of visible
