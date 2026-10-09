@@ -31,6 +31,7 @@ pub enum WatchOutcome {
     CleanupFailed { reason: String },
     Cancelled,
     AwaitingUserResponse,
+    AwaitingTaskApproval,
 }
 
 impl WatchOutcome {
@@ -42,6 +43,9 @@ impl WatchOutcome {
             ("cancelled", None) => Ok(Self::Cancelled),
             ("awaiting_user_response", Some(reason)) if reason == "question_request" => {
                 Ok(Self::AwaitingUserResponse)
+            }
+            ("awaiting_task_approval", Some(reason)) if reason == "task_approval_wait" => {
+                Ok(Self::AwaitingTaskApproval)
             }
             _ => Err(DbError::Serialization(
                 "invalid watch outcome/reason pair".into(),
@@ -57,6 +61,7 @@ impl WatchOutcome {
             Self::CleanupFailed { .. } => "cleanup_failed",
             Self::Cancelled => "cancelled",
             Self::AwaitingUserResponse => "awaiting_user_response",
+            Self::AwaitingTaskApproval => "awaiting_task_approval",
         }
     }
 
@@ -65,6 +70,7 @@ impl WatchOutcome {
         match self {
             Self::Failed { reason } | Self::CleanupFailed { reason } => Some(reason),
             Self::AwaitingUserResponse => Some("question_request"),
+            Self::AwaitingTaskApproval => Some("task_approval_wait"),
             Self::Completed | Self::Cancelled => None,
         }
     }
@@ -353,20 +359,23 @@ pub(crate) async fn record_steering_event_tx(
     .await
 }
 
-pub(crate) async fn record_question_wait_tx(
+pub(crate) async fn record_wait_entry_tx(
     tx: &mut Transaction<'_, Sqlite>,
     transcript_id: &str,
     state: &ConvState,
 ) -> DbResult<()> {
-    let ConvState::AwaitingUserResponse {
-        request_authority, ..
-    } = state
-    else {
-        return Ok(());
-    };
-    let Some(request_id) = request_authority.request_id() else {
-        tracing::debug!(transcript_id, "legacy question wait has no durable request identity; not emitting a historical watch event");
-        return Ok(());
+    let (kind, outcome, identified_request) = match state {
+        ConvState::AwaitingUserResponse {
+            request_authority, ..
+        } => (
+            "question_request",
+            "awaiting_user_response",
+            request_authority.request_id(),
+        ),
+        ConvState::AwaitingTaskApproval { .. } => {
+            ("task_approval_wait", "awaiting_task_approval", None)
+        }
+        _ => return Ok(()),
     };
     let previous: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
         .bind(transcript_id)
@@ -374,15 +383,21 @@ pub(crate) async fn record_question_wait_tx(
         .await?;
     let previous: ConvState = serde_json::from_str(&previous)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    if let ConvState::AwaitingUserResponse {
-        request_authority: previous,
-        ..
-    } = previous
-    {
-        if previous.request_id() == Some(request_id) {
-            return Ok(());
-        }
+    let same_occurrence = match (identified_request, &previous) {
+        (
+            Some(request_id),
+            ConvState::AwaitingUserResponse {
+                request_authority, ..
+            },
+        ) => request_authority.request_id() == Some(request_id),
+        (None, _) => &previous == state,
+        _ => false,
+    };
+    if same_occurrence {
+        return Ok(());
     }
+    let occurrence_id =
+        identified_request.map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
     let watch_ids: Vec<i64> = sqlx::query_scalar(
         "SELECT w.id FROM conversations c JOIN coordinator_watches w
          ON w.source_product_conversation_id = c.product_conversation_id
@@ -395,11 +410,12 @@ pub(crate) async fn record_question_wait_tx(
         sqlx::query("INSERT INTO coordinator_watch_events
             (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
              source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
-            VALUES (?1, ?2, 'question_request', ?3, 0, ?4, 'awaiting_user_response', 'question_request', ?5)
+            VALUES (?1, ?2, ?6, ?3, 0, ?4, ?7, ?6, ?5)
             ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING")
             .bind(uuid::Uuid::new_v4().to_string()).bind(watch_id)
-            .bind(request_id.to_string()).bind(transcript_id)
-            .bind(chrono::Utc::now().timestamp_micros()).execute(&mut **tx).await?;
+            .bind(&occurrence_id).bind(transcript_id)
+            .bind(chrono::Utc::now().timestamp_micros()).bind(kind).bind(outcome)
+            .execute(&mut **tx).await?;
     }
     Ok(())
 }
@@ -631,6 +647,79 @@ mod tests {
             terminal.is_none(),
             "waiting must not settle the active turn"
         );
+    }
+
+    #[tokio::test]
+    async fn task_and_legacy_wait_entries_deduplicate_without_replaying_enrollment() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("fallback-waits", "fallback-waits", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let approval = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let legacy: ConvState = serde_json::from_value(serde_json::json!({
+            "type": "awaiting_user_response", "tool_use_id": "reused", "questions": []
+        }))
+        .unwrap();
+        db.update_conversation_state(&source.id, &approval)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &approval)
+            .await
+            .unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        db.update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let turn_id = source_turn(&db, &source.id, "fallback-turn").await;
+        for (index, wait) in [&approval, &legacy].into_iter().enumerate() {
+            db.update_conversation_state(&source.id, &ConvState::Idle)
+                .await
+                .unwrap();
+            db.update_conversation_state(&source.id, wait)
+                .await
+                .unwrap();
+            let restored: ConvState =
+                serde_json::from_str(&serde_json::to_string(wait).unwrap()).unwrap();
+            db.update_conversation_state(&source.id, &restored)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.pending_coordinator_watch_events(16).await.unwrap().len(),
+                index * 2 + 1
+            );
+            db.update_conversation_state(&source.id, &ConvState::Idle)
+                .await
+                .unwrap();
+            db.update_conversation_state(&source.id, wait)
+                .await
+                .unwrap();
+            let events = db.pending_coordinator_watch_events(16).await.unwrap();
+            assert_eq!(events.len(), index * 2 + 2);
+            assert_ne!(
+                events[index * 2].source_occurrence_id,
+                events[index * 2 + 1].source_occurrence_id
+            );
+        }
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none());
     }
 
     #[tokio::test]

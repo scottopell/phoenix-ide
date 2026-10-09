@@ -7432,7 +7432,7 @@ impl Database {
                 .fetch_one(&mut *tx)
                 .await?;
 
-        coordinator_watches::record_question_wait_tx(&mut tx, id, state).await?;
+        coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
 
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",

@@ -41,11 +41,13 @@ CREATE TABLE coordinator_watch_events (
          AND watch_id IS NOT NULL
          AND mandatory_failure_occurrence_id IS NULL
          AND mandatory_source_product_id IS NULL
-         AND source_occurrence_kind IN ('direct_turn', 'creation', 'steering', 'wake', 'seeded_fork', 'interaction_response', 'continuation_summary', 'question_request')
-         AND terminal_kind IN ('completed', 'failed', 'cancelled', 'awaiting_user_response')
-         AND ((terminal_kind IN ('failed', 'awaiting_user_response')) = (terminal_reason IS NOT NULL))
+         AND source_occurrence_kind IN ('direct_turn', 'creation', 'steering', 'wake', 'seeded_fork', 'interaction_response', 'continuation_summary', 'question_request', 'task_approval_wait')
+         AND terminal_kind IN ('completed', 'failed', 'cancelled', 'awaiting_user_response', 'awaiting_task_approval')
+         AND ((terminal_kind IN ('failed', 'awaiting_user_response', 'awaiting_task_approval')) = (terminal_reason IS NOT NULL))
          AND ((source_occurrence_kind = 'question_request') = (terminal_kind = 'awaiting_user_response'))
-         AND (terminal_kind != 'awaiting_user_response' OR terminal_reason = 'question_request'))
+         AND (terminal_kind != 'awaiting_user_response' OR terminal_reason = 'question_request')
+         AND ((source_occurrence_kind = 'task_approval_wait') = (terminal_kind = 'awaiting_task_approval'))
+         AND (terminal_kind != 'awaiting_task_approval' OR terminal_reason = 'task_approval_wait'))
         OR
         (route_kind = 'mandatory_close_failure'
          AND watch_id IS NULL

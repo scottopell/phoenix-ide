@@ -33,6 +33,19 @@ class WaitMigrationTest(close.MandatoryCloseOutboxTests):
         apply(self.db)
         self.db.execute("COMMIT")
 
+    def test_task_approval_wait_uses_same_admission_and_unsubscribe_fences(self):
+        self.ordinary("approval", source_occurrence_kind="task_approval_wait",
+                      terminal_kind="awaiting_task_approval", terminal_reason="task_approval_wait")
+        self.accept("approval", "durable_turns", "approval-turn")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ordinary("bad-approval", source_occurrence_kind="task_approval_wait",
+                          terminal_kind="awaiting_task_approval", terminal_reason="question_request")
+        self.ordinary("late-approval", source_occurrence_kind="task_approval_wait",
+                      terminal_kind="awaiting_task_approval", terminal_reason="task_approval_wait")
+        self.db.execute("UPDATE coordinator_watches SET ended_at_us=50 WHERE id=1")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.accept("late-approval", "durable_turns", "late-turn")
+
     def test_populated_mandatory_pending_and_accepted_survive_rebuild(self):
         self.failure("accepted", ordinal=1)
         self.mandatory("accepted")
