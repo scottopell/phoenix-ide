@@ -52,6 +52,95 @@ impl fmt::Display for CloseAttemptIdError {
 }
 impl std::error::Error for CloseAttemptIdError {}
 
+/// A positive, `SQLite`-representable execution ordinal under one Close authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "i64", into = "i64")]
+pub struct CloseRunOrdinal(i64);
+
+impl CloseRunOrdinal {
+    pub const INITIAL: Self = Self(1);
+
+    /// # Errors
+    /// Rejects zero and negative ordinals.
+    pub fn parse(value: i64) -> Result<Self, CloseRunOrdinalError> {
+        if value > 0 {
+            Ok(Self(value))
+        } else {
+            Err(CloseRunOrdinalError)
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+
+    /// # Errors
+    /// Rejects exhaustion of the `SQLite` integer range.
+    pub fn checked_next(self) -> Result<Self, CloseRunOrdinalError> {
+        self.0.checked_add(1).map(Self).ok_or(CloseRunOrdinalError)
+    }
+}
+
+impl TryFrom<i64> for CloseRunOrdinal {
+    type Error = CloseRunOrdinalError;
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl From<CloseRunOrdinal> for i64 {
+    fn from(value: CloseRunOrdinal) -> Self {
+        value.get()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseRunOrdinalError;
+
+impl fmt::Display for CloseRunOrdinalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Close run ordinal must be a positive SQLite integer")
+    }
+}
+
+impl std::error::Error for CloseRunOrdinalError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CloseRunRef {
+    pub attempt_id: CloseAttemptId,
+    pub ordinal: CloseRunOrdinal,
+}
+
+impl CloseRunRef {
+    #[must_use]
+    pub fn initial(attempt_id: CloseAttemptId) -> Self {
+        Self {
+            attempt_id,
+            ordinal: CloseRunOrdinal::INITIAL,
+        }
+    }
+
+    #[must_use]
+    pub fn failure_occurrence_id(&self) -> String {
+        format!("close-failure:{}:{}", self.ordinal.get(), self.attempt_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseRunStatus {
+    Running,
+    Stopped,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseRun {
+    pub run: CloseRunRef,
+    pub status: CloseRunStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct TranscriptConversationId(String);
@@ -320,6 +409,7 @@ pub enum RetirementFailureReason {
     StillSharedByLiveOwner,
     ResidualProcessAlive,
     IdentityNotProven,
+    Interrupted,
     ManualRepairRequired,
 }
 
@@ -331,6 +421,7 @@ impl RetirementFailureReason {
             Self::StillSharedByLiveOwner => "still_shared_by_live_owner",
             Self::ResidualProcessAlive => "residual_process_alive",
             Self::IdentityNotProven => "identity_not_proven",
+            Self::Interrupted => "interrupted",
             Self::ManualRepairRequired => "manual_repair_required",
         }
     }
@@ -1247,6 +1338,30 @@ pub struct CloseRetiredResource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn close_run_identity_is_positive_bounded_and_deterministic() {
+        for value in [0, -1, i64::MIN] {
+            assert!(CloseRunOrdinal::parse(value).is_err());
+            assert!(serde_json::from_str::<CloseRunOrdinal>(&value.to_string()).is_err());
+        }
+        let initial =
+            CloseRunRef::initial(CloseAttemptId::parse("attempt:with:delimiters").unwrap());
+        assert_eq!(initial.ordinal.get(), 1);
+        assert_eq!(
+            initial.failure_occurrence_id(),
+            "close-failure:1:attempt:with:delimiters"
+        );
+        assert_eq!(initial.ordinal.checked_next().unwrap().get(), 2);
+        assert!(CloseRunOrdinal::parse(i64::MAX)
+            .unwrap()
+            .checked_next()
+            .is_err());
+        assert_eq!(
+            serde_json::from_str::<CloseRunRef>(&serde_json::to_string(&initial).unwrap()).unwrap(),
+            initial
+        );
+    }
+
     #[test]
     fn historical_commission_review_approval_snapshot_remains_readable() {
         assert_eq!(

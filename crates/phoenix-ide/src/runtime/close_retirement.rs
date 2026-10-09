@@ -9,11 +9,11 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
-    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseExpectedRetirementResource,
-    CloseLossItem, CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot,
-    CloseStopCertainty, GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity,
-    RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
-    WorktreeIdentity,
+    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome,
+    CloseExpectedRetirementResource, CloseLossItem, CloseOwnedResourceInventory, ClosePhase,
+    CloseRetirementSnapshot, CloseStopCertainty, GitOidIdentity, GitPathIdentity, LossItemIdentity,
+    OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
+    RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
     ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -33,10 +33,11 @@ use super::RuntimeManager;
 use crate::db::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
-    CloseCleanupFailureAuthority, CloseWorktreeFinalTombstone,
-    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
-    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
-    ReplaceCloseInspectionScopeRequest, TerminalizeInitialCloseCleanupFailureRequest,
+    CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
+    CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
+    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
+    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
+    TerminalizeInitialCloseCleanupFailureRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -57,25 +58,55 @@ struct CompletedCloseResource {
 #[derive(Debug, PartialEq, Eq)]
 enum CloseLeaseFailure {
     ProcessEpoch {
-        kind: RetiredResourceKind,
+        resource: RetiredResourceIdentity,
         reason: String,
     },
+    UnattributedProcessEpoch {
+        kind: RetiredResourceKind,
+        captured_resources: Vec<RetiredResourceIdentity>,
+        reason: String,
+    },
+    Unavailable,
     Tmux {
         reason: RetirementFailureReason,
         detail: String,
     },
 }
 
+impl CloseLeaseFailure {
+    fn process_epoch(
+        kind: RetiredResourceKind,
+        captured_resources: Vec<RetiredResourceIdentity>,
+        reason: String,
+    ) -> Self {
+        match captured_resources.as_slice() {
+            [resource] => Self::ProcessEpoch {
+                resource: resource.clone(),
+                reason,
+            },
+            _ => Self::UnattributedProcessEpoch {
+                kind,
+                captured_resources,
+                reason,
+            },
+        }
+    }
+}
+
 impl std::fmt::Display for CloseLeaseFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ProcessEpoch { kind, reason } => {
-                write!(
-                    formatter,
-                    "{} process-epoch teardown failed: {reason}",
-                    kind.as_str()
-                )
-            }
+            Self::ProcessEpoch { resource, reason } => write!(
+                formatter,
+                "{} process-epoch teardown failed for {:?}: {reason}",
+                resource.kind().as_str(), resource.identity()
+            ),
+            Self::UnattributedProcessEpoch { kind, captured_resources, reason } => write!(
+                formatter,
+                "{} process-epoch teardown failed without an individually attributed target; captured resources {captured_resources:?}: {reason}",
+                kind.as_str()
+            ),
+            Self::Unavailable => write!(formatter, "Close resource lease is unavailable; process-epoch identities cannot be rehydrated"),
             Self::Tmux { detail, .. } => write!(formatter, "tmux teardown failed: {detail}"),
         }
     }
@@ -86,6 +117,19 @@ impl RuntimeManager {
         &self,
         attempt_id: &CloseAttemptId,
     ) -> Result<(), String> {
+        let broadcasters = self.close_retirement_broadcasters(attempt_id).await?;
+        self.db()
+            .complete_close_retirement(attempt_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Self::publish_close_retirement_updates(broadcasters, true);
+        Ok(())
+    }
+
+    async fn close_retirement_broadcasters(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> Result<Vec<crate::runtime::SseBroadcaster>, String> {
         let participant_ids = self
             .db()
             .list_close_retirement_archived_conversation_ids(attempt_id.as_str())
@@ -100,16 +144,12 @@ impl RuntimeManager {
                 broadcasters.push(broadcaster);
             }
         }
-        self.db()
-            .complete_close_retirement(attempt_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Self::publish_close_retirement_archived_updates(broadcasters);
-        Ok(())
+        Ok(broadcasters)
     }
 
-    fn publish_close_retirement_archived_updates(
+    fn publish_close_retirement_updates(
         broadcasters: Vec<crate::runtime::SseBroadcaster>,
+        archived: bool,
     ) {
         for broadcaster in broadcasters {
             let _ = broadcaster.send_seq(|seq| crate::runtime::SseEvent::ConversationUpdate {
@@ -128,10 +168,35 @@ impl RuntimeManager {
                     task_title: None,
                     work_scope_key: None,
                     model: None,
-                    archived: Some(true),
+                    archived: Some(archived),
                 },
             });
         }
+    }
+
+    /// Restores admission-only fences from durable unresolved Close state.
+    pub(crate) async fn restore_close_admission_fences(&self) -> Result<(), String> {
+        let scopes = self
+            .db()
+            .list_close_execution_fence_scopes()
+            .await
+            .map_err(|error| error.to_string())?;
+        for scope in scopes {
+            let resource_scope = ResourceScopeKey::Work(scope);
+            self.bash_handles()
+                .fence_retirement_admission(&resource_scope)
+                .await;
+            drop(self.terminals.begin_retirement(&resource_scope));
+            drop(
+                self.browser_sessions()
+                    .begin_retirement(&resource_scope)
+                    .await,
+            );
+            self.tmux_registry()
+                .fence_retirement_admission(&resource_scope)
+                .await;
+        }
+        Ok(())
     }
 
     /// Inspects exact server-owned captured worktrees and persists normalized loss evidence.
@@ -171,6 +236,21 @@ impl RuntimeManager {
             .list_close_attempt_scopes(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        for captured in &scopes {
+            if let Err(error) = self
+                .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
+                .await
+            {
+                return self
+                    .route_close_attempt_to_repair(
+                        &attempt_id,
+                        &captured.scope,
+                        RetirementFailureReason::IdentityNotProven,
+                        format!("Close resource admission fencing failed: {error}"),
+                    )
+                    .await;
+            }
+        }
         let mut requests = Vec::with_capacity(scopes.len());
         for scope in scopes {
             let (snapshot, losses) = match scope.captured_worktree {
@@ -405,7 +485,10 @@ impl RuntimeManager {
             Some(CapturedWorktreeIdentity::Unresolved { .. }) | None => None,
         };
         let key = ResourceScopeKey::Work(scope.clone());
-        let bash = self.bash_handles().begin_retirement(&key).await;
+        self.bash_handles().fence_retirement_admission(&key).await;
+        let terminal = self.terminals.begin_retirement(&key);
+        let browser = self.browser_sessions().begin_retirement(&key).await;
+        self.tmux_registry().fence_retirement_admission(&key).await;
         let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
         let tmux_discovery = match self
             .tmux_registry()
@@ -413,10 +496,7 @@ impl RuntimeManager {
             .await
         {
             Ok(discovery) => discovery,
-            Err(error) => {
-                self.bash_handles().cancel_retirement(bash).await;
-                return Err(format!("tmux identity discovery failed: {error}"));
-            }
+            Err(error) => return Err(format!("tmux identity discovery failed: {error}")),
         };
         let tmux = match tmux_discovery {
             discovery @ (PersistentTmuxDiscovery::EndpointAbsent
@@ -427,7 +507,6 @@ impl RuntimeManager {
             {
                 Ok(permit) => permit,
                 Err(outcome) => {
-                    self.bash_handles().cancel_retirement(bash).await;
                     return Err(format!("tmux retirement fencing failed: {outcome:?}"));
                 }
             },
@@ -445,27 +524,20 @@ impl RuntimeManager {
                     {
                         Ok(permit) => permit,
                         Err(outcome) => {
-                            self.bash_handles().cancel_retirement(bash).await;
                             return Err(format!("tmux retirement fencing failed: {outcome:?}"));
                         }
                     },
                     Ok(TmuxRetirementRehydration::Residual { reason }) => {
-                        self.bash_handles().cancel_retirement(bash).await;
                         return Err(format!("tmux identity is ambiguous: {reason}"));
                     }
-                    Err(error) => {
-                        self.bash_handles().cancel_retirement(bash).await;
-                        return Err(format!("tmux rehydration failed: {error}"));
-                    }
+                    Err(error) => return Err(format!("tmux rehydration failed: {error}")),
                 }
             }
             PersistentTmuxDiscovery::Ambiguous { reason } => {
-                self.bash_handles().cancel_retirement(bash).await;
                 return Err(format!("tmux identity is ambiguous: {reason}"));
             }
         };
-        let terminal = self.terminals.begin_retirement(&key);
-        let browser = self.browser_sessions().begin_retirement(&key).await;
+        let bash = self.bash_handles().begin_retirement(&key).await;
         let mut resources = Vec::new();
         for target in &bash.exact_process_groups {
             resources.push(opaque_resource(
@@ -912,16 +984,36 @@ impl RuntimeManager {
                 .await
             {
                 Ok(resources) => resources,
-                Err(CloseLeaseFailure::ProcessEpoch { kind, reason }) => {
+                Err(ref failure @ CloseLeaseFailure::ProcessEpoch { ref resource, .. }) => {
+                    let detail = failure.to_string();
                     return self
-                        .route_close_attempt_to_repair(
+                        .record_close_process_failure(
                             &attempt_id,
                             &scope,
-                            RetirementFailureReason::IdentityNotProven,
-                            &format!(
-                                "{} process-epoch Close teardown failed: {reason}",
-                                kind.as_str()
-                            ),
+                            Some(resource.clone()),
+                            vec![],
+                            &detail,
+                        )
+                        .await;
+                }
+                Err(
+                    failure @ (CloseLeaseFailure::UnattributedProcessEpoch { .. }
+                    | CloseLeaseFailure::Unavailable),
+                ) => {
+                    let detail = failure.to_string();
+                    let captured_resources = match failure {
+                        CloseLeaseFailure::UnattributedProcessEpoch {
+                            captured_resources, ..
+                        } => captured_resources,
+                        _ => vec![],
+                    };
+                    return self
+                        .record_close_process_failure(
+                            &attempt_id,
+                            &scope,
+                            None,
+                            captured_resources,
+                            &detail,
                         )
                         .await;
                 }
@@ -1775,6 +1867,125 @@ impl RuntimeManager {
             .map_err(|error| error.to_string())
     }
 
+    async fn append_live_process_remaining_resources(
+        &self,
+        attempt_id: &CloseAttemptId,
+        remaining: &mut Vec<CloseCleanupFailureResource>,
+    ) {
+        let leases = self.close_retirement_leases.lock().await;
+        for ((lease_attempt, scope), lease) in leases.iter() {
+            if lease_attempt != attempt_id.as_str() {
+                continue;
+            }
+            for resource in lease.resources.iter().filter(|resource| {
+                matches!(
+                    resource.kind(),
+                    RetiredResourceKind::BashProcessGroup
+                        | RetiredResourceKind::PtySession
+                        | RetiredResourceKind::BrowserSession
+                        | RetiredResourceKind::EquivalentLiveResource
+                )
+            }) {
+                if !remaining
+                    .iter()
+                    .any(|item| item.scope == *scope && item.resource == *resource)
+                {
+                    remaining.push(CloseCleanupFailureResource {
+                        scope: scope.clone(),
+                        resource: resource.clone(),
+                        disposition: CloseCleanupResourceDisposition::Unknown,
+                    });
+                }
+            }
+        }
+    }
+
+    fn order_close_failure_resources(
+        authority_scope: &WorkScopeId,
+        authority_resource: &RetiredResourceIdentity,
+        resources: &mut [CloseCleanupFailureResource],
+    ) {
+        resources.sort_by(|left, right| {
+            let left_authority =
+                left.scope == *authority_scope && left.resource == *authority_resource;
+            let right_authority =
+                right.scope == *authority_scope && right.resource == *authority_resource;
+            right_authority.cmp(&left_authority).then_with(|| {
+                (
+                    left.scope.as_str(),
+                    left.resource.kind().as_str(),
+                    left.resource.identity().value(),
+                )
+                    .cmp(&(
+                        right.scope.as_str(),
+                        right.resource.kind().as_str(),
+                        right.resource.identity().value(),
+                    ))
+            })
+        });
+    }
+
+    async fn record_close_process_failure<T>(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        failed_resource: Option<RetiredResourceIdentity>,
+        captured_resources: Vec<RetiredResourceIdentity>,
+        detail: &str,
+    ) -> Result<T, String> {
+        let mut durable_remaining = self
+            .db()
+            .unresolved_expected_close_cleanup_resources(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let (authority, disposition) = match failed_resource {
+            Some(resource) => (
+                CloseCleanupFailureAuthority::ObservedProcessResource { resource },
+                CloseCleanupResourceDisposition::Failed,
+            ),
+            None => (
+                CloseCleanupFailureAuthority::CapturedScope {
+                    resource: opaque_resource(
+                        RetiredResourceKind::WorkScope,
+                        scope.as_str().to_string(),
+                    ),
+                },
+                CloseCleanupResourceDisposition::Unknown,
+            ),
+        };
+        let mut remaining_resources = vec![CloseCleanupFailureResource {
+            scope: scope.clone(),
+            resource: authority.resource().clone(),
+            disposition,
+        }];
+        remaining_resources.append(&mut durable_remaining);
+        for resource in captured_resources {
+            if !remaining_resources
+                .iter()
+                .any(|remaining| remaining.resource == resource)
+            {
+                remaining_resources.push(CloseCleanupFailureResource {
+                    scope: scope.clone(),
+                    resource,
+                    disposition: CloseCleanupResourceDisposition::Unknown,
+                });
+            }
+        }
+        self.append_live_process_remaining_resources(attempt_id, &mut remaining_resources)
+            .await;
+        Self::order_close_failure_resources(scope, authority.resource(), &mut remaining_resources);
+        self.terminalize_close_cleanup_failure(
+            attempt_id,
+            scope,
+            authority,
+            remaining_resources,
+            RetirementFailureReason::IdentityNotProven,
+            detail,
+            CloseStopCertainty::ShutdownUncertain,
+        )
+        .await
+    }
+
     pub(crate) async fn route_close_attempt_to_repair<T>(
         &self,
         attempt_id: &CloseAttemptId,
@@ -1807,10 +2018,29 @@ impl RuntimeManager {
             }
         }
         .map_err(|error| error.to_string())?;
+        let authority = CloseCleanupFailureAuthority::CapturedScope {
+            resource: residual.clone(),
+        };
+        let mut remaining_resources = self
+            .db()
+            .unresolved_expected_close_cleanup_resources(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        remaining_resources
+            .retain(|remaining| remaining.scope != *scope || remaining.resource != residual);
+        remaining_resources.push(CloseCleanupFailureResource {
+            scope: scope.clone(),
+            resource: residual,
+            disposition: CloseCleanupResourceDisposition::Failed,
+        });
+        self.append_live_process_remaining_resources(attempt_id, &mut remaining_resources)
+            .await;
+        Self::order_close_failure_resources(scope, authority.resource(), &mut remaining_resources);
         self.terminalize_close_cleanup_failure(
             attempt_id,
             scope,
-            CloseCleanupFailureAuthority::CapturedScope { resource: residual },
+            authority,
+            remaining_resources,
             reason,
             &detail,
             CloseStopCertainty::ShutdownUncertain,
@@ -1827,6 +2057,14 @@ impl RuntimeManager {
         reason: RetirementFailureReason,
         detail: &str,
     ) -> Result<T, String> {
+        let mut remaining_resources = self
+            .db()
+            .expected_close_cleanup_failure_resources(attempt_id.as_str(), scope, &resource)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.append_live_process_remaining_resources(attempt_id, &mut remaining_resources)
+            .await;
+        Self::order_close_failure_resources(scope, &resource, &mut remaining_resources);
         self.terminalize_close_cleanup_failure(
             attempt_id,
             scope,
@@ -1834,6 +2072,7 @@ impl RuntimeManager {
                 snapshot: snapshot.clone(),
                 resource,
             },
+            remaining_resources,
             reason,
             detail,
             CloseStopCertainty::ShutdownUncertain,
@@ -1850,6 +2089,14 @@ impl RuntimeManager {
         reason: RetirementFailureReason,
         detail: &str,
     ) -> Result<T, String> {
+        let mut remaining_resources = self
+            .db()
+            .expected_close_cleanup_failure_resources(attempt_id.as_str(), scope, &resource)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.append_live_process_remaining_resources(attempt_id, &mut remaining_resources)
+            .await;
+        Self::order_close_failure_resources(scope, &resource, &mut remaining_resources);
         self.terminalize_close_cleanup_failure(
             attempt_id,
             scope,
@@ -1857,6 +2104,7 @@ impl RuntimeManager {
                 snapshot: snapshot.clone(),
                 resource,
             },
+            remaining_resources,
             reason,
             detail,
             CloseStopCertainty::ConversationAndProcessesStopped {
@@ -1866,11 +2114,13 @@ impl RuntimeManager {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn terminalize_close_cleanup_failure<T>(
         &self,
         attempt_id: &CloseAttemptId,
         scope: &WorkScopeId,
         authority: CloseCleanupFailureAuthority,
+        remaining_resources: Vec<CloseCleanupFailureResource>,
         reason: RetirementFailureReason,
         detail: &str,
         stop_certainty: CloseStopCertainty,
@@ -1880,7 +2130,9 @@ impl RuntimeManager {
             .get_close_obligation(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
-        let failure_occurrence_id = format!("close-cleanup-failure:{attempt_id}:0");
+        let failure_occurrence_id =
+            phoenix_core::domain::close::CloseRunRef::initial(attempt_id.clone())
+                .failure_occurrence_id();
         let persisted_timing = self
             .db()
             .close_cleanup_failure_timing(&failure_occurrence_id)
@@ -1902,6 +2154,7 @@ impl RuntimeManager {
             source_product_conversation_id: obligation.product_conversation_id().clone(),
             scope: scope.clone(),
             authority,
+            remaining_resources,
             reason,
             detail: detail.to_string(),
             stop_certainty,
@@ -1914,15 +2167,26 @@ impl RuntimeManager {
         &self,
         request: &TerminalizeInitialCloseCleanupFailureRequest,
     ) -> Result<T, String> {
-        self.db()
+        let broadcasters = self
+            .close_retirement_broadcasters(&request.attempt_id)
+            .await?;
+        let completed = self
+            .db()
             .terminalize_initial_close_cleanup_failure(request)
             .await
             .map_err(|error| error.to_string())?;
-        self.kick_direct_turn_worker();
-        if let Err(error) = self.cancel_close_resource_leases(&request.attempt_id).await {
-            tracing::warn!(attempt_id = %request.attempt_id, %error,
-                "failed to release Close resource leases after terminal cleanup failure");
+        self.discard_close_resource_leases(&request.attempt_id)
+            .await;
+        match completed.close_outcome() {
+            Some(CloseCompletionOutcome::ArchivedCleanupAttention) => {
+                Self::publish_close_retirement_updates(broadcasters, true);
+            }
+            Some(CloseCompletionOutcome::CloseIncomplete) => {
+                Self::publish_close_retirement_updates(broadcasters, false);
+            }
+            Some(CloseCompletionOutcome::Archived | CloseCompletionOutcome::Cancelled) | None => {}
         }
+        self.kick_direct_turn_worker();
         Err(request.detail.clone())
     }
 
@@ -1935,18 +2199,36 @@ impl RuntimeManager {
         let key = (attempt_id.as_str().to_string(), scope.clone());
         let lease = self.close_retirement_leases.lock().await.remove(&key);
         let Some(lease) = lease else {
-            return Err(CloseLeaseFailure::ProcessEpoch {
-                kind: RetiredResourceKind::EquivalentLiveResource,
-                reason: "Close resource lease is unavailable after restart; process-epoch identities cannot be rehydrated".to_string(),
-            });
+            return Err(CloseLeaseFailure::Unavailable);
         };
         let result = async {
-            require_absent(self.bash_handles().complete_retirement(&lease.bash).await).map_err(
-                |reason| CloseLeaseFailure::ProcessEpoch {
-                    kind: RetiredResourceKind::BashProcessGroup,
+            let bash_outcome = self.bash_handles().complete_retirement(&lease.bash).await;
+            let failed_bash_resources = lease
+                .bash
+                .exact_process_groups
+                .iter()
+                .filter(|target| {
+                    bash_outcome.report().kill_failures.iter().any(|(pid, _)| {
+                        *pid == target.pgid
+                            || u32::try_from(*pid)
+                                .ok()
+                                .is_some_and(|pid| target.pid == Some(pid))
+                    })
+                })
+                .map(|target| {
+                    opaque_resource(
+                        RetiredResourceKind::BashProcessGroup,
+                        target.stable_resource_identity(),
+                    )
+                })
+                .collect();
+            require_absent(bash_outcome).map_err(|reason| {
+                CloseLeaseFailure::process_epoch(
+                    RetiredResourceKind::BashProcessGroup,
+                    failed_bash_resources,
                     reason,
-                },
-            )?;
+                )
+            })?;
             let tmux_outcome = self
                 .tmux_registry()
                 .complete_retirement(&lease.tmux)
@@ -1958,18 +2240,34 @@ impl RuntimeManager {
             let tmux_outcome = tmux_retirement_outcome(tmux_outcome)
                 .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?;
             require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)
-                .map_err(|reason| CloseLeaseFailure::ProcessEpoch {
-                    kind: RetiredResourceKind::PtySession,
-                    reason,
+                .map_err(|reason| {
+                    CloseLeaseFailure::process_epoch(
+                        RetiredResourceKind::PtySession,
+                        lease
+                            .resources
+                            .iter()
+                            .filter(|resource| resource.kind() == RetiredResourceKind::PtySession)
+                            .cloned()
+                            .collect(),
+                        reason,
+                    )
                 })?;
             require_browser_absent(
                 self.browser_sessions()
                     .complete_retirement(&lease.browser)
                     .await,
             )
-            .map_err(|reason| CloseLeaseFailure::ProcessEpoch {
-                kind: RetiredResourceKind::BrowserSession,
-                reason,
+            .map_err(|reason| {
+                CloseLeaseFailure::process_epoch(
+                    RetiredResourceKind::BrowserSession,
+                    lease
+                        .resources
+                        .iter()
+                        .filter(|resource| resource.kind() == RetiredResourceKind::BrowserSession)
+                        .cloned()
+                        .collect(),
+                    reason,
+                )
             })?;
             Ok(lease
                 .resources
@@ -5148,7 +5446,34 @@ mod tests {
     use std::io::{BufRead as _, Read as _};
     use std::path::Path;
 
+    async fn assert_close_admission_fenced(
+        manager: &super::RuntimeManager,
+        scope: &phoenix_core::work_scope::WorkScopeId,
+    ) {
+        let key = phoenix_core::work_scope::ResourceScopeKey::Work(scope.clone());
+        assert!(matches!(
+            manager.bash_handles().reserve_spawn(&key).await,
+            Err(phoenix_tools::bash::registry::BashHandleError::SpawnFenced)
+        ));
+        assert!(matches!(
+            manager.terminals.reserve_spawn(&key),
+            Err(phoenix_terminal::session::ActiveTerminalInsertError::RetirementFenced)
+        ));
+        assert!(matches!(
+            manager.browser_sessions().get_session(&key).await,
+            Err(phoenix_tools::browser::session::BrowserError::RetirementFenced { .. })
+        ));
+        assert!(matches!(
+            manager
+                .tmux_registry()
+                .ensure_live(&key, Path::new("/tmp"), None, None)
+                .await,
+            Err(phoenix_tools::tmux::registry::TmuxError::RetirementFenced { .. })
+        ));
+    }
+
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn captured_cleanup_failure_terminalizes_and_kicks_on_exact_replay() {
         use phoenix_core::domain::close::{
             CloseAttemptId, CloseCompletionOutcome, ClosePhase, RetirementFailureReason,
@@ -5179,6 +5504,12 @@ mod tests {
             Arc::new(crate::tools::mcp::McpClientManager::new()),
             None,
         );
+        manager
+            .acquire_close_resource_lease(&attempt_id, scope.clone())
+            .await
+            .unwrap();
+        let broadcaster = manager.conversation_broadcaster(&conversation.id).await;
+        let mut receiver = broadcaster.subscribe();
         let mut kicks = manager.direct_turn_kick_tx.subscribe();
         let initial_kick = *kicks.borrow_and_update();
         let detail = "process shutdown could not be proven";
@@ -5203,7 +5534,21 @@ mod tests {
                 .unwrap()
                 .archived
         );
-        let failure_occurrence_id = format!("close-cleanup-failure:{attempt_id}:0");
+        assert_close_admission_fenced(&manager, &scope).await;
+        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            crate::runtime::SseEvent::ConversationUpdate {
+                update: crate::runtime::ConversationMetadataUpdate {
+                    archived: Some(false),
+                    ..
+                },
+                ..
+            }
+        ));
+        let failure_occurrence_id =
+            phoenix_core::domain::close::CloseRunRef::initial(attempt_id.clone())
+                .failure_occurrence_id();
         let failures: Vec<(String, i64)> = sqlx::query_as(
             "SELECT failure_occurrence_id, occurred_at_us FROM close_cleanup_failures",
         )
@@ -5212,6 +5557,21 @@ mod tests {
         .unwrap();
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].0, failure_occurrence_id);
+        let persisted = db
+            .list_close_cleanup_failures(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted[0].occurrence.remaining_resources,
+            vec![super::CloseCleanupFailureResource {
+                scope: scope.clone(),
+                resource: super::opaque_resource(
+                    phoenix_core::domain::close::RetiredResourceKind::WorkScope,
+                    scope.as_str().to_string()
+                ),
+                disposition: super::CloseCleanupResourceDisposition::Failed,
+            }]
+        );
         assert_eq!(
             manager
                 .route_close_attempt_to_repair::<()>(&attempt_id, &scope, reason, detail)
@@ -5220,6 +5580,17 @@ mod tests {
         );
         assert!(kicks.has_changed().unwrap());
         assert_eq!(*kicks.borrow_and_update(), initial_kick + 2);
+        assert_close_admission_fenced(&manager, &scope).await;
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            crate::runtime::SseEvent::ConversationUpdate {
+                update: crate::runtime::ConversationMetadataUpdate {
+                    archived: Some(false),
+                    ..
+                },
+                ..
+            }
+        ));
         let events: Vec<(String, String)> =
             sqlx::query_as("SELECT event_id, route_kind FROM coordinator_watch_events")
                 .fetch_all(db.pool())
@@ -5232,6 +5603,462 @@ mod tests {
         assert_eq!(
             db.get_close_obligation(attempt_id.as_str()).await.unwrap(),
             completed
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn cleanup_attention_publishes_all_participants_only_after_commit_and_replays() {
+        use super::*;
+        use phoenix_core::domain::close::TranscriptConversationId;
+        use std::sync::Arc;
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("source", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope = conversation.attached_work_scope_id.clone().unwrap();
+        db.create_subagent_conversation(
+            "participant",
+            "participant",
+            "/tmp",
+            &conversation.id,
+            "test-model",
+            &crate::db::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            Some(&scope),
+            crate::db::SubAgentExecution {
+                connection: "mock",
+                effort: None,
+                persona: None,
+            },
+        )
+        .await
+        .unwrap();
+        let worktree = WorktreeIdentity::from_parts(
+            WorktreeId::parse("failure-worktree").unwrap(),
+            WorktreeFingerprint::parse("failure-fingerprint").unwrap(),
+            GitPathIdentity::from_bytes(b"/tmp/runtime-cleanup-attention-worktree".to_vec()),
+        );
+        sqlx::query("UPDATE work_scopes SET environment_kind='allocated_worktree', worktree_path=?1, worktree_id=?2, worktree_fingerprint=?3, branch_name='test', base_branch='main' WHERE id=?4")
+            .bind("/tmp/runtime-cleanup-attention-worktree").bind(worktree.id().as_str()).bind(worktree.fingerprint().as_str()).bind(scope.as_str())
+            .execute(db.pool()).await.unwrap();
+        db.update_conversation_state(
+            &conversation.id,
+            &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+                summary: "continue onto another scope".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let crate::db::ContinueOutcome::Created(latest) =
+            db.continue_conversation(&conversation.id).await.unwrap()
+        else {
+            panic!("expected a new continuation");
+        };
+        let later_scope = WorkScopeId::parse("later-scope").unwrap();
+        sqlx::query("INSERT INTO work_scopes (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at) SELECT ?1, 'work', 'active', 'unowned_cwd', '/tmp/later', created_at, updated_at FROM work_scopes WHERE id=?2")
+            .bind(later_scope.as_str()).bind(scope.as_str()).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE conversations SET work_scope_id=?1 WHERE id=?2")
+            .bind(later_scope.as_str())
+            .bind(&latest.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse("runtime-cleanup-attention").unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &TranscriptConversationId::parse(&latest.id).unwrap(),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        db.advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        let manager = RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::platform::PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        );
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("failure-gen", "failure-fp").unwrap(),
+                losses: vec![],
+            }],
+        })
+        .await
+        .unwrap();
+        let snapshot = db
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
+        manager
+            .acquire_close_resource_lease(&attempt_id, scope.clone())
+            .await
+            .unwrap();
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree.clone()),
+        )
+        .unwrap();
+        db.capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+            attempt_id: attempt_id.clone(),
+            snapshot: snapshot.clone(),
+            scopes: vec![
+                CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(worktree),
+                        work_scopes: BTreeSet::new(),
+                        bash_process_groups: BTreeSet::new(),
+                        tmux_servers: BTreeSet::new(),
+                        pty_sessions: BTreeSet::new(),
+                        browser_sessions: BTreeSet::new(),
+                        equivalent_live_resources: BTreeSet::new(),
+                    },
+                },
+                CaptureCloseRetirementInventoryScopeRequest {
+                    scope: later_scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: None,
+                        work_scopes: BTreeSet::new(),
+                        bash_process_groups: BTreeSet::new(),
+                        tmux_servers: BTreeSet::new(),
+                        pty_sessions: BTreeSet::new(),
+                        browser_sessions: BTreeSet::new(),
+                        equivalent_live_resources: BTreeSet::new(),
+                    },
+                },
+            ],
+        })
+        .await
+        .unwrap();
+        let mut receivers = Vec::new();
+        for id in [&conversation.id, "participant", &latest.id] {
+            receivers.push((id, manager.conversation_broadcaster(id).await.subscribe()));
+        }
+        let detail = "scope retirement failed";
+        let reason = RetirementFailureReason::RemovalFailed;
+        sqlx::query("CREATE TRIGGER reject_failure_event BEFORE INSERT ON coordinator_watch_events BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END")
+            .execute(db.pool()).await.unwrap();
+        let error = manager
+            .record_close_cleanup_failure::<()>(
+                &attempt_id,
+                &snapshot,
+                &scope,
+                resource.clone(),
+                reason,
+                detail,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected outbox failure"), "{error}");
+        for (id, receiver) in &mut receivers {
+            assert!(!db.get_conversation(id).await.unwrap().archived);
+            assert!(receiver.try_recv().is_err());
+        }
+        assert_eq!(manager.close_retirement_leases.lock().await.len(), 1);
+        assert_close_admission_fenced(&manager, &scope).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        sqlx::query("DROP TRIGGER reject_failure_event")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                manager
+                    .record_close_cleanup_failure::<()>(
+                        &attempt_id,
+                        &snapshot,
+                        &scope,
+                        resource.clone(),
+                        reason,
+                        detail
+                    )
+                    .await,
+                Err(detail.to_string())
+            );
+            assert_eq!(
+                db.get_close_obligation(attempt_id.as_str())
+                    .await
+                    .unwrap()
+                    .close_outcome(),
+                Some(CloseCompletionOutcome::ArchivedCleanupAttention)
+            );
+            let failures = db
+                .list_close_cleanup_failures(attempt_id.as_str())
+                .await
+                .unwrap();
+            assert_eq!(failures.len(), 1);
+            let remaining = &failures[0].occurrence.remaining_resources;
+            assert_eq!(remaining.len(), 3);
+            assert!(remaining.contains(&CloseCleanupFailureResource {
+                scope: scope.clone(),
+                resource: resource.clone(),
+                disposition: CloseCleanupResourceDisposition::Failed,
+            }));
+            for captured_scope in [&scope, &later_scope] {
+                assert!(remaining.contains(&CloseCleanupFailureResource {
+                    scope: captured_scope.clone(),
+                    resource: opaque_resource(
+                        RetiredResourceKind::WorkScope,
+                        captured_scope.as_str().to_string()
+                    ),
+                    disposition: CloseCleanupResourceDisposition::Unattempted,
+                }));
+            }
+            for (id, receiver) in &mut receivers {
+                assert!(db.get_conversation(id).await.unwrap().archived);
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    crate::runtime::SseEvent::ConversationUpdate {
+                        update: crate::runtime::ConversationMetadataUpdate {
+                            archived: Some(true),
+                            ..
+                        },
+                        ..
+                    }
+                ));
+                assert!(receiver.try_recv().is_err());
+            }
+            assert!(manager.close_retirement_leases.lock().await.is_empty());
+            assert_close_admission_fenced(&manager, &scope).await;
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn process_cleanup_failure_preserves_exact_identity_and_unknown_candidates() {
+        use super::*;
+        use phoenix_core::domain::close::TranscriptConversationId;
+        use std::sync::Arc;
+
+        let bash = opaque_resource(
+            RetiredResourceKind::BashProcessGroup,
+            "epoch-A:pgid-17".into(),
+        );
+        let pty = opaque_resource(RetiredResourceKind::PtySession, "epoch-A:pty-19".into());
+        let browser = opaque_resource(
+            RetiredResourceKind::BrowserSession,
+            "epoch-A:browser-23".into(),
+        );
+        let other_browser = opaque_resource(
+            RetiredResourceKind::BrowserSession,
+            "epoch-A:browser-29".into(),
+        );
+        for (failed, candidates, lease_resources) in [
+            (
+                Some(bash.clone()),
+                vec![],
+                Some(vec![bash.clone(), pty.clone(), browser.clone()]),
+            ),
+            (
+                Some(pty.clone()),
+                vec![],
+                Some(vec![pty.clone(), browser.clone()]),
+            ),
+            (
+                Some(browser.clone()),
+                vec![],
+                Some(vec![browser.clone(), other_browser.clone()]),
+            ),
+            (
+                None,
+                vec![browser.clone(), other_browser.clone()],
+                Some(vec![browser.clone(), other_browser.clone(), pty.clone()]),
+            ),
+            (None, vec![], Some(vec![pty.clone()])),
+            (None, vec![], None),
+        ] {
+            let db = crate::db::Database::open_in_memory().await.unwrap();
+            let conversation = db
+                .create_conversation("source", "source", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let scope = conversation.attached_work_scope_id.clone().unwrap();
+            let attempt_id = CloseAttemptId::parse("process-cleanup-failure").unwrap();
+            db.begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(&conversation.id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+            let manager = RuntimeManager::new(
+                db.clone(),
+                Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+                crate::platform::PlatformCapability::None {
+                    details: "test".into(),
+                },
+                Arc::new(crate::tools::mcp::McpClientManager::new()),
+                None,
+            );
+            let has_lease = lease_resources.is_some();
+            let mut expected_candidates = candidates.clone();
+            if let Some(resources) = lease_resources {
+                manager
+                    .acquire_close_resource_lease(&attempt_id, scope.clone())
+                    .await
+                    .unwrap();
+                expected_candidates.extend(resources.clone());
+                manager
+                    .close_retirement_leases
+                    .lock()
+                    .await
+                    .get_mut(&(attempt_id.as_str().to_string(), scope.clone()))
+                    .unwrap()
+                    .resources = resources;
+            }
+            let mut receiver = manager
+                .conversation_broadcaster(&conversation.id)
+                .await
+                .subscribe();
+            let detail = "process shutdown uncertain";
+            assert_eq!(
+                manager
+                    .record_close_process_failure::<()>(
+                        &attempt_id,
+                        &scope,
+                        failed.clone(),
+                        candidates,
+                        detail,
+                    )
+                    .await,
+                Err(detail.into())
+            );
+            let failures = db
+                .list_close_cleanup_failures(attempt_id.as_str())
+                .await
+                .unwrap();
+            assert_eq!(failures.len(), 1);
+            let occurrence = &failures[0].occurrence;
+            assert_eq!(
+                occurrence.stop_certainty,
+                CloseStopCertainty::ShutdownUncertain
+            );
+            let authority_resource = failed.clone().unwrap_or_else(|| {
+                opaque_resource(RetiredResourceKind::WorkScope, scope.as_str().to_string())
+            });
+            assert_eq!(
+                occurrence.authority,
+                match &failed {
+                    Some(resource) => CloseCleanupFailureAuthority::ObservedProcessResource {
+                        resource: resource.clone()
+                    },
+                    None => CloseCleanupFailureAuthority::CapturedScope {
+                        resource: authority_resource.clone()
+                    },
+                }
+            );
+            let mut expected = vec![CloseCleanupFailureResource {
+                scope: scope.clone(),
+                resource: authority_resource.clone(),
+                disposition: if failed.is_some() {
+                    CloseCleanupResourceDisposition::Failed
+                } else {
+                    CloseCleanupResourceDisposition::Unknown
+                },
+            }];
+            for resource in expected_candidates {
+                if !expected.iter().any(|target| target.resource == resource) {
+                    expected.push(CloseCleanupFailureResource {
+                        scope: scope.clone(),
+                        resource,
+                        disposition: CloseCleanupResourceDisposition::Unknown,
+                    });
+                }
+            }
+            RuntimeManager::order_close_failure_resources(
+                &scope,
+                &authority_resource,
+                &mut expected,
+            );
+            assert_eq!(occurrence.remaining_resources, expected);
+            assert_eq!(
+                db.get_close_obligation(attempt_id.as_str())
+                    .await
+                    .unwrap()
+                    .close_outcome(),
+                Some(CloseCompletionOutcome::CloseIncomplete)
+            );
+            assert!(
+                !db.get_conversation(&conversation.id)
+                    .await
+                    .unwrap()
+                    .archived
+            );
+            if has_lease {
+                assert_close_admission_fenced(&manager, &scope).await;
+            }
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                crate::runtime::SseEvent::ConversationUpdate {
+                    update: crate::runtime::ConversationMetadataUpdate {
+                        archived: Some(false),
+                        ..
+                    },
+                    ..
+                }
+            ));
+            assert!(manager.close_retirement_leases.lock().await.is_empty());
+        }
+    }
+
+    #[test]
+    fn process_epoch_failure_does_not_invent_one_failed_resource_for_aggregate_errors() {
+        use phoenix_core::domain::close::RetiredResourceKind;
+        let resources = vec![
+            super::opaque_resource(RetiredResourceKind::BrowserSession, "browser-a".to_string()),
+            super::opaque_resource(RetiredResourceKind::BrowserSession, "browser-b".to_string()),
+        ];
+        let failure = CloseLeaseFailure::process_epoch(
+            RetiredResourceKind::BrowserSession,
+            resources.clone(),
+            "batch failure".to_string(),
+        );
+        assert!(
+            matches!(failure, CloseLeaseFailure::UnattributedProcessEpoch { captured_resources, .. } if captured_resources == resources)
+        );
+        assert!(
+            matches!(CloseLeaseFailure::process_epoch(RetiredResourceKind::PtySession, vec![], "no captured target".to_string()), CloseLeaseFailure::UnattributedProcessEpoch { captured_resources, .. } if captured_resources.is_empty())
         );
     }
 
@@ -7194,10 +8021,15 @@ mod tests {
 
     #[test]
     fn close_lease_failure_origin_distinguishes_tmux_from_process_epoch() {
-        let process_epoch = CloseLeaseFailure::ProcessEpoch {
-            kind: phoenix_core::domain::close::RetiredResourceKind::BrowserSession,
-            reason: "profile identity changed".to_string(),
-        };
+        let resource = super::opaque_resource(
+            phoenix_core::domain::close::RetiredResourceKind::BrowserSession,
+            "exact-browser-launch-and-profile".to_string(),
+        );
+        let process_epoch = CloseLeaseFailure::process_epoch(
+            resource.kind(),
+            vec![resource.clone()],
+            "profile identity changed".to_string(),
+        );
         let tmux = CloseLeaseFailure::Tmux {
             reason: phoenix_core::domain::close::RetirementFailureReason::IdentityNotProven,
             detail: "server token changed".to_string(),
@@ -7205,10 +8037,7 @@ mod tests {
 
         assert!(matches!(
             process_epoch,
-            CloseLeaseFailure::ProcessEpoch {
-                kind: phoenix_core::domain::close::RetiredResourceKind::BrowserSession,
-                ..
-            }
+            CloseLeaseFailure::ProcessEpoch { resource: failed, .. } if failed == resource
         ));
         assert!(matches!(tmux, CloseLeaseFailure::Tmux { .. }));
     }

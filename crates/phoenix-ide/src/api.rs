@@ -124,6 +124,77 @@ async fn reconcile_startup_continuations(
     Ok(())
 }
 
+async fn observe_running_close_runs(
+    db: &Database,
+    mut after_commit: impl FnMut(),
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let running = db.list_running_close_runs().await?;
+    let mut classified = 0;
+    for run in running {
+        db.classify_interrupted_close_run(&run).await?;
+        classified += 1;
+        after_commit();
+    }
+    Ok(classified)
+}
+
+#[cfg(test)]
+mod close_startup_tests {
+    use super::*;
+    use phoenix_core::domain::close::TranscriptConversationId;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn startup_observation_classifies_once_and_does_not_start_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("startup-close", "startup-close", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_id = conversation.product_conversation_id;
+        let transcript_id = TranscriptConversationId::parse("startup-close").unwrap();
+        db.begin_close_foundation(&product_id, &transcript_id, "startup-close-attempt")
+            .await
+            .unwrap();
+
+        let commits = Cell::new(0);
+        assert_eq!(
+            observe_running_close_runs(&db, || commits.set(commits.get() + 1))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            observe_running_close_runs(&db, || commits.set(commits.get() + 1))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(commits.get(), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_retirement_resources")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+}
+
 impl AppState {
     /// Create new application state and start the sub-agent handler
     // Each argument is a distinct startup-resolved dependency (db, registry,
@@ -155,6 +226,15 @@ impl AppState {
             credential_helper.clone(),
             &runtime_env,
         ));
+        runtime
+            .restore_close_admission_fences()
+            .await
+            .map_err(std::io::Error::other)?;
+        observe_running_close_runs(&db, || {
+            runtime.kick_direct_turn_worker();
+            runtime.kick_wake_worker();
+        })
+        .await?;
         let retired_wakes = db
             .wake_repository()
             .retire_all_registrations(phoenix_workflow::Timestamp(

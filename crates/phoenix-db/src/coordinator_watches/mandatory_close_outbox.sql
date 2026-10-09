@@ -11,9 +11,8 @@ CREATE TABLE coordinator_watch_events (
     route_kind TEXT NOT NULL DEFAULT 'subscription'
         CHECK(route_kind IN ('subscription', 'mandatory_close_failure')),
     watch_id INTEGER REFERENCES coordinator_watches(id),
-    mandatory_failure_occurrence_id TEXT UNIQUE
-        REFERENCES close_cleanup_failures(failure_occurrence_id) ON DELETE RESTRICT,
-    mandatory_source_product_id TEXT REFERENCES product_conversations(id) ON DELETE RESTRICT,
+    mandatory_failure_occurrence_id TEXT UNIQUE,
+    mandatory_source_product_id TEXT,
     source_occurrence_kind TEXT NOT NULL,
     source_occurrence_id TEXT NOT NULL CHECK(length(trim(source_occurrence_id)) > 0),
     source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
@@ -26,6 +25,16 @@ CREATE TABLE coordinator_watch_events (
     delivery_state TEXT NOT NULL DEFAULT 'pending'
         CHECK(delivery_state IN ('pending', 'accepted', 'suppressed')),
     accepted_transcript_id TEXT,
+    pending_failure_occurrence_id TEXT GENERATED ALWAYS AS (
+        CASE WHEN delivery_state = 'pending' THEN mandatory_failure_occurrence_id END
+    ) VIRTUAL REFERENCES close_cleanup_failures(failure_occurrence_id) ON DELETE RESTRICT,
+    pending_source_product_id TEXT GENERATED ALWAYS AS (
+        CASE WHEN delivery_state = 'pending' THEN mandatory_source_product_id END
+    ) VIRTUAL REFERENCES product_conversations(id) ON DELETE RESTRICT,
+    pending_source_transcript_id TEXT GENERATED ALWAYS AS (
+        CASE WHEN route_kind = 'mandatory_close_failure' AND delivery_state = 'pending'
+             THEN source_transcript_id END
+    ) VIRTUAL REFERENCES conversations(id) ON DELETE RESTRICT,
     CHECK ((delivery_state = 'accepted') = (accepted_transcript_id IS NOT NULL)),
     UNIQUE(source_occurrence_kind, source_occurrence_id, source_generation, watch_id),
     CHECK (
@@ -62,6 +71,10 @@ SELECT event_id, watch_id, source_occurrence_kind, source_occurrence_id,
 FROM mandatory_close_outbox_snapshot;
 DROP TABLE mandatory_close_outbox_snapshot;
 CREATE INDEX coordinator_watch_events_pending ON coordinator_watch_events(delivery_state, occurred_at_us);
+
+CREATE TRIGGER watch_event_mandatory_pending_reject_delete BEFORE DELETE ON coordinator_watch_events
+WHEN OLD.route_kind = 'mandatory_close_failure' AND OLD.delivery_state = 'pending'
+BEGIN SELECT RAISE(ABORT, 'pending mandatory Close event requires delivery'); END;
 
 CREATE TRIGGER watch_event_payload_immutable BEFORE UPDATE ON coordinator_watch_events
 WHEN NEW.event_id IS NOT OLD.event_id
@@ -141,6 +154,17 @@ BEGIN
                     AND EXISTS (SELECT 1 FROM conversations head
                                 WHERE head.product_conversation_id = p.id AND head.coordinator_head = 1));
     SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'watch event no longer deliverable') END;
+END;
+
+DROP TRIGGER close_obligations_require_member_cleanup_before_delete;
+CREATE TRIGGER close_obligations_require_member_cleanup_before_delete
+BEFORE DELETE ON close_obligations
+WHEN OLD.phase = 'completed'
+  AND EXISTS (SELECT 1 FROM product_conversations WHERE id = OLD.product_conversation_id)
+  AND (EXISTS (SELECT 1 FROM close_attempt_members WHERE attempt_id = OLD.attempt_id)
+       OR EXISTS (SELECT 1 FROM close_attempt_scopes WHERE attempt_id = OLD.attempt_id))
+BEGIN
+    SELECT RAISE(ABORT, 'completed Close history must remove member snapshots before obligation deletion');
 END;
 
 -- A rebuilt parent can leave stale deferred-FK bookkeeping on older SQLite.

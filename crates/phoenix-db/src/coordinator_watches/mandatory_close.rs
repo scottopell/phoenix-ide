@@ -1,11 +1,74 @@
+use phoenix_core::{domain::close::CloseRunOrdinal, work_scope::WorkScopeId};
+
 use sqlx::{Row, Sqlite, Transaction};
 
-use crate::{DbError, DbResult};
+use crate::{CloseCleanupFailureResource, CloseCleanupResourceDisposition, DbError, DbResult};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseFailureRemainingResource {
+    pub scope: WorkScopeId,
+    pub resource_kind: String,
+    pub identity_kind: String,
+    pub identity_codec: String,
+    pub identity_value: String,
+    pub disposition: CloseCleanupResourceDisposition,
+}
+
+impl From<CloseCleanupFailureResource> for CloseFailureRemainingResource {
+    fn from(resource: CloseCleanupFailureResource) -> Self {
+        Self {
+            scope: resource.scope,
+            resource_kind: resource.resource.kind().as_str().into(),
+            identity_kind: resource.resource.identity().identity_kind().into(),
+            identity_codec: resource.resource.identity().codec().into(),
+            identity_value: resource.resource.identity().value(),
+            disposition: resource.disposition,
+        }
+    }
+}
+
+pub(super) async fn remaining_resources(
+    pool: &sqlx::SqlitePool,
+    failure_occurrence_id: &str,
+) -> DbResult<Vec<CloseFailureRemainingResource>> {
+    sqlx::query(
+        "SELECT scope, resource_kind, identity_kind, identity_codec, identity_value, disposition
+         FROM close_cleanup_failure_resources WHERE failure_occurrence_id = ?1 ORDER BY ordinal",
+    )
+    .bind(failure_occurrence_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(CloseFailureRemainingResource {
+            scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+            resource_kind: row.try_get("resource_kind")?,
+            identity_kind: row.try_get("identity_kind")?,
+            identity_codec: row.try_get("identity_codec")?,
+            identity_value: row.try_get("identity_value")?,
+            disposition: match row.try_get::<&str, _>("disposition")? {
+                "failed" => CloseCleanupResourceDisposition::Failed,
+                "residual" => CloseCleanupResourceDisposition::Residual,
+                "unattempted" => CloseCleanupResourceDisposition::Unattempted,
+                "unknown" => CloseCleanupResourceDisposition::Unknown,
+                other => {
+                    return Err(DbError::Serialization(format!(
+                        "unknown cleanup resource disposition {other}"
+                    )))
+                }
+            },
+        })
+    })
+    .collect()
+}
 
 #[derive(Debug, Clone)]
 pub enum WatchEventRoute {
     Subscription,
     MandatoryCloseFailure {
+        run_ordinal: CloseRunOrdinal,
+        remaining_resources: Vec<CloseFailureRemainingResource>,
         scope: String,
         resource_kind: String,
         identity_kind: String,
@@ -45,6 +108,9 @@ pub(super) fn decode_route(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchEvent
                 }
             };
             Ok(WatchEventRoute::MandatoryCloseFailure {
+                run_ordinal: CloseRunOrdinal::parse(row.try_get("cleanup_run_ordinal")?)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                remaining_resources: Vec::new(),
                 scope: row.try_get("scope")?,
                 resource_kind: row.try_get("resource_kind")?,
                 identity_kind: row.try_get("identity_kind")?,

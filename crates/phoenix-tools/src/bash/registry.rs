@@ -807,6 +807,11 @@ impl BashHandleRegistry {
         }
     }
 
+    /// Seals spawn admission for a scope without starting process retirement.
+    pub async fn fence_retirement_admission(&self, work_scope: &ResourceScopeKey) {
+        let _ = self.begin_teardown(work_scope).await;
+    }
+
     pub async fn begin_retirement(&self, work_scope: &ResourceScopeKey) -> BashRetirementPermit {
         let Some(fence) = self.begin_teardown(work_scope).await else {
             unreachable!("begin_teardown always installs or reuses a fenced owner table")
@@ -940,6 +945,7 @@ impl BashHandleRegistry {
                         i32::try_from(handle.launch_identity.process.pid).unwrap_or(i32::MAX),
                         error.to_string(),
                     ));
+                    break;
                 }
             }
         }

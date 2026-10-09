@@ -117,7 +117,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
-| Specifying Close failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 087 supersedes the Close recovery/finalization consequences of 026/040/041/042/080; retain their identity and ownership safeguards |
+| Specifying Close failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 088 supersedes the Close recovery/finalization consequences of 026/040/041/042/080; retain their identity and ownership safeguards |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |

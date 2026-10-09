@@ -2672,10 +2672,8 @@ impl BrowserSessionManager {
 
         let mut failures = Vec::new();
         if matches_current_generation {
-            let mut started = Vec::new();
-            let mut already_requested = Vec::new();
             for expected in &permit.instances {
-                match self
+                let failure = match self
                     .spawn_kill_session_by_key(
                         expected.session_key.clone(),
                         permit.work_scope.clone(),
@@ -2683,48 +2681,30 @@ impl BrowserSessionManager {
                     )
                     .await
                 {
-                    KillSessionOutcome::Absent => {}
+                    KillSessionOutcome::Absent => None,
                     KillSessionOutcome::Started {
                         key,
                         handle,
                         attempt,
-                    } => started.push((key, handle, attempt)),
-                    KillSessionOutcome::AlreadyRequested { attempt } => {
-                        already_requested.push(attempt);
-                    }
-                }
-            }
-
-            for (key, attempt, result) in futures::future::join_all(
-                started
-                    .into_iter()
-                    .map(|(key, handle, attempt)| async move { (key, attempt, handle.await) }),
-            )
-            .await
-            {
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => failures.push(error.to_string()),
-                    Err(error) => {
-                        self.complete_kill_failure(
-                            &key,
-                            &attempt,
-                            format!("browser kill task failed: {error}"),
-                        )
-                        .await;
-                        failures.push(format!("browser kill task failed: {error}"));
-                    }
-                }
-            }
-            for result in futures::future::join_all(
-                already_requested
-                    .into_iter()
-                    .map(|attempt| self.wait_for_kill_completion(attempt)),
-            )
-            .await
-            {
-                if let Err(error) = result {
-                    failures.push(error.to_string());
+                    } => match handle.await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(error) => {
+                            let detail = format!("browser kill task failed: {error}");
+                            self.complete_kill_failure(&key, &attempt, detail.clone())
+                                .await;
+                            Some(detail)
+                        }
+                    },
+                    KillSessionOutcome::AlreadyRequested { attempt } => self
+                        .wait_for_kill_completion(attempt)
+                        .await
+                        .err()
+                        .map(|error| error.to_string()),
+                };
+                if let Some(failure) = failure {
+                    failures.push(failure);
+                    break;
                 }
             }
         }

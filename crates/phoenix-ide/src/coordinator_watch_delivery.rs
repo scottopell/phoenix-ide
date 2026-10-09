@@ -29,6 +29,8 @@ fn notification(event: &PendingWatchEvent) -> String {
         text.push_str(reason);
     }
     if let WatchEventRoute::MandatoryCloseFailure {
+        run_ordinal,
+        remaining_resources,
         scope,
         resource_kind,
         identity_kind,
@@ -40,7 +42,8 @@ fn notification(event: &PendingWatchEvent) -> String {
     {
         let _ = write!(
             text,
-            " Scope: {scope}. Resource kind: {resource_kind}. Identity ({identity_kind}, {identity_codec}): {identity_value}. Detail: {detail}."
+            " Cleanup run ordinal: {}. Failed resource — Scope: {scope}. Resource kind: {resource_kind}. Identity ({identity_kind}, {identity_codec}): {identity_value}. Detail: {detail}.",
+            run_ordinal.get(),
         );
         match stop {
             CloseFailureStop::ConversationAndProcessesStopped {
@@ -55,6 +58,20 @@ fn notification(event: &PendingWatchEvent) -> String {
                 text.push_str(" Shutdown uncertain. Close incomplete.");
             }
         }
+        text.push_str("\nRemaining resources:");
+        for resource in remaining_resources {
+            let _ = write!(
+                text,
+                "\n- Scope: {}. Resource kind: {}. Identity ({}, {}): {}. Disposition: {}.",
+                resource.scope.as_str(),
+                resource.resource_kind,
+                resource.identity_kind,
+                resource.identity_codec,
+                resource.identity_value,
+                resource.disposition.as_str(),
+            );
+        }
+        text.push_str("\nRead-only investigation is allowed. Delivery acceptance is not cleanup success or repair approval.");
     }
     text
 }
@@ -123,6 +140,8 @@ mod tests {
     fn failure(stop: CloseFailureStop) -> PendingWatchEvent {
         PendingWatchEvent {
             route: WatchEventRoute::MandatoryCloseFailure {
+                run_ordinal: phoenix_core::domain::close::CloseRunOrdinal::parse(2).unwrap(),
+                remaining_resources: Vec::new(),
                 scope: "scope-1".into(),
                 resource_kind: "worktree".into(),
                 identity_kind: "path".into(),
@@ -152,6 +171,8 @@ mod tests {
         ));
         for fact in [
             "Mandatory Close cleanup failure",
+            "Cleanup run ordinal: 2",
+            "Failed resource",
             "product-1",
             "root-1",
             "failure-1",
@@ -167,6 +188,95 @@ mod tests {
         }
         assert!(!text.contains("Watched conversation"));
         assert!(!text.contains("Close incomplete"));
+    }
+
+    #[test]
+    fn mandatory_message_renders_every_remaining_resource_and_disposition() {
+        use phoenix_core::{
+            domain::close::{
+                LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind,
+            },
+            work_scope::WorkScopeId,
+        };
+        use phoenix_db::{
+            CloseCleanupFailureResource, CloseCleanupResourceDisposition as Disposition,
+        };
+
+        let mut event = failure(CloseFailureStop::ShutdownUncertain);
+        let WatchEventRoute::MandatoryCloseFailure {
+            remaining_resources,
+            ..
+        } = &mut event.route
+        else {
+            unreachable!();
+        };
+        let targets = [
+            (
+                "scope-1",
+                RetiredResourceKind::BashProcessGroup,
+                "epoch:failed",
+                Disposition::Failed,
+            ),
+            (
+                "scope-2",
+                RetiredResourceKind::BrowserSession,
+                "epoch:residual",
+                Disposition::Residual,
+            ),
+            (
+                "scope-1",
+                RetiredResourceKind::PtySession,
+                "epoch:unattempted",
+                Disposition::Unattempted,
+            ),
+            (
+                "scope-2",
+                RetiredResourceKind::EquivalentLiveResource,
+                "epoch:unknown",
+                Disposition::Unknown,
+            ),
+        ];
+        *remaining_resources = targets
+            .iter()
+            .map(|(scope, kind, identity, disposition)| {
+                CloseCleanupFailureResource {
+                    scope: WorkScopeId::parse(*scope).unwrap(),
+                    resource: RetiredResourceIdentity::parse(
+                        *kind,
+                        LossItemIdentity::Opaque(OpaqueIdentity::parse(*identity).unwrap()),
+                    )
+                    .unwrap(),
+                    disposition: *disposition,
+                }
+                .into()
+            })
+            .collect();
+        let text = notification(&event);
+        let lines = text
+            .lines()
+            .filter(|line| line.starts_with("- Scope:"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), targets.len());
+        for (line, (scope, kind, identity, disposition)) in lines.into_iter().zip(targets) {
+            assert_eq!(line, format!("- Scope: {scope}. Resource kind: {}. Identity (opaque, opaque_string_v1): {identity}. Disposition: {}.", kind.as_str(), disposition.as_str()));
+        }
+        assert_eq!(text.matches("Mandatory Close cleanup failure").count(), 1);
+        assert!(text.contains("Cleanup run ordinal: 2"));
+        assert!(text.contains("Failed resource"));
+        assert!(text.contains("Shutdown uncertain. Close incomplete."));
+        assert!(text.contains("Read-only investigation is allowed"));
+        assert!(text.contains("Delivery acceptance is not cleanup success or repair approval"));
+    }
+
+    #[test]
+    fn subscription_message_has_no_cleanup_evidence() {
+        let mut event = failure(CloseFailureStop::ShutdownUncertain);
+        event.route = WatchEventRoute::Subscription;
+        let text = notification(&event);
+        assert!(text.starts_with("Watched conversation terminal event."));
+        assert!(!text.contains("Cleanup run ordinal"));
+        assert!(!text.contains("Remaining resources"));
+        assert!(!text.contains("Shutdown uncertain"));
     }
 
     #[test]

@@ -95,7 +95,13 @@ CREATE TABLE conversations (
     coordinator_head INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE product_creation_jobs (id TEXT PRIMARY KEY);
-CREATE TABLE close_obligations (product_conversation_id TEXT, phase TEXT);
+CREATE TABLE close_obligations (
+    product_conversation_id TEXT REFERENCES product_conversations(id) ON DELETE CASCADE,
+    phase TEXT,
+    attempt_id TEXT PRIMARY KEY
+);
+CREATE TABLE close_attempt_members (attempt_id TEXT REFERENCES close_obligations(attempt_id) ON DELETE CASCADE);
+CREATE TABLE close_attempt_scopes (attempt_id TEXT REFERENCES close_obligations(attempt_id) ON DELETE CASCADE);
 CREATE TABLE automatic_continuation_admissions (
     predecessor_conversation_id TEXT, phase TEXT
 );
@@ -119,14 +125,20 @@ CREATE TABLE close_cleanup_failures (
     reason TEXT NOT NULL, detail TEXT NOT NULL,
     stop_certainty TEXT NOT NULL CHECK(stop_certainty IN
         ('conversation_and_processes_stopped', 'shutdown_uncertain')),
-    stop_confirmed_at_unix_us INTEGER,
-    occurred_at_unix_us INTEGER NOT NULL,
+    confirmed_at_us INTEGER,
+    occurred_at_us INTEGER NOT NULL,
     UNIQUE(attempt_id, cleanup_run_ordinal)
 );
 -- Close owns this immutable table, independently of the outbox fragment.
 CREATE TRIGGER close_failure_immutable BEFORE UPDATE ON close_cleanup_failures
 BEGIN SELECT RAISE(ABORT, 'Close failure is immutable'); END;
 """
+
+
+BASE += re.findall(
+    r"CREATE TRIGGER close_obligations_require_member_cleanup_before_delete\b.*?END;",
+    MIGRATIONS, re.S,
+)[0]
 
 
 class MandatoryCloseOutboxTests(unittest.TestCase):
@@ -187,8 +199,8 @@ class MandatoryCloseOutboxTests(unittest.TestCase):
             source_product_conversation_id="source", scope="conversation", resource_kind="directory",
             identity_kind="path", identity_codec="utf8", identity_value="/fixture-only",
             reason="directory removal failed", detail="fixture failure", stop_certainty=certainty,
-            stop_confirmed_at_unix_us=25 if certainty != "shutdown_uncertain" else None,
-            occurred_at_unix_us=30))
+            confirmed_at_us=25 if certainty != "shutdown_uncertain" else None,
+            occurred_at_us=30))
 
     def mandatory(self, failure_id="failure-1", **overrides):
         row = dict(event_id=failure_id, route_kind="mandatory_close_failure", watch_id=None,
@@ -223,7 +235,8 @@ class MandatoryCloseOutboxTests(unittest.TestCase):
                 self.rejected(lambda: self.accept("absent", table=table))
         after = dict(self.db.execute("SELECT name, sql FROM sqlite_schema WHERE type='trigger'"))
         for name, sql in self.before_triggers.items():
-            if name not in ("watch_event_accept_turn", "watch_event_accept_steering"):
+            if name not in ("watch_event_accept_turn", "watch_event_accept_steering",
+                            "close_obligations_require_member_cleanup_before_delete"):
                 self.assertEqual(after[name], sql, name)
         self.assertEqual(self.db.execute("PRAGMA foreign_keys").fetchone(), (1,))
         self.assertEqual(self.db.execute("PRAGMA defer_foreign_keys").fetchone(), (0,))
@@ -269,13 +282,13 @@ class MandatoryCloseOutboxTests(unittest.TestCase):
 
     def test_actual_pending_query_includes_unwatched_history_failure_filters_ordinary(self):
         self.db.execute("UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id='other'")
-        self.db.execute("INSERT INTO close_obligations VALUES ('other','failed')")
+        self.db.execute("INSERT INTO close_obligations (product_conversation_id, phase) VALUES ('other','failed')")
         self.insert("close_cleanup_failures", dict(
             failure_occurrence_id="unwatched-failure", attempt_id="attempt", cleanup_run_ordinal=1,
             source_product_conversation_id="other", scope="conversation", resource_kind="directory",
             identity_kind="path", identity_codec="utf8", identity_value="/fixture-only",
             reason="directory removal failed", detail="failure detail", stop_certainty="shutdown_uncertain",
-            stop_confirmed_at_unix_us=None, occurred_at_unix_us=30))
+            confirmed_at_us=None, occurred_at_us=30))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM coordinator_watches WHERE source_product_conversation_id='other'").fetchone(), (0,))
         self.assertEqual(append_from_rust_sql(self.db, "unwatched-failure"), 1)
         eligible = pending_from_rust_sql(self.db)
@@ -290,7 +303,7 @@ class MandatoryCloseOutboxTests(unittest.TestCase):
         for change in (
             "UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id='source'",
             "UPDATE coordinator_watches SET ended_at_us=21 WHERE id=1",
-            "INSERT INTO close_obligations VALUES ('source','failed')",
+            "INSERT INTO close_obligations (product_conversation_id, phase) VALUES ('source','failed')",
         ):
             with self.subTest(change=change):
                 self.db.execute("SAVEPOINT eligibility")
@@ -334,7 +347,7 @@ class MandatoryCloseOutboxTests(unittest.TestCase):
     def test_mandatory_bypasses_watch_history_and_active_close(self):
         self.db.execute("UPDATE coordinator_watches SET ended_at_us=21 WHERE id=1")
         self.db.execute("UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id='source'")
-        self.db.execute("INSERT INTO close_obligations VALUES ('source', 'failed')")
+        self.db.execute("INSERT INTO close_obligations (product_conversation_id, phase) VALUES ('source', 'failed')")
         for ordinal, table in enumerate(("durable_turns", "steering_messages"), 1):
             failure_id = f"failure-{ordinal}"
             self.failure(failure_id, ordinal)
@@ -354,9 +367,9 @@ class MandatoryCloseOutboxTests(unittest.TestCase):
             source_product_conversation_id="other", scope="conversation", resource_kind="directory",
             identity_kind="path", identity_codec="utf8", identity_value="/fixture-only",
             reason="directory removal failed", detail="failure", stop_certainty="shutdown_uncertain",
-            stop_confirmed_at_unix_us=None, occurred_at_unix_us=30))
+            confirmed_at_us=None, occurred_at_us=30))
         self.db.execute("UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id='other'")
-        self.db.execute("INSERT INTO close_obligations VALUES ('other','failed')")
+        self.db.execute("INSERT INTO close_obligations (product_conversation_id, phase) VALUES ('other','failed')")
         self.assertEqual(append_from_rust_sql(self.db, "other-failure"), 1)
         for table in ("durable_turns", "steering_messages"):
             self.db.execute("SAVEPOINT unwatched")
@@ -382,7 +395,7 @@ class MandatoryCloseOutboxTests(unittest.TestCase):
         cases = [
             "UPDATE coordinator_watches SET ended_at_us=21 WHERE id=1",
             "UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id='source'",
-            "INSERT INTO close_obligations VALUES ('source','failed')",
+            "INSERT INTO close_obligations (product_conversation_id, phase) VALUES ('source','failed')",
             "UPDATE coordinator_watch_events SET continuation_state='awaiting' WHERE event_id='old-pending'",
         ]
         for table in ("durable_turns", "steering_messages"):
@@ -458,6 +471,72 @@ class MandatoryCloseOutboxTests(unittest.TestCase):
         self.rejected(lambda: self.db.execute("DELETE FROM close_cleanup_failures WHERE failure_occurrence_id='failure-1'"), "FOREIGN KEY")
         self.rejected(lambda: self.db.execute("DELETE FROM product_conversations WHERE id='source'"), "FOREIGN KEY")
         self.accept("failure-1")
+
+    def test_pending_mandatory_event_pins_failure_product_and_transcript(self):
+        self.failure()
+        self.mandatory()
+        before = pending_from_rust_sql(self.db)
+        for statement in (
+            "DELETE FROM close_cleanup_failures WHERE failure_occurrence_id='failure-1'",
+            "DELETE FROM product_conversations WHERE id='source'",
+            "DELETE FROM conversations WHERE id='root'",
+        ):
+            with self.subTest(statement=statement):
+                self.rejected(lambda: self.db.execute(statement), "FOREIGN KEY")
+                self.assertEqual(pending_from_rust_sql(self.db), before)
+        self.rejected(lambda: self.db.execute(
+            "DELETE FROM coordinator_watch_events WHERE event_id='failure-1'"),
+            "requires delivery")
+        self.assertEqual(self.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_accepted_mandatory_event_preserves_receipt_without_pinning_source(self):
+        for table in ("durable_turns", "steering_messages"):
+            with self.subTest(table=table):
+                self.db.execute("SAVEPOINT accepted_delete")
+                self.failure()
+                self.mandatory()
+                self.accept("failure-1", table)
+                self.db.execute("DELETE FROM conversations WHERE id='root'")
+                self.db.execute("DELETE FROM close_cleanup_failures WHERE failure_occurrence_id='failure-1'")
+                self.db.execute("DELETE FROM product_conversations WHERE id='source'")
+                self.assertEqual(self.db.execute("""SELECT delivery_state, mandatory_failure_occurrence_id,
+                    mandatory_source_product_id, source_transcript_id, pending_failure_occurrence_id,
+                    pending_source_product_id, pending_source_transcript_id
+                    FROM coordinator_watch_events WHERE event_id='failure-1'""").fetchone(),
+                    ("accepted", "failure-1", "source", "root", None, None, None))
+                self.assertEqual(self.db.execute(f"SELECT origin_subscription_event_id FROM {table} WHERE id='new-receipt'").fetchone(), ("failure-1",))
+                self.assertEqual(self.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+                self.rejected(lambda: self.db.execute("""UPDATE coordinator_watch_events
+                    SET delivery_state='pending', accepted_transcript_id=NULL WHERE event_id='failure-1'"""), "FOREIGN KEY")
+                self.db.execute("ROLLBACK TO accepted_delete")
+                self.db.execute("RELEASE accepted_delete")
+
+    def test_accepted_failure_does_not_unpin_pending_retry(self):
+        self.failure()
+        self.mandatory()
+        self.failure("failure-retry", 2)
+        self.mandatory("failure-retry")
+        self.accept("failure-1")
+        self.rejected(lambda: self.db.execute("DELETE FROM conversations WHERE id='root'"), "FOREIGN KEY")
+        self.rejected(lambda: self.db.execute("DELETE FROM close_cleanup_failures"), "FOREIGN KEY")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM close_cleanup_failures").fetchone(), (2,))
+        self.assertIn("failure-retry", [row["event_id"] for row in pending_from_rust_sql(self.db)])
+        self.accept("failure-retry", receipt_id="retry-receipt")
+        self.db.execute("DELETE FROM conversations WHERE id='root'")
+        self.db.execute("DELETE FROM close_cleanup_failures")
+        self.db.execute("DELETE FROM product_conversations WHERE id='source'")
+        self.assertEqual(self.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_completed_snapshots_delete_only_with_product(self):
+        self.db.execute("INSERT INTO close_obligations VALUES ('other', 'completed', 'completed-attempt')")
+        self.db.execute("INSERT INTO close_attempt_members VALUES ('completed-attempt')")
+        self.db.execute("INSERT INTO close_attempt_scopes VALUES ('completed-attempt')")
+        self.rejected(lambda: self.db.execute("DELETE FROM close_obligations WHERE attempt_id='completed-attempt'"), "remove member snapshots")
+        self.db.execute("DELETE FROM conversations WHERE id='other-root'")
+        self.db.execute("DELETE FROM product_conversations WHERE id='other'")
+        for table in ("close_obligations", "close_attempt_members", "close_attempt_scopes"):
+            self.assertEqual(self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone(), (0,))
+        self.assertEqual(self.db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_failure_dedup_retry_and_event_identity(self):
         self.failure()

@@ -474,7 +474,7 @@ async fn admit_automatic_continuation_tx(
            AND NOT EXISTS (
                SELECT 1 FROM close_obligations obligation
                WHERE obligation.product_conversation_id = product.id
-                 AND obligation.phase <> 'completed'
+                 AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
            )
          ON CONFLICT(predecessor_conversation_id) DO NOTHING",
     )
@@ -3112,7 +3112,8 @@ impl Database {
                        JOIN close_obligations obligation
                          ON obligation.attempt_id = captured.attempt_id
                        WHERE captured.scope = work_scopes.id
-                         AND obligation.phase <> 'completed'
+                         AND (obligation.phase <> 'completed'
+                              OR obligation.close_outcome IN ('archived_cleanup_attention', 'close_incomplete'))
                          AND obligation.topology_sealed = 1
                    )",
             )
@@ -3152,7 +3153,8 @@ impl Database {
                        JOIN close_obligations obligation
                          ON obligation.attempt_id = captured.attempt_id
                        WHERE captured.scope = work_scopes.id
-                         AND obligation.phase <> 'completed'
+                         AND (obligation.phase <> 'completed'
+                              OR obligation.close_outcome IN ('archived_cleanup_attention', 'close_incomplete'))
                          AND obligation.topology_sealed = 1
                    )",
             )
@@ -3187,7 +3189,8 @@ impl Database {
                        JOIN close_obligations obligation
                          ON obligation.attempt_id = captured.attempt_id
                        WHERE captured.scope = work_scopes.id
-                         AND obligation.phase <> 'completed'
+                         AND (obligation.phase <> 'completed'
+                              OR obligation.close_outcome IN ('archived_cleanup_attention', 'close_incomplete'))
                          AND obligation.topology_sealed = 1
                    )",
             )
@@ -5680,7 +5683,8 @@ impl Database {
                SELECT 1 FROM conversations conversation
                JOIN close_obligations obligation
                  ON obligation.product_conversation_id = conversation.product_conversation_id
-               WHERE conversation.id = ?1 AND obligation.phase <> 'completed'
+               WHERE conversation.id = ?1
+                 AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
              )",
         )
         .bind(conversation_id)
@@ -28475,6 +28479,129 @@ mod tests {
         assert!(error.to_string().contains("induced member delete failure"));
         assert!(db.get_conversation("atomic-root").await.is_ok());
         assert!(db.get_conversation("atomic-member").await.is_ok());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn hard_delete_mandatory_close_failure_requires_delivery_then_preserves_receipt() {
+        use phoenix_core::domain::close::TranscriptConversationId;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("delete-failure", "delete-failure", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        db.begin_close_foundation(
+            &source.product_conversation_id,
+            &TranscriptConversationId::parse(source.id.clone()).unwrap(),
+            "delete-failure-attempt",
+        )
+        .await
+        .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO close_cleanup_failures (
+                failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
+                scope, authority_kind, resource_kind, identity_kind, identity_codec, identity_value,
+                reason, detail, stop_certainty, occurred_at_us)
+             SELECT 'close-failure:1:delete-failure-attempt', obligation.attempt_id, 1,
+                obligation.product_conversation_id, captured.scope, 'captured_scope', 'work_scope',
+                'opaque', 'opaque_string_v1', captured.scope, 'identity_not_proven',
+                'shutdown uncertain', 'shutdown_uncertain', ?1
+             FROM close_obligations obligation JOIN close_attempt_scopes captured
+               ON captured.attempt_id = obligation.attempt_id
+             WHERE obligation.attempt_id = 'delete-failure-attempt'",
+        )
+        .bind(Utc::now().timestamp_micros())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_cleanup_failure_resources (
+                failure_occurrence_id, ordinal, scope, resource_kind, identity_kind,
+                identity_codec, identity_value, disposition)
+             SELECT failure_occurrence_id, 0, scope, resource_kind, identity_kind,
+                identity_codec, identity_value, 'unknown'
+             FROM close_cleanup_failures
+             WHERE failure_occurrence_id = 'close-failure:1:delete-failure-attempt'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        append_mandatory_close_failure_event_tx(&mut tx, "close-failure:1:delete-failure-attempt")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES ('close-outcome:delete-failure-attempt', ?1, 1, 'system', ?2, ?3)",
+        )
+        .bind(&source.id)
+        .bind(serde_json::to_string(&MessageContent::system("Close incomplete").to_stored_json()).unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE close_obligations SET phase = 'completed', close_outcome = 'close_incomplete',
+                completed_at = ?1, updated_at = ?1 WHERE attempt_id = 'delete-failure-attempt'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let error = db.delete_conversation(&source.id).await.unwrap_err();
+        assert!(error.to_string().contains("FOREIGN KEY"), "{error}");
+        assert!(db.get_conversation(&source.id).await.is_ok());
+        let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].event_id,
+            "close-failure:1:delete-failure-attempt"
+        );
+        assert_eq!(pending[0].source_transcript_id, source.id);
+
+        sqlx::query(
+            "INSERT INTO steering_messages
+                (message_id, conversation_id, ordinal, text, origin_kind, origin_subscription_event_id)
+             VALUES ('delete-failure-receipt', ?1, 0, 'Close failed', 'subscription_event', 'close-failure:1:delete-failure-attempt')",
+        )
+        .bind(&coordinator.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.delete_conversation(&source.id).await.unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        let retained: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM conversations WHERE id = ?1),
+                (SELECT COUNT(*) FROM product_conversations WHERE id = ?2),
+                (SELECT COUNT(*) FROM close_cleanup_failures WHERE failure_occurrence_id = 'close-failure:1:delete-failure-attempt'),
+                (SELECT COUNT(*) FROM steering_messages receipt
+                 JOIN coordinator_watch_events event ON event.event_id = receipt.origin_subscription_event_id
+                 WHERE receipt.message_id = 'delete-failure-receipt' AND event.delivery_state = 'accepted'
+                   AND event.mandatory_source_product_id = ?2 AND event.source_transcript_id = ?1)",
+        )
+        .bind(&source.id)
+        .bind(source.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retained, (0, 0, 0, 1));
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

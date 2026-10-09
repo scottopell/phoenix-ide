@@ -978,7 +978,8 @@ function ProductConversationPageInner() {
     ].filter((id): id is string => Boolean(id)));
     if (notificationIds.size === 0) return;
     const refresh = (source: 'close' | 'stream') => {
-      const closeIsActive = snapshot?.close != null && snapshot.close.phase !== 'completed';
+      const closeIsActive = snapshot?.close != null
+        && (snapshot.close.phase !== 'completed' || snapshot.close.outcome === 'close_incomplete');
       if (source === 'close' || closeIsActive) setSnapshotRetry((retry) => retry + 1);
     };
     const unsubscribes = [...notificationIds].map((id) =>
@@ -1095,7 +1096,8 @@ function ProductConversationPageInner() {
   }, [currentLatestProjection?.conversationId, historyGeneration, loadingOlder, productConversationId, snapshot]);
 
   const messages = aggregateMessages;
-  const closeInProgress = snapshot?.close != null && snapshot.close.phase !== 'completed';
+  const closeIncomplete = snapshot?.close?.outcome === 'close_incomplete';
+  const closeInProgress = snapshot?.close != null && (snapshot.close.phase !== 'completed' || closeIncomplete);
   const convState = useMemo(
     () => snapshot?.ordinary_lifecycle === 'history' || closeInProgress
       ? ({ type: 'idle' } satisfies ConversationState)
@@ -1202,6 +1204,33 @@ function ProductConversationPageInner() {
         messages={messages}
         recallDisabled={!liveControlsEnabled}
       />
+      {snapshot.close && (snapshot.close.outcome === 'archived_cleanup_attention' || closeIncomplete) && (
+        <section className="product-conversation-page__close-status" role="alert" aria-label="Close status">
+          <strong>{closeIncomplete
+            ? 'Close incomplete — shutdown could not be confirmed'
+            : 'Closed — cleanup needs attention'}</strong>
+          <div>Run {snapshot.close.run_ordinal} · {snapshot.close.run_status}. No automatic retry.</div>
+          {snapshot.close.failure && (
+            <>
+              <div>{snapshot.close.failure.reason.replaceAll('_', ' ')} — {snapshot.close.failure.detail}</div>
+              <div>{snapshot.close.failure.stop_certainty.kind === 'conversation_and_processes_stopped'
+                ? 'Conversation and processes stopped.' : 'Shutdown uncertain.'}</div>
+              <div>Failure <code>{snapshot.close.failure.occurrence_id}</code></div>
+              <details>
+                <summary>Remaining resources ({snapshot.close.failure.remaining_resources.length})</summary>
+                <ol>
+                  {snapshot.close.failure.remaining_resources.map((resource, ordinal) => (
+                    <li key={ordinal}>
+                      <code>{resource.scope}: {resource.resource_kind.replaceAll('_', ' ')} · {resource.identity}</code>
+                      {' · '}{resource.disposition}
+                    </li>
+                  ))}
+                </ol>
+              </details>
+            </>
+          )}
+        </section>
+      )}
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">
           {olderError ?? error ?? 'The linked message is not available in this conversation history.'}
@@ -1212,8 +1241,8 @@ function ProductConversationPageInner() {
           messages={messages}
           pendingMessages={currentLatestProjection?.pendingMessages ?? []}
           convState={convState}
-          onRetry={currentLatestProjection?.onRetryPending ?? (() => {})}
-          onCancelSteering={currentLatestProjection?.onCancelSteering}
+          onRetry={liveControlsEnabled ? currentLatestProjection?.onRetryPending ?? (() => {}) : () => {}}
+          onCancelSteering={liveControlsEnabled ? currentLatestProjection?.onCancelSteering : undefined}
           onOpenFile={currentLatestProjection?.onOpenFile}
           filePathRootDir={currentLatestProjection?.filePathRootDir}
           systemPrompt={currentLatestProjection?.systemPrompt}
@@ -1238,7 +1267,7 @@ function ProductConversationPageInner() {
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
-      {isOpen && snapshot.latest_transcript_row_id ? (
+      {isOpen && !closeIncomplete && snapshot.latest_transcript_row_id ? (
         <div className="product-conversation-page__composer" data-testid="product-conversation-composer">
           <EmbeddedConversationPage
             slug={snapshot.latest_transcript_row_id}
@@ -1254,7 +1283,9 @@ function ProductConversationPageInner() {
           />
         </div>
       ) : (
-        <div className="product-conversation-page__composer-placeholder" data-testid="product-conversation-history">History is read-only.</div>
+        <div className="product-conversation-page__composer-placeholder" data-testid={closeIncomplete ? 'product-conversation-close-incomplete' : 'product-conversation-history'}>
+          {closeIncomplete ? 'Conversation controls are disabled until shutdown is resolved.' : 'History is read-only.'}
+        </div>
       )}
 
       {aggregateMessageSlot && (
