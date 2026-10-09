@@ -576,6 +576,7 @@ export function useConnection({
               sequenceId: res.data.sequence_id,
               updates,
             });
+            notifyCloseSnapshotChanged(convId, 'stream');
           });
 
           // Task 02675: tokens share the server-side global sequence_id
