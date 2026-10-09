@@ -669,9 +669,9 @@ rule ResponsesResponseNormalized {
         -- items takes the LlmResponse branch. Reasoning requires a positive
         -- reasoning-token subset of raw_output_tokens; absent reasoning requires
         -- zero reasoning usage. No non-empty visible content or function call
-        -- may have been observed in stream events. Phoenix does not infer quiet
-        -- completion from missing usage
-        -- detail or a loose type tag. An empty output array with output_tokens = 0
+        -- may have been observed in stream events. When reasoning items exist,
+        -- Phoenix does not infer quiet completion from missing usage detail or a
+        -- loose type tag. An empty output array with output_tokens = 0
         -- is a genuinely-empty valid turn and also takes the LlmResponse branch.
         -- GPT-5.6-era Responses usage reports cache writes in
         -- input_tokens_details.cache_write_tokens; older responses default it
