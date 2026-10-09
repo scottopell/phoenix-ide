@@ -2670,6 +2670,27 @@ impl TmuxRegistry {
                     reason: error.to_string(),
                 },
             };
+            if matches!(
+                outcome,
+                TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified
+            ) {
+                let key = work_scope.stable_key();
+                match tokio::time::timeout_at(expires, self.inner.write()).await {
+                    Ok(mut entries) => {
+                        entries.remove(&key);
+                    }
+                    Err(_) => {
+                        return CascadeReport {
+                            socket_path: identity.socket_path.clone(),
+                            kill_server_error: Some(
+                                "tmux cascade final registry removal exceeded the Close deadline"
+                                    .to_string(),
+                            ),
+                            unlink_error: None,
+                        };
+                    }
+                }
+            }
             return match outcome {
                 TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => {
                     CascadeReport {
