@@ -1,7 +1,7 @@
 //! `OpenAI` and `OpenAI`-compatible provider implementation
 
 use super::headers::apply_source_header;
-use super::models::ModelSpec;
+use super::models::{ModelSpec, RequestModelName};
 use super::rate_limit::{
     normalize_credit_depletion, parse_active_limit, parse_credits_snapshot, parse_promo_message,
     parse_rate_limit_for_limit, parse_rate_limit_reached_type, QuotaDetails,
@@ -56,6 +56,7 @@ fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
 #[allow(clippy::too_many_arguments)]
 pub async fn complete(
     spec: &ModelSpec,
+    request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -63,7 +64,7 @@ pub async fn complete(
     request: &LlmRequest,
     use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
-    validate_responses_replay(request, &spec.api_name)?;
+    validate_responses_replay(request, request_name.as_str())?;
     if use_codex_backend {
         // Non-streaming callers do not consume deltas. Close the receiver so
         // awaited provider sends fail immediately instead of filling a bounded
@@ -72,6 +73,7 @@ pub async fn complete(
         drop(chunk_rx);
         return complete_streaming(
             spec,
+            request_name,
             api_key,
             base_url_override,
             custom_headers,
@@ -90,8 +92,9 @@ pub async fn complete(
             .attempt_capture
             .set_transport(crate::LlmTransport::HttpJson);
     }
-    let mut responses_request = translate_to_backend_request(
-        &spec.api_name,
+    let mut responses_request = translate_to_backend_request_for_model(
+        spec,
+        request_name.as_str(),
         request,
         use_codex_backend,
         use_codex_backend || is_official_responses_route(base_url_override),
@@ -107,7 +110,7 @@ pub async fn complete(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
-    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+    if use_codex_backend && supports_responses_lite(spec) {
         builder = builder.header("x-openai-internal-codex-responses-lite", "true");
     }
     builder = apply_source_header(builder, custom_headers);
@@ -142,7 +145,7 @@ pub async fn complete(
 
     bind_responses_model(
         normalize_responses_api_response(responses_response)?,
-        &spec.api_name,
+        request_name.as_str(),
     )
 }
 
@@ -1420,6 +1423,7 @@ fn finalize_responses_stream(
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming(
     spec: &ModelSpec,
+    request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -1429,10 +1433,11 @@ pub async fn complete_streaming(
     use_codex_backend: bool,
     ws_sessions: Option<&Arc<Mutex<CodexWsSessions>>>,
 ) -> Result<LlmResponse, LlmError> {
-    validate_responses_replay(request, &spec.api_name)?;
+    validate_responses_replay(request, request_name.as_str())?;
     let url = resolve_endpoint(base_url_override);
-    let mut responses_request = translate_to_backend_request(
-        &spec.api_name,
+    let mut responses_request = translate_to_backend_request_for_model(
+        spec,
+        request_name.as_str(),
         request,
         use_codex_backend,
         use_codex_backend || is_official_responses_route(base_url_override),
@@ -1440,7 +1445,7 @@ pub async fn complete_streaming(
     responses_request.set_streaming();
     responses_request.set_tags(request_tags);
 
-    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+    if use_codex_backend && supports_responses_lite(spec) {
         if let Some(sessions) = ws_sessions {
             if let Some(telemetry) = request.telemetry.as_ref() {
                 telemetry
@@ -1524,7 +1529,7 @@ pub async fn complete_streaming(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
-    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+    if use_codex_backend && supports_responses_lite(spec) {
         builder = builder.header("x-openai-internal-codex-responses-lite", "true");
     }
     builder = apply_source_header(builder, custom_headers);
@@ -1603,7 +1608,7 @@ pub async fn complete_streaming(
             .await?;
     }
 
-    finalize_responses_stream(acc, &spec.api_name)
+    finalize_responses_stream(acc, request_name.as_str())
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
@@ -1614,7 +1619,8 @@ pub async fn complete_streaming(
 ///   `ChatGPT` backend rejects requests without instructions, while the platform
 ///   Responses API tolerates omission.
 #[allow(clippy::too_many_lines)] // single-pass message translation; splitting would add indirection without clarity
-fn translate_to_responses_request(
+fn translate_to_responses_request_for_model(
+    spec: &ModelSpec,
     api_name: &str,
     request: &LlmRequest,
     use_codex_backend: bool,
@@ -1826,7 +1832,7 @@ fn translate_to_responses_request(
         };
 
     let explicit_cache_supported =
-        !use_codex_backend && official_openai_route && supports_explicit_prompt_cache(api_name);
+        !use_codex_backend && official_openai_route && supports_explicit_prompt_cache(spec);
     if explicit_cache_supported {
         place_explicit_cache_breakpoints(&mut input_items);
     }
@@ -1863,7 +1869,7 @@ fn translate_to_responses_request(
             .map(platform_reasoning),
         service_tier: ProviderRequestTier::from_effective_service_tier(
             request.service_tier,
-            use_codex_backend || (official_openai_route && is_known_gpt_6(api_name)),
+            use_codex_backend || (official_openai_route && is_known_gpt_6(spec)),
         )
         .responses_request_value()
         .map(str::to_string),
@@ -2094,38 +2100,91 @@ fn codex_lite_reasoning(effort: Option<ModelEffort>) -> CodexResponsesLiteReason
     }
 }
 
-fn translate_to_backend_request(
+fn translate_to_backend_request_for_model(
+    spec: &ModelSpec,
     api_name: &str,
     request: &LlmRequest,
     use_codex_backend: bool,
     official_openai_route: bool,
 ) -> ResponsesBackendRequest {
-    let platform =
-        translate_to_responses_request(api_name, request, use_codex_backend, official_openai_route);
-    if use_codex_backend && supports_responses_lite(api_name) {
+    let platform = translate_to_responses_request_for_model(
+        spec,
+        api_name,
+        request,
+        use_codex_backend,
+        official_openai_route,
+    );
+    if use_codex_backend && supports_responses_lite(spec) {
         ResponsesBackendRequest::CodexLite(CodexResponsesLiteRequest::from_platform(platform))
     } else {
         ResponsesBackendRequest::Platform(platform)
     }
 }
 
-fn is_known_gpt_6(api_name: &str) -> bool {
-    matches!(
+#[cfg(test)]
+fn test_model_spec(id: &str) -> ModelSpec {
+    let mut spec = crate::all_models()
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .unwrap_or_else(|| {
+            crate::all_models()
+                .into_iter()
+                .find(|spec| spec.id == "gpt-5.6-sol")
+                .unwrap()
+        });
+    spec.id = id.to_owned();
+    spec
+}
+
+#[cfg(test)]
+fn translate_to_responses_request(
+    api_name: &str,
+    request: &LlmRequest,
+    use_codex_backend: bool,
+    official_openai_route: bool,
+) -> ResponsesApiRequest {
+    translate_to_responses_request_for_model(
+        &test_model_spec(api_name),
         api_name,
+        request,
+        use_codex_backend,
+        official_openai_route,
+    )
+}
+
+#[cfg(test)]
+fn translate_to_backend_request(
+    api_name: &str,
+    request: &LlmRequest,
+    use_codex_backend: bool,
+    official_openai_route: bool,
+) -> ResponsesBackendRequest {
+    translate_to_backend_request_for_model(
+        &test_model_spec(api_name),
+        api_name,
+        request,
+        use_codex_backend,
+        official_openai_route,
+    )
+}
+
+fn is_known_gpt_6(spec: &ModelSpec) -> bool {
+    matches!(
+        spec.id.as_str(),
         "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
     )
 }
 
-fn supports_modern_responses(api_name: &str) -> bool {
-    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-") || is_known_gpt_6(api_name)
+fn supports_modern_responses(spec: &ModelSpec) -> bool {
+    spec.id == "gpt-5.6" || spec.id.starts_with("gpt-5.6-") || is_known_gpt_6(spec)
 }
 
-pub(crate) fn supports_responses_lite(api_name: &str) -> bool {
-    supports_modern_responses(api_name)
+pub(crate) fn supports_responses_lite(spec: &ModelSpec) -> bool {
+    supports_modern_responses(spec)
 }
 
-fn supports_explicit_prompt_cache(api_name: &str) -> bool {
-    supports_modern_responses(api_name)
+fn supports_explicit_prompt_cache(spec: &ModelSpec) -> bool {
+    supports_modern_responses(spec)
 }
 
 /// Preserve `OpenAI`'s historical read boundaries while leaving the latest
@@ -2929,7 +2988,8 @@ pub(crate) struct ResponsesApiUsage {
 /// Complete using the `OpenAI` Chat Completions API (non-streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_chat(
-    spec: &ModelSpec,
+    _spec: &ModelSpec,
+    request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -2938,7 +2998,7 @@ pub async fn complete_chat(
 ) -> Result<LlmResponse, LlmError> {
     let url = resolve_chat_endpoint(base_url_override);
     let mut chat_request = translate_to_chat_request_with_route(
-        &spec.api_name,
+        request_name.as_str(),
         request,
         base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions"),
     );
@@ -2981,13 +3041,14 @@ pub async fn complete_chat(
         LlmError::invalid_response("Failed to parse Chat Completions response")
     })?;
 
-    normalize_chat_response(chat_response, &spec.api_name)
+    normalize_chat_response(chat_response, request_name.as_str())
 }
 
 /// Complete using the `OpenAI` Chat Completions API (streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming_chat(
-    spec: &ModelSpec,
+    _spec: &ModelSpec,
+    request_name: &RequestModelName,
     api_key: &str,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -2999,7 +3060,7 @@ pub async fn complete_streaming_chat(
 
     let url = resolve_chat_endpoint(base_url_override);
     let mut chat_request = translate_to_chat_request_with_route(
-        &spec.api_name,
+        request_name.as_str(),
         request,
         base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/chat/completions"),
     );
@@ -4151,7 +4212,7 @@ mod tests {
     fn codex_spec() -> ModelSpec {
         ModelSpec {
             id: "gpt-5.6".into(),
-            api_name: "gpt-5.6".into(),
+            default_request_name: "gpt-5.6".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: String::new(),
@@ -4321,6 +4382,7 @@ mod tests {
         );
         let error = complete(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "test-key",
             Some(&url),
             &[],
@@ -4368,6 +4430,7 @@ mod tests {
         for round in 1..=3 {
             let response = complete_streaming(
                 &codex_spec(),
+                &codex_spec().default_request_name,
                 "account-a",
                 Some(&url),
                 &[],
@@ -4457,6 +4520,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "account-a",
                     Some(&url),
                     &[],
@@ -4542,6 +4606,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "account-a",
                     Some(&url),
                     &[],
@@ -4641,6 +4706,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "secret",
                     Some(&url),
                     &[],
@@ -4680,6 +4746,7 @@ mod tests {
 
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &[],
@@ -4709,6 +4776,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "secret",
                     Some(&url),
                     &[],
@@ -4761,6 +4829,7 @@ mod tests {
         });
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &[],
@@ -4812,6 +4881,7 @@ mod tests {
         ];
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers,
@@ -4832,6 +4902,7 @@ mod tests {
         assert!((snapshot.primary.unwrap().used_percent - 42.0).abs() < f64::EPSILON);
         let text_response = complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers,
@@ -4848,6 +4919,7 @@ mod tests {
 
         let http_only = complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers,
@@ -4874,6 +4946,7 @@ mod tests {
 
         let error = complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers,
@@ -5035,6 +5108,7 @@ mod tests {
                 &request,
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "secret",
                     Some(&url),
                     &[],
@@ -5108,6 +5182,7 @@ mod tests {
         let headers_a = vec![("chatgpt-account-id".into(), "a".into())];
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers_a,
@@ -5128,6 +5203,7 @@ mod tests {
         let headers_b = vec![("ChatGPT-Account-ID".into(), "b".into())];
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &headers_b,
@@ -5152,6 +5228,7 @@ mod tests {
             async move {
                 complete_streaming(
                     &codex_spec(),
+                    &codex_spec().default_request_name,
                     "secret",
                     Some(&url),
                     &[],
@@ -5175,6 +5252,7 @@ mod tests {
         let _ = task.await;
         complete_streaming(
             &codex_spec(),
+            &codex_spec().default_request_name,
             "secret",
             Some(&url),
             &[],
@@ -5659,7 +5737,7 @@ mod tests {
             translate_to_backend_request("gpt-6.1-sol", &request, true, false),
             ResponsesBackendRequest::CodexLite(_)
         ));
-        assert!(supports_responses_lite("gpt-6.1-sol"));
+        assert!(supports_responses_lite(&test_model_spec("gpt-6.1-sol")));
         let custom = serde_json::to_value(translate_to_backend_request(
             "gpt-6.1-sol",
             &request,
@@ -5683,8 +5761,10 @@ mod tests {
         ))
         .unwrap();
         assert!(direct.get("service_tier").is_none());
-        assert!(!supports_responses_lite("gpt-6-future"));
-        assert!(!supports_explicit_prompt_cache("gpt-6-future"));
+        assert!(!supports_responses_lite(&test_model_spec("gpt-6-future")));
+        assert!(!supports_explicit_prompt_cache(&test_model_spec(
+            "gpt-6-future"
+        )));
     }
 
     #[test]
