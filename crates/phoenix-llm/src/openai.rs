@@ -4348,6 +4348,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_alias_binds_private_replay_to_request_not_physical_model() {
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let app = Router::new().route("/responses", axum::routing::post({
+            let captured = Arc::clone(&captured);
+            move |Json(body): Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().await.push(body.clone());
+                    let physical = serde_json::json!({
+                        "id":"physical-response", "model":"physical-B", "status":"completed",
+                        "output":[{"type":"function_call","id":"item-1","call_id":"call-1","name":"bash","arguments":"{}"}],
+                        "usage":{"input_tokens":5,"output_tokens":2}
+                    });
+                    if body["stream"] == true {
+                        ([("content-type", "text/event-stream")], format!(
+                            "event: response.completed\ndata: {}\n\n",
+                            serde_json::json!({"type":"response.completed","response":physical})
+                        )).into_response()
+                    } else {
+                        Json(physical).into_response()
+                    }
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let spec = test_model_spec("gpt-6.1-sol");
+        let alias = RequestModelName::from("gateway/alias-A");
+        let request = empty_request();
+        let json_response = complete(
+            &spec,
+            &alias,
+            "key",
+            Some(&url),
+            &[],
+            &BTreeMap::new(),
+            &request,
+            false,
+        )
+        .await
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let stream_response = complete_streaming(
+            &spec,
+            &alias,
+            "key",
+            Some(&url),
+            &[],
+            &BTreeMap::new(),
+            &request,
+            &tx,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        for response in [json_response, stream_response] {
+            let Some(ProviderReplayUpdate::Responses(set)) = response.provider_replay else {
+                panic!("function call must retain private replay");
+            };
+            assert_eq!(set.model, alias.as_str());
+            assert_eq!(set.response_id, "physical-response");
+            let set = set.with_owner_message_id("owner".into());
+            let restored: ResponsesResponseSet =
+                serde_json::from_value(serde_json::to_value(&set).unwrap()).unwrap();
+            assert_eq!(restored.model, alias.as_str());
+            let mut next = empty_request();
+            next.messages.push(LlmMessage {
+                source_message_id: Some("owner".into()),
+                role: MessageRole::Assistant,
+                content: set.public_content.clone(),
+            });
+            next.responses_replay.push(restored);
+            validate_responses_replay(&next, alias.as_str()).unwrap();
+            assert!(validate_responses_replay(&next, "physical-B").is_err());
+        }
+        assert_eq!(captured.lock().await.len(), 2);
+        assert!(captured
+            .lock()
+            .await
+            .iter()
+            .all(|wire| wire["model"] == alias.as_str()));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn nonstreaming_malformed_response_never_exposes_private_output() {
         let app = Router::new().route(
             "/responses",

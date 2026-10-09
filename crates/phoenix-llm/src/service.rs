@@ -914,6 +914,14 @@ mod tests {
 
         let headers = service.headers_for_provider();
         assert!(!headers.iter().any(|(_, value)| value == "custom-account"));
+        assert!(!headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("provider")));
+        assert!(service.continuation_route_key().contains(":gpt-6-astra:"));
+        assert_eq!(
+            service.attempt_transport(true),
+            crate::LlmTransport::Websocket
+        );
         assert!(headers.iter().any(|(name, value)| name
             .eq_ignore_ascii_case("chatgpt-account-id")
             && value == "catalog-account"));
@@ -1001,6 +1009,64 @@ mod tests {
             ],
             BTreeMap::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn mapped_claude_and_gpt_requests_use_alias_without_implicit_provider_header() {
+        use axum::{
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+            Json, Router,
+        };
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(serde_json::Value, Option<String>)>();
+        async fn capture(
+            State(tx): State<
+                tokio::sync::mpsc::UnboundedSender<(serde_json::Value, Option<String>)>,
+            >,
+            headers: HeaderMap,
+            Json(body): Json<serde_json::Value>,
+        ) -> (StatusCode, &'static str) {
+            tx.send((
+                body,
+                headers
+                    .get("provider")
+                    .map(|v| v.to_str().unwrap().to_owned()),
+            ))
+            .unwrap();
+            (StatusCode::BAD_REQUEST, "{}")
+        }
+        let app = Router::new()
+            .route("/messages", post(capture))
+            .route("/responses", post(capture))
+            .with_state(tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (id, path, alias) in [
+            ("claude-sonnet-5-5", "messages", "anthropic/claude-sonnet-5"),
+            ("gpt-6.1-sol", "responses", "gateway/gpt-sol"),
+        ] {
+            let spec = all_models().into_iter().find(|s| s.id == id).unwrap();
+            let before = spec.effort_capabilities.clone();
+            let service = LlmServiceImpl::new(
+                spec,
+                LlmAuth::new(Arc::new(StaticCredential::new("key")), AuthStyle::ApiKey),
+                (path == "messages").then(|| format!("{base}/messages")),
+                (path == "responses").then(|| format!("{base}/responses")),
+                None,
+                vec![],
+                BTreeMap::new(),
+            )
+            .with_request_name(alias.into());
+            assert_eq!(service.spec.effort_capabilities, before);
+            assert!(service.complete(&request_with_capture().0).await.is_err());
+            let (body, provider) = rx.recv().await.unwrap();
+            assert_eq!(body["model"], alias);
+            assert_eq!(provider, None);
+        }
+        server.abort();
     }
 
     #[test]
