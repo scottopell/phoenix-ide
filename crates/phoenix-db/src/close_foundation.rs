@@ -5877,8 +5877,7 @@ impl Database {
                         UNION ALL
                         SELECT 1 FROM close_process_step_successes success
                         WHERE success.attempt_id = ?1 AND success.scope = ?2
-                          AND success.resource_kind = ?3 AND success.identity_kind = ?4
-                          AND success.identity_codec = ?5 AND success.identity_value = ?6
+                          AND success.resource_kind = ?3 AND success.identity_value = ?6
                     )",
                 )
                 .bind(request.attempt_id.as_str())
