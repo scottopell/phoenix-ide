@@ -256,12 +256,28 @@ fn responses_http_error(status: u16, body: &str) -> LlmError {
     LlmError::from_http_status(status, body)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+enum ResponsesReasoningUsage {
+    #[default]
+    Absent,
+    Valid(u32),
+    Invalid,
+}
+
+impl ResponsesReasoningUsage {
+    fn value(self) -> Option<u32> {
+        match self {
+            Self::Valid(value) => Some(value),
+            Self::Absent | Self::Invalid => None,
+        }
+    }
+}
+
 /// Accumulates state across Responses API SSE stream events.
 struct ResponsesStreamAccumulator {
     input_tokens: u32,
     output_tokens: u32,
-    reasoning_tokens: Option<u32>,
-    invalid_reasoning_tokens: bool,
+    reasoning_usage: ResponsesReasoningUsage,
     /// Cached-read subset of `input_tokens`.
     cached_tokens: u32,
     /// Cache-write subset of `input_tokens` on GPT-5.6-era models.
@@ -333,8 +349,7 @@ impl ResponsesStreamAccumulator {
         Self {
             input_tokens: 0,
             output_tokens: 0,
-            reasoning_tokens: None,
-            invalid_reasoning_tokens: false,
+            reasoning_usage: ResponsesReasoningUsage::Absent,
             cached_tokens: 0,
             cache_write_tokens: 0,
             output_items: BTreeMap::new(),
@@ -576,8 +591,10 @@ impl ResponsesStreamAccumulator {
                     .unwrap_or(0);
                     if let Some(value) = usage.pointer("/output_tokens_details/reasoning_tokens") {
                         match value.as_u64().and_then(|value| u32::try_from(value).ok()) {
-                            Some(tokens) => self.reasoning_tokens = Some(tokens),
-                            None => self.invalid_reasoning_tokens = true,
+                            Some(tokens) => {
+                                self.reasoning_usage = ResponsesReasoningUsage::Valid(tokens);
+                            }
+                            None => self.reasoning_usage = ResponsesReasoningUsage::Invalid,
                         }
                     }
                     self.cached_tokens = u32::try_from(
@@ -681,7 +698,7 @@ impl ResponsesStreamAccumulator {
             output_tokens = self.output_tokens,
             "responses_api stream accumulator finalizing"
         );
-        if self.invalid_reasoning_tokens {
+        if matches!(self.reasoning_usage, ResponsesReasoningUsage::Invalid) {
             return Err(LlmError::server_error(
                 "OpenAI returned invalid reasoning token usage",
             ));
@@ -701,7 +718,7 @@ impl ResponsesStreamAccumulator {
                         cached_tokens: self.cached_tokens,
                         cache_write_tokens: self.cache_write_tokens,
                     },
-                    output_tokens_details: self.reasoning_tokens.map(|reasoning_tokens| {
+                    output_tokens_details: self.reasoning_usage.value().map(|reasoning_tokens| {
                         ResponsesApiOutputTokensDetails {
                             reasoning_tokens: Some(reasoning_tokens),
                         }
