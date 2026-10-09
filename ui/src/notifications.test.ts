@@ -169,6 +169,7 @@ describe('archive close conflict notifications', () => {
       'close_settlement_in_progress',
       'close_inspection_failed',
       'close_retirement_needs_repair',
+      'close_incomplete',
       'stale_close_inspection',
     ]) {
       expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
@@ -176,7 +177,7 @@ describe('archive close conflict notifications', () => {
         error_type,
       }))).toBe(true);
     }
-    expect(closeListener).toHaveBeenCalledTimes(6);
+    expect(closeListener).toHaveBeenCalledTimes(7);
     expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
       error: 'close could not start',
       error_type: 'close_start_failed',

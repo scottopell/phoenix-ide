@@ -53,6 +53,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1200"
     steps:
       - uses: actions/checkout@v4
         with:

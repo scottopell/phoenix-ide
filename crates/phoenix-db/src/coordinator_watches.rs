@@ -1,3 +1,10 @@
+mod mandatory_close;
+use mandatory_close::decode_route;
+pub use mandatory_close::{
+    append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
+    WatchEventRoute,
+};
+
 use chrono::Utc;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_core::domain::sm_state::ConvState;
@@ -21,6 +28,7 @@ pub struct WatchSnapshot {
 pub enum WatchOutcome {
     Completed,
     Failed { reason: String },
+    CleanupFailed { reason: String },
     Cancelled,
     AwaitingUserResponse,
 }
@@ -30,6 +38,7 @@ impl WatchOutcome {
         match (kind, reason) {
             ("completed", None) => Ok(Self::Completed),
             ("failed", Some(reason)) => Ok(Self::Failed { reason }),
+            ("cleanup_failed", Some(reason)) => Ok(Self::CleanupFailed { reason }),
             ("cancelled", None) => Ok(Self::Cancelled),
             ("awaiting_user_response", Some(reason)) if reason == "question_request" => {
                 Ok(Self::AwaitingUserResponse)
@@ -45,6 +54,7 @@ impl WatchOutcome {
         match self {
             Self::Completed => "completed",
             Self::Failed { .. } => "failed",
+            Self::CleanupFailed { .. } => "cleanup_failed",
             Self::Cancelled => "cancelled",
             Self::AwaitingUserResponse => "awaiting_user_response",
         }
@@ -53,7 +63,7 @@ impl WatchOutcome {
     #[must_use]
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::Failed { reason } => Some(reason),
+            Self::Failed { reason } | Self::CleanupFailed { reason } => Some(reason),
             Self::AwaitingUserResponse => Some("question_request"),
             Self::Completed | Self::Cancelled => None,
         }
@@ -62,6 +72,7 @@ impl WatchOutcome {
 
 #[derive(Debug, Clone)]
 pub struct PendingWatchEvent {
+    pub route: WatchEventRoute,
     pub event_id: String,
     pub product_conversation_id: ProductConversationId,
     pub source_transcript_id: String,
@@ -176,7 +187,7 @@ impl Database {
     /// # Errors
     /// Returns a database error if suppression fails.
     pub async fn suppress_stale_watch_event(&self, event_id: &str) -> DbResult<()> {
-        sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed' WHERE event_id = ?1 AND delivery_state = 'pending' AND NOT EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p ON p.id = w.source_product_conversation_id WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open')")
+        sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed' WHERE event_id = ?1 AND route_kind = 'subscription' AND delivery_state = 'pending' AND NOT EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p ON p.id = w.source_product_conversation_id WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open')")
             .bind(event_id).execute(self.pool()).await?;
         Ok(())
     }
@@ -201,21 +212,30 @@ impl Database {
         &self,
         limit: i64,
     ) -> DbResult<Vec<PendingWatchEvent>> {
-        let rows = sqlx::query("SELECT e.event_id, w.source_product_conversation_id,
+        let rows = sqlx::query("SELECT e.event_id, e.route_kind,
+                  COALESCE(w.source_product_conversation_id, f.source_product_conversation_id) AS source_product_conversation_id,
                   e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
-                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us
-             FROM coordinator_watch_events e JOIN coordinator_watches w ON w.id = e.watch_id
-             JOIN product_conversations p ON p.id = w.source_product_conversation_id
-             WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none' AND w.ended_at_us IS NULL
-               AND p.ordinary_lifecycle = 'open'
-               AND NOT EXISTS (SELECT 1 FROM close_obligations o
-                               WHERE o.product_conversation_id = p.id AND o.phase != 'completed')
+                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
+                  f.authority_kind, f.scope, f.resource_kind, f.identity_kind, f.identity_codec, f.identity_value,
+                  f.detail, f.cleanup_run_ordinal, f.stop_certainty, f.confirmed_at_us AS stop_confirmed_at_unix_us
+             FROM coordinator_watch_events e
+             LEFT JOIN coordinator_watches w ON w.id = e.watch_id
+             LEFT JOIN product_conversations p ON p.id = w.source_product_conversation_id
+             LEFT JOIN close_cleanup_failures f ON f.failure_occurrence_id = e.mandatory_failure_occurrence_id
+             WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none'
+               AND (e.route_kind = 'mandatory_close_failure' OR
+                    (e.route_kind = 'subscription' AND w.ended_at_us IS NULL
+                     AND p.ordinary_lifecycle = 'open'
+                     AND NOT EXISTS (SELECT 1 FROM close_obligations o
+                                     WHERE o.product_conversation_id = p.id AND o.phase != 'completed')))
              ORDER BY e.occurred_at_us, e.event_id LIMIT ?1")
             .bind(limit).fetch_all(&self.pool).await?;
-        rows.into_iter()
+        let mut events = rows
+            .into_iter()
             .map(|row| {
                 let product_id: String = row.try_get("source_product_conversation_id")?;
                 Ok(PendingWatchEvent {
+                    route: decode_route(&row)?,
                     event_id: row.try_get("event_id")?,
                     product_conversation_id: ProductConversationId::parse(product_id)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
@@ -230,7 +250,19 @@ impl Database {
                     occurred_at_us: row.try_get("occurred_at_us")?,
                 })
             })
-            .collect()
+            .collect::<DbResult<Vec<_>>>()?;
+        for event in &mut events {
+            if let WatchEventRoute::MandatoryCloseFailure {
+                remaining_resources,
+                ..
+            } = &mut event.route
+            {
+                *remaining_resources =
+                    mandatory_close::remaining_resources(&self.pool, &event.source_occurrence_id)
+                        .await?;
+            }
+        }
+        Ok(events)
     }
 
     /// Find the active coordinator transcript that receives watch events.
@@ -472,6 +504,23 @@ async fn record_watch_event_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_preserves_mandatory_cleanup_failure_alongside_waits() {
+        assert_eq!(
+            WatchOutcome::decode("cleanup_failed", Some("resource preserved".into())).unwrap(),
+            WatchOutcome::CleanupFailed {
+                reason: "resource preserved".into()
+            }
+        );
+        assert!(WatchOutcome::decode("cleanup_failed", None).is_err());
+        assert_eq!(
+            WatchOutcome::decode("awaiting_user_response", Some("question_request".into()))
+                .unwrap(),
+            WatchOutcome::AwaitingUserResponse
+        );
+    }
+
     use crate::workflow::AcceptAuthoritativeTurn;
     use phoenix_core::domain::db_schema::InputOrigin;
     use phoenix_core::domain::sm_event::{
@@ -1141,6 +1190,225 @@ mod tests {
         assert_eq!(exposed[0].source_occurrence_kind, "direct_turn");
         assert_eq!(exposed[0].source_occurrence_id, turn.to_string());
         assert_eq!(exposed[0].outcome.label(), "cancelled");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mandatory_failure_loads_ordered_resources_until_acceptance() {
+        use crate::{
+            CloseCleanupFailureAuthority, CloseCleanupFailureResource,
+            CloseCleanupResourceDisposition as Disposition,
+            TerminalizeInitialCloseCleanupFailureRequest,
+        };
+        use phoenix_core::domain::close::{
+            CloseAttemptId, CloseRunOrdinal, CloseStopCertainty, LossItemIdentity, OpaqueIdentity,
+            RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
+            TranscriptConversationId,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let ordinary = db
+            .create_conversation("ordinary", "ordinary", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&ordinary.product_conversation_id)
+            .await
+            .unwrap();
+        let turn = source_turn(&db, &ordinary.id, "ordinary-turn").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        record_terminal_event_tx(&mut tx, turn, 0, &ordinary.id, "Completed", None, false)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let ordinary_event_id = db.pending_coordinator_watch_events(16).await.unwrap()[0]
+            .event_id
+            .clone();
+
+        let source = db
+            .create_conversation("close-source", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope = source.attached_work_scope_id.clone().unwrap();
+        let other_scope = phoenix_core::work_scope::WorkScopeId::parse("other-scope").unwrap();
+        sqlx::query("INSERT INTO work_scopes (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+            SELECT ?1, authority_kind, lifecycle, 'unowned_cwd', '/tmp/child', created_at, updated_at FROM work_scopes WHERE id = ?2")
+            .bind(other_scope.as_str()).bind(scope.as_str()).execute(db.pool()).await.unwrap();
+        let mut latest = source.clone();
+        latest.id = "close-latest".into();
+        latest.slug = Some("close-latest".into());
+        latest.attached_work_scope_id = Some(other_scope.clone());
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO product_continuation_reservations (predecessor_conversation_id, successor_conversation_id, product_conversation_id) VALUES (?1, ?2, ?3)")
+            .bind(&source.id).bind(&latest.id).bind(source.product_conversation_id.as_str()).execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind(&latest.id)
+            .bind(&source.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        crate::insert_conversation_tx(&mut tx, &latest)
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(&source.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        db.begin_close_foundation(
+            &source.product_conversation_id,
+            &TranscriptConversationId::parse(latest.id.clone()).unwrap(),
+            "watch-failure",
+        )
+        .await
+        .unwrap();
+        let resources = [
+            (
+                &scope,
+                RetiredResourceKind::BashProcessGroup,
+                "epoch:failed",
+                Disposition::Failed,
+            ),
+            (
+                &other_scope,
+                RetiredResourceKind::BrowserSession,
+                "epoch:residual",
+                Disposition::Residual,
+            ),
+            (
+                &scope,
+                RetiredResourceKind::PtySession,
+                "epoch:unattempted",
+                Disposition::Unattempted,
+            ),
+            (
+                &other_scope,
+                RetiredResourceKind::EquivalentLiveResource,
+                "epoch:unknown",
+                Disposition::Unknown,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(scope, kind, identity, disposition)| CloseCleanupFailureResource {
+                scope: scope.clone(),
+                resource: RetiredResourceIdentity::parse(
+                    kind,
+                    LossItemIdentity::Opaque(OpaqueIdentity::parse(identity).unwrap()),
+                )
+                .unwrap(),
+                disposition,
+            },
+        )
+        .collect::<Vec<_>>();
+        let request = TerminalizeInitialCloseCleanupFailureRequest {
+            failure_occurrence_id: "close-failure:1:watch-failure".into(),
+            attempt_id: CloseAttemptId::parse("watch-failure").unwrap(),
+            source_product_conversation_id: source.product_conversation_id.clone(),
+            authority: CloseCleanupFailureAuthority::ObservedProcessResource {
+                scope,
+                resource: resources[0].resource.clone(),
+            },
+            remaining_resources: resources.clone(),
+            reason: RetirementFailureReason::ResidualProcessAlive,
+            detail: "shutdown failed".into(),
+            stop_certainty: CloseStopCertainty::ShutdownUncertain,
+            occurred_at_us: 1,
+        };
+        db.terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .unwrap();
+        db.terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .unwrap();
+        db.suppress_stale_watch_event(&request.failure_occurrence_id)
+            .await
+            .unwrap();
+        assert!(!db
+            .unwatch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap());
+        let expected = resources
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<mandatory_close::CloseFailureRemainingResource>>();
+        for _ in 0..2 {
+            let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+            assert_eq!(pending.len(), 2);
+            assert_eq!(pending[0].event_id, request.failure_occurrence_id);
+            assert_eq!(pending[1].event_id, ordinary_event_id);
+            assert!(matches!(pending[1].route, WatchEventRoute::Subscription));
+            let WatchEventRoute::MandatoryCloseFailure {
+                run_ordinal,
+                remaining_resources,
+                stop,
+                ..
+            } = &pending[0].route
+            else {
+                panic!("expected mandatory route");
+            };
+            assert_eq!(*run_ordinal, CloseRunOrdinal::INITIAL);
+            assert_eq!(*remaining_resources, expected);
+            assert!(matches!(stop, CloseFailureStop::ShutdownUncertain));
+            let limited = db.pending_coordinator_watch_events(1).await.unwrap();
+            assert_eq!(limited.len(), 1);
+            assert_eq!(limited[0].event_id, request.failure_occurrence_id);
+        }
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let admission = "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text, origin_kind, origin_subscription_event_id)
+                         VALUES (?1, ?2, ?3, 'failure with resources', 'subscription_event', ?4)";
+        assert!(sqlx::query(admission)
+            .bind("wrong-target")
+            .bind(&ordinary.id)
+            .bind(0)
+            .bind(&request.failure_occurrence_id)
+            .execute(db.pool())
+            .await
+            .is_err());
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            2
+        );
+        sqlx::query(admission)
+            .bind("accepted-failure")
+            .bind(&coordinator.id)
+            .bind(0)
+            .bind(&request.failure_occurrence_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(sqlx::query(admission)
+            .bind("duplicate-failure")
+            .bind(&coordinator.id)
+            .bind(1)
+            .bind(&request.failure_occurrence_id)
+            .execute(db.pool())
+            .await
+            .is_err());
+        db.terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .unwrap();
+        let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_id, ordinary_event_id);
+        assert_eq!(
+            mandatory_close::remaining_resources(db.pool(), &request.failure_occurrence_id)
+                .await
+                .unwrap(),
+            expected
+        );
+        let accepted: (String, String) = sqlx::query_as("SELECT delivery_state, accepted_transcript_id FROM coordinator_watch_events WHERE event_id = ?1")
+            .bind(&request.failure_occurrence_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(accepted, ("accepted".into(), coordinator.id));
     }
 
     #[tokio::test]

@@ -103,7 +103,7 @@ value ResponsesRawResponse {
     has_function_call: Boolean
     has_output_items: Boolean
     has_output_content: Boolean
-    has_proven_quiet_reasoning_terminal: Boolean
+    has_proven_quiet_terminal: Boolean
 }
 
 value ResponsesFunctionResult {
@@ -615,12 +615,13 @@ rule ResponsesServerBlockDropped {
 --      reported output items or positive output usage, and the terminal shape
 --      does not prove completed quiet reasoning output. Yields a RETRYABLE
 --      server_error rather than a silently-empty agent turn.
---   2. Proven quiet reasoning — the terminal contains one or more structurally
---      valid, non-incomplete reasoning items and may also contain structurally
---      completed assistant messages with no public content. Usage reports a
---      positive reasoning-token subset of billed output, and no non-empty
---      visible content or function call was observed in stream events. Yields
---      a valid quiet end turn without synthetic public text.
+--   2. Proven quiet terminal — every item is either a structurally completed
+--      assistant message with no public content or a structurally valid,
+--      non-incomplete reasoning item. Reasoning items, when present, have a
+--      positive reasoning-token subset of billed output; reasoning usage is
+--      zero when they are absent. No non-empty visible content or function call
+--      was observed in stream events. Yields a valid quiet end turn without
+--      synthetic public text.
 --   3. Otherwise a normalized llm/LlmResponse. Output items map:
 --      message -> text content (both output_text and refusal parts),
 --      function_call -> tool_use, reasoning -> private continuation, other ->
@@ -638,7 +639,7 @@ rule ResponsesResponseNormalized {
     let end_turn = raw.status = "completed" and not raw.has_function_call
 
     ensures:
-        if not raw.has_output_content and (raw.has_output_items or raw.raw_output_tokens > 0) and not raw.has_proven_quiet_reasoning_terminal:
+        if not raw.has_output_content and (raw.has_output_items or raw.raw_output_tokens > 0) and not raw.has_proven_quiet_terminal:
             llm/LlmError.created(
                 kind: server_error,
                 message: "OpenAI returned empty response without valid terminal evidence",
@@ -663,13 +664,14 @@ rule ResponsesResponseNormalized {
         -- ResponsesStreamCompleted recovery fallback: the fallback
         -- salvages a message that arrived only in /response/output,
         -- this branch catches the case where even that normalizes empty despite
-        -- output items or positive usage. A completed terminal containing valid
-        -- reasoning and only structurally completed empty assistant-message
-        -- companions takes the LlmResponse branch when usage reports a positive
-        -- reasoning-token subset of raw_output_tokens and no non-empty visible
-        -- content or function call was observed in stream events; Phoenix does
-        -- not infer quiet completion from missing usage
-        -- detail or a loose type tag. An empty output array with output_tokens = 0
+        -- output items or positive usage. A completed terminal containing only
+        -- structurally completed empty assistant messages and valid reasoning
+        -- items takes the LlmResponse branch. Reasoning requires a positive
+        -- reasoning-token subset of raw_output_tokens; absent reasoning requires
+        -- zero reasoning usage. No non-empty visible content or function call
+        -- may have been observed in stream events. When reasoning items exist,
+        -- Phoenix does not infer quiet completion from missing usage detail or a
+        -- loose type tag. An empty output array with output_tokens = 0
         -- is a genuinely-empty valid turn and also takes the LlmResponse branch.
         -- GPT-5.6-era Responses usage reports cache writes in
         -- input_tokens_details.cache_write_tokens; older responses default it
@@ -739,8 +741,8 @@ rule ResponsesFinalizedVisibleOutputObserved {
     ensures: stream.observed_non_reasoning_output = true
 }
 
--- A named function-call item or non-empty incremental or finalized argument
--- event proves that tool output existed even if terminal assembly loses the item.
+-- Any function-call item or function-call argument event proves that tool output
+-- existed even if terminal assembly later loses or replaces the item.
 rule ResponsesFunctionCallOutputObserved {
     when: ResponsesFunctionCallOutput(stream)
 
@@ -1071,11 +1073,11 @@ invariant ResponsesCacheDetailsSubsetOfInput {
 -- Empty normalization is modelled directly in ResponsesResponseNormalized: a
 -- completed response with no content block but output items or positive output
 -- usage yields a retryable server_error unless the authenticated terminal output
--- contains structurally valid reasoning items and only structurally completed
--- empty assistant-message companions, usage reports a positive reasoning-token
--- subset of raw_output_tokens, and no visible or tool output was observed. That
--- proven case and a genuinely empty zero-token turn are valid quiet
--- llm/LlmResponse values.
+-- contains only structurally completed empty assistant messages and valid
+-- reasoning items. Present reasoning requires a positive reasoning-token subset
+-- of raw_output_tokens; absent reasoning requires zero reasoning usage. No
+-- visible or tool output may have been observed. That proven case and a
+-- genuinely empty zero-token turn are valid quiet llm/LlmResponse values.
 --
 -- Responses reasoning output is not public transcript content. Required
 -- replay is governed by ResponsesToolContinuation independently of visible

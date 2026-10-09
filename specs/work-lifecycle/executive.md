@@ -2,55 +2,53 @@
 
 ## What This Spec Covers
 
-The work lifecycle spec now describes the intended user-facing **Close conversation** flow for Git-backed conversations, the worktree-loss inspection it requires, the immutable restart-repair evidence retained when a registered worktree is missing or inaccessible after restart, and the idempotent retirement of attached `WorkScope` resources without branch or PR mutation.
+Explicit Close for Git-backed ProductConversations: exact loss inspection, reconstructible-only automatic deletion, owned-resource shutdown and retirement, failure visibility, mandatory Global delivery, and fresh safe retry under the original Close authority. Branches and pull requests are never Close-owned artifacts.
 
 ## Current Reality
 
-Durable Close retirement and ProductConversation History finalization are shipped, while the dedicated Close-start replacement and legacy-edge removal remain incomplete. A successful exact attempt retires the attached WorkScope resources, records one durable outcome message, transitions the ordinary aggregate to History in the completion transaction, and publishes compatibility updates only after commit. Primary ProductConversation surfaces expose Close and read-only History rather than Archive, but `POST /api/conversations/:id/archive`, `/abandon-task`, `/mark-merged`, and `continued_in_conv_id` compatibility checks remain live internally or on legacy surfaces. Existing row-level WorkScope fields remain attachment authority, with no parallel writable normalized attachment relation. Phoenix continues using the current Project-backed repository model; replacement is deferred until a named feature requires it. Exact-attempt adoption of immutable restart-repair evidence remains incomplete.
+**Candidate / implementation acceptance unvalidated.** ADR-088 supersedes automatic Close recovery, same-execution retry, and the rule that all cleanup failures must remain Open. This spec slice records the settled contract; it does not certify a source candidate, migration, deployment, or live behavior. Historical green checks under the superseded contract are not acceptance evidence for this contract. No production cleanup or database repair is authorized by this document.
 
-## Requirements Summary
+Lifecycle ended and resources retired are separate facts. Confirmed conversation **and** owned-process shutdown permits read-only History with conspicuous `cleanup_attention` after cleanup failure. Uncertain shutdown stays Open with `CloseIncomplete`. A stopped execution is never resumed; startup observes only. Explicit user or Global safe retry allocates a new durable run ordinal under the original Close authority after fresh safety proof. Changed risk, unique/uncertain discard, expanded effects, or database surgery requires a concrete proposal and separate approval.
 
-| ID | Summary |
-|----|---------|
-| REQ-WL-001 | Close conversation is the only intended user-facing terminal lifecycle action for Git-backed conversations |
-| REQ-WL-002 | Retirement inspection classifies exact worktree-loss risk before destructive teardown |
-| REQ-WL-002a | Discard confirmation binds to one exact inspected workspace generation |
-| REQ-WL-002b | Retirement retires owned resources stepwise, idempotently, and without automatic recovery artifacts |
-| REQ-PROJ-028a | Restart retains immutable repair evidence and fail-closed adoption for missing/inaccessible worktrees |
-| REQ-WL-003 | Pull-request state guides Close but never triggers it |
+## Requirements and Acceptance Status
+
+| Requirement | Contract | Status |
+|-------------|----------|--------|
+| REQ-BED-029 | One normal run stops at first failure; proven shutdown enters History independently of cleanup success | Candidate / unvalidated |
+| REQ-WL-001 | Close is the only ordinary terminal action; legacy inputs must preserve its contract | Candidate / unvalidated |
+| REQ-WL-002 | Exact loss inventory; automatic deletion needs fresh reconstructibility proof | Candidate / unvalidated |
+| REQ-WL-002a | Discard confirmation binds exact original authority, run ordinal, generation, and fingerprint | Candidate / unvalidated |
+| REQ-WL-002b | Exact scope/process/private-directory authority; stop on first failure; observation-only startup; no repository mutation or recovery artifact | Candidate / unvalidated |
+| REQ-WL-002c | Explicit fresh safe retry; no unresolved replay, completed-effect repetition, or authority expansion | Candidate / unvalidated |
+| REQ-WL-002d | Tmux retirement needs exact socket plus server-token authority | Candidate / unvalidated |
+| REQ-WL-004 | Durable mandatory once-per-failure Global event through unified delivery, even unwatched or in History | Candidate / unvalidated |
+| REQ-PROJ-028a | Missing/inaccessible worktrees remain exact immutable observations, not startup cleanup authority | Candidate / unvalidated |
+| REQ-PROJ-WS-001 | One ordinary owner per WorkScope; subordinate participants do not become owners | Candidate / unvalidated |
+| REQ-WL-003 | PR state is advisory and never triggers Close | Candidate / unvalidated |
+
+## Required Behavioral Acceptance
+
+These are acceptance obligations, **not tests reported as passing**:
+
+| Scenario | Required evidence |
+|----------|-------------------|
+| Normal clean Close | Fresh reconstructibility/identity proof, confirmed shutdown, exact successful disposition, atomic History outcome |
+| Unique or uncertain work | Preserve resources; exact inventory and concrete discard proposal/decision; no inferred deletion authority |
+| First failure before confirmed shutdown | No subsequent Close effect; Open `CloseIncomplete`; exact durable failure and mandatory Global event |
+| Cleanup failure after confirmed shutdown | No subsequent Close effect; History `cleanup_attention`; retained residuals; no false cleanup-success message |
+| Crash and startup | Read-only observations and truthful shutdown classification only; no settlement/cleanup/retry dispatch |
+| Delayed progress or duplicated command | Stopped run cannot dispatch; stale ordinal cannot advance a fresh run; no duplicate failure event |
+| Unwatched source / source enters History | Mandatory Global delivery survives watch absence and lifecycle change; exactly one event per failure |
+| Safe explicit retry | Fresh resolved-precondition proof, new ordinal under original authority, exact remaining effects only, old stopped evidence unchanged |
+| Unresolved / risky retry | Reject without effects; unique discard, changed risk, expanded targets, or DB surgery requires separate concrete proposal |
+| Retry fails again | New stopped run, distinct run-bound failure, its own once-per-failure Global event |
+| Reused tmux socket / worktree path / missing live permit | Preserve unproven resource; no PID/path-based authority or fabricated shutdown |
+| Branches, PRs, recovery artifacts | No deletion or other ref/PR mutation, and no automatic branch/tag/stash/patch/snapshot creation |
 
 ## Normative Authority
 
-Current normative authority is `requirements.md`, `work-lifecycle.allium`, `specs/bedrock/bedrock.allium`, and the restart-repair evidence defined in `specs/git-repository/git-repository.allium`. ADR-026 records WorkScope resource ownership; ADR-031 records staged single authority for ProductConversation lifecycle and attachment persistence; ADR-032 records the hidden-repository identity plus retained repair-evidence adoption rules. This executive intentionally reports current implementation drift instead of treating the normative Close model as shipped.
-
-## Implementation Status
-
-| Requirement | Status | Surface |
-|-------------|--------|---------|
-| REQ-WL-001 | Partially implemented | Primary ProductConversation surfaces expose Close, but legacy abandon / mark-merged endpoints and dedicated Close-start replacement remain incomplete |
-| REQ-WL-002 | Partially implemented | Legacy flows already inspect/capture worktree state for cleanup paths, but the exact Close loss-inventory contract is not the shipped user flow |
-| REQ-WL-002a | Not implemented | No shipped fingerprint-bound discard confirmation for the unified Close obligation |
-| REQ-WL-002b | Partially implemented | Durable Close retirement idempotently retires attached WorkScope resources and completes with one outcome plus aggregate History; legacy entry and cleanup edges remain |
-| REQ-PROJ-028a | Not implemented | Missing/inaccessible registered worktrees are not yet preserved as immutable restart-repair evidence that later Close attempts can adopt fail-closed by exact identity |
-| REQ-WL-003 | Partially implemented | Observed PR state already guides current cleanup affordances, but it still participates in legacy mark-merged UX rather than purely advisory Close guidance |
-
-## Legacy Surface Inventory
-
-The following legacy surfaces are still current reality and must remain called out as such until code changes land:
-
-- `/abandon-task` — shipped destructive terminal flow with diff capture and mode-dependent cleanup
-- `/mark-merged` — shipped cleanup flow keyed to current branch/PR completion UX
-- `/archive` — shipped compatibility entry used internally by the current Close journey and still reachable from legacy surfaces; aggregate lifecycle authority is Open/History
-- continuation gating via `continued_in_conv_id` — shipped protection against closing/cleaning up predecessors after handoff
+`requirements.md`, `work-lifecycle.allium`, `specs/bedrock/requirements.md`, and `specs/bedrock/bedrock.allium` define Close behavior. `specs/git-repository/git-repository.allium` defines retained restart observations. ADR-088 records the superseding policy; ADR-026's authority separation and ADR-040/042/080's retained identity/private-namespace safety remain relevant within that bounded policy.
 
 ## Validation Notes
 
-Current-reality verification for this reconciliation used:
-
-- `crates/phoenix-ide/src/api/lifecycle_handlers.rs`
-- `crates/phoenix-ide/src/api/handlers.rs`
-- `crates/phoenix-db/src/lib.rs` (`archive_conversation`, `archived` listings, continuation/ownership queries)
-
-## Provenance
-
-Durable Close retirement and aggregate History finalization are shipped through compatibility entrypoints. Dedicated Close-start replacement and removal of abandon, mark-merged, archive, and continuation compatibility edges remain incomplete, so the unified lifecycle is only partially implemented.
+This is a specification-only slice. Targeted Allium parsing and repository spec-shape/anchor checks must be distinguished from whole-repository analyser baseline checks and implementation acceptance. No runtime, UI, production, or migration acceptance is claimed here; the required matrix above remains unvalidated until a source candidate is qualified against it.
