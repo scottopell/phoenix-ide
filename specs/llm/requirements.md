@@ -541,8 +541,11 @@ THE SYSTEM SHALL reject the incomplete stream as an invalid response
 
 WHEN a Responses transport receives an authenticated `response.completed` terminal event whose complete output consists only of structurally valid, non-incomplete reasoning items
 AND the provider reports a positive reasoning-token subset of the billed output tokens
-AND the stream did not previously emit or finalize non-empty visible output
+AND the stream did not previously expose non-empty visible output or a function call in stream events
 THEN Phoenix SHALL settle the request as a valid quiet end turn without fabricating visible assistant text.
+
+WHEN a Responses terminal includes reasoning items but does not report a positive reasoning-token subset of billed output
+THEN Phoenix SHALL classify the result as a retryable provider failure rather than treating it as an unbilled empty turn.
 
 WHEN billed output has no terminal model-visible content and the terminal shape does not prove a completed reasoning-only response
 THEN Phoenix SHALL classify the result as a retryable provider failure rather than silently persisting an empty agent turn.

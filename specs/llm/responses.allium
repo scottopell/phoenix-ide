@@ -155,7 +155,7 @@ entity ResponsesStream {
     cached_tokens: Integer
     cache_write_tokens: Integer
     recovered_from_completed: Boolean
-    observed_visible_output: Boolean
+    observed_non_reasoning_output: Boolean
 
     output_items: ResponsesOutputItem with stream = this
 
@@ -616,9 +616,9 @@ rule ResponsesServerBlockDropped {
 --      server_error rather than a silently-empty agent turn.
 --   2. Proven reasoning-only — every terminal item is a structurally valid,
 --      non-incomplete reasoning item, usage reports a positive reasoning-token
---      subset of billed output, and no non-empty visible delta or finalized
---      visible content was observed. Yields a valid quiet end turn without
---      synthetic public text.
+--      subset of billed output, and no non-empty visible content or function
+--      call was observed in stream events. Yields a valid quiet end turn
+--      without synthetic public text.
 --   3. Otherwise a normalized llm/LlmResponse. Output items map:
 --      message -> text content (both output_text and refusal parts),
 --      function_call -> tool_use, reasoning -> private continuation, other ->
@@ -664,10 +664,10 @@ rule ResponsesResponseNormalized {
         -- tokens were billed. A completed terminal containing only reasoning
         -- items takes the LlmResponse branch only when usage reports a positive
         -- reasoning-token subset of raw_output_tokens and no non-empty visible
-        -- delta or finalized visible content was observed; Phoenix does not
-        -- infer quiet completion from missing usage
-        -- detail or a loose type tag. An empty response with output_tokens = 0 is a
-        -- genuinely-empty valid turn and also takes the LlmResponse branch.
+        -- content or function call was observed in stream events; Phoenix does
+        -- not infer quiet completion from missing usage
+        -- detail or a loose type tag. An empty output array with output_tokens = 0
+        -- is a genuinely-empty valid turn and also takes the LlmResponse branch.
         -- GPT-5.6-era Responses usage reports cache writes in
         -- input_tokens_details.cache_write_tokens; older responses default it
         -- to zero. saturating_sub floors at 0; OpenAI guarantees the combined
@@ -696,7 +696,7 @@ rule ResponsesStreamOpened {
         cached_tokens: 0,
         cache_write_tokens: 0,
         recovered_from_completed: false,
-        observed_visible_output: false
+        observed_non_reasoning_output: false
     )
 }
 
@@ -733,7 +733,17 @@ rule ResponsesFinalizedVisibleOutputObserved {
     requires: stream.status = accumulating
     requires: content != ""
 
-    ensures: stream.observed_visible_output = true
+    ensures: stream.observed_non_reasoning_output = true
+}
+
+-- A named function-call item or non-empty function-call argument delta proves
+-- that tool output existed even if terminal assembly loses the completed item.
+rule ResponsesFunctionCallOutputObserved {
+    when: ResponsesFunctionCallOutput(stream)
+
+    requires: stream.status = accumulating
+
+    ensures: stream.observed_non_reasoning_output = true
 }
 
 -- A response.output_item.done event. The completed output item is

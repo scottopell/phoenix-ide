@@ -278,7 +278,7 @@ struct ResponsesStreamAccumulator {
     /// classify the wire shape next time the success path stops working.
     logged_empty_dispatch: bool,
     telemetry: StreamTelemetryRecorder,
-    observed_visible_output: bool,
+    observed_non_reasoning_output: bool,
 }
 
 fn has_finalized_visible_output(event_type: &str, event: &serde_json::Value) -> bool {
@@ -323,7 +323,7 @@ impl ResponsesStreamAccumulator {
                     .as_ref()
                     .map(|t| t.attempt_capture.clone()),
             ),
-            observed_visible_output: false,
+            observed_non_reasoning_output: false,
         }
     }
 
@@ -357,7 +357,7 @@ impl ResponsesStreamAccumulator {
                         self.telemetry
                             .record_generation_event_at(now, GenerationKind::Text);
                         self.telemetry.record_visible_text_at(now);
-                        self.observed_visible_output = true;
+                        self.observed_non_reasoning_output = true;
                         let _ = emit.send(super::TokenChunk::Text(delta.to_string())).await;
                     }
                 }
@@ -369,7 +369,7 @@ impl ResponsesStreamAccumulator {
                     self.telemetry
                         .record_generation_event_at(now, GenerationKind::Text);
                     self.telemetry.record_visible_text_at(now);
-                    self.observed_visible_output = true;
+                    self.observed_non_reasoning_output = true;
                 }
             }
             "response.reasoning.delta"
@@ -390,6 +390,7 @@ impl ResponsesStreamAccumulator {
                 {
                     self.telemetry
                         .record_generation_event_at(now, GenerationKind::Tool);
+                    self.observed_non_reasoning_output = true;
                 }
             }
             "response.output_item.added" => {
@@ -401,6 +402,7 @@ impl ResponsesStreamAccumulator {
                 {
                     self.telemetry
                         .record_generation_event_at(now, GenerationKind::Tool);
+                    self.observed_non_reasoning_output = true;
                 }
             }
             "response.output_item.done" => {
@@ -659,7 +661,7 @@ impl ResponsesStreamAccumulator {
                     }),
                 },
             },
-            self.observed_visible_output,
+            self.observed_non_reasoning_output,
         )?;
         telemetry.attach_success(&mut response);
         Ok(response)
@@ -2146,12 +2148,12 @@ fn validate_responses_terminal_content(
     usage: &ResponsesApiUsage,
     output_items: &[serde_json::Value],
     content_is_empty: bool,
-    observed_visible_output: bool,
+    observed_non_reasoning_output: bool,
 ) -> Result<(), LlmError> {
     if !content_is_empty {
         return Ok(());
     }
-    if observed_visible_output {
+    if observed_non_reasoning_output {
         tracing::error!(
             output_tokens = usage.output_tokens,
             reasoning_tokens = usage
@@ -2160,13 +2162,13 @@ fn validate_responses_terminal_content(
                 .and_then(|details| details.reasoning_tokens),
             output_item_count = output_items.len(),
             status,
-            "responses_api lost observed visible output before terminal assembly"
+            "responses_api lost observed non-reasoning output before terminal assembly"
         );
         return Err(LlmError::server_error(
-            "OpenAI streamed visible output without a completed message item",
+            "OpenAI streamed non-reasoning output without a completed terminal item",
         ));
     }
-    if usage.output_tokens == 0 {
+    if usage.output_tokens == 0 && output_items.is_empty() {
         return Ok(());
     }
 
@@ -2242,7 +2244,7 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
 
 fn normalize_responses_api_response_with_evidence(
     resp: ResponsesApiResponse,
-    observed_visible_output: bool,
+    observed_non_reasoning_output: bool,
 ) -> Result<LlmResponse, LlmError> {
     let output_items: Vec<serde_json::Value> =
         resp.output.iter().map(|item| item.0.clone()).collect();
@@ -2315,7 +2317,7 @@ fn normalize_responses_api_response_with_evidence(
         &resp.usage,
         &output_items,
         content.is_empty(),
-        observed_visible_output,
+        observed_non_reasoning_output,
     )?;
 
     let mut response = LlmResponse::non_streaming(content, end_turn, {
@@ -6898,6 +6900,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_item_without_positive_usage_is_not_an_unbilled_empty_turn() {
+        for item in [
+            serde_json::json!({"type": "reasoning", "id": "", "summary": []}),
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "reasoning-1",
+                "summary": [],
+                "status": "incomplete"
+            }),
+        ] {
+            let err =
+                normalize_responses_api_response(reasoning_only_response(vec![item], 0, None))
+                    .expect_err("a reasoning item requires positive reasoning usage");
+            assert_eq!(err.kind, crate::LlmErrorKind::ServerError);
+            assert!(err.kind.is_auto_retryable());
+        }
+    }
+
+    #[tokio::test]
     async fn reasoning_usage_without_items_or_with_mixed_output_remains_retryable() {
         let empty = normalize_responses_api_response(reasoning_only_response(vec![], 18, Some(16)))
             .expect_err("usage without a reasoning item is not terminal evidence");
@@ -6916,7 +6937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_visible_output_without_completed_message_remains_retryable() {
+    async fn observed_non_reasoning_output_without_completed_message_remains_retryable() {
         let err = normalize_responses_api_response_with_evidence(
             reasoning_only_response(
                 vec![serde_json::json!({
@@ -6935,7 +6956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalized_visible_output_loss_is_retryable_on_websocket_and_sse() {
+    async fn observed_non_reasoning_output_loss_is_retryable_on_websocket_and_sse() {
         let request = empty_request();
         let terminal = serde_json::json!({
             "type": "response.completed",
@@ -6964,6 +6985,14 @@ mod tests {
                 "type": "response.content_part.done",
                 "part": {"type": "output_text", "text": "final content part"}
             }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "delta": "{}"
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "name": "get_weather"}
+            }),
         ];
         let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
 
@@ -6981,9 +7010,9 @@ mod tests {
                 .await
                 .unwrap();
             let websocket_error = finalize_websocket_response(websocket, "gpt-test")
-                .expect_err("finalized visible output cannot disappear on WebSocket");
+                .expect_err("observed non-reasoning output cannot disappear on WebSocket");
             let CodexWsError::Backend(websocket_error) = websocket_error else {
-                panic!("visible-output loss must remain a provider error");
+                panic!("non-reasoning output loss must remain a provider error");
             };
             assert_eq!(websocket_error.kind, crate::LlmErrorKind::ServerError);
             assert!(websocket_error.kind.is_auto_retryable());
@@ -6996,7 +7025,7 @@ mod tests {
                 .await
                 .unwrap();
             let sse_error = finalize_responses_stream(sse, "gpt-test")
-                .expect_err("finalized visible output cannot disappear on SSE");
+                .expect_err("observed non-reasoning output cannot disappear on SSE");
             assert_eq!(sse_error.kind, crate::LlmErrorKind::ServerError);
             assert!(sse_error.kind.is_auto_retryable());
         }
