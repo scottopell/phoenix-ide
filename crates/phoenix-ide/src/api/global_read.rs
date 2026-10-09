@@ -463,6 +463,21 @@ impl GlobalReadService {
                     return PreviousTranscriptsOutput::InvalidTarget;
                 };
                 let target = conv.id.as_str();
+                let targeted_message = if let Some(message_id) = message_id {
+                    match self
+                        .db
+                        .get_message_by_id_in_conversation(target, message_id)
+                        .await
+                    {
+                        Ok(message) if !message_is_hidden(&message) => Some(message),
+                        Ok(_) | Err(DbError::MessageNotFound(_)) => {
+                            return PreviousTranscriptsOutput::InvalidTarget;
+                        }
+                        Err(_) => return PreviousTranscriptsOutput::Unavailable,
+                    }
+                } else {
+                    None
+                };
                 let mut position = match decode_previous_cursor(
                     cursor.as_deref(),
                     binding,
@@ -472,18 +487,7 @@ impl GlobalReadService {
                     Err(error) => return error,
                 };
                 if cursor.is_none() {
-                    if let Some(message_id) = message_id {
-                        let message = match self
-                            .db
-                            .get_message_by_id_in_conversation(target, message_id)
-                            .await
-                        {
-                            Ok(message) => message,
-                            Err(DbError::MessageNotFound(_)) => {
-                                return PreviousTranscriptsOutput::InvalidTarget;
-                            }
-                            Err(_) => return PreviousTranscriptsOutput::Unavailable,
-                        };
+                    if let Some(message) = targeted_message {
                         position.sequence = message.sequence_id;
                         position.message_id = Some(sha256_hex(&message.message_id));
                     }
@@ -494,14 +498,8 @@ impl GlobalReadService {
                     bounded_transcript_ref(target)
                 };
                 position.target = Some(previous_cursor_target(&continuation_target));
-                self.previous_read_page(
-                    binding,
-                    conv,
-                    position,
-                    continuation_target,
-                    message_id.is_some(),
-                )
-                .await
+                self.previous_read_page(binding, conv, position, continuation_target)
+                    .await
             }
         }
     }
@@ -675,7 +673,6 @@ impl GlobalReadService {
         conv: &Conversation,
         position: PreviousCursor,
         continuation_target: String,
-        targeted_message: bool,
     ) -> PreviousTranscriptsOutput {
         let mut position = position;
         let mut message = if position.sequence > 0 {
@@ -701,8 +698,8 @@ impl GlobalReadService {
                 Err(_) => return PreviousTranscriptsOutput::Unavailable,
             }
         };
-        if targeted_message && message.as_ref().is_some_and(message_is_hidden) {
-            return PreviousTranscriptsOutput::InvalidTarget;
+        if position.byte_offset != 0 && message.as_ref().is_some_and(message_is_hidden) {
+            return PreviousTranscriptsOutput::InvalidCursor;
         }
         while message.as_ref().is_some_and(message_is_hidden) {
             let hidden = message.as_ref().expect("checked above");
@@ -2610,6 +2607,151 @@ mod previous_transcripts_tests {
             decode_previous_cursor(Some(&forged), &binding, Some("prev")),
             Err(PreviousTranscriptsOutput::InvalidCursor)
         ));
+    }
+
+    #[tokio::test]
+    async fn targeted_read_continuation_skips_hidden_rows_but_rejects_explicit_hidden_target() {
+        let (db, service, binding) = fixture().await;
+        db.add_message(
+            "prev-target",
+            "prev-root",
+            &MessageContent::User(UserContent::new("targeted predecessor evidence")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "prev-hidden-middle",
+            "prev-root",
+            &MessageContent::User(UserContent::new("implementation marker")),
+            Some(&serde_json::json!({"hidden": true})),
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "prev-visible-final",
+            "prev-root",
+            &MessageContent::User(UserContent::new("visible after marker")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "prev-hidden-final",
+            "prev-root",
+            &MessageContent::User(UserContent::new("final implementation marker")),
+            Some(&serde_json::json!({"hidden": true})),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = "@transcript:prev-root#message-prev-target";
+        let first = service
+            .previous_transcripts(
+                &binding,
+                PreviousTranscriptsRequest::Read {
+                    transcript_ref: target.into(),
+                    cursor: None,
+                },
+            )
+            .await;
+        let PreviousTranscriptsOutput::ReadPage {
+            next_cursor: Some(cursor),
+            ..
+        } = first
+        else {
+            panic!("{first:?}")
+        };
+        let continuation = service
+            .previous_transcripts(
+                &binding,
+                PreviousTranscriptsRequest::Read {
+                    transcript_ref: target.into(),
+                    cursor: Some(cursor),
+                },
+            )
+            .await;
+        let PreviousTranscriptsOutput::ReadPage {
+            provenance,
+            content,
+            next_cursor,
+            ..
+        } = continuation
+        else {
+            panic!("{continuation:?}")
+        };
+        assert_eq!(
+            provenance,
+            Some(PreviousMessageProvenance::MessageRef {
+                message_ref: "@transcript:prev-root#message-prev-visible-final".into()
+            })
+        );
+        assert!(content.contains("visible after marker"));
+        let terminal_cursor = next_cursor.expect("hidden final row remains to be skipped");
+        assert_eq!(
+            service
+                .previous_transcripts(
+                    &binding,
+                    PreviousTranscriptsRequest::Read {
+                        transcript_ref: target.into(),
+                        cursor: Some(terminal_cursor),
+                    },
+                )
+                .await,
+            PreviousTranscriptsOutput::ReadPage {
+                transcript_ref: target.into(),
+                provenance: None,
+                content: String::new(),
+                next_cursor: None,
+            }
+        );
+
+        let malformed_hidden_cursor = encode_previous_cursor(&PreviousCursor {
+            scope: previous_scope(&binding),
+            target: Some(previous_cursor_target(target)),
+            sequence: db
+                .get_message_by_id_in_conversation("prev-root", "prev-hidden-middle")
+                .await
+                .unwrap()
+                .sequence_id,
+            byte_offset: 1,
+            message_id: Some(sha256_hex("prev-hidden-middle")),
+        });
+        assert_eq!(
+            service
+                .previous_transcripts(
+                    &binding,
+                    PreviousTranscriptsRequest::Read {
+                        transcript_ref: target.into(),
+                        cursor: Some(malformed_hidden_cursor),
+                    },
+                )
+                .await,
+            PreviousTranscriptsOutput::InvalidCursor
+        );
+
+        let explicit_hidden_target = "@transcript:prev-root#message-prev-hidden-middle";
+        assert_eq!(
+            service
+                .previous_transcripts(
+                    &binding,
+                    PreviousTranscriptsRequest::Read {
+                        transcript_ref: explicit_hidden_target.into(),
+                        cursor: Some(encode_previous_cursor(&PreviousCursor {
+                            scope: previous_scope(&binding),
+                            target: Some(previous_cursor_target(explicit_hidden_target)),
+                            sequence: 1,
+                            byte_offset: 0,
+                            message_id: Some(sha256_hex("prev-hidden-middle")),
+                        })),
+                    },
+                )
+                .await,
+            PreviousTranscriptsOutput::InvalidTarget
+        );
     }
 
     #[tokio::test]
