@@ -3635,9 +3635,9 @@ fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
         })?;
     let pointer = path_buf_from_git_bytes(pointer);
     let candidate = if pointer.is_absolute() {
-        pointer
+        pointer.clone()
     } else {
-        repository.join(pointer)
+        repository.join(&pointer)
     };
     if let Ok(candidate) = candidate.canonicalize() {
         return Ok(candidate);
@@ -3653,18 +3653,90 @@ fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
                 repository.display()
             )
         })?;
-    let relative = repository
-        .strip_prefix(parent_repository)
-        .map_err(|error| error.to_string())?;
-    let candidate = git_directory_for_worktree(parent_repository)?
-        .join("modules")
-        .join(relative);
-    candidate.canonicalize().map_err(|error| {
-        format!(
-            "cannot resolve moved Git directory {}: {error}",
-            candidate.display()
-        )
-    })
+    let parent_git_dir = git_directory_for_worktree(parent_repository)?;
+    let components = pointer.components().collect::<Vec<_>>();
+    let mut candidates = std::collections::BTreeSet::new();
+    for (index, component) in components.iter().enumerate() {
+        if component.as_os_str() != std::ffi::OsStr::new("modules") {
+            continue;
+        }
+        let mut candidate = parent_git_dir.join("modules");
+        for component in &components[index + 1..] {
+            match component {
+                std::path::Component::Normal(component) => candidate.push(component),
+                _ => {
+                    candidate.clear();
+                    break;
+                }
+            }
+        }
+        if candidate.as_os_str().is_empty() {
+            continue;
+        }
+        if let Ok(candidate) = candidate.canonicalize() {
+            candidates.insert(candidate);
+        }
+    }
+    if candidates.len() != 1 {
+        return Err(format!(
+            "cannot resolve the exact moved Git directory for {} from its pre-move gitdir binding",
+            repository.display()
+        ));
+    }
+    Ok(candidates
+        .pop_first()
+        .expect("exactly one candidate exists"))
+}
+
+fn capture_git_directory_bindings(
+    root: &Path,
+) -> Result<std::collections::BTreeMap<PathBuf, PathBuf>, String> {
+    fn capture(
+        repository: &Path,
+        relative: &Path,
+        deadline: std::time::Instant,
+        bindings: &mut std::collections::BTreeMap<PathBuf, PathBuf>,
+    ) -> Result<(), String> {
+        bindings.insert(
+            relative.to_path_buf(),
+            git_directory_for_worktree(repository)?,
+        );
+        let (_, gitlinks) = index_gitlinks(repository, deadline)?;
+        for gitlink in gitlinks {
+            let path = path_buf_from_git_bytes(gitlink.path.as_bytes());
+            let submodule = repository.join(&path);
+            if !submodule.join(".git").exists() {
+                continue;
+            }
+            capture(&submodule, &relative.join(path), deadline, bindings)?;
+        }
+        Ok(())
+    }
+
+    let mut bindings = std::collections::BTreeMap::new();
+    capture(
+        root,
+        Path::new(""),
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        &mut bindings,
+    )?;
+    Ok(bindings)
+}
+
+fn verify_git_directory_bindings(
+    root: &Path,
+    expected: &std::collections::BTreeMap<PathBuf, PathBuf>,
+) -> Result<(), String> {
+    for (relative, expected_git_dir) in expected {
+        let observed = git_directory_for_worktree(&root.join(relative))?;
+        if &observed != expected_git_dir {
+            return Err(format!(
+                "Git administrative binding changed for {}",
+                relative.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn bind_git_command_to_worktree(
@@ -6002,7 +6074,13 @@ where
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
-        let verify_confirmed_snapshot = |candidate: &Path| -> Result<(), String> {
+        let verify_confirmed_snapshot = |
+            candidate: &Path,
+            git_bindings: Option<&std::collections::BTreeMap<PathBuf, PathBuf>>,
+        | -> Result<(), String> {
+            if let Some(git_bindings) = git_bindings {
+                verify_git_directory_bindings(candidate, git_bindings)?;
+            }
             let (fresh, _) = verification_runtime
                 .block_on(inspect_worktree_at(&inspection_identity, candidate.to_path_buf()))?;
             if fresh.fingerprint() != confirmed_fingerprint {
@@ -6013,9 +6091,10 @@ where
             }
             ensure_no_ignored_content(candidate)
         };
-        if let Err(detail) = verify_confirmed_snapshot(inspection_path) {
+        if let Err(detail) = verify_confirmed_snapshot(inspection_path, None) {
             return Ok(ExactWorktreeRemoval::ReinspectionRequired { detail });
         }
+        let verified_git_bindings = capture_git_directory_bindings(inspection_path)?;
         if !resuming_quarantine {
             if quarantine
                 .try_exists()
@@ -6065,7 +6144,9 @@ where
                 ),
             });
         }
-        if let Err(detail) = verify_confirmed_snapshot(&quarantine) {
+        if let Err(detail) =
+            verify_confirmed_snapshot(&quarantine, Some(&verified_git_bindings))
+        {
             return Ok(ExactWorktreeRemoval::ReinspectionRequired { detail });
         }
         let administrative_dir = exact_worktree_administrative_dir(&quarantine, &common)?;
@@ -6091,7 +6172,7 @@ where
             },
             |_| {},
             bind_tombstone,
-            |_, object| verify_confirmed_snapshot(object),
+            |_, object| verify_confirmed_snapshot(object, Some(&verified_git_bindings)),
             "quarantined worktree",
         )?;
         remove_exact_worktree_administrative_dir(
@@ -8569,13 +8650,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn initialized_submodule_ignored_content_preserves_linked_worktree() {
+    fn named_nested_submodule_preserves_ignored_content_then_deletes_cleanly() {
         let temp = tempfile::tempdir().unwrap();
         let subrepo = temp.path().join("subrepo");
         initialize_repository(&subrepo);
         std::fs::write(subrepo.join(".gitignore"), "build/\n").unwrap();
         run_git(&subrepo, &["add", ".gitignore"]);
         run_git(&subrepo, &["commit", "--quiet", "-m", "ignore build"]);
+        let grandrepo = temp.path().join("grandrepo");
+        initialize_repository(&grandrepo);
+        run_git(
+            &subrepo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                "--name",
+                "logical-grandchild",
+                grandrepo.to_str().unwrap(),
+                "vendor/grandchild",
+            ],
+        );
+        run_git(
+            &subrepo,
+            &["commit", "--quiet", "-am", "add nested submodule"],
+        );
         let repository = temp.path().join("repository");
         initialize_repository(&repository);
         run_git(
@@ -8586,8 +8687,10 @@ mod tests {
                 "submodule",
                 "add",
                 "-q",
+                "--name",
+                "logical-child",
                 subrepo.to_str().unwrap(),
-                "nested",
+                "deps/child",
             ],
         );
         run_git(&repository, &["commit", "--quiet", "-am", "add submodule"]);
@@ -8611,20 +8714,21 @@ mod tests {
                 "submodule",
                 "update",
                 "--init",
+                "--recursive",
                 "--quiet",
             ],
         );
         let identity = inspection_identity(&target);
         let confirmed = test_worktree_snapshot(&identity, &target);
-        std::fs::create_dir(target.join("nested/build")).unwrap();
-        std::fs::write(target.join("nested/build/unique"), "preserve").unwrap();
+        std::fs::create_dir(target.join("deps/child/build")).unwrap();
+        std::fs::write(target.join("deps/child/build/unique"), "preserve").unwrap();
         assert!(super::ensure_no_ignored_content(&target)
             .unwrap_err()
             .contains("ignored content"));
         let fresh = test_worktree_snapshot(&identity, &target);
         assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
-        assert!(target.join("nested/build/unique").exists());
-        std::fs::remove_dir_all(target.join("nested/build")).unwrap();
+        assert!(target.join("deps/child/build/unique").exists());
+        std::fs::remove_dir_all(target.join("deps/child/build")).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
