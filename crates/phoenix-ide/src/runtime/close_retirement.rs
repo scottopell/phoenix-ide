@@ -3662,12 +3662,11 @@ fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
         }
         let mut candidate = parent_git_dir.join("modules");
         for component in &components[index + 1..] {
-            match component {
-                std::path::Component::Normal(component) => candidate.push(component),
-                _ => {
-                    candidate.clear();
-                    break;
-                }
+            if let std::path::Component::Normal(component) = component {
+                candidate.push(component);
+            } else {
+                candidate.clear();
+                break;
             }
         }
         if candidate.as_os_str().is_empty() {
@@ -5998,6 +5997,7 @@ where
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn quarantine_and_remove_exact_worktree_with_stop<F, B, S>(
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
