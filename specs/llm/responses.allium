@@ -89,11 +89,11 @@ enum ResponsesOutputKind { message | function_call | reasoning | other }
 -- branches on. `cached_tokens` is OpenAI's input_tokens_details.
 -- cached_tokens — a subset already counted inside raw_input_tokens.
 --
--- `has_output_content` is true iff at least one content block resulted
--- (non-empty message text — an output_text or a refusal part — or a
--- function_call). It is false when every output item was discarded
--- (private-only items) or empty — the condition the billed-but-empty guard
--- pairs with raw_output_tokens.
+-- `has_output_items` records whether the terminal carried any item, including
+-- private reasoning. `has_output_content` is true iff at least one content
+-- block resulted (non-empty message text — an output_text or a refusal part —
+-- or a function_call). It is false when every output item was private-only or
+-- empty; the terminal guard pairs it with item presence and raw_output_tokens.
 value ResponsesRawResponse {
     status: String
     raw_input_tokens: Integer
@@ -101,7 +101,9 @@ value ResponsesRawResponse {
     cached_tokens: Integer
     cache_write_tokens: Integer
     has_function_call: Boolean
+    has_output_items: Boolean
     has_output_content: Boolean
+    has_proven_reasoning_only_terminal: Boolean
 }
 
 value ResponsesFunctionResult {
@@ -154,6 +156,7 @@ entity ResponsesStream {
     cached_tokens: Integer
     cache_write_tokens: Integer
     recovered_from_completed: Boolean
+    observed_non_reasoning_output: Boolean
 
     output_items: ResponsesOutputItem with stream = this
 
@@ -607,12 +610,17 @@ rule ResponsesServerBlockDropped {
 -- Rules — response normalization
 ------------------------------------------------------------
 
--- Normalize a Responses API response. Two outcomes:
---   1. Billed-but-empty — no content block resulted yet OpenAI reported
---      output tokens. The assembled message was lost (a gateway
---      dropping the output array). Yields a RETRYABLE server_error
---      rather than a silently-empty agent turn the user was billed for.
---   2. Otherwise a normalized llm/LlmResponse. Output items map:
+-- Normalize a Responses API response. Three outcomes:
+--   1. Ambiguous empty normalization — no content block resulted, the terminal
+--      reported output items or positive output usage, and the terminal shape
+--      does not prove completed reasoning-only output. Yields a RETRYABLE
+--      server_error rather than a silently-empty agent turn.
+--   2. Proven reasoning-only — every terminal item is a structurally valid,
+--      non-incomplete reasoning item, usage reports a positive reasoning-token
+--      subset of billed output, and no non-empty visible content or function
+--      call was observed in stream events. Yields a valid quiet end turn
+--      without synthetic public text.
+--   3. Otherwise a normalized llm/LlmResponse. Output items map:
 --      message -> text content (both output_text and refusal parts),
 --      function_call -> tool_use, reasoning -> private continuation, other ->
 --      ignored. end_turn holds iff the status is "completed" AND no
@@ -629,10 +637,10 @@ rule ResponsesResponseNormalized {
     let end_turn = raw.status = "completed" and not raw.has_function_call
 
     ensures:
-        if not raw.has_output_content and raw.raw_output_tokens > 0:
+        if not raw.has_output_content and (raw.has_output_items or raw.raw_output_tokens > 0) and not raw.has_proven_reasoning_only_terminal:
             llm/LlmError.created(
                 kind: server_error,
-                message: "OpenAI returned empty response with output tokens billed",
+                message: "OpenAI returned empty response without valid terminal evidence",
                 recovery_in_progress: false,
                 has_quota: false
             )
@@ -653,10 +661,15 @@ rule ResponsesResponseNormalized {
         -- into_response. The billed-but-empty branch complements the
         -- ResponsesStreamCompleted recovery fallback: the fallback
         -- salvages a message that arrived only in /response/output,
-        -- this branch catches the case where even that is empty though
-        -- tokens were billed. An empty response with output_tokens = 0
-        -- is a genuinely-empty valid turn and takes the LlmResponse
-        -- branch. GPT-5.6-era Responses usage reports cache writes in
+        -- this branch catches the case where even that normalizes empty despite
+        -- output items or positive usage. A completed terminal containing only
+        -- reasoning items takes the LlmResponse branch only when usage reports
+        -- a positive reasoning-token subset of raw_output_tokens and no
+        -- non-empty visible content or function call was observed in stream
+        -- events; Phoenix does not infer quiet completion from missing usage
+        -- detail or a loose type tag. An empty output array with output_tokens = 0
+        -- is a genuinely-empty valid turn and also takes the LlmResponse branch.
+        -- GPT-5.6-era Responses usage reports cache writes in
         -- input_tokens_details.cache_write_tokens; older responses default it
         -- to zero. saturating_sub floors at 0; OpenAI guarantees the combined
         -- cache detail subsets do not exceed raw_input_tokens
@@ -683,7 +696,21 @@ rule ResponsesStreamOpened {
         output_tokens: 0,
         cached_tokens: 0,
         cache_write_tokens: 0,
-        recovered_from_completed: false
+        recovered_from_completed: false,
+        observed_non_reasoning_output: false
+    )
+}
+
+rule ResponsesStreamEndedBeforeTerminal {
+    when: ResponsesByteStreamEnded(stream)
+
+    requires: stream.status = accumulating
+
+    ensures: llm/LlmError.created(
+        kind: network,
+        message: "Responses stream ended before a terminal event",
+        recovery_in_progress: false,
+        has_quota: false
     )
 }
 
@@ -696,6 +723,28 @@ rule ResponsesTextDeltaForwarded {
     requires: fragment != ""
 
     ensures: ResponsesTextChunkForwarded(text: fragment)
+}
+
+-- A non-empty finalized output_text, refusal, or content_part event proves
+-- that public output existed even when its deltas and terminal message item
+-- are absent. Normalization must not classify that loss as a quiet turn.
+rule ResponsesFinalizedVisibleOutputObserved {
+    when: ResponsesFinalizedVisibleOutput(stream, content)
+
+    requires: stream.status = accumulating
+    requires: content != ""
+
+    ensures: stream.observed_non_reasoning_output = true
+}
+
+-- A named function-call item or non-empty incremental or finalized argument
+-- event proves that tool output existed even if terminal assembly loses the item.
+rule ResponsesFunctionCallOutputObserved {
+    when: ResponsesFunctionCallOutput(stream)
+
+    requires: stream.status = accumulating
+
+    ensures: stream.observed_non_reasoning_output = true
 }
 
 -- A response.output_item.done event. The completed output item is
@@ -1019,8 +1068,11 @@ invariant ResponsesCacheDetailsSubsetOfInput {
 ------------------------------------------------------------
 -- Billed-but-empty normalization is modelled directly in
 -- ResponsesResponseNormalized: a completed response with no content block but
--- raw_output_tokens > 0 yields a retryable server_error, while a genuinely
--- empty turn with output_tokens = 0 remains a valid empty llm/LlmResponse.
+-- raw_output_tokens > 0 yields a retryable server_error unless the authenticated
+-- terminal output consists only of structurally valid reasoning items, usage
+-- reports a positive reasoning-token subset of raw_output_tokens, and no visible
+-- output was observed. That proven case and a genuinely empty zero-token turn
+-- are valid quiet llm/LlmResponse values.
 --
 -- Responses reasoning output is not public transcript content. Required
 -- replay is governed by ResponsesToolContinuation independently of visible
@@ -1031,9 +1083,8 @@ invariant ResponsesCacheDetailsSubsetOfInput {
 -- ResponsesSseErrorClassified or the non-streaming HTTP classifier.
 --
 -- If the byte stream ends before a response.completed event, the accumulator
--- assembles whatever it already collected. This produces no distinct
--- observable state beyond the normalized response, so it is left as a scope
--- note rather than a separate rule.
+-- yields a retryable network error. Partial output never fabricates completed
+-- status.
 
 surface ResponsesToolContinuationBoundary {
     facing: PhoenixRuntime
