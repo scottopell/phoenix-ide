@@ -42,7 +42,7 @@ class WaitMigrationTest(unittest.TestCase):
             db.execute("INSERT INTO receipts VALUES('receipt','old')")
             db.commit()
             db.execute("BEGIN")
-            apply(db, migration("118"))
+            apply(db, migration("119"))
             db.commit()
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(db.execute("SELECT event_id FROM receipts").fetchall(), [('old',)])

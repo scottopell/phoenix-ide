@@ -601,23 +601,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_conversation_tool_policy",
         sql: MIGRATION_117,
     },
-<<<<<<< HEAD
     Migration {
         version: 118,
         name: "persist_mcp_token_removals",
         sql: "CREATE TABLE mcp_oauth_removals (server_name TEXT PRIMARY KEY NOT NULL);",
     },
-||||||| parent of ed9e2331d (feat: preserve constrained question wait events and future-only enrollment)
-=======
     Migration {
-        version: 118,
+        version: 119,
         name: "coordinator_question_wait_events",
-        sql: MIGRATION_118,
+        sql: MIGRATION_119,
     },
->>>>>>> ed9e2331d (feat: preserve constrained question wait events and future-only enrollment)
 ];
 
-const MIGRATION_118: &str = r"
+const MIGRATION_119: &str = r"
 PRAGMA defer_foreign_keys = ON;
 CREATE TEMP TABLE coordinator_watch_events_waits AS SELECT * FROM coordinator_watch_events;
 DROP TABLE coordinator_watch_events;
