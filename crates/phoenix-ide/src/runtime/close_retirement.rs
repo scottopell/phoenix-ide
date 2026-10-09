@@ -1536,6 +1536,7 @@ impl RuntimeManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn retry_close_tmux(
         &self,
         run: &CloseRunRef,
@@ -2786,6 +2787,7 @@ impl RuntimeManager {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn terminalize_known_close_retry_failure<T>(
         &self,
         run: &CloseRunRef,

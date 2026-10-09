@@ -5002,6 +5002,9 @@ impl Database {
     }
 
     /// Returns whether a prior retry run durably established this exact resource success.
+    ///
+    /// # Errors
+    /// Returns a database error when the durable success query fails.
     pub async fn close_resource_has_retry_success(
         &self,
         attempt_id: &CloseAttemptId,
@@ -11057,6 +11060,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn close_runs_safe_retry_requires_complete_run_bound_success_to_archive() {
         for certainty in [
@@ -11149,11 +11153,8 @@ mod tests {
                 db.get_close_run(&request.failed_run).await.unwrap().status,
                 CloseRunStatus::Stopped
             );
-            assert_eq!(db.get_conversation("latest").await.unwrap().archived, true);
-            assert_eq!(
-                db.get_conversation("participant").await.unwrap().archived,
-                true
-            );
+            assert!(db.get_conversation("latest").await.unwrap().archived);
+            assert!(db.get_conversation("participant").await.unwrap().archived);
             assert!(db.complete_close_safe_retry(&run).await.is_err());
             assert!(db.admit_close_safe_retry(&request).await.is_err());
             assert_eq!(
@@ -11352,6 +11353,7 @@ mod tests {
         assert!(db.close_safe_retry_progress(&run).await.is_err());
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn retry_interruption_after_all_successes_stops_until_explicit_completion_only_run() {
         for certainty in [
@@ -11421,7 +11423,7 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap(),
-                request.remaining_effects.len() as i64
+                i64::try_from(request.remaining_effects.len()).unwrap()
             );
             assert!(db
                 .close_retry_verified_completion_eligible(&run)
@@ -11795,6 +11797,7 @@ mod tests {
         assert!(shape);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn close_scope_free_failure_check_rejects_partial_resource_shapes() {
         let db = Database::open_in_memory().await.unwrap();

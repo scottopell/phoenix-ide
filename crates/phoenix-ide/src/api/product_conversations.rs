@@ -1360,6 +1360,7 @@ mod tests {
         assert_eq!(wire["remaining_resources"], serde_json::json!([]));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn snapshot_projects_preinventory_process_and_captured_failures_read_only() {
         use crate::db::{
