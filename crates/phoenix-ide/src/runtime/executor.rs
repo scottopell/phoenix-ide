@@ -18820,6 +18820,54 @@ mod steer_drain_detector_tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn bash_wait_restart_uses_persisted_absolute_expiry() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "bash-wait-restart",
+            bash_wait_executing_state("wait-restart", "b-restart", Some(600)),
+            vec![],
+        );
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(700);
+        let remaining = rt.bash_wait_transition_remaining(&rt.state).unwrap();
+        assert_eq!(remaining, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sequential_bash_waits_rearm_even_when_provider_reuses_tool_id() {
+        let first = bash_wait_executing_state("reused-id", "b-first", Some(600));
+        let second = bash_wait_executing_state("reused-id", "b-second", Some(600));
+        let (mut rt, _storage) =
+            build_runtime_with_state_and_queue("bash-wait-reused", first.clone(), vec![]);
+        rt.deadline = None;
+        rt.state = second;
+        rt.state_updated_at = Utc::now();
+        rt.manage_deadline(&first);
+        let remaining = rt.deadline.unwrap() - tokio::time::Instant::now();
+        assert!(remaining <= Duration::from_secs(605));
+        assert!(remaining > Duration::from_secs(604));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_bash_wait_transition_fails_stop_before_retrying_persistence() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-transition-bound",
+            bash_wait_executing_state("wait-bound", "b-bound", Some(0)),
+            vec![],
+        );
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(6);
+        let result = rt
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                ToolResult::success("wait-bound".to_string(), "late result".to_string()),
+            )))
+            .await;
+        assert!(result
+            .unwrap_err()
+            .contains("absolute settlement deadline; runtime fail-stop required"));
+        assert!(storage
+            .get_all_messages("bash-wait-transition-bound")
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn subagent_pre_state_persist_failure_restores_terminal_transition() {
         let (mut rt, storage) = build_runtime_with_state_and_queue(

@@ -1665,7 +1665,8 @@ mod tests {
         assert!(!output.is_success());
         assert!(output
             .output()
-            .contains("active persisted WorkScope with a live owner not found"));
+            .contains("Active persisted WorkScope with a live owner not found"));
+        assert!(output.output().contains("missing-scope"));
         assert!(registry.snapshot_live_pgids().await.is_empty());
     }
 }
