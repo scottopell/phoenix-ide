@@ -89,11 +89,11 @@ enum ResponsesOutputKind { message | function_call | reasoning | other }
 -- branches on. `cached_tokens` is OpenAI's input_tokens_details.
 -- cached_tokens — a subset already counted inside raw_input_tokens.
 --
--- `has_output_content` is true iff at least one content block resulted
--- (non-empty message text — an output_text or a refusal part — or a
--- function_call). It is false when every output item was discarded
--- (private-only items) or empty — the condition the billed-but-empty guard
--- pairs with raw_output_tokens.
+-- `has_output_items` records whether the terminal carried any item, including
+-- private reasoning. `has_output_content` is true iff at least one content
+-- block resulted (non-empty message text — an output_text or a refusal part —
+-- or a function_call). It is false when every output item was private-only or
+-- empty; the terminal guard pairs it with item presence and raw_output_tokens.
 value ResponsesRawResponse {
     status: String
     raw_input_tokens: Integer
@@ -101,6 +101,7 @@ value ResponsesRawResponse {
     cached_tokens: Integer
     cache_write_tokens: Integer
     has_function_call: Boolean
+    has_output_items: Boolean
     has_output_content: Boolean
     has_proven_reasoning_only_terminal: Boolean
 }
@@ -610,9 +611,9 @@ rule ResponsesServerBlockDropped {
 ------------------------------------------------------------
 
 -- Normalize a Responses API response. Three outcomes:
---   1. Ambiguous billed-but-empty — no content block resulted, OpenAI
---      reported output tokens, and the terminal shape does not prove every
---      output token belonged to completed reasoning items. Yields a RETRYABLE
+--   1. Ambiguous empty normalization — no content block resulted, the terminal
+--      reported output items or positive output usage, and the terminal shape
+--      does not prove completed reasoning-only output. Yields a RETRYABLE
 --      server_error rather than a silently-empty agent turn.
 --   2. Proven reasoning-only — every terminal item is a structurally valid,
 --      non-incomplete reasoning item, usage reports a positive reasoning-token
@@ -636,10 +637,10 @@ rule ResponsesResponseNormalized {
     let end_turn = raw.status = "completed" and not raw.has_function_call
 
     ensures:
-        if not raw.has_output_content and raw.raw_output_tokens > 0 and not raw.has_proven_reasoning_only_terminal:
+        if not raw.has_output_content and (raw.has_output_items or raw.raw_output_tokens > 0) and not raw.has_proven_reasoning_only_terminal:
             llm/LlmError.created(
                 kind: server_error,
-                message: "OpenAI returned empty response with output tokens billed",
+                message: "OpenAI returned empty response without valid terminal evidence",
                 recovery_in_progress: false,
                 has_quota: false
             )
@@ -660,12 +661,12 @@ rule ResponsesResponseNormalized {
         -- into_response. The billed-but-empty branch complements the
         -- ResponsesStreamCompleted recovery fallback: the fallback
         -- salvages a message that arrived only in /response/output,
-        -- this branch catches the case where even that is empty though
-        -- tokens were billed. A completed terminal containing only reasoning
-        -- items takes the LlmResponse branch only when usage reports a positive
-        -- reasoning-token subset of raw_output_tokens and no non-empty visible
-        -- content or function call was observed in stream events; Phoenix does
-        -- not infer quiet completion from missing usage
+        -- this branch catches the case where even that normalizes empty despite
+        -- output items or positive usage. A completed terminal containing only
+        -- reasoning items takes the LlmResponse branch only when usage reports
+        -- a positive reasoning-token subset of raw_output_tokens and no
+        -- non-empty visible content or function call was observed in stream
+        -- events; Phoenix does not infer quiet completion from missing usage
         -- detail or a loose type tag. An empty output array with output_tokens = 0
         -- is a genuinely-empty valid turn and also takes the LlmResponse branch.
         -- GPT-5.6-era Responses usage reports cache writes in

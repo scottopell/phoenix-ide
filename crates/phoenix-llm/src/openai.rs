@@ -281,24 +281,37 @@ struct ResponsesStreamAccumulator {
     observed_non_reasoning_output: bool,
 }
 
-fn has_finalized_visible_output(event_type: &str, event: &serde_json::Value) -> bool {
-    let nonempty = |value: Option<&serde_json::Value>| {
-        value
+fn has_visible_content_part(part: &serde_json::Value) -> bool {
+    let nonempty = |field| {
+        part.get(field)
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| !text.is_empty())
     };
 
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some("output_text") => nonempty("text"),
+        Some("refusal") => nonempty("refusal"),
+        _ => false,
+    }
+}
+
+fn has_streamed_visible_output(event_type: &str, event: &serde_json::Value) -> bool {
     match event_type {
-        "response.output_text.done" => nonempty(event.get("text")),
-        "response.refusal.done" => nonempty(event.get("refusal")),
-        "response.content_part.done" => match event
-            .pointer("/part/type")
+        "response.output_text.done" => event
+            .get("text")
             .and_then(serde_json::Value::as_str)
-        {
-            Some("output_text") => nonempty(event.pointer("/part/text")),
-            Some("refusal") => nonempty(event.pointer("/part/refusal")),
-            _ => false,
-        },
+            .is_some_and(|text| !text.is_empty()),
+        "response.refusal.done" => event
+            .get("refusal")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|refusal| !refusal.is_empty()),
+        "response.content_part.added" | "response.content_part.done" => {
+            event.get("part").is_some_and(has_visible_content_part)
+        }
+        "response.output_item.added" => event
+            .pointer("/item/content")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|content| content.iter().any(has_visible_content_part)),
         _ => false,
     }
 }
@@ -364,8 +377,9 @@ impl ResponsesStreamAccumulator {
             }
             "response.output_text.done"
             | "response.refusal.done"
+            | "response.content_part.added"
             | "response.content_part.done" => {
-                if has_finalized_visible_output(dispatch_type, &v) {
+                if has_streamed_visible_output(dispatch_type, &v) {
                     self.telemetry
                         .record_generation_event_at(now, GenerationKind::Text);
                     self.telemetry.record_visible_text_at(now);
@@ -384,7 +398,7 @@ impl ResponsesStreamAccumulator {
                 }
             }
             "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
-                let field = if dispatch_type.ends_with(".done") {
+                let field = if dispatch_type == "response.function_call_arguments.done" {
                     "arguments"
                 } else {
                     "delta"
@@ -399,16 +413,21 @@ impl ResponsesStreamAccumulator {
                 }
             }
             "response.output_item.added" => {
-                if v.pointer("/item/type").and_then(serde_json::Value::as_str)
+                let observed_tool = v.pointer("/item/type").and_then(serde_json::Value::as_str)
                     == Some("function_call")
                     && v.pointer("/item/name")
                         .and_then(serde_json::Value::as_str)
-                        .is_some_and(|name| !name.is_empty())
-                {
+                        .is_some_and(|name| !name.is_empty());
+                let observed_text = has_streamed_visible_output(dispatch_type, &v);
+                if observed_tool {
                     self.telemetry
                         .record_generation_event_at(now, GenerationKind::Tool);
-                    self.observed_non_reasoning_output = true;
+                } else if observed_text {
+                    self.telemetry
+                        .record_generation_event_at(now, GenerationKind::Text);
+                    self.telemetry.record_visible_text_at(now);
                 }
+                self.observed_non_reasoning_output |= observed_tool || observed_text;
             }
             "response.output_item.done" => {
                 if let Some(item) = v.get("item") {
@@ -6829,30 +6848,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_item_without_complete_reasoning_usage_remains_retryable_error() {
-        let err = normalize_responses_api_response(ResponsesApiResponse {
-            id: "resp-ambiguous-reasoning".to_string(),
-            model: "gpt-test".to_string(),
-            status: "completed".to_string(),
-            output: vec![ResponsesApiOutput(serde_json::json!({
-                "type": "reasoning",
-                "id": "reasoning-1",
-                "summary": []
-            }))],
-            usage: ResponsesApiUsage {
-                input_tokens: 1000,
-                output_tokens: 18,
-                input_tokens_details: ResponsesApiInputTokensDetails {
-                    cached_tokens: 0,
-                    cache_write_tokens: 0,
-                },
-                output_tokens_details: None,
-            },
-        })
-        .expect_err("ambiguous billed output must not be inferred to be a quiet turn");
+    async fn invalid_reasoning_usage_boundaries_remain_retryable_errors() {
+        let item = serde_json::json!({
+            "type": "reasoning",
+            "id": "reasoning-1",
+            "summary": []
+        });
+        for reasoning_tokens in [None, Some(0), Some(19)] {
+            let err = normalize_responses_api_response(reasoning_only_response(
+                vec![item.clone()],
+                18,
+                reasoning_tokens,
+            ))
+            .expect_err("reasoning usage must be a positive subset of output usage");
 
-        assert_eq!(err.kind, crate::LlmErrorKind::ServerError);
-        assert!(err.kind.is_auto_retryable());
+            assert_eq!(err.kind, crate::LlmErrorKind::ServerError);
+            assert!(err.kind.is_auto_retryable());
+        }
     }
 
     fn reasoning_only_response(
@@ -6989,6 +7001,17 @@ mod tests {
             serde_json::json!({
                 "type": "response.content_part.done",
                 "part": {"type": "output_text", "text": "final content part"}
+            }),
+            serde_json::json!({
+                "type": "response.content_part.added",
+                "part": {"type": "refusal", "refusal": "added refusal part"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "added message text"}]
+                }
             }),
             serde_json::json!({
                 "type": "response.function_call_arguments.delta",
