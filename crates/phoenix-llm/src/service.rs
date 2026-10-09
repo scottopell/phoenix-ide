@@ -1019,8 +1019,6 @@ mod tests {
             routing::post,
             Json, Router,
         };
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<(serde_json::Value, Option<String>)>();
         async fn capture(
             State(tx): State<
                 tokio::sync::mpsc::UnboundedSender<(serde_json::Value, Option<String>)>,
@@ -1037,6 +1035,8 @@ mod tests {
             .unwrap();
             (StatusCode::BAD_REQUEST, "{}")
         }
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(serde_json::Value, Option<String>)>();
         let app = Router::new()
             .route("/messages", post(capture))
             .route("/responses", post(capture))
