@@ -40,6 +40,7 @@ impl WatchOutcome {
         }
     }
 
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
@@ -49,6 +50,7 @@ impl WatchOutcome {
         }
     }
 
+    #[must_use]
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Failed { reason } => Some(reason),
