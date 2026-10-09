@@ -67,6 +67,8 @@ pub enum LlmOutcome {
         message: String,
         detected_at: chrono::DateTime<chrono::Utc>,
         guidance: Option<OverloadRetryGuidance>,
+        logical_request_id: String,
+        model_id: String,
     },
     /// Network/connection error — retryable
     NetworkError { message: String },

@@ -1719,12 +1719,14 @@ fn finish_sub_agent_overload_error(mut result: TransitionResult) -> TransitionRe
     result
 }
 
-fn overload_retry_delay(attempt: u32, identity: &str) -> Duration {
+fn overload_retry_delay(attempt: u32, logical_request_id: &str) -> Duration {
     let base_ms = 4_000_u64 << (attempt - 2);
-    let hash = identity.bytes().fold(u64::from(attempt), |acc, byte| {
-        acc.wrapping_mul(1_099_511_628_211)
-            .wrapping_add(u64::from(byte))
-    });
+    let hash = logical_request_id
+        .bytes()
+        .fold(u64::from(attempt), |acc, byte| {
+            acc.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(u64::from(byte))
+        });
     Duration::from_millis(base_ms * (75 + hash % 51) / 100)
 }
 
@@ -1779,7 +1781,8 @@ fn schedule_server_overload(
     deadline_at: chrono::DateTime<chrono::Utc>,
     detected_at: chrono::DateTime<chrono::Utc>,
     guidance: Option<OverloadRetryGuidance>,
-    identity: &str,
+    logical_request_id: String,
+    model_id: String,
     message: String,
 ) -> Result<CoreTransitionResult, TransitionError> {
     let terminal_retry = ServerOverloadRetry {
@@ -1788,6 +1791,8 @@ fn schedule_server_overload(
         attempt: attempt.saturating_sub(1),
         started_at,
         deadline_at,
+        logical_request_id: logical_request_id.clone(),
+        model_id: model_id.clone(),
     };
     if let Some(OverloadRetryGuidance::ExceedsLimit(duration)) = guidance {
         return overload_terminal(
@@ -1805,7 +1810,7 @@ fn schedule_server_overload(
             None,
         );
     }
-    let delay = overload_retry_delay(attempt, identity).max(
+    let delay = overload_retry_delay(attempt, &logical_request_id).max(
         guidance
             .map(OverloadRetryGuidance::duration)
             .unwrap_or_default(),
@@ -1818,6 +1823,8 @@ fn schedule_server_overload(
         attempt,
         started_at,
         deadline_at,
+        logical_request_id,
+        model_id,
     };
     if retry_at >= deadline_at {
         let mut last_dispatched = retry;
@@ -1846,7 +1853,7 @@ fn schedule_server_overload(
 
 fn continue_overload_after_mixed_transient(
     retry: &ServerOverloadRetry,
-    context: &ConvContext,
+    _context: &ConvContext,
     message: &str,
     observed_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<TransitionResult, TransitionError> {
@@ -1860,11 +1867,7 @@ fn continue_overload_after_mixed_transient(
         )
         .map(CoreTransitionResult::into_conv_result);
     }
-    let identity = match &retry.target {
-        ServerOverloadTarget::Ordinary => &context.conversation_id,
-        ServerOverloadTarget::Continuation { operation_id, .. } => operation_id,
-    };
-    let delay = overload_retry_delay(next_attempt, identity);
+    let delay = overload_retry_delay(next_attempt, &retry.logical_request_id);
     let retry_at =
         observed_at + chrono::Duration::from_std(delay).expect("overload delay fits chrono");
     if retry_at >= retry.deadline_at {
@@ -1897,7 +1900,7 @@ fn continue_overload_after_mixed_transient(
 #[allow(clippy::too_many_lines)]
 fn handle_server_overload_retry(
     state: &CoreState,
-    context: &ConvContext,
+    _context: &ConvContext,
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
     match (state, event) {
@@ -1907,6 +1910,8 @@ fn handle_server_overload_retry(
                 message,
                 detected_at,
                 guidance,
+                logical_request_id,
+                model_id,
             },
         ) => {
             let deadline_at = detected_at + chrono::Duration::seconds(120);
@@ -1917,7 +1922,8 @@ fn handle_server_overload_retry(
                 deadline_at,
                 detected_at,
                 guidance,
-                &context.conversation_id,
+                logical_request_id,
+                model_id,
                 message,
             )
         }
@@ -1928,6 +1934,8 @@ fn handle_server_overload_retry(
                 message,
                 detected_at,
                 guidance,
+                logical_request_id,
+                model_id,
             },
         ) if request.operation_id == operation_id => {
             let deadline_at = detected_at + chrono::Duration::seconds(120);
@@ -1941,7 +1949,8 @@ fn handle_server_overload_retry(
                 deadline_at,
                 detected_at,
                 guidance,
-                &request.operation_id,
+                logical_request_id,
+                model_id,
                 message,
             )
         }
@@ -2015,23 +2024,19 @@ fn handle_server_overload_retry(
                 message,
                 detected_at,
                 guidance,
+                ..
             },
-        ) if matches!(retry.phase, ServerOverloadPhase::InFlight) => {
-            let identity = match &retry.target {
-                ServerOverloadTarget::Ordinary => &context.conversation_id,
-                ServerOverloadTarget::Continuation { operation_id, .. } => operation_id,
-            };
-            schedule_server_overload(
-                retry.target.clone(),
-                retry.attempt + 1,
-                retry.started_at,
-                retry.deadline_at,
-                detected_at,
-                guidance,
-                identity,
-                message,
-            )
-        }
+        ) if matches!(retry.phase, ServerOverloadPhase::InFlight) => schedule_server_overload(
+            retry.target.clone(),
+            retry.attempt + 1,
+            retry.started_at,
+            retry.deadline_at,
+            detected_at,
+            guidance,
+            retry.logical_request_id.clone(),
+            retry.model_id.clone(),
+            message,
+        ),
         (
             CoreState::ServerOverloadRetrying { retry },
             CoreEvent::ContinuationServerOverloaded {
@@ -2039,6 +2044,7 @@ fn handle_server_overload_retry(
                 message,
                 detected_at,
                 guidance,
+                ..
             },
         ) if matches!(retry.phase, ServerOverloadPhase::InFlight)
             && matches!(
@@ -2053,7 +2059,8 @@ fn handle_server_overload_retry(
                 retry.deadline_at,
                 detected_at,
                 guidance,
-                &operation_id,
+                retry.logical_request_id.clone(),
+                retry.model_id.clone(),
                 message,
             )
         }
@@ -4108,10 +4115,14 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
             message,
             detected_at,
             guidance,
+            logical_request_id,
+            model_id,
         } => Event::ServerOverloaded {
             message,
             detected_at,
             guidance,
+            logical_request_id,
+            model_id,
         },
         LlmOutcome::NetworkError { message } => {
             let attempt = current_attempt(state);
@@ -4520,6 +4531,9 @@ mod tests {
             message: "capacity".to_string(),
             detected_at: at,
             guidance: None,
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         }
     }
 
@@ -4556,11 +4570,50 @@ mod tests {
                 message,
                 detected_at,
                 guidance: Some(OverloadRetryGuidance::WithinLimit(Duration::from_secs(20))),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         )
         .unwrap();
         assert!(
             matches!(guided.effects.as_slice(), [Effect::PersistState, Effect::ScheduleRetry { delay, attempt: 2, max_attempts: 5, .. }, Effect::NotifyStateChange] if *delay == Duration::from_secs(20))
+        );
+    }
+
+    #[test]
+    fn overload_incident_persists_request_and_resolved_model_identity() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let scheduled = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::ServerOverloaded {
+                message: "capacity".to_string(),
+                detected_at: at,
+                guidance: None,
+                logical_request_id: "request-a".to_string(),
+                model_id: "resolved-model-a".to_string(),
+            },
+        )
+        .unwrap();
+        let ConvState::ServerOverloadRetrying { retry } = &scheduled.new_state else {
+            panic!("overload must persist its incident")
+        };
+        assert_eq!(retry.logical_request_id, "request-a");
+        assert_eq!(retry.model_id, "resolved-model-a");
+
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&scheduled.new_state).unwrap()).unwrap();
+        assert_eq!(restored, scheduled.new_state);
+        assert_eq!(
+            overload_retry_delay(2, "request-a"),
+            overload_retry_delay(2, "request-a")
+        );
+        assert_ne!(
+            overload_retry_delay(2, "request-a"),
+            overload_retry_delay(2, "request-b")
         );
     }
 
@@ -4577,6 +4630,9 @@ mod tests {
                 message: "capacity".to_string(),
                 detected_at: at,
                 guidance: Some(OverloadRetryGuidance::ExceedsLimit(duration)),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         )
         .unwrap();
@@ -4595,6 +4651,9 @@ mod tests {
                 attempt: OVERLOAD_MAX_ATTEMPTS,
                 started_at: at,
                 deadline_at: at + chrono::Duration::seconds(120),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         let exhausted = transition(
@@ -4630,6 +4689,9 @@ mod tests {
                     attempt: 3,
                     started_at: at - chrono::Duration::seconds(120),
                     deadline_at: at,
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             };
             let result =
@@ -4728,6 +4790,9 @@ mod tests {
                 attempt: 2,
                 started_at: at,
                 deadline_at: at + chrono::Duration::seconds(120),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         let response = || Event::LlmResponse {
@@ -4771,6 +4836,9 @@ mod tests {
             attempt: 2,
             started_at: at,
             deadline_at: at + chrono::Duration::seconds(120),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         };
         let result = transition(
             &ConvState::ServerOverloadRetrying {
@@ -4829,6 +4897,9 @@ mod tests {
                     attempt: OVERLOAD_MAX_ATTEMPTS,
                     started_at: at,
                     deadline_at: at + chrono::Duration::seconds(120),
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             },
             &test_context(),
@@ -4890,6 +4961,9 @@ mod tests {
                     attempt: 3,
                     started_at: at,
                     deadline_at: at + chrono::Duration::seconds(120),
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             };
             let event = match target {
@@ -4965,6 +5039,9 @@ mod tests {
                     attempt: OVERLOAD_MAX_ATTEMPTS,
                     started_at: at,
                     deadline_at: at + chrono::Duration::seconds(120),
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             };
             let event = match target {
@@ -5020,6 +5097,9 @@ mod tests {
                     attempt: OVERLOAD_MAX_ATTEMPTS,
                     started_at: at,
                     deadline_at: at + chrono::Duration::seconds(120),
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             },
             &sub_agent_context(),
@@ -5072,6 +5152,9 @@ mod tests {
                 attempt: 3,
                 started_at: at,
                 deadline_at: at + chrono::Duration::seconds(120),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
 
@@ -5163,6 +5246,8 @@ mod tests {
                     attempt: OVERLOAD_MAX_ATTEMPTS,
                     started_at: at,
                     deadline_at: at + chrono::Duration::seconds(120),
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             },
         };
@@ -5209,6 +5294,8 @@ mod tests {
                     attempt: 2,
                     started_at: at,
                     deadline_at: at + chrono::Duration::seconds(120),
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             },
         };
@@ -5250,6 +5337,8 @@ mod tests {
                     attempt: 2,
                     started_at: at,
                     deadline_at: at + chrono::Duration::seconds(120),
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             },
         };
@@ -5293,6 +5382,9 @@ mod tests {
                 message: "capacity".to_string(),
                 detected_at: at,
                 guidance: Some(OverloadRetryGuidance::ExceedsLimit(Duration::from_secs(31))),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         )
         .unwrap();
@@ -5327,6 +5419,9 @@ mod tests {
                 attempt: 5,
                 started_at: at,
                 deadline_at: at + chrono::Duration::seconds(120),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
 
@@ -5383,6 +5478,9 @@ mod tests {
                 attempt: 4,
                 started_at: at - chrono::Duration::seconds(120),
                 deadline_at: at,
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         let expired = transition(
@@ -5393,6 +5491,9 @@ mod tests {
                 message: "continuation overload deadline elapsed".to_string(),
                 detected_at: at,
                 guidance: Some(OverloadRetryGuidance::ExceedsLimit(Duration::from_secs(31))),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         )
         .unwrap();
@@ -5412,6 +5513,9 @@ mod tests {
                 message: "duplicate expiry".to_string(),
                 detected_at: at + chrono::Duration::seconds(1),
                 guidance: Some(OverloadRetryGuidance::ExceedsLimit(Duration::from_secs(31))),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
             Event::ContinuationResponse {
                 operation_id: operation_id.clone(),
@@ -5439,6 +5543,9 @@ mod tests {
                 attempt: 2,
                 started_at: at,
                 deadline_at: at + chrono::Duration::seconds(120),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         for stale in [
@@ -5447,6 +5554,9 @@ mod tests {
                 message: "capacity".to_string(),
                 detected_at: at,
                 guidance: None,
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
             Event::ContinuationResponse {
                 operation_id: "stale-op".to_string(),
@@ -5481,6 +5591,9 @@ mod tests {
                 attempt: 3,
                 started_at: at,
                 deadline_at: at + chrono::Duration::seconds(5),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         let result = transition(
@@ -5491,6 +5604,9 @@ mod tests {
                 message: "capacity".to_string(),
                 detected_at: at + chrono::Duration::seconds(4),
                 guidance: None,
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         )
         .unwrap();
@@ -5518,6 +5634,9 @@ mod tests {
                 message: "capacity".to_string(),
                 detected_at: at,
                 guidance: None,
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         )
         .unwrap();
@@ -6058,6 +6177,9 @@ mod tests {
                     .unwrap()
                     .with_timezone(&chrono::Utc),
                 guidance: None,
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         )
         .expect("capacity failure should remain recoverable");

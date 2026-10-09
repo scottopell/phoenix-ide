@@ -2709,6 +2709,11 @@ where
             }
         }
 
+        if matches!(self.state.step_result(), StepResult::Terminal(_)) {
+            self.emit_terminal_lifecycle_event().await;
+            return RuntimeExitDisposition::Terminal;
+        }
+
         // Check if we need to resume an interrupted operation
         // This handles crash recovery for in-flight LLM requests
 
@@ -7589,7 +7594,7 @@ where
             }
             _ => 1,
         };
-        let overload_deadline = match &self.state {
+        let overload_incident = match &self.state {
             ConvState::ServerOverloadRetrying { retry }
                 if matches!(
                     retry.target,
@@ -7599,18 +7604,27 @@ where
                     phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
                 ) =>
             {
-                Some(retry.deadline_at)
+                Some((
+                    retry.deadline_at,
+                    retry.logical_request_id.clone(),
+                    retry.model_id.clone(),
+                ))
             }
             _ => None,
         };
+        let overload_deadline = overload_incident.as_ref().map(|(deadline, _, _)| *deadline);
         let mut tool_surface = LlmToolSurface::Full;
 
-        if overload_deadline.is_some_and(|deadline| deadline <= Utc::now()) {
-            return Ok(Some(Event::ServerOverloaded {
-                detected_at: Utc::now(),
-                message: "Server overload retry deadline elapsed".to_string(),
-                guidance: None,
-            }));
+        if let Some((deadline, logical_request_id, model_id)) = &overload_incident {
+            if *deadline <= Utc::now() {
+                return Ok(Some(Event::ServerOverloaded {
+                    detected_at: Utc::now(),
+                    message: "Server overload retry deadline elapsed".to_string(),
+                    guidance: None,
+                    logical_request_id: logical_request_id.clone(),
+                    model_id: model_id.clone(),
+                }));
+            }
         }
 
         // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
@@ -7718,12 +7732,16 @@ where
         // Persistence effects have settled before RequestLlm reaches this method.
         // Refresh and render now, before any provider task exists, so scheduling
         // cannot admit later steering into this request.
-        if overload_deadline.is_some_and(|deadline| deadline <= Utc::now()) {
-            return Ok(Some(Event::ServerOverloaded {
-                detected_at: Utc::now(),
-                message: "Server overload retry deadline elapsed".to_string(),
-                guidance: None,
-            }));
+        if let Some((deadline, logical_request_id, model_id)) = &overload_incident {
+            if *deadline <= Utc::now() {
+                return Ok(Some(Event::ServerOverloaded {
+                    detected_at: Utc::now(),
+                    message: "Server overload retry deadline elapsed".to_string(),
+                    guidance: None,
+                    logical_request_id: logical_request_id.clone(),
+                    model_id: model_id.clone(),
+                }));
+            }
         }
         self.refresh_active_prompt_projection().await?;
         let trusted_results = self.pending_trusted_tool_results.clone();
@@ -7846,7 +7864,10 @@ where
         // Message, producing a phantom streaming buffer on the
         // client (the "repeated message" bug).
         let (chunk_tx, chunk_rx) = mpsc::channel::<phoenix_llm::TokenChunk>(256);
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = overload_incident.as_ref().map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |(_, logical_request_id, _)| logical_request_id.clone(),
+        );
 
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
@@ -8119,7 +8140,7 @@ where
                         request_id: request_id.clone(),
                     }
                 }
-                Err(e) => llm_error_to_outcome(e),
+                Err(e) => llm_error_to_outcome(e, &request_id, &model_id),
             };
 
             let finalized_metrics = attempt_capture.finalized();
@@ -9172,7 +9193,17 @@ where
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = match &self.state {
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(
+                    retry.phase,
+                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                ) =>
+            {
+                retry.logical_request_id.clone()
+            }
+            _ => uuid::Uuid::new_v4().to_string(),
+        };
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
         let model_id = self.context.model_id.clone();
@@ -9349,7 +9380,7 @@ where
             telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                 conversation_id: conv_id.clone(),
                 root_conversation_id: root_conv_id,
-                request_id,
+                request_id: request_id.clone(),
                 retry_attempt,
                 attempt_capture: attempt_capture.clone(),
             }),
@@ -9445,6 +9476,8 @@ where
                             message: e.message.clone(),
                             detected_at: Utc::now(),
                             guidance,
+                            logical_request_id: request_id.clone(),
+                            model_id: model_id.clone(),
                         }
                     } else if e.recovery_in_progress {
                         Event::LlmError {
@@ -12282,7 +12315,11 @@ fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKin
 
 /// Convert an LLM error into a typed `LlmOutcome`.
 /// Explicit match arms — the compiler enforces exhaustiveness.
-fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
+fn llm_error_to_outcome(
+    error: phoenix_llm::LlmError,
+    logical_request_id: &str,
+    model_id: &str,
+) -> LlmOutcome {
     use phoenix_llm::LlmErrorKind;
     match error.kind {
         LlmErrorKind::RateLimit => LlmOutcome::RateLimited {
@@ -12338,6 +12375,8 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
                 message: error.message,
                 detected_at: Utc::now(),
                 guidance,
+                logical_request_id: logical_request_id.to_string(),
+                model_id: model_id.to_string(),
             }
         }
         LlmErrorKind::Network => LlmOutcome::NetworkError {
@@ -12679,8 +12718,11 @@ mod error_mapping_tests {
     #[test]
     fn test_invalid_response_outcome_is_not_request_rejected() {
         // InvalidResponse must take the automatically retryable outcome path.
-        let outcome =
-            llm_error_to_outcome(phoenix_llm::LlmError::invalid_response("garbled SSE event"));
+        let outcome = llm_error_to_outcome(
+            phoenix_llm::LlmError::invalid_response("garbled SSE event"),
+            "logical-request",
+            "test-model",
+        );
         assert!(
             matches!(outcome, LlmOutcome::InvalidResponse { .. }),
             "invalid_response must map to LlmOutcome::InvalidResponse, got {outcome:?}"
@@ -12712,10 +12754,11 @@ mod error_mapping_tests {
             let result = handle_outcome(
                 &ConvState::LlmRequesting { attempt: 1 },
                 &context,
-                EffectOutcome::Llm(llm_error_to_outcome(phoenix_llm::LlmError::new(
-                    provider_kind,
-                    "provider rejected request",
-                ))),
+                EffectOutcome::Llm(llm_error_to_outcome(
+                    phoenix_llm::LlmError::new(provider_kind, "provider rejected request"),
+                    "logical-request",
+                    "test-model",
+                )),
             )
             .unwrap();
             let ConvState::Error { error_kind, .. } = &result.new_state else {
@@ -12740,17 +12783,23 @@ mod error_mapping_tests {
         assert!(!db_error.is_auto_retryable());
         assert!(db_error.is_user_resumable());
 
-        let outcome = llm_error_to_outcome(phoenix_llm::LlmError::prompt_rejected(
-            "invalid_prompt: policy rejected the assembled prompt",
-        ));
+        let outcome = llm_error_to_outcome(
+            phoenix_llm::LlmError::prompt_rejected(
+                "invalid_prompt: policy rejected the assembled prompt",
+            ),
+            "logical-request",
+            "test-model",
+        );
         assert!(matches!(outcome, LlmOutcome::PromptRejected { .. }));
     }
 
     #[test]
     fn provider_context_window_error_still_maps_to_token_budget_exceeded() {
-        let outcome = llm_error_to_outcome(phoenix_llm::LlmError::context_window_exceeded(
-            "provider rejected oversized context",
-        ));
+        let outcome = llm_error_to_outcome(
+            phoenix_llm::LlmError::context_window_exceeded("provider rejected oversized context"),
+            "logical-request",
+            "test-model",
+        );
         assert!(
             matches!(outcome, LlmOutcome::TokenBudgetExceeded),
             "provider context-window errors must retain the terminal path, got {outcome:?}"
@@ -20964,6 +21013,9 @@ mod steer_drain_detector_tests {
                     attempt: 2,
                     started_at: Utc::now(),
                     deadline_at: Utc::now() + chrono::Duration::seconds(120),
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             },
             ConvState::AwaitingTaskApproval {
@@ -21136,6 +21188,9 @@ mod steer_drain_detector_tests {
             attempt: 1,
             started_at: now,
             deadline_at: now + chrono::Duration::seconds(120),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         };
         let (mut rt, _storage) = build_runtime_with_state_and_queue(
             "conv-trusted-overload-auth-recovery",
@@ -22886,8 +22941,22 @@ mod retry_timer_epoch_tests {
         ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
 
     fn runtime_requesting() -> TestRuntime {
+        runtime_requesting_with_role(false)
+    }
+
+    fn runtime_requesting_with_role(is_sub_agent: bool) -> TestRuntime {
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("conv-retry", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = if is_sub_agent {
+            ConvContext::sub_agent(
+                "conv-retry",
+                PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+                "root-conv",
+            )
+        } else {
+            ConvContext::new("conv-retry", PathBuf::from("/tmp"), "test-model", 200_000)
+        };
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -22924,6 +22993,9 @@ mod retry_timer_epoch_tests {
             message: "capacity".to_string(),
             detected_at: Utc::now(),
             guidance: None,
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         }
     }
 
@@ -23052,8 +23124,8 @@ mod retry_timer_epoch_tests {
     }
 
     #[tokio::test]
-    async fn startup_expired_ordinary_overload_persists_deadline_terminal() {
-        let mut rt = runtime_requesting();
+    async fn startup_expired_subagent_overload_persists_and_exits_terminal() {
+        let mut rt = runtime_requesting_with_role(true);
         let storage = Arc::clone(&rt.storage);
         let now = Utc::now();
         rt.state = ConvState::ServerOverloadRetrying {
@@ -23065,13 +23137,16 @@ mod retry_timer_epoch_tests {
                 attempt: 4,
                 started_at: now - chrono::Duration::seconds(121),
                 deadline_at: now - chrono::Duration::seconds(1),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         let runtime = tokio::spawn(rt.run());
 
         let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let Some(state @ ConvState::Error { .. }) =
+                if let Some(state @ ConvState::Failed { .. }) =
                     storage.get_current_state("conv-retry")
                 {
                     break state;
@@ -23081,10 +23156,9 @@ mod retry_timer_epoch_tests {
         })
         .await
         .expect("startup expiry reaches durable terminal state");
-        let ConvState::Error {
-            message,
+        let ConvState::Failed {
+            error: message,
             error_kind,
-            ..
         } = persisted
         else {
             unreachable!()
@@ -23096,8 +23170,13 @@ mod retry_timer_epoch_tests {
         assert!(message.contains("deadline elapsed"));
         assert!(!message.contains("Retry-After"));
 
-        runtime.abort();
-        assert!(matches!(runtime.await, Err(error) if error.is_cancelled()));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), runtime)
+                .await
+                .expect("terminalized startup runtime exits")
+                .expect("runtime task joins"),
+            RuntimeExitDisposition::Terminal
+        );
     }
 
     #[tokio::test]
@@ -23117,6 +23196,9 @@ mod retry_timer_epoch_tests {
                 attempt: 4,
                 started_at: now - chrono::Duration::seconds(121),
                 deadline_at: now - chrono::Duration::seconds(1),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         let runtime = tokio::spawn(rt.run());
@@ -24226,6 +24308,8 @@ mod overload_startup_tests {
             attempt: 2,
             started_at: now,
             deadline_at: now + chrono::Duration::seconds(120),
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         }
     }
 
@@ -24269,6 +24353,9 @@ mod overload_startup_tests {
             attempt: 4,
             started_at: observed_at - chrono::Duration::seconds(37),
             deadline_at: observed_at + chrono::Duration::seconds(83),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         };
         let restored: ServerOverloadRetry =
             serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
@@ -24297,6 +24384,8 @@ mod overload_startup_tests {
                     attempt: 2,
                     started_at: now,
                     deadline_at: now + chrono::Duration::seconds(120),
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             },
         };

@@ -636,6 +636,9 @@ mod random_walk {
                         message: "still overloaded".to_string(),
                         detected_at: chrono::Utc::now(),
                         guidance: None,
+
+                        logical_request_id: "logical-request".to_string(),
+                        model_id: "test-model".to_string(),
                     }
                 }
             },

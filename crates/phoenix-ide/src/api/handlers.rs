@@ -14825,6 +14825,9 @@ pub(crate) mod hard_delete_cascade_tests {
                 attempt: 2,
                 started_at: now,
                 deadline_at: now + chrono::Duration::seconds(120),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         state
@@ -14917,6 +14920,9 @@ pub(crate) mod hard_delete_cascade_tests {
                 attempt: 2,
                 started_at: now,
                 deadline_at: now + chrono::Duration::seconds(120),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         state

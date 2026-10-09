@@ -1442,6 +1442,8 @@ pub struct ServerOverloadRetry {
     pub attempt: u32,
     pub started_at: DateTime<Utc>,
     pub deadline_at: DateTime<Utc>,
+    pub logical_request_id: String,
+    pub model_id: String,
 }
 
 /// Conversation state

@@ -20168,6 +20168,9 @@ mod tests {
             attempt: 3,
             started_at: now - chrono::Duration::seconds(30),
             deadline_at: now + chrono::Duration::seconds(90),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         };
         db.update_conversation_state(
             conversation_id,
@@ -20283,6 +20286,9 @@ mod tests {
                     attempt: OVERLOAD_MAX_ATTEMPTS,
                     started_at: now - chrono::Duration::seconds(30),
                     deadline_at: now + chrono::Duration::seconds(90),
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
                 },
             },
         )
@@ -20561,6 +20567,9 @@ mod tests {
                 attempt: 3,
                 started_at: now - chrono::Duration::seconds(30),
                 deadline_at: now + chrono::Duration::seconds(90),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         db.update_conversation_state(conversation_id, &in_flight)
@@ -25702,6 +25711,9 @@ mod tests {
                 attempt: 2,
                 started_at,
                 deadline_at: started_at + chrono::Duration::minutes(10),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         }
     }
@@ -25825,6 +25837,9 @@ mod tests {
             attempt: 3,
             started_at,
             deadline_at: started_at + chrono::Duration::seconds(120),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         };
         db.update_conversation_state(
             "overload-auth",

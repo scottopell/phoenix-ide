@@ -3913,10 +3913,37 @@ impl RuntimeManager {
                     has_resumable_occurrence,
                 )
                 .await?;
+            if matches!(
+                &conversation.state,
+                ConvState::ServerOverloadRetrying { retry } if retry.deadline_at <= chrono::Utc::now()
+            ) {
+                self.settle_persisted_llm_request(&conversation_id).await?;
+                continue;
+            }
             let stored_model_id = conversation
                 .model
                 .unwrap_or_else(|| self.llm_registry.default_model_id());
-            if let Err(error) = self.llm_registry.resolve_model_id(&stored_model_id) {
+            let persisted_overload_model = match &conversation.state {
+                ConvState::ServerOverloadRetrying { retry } => Some(retry.model_id.as_str()),
+                ConvState::AwaitingRecovery {
+                    resume:
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                            retry,
+                        },
+                    ..
+                } => Some(retry.model_id.as_str()),
+                _ => None,
+            };
+            let model_to_initialize = persisted_overload_model.unwrap_or(&stored_model_id);
+            let model_resolution = self.llm_registry.resolve_model_id(model_to_initialize);
+            let initialization_error = match (&model_resolution, persisted_overload_model) {
+                (Err(error), _) => Some(error.clone()),
+                (Ok(resolved), Some(exact)) if resolved != exact => Some(format!(
+                    "Overload recovery cannot replace selected model '{exact}' with '{resolved}'"
+                )),
+                _ => None,
+            };
+            if let Some(error) = initialization_error {
                 tracing::error!(
                     conv_id = %conversation_id,
                     %error,
@@ -5769,12 +5796,27 @@ impl RuntimeManager {
             )
         };
 
-        // Resolve model once: use conversation's stored model, or fall back to registry default
-        let stored_model_id = conv
-            .model
-            .clone()
-            .unwrap_or_else(|| self.llm_registry.default_model_id());
-        let model_id = self.llm_registry.resolve_model_id(&stored_model_id)?;
+        // An overload incident owns its already-resolved model identity. Do not
+        // run that identity through catalog replacement after restart: doing so
+        // would silently move the admitted request to another selected model.
+        let persisted_overload_model = match &conv.state {
+            ConvState::ServerOverloadRetrying { retry } => Some(retry.model_id.clone()),
+            ConvState::AwaitingRecovery {
+                resume:
+                    phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { retry },
+                ..
+            } => Some(retry.model_id.clone()),
+            _ => None,
+        };
+        let model_id = if let Some(model_id) = persisted_overload_model {
+            model_id
+        } else {
+            let stored_model_id = conv
+                .model
+                .clone()
+                .unwrap_or_else(|| self.llm_registry.default_model_id());
+            self.llm_registry.resolve_model_id(&stored_model_id)?
+        };
         let context_window = self.llm_registry.context_window(&model_id);
         let approved_task_objective = self
             .db
@@ -11705,6 +11747,8 @@ mod scope_liveness_tests {
                         attempt: 2,
                         started_at: Utc::now(),
                         deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                        logical_request_id: "logical-request".to_string(),
+                        model_id: "test-model".to_string(),
                     },
                 },
             ),
@@ -11723,6 +11767,8 @@ mod scope_liveness_tests {
                         attempt: 2,
                         started_at: Utc::now(),
                         deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                        logical_request_id: "logical-request".to_string(),
+                        model_id: "test-model".to_string(),
                     },
                 },
             ),
@@ -11742,6 +11788,8 @@ mod scope_liveness_tests {
                                 attempt: 3,
                                 started_at: Utc::now(),
                                 deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                                logical_request_id: "logical-request".to_string(),
+                                model_id: "test-model".to_string(),
                             },
                         },
                 },
@@ -11765,6 +11813,8 @@ mod scope_liveness_tests {
                                 attempt: 3,
                                 started_at: Utc::now(),
                                 deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                                logical_request_id: "logical-request".to_string(),
+                                model_id: "test-model".to_string(),
                             },
                         },
                 },
@@ -15625,6 +15675,9 @@ mod scope_liveness_tests {
                 attempt: 3,
                 started_at,
                 deadline_at: started_at + chrono::Duration::minutes(5),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
             },
         };
         mgr.db()
