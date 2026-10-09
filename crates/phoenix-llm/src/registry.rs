@@ -1906,6 +1906,92 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn request_model_map_validates_exact_routes_and_catalog_identity() {
+        let specs = merge_model_specs(all_models(), &[external_gateway_model()]);
+        let valid = RequestModelOverrides::parse(
+            r#"{"anthropic":{"claude-sonnet-5":"anthropic/claude-sonnet-5"},"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"},"openai_chat_completions":{}}"#,
+            &specs,
+            false,
+        ).unwrap();
+        assert_eq!(valid.len(), 2);
+        assert_eq!(
+            valid
+                .resolve(
+                    specs.iter().find(|s| s.id == "claude-sonnet-5").unwrap(),
+                    false
+                )
+                .as_str(),
+            "anthropic/claude-sonnet-5"
+        );
+        for (raw, reason) in [
+            ("not json", "invalid JSON map"),
+            ("[]", "invalid JSON map"),
+            (r#"{"codex":{"gpt-6.1-sol":"other"}}"#, "unknown route"),
+            (r#"{"anthropic":{"absent":"other"}}"#, "unknown model ID"),
+            (
+                r#"{"anthropic":{"gpt-6.1-sol":"other"}}"#,
+                "different backend",
+            ),
+            (
+                r#"{"anthropic":{"claude-sonnet-5":"  "}}"#,
+                "blank request name",
+            ),
+        ] {
+            let error = RequestModelOverrides::parse(raw, &specs, false).unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
+        assert!(RequestModelOverrides::parse(
+            r#"{"openai_responses":{"gpt-6.1-sol":"other"}}"#,
+            &specs,
+            true,
+        )
+        .unwrap_err()
+        .contains("Codex route"));
+        assert_eq!(
+            valid
+                .resolve(specs.iter().find(|s| s.id == "gpt-6.1-sol").unwrap(), true)
+                .as_str(),
+            "gpt-6.1-sol"
+        );
+    }
+
+    #[test]
+    fn request_override_changes_route_key_not_catalog_capabilities_or_default_key() {
+        let original = LlmConfig {
+            anthropic_api_key: Some("key".into()),
+            openai_api_key: Some("key".into()),
+            ..Default::default()
+        };
+        let overrides = RequestModelOverrides::parse(
+            r#"{"anthropic":{"claude-sonnet-5-5":"anthropic/claude-sonnet-5"},"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"}}"#,
+            &ModelRegistry::model_specs(&original), false,
+        ).unwrap();
+        let mapped = LlmConfig {
+            request_models: overrides,
+            ..original.clone()
+        };
+        let first = ModelRegistry::new(&original);
+        let second = ModelRegistry::new(&mapped);
+        for (id, expected_request) in [
+            ("claude-sonnet-5-5", "anthropic/claude-sonnet-5"),
+            ("gpt-6.1-sol", "gateway/gpt-sol"),
+        ] {
+            let before = first.get(id).unwrap().continuation_route_key();
+            let after = second.get(id).unwrap().continuation_route_key();
+            assert!(before.contains(&format!(":{id}:")));
+            assert!(after.contains(&format!(":{expected_request}:")));
+            assert_ne!(before, after);
+            let spec = second.specs.read().unwrap().get(id).unwrap().clone();
+            assert_eq!(spec.id, id);
+            assert_eq!(spec.default_request_name.as_str(), id);
+            assert_eq!(
+                second.effort_capabilities(id),
+                first.effort_capabilities(id)
+            );
+        }
+    }
+
+    #[test]
     fn codex_bridge_transport_is_websocket_across_registration_paths() {
         assert_eq!(codex_bridge_transport(), LlmTransport::Websocket);
     }
@@ -2289,6 +2375,45 @@ mod tests {
             &model,
             &discovered,
             &LlmConfig::default()
+        ));
+    }
+
+    #[test]
+    fn discovery_matcher_uses_resolved_request_name_on_matching_backend() {
+        let model = all_models()
+            .into_iter()
+            .find(|model| model.id == "claude-sonnet-5")
+            .unwrap();
+        let config = LlmConfig {
+            request_models: RequestModelOverrides::parse(
+                r#"{"anthropic":{"claude-sonnet-5":"gateway/sonnet-alias"}}"#,
+                &all_models(),
+                false,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        let mut discovered = DiscoveredModels {
+            anthropic_listed: true,
+            anthropic: HashSet::from(["gateway/sonnet-alias".to_owned()]),
+            openai_responses_listed: true,
+            openai_responses: HashSet::new(),
+            openai_chat_completions_listed: false,
+            openai_chat_completions: HashSet::new(),
+        };
+        assert!(ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered,
+            &config
+        ));
+        discovered.anthropic.clear();
+        discovered
+            .openai_responses
+            .insert("gateway/sonnet-alias".to_owned());
+        assert!(!ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered,
+            &config
         ));
     }
 
