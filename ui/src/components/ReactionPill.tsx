@@ -62,7 +62,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     let observedScroller: HTMLElement = scroller;
     let initialClearancePending = dockActive;
     let observedObstructions = new Set<Element>();
-    let observedSource: Element | null = null;
+    let observedMessages = new Set<Element>();
     const initialComposer = document.getElementById('input-area');
     const scrollerAncestors = new Set<Element>();
     for (let ancestor: Element | null = scroller; ancestor; ancestor = ancestor.parentElement) scrollerAncestors.add(ancestor);
@@ -94,6 +94,10 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         observedComposer = composer;
         if (observedComposer) resize.observe(observedComposer);
       }
+      const renderedMessages = new Set<Element>(observedScroller.querySelectorAll('[data-inline-reaction-message]'));
+      for (const message of observedMessages) if (!renderedMessages.has(message)) resize.unobserve(message);
+      for (const message of renderedMessages) if (!observedMessages.has(message)) resize.observe(message);
+      observedMessages = renderedMessages;
       const styles = getComputedStyle(document.documentElement);
       const safeTop = Number.parseFloat(styles.getPropertyValue('--safe-area-top')) || 0;
       const safeRight = Number.parseFloat(styles.getPropertyValue('--safe-area-right')) || 0;
@@ -109,12 +113,6 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const restoredRange = restoreReactionRange(source);
       const fallbackOwner = sourceRange?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]');
       const range = restoredRange ?? (sourceRange && fallbackOwner && observedScroller.contains(fallbackOwner) ? sourceRange : null);
-      const liveSource = restoredRange?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]') ?? null;
-      if (liveSource !== observedSource) {
-        if (observedSource) resize.unobserve(observedSource);
-        observedSource = liveSource;
-        if (observedSource) resize.observe(observedSource);
-      }
       const rect = range?.getBoundingClientRect();
       if (returning.current && rect && rect.height > 0) {
         returning.current = false;

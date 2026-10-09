@@ -36,7 +36,7 @@ beforeEach(() => {
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 600, 500));
   Object.defineProperty(Range.prototype, 'getBoundingClientRect', { configurable: true, value: () => new DOMRect(20, offscreen ? -100 : 100, 150, 20) });
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('reaction pill', () => {
   it('focuses on Enter without appending, but leaves controls and composition alone', () => {
@@ -359,6 +359,44 @@ describe('reaction pill', () => {
     expect(replacement).not.toBe(original);
     await waitFor(() => expect(replacement).toHaveClass('reaction-dock-reserved'));
     expect(original).not.toHaveClass('reaction-dock-reserved');
+  });
+
+  it('repositions when a preceding rendered message resizes around the selected passage', async () => {
+    const observers: TestResizeObserver[] = [];
+    class TestResizeObserver implements ResizeObserver {
+      readonly observed = new Set<Element>();
+      constructor(private readonly callback: ResizeObserverCallback) { observers.push(this); }
+      observe(target: Element) { this.observed.add(target); }
+      unobserve(target: Element) { this.observed.delete(target); }
+      disconnect() { this.observed.clear(); }
+      trigger(target: Element) {
+        this.callback([{ target } as ResizeObserverEntry], this);
+      }
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+    let rangeBottom = 300;
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockImplementation(() => new DOMRect(0, rangeBottom - 50, 200, 50));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 580, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages">
+        <div data-testid="preceding" data-inline-reaction-message="earlier" data-message-occurrence="earlier:earlier"><div className="agent-text-block" data-fragment-id="text-0">Earlier row</div></div>
+        <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>
+      </div><footer id="input-area" /></div>
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    const preceding = screen.getByTestId('preceding');
+    const observer = observers.find((candidate) => candidate.observed.has(preceding));
+    expect(observer).toBeDefined();
+    expect(screen.queryByRole('button', { name: /Return to passage/ })).not.toBeInTheDocument();
+    rangeBottom = 620;
+    act(() => observer!.trigger(preceding));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
+    expect(screen.getByRole('textbox')).not.toHaveFocus();
+    expect(add).not.toHaveBeenCalled();
   });
 
   it('keeps an unpinned bottom selection above the touch dock after later scrolling', async () => {
