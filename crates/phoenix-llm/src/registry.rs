@@ -8,7 +8,9 @@ use super::{
     LoggingService, ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,16 +147,64 @@ pub struct ResolvedAuth {
     pub style: AuthStyle,
 }
 
+/// A `HashMap<String, V>` that rejects duplicate keys at deserialization time
+/// instead of silently keeping only the last occurrence. `serde_json`'s
+/// default `HashMap` support calls `insert` unconditionally per entry, so a
+/// duplicate key (legal in JSON, ambiguous in practice) would otherwise erase
+/// an earlier entry — including one that was invalid — before validation
+/// ever saw it.
+struct NoDupMap<V>(HashMap<String, V>);
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for NoDupMap<V> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NoDupVisitor<V>(PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for NoDupVisitor<V> {
+            type Value = HashMap<String, V>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object with unique keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((key, value)) = map.next_entry::<String, V>()? {
+                    if out.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer
+            .deserialize_map(NoDupVisitor(PhantomData))
+            .map(NoDupMap)
+    }
+}
+
 /// Exact route -> canonical model ID -> request spelling, validated at startup.
 #[derive(Debug, Clone, Default)]
 pub struct RequestModelOverrides(HashMap<ModelBackend, HashMap<String, RequestModelName>>);
 
 impl RequestModelOverrides {
-    fn parse(raw: &str, specs: &[super::ModelSpec], use_codex_auth: bool) -> Result<Self, String> {
-        let routes: HashMap<String, HashMap<String, String>> =
+    /// Validation is purely a function of the configured catalog and
+    /// declared backend — it does not know which route is actually in use.
+    /// Codex auth being active never changes whether an entry is *valid*;
+    /// it only changes whether [`Self::resolve`] applies it (native Codex
+    /// built-ins always use their own default spelling, so a map entry for
+    /// one is accepted but stays dormant).
+    fn parse(raw: &str, specs: &[super::ModelSpec]) -> Result<Self, String> {
+        let routes: NoDupMap<NoDupMap<String>> =
             serde_json::from_str(raw).map_err(|error| format!("invalid JSON map: {error}"))?;
         let mut overrides = HashMap::new();
-        for (route, names) in routes {
+        for (route, names) in routes.0 {
             let backend = match route.as_str() {
                 "anthropic" => ModelBackend::Anthropic,
                 "openai_responses" => ModelBackend::OpenAIResponses,
@@ -162,7 +212,7 @@ impl RequestModelOverrides {
                 _ => return Err(format!("unknown route '{route}'")),
             };
             let mut mapped = HashMap::new();
-            for (id, name) in names {
+            for (id, name) in names.0 {
                 let spec = specs
                     .iter()
                     .find(|spec| spec.id == id)
@@ -171,12 +221,6 @@ impl RequestModelOverrides {
                     return Err(format!(
                         "model '{id}' has a different backend from route '{route}'"
                     ));
-                }
-                if use_codex_auth
-                    && backend == ModelBackend::OpenAIResponses
-                    && spec.source == ModelSource::BuiltIn
-                {
-                    return Err(format!("Codex route does not accept override for '{id}'"));
                 }
                 if name.trim().is_empty() {
                     return Err(format!("blank request name for '{id}' on route '{route}'"));
@@ -351,8 +395,8 @@ impl LlmConfig {
     /// # Panics
     ///
     /// Panics if `PHOENIX_LLM_REQUEST_MODELS` is set but fails to parse or
-    /// validate (unknown route/model, backend mismatch, blank name, or a
-    /// Codex-bridge override). The map is rejected atomically before any
+    /// validate (unknown route/model, backend mismatch, blank name, or
+    /// duplicate keys). The map is rejected atomically before any
     /// request can use it, so a malformed override must fail startup rather
     /// than silently fall back to defaults.
     #[allow(clippy::too_many_lines)]
@@ -439,7 +483,7 @@ impl LlmConfig {
             .ok()
             .map(|raw| {
                 let specs = merge_model_specs(all_models(), &external_models);
-                RequestModelOverrides::parse(&raw, &specs, use_codex_auth)
+                RequestModelOverrides::parse(&raw, &specs)
                     .unwrap_or_else(|error| panic!("PHOENIX_LLM_REQUEST_MODELS: {error}"))
             })
             .unwrap_or_default();
@@ -1918,7 +1962,6 @@ mod tests {
         let valid = RequestModelOverrides::parse(
             r#"{"anthropic":{"claude-sonnet-5":"anthropic/claude-sonnet-5"},"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"},"openai_chat_completions":{}}"#,
             &specs,
-            false,
         ).unwrap();
         assert_eq!(valid.len(), 2);
         assert_eq!(
@@ -1944,22 +1987,36 @@ mod tests {
                 "blank request name",
             ),
         ] {
-            let error = RequestModelOverrides::parse(raw, &specs, false).unwrap_err();
+            let error = RequestModelOverrides::parse(raw, &specs).unwrap_err();
             assert!(error.contains(reason), "{error}");
         }
-        assert!(RequestModelOverrides::parse(
-            r#"{"openai_responses":{"gpt-6.1-sol":"other"}}"#,
+        let dormant = RequestModelOverrides::parse(
+            r#"{"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"}}"#,
             &specs,
-            true,
         )
-        .unwrap_err()
-        .contains("Codex route"));
+        .unwrap();
+        let gpt = specs.iter().find(|s| s.id == "gpt-6.1-sol").unwrap();
+        assert_eq!(dormant.resolve(gpt, true).as_str(), "gpt-6.1-sol");
+        assert_eq!(dormant.resolve(gpt, false).as_str(), "gateway/gpt-sol");
         assert_eq!(
             valid
                 .resolve(specs.iter().find(|s| s.id == "gpt-6.1-sol").unwrap(), true)
                 .as_str(),
             "gpt-6.1-sol"
         );
+    }
+
+    #[test]
+    fn duplicate_request_name_keys_are_rejected_at_both_levels() {
+        for raw in [
+            r#"{"anthropic":{"claude-sonnet-5":"","claude-sonnet-5":"alias"}}"#,
+            r#"{"anthropic":{"absent":"alias"},"anthropic":{"claude-sonnet-5":"alias"}}"#,
+            r#"{"anthropic":{"claude-sonnet-5":"alias","claude-sonnet-5":"alias"}}"#,
+            r#"{"anthropic":{},"anthropic":{}}"#,
+        ] {
+            let error = RequestModelOverrides::parse(raw, &all_models()).unwrap_err();
+            assert!(error.contains("duplicate"), "{error}");
+        }
     }
 
     #[test]
@@ -1970,8 +2027,8 @@ mod tests {
             ..Default::default()
         };
         let overrides = RequestModelOverrides::parse(
-            r#"{"anthropic":{"claude-sonnet-5-5":"anthropic/claude-sonnet-5"},"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"}}"#,
-            &ModelRegistry::model_specs(&original), false,
+            r#"{"anthropic":{"claude-sonnet-5-5":"anthropic/claude-sonnet-5-5"},"openai_responses":{"gpt-6.1-sol":"gateway/gpt-sol"}}"#,
+            &ModelRegistry::model_specs(&original),
         ).unwrap();
         let mapped = LlmConfig {
             request_models: overrides,
@@ -1980,7 +2037,7 @@ mod tests {
         let first = ModelRegistry::new(&original);
         let second = ModelRegistry::new(&mapped);
         for (id, expected_request) in [
-            ("claude-sonnet-5-5", "anthropic/claude-sonnet-5"),
+            ("claude-sonnet-5-5", "anthropic/claude-sonnet-5-5"),
             ("gpt-6.1-sol", "gateway/gpt-sol"),
         ] {
             let before = first.get(id).unwrap().continuation_route_key();
@@ -2395,7 +2452,6 @@ mod tests {
             request_models: RequestModelOverrides::parse(
                 r#"{"anthropic":{"claude-sonnet-5":"gateway/sonnet-alias"}}"#,
                 &all_models(),
-                false,
             )
             .unwrap(),
             ..Default::default()

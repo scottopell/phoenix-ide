@@ -251,13 +251,13 @@ keyed by backend route (`anthropic`, `openai_responses`,
 `openai_chat_completions`); each route maps Phoenix model IDs on that route
 to the request spelling to send. The whole map is validated once at
 startup and rejected atomically — an unknown route, an unknown model ID, a
-model ID on the wrong route, or a blank spelling fails startup rather than
+model ID on the wrong route, a blank spelling, or duplicate keys fail startup rather than
 partially applying. The Codex bridge route is not a valid key: native
 ChatGPT/Codex-authenticated requests always use the model's own default
 spelling and ignore this map.
 
 ```env
-PHOENIX_LLM_REQUEST_MODELS={"anthropic":{"claude-sonnet-5-5":"gateway/anthropic/claude-sonnet-5-5"},"openai_responses":{"gpt-6.1-sol":"gateway/openai/gpt-6.1-sol"}}
+PHOENIX_LLM_REQUEST_MODELS={"anthropic":{"claude-sonnet-5":"anthropic/claude-sonnet-5"},"openai_responses":{"gpt-6.1-sol":"openai/gpt-6.1-sol"}}
 ```
 
 ### TLS
