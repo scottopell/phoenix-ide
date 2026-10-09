@@ -6060,6 +6060,7 @@ impl Database {
         Self::finish_close_failure_tx(tx, run, request, obligation).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn finish_close_failure_tx(
         tx: &mut Transaction<'_, Sqlite>,
         run: &CloseRunRef,
