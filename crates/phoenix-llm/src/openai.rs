@@ -7163,48 +7163,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quiet_reasoning_terminal_has_websocket_sse_finalizer_parity() {
+    async fn quiet_reasoning_terminals_have_websocket_sse_finalizer_parity() {
         let request = empty_request();
-        let terminal = serde_json::json!({
-            "type": "response.completed",
-            "response": {
-                "id": "resp-quiet-reasoning-parity",
-                "status": "completed",
-                "output": [
-                    {"type": "reasoning", "id": "reasoning-1", "summary": []},
+        let cases = [
+            (
+                serde_json::json!([
+                    {"type": "reasoning", "id": "reasoning-only", "summary": []}
+                ]),
+                18,
+                16,
+            ),
+            (
+                serde_json::json!([
+                    {"type": "reasoning", "id": "reasoning-with-message", "summary": []},
                     {
                         "type": "message", "id": "message-1", "status": "completed",
                         "role": "assistant", "content": []
                     }
-                ],
-                "usage": {
-                    "input_tokens": 1000,
-                    "output_tokens": 18,
-                    "output_tokens_details": {"reasoning_tokens": 16}
-                }
-            }
-        })
-        .to_string();
+                ]),
+                50,
+                44,
+            ),
+        ];
         let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
 
-        let mut websocket = ResponsesStreamAccumulator::new(Instant::now(), &request);
-        websocket
-            .process_event("response.completed", &terminal, &chunk_tx)
-            .await
-            .unwrap();
-        let websocket = finalize_websocket_response(websocket, "gpt-test").unwrap();
+        for (output, output_tokens, reasoning_tokens) in cases {
+            let terminal = serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-quiet-reasoning-parity",
+                    "status": "completed",
+                    "output": output,
+                    "usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": output_tokens,
+                        "output_tokens_details": {"reasoning_tokens": reasoning_tokens}
+                    }
+                }
+            })
+            .to_string();
 
-        let mut sse = ResponsesStreamAccumulator::new(Instant::now(), &request);
-        sse.process_event("response.completed", &terminal, &chunk_tx)
-            .await
-            .unwrap();
-        let sse = finalize_responses_stream(sse, "gpt-test").unwrap();
+            let mut websocket = ResponsesStreamAccumulator::new(Instant::now(), &request);
+            websocket
+                .process_event("response.completed", &terminal, &chunk_tx)
+                .await
+                .unwrap();
+            let websocket = finalize_websocket_response(websocket, "gpt-test").unwrap();
 
-        assert!(websocket.content.is_empty());
-        assert_eq!(websocket.content, sse.content);
-        assert_eq!(websocket.end_turn, sse.end_turn);
-        assert_eq!(websocket.usage, sse.usage);
-        assert_eq!(websocket.provider_replay, sse.provider_replay);
+            let mut sse = ResponsesStreamAccumulator::new(Instant::now(), &request);
+            sse.process_event("response.completed", &terminal, &chunk_tx)
+                .await
+                .unwrap();
+            let sse = finalize_responses_stream(sse, "gpt-test").unwrap();
+
+            for response in [&websocket, &sse] {
+                assert!(response.content.is_empty());
+                assert!(response.end_turn);
+                assert_eq!(response.usage.output_tokens, output_tokens);
+                assert_eq!(response.usage.reasoning_tokens, Some(reasoning_tokens));
+                assert_eq!(response.provider_replay, Some(ProviderReplayUpdate::Clear));
+            }
+        }
     }
 
     #[test]
