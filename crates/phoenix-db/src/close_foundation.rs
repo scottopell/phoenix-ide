@@ -4598,6 +4598,7 @@ impl Database {
     ///
     /// # Errors
     /// Rejects absent runs, unavailable captured scope authority, and persistence failures.
+    #[allow(clippy::too_many_lines)]
     pub async fn classify_interrupted_close_run(
         &self,
         run: &CloseRunRef,
@@ -4738,6 +4739,9 @@ impl Database {
     }
 
     /// Derives every unresolved target from retained sealed inventory and exact proofs.
+    ///
+    /// # Errors
+    /// Returns a database error when retained inventory or proof rows cannot be read.
     pub async fn unresolved_expected_close_cleanup_resources(
         &self,
         attempt_id: &str,
