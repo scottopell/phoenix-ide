@@ -545,6 +545,12 @@ AND no reasoning tokens are reported when reasoning items are absent
 AND the stream did not previously expose non-empty visible output or a function call in stream events
 THEN Phoenix SHALL settle the request as a valid quiet end turn without fabricating visible assistant text.
 
+WHEN any stream event exposes non-empty visible output or a function call
+THEN Phoenix SHALL retain that evidence through terminal assembly and SHALL NOT settle quietly if a later event overwrites or omits the output item.
+
+WHEN reasoning-token usage is present but is not a nonnegative in-range integer
+THEN Phoenix SHALL classify the result as a retryable provider failure rather than treating the malformed value as absent or zero.
+
 WHEN a Responses terminal includes reasoning items but does not report a positive reasoning-token subset of billed output
 THEN Phoenix SHALL classify the result as a retryable provider failure rather than treating it as an unbilled empty turn.
 

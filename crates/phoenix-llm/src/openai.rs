@@ -261,6 +261,7 @@ struct ResponsesStreamAccumulator {
     input_tokens: u32,
     output_tokens: u32,
     reasoning_tokens: Option<u32>,
+    invalid_reasoning_tokens: bool,
     /// Cached-read subset of `input_tokens`.
     cached_tokens: u32,
     /// Cache-write subset of `input_tokens` on GPT-5.6-era models.
@@ -316,12 +317,24 @@ fn has_streamed_visible_output(event_type: &str, event: &serde_json::Value) -> b
     }
 }
 
+fn output_item_has_non_reasoning_output(item: &serde_json::Value) -> bool {
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("function_call") => true,
+        Some("message") => item
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|content| content.iter().any(has_visible_content_part)),
+        _ => false,
+    }
+}
+
 impl ResponsesStreamAccumulator {
     fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
             reasoning_tokens: None,
+            invalid_reasoning_tokens: false,
             cached_tokens: 0,
             cache_write_tokens: 0,
             output_items: BTreeMap::new(),
@@ -431,6 +444,8 @@ impl ResponsesStreamAccumulator {
             }
             "response.output_item.done" => {
                 if let Some(item) = v.get("item") {
+                    self.observed_non_reasoning_output |=
+                        output_item_has_non_reasoning_output(item);
                     match serde_json::from_value::<ResponsesApiOutput>(item.clone()) {
                         Ok(output) => {
                             tracing::debug!(
@@ -559,10 +574,12 @@ impl ResponsesStreamAccumulator {
                             .unwrap_or(0),
                     )
                     .unwrap_or(0);
-                    self.reasoning_tokens = usage
-                        .pointer("/output_tokens_details/reasoning_tokens")
-                        .and_then(serde_json::Value::as_u64)
-                        .and_then(|value| u32::try_from(value).ok());
+                    if let Some(value) = usage.pointer("/output_tokens_details/reasoning_tokens") {
+                        match value.as_u64().and_then(|value| u32::try_from(value).ok()) {
+                            Some(tokens) => self.reasoning_tokens = Some(tokens),
+                            None => self.invalid_reasoning_tokens = true,
+                        }
+                    }
                     self.cached_tokens = u32::try_from(
                         usage
                             .pointer("/input_tokens_details/cached_tokens")
@@ -664,6 +681,12 @@ impl ResponsesStreamAccumulator {
             output_tokens = self.output_tokens,
             "responses_api stream accumulator finalizing"
         );
+        if self.invalid_reasoning_tokens {
+            return Err(LlmError::server_error(
+                "OpenAI returned invalid reasoning token usage",
+            ));
+        }
+
         let telemetry = self.telemetry;
         let mut response = normalize_responses_api_response_with_evidence(
             ResponsesApiResponse {
@@ -7365,6 +7388,119 @@ mod tests {
                 .expect_err("observed non-reasoning output cannot disappear on SSE");
             assert_eq!(sse_error.kind, crate::LlmErrorKind::ServerError);
             assert!(sse_error.kind.is_auto_retryable());
+        }
+    }
+
+    #[tokio::test]
+    async fn overwritten_completed_output_items_remain_loss_evidence_on_both_transports() {
+        let request = empty_request();
+        let prior_items = [
+            serde_json::json!({
+                "type": "message", "id": "visible-text", "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "answer"}]
+            }),
+            serde_json::json!({
+                "type": "message", "id": "visible-refusal", "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "refusal"}]
+            }),
+            serde_json::json!({
+                "type": "function_call", "id": "tool-1", "call_id": "call-1",
+                "name": "get_weather", "arguments": "{}", "status": "completed"
+            }),
+        ];
+        let quiet_message = serde_json::json!({
+            "type": "message", "id": "quiet", "status": "completed",
+            "role": "assistant", "content": []
+        });
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-overwritten-output", "status": "completed",
+                "output": [quiet_message.clone()],
+                "usage": {"input_tokens": 1000, "output_tokens": 4,
+                    "output_tokens_details": {"reasoning_tokens": 0}}
+            }
+        })
+        .to_string();
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
+
+        for prior_item in prior_items {
+            for websocket in [true, false] {
+                let mut accumulator = ResponsesStreamAccumulator::new(Instant::now(), &request);
+                for item in [prior_item.clone(), quiet_message.clone()] {
+                    let done = serde_json::json!({
+                        "type": "response.output_item.done", "output_index": 0, "item": item
+                    })
+                    .to_string();
+                    accumulator
+                        .process_event("response.output_item.done", &done, &chunk_tx)
+                        .await
+                        .unwrap();
+                }
+                accumulator
+                    .process_event("response.completed", &terminal, &chunk_tx)
+                    .await
+                    .unwrap();
+                let error = if websocket {
+                    let CodexWsError::Backend(error) =
+                        finalize_websocket_response(accumulator, "gpt-test").unwrap_err()
+                    else {
+                        panic!("lost output must remain a provider error");
+                    };
+                    error
+                } else {
+                    finalize_responses_stream(accumulator, "gpt-test").unwrap_err()
+                };
+                assert_eq!(error.kind, crate::LlmErrorKind::ServerError);
+                assert!(error.kind.is_auto_retryable());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_reasoning_usage_wire_values_fail_on_both_transports() {
+        let request = empty_request();
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
+        for reasoning_tokens in [
+            serde_json::json!(-1),
+            serde_json::json!(4_294_967_296_u64),
+            serde_json::json!("invalid"),
+        ] {
+            let terminal = serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-invalid-usage", "status": "completed",
+                    "output": [{
+                        "type": "message", "id": "quiet", "status": "completed",
+                        "role": "assistant", "content": []
+                    }],
+                    "usage": {"input_tokens": 1000, "output_tokens": 4,
+                        "output_tokens_details": {"reasoning_tokens": reasoning_tokens}}
+                }
+            })
+            .to_string();
+
+            for websocket in [true, false] {
+                let mut accumulator = ResponsesStreamAccumulator::new(Instant::now(), &request);
+                accumulator
+                    .process_event("response.completed", &terminal, &chunk_tx)
+                    .await
+                    .unwrap();
+                let error = if websocket {
+                    let CodexWsError::Backend(error) =
+                        finalize_websocket_response(accumulator, "gpt-test").unwrap_err()
+                    else {
+                        panic!("invalid usage must remain a provider error");
+                    };
+                    error
+                } else {
+                    finalize_responses_stream(accumulator, "gpt-test").unwrap_err()
+                };
+                assert_eq!(error.kind, crate::LlmErrorKind::ServerError);
+                assert!(error.kind.is_auto_retryable());
+            }
         }
     }
 
