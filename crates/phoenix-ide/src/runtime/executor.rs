@@ -18875,6 +18875,43 @@ mod steer_drain_detector_tests {
             .is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn bash_wait_mid_persistence_expiry_closes_authority_and_blocks_publication() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-mid-persist",
+            bash_wait_executing_state("wait-mid-persist", "b-mid-persist", Some(0)),
+            vec![],
+        );
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        let (write_started, write_release) = storage.gate_message_add();
+        let transition = tokio::spawn(async move {
+            let result = rt
+                .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                    ToolResult::success(
+                        "wait-mid-persist".to_string(),
+                        "completed before persistence stalled".to_string(),
+                    ),
+                )))
+                .await;
+            (rt, result)
+        });
+
+        write_started.await.unwrap();
+        assert!(!fence.is_closed());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        let (rt, result) = transition.await.unwrap();
+        assert!(result
+            .unwrap_err()
+            .contains("absolute settlement deadline; fatal local authority fence closed"));
+        assert!(fence.is_closed());
+        assert!(fence.try_acquire().is_err());
+        assert!(rt.live_state_owner().is_err());
+        assert!(storage.get_all_messages("bash-wait-mid-persist").is_empty());
+        assert!(write_release.send(()).is_err());
+    }
+
     #[tokio::test]
     async fn subagent_pre_state_persist_failure_restores_terminal_transition() {
         let (mut rt, storage) = build_runtime_with_state_and_queue(
