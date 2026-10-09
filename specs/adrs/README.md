@@ -102,6 +102,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [086](086_mcp-credential-removal-has-durable-intent.md) | MCP credential removal has durable intent | Accepted | REQ-MCP-012; credential-removal recovery |
 | [087](087_tmux-effects-go-through-a-backend-seam.md) | Tmux effects go through a backend seam, and tests use an in-memory fake | Accepted | tmux registry and `tmux_run`; Close retirement of tmux servers |
 | [088](088_federation-pins-imported-private-ca-trust-per-peer.md) | Federation pins imported private-CA trust per peer | Accepted | REQ-RQD-003, REQ-RQD-004; federation enrollment transfer and caller-side peer persistence |
+| [089](089_federation-validates-ca-capability-and-types-ipv6-persistence.md) | Federation validates CA capability and types IPv6 persistence | Accepted | REQ-RQD-003, REQ-RQD-004; peer origin and private-CA admission |
 
 ## For agents: which decisions bind your task
 
@@ -115,7 +116,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
-| Implementing federation peer TLS trust or enrollment transfer | 088, then 083 and 034 |
+| Implementing federation peer TLS trust, enrollment transfer, or peer origins | 089, then 088, 083, and 034 |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Creating or restructuring Phoenix spec artifacts | 000 |
@@ -176,6 +177,9 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-007 (Conversation creation uses fenced reconciliation)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
+      ├── ADR-083 (Federation establishes stable instance identity and excludes known credentials from agent SQL)
+      │   └── ADR-088 (Federation pins imported private-CA trust per peer)
+      │       └── ADR-089 (Federation validates CA capability and types IPv6 persistence)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
       │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)

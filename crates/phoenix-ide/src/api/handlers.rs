@@ -114,6 +114,8 @@ const STREAMING_ROUTES: &[&str] = &[
     "/api/conversations/:id/browser-view",
 ];
 
+const MAX_REMOTE_QUERY_REQUEST_BODY_BYTES: usize = 100 * 1024;
+
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
     // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
@@ -646,7 +648,8 @@ pub fn create_router(state: AppState) -> Router {
     let peer_router = Router::new()
         .route(
             "/api/federation/peer/query-database",
-            post(super::federation::query_database),
+            post(super::federation::query_database)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -18124,6 +18127,43 @@ mod wake_handler_tests {
         assert_eq!(body["destination_instance_id"], destination.to_string());
         assert_eq!(body["caller_instance_id"], caller.to_string());
         assert_eq!(body["result"]["rows"][0][0]["value"], 1);
+    }
+
+    #[tokio::test]
+    async fn peer_query_database_bounds_body_before_json_extraction() {
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        state.password = Some("owner-password".to_string());
+        let caller = phoenix_core::domain::instance_identity::InstanceId::new();
+        let token = format!("phx_peer_{}", "a".repeat(43));
+        state
+            .db
+            .replace_federation_enrollment(
+                caller,
+                "peer",
+                &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    token.as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+        let oversized_body = " ".repeat(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES + 1);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(oversized_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use phoenix_core::domain::instance_identity::{
-    InstanceId, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem, PeerTlsTrust,
+    InstanceId, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem, PeerHost, PeerTlsTrust,
 };
 use sqlx::Row;
 
@@ -36,14 +36,19 @@ impl Database {
             PeerTlsTrust::PlatformRoots => None,
             PeerTlsTrust::PrivateCa { certificate_pem } => Some(certificate_pem.expose()),
         };
+        let (domain_or_ipv4_host, ipv6_host) = match base_url.host() {
+            PeerHost::DomainOrIpv4(host) => (Some(host.to_owned()), None),
+            PeerHost::Ipv6(address) => (None, Some(address.octets().to_vec())),
+        };
         sqlx::query(
             "INSERT INTO federation_peer_connections
-                 (peer_instance_id, peer_display_name, host, port, bearer_credential,
-                  tls_ca_certificate_pem, created_at_us)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+                  bearer_credential, tls_ca_certificate_pem, created_at_us)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(peer_instance_id) DO UPDATE SET
                  peer_display_name = excluded.peer_display_name,
-                 host = excluded.host,
+                 domain_or_ipv4_host = excluded.domain_or_ipv4_host,
+                 ipv6_host = excluded.ipv6_host,
                  port = excluded.port,
                  bearer_credential = excluded.bearer_credential,
                  tls_ca_certificate_pem = excluded.tls_ca_certificate_pem,
@@ -51,7 +56,8 @@ impl Database {
         )
         .bind(peer_instance_id.to_string())
         .bind(peer_display_name)
-        .bind(base_url.host())
+        .bind(domain_or_ipv4_host)
+        .bind(ipv6_host)
         .bind(i64::from(base_url.port()))
         .bind(bearer_credential.expose())
         .bind(tls_ca_certificate_pem)
@@ -71,8 +77,8 @@ impl Database {
         peer_instance_id: InstanceId,
     ) -> DbResult<Option<FederationPeerConnection>> {
         let row = sqlx::query(
-            "SELECT peer_instance_id, peer_display_name, host, port, bearer_credential,
-                    tls_ca_certificate_pem, created_at_us
+            "SELECT peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+                    bearer_credential, tls_ca_certificate_pem, created_at_us
              FROM federation_peer_connections WHERE peer_instance_id = ?1",
         )
         .bind(peer_instance_id.to_string())
@@ -80,21 +86,42 @@ impl Database {
         .await?;
         row.map(|row| {
             let id: String = row.try_get("peer_instance_id")?;
-            let host: String = row.try_get("host")?;
+            let domain_or_ipv4_host: Option<String> = row.try_get("domain_or_ipv4_host")?;
+            let ipv6_host: Option<Vec<u8>> = row.try_get("ipv6_host")?;
             let port: i64 = row.try_get("port")?;
             let bearer: String = row.try_get("bearer_credential")?;
             let ca_certificate: Option<String> = row.try_get("tls_ca_certificate_pem")?;
             let created_at_us: i64 = row.try_get("created_at_us")?;
+            let ipv6_address = ipv6_host
+                .map(|bytes| {
+                    <[u8; 16]>::try_from(bytes)
+                        .map(std::net::Ipv6Addr::from)
+                        .map_err(|_| {
+                            DbError::Serialization(
+                                "peer IPv6 host must contain exactly 16 bytes".to_string(),
+                            )
+                        })
+                })
+                .transpose()?;
+            let typed_host = match (domain_or_ipv4_host.as_deref(), ipv6_address) {
+                (Some(host), None) => PeerHost::DomainOrIpv4(host),
+                (None, Some(address)) => PeerHost::Ipv6(address),
+                _ => {
+                    return Err(DbError::Serialization(
+                        "peer connection must contain exactly one typed host".to_string(),
+                    ));
+                }
+            };
+            let base_url = PeerBaseUrl::from_host_port(
+                typed_host,
+                u16::try_from(port).map_err(|error| DbError::Serialization(error.to_string()))?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
             Ok(FederationPeerConnection {
                 peer_instance_id: InstanceId::from_str(&id)
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
                 peer_display_name: row.try_get("peer_display_name")?,
-                base_url: PeerBaseUrl::from_host_port(
-                    &host,
-                    u16::try_from(port)
-                        .map_err(|error| DbError::Serialization(error.to_string()))?,
-                )
-                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                base_url,
                 bearer_credential: PeerBearerCredential::parse(bearer)
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
                 tls_trust: match ca_certificate {
@@ -146,29 +173,37 @@ mod tests {
             "21f7f8de-8051-5b89-8680-0195ef798b6a",
             "00000000-0000-4000-0000-000000000000",
         ] {
-            assert!(sqlx::query(
-                "INSERT INTO federation_peer_connections
-                     (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
-                 VALUES (?1, 'peer', 'peer.example', 443, ?2, 1)",
-            )
-            .bind(id)
-            .bind(&bearer)
-            .execute(db.pool())
-            .await
-            .is_err(), "{id}");
+            assert!(
+                sqlx::query(
+                    "INSERT INTO federation_peer_connections
+                     (peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+                      bearer_credential, created_at_us)
+                 VALUES (?1, 'peer', 'peer.example', NULL, 443, ?2, 1)",
+                )
+                .bind(id)
+                .bind(&bearer)
+                .execute(db.pool())
+                .await
+                .is_err(),
+                "{id}"
+            );
         }
         for host in ["", "[", "%2F", "peer example", "peer.example\n"] {
-            assert!(sqlx::query(
-                "INSERT INTO federation_peer_connections
-                     (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
-                 VALUES (?1, 'peer', ?2, 443, ?3, 1)",
-            )
-            .bind(InstanceId::new().to_string())
-            .bind(host)
-            .bind(&bearer)
-            .execute(db.pool())
-            .await
-            .is_err(), "{host:?}");
+            assert!(
+                sqlx::query(
+                    "INSERT INTO federation_peer_connections
+                     (peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+                      bearer_credential, created_at_us)
+                 VALUES (?1, 'peer', ?2, NULL, 443, ?3, 1)",
+                )
+                .bind(InstanceId::new().to_string())
+                .bind(host)
+                .bind(&bearer)
+                .execute(db.pool())
+                .await
+                .is_err(),
+                "{host:?}"
+            );
         }
     }
 
@@ -180,7 +215,7 @@ mod tests {
             .unwrap();
         let peer = InstanceId::new();
         let first_url = PeerBaseUrl::from_str("https://peer.example").unwrap();
-        let second_url = PeerBaseUrl::from_str("https://renamed.example").unwrap();
+        let second_url = PeerBaseUrl::from_str("https://[2001:db8::1]:8031").unwrap();
         let first_token =
             PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap();
         let second_token =

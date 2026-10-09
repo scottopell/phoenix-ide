@@ -91,12 +91,12 @@ impl FromStr for PeerBaseUrl {
         if url.scheme() != "https" {
             return Err(PeerBaseUrlError::NotHttps);
         }
-        let Some(host) = url.host_str() else {
+        let Some(host) = url.host() else {
             return Err(PeerBaseUrlError::ContainsAmbientData);
         };
-        if !host
+        if matches!(host, url::Host::Domain(domain) if !domain
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')))
         {
             return Err(PeerBaseUrlError::ContainsAmbientData);
         }
@@ -123,6 +123,12 @@ impl fmt::Display for PeerBaseUrl {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerHost<'a> {
+    DomainOrIpv4(&'a str),
+    Ipv6(std::net::Ipv6Addr),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FederationQueryDatabaseEndpoint(url::Url);
 
@@ -134,15 +140,25 @@ impl FederationQueryDatabaseEndpoint {
 }
 
 impl PeerBaseUrl {
-    /// Return the normalized ASCII hostname.
+    /// Return the typed normalized host.
     ///
     /// # Panics
     /// Panics only if this value bypassed `PeerBaseUrl` construction.
     #[must_use]
-    pub fn host(&self) -> &str {
-        self.0
-            .host_str()
+    pub fn host(&self) -> PeerHost<'_> {
+        match self
+            .0
+            .host()
             .expect("validated HTTPS origin always has a host")
+        {
+            url::Host::Domain(domain) => PeerHost::DomainOrIpv4(domain),
+            url::Host::Ipv4(_address) => PeerHost::DomainOrIpv4(
+                self.0
+                    .host_str()
+                    .expect("validated IPv4 origin always has a host"),
+            ),
+            url::Host::Ipv6(address) => PeerHost::Ipv6(address),
+        }
     }
 
     /// Return the explicit or HTTPS-default port.
@@ -173,8 +189,11 @@ impl PeerBaseUrl {
     ///
     /// # Errors
     /// Returns an error if the persisted host and port do not form a bare HTTPS origin.
-    pub fn from_host_port(host: &str, port: u16) -> Result<Self, PeerBaseUrlError> {
-        Self::from_str(&format!("https://{host}:{port}"))
+    pub fn from_host_port(host: PeerHost<'_>, port: u16) -> Result<Self, PeerBaseUrlError> {
+        match host {
+            PeerHost::DomainOrIpv4(host) => Self::from_str(&format!("https://{host}:{port}")),
+            PeerHost::Ipv6(address) => Self::from_str(&format!("https://[{address}]:{port}")),
+        }
     }
 }
 
@@ -254,6 +273,7 @@ impl PeerCaCertificatePem {
         let [certificate]: [_; 1] = certificates
             .try_into()
             .map_err(|_| PeerCaCertificatePemError::CertificateCount)?;
+        validate_peer_ca_certificate(certificate.as_ref())?;
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(certificate)
@@ -265,6 +285,27 @@ impl PeerCaCertificatePem {
     pub fn expose(&self) -> &str {
         &self.0
     }
+}
+
+fn validate_peer_ca_certificate(der: &[u8]) -> Result<(), PeerCaCertificatePemError> {
+    use x509_parser::prelude::FromDer as _;
+
+    let (remainder, certificate) = x509_parser::certificate::X509Certificate::from_der(der)
+        .map_err(|_| PeerCaCertificatePemError::Invalid)?;
+    let basic_constraints = certificate
+        .basic_constraints()
+        .map_err(|_| PeerCaCertificatePemError::Invalid)?;
+    if !remainder.is_empty() || !basic_constraints.is_some_and(|constraints| constraints.value.ca) {
+        return Err(PeerCaCertificatePemError::NotCertificateAuthority);
+    }
+    if certificate
+        .key_usage()
+        .map_err(|_| PeerCaCertificatePemError::Invalid)?
+        .is_some_and(|usage| !usage.value.key_cert_sign())
+    {
+        return Err(PeerCaCertificatePemError::NotCertificateAuthority);
+    }
+    Ok(())
 }
 
 impl serde::Serialize for PeerCaCertificatePem {
@@ -292,6 +333,8 @@ pub enum PeerCaCertificatePemError {
     Empty,
     #[error("peer CA certificate PEM exceeds 32 KiB")]
     TooLarge,
+    #[error("peer CA certificate PEM is not a certificate authority")]
+    NotCertificateAuthority,
     #[error("peer CA certificate PEM is invalid")]
     Invalid,
     #[error("peer CA certificate PEM must contain exactly one certificate")]
@@ -331,6 +374,21 @@ mod tests {
         assert_eq!(
             endpoint.as_url().as_str(),
             "https://peer.example:8443/api/federation/peer/query-database"
+        );
+        let ipv6 = PeerBaseUrl::from_str("https://[2001:db8::1]:8031").unwrap();
+        assert_eq!(ipv6.host(), PeerHost::Ipv6("2001:db8::1".parse().unwrap()));
+        assert_eq!(
+            PeerBaseUrl::from_str("https://127.0.0.1").unwrap().host(),
+            PeerHost::DomainOrIpv4("127.0.0.1")
+        );
+        assert_eq!(
+            PeerBaseUrl::from_host_port(PeerHost::Ipv6("2001:db8::1".parse().unwrap()), 8031)
+                .unwrap(),
+            ipv6
+        );
+        assert_eq!(
+            ipv6.query_database_endpoint().as_url().as_str(),
+            "https://[2001:db8::1]:8031/api/federation/peer/query-database"
         );
         for value in [
             "http://peer.example",
@@ -388,6 +446,37 @@ mod tests {
             )
             .unwrap_err(),
             PeerCaCertificatePemError::Invalid
+        );
+        let leaf_cert_path = temp.path().join("leaf.pem");
+        let leaf_key_path = temp.path().join("leaf-key.pem");
+        phoenix_tls::issue_leaf(
+            temp.path(),
+            &leaf_cert_path,
+            &leaf_key_path,
+            &["localhost".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            PeerCaCertificatePem::parse(std::fs::read_to_string(leaf_cert_path).unwrap())
+                .unwrap_err(),
+            PeerCaCertificatePemError::NotCertificateAuthority
+        );
+        let mut ca_without_key_cert_sign = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("empty SAN list is valid for CA certificates");
+        ca_without_key_cert_sign.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_without_key_cert_sign
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::DigitalSignature);
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        assert_eq!(
+            PeerCaCertificatePem::parse(
+                ca_without_key_cert_sign
+                    .self_signed(&key_pair)
+                    .unwrap()
+                    .pem(),
+            )
+            .unwrap_err(),
+            PeerCaCertificatePemError::NotCertificateAuthority
         );
     }
 

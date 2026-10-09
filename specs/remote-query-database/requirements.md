@@ -55,6 +55,7 @@ AND SHALL NOT grant those operations through peer credentials.
 ### REQ-RQD-003: Closed HTTPS Transport Without Redirects
 
 THE SYSTEM SHALL construct only the fixed `/api/federation/peer/query-database` endpoint beneath the enrolled bare HTTPS origin
+AND SHALL support domain, IPv4, and bracketed IPv6 origins
 AND SHALL reject origin values containing URL credentials, a non-root path, query, or fragment.
 
 THE SYSTEM SHALL send one authenticated POST with a 30-second request timeout
@@ -74,7 +75,7 @@ AND SHALL NOT apply it to another peer, disable certificate or hostname verifica
 IF the selected peer's TLS trust cannot be established
 THE SYSTEM SHALL fail the operation without an insecure transport fallback.
 
-THE owner-authorized enrollment transfer SHALL identify platform roots or carry exactly one bounded public private-CA certificate
+THE owner-authorized enrollment transfer SHALL identify platform roots or carry exactly one bounded public private-CA certificate whose Basic Constraints identify it as a certificate authority and whose Key Usage permits certificate signing when that extension is present
 AND SHALL NOT carry a private key, infer trust on first use, or replace an enrolled trust anchor without an explicit owner-authorized import.
 
 THE owner SHALL supply the peer origin during import
@@ -108,6 +109,8 @@ THE receiver SHALL deny known credential-bearing columns, including owner sessio
 AND SHALL NOT present the policy as a guarantee that all application data is nonsensitive.
 
 ### REQ-RQD-007: Bounded Values, Work, and Admission
+
+THE receiver SHALL apply a bounded HTTP request-body envelope before JSON extraction.
 
 THE receiver SHALL limit SQL input to 16 KiB, result columns to 64, returned rows to 200, and the serialized query result to 64 KiB
 AND SHALL report `truncated` when rows are omitted to fit row or output limits rather than return partial rows.
