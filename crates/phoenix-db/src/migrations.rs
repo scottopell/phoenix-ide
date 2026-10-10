@@ -1494,7 +1494,7 @@ CHECK (
 ";
 
 const MIGRATION_121: &str = r"
-CREATE TABLE federation_peer_connections_v121 (
+CREATE TEMP TABLE federation_peer_connections_v121 (
     peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
         typeof(peer_instance_id) = 'text'
         AND length(peer_instance_id) = 36
@@ -1553,7 +1553,59 @@ SELECT peer_instance_id, peer_display_name, host, NULL, port,
        bearer_credential, tls_ca_certificate_pem, created_at_us
 FROM federation_peer_connections;
 DROP TABLE federation_peer_connections;
-ALTER TABLE federation_peer_connections_v121 RENAME TO federation_peer_connections;
+CREATE TABLE federation_peer_connections (
+    peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
+        typeof(peer_instance_id) = 'text'
+        AND length(peer_instance_id) = 36
+        AND peer_instance_id = lower(peer_instance_id)
+        AND substr(peer_instance_id, 9, 1) = '-'
+        AND substr(peer_instance_id, 14, 1) = '-'
+        AND substr(peer_instance_id, 15, 1) = '4'
+        AND substr(peer_instance_id, 19, 1) = '-'
+        AND substr(peer_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(peer_instance_id, 24, 1) = '-'
+        AND length(replace(peer_instance_id, '-', '')) = 32
+        AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
+    domain_or_ipv4_host TEXT CHECK(
+        domain_or_ipv4_host IS NULL
+        OR (
+            typeof(domain_or_ipv4_host) = 'text'
+            AND length(domain_or_ipv4_host) > 0
+            AND domain_or_ipv4_host NOT GLOB '*[^A-Za-z0-9.-]*'
+        )
+    ),
+    ipv6_host BLOB CHECK(
+        ipv6_host IS NULL
+        OR (typeof(ipv6_host) = 'blob' AND length(ipv6_host) = 16)
+    ),
+    port INTEGER NOT NULL CHECK(
+        typeof(port) = 'integer' AND port BETWEEN 1 AND 65535
+    ),
+    bearer_credential TEXT NOT NULL UNIQUE CHECK(
+        bearer_credential GLOB 'phx_peer_*'
+        AND length(bearer_credential) = 52
+        AND substr(bearer_credential, 10) NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    tls_ca_certificate_pem TEXT CHECK(
+        tls_ca_certificate_pem IS NULL
+        OR (
+            typeof(tls_ca_certificate_pem) = 'text'
+            AND length(tls_ca_certificate_pem) BETWEEN 1 AND 32768
+            AND tls_ca_certificate_pem LIKE '-----BEGIN CERTIFICATE-----%'
+            AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
+        )
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    CHECK((domain_or_ipv4_host IS NULL) <> (ipv6_host IS NULL)),
+    UNIQUE(domain_or_ipv4_host, port),
+    UNIQUE(ipv6_host, port)
+);
+INSERT INTO federation_peer_connections SELECT * FROM federation_peer_connections_v121;
+DROP TABLE federation_peer_connections_v121;
 ";
 
 const MIGRATION_113: &str = "";
@@ -12898,6 +12950,26 @@ mod tests {
         .await
         .unwrap();
 
+        sqlx::raw_sql(
+            "CREATE TABLE legacy_schema_dependency (value TEXT);
+             CREATE TRIGGER legacy_schema_dependency_trigger
+             AFTER INSERT ON legacy_schema_dependency
+             BEGIN
+                 SELECT missing_column FROM conversations;
+             END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let legacy_trigger_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'legacy_schema_dependency_trigger'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
         sqlx::raw_sql(MIGRATION_121).execute(&pool).await.unwrap();
         let preserved: (String, Option<Vec<u8>>, String) = sqlx::query_as(
             "SELECT domain_or_ipv4_host, ipv6_host, bearer_credential
@@ -12915,6 +12987,14 @@ mod tests {
                 format!("phx_peer_{}", "a".repeat(43)),
             )
         );
+        let preserved_trigger_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'legacy_schema_dependency_trigger'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved_trigger_sql, legacy_trigger_sql);
 
         let ipv6_peer = phoenix_core::domain::instance_identity::InstanceId::new();
         sqlx::query(
