@@ -5897,12 +5897,21 @@ impl RuntimeManager {
                     self.db.clone(),
                     self.message_retriever.clone(),
                 );
+                if conv.runtime_role != crate::work_scope::RuntimeRole::User {
+                    return Err("ordinary parent tool registry requires user runtime role".into());
+                }
                 let send_chat =
                     Arc::new(crate::send_chat_service::SendChatApplicationService::new(
                         self.db.clone(),
                         self.clone(),
                     ));
-                let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
+                let writing_tools =
+                    crate::coordinator_tools::writing_tools(global_read.clone(), send_chat);
+                let predecessor_tool = crate::coordinator_tools::previous_transcripts_tool(
+                    global_read,
+                    conv.product_conversation_id.clone(),
+                    conv.id.clone(),
+                );
                 let approved_registry = approved_managed_registry(
                     &conv.conv_mode,
                     context.resource_authority,
@@ -5945,12 +5954,14 @@ impl RuntimeManager {
                         None,
                     ),
                 };
+                let registry = registry.try_with_host_bound_tool(predecessor_tool.clone())?;
                 ToolRegistryExecutor::with_mcp(
                     registry,
                     self.mcp_manager.clone(),
                     agent_catalog.clone(),
                 )
                 .with_writing_tools(upgrade_writing_tools)
+                .with_predecessor_tool(predecessor_tool)
             }
         };
 
@@ -6160,6 +6171,20 @@ impl RuntimeManager {
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
             .with_agent_config(agent_config);
+        let runtime = if !is_sub_agent && !is_coordinator {
+            runtime.with_previous_transcripts(
+                crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                ),
+                crate::api::global_read::PreviousTranscriptsBinding::new(
+                    conv.product_conversation_id.clone(),
+                    conv.id.clone(),
+                ),
+            )
+        } else {
+            runtime
+        };
         let runtime = if let Some(parent_conversation_id) = conv.parent_conversation_id.clone() {
             runtime.with_parent_dispatch(
                 parent_conversation_id,
