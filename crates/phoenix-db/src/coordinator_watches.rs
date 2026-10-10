@@ -668,6 +668,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_without_provider_replay_persists_approval_event_atomically() {
+        use phoenix_core::domain::db_schema::{Message, MessageContent, MessageType};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation(
+                "checkpoint-wait",
+                "Checkpoint wait",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let turn = source_turn(&db, &source.id, "checkpoint-turn").await;
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let assistant = Message {
+            origin: InputOrigin::UnknownHistorical,
+            message_id: "checkpoint-assistant".into(),
+            conversation_id: source.id.clone(),
+            sequence_id: 10,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        sqlx::query("CREATE TRIGGER reject_wait_checkpoint BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'checkpoint test failure'); END")
+            .execute(db.pool()).await.unwrap();
+        assert!(db
+            .persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .is_err());
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db.get_message_by_id(&assistant.message_id).await.is_err());
+        sqlx::query("DROP TRIGGER reject_wait_checkpoint")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, WatchOutcome::AwaitingTaskApproval);
+        assert_eq!(
+            db.get_conversation(&source.id).await.unwrap().state,
+            waiting
+        );
+        assert!(db.get_message_by_id(&assistant.message_id).await.is_ok());
+        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none());
+    }
+
+    #[tokio::test]
     async fn wait_outbox_and_state_rollback_together_before_delivery() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wait.db");
