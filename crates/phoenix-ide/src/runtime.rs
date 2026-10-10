@@ -13546,6 +13546,95 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn watch_wait_input_is_claimed_executed_and_settled_once() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(llm.clone()).await);
+        let global = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let source = manager
+            .db()
+            .create_conversation(
+                "worker-wait-source",
+                "Worker wait source",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        manager
+            .db()
+            .update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        let event = manager
+            .db()
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .remove(0);
+        crate::coordinator_watch_delivery::deliver_pass(&manager).await;
+        let handle = manager.get_or_create(&global.id).await.unwrap();
+        let mut states = handle.state_rx.clone();
+        manager.dispatch_standalone_turn(&global.id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if *states.borrow_and_update() == ConvState::Idle {
+                    let terminal: Option<String> = sqlx::query_scalar(
+                        "SELECT terminal_kind FROM durable_turns WHERE origin_subscription_event_id = ?1",
+                    ).bind(&event.event_id).fetch_one(manager.db().pool()).await.unwrap();
+                    if terminal.is_some() { break; }
+                }
+                states.changed().await.expect("runtime remains live through settlement");
+            }
+        }).await.expect("watch input settles through real worker and executor");
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(&source.id)
+                .await
+                .unwrap()
+                .state,
+            waiting
+        );
+        crate::coordinator_watch_delivery::deliver_pass(&manager).await;
+        manager.dispatch_standalone_turn(&global.id).await.unwrap();
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let terminal: String = sqlx::query_scalar(
+            "SELECT terminal_kind FROM durable_turns WHERE origin_subscription_event_id = ?1 AND conversation_id = ?2",
+        ).bind(&event.event_id).bind(&global.id).fetch_one(manager.db().pool()).await.unwrap();
+        let unconsumed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND terminal_kind IS NULL",
+        ).bind(&global.id).fetch_one(manager.db().pool()).await.unwrap();
+        assert_eq!(
+            unconsumed, 0,
+            "duplicate passes must leave no queued turn to execute later"
+        );
+        assert_eq!(terminal, "Completed");
+    }
+
+    #[tokio::test]
     async fn interaction_response_occurrence_wins_over_nonresumable_baton_shape() {
         let conversation_id = "restart-interaction-response-with-baton";
         let db = crate::db::Database::open_in_memory().await.expect("db");

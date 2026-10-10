@@ -111,7 +111,7 @@ The comparator establishes a policy gap, not a shared incident cause.
 | Delays | Nominal overload waits 4s/8s/16s/32s, with deterministic ±25% jitter derived from stable logical identity and target attempt. |
 | Provider guidance | Standard `Retry-After` (seconds/date) and supported millisecond equivalents are typed separately from quota reset. A valid hint is a floor. A hint over 30s terminates automatic recovery visibly rather than being truncated. |
 | Elapsed budget | Fixed 120s absolute window captured at first overload; never renewed by retry, reconnect, process restart, or policy routing. Dispatch and provider work are rejected/timed out at the same deadline. |
-| Durability | Persisted typed waiting/in-flight state owns target, attempt, retry time, start, deadline, and continuation operation identity. Migration 120 expands the relational discriminator and marks the rollback boundary. |
+| Durability | Persisted typed waiting/in-flight state owns target, attempt, retry time, start, deadline, and continuation operation identity. Migration 121 expands the relational discriminator and marks the rollback boundary. |
 | Visibility | SSE/UI shows `retry K/5 model overloaded` and countdown. Exhaustion clears live retry context and publishes ordinary `Error` or continuation `RecoverableContinuationFailure`. |
 | Cancellation/Close | Timer generation and task are retired; stale timeout is ignored; fatal close releases admitted authority. |
 | Restart | Waiting state rearms remaining time; due work dispatches once; expired state settles visibly without provider dispatch; in-flight work recovers under the original deadline. |
@@ -128,7 +128,7 @@ Structural correction:
 - preserves provider retry guidance in typed overload errors without conflating quota windows;
 - represents overload retry as one persisted waiting/in-flight lifecycle;
 - uses one shared reducer policy for ordinary and continuation summary work;
-- expands the SQLite `state_kind` domain in migration 120 and preserves the state through startup reset/materialization;
+- expands the SQLite `state_kind` domain in migration 121 and preserves the state through startup reset/materialization;
 - projects a narrow public/UI state rather than exposing the persisted continuation request;
 - uses existing generation, operation, and direct-turn ownership fences for cancellation and duplicate suppression;
 - updates normative LLM, retry-visibility, Bedrock, provider Allium, and ADR-089.

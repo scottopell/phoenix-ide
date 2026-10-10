@@ -613,8 +613,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 120,
+        name: "coordinator_question_wait_events",
+        sql: include_str!("coordinator_watches/question_wait_outbox.sql"),
+    },
+    Migration {
+        version: 121,
         name: "admit_server_overload_retrying_state",
-        sql: MIGRATION_120,
+        sql: MIGRATION_121,
     },
 ];
 
@@ -1750,7 +1755,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_120: &str = r"
+const MIGRATION_121: &str = r"
 UPDATE sqlite_schema
 SET sql = replace(
     sql,
@@ -1775,7 +1780,7 @@ WHERE type = 'table'
 ";
 
 #[cfg(test)]
-mod migration_120_tests {
+mod migration_121_tests {
     use super::{run_pending_migrations, MIGRATIONS};
     use sqlx::{sqlite::SqlitePoolOptions, Row};
 
@@ -1807,7 +1812,7 @@ mod migration_120_tests {
         .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version <= 119)
+            .filter(|migration| migration.version <= 120)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -1833,7 +1838,7 @@ mod migration_120_tests {
                 .get("sql");
         assert!(close_schema.contains("'server_overload_retrying'"));
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 120")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 121")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -11265,7 +11270,7 @@ async fn apply_migration_body(
     Ok(())
 }
 
-async fn run_migration_120(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+async fn run_migration_121(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
     let result = async {
         let mut tx = guard.connection().begin().await?;
@@ -11304,7 +11309,7 @@ async fn run_migration_120(pool: &SqlitePool, migration: &Migration) -> DbResult
                     .is_some_and(|schema| !schema.contains("'server_overload_retrying'"))
             {
                 return Err(DbError::Serialization(
-                    "migration 120 expected overload-compatible conversation and Close schemas"
+                    "migration 121 expected overload-compatible conversation and Close schemas"
                         .to_string(),
                 ));
             }
@@ -11393,8 +11398,8 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             continue;
         }
 
-        if migration.version == 120 {
-            run_migration_120(pool, migration).await?;
+        if migration.version == 121 {
+            run_migration_121(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -12954,7 +12959,8 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (120, "admit_server_overload_retrying_state"),
+            (121, "admit_server_overload_retrying_state"),
+            (120, "coordinator_question_wait_events"),
             (119, "close_cleanup_failures"),
             (118, "persist_mcp_token_removals"),
             (117, "persist_conversation_tool_policy"),
@@ -17916,7 +17922,8 @@ mod tests {
                     (108, 'temporarily_skip_authority_timestamp_storage_class'),
                     (111, 'temporarily_skip_coordinator_watches'),
                     (113, 'temporarily_skip_historical_continuation_settlement'),
-                    (119, 'temporarily_skip_close_cleanup_failures')",
+                    (119, 'temporarily_skip_close_cleanup_failures'),
+                    (120, 'temporarily_skip_coordinator_question_wait_events')",
         )
         .execute(&pool)
         .await
@@ -18816,7 +18823,8 @@ mod tests {
                     (108, 'temporarily_skip_authority_timestamp_storage_class'),
                     (111, 'temporarily_skip_coordinator_watches'),
                     (113, 'temporarily_skip_historical_continuation_settlement'),
-                    (119, 'temporarily_skip_close_cleanup_failures')",
+                    (119, 'temporarily_skip_close_cleanup_failures'),
+                    (120, 'temporarily_skip_coordinator_question_wait_events')",
         )
         .execute(pool)
         .await
