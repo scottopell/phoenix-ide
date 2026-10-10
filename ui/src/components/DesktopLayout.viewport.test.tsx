@@ -165,9 +165,10 @@ describe('app viewport ownership', () => {
       /@media\s*\(display-mode:\s*standalone\)\s*\{\s*:root\s*\{[^}]*--app-safe-area-top:\s*env\(safe-area-inset-top,\s*0px\);/s,
     );
     expect(appCss).toMatch(
-      /@media\s*\(display-mode:\s*standalone\)\s*\{\s*\.app-viewport:not\(\.desktop-layout\)\s*\{[^}]*padding-top:\s*var\(--app-safe-area-top\);/s,
+      /@media\s*\(display-mode:\s*standalone\)\s*\{\s*\.app-viewport:not\(\.desktop-layout\) > \.app-safe-area-top\s*\{[^}]*flex:\s*0 0 var\(--app-safe-area-top\);[^}]*background:\s*var\(--bg-primary\);[^}]*pointer-events:\s*none;/s,
     );
     expect(ruleFor('.app-viewport')).not.toMatch(/padding-top/);
+    expect(appCss).not.toMatch(/\.app-viewport:not\(\.desktop-layout\)\s*\{[^}]*padding-top:/s);
     expect(appCss).toMatch(/\.app-viewport:not\(\.desktop-layout\) \.product-conversation-page,[^{]*\.app-viewport:not\(\.desktop-layout\) \.coordinator-page\s*\{[^}]*height:\s*100%;/s);
     expect(appCss).not.toMatch(/\.list-page #main-area\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top/s);
     expect(appCss).not.toMatch(/#conversation-nav\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top/s);
