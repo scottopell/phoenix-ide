@@ -272,7 +272,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
                   if (event.key === 'Enter') {
                     event.stopPropagation();
                     event.preventDefault();
-                    if ((event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) onAdd();
+                    if ((event.metaKey || event.ctrlKey) && available && body.trim() && !event.nativeEvent.isComposing) onAdd();
                   }
                 }}
               />

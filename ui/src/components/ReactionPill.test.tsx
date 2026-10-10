@@ -142,6 +142,9 @@ describe('reaction pill', () => {
     const input = screen.getByRole('textbox');
     expect(input).toHaveValue('Retained desktop note');
     expect(input).toBeEnabled();
+    fireEvent.keyDown(input, { key: 'Enter', metaKey: true });
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true });
+    expect(add).not.toHaveBeenCalled();
     fireEvent.change(input, { target: { value: 'Still editable' } });
     expect(change).toHaveBeenCalledWith('Still editable');
     fireEvent.click(returnButton);
