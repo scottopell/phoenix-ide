@@ -608,7 +608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overload_retry_is_active_work_not_a_wait_event() {
+    async fn overload_does_not_claim_input_wait_or_settle_watched_turn() {
         use phoenix_core::domain::sm_state::{
             ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
         };
@@ -653,12 +653,27 @@ mod tests {
                 .unwrap();
         assert!(terminal.is_none(), "overload retry must remain active work");
 
-        db.update_conversation_state(&source.id, &ConvState::Completed { result: None })
-            .await
-            .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            turn_id,
+            0,
+            &source.id,
+            "Failed",
+            Some("overload recovery exhausted"),
+            false,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].outcome, WatchOutcome::Completed);
+        assert_eq!(
+            events[0].outcome,
+            WatchOutcome::Failed {
+                reason: "overload recovery exhausted".into(),
+            }
+        );
     }
 
     #[tokio::test]
