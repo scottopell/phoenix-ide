@@ -152,7 +152,7 @@ struct StateDetailBody: View {
                     .foregroundStyle(.secondary)
             }
 
-        case .serverOverloadRetrying(let attempt, let maxAttempts, let retryAt):
+        case .serverOverloadRetrying(let attempt, let maxAttempts, let retryAt, _):
             workingRow {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     Text(Self.overloadRetryText(

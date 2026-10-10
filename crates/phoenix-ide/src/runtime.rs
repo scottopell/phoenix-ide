@@ -1773,6 +1773,10 @@ pub(crate) fn public_conversation_state(state: &ConvState) -> serde_json::Value 
             "type": "server_overload_retrying",
             "attempt": retry.attempt,
             "max_attempts": phoenix_core::domain::retry_policy::OVERLOAD_MAX_ATTEMPTS,
+            "target": match &retry.target {
+                phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary => "ordinary",
+                phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation { .. } => "continuation",
+            },
             "retry_at": match &retry.phase {
                 phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting { retry_at } => {
                     Some(retry_at)
@@ -1781,6 +1785,38 @@ pub(crate) fn public_conversation_state(state: &ConvState) -> serde_json::Value 
             },
         }),
         _ => serde_json::to_value(state).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod public_overload_state_tests {
+    use super::*;
+    use phoenix_core::domain::sm_state::{
+        ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+    };
+
+    #[test]
+    fn public_projection_exposes_only_overload_target_discriminator() {
+        let now = chrono::Utc::now();
+        let projected = public_conversation_state(&ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Continuation {
+                    operation_id: "private-operation".into(),
+                    rejected_tool_calls: vec![],
+                },
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 2,
+                started_at: now,
+                deadline_at: now + chrono::Duration::seconds(120),
+                logical_request_id: "private-request".into(),
+                model_id: "private-model".into(),
+            },
+        });
+        assert_eq!(projected["target"], "continuation");
+        assert!(projected.get("retry").is_none());
+        assert!(projected.get("operation_id").is_none());
+        assert!(projected.get("logical_request_id").is_none());
+        assert!(projected.get("model_id").is_none());
     }
 }
 
