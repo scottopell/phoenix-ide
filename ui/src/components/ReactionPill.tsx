@@ -211,6 +211,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   }, [sourceDocked]);
 
   const returnToPassage = async () => {
+    captureSource?.();
     returnRequest.current?.abort();
     const request = new AbortController();
     returnRequest.current = request;

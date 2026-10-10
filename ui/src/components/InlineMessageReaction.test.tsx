@@ -350,8 +350,7 @@ describe('inline message reactions', () => {
     select(text);
     expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     window.getSelection()?.removeAllRanges();
-    fireEvent(document, new Event('selectionchange'));
-    await act(async () => { await new Promise(requestAnimationFrame); });
+    act(() => { fireEvent(document, new Event('selectionchange')); });
     expect(store.getSnapshot('conversation-a')).toBeNull();
   });
 

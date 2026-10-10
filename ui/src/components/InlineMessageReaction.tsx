@@ -103,6 +103,12 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
     };
     const selectionChange = () => {
       if (selectionInput.current !== null) selectionChangedDuringGesture.current = true;
+      const nativeSelection = window.getSelection();
+      if (selectionInput.current === null && (!nativeSelection || nativeSelection.rangeCount === 0 || nativeSelection.isCollapsed)) {
+        cancelAnimationFrame(frame);
+        read();
+        return;
+      }
       schedule();
     };
     document.addEventListener('selectionchange', selectionChange);
