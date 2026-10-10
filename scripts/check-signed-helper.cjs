@@ -19,7 +19,7 @@ function command(binary, args) {
   requireCheck(result.status === 0, 'artifact-command-failed');
   return (result.stdout || '') + (result.stderr || '');
 }
-function request(port, pathname, body, cookie) {
+function request(port, pathname, body, cookie, timeout = 10000) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: '127.0.0.1', port, path: pathname, method: body ? 'POST' : 'GET',
@@ -36,7 +36,7 @@ function request(port, pathname, body, cookie) {
       });
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text }));
     });
-    const timer = setTimeout(() => req.destroy(new AcceptanceFailure('request-timeout')), 1000);
+    const timer = setTimeout(() => req.destroy(new AcceptanceFailure('request-timeout')), timeout);
     req.on('error', reject);
     req.on('close', () => clearTimeout(timer));
     req.end(body);
@@ -158,7 +158,7 @@ async function checkSignedHelper(options, dependencies = {}) {
     while (Date.now() < deadline) {
       requireCheck(alive(), 'helper-exited-before-ready');
       try {
-        const response = await request(port, '/api/version');
+        const response = await request(port, '/api/version', null, null, 1000);
         if (response.status === 200) { observed = json(response.text); break; }
       } catch (error) {
         if (error instanceof AcceptanceFailure && error.message === 'invalid-json-response') throw error;

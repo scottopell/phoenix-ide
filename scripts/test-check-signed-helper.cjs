@@ -23,7 +23,8 @@ const app=http.createServer((req,res)=>{
   let body='';req.on('data',c=>body+=c);req.on('end',()=>{
    if(JSON.parse(body).password!==process.env.PHOENIX_PASSWORD)process.exit(7);
    if(mode==='login'){res.statusCode=403;res.end('{}');return;}
-   res.setHeader('set-cookie','phoenix-auth=PRIVATE-COOKIE; HttpOnly; Path=/');res.end('{}');
+   res.setHeader('set-cookie','phoenix-auth=PRIVATE-COOKIE; HttpOnly; Path=/');
+   if(mode==='delayed-login')setTimeout(()=>res.end('{}'),1200);else res.end('{}');
   });return;
  }
  if(req.url==='/api/deployment'){
@@ -114,6 +115,14 @@ for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
     assert.equal(f.child().exitCode, 0);
   });
 }
+
+test('post-readiness login tolerates a bounded busy-host response', async t => {
+  const f = fixture(t, 'delayed-login');
+  const report = await checkSignedHelper(f.options, f.dependencies);
+  assert.equal(report.result, 'passed');
+  assert.deepEqual(report.checks.auth_statuses, [401, 200, 200]);
+  assert.equal(f.child().exitCode, 0);
+});
 
 for (const [mode, code] of [
   ['adhoc', 'developer-id-runtime-timestamp-required'], ['signature', 'check-failed-details-withheld'],
