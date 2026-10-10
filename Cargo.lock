@@ -2964,6 +2964,7 @@ dependencies = [
  "libc",
  "libsqlite3-sys",
  "phoenix-core",
+ "phoenix-state-machine",
  "phoenix-svg",
  "phoenix-workflow",
  "rand 0.10.1",

@@ -356,9 +356,12 @@ pub(crate) async fn persist_continuation_start_tx(
         ) if matches!(persisted_retry.target, ServerOverloadTarget::Ordinary)
             && matches!(persisted_retry.phase, ServerOverloadPhase::InFlight)
             && matches!(target_retry.phase, ServerOverloadPhase::InFlight)
-            && persisted_retry.attempt == target_retry.attempt
+            && persisted_retry.attempt < OVERLOAD_MAX_ATTEMPTS
+            && persisted_retry.attempt.checked_add(1) == Some(target_retry.attempt)
             && persisted_retry.started_at == target_retry.started_at
             && persisted_retry.deadline_at == target_retry.deadline_at
+            && persisted_retry.logical_request_id == target_retry.logical_request_id
+            && persisted_retry.model_id == target_retry.model_id
             && matches!(
                 &target_retry.target,
                 ServerOverloadTarget::Continuation {
@@ -20286,9 +20289,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn overload_continuation_start_is_atomic_exact_and_idempotent() {
-        use phoenix_core::domain::sm_state::{
-            ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+        use phoenix_core::domain::{
+            llm_types::{ContentBlock, Usage},
+            sm_event::Event,
+            sm_state::{
+                ConvContext, ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+            },
         };
+        use phoenix_state_machine::transition;
 
         let db = Database::open_in_memory().await.unwrap();
         let conversation_id = "overload-continuation-start";
@@ -20315,19 +20323,40 @@ mod tests {
         .await
         .unwrap();
         let operation_id = "overload-start-operation";
-        let target = ConvState::ServerOverloadRetrying {
-            retry: ServerOverloadRetry {
-                target: ServerOverloadTarget::Continuation {
-                    operation_id: operation_id.to_string(),
-                    rejected_tool_calls: Vec::new(),
-                },
-                ..persisted_retry.clone()
+        let reducer_result = transition(
+            &ConvState::ServerOverloadRetrying {
+                retry: persisted_retry.clone(),
             },
-        };
-        let content =
-            MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
-                "threshold response",
-            )]);
+            &ConvContext::new(conversation_id, "/tmp".into(), "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::text("threshold response")],
+                tool_calls: Vec::new(),
+                end_turn: true,
+                usage: Usage {
+                    input_tokens: 190_000,
+                    output_tokens: 1,
+                    reasoning_tokens: None,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+                request_id: operation_id.to_string(),
+            },
+        )
+        .expect("overload response above threshold starts continuation");
+        let target = reducer_result.new_state;
+        assert!(matches!(
+            &target,
+            ConvState::ServerOverloadRetrying { retry }
+                if retry.attempt == persisted_retry.attempt + 1
+                    && matches!(
+                        &retry.target,
+                        ServerOverloadTarget::Continuation {
+                            operation_id: target_operation_id,
+                            ..
+                        } if target_operation_id == operation_id
+                    )
+        ));
+        let content = MessageContent::agent(vec![ContentBlock::text("threshold response")]);
         let message = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: operation_id.to_string(),
