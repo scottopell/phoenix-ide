@@ -310,6 +310,30 @@ for fragment in [
     if fragment not in allium:
         raise SystemExit(f'missing native acceptance model contract: {fragment}')
 
+for helper, next_helper in [
+    ('required_architecture_pairs_validated(publication)', 'public_release_is_exact(publication)'),
+    ('preparation_uses_release_security_path(preparation)', 'preparation_has_no_release_authority(preparation)'),
+]:
+    contract = allium.split('-- ' + helper + ' -> Boolean\n', 1)[1].split('-- ' + next_helper, 1)[0]
+    if 'native_acceptance state, read through' not in contract or 'required_native_pairs_passed' not in contract:
+        raise SystemExit(f'{helper} must defer native acceptance to its typed authority')
+    for duplicate in ['native isolated artifact checks', 'sanitized receipts retained', 'native_acceptance = passed']:
+        if duplicate in contract:
+            raise SystemExit(f'{helper} must not duplicate native acceptance checks or results')
+notes_helper = 'reviewed_notes_attached_atomically_when_supplied(publication)'
+notes_contract = allium.split('-- ' + notes_helper + ' -> Boolean\n', 1)[1].split('-- preparation_identity_is_current_main', 1)[0]
+for fragment in ['immutable tagged source', 'nonempty notes', 'visibility/channel fields',
+                 'no reviewed notes', 'true without', 'existing generated notes remain',
+                 'No subsequent public']:
+    if fragment not in notes_contract:
+        raise SystemExit(f'atomic optional notes contract missing: {fragment}')
+public_transition = allium.split('rule VerifiedInaccessiblePublicationBecomesPublic {', 1)[1].split('\n}', 1)[0]
+if 'requires: ' + notes_helper not in public_transition:
+    raise SystemExit('private-to-public transition must carry supplied notes in its publication request')
+public_retry = allium.split('rule ExactPublicRetryIsIdempotent {', 1)[1].split('\n}', 1)[0]
+if notes_helper in public_retry:
+    raise SystemExit('already-public retries must not require a notes mutation')
+
 if '        if:' in acceptance:
     raise SystemExit('native headless acceptance must gate preparation and release on default success')
 release_upload = build_macos_job.split('          name: macos-${{ matrix.target }}', 1)[1].split('      - uses:', 1)[0]

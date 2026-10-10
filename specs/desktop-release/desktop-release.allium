@@ -227,22 +227,30 @@ surface DesktopReleaseWorkflow {
 --   non-manifest assets and SHA256SUMS, whose entries and reported digests match.
 -- required_architecture_pairs_validated(publication) -> Boolean
 --   publication.apple_silicon_pair and publication.intel_pair have distinct
---   targets, matching release identities, verified helper/app artifacts,
---   validated notarization, and passed native isolated artifact checks with
---   sanitized receipts retained.
+--   targets, matching release identities, verified helper/app artifacts, and
+--   validated notarization. Native acceptance is owned only by each pair's
+--   native_acceptance state, read through required_native_pairs_passed.
 -- public_release_is_exact(publication) -> Boolean
 --   the public release contains exactly the required names and matching digests.
 -- publication_channel_is_exact(publication) -> Boolean
 --   stable publication metadata is prerelease=false and make_latest=true unless a
 --   newer stable is already latest, in which case publication is refused; RC
 --   metadata is prerelease=true and make_latest=false.
+-- reviewed_notes_attached_atomically_when_supplied(publication) -> Boolean
+--   if publication's immutable tagged source supplies reviewed notes, the request
+--   that changes its verified private release to public includes those exact
+--   nonempty notes as the release body alongside the visibility/channel fields.
+--   If the tagged source has no reviewed notes, this predicate is true without
+--   a body override: the existing generated notes remain. No subsequent public
+--   edit is used to satisfy the supplied-notes obligation.
 -- preparation_identity_is_current_main(preparation) -> Boolean
 --   preparation identity is the exact current main commit and its source version.
 -- preparation_uses_release_security_path(preparation) -> Boolean
 --   preparation.apple_silicon_pair and preparation.intel_pair have their matching
 --   targets and satisfy the signing, notarization, stapling, Gatekeeper,
---   helper-byte, complete identity, checksum, and native isolated artifact checks
---   with sanitized receipts retained.
+--   helper-byte, complete identity, and checksum checks. Native acceptance is
+--   owned only by each pair's native_acceptance state, read through
+--   required_native_pairs_passed.
 -- preparation_has_no_release_authority(preparation) -> Boolean
 --   preparation creates or moves no tag, creates or mutates no GitHub release,
 --   performs no deployment or installation, and grants no stable/RC decision.
@@ -409,6 +417,7 @@ rule VerifiedInaccessiblePublicationBecomesPublic {
     requires: required_native_pairs_passed(publication)
     requires: publication_channel_is_exact(publication)
     requires: publication_has_workflow_sole_writer(publication)
+    requires: reviewed_notes_attached_atomically_when_supplied(publication)
     ensures: publication.state = public
     ensures: publication.failure_domain = none
 }
