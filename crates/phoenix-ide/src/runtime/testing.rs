@@ -636,6 +636,8 @@ pub struct InMemoryStorage {
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
     fail_tool_round_persist: Mutex<bool>,
+    tool_round_persist_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    tool_round_persist_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -719,6 +721,8 @@ impl InMemoryStorage {
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
             fail_tool_round_persist: Mutex::new(false),
+            tool_round_persist_started: Mutex::new(None),
+            tool_round_persist_release: Mutex::new(None),
             fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
@@ -817,6 +821,19 @@ impl InMemoryStorage {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.prompt_projection_load_started.lock().unwrap() = Some(started_tx);
         *self.prompt_projection_load_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
+    }
+
+    pub fn gate_tool_round_persist(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.tool_round_persist_started.lock().unwrap() = Some(started_tx);
+        *self.tool_round_persist_release.lock().unwrap() = Some(release_rx);
         (started_rx, release_tx)
     }
 
@@ -1874,6 +1891,13 @@ impl MessageStore for InMemoryStorage {
     ) -> Result<(), String> {
         if *self.fail_tool_round_persist.lock().unwrap() {
             return Err("injected tool round persist failure".to_string());
+        }
+        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.tool_round_persist_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
         }
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();

@@ -3596,10 +3596,13 @@ where
     ) -> Result<Vec<Event>, String> {
         let remaining = self.bash_wait_transition_remaining(&result.new_state);
         if let Some(remaining) = remaining {
-            if let Ok(result) =
-                tokio::time::timeout(remaining, self.apply_transition_result_inner(result)).await
-            {
-                return result;
+            if !remaining.is_zero() {
+                if let Ok(result) =
+                    tokio::time::timeout(remaining, self.apply_transition_result_inner(result))
+                        .await
+                {
+                    return result;
+                }
             }
             self.fatal_local_authority_fence
                 .close("bash_wait_transition_deadline");
@@ -18880,8 +18883,11 @@ mod steer_drain_detector_tests {
             bash_wait_executing_state("wait-mid-persist", "b-mid-persist", Some(0)),
             vec![],
         );
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(1);
+        let remaining = rt.bash_wait_transition_remaining(&rt.state).unwrap();
+        assert!(remaining < Duration::from_secs(5));
         let fence = Arc::clone(&rt.fatal_local_authority_fence);
-        let (write_started, write_release) = storage.gate_message_add();
+        let (write_started, write_release) = storage.gate_tool_round_persist();
         let transition = tokio::spawn(async move {
             let result = rt
                 .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
