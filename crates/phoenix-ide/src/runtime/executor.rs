@@ -2809,25 +2809,38 @@ where
         }
 
         // If the credential helper is still running, the select loop will pick it up.
-        // If it already settled, handle it immediately.
+        // If it already settled, handle it immediately. The deadline is checked
+        // after observing helper status so a result returned after the incident's
+        // absolute deadline cannot supersede overload exhaustion.
         if matches!(self.state, ConvState::AwaitingRecovery { .. }) {
-            if let Some(ref helper) = self.credential_helper {
-                let status = helper.credential_status().await;
-                if !matches!(
+            let credential_status = if let Some(ref helper) = self.credential_helper {
+                Some(helper.credential_status().await)
+            } else {
+                None
+            };
+            if overload_recovery_deadline_for(&self.state, Utc::now()) == Some(Duration::ZERO) {
+                if let Err(error) = self
+                    .process_event(Event::OverloadRetryDeadlineExpired)
+                    .await
+                {
+                    tracing::error!(%error, "Failed to expire recovered overload credential wait");
+                    return RuntimeExitDisposition::Interrupted;
+                }
+            } else if credential_status.is_some_and(|status| {
+                !matches!(
                     status,
                     phoenix_llm::credential_helper::CredentialStatus::Running
-                ) {
-                    self.handle_credential_settlement().await;
-                }
-            } else {
-                // No credential helper available after restart — fall through to error.
-                if let Err(e) = self
+                )
+            }) {
+                self.handle_credential_settlement().await;
+            } else if credential_status.is_none() {
+                if let Err(error) = self
                     .process_event(Event::CredentialHelperFailed {
                         message: "Credential helper not available after restart".to_string(),
                     })
                     .await
                 {
-                    tracing::error!(error = %e, "Error handling post-restart credential recovery");
+                    tracing::error!(%error, "Error handling post-restart credential recovery");
                 }
             }
         }
@@ -6396,6 +6409,52 @@ where
                     usage_data: Some(usage_data),
                     created_at: Utc::now(),
                 };
+                if matches!(
+                    &self.state,
+                    ConvState::RecoverableContinuationFailure { .. }
+                ) {
+                    let terminal = self
+                        .pending_direct_turn_terminal
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                reason: "Automatic overload retry attempts exhausted before continuation"
+                                    .to_string(),
+                            }
+                        });
+                    let outcome = self
+                        .storage
+                        .recover_continuation_start(
+                            &crate::runtime::traits::ContinuationStartRecoverySettlement {
+                                turn: self.active_direct_turn.as_deref().cloned(),
+                                terminal: self.active_direct_turn.as_ref().map(|_| terminal),
+                                operation_id: request.operation_id.clone(),
+                                message: message.clone(),
+                                state: self.state.clone(),
+                                state_updated_at: self.state_updated_at,
+                            },
+                        )
+                        .await?;
+                    match outcome {
+                        crate::db::ContinuationCommitOutcome::Applied
+                        | crate::db::ContinuationCommitOutcome::Duplicate => {
+                            self.active_direct_turn = None;
+                            self.pending_direct_turn_terminal = None;
+                            self.direct_turn_cancellation_initiated = false;
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .persisted_message(message);
+                        }
+                        crate::db::ContinuationCommitOutcome::Stale => {
+                            self.continuation_effect_disposition =
+                                ContinuationEffectDisposition::AbortRemaining;
+                        }
+                    }
+                    drop(reserved_range);
+                    return Ok(None);
+                }
                 let outcome = match self
                     .storage
                     .begin_continuation(
@@ -24232,6 +24291,84 @@ mod retry_timer_epoch_tests {
         );
     }
 
+    #[tokio::test]
+    async fn capped_overload_continuation_opening_atomically_settles_direct_turn() {
+        let mut rt = runtime_requesting();
+        let storage = Arc::clone(&rt.storage);
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(901),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                reason: "overload exhausted".into(),
+            },
+        ));
+        let now = Utc::now();
+        rt.state = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                attempt: 5,
+                started_at: now,
+                deadline_at: now + chrono::Duration::seconds(120),
+                logical_request_id: "capped-continuation-request".into(),
+                model_id: "test-model".into(),
+            },
+        };
+        storage
+            .update_state(&rt.context.conversation_id, &rt.state, rt.state_updated_at)
+            .await
+            .unwrap();
+        let usage = phoenix_llm::Usage {
+            input_tokens: 190_000,
+            output_tokens: 17,
+            reasoning_tokens: None,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            LlmOutcome::Response {
+                provider_replay: None,
+                content: vec![ContentBlock::text("final response before continuation")],
+                tool_calls: vec![],
+                end_turn: true,
+                usage: usage.clone(),
+                request_id: "capped-continuation-operation".into(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            rt.state,
+            ConvState::RecoverableContinuationFailure { ref failure }
+                if failure.request.operation_id == "capped-continuation-operation"
+                    && failure.request.attempt == 5
+        ));
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        let messages = storage.recorded_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, "capped-continuation-operation");
+        assert_eq!(messages[0].usage_data.as_ref(), Some(&usage));
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Agent(content) if content == &vec![ContentBlock::text("final response before continuation")]
+        ));
+        assert!(matches!(
+            storage
+                .get_state_snapshot(&rt.context.conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::RecoverableContinuationFailure { .. }
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn overload_backoff_cleanup_retires_timer_generation_and_admission() {
         let mut cancelled = runtime_requesting();
@@ -24291,6 +24428,67 @@ mod retry_timer_epoch_tests {
         assert!(fatally_aborted.retry_generation > fatal_generation);
         assert!(!route_retry_timeout(&mut fatally_aborted, fatal_generation, 2).await);
         assert_eq!(fatal_fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_overload_credential_failure_respects_absolute_deadline() {
+        async fn persisted_error_for_deadline(deadline_at: chrono::DateTime<Utc>) -> ConvState {
+            let mut rt = runtime_requesting();
+            let storage = Arc::clone(&rt.storage);
+            let now = Utc::now();
+            rt.state = ConvState::AwaitingRecovery {
+                message: "refreshing credentials".into(),
+                error_kind: crate::db::ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                        attempt: 3,
+                        started_at: now - chrono::Duration::seconds(119),
+                        deadline_at,
+                        logical_request_id: "credential-deadline-request".into(),
+                        model_id: "test-model".into(),
+                    },
+                },
+            };
+            let runtime = tokio::spawn(rt.run());
+            let persisted = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(state @ ConvState::Error { .. }) =
+                        storage.get_current_state("conv-retry")
+                    {
+                        break state;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("startup recovery reaches durable error");
+            runtime.abort();
+            let _ = runtime.await;
+            persisted
+        }
+
+        let before_deadline =
+            persisted_error_for_deadline(Utc::now() + chrono::Duration::seconds(30)).await;
+        assert!(matches!(
+            before_deadline,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::Auth,
+                ..
+            }
+        ));
+
+        let at_deadline = persisted_error_for_deadline(Utc::now()).await;
+        assert!(matches!(
+            at_deadline,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::ServerOverloaded,
+                ref message,
+                ..
+            } if message.contains("deadline elapsed")
+        ));
     }
 
     #[tokio::test]
