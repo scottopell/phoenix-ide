@@ -1,9 +1,10 @@
-import { createRef } from 'react';
+import { createRef, type RefObject } from 'react';
+import { createPortal } from 'react-dom';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReactionPill } from './ReactionPill';
 import { restoreReactionRange } from './reactionRange';
-import { FocusScopeProvider } from '../hooks/useFocusScope';
+import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import type { ReactionSource } from '../conversation/InlineReactionStore';
 
 const source: ReactionSource = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'second', textAnchor: { start: { fragmentId: 'text-0', offset: 6 }, end: { fragmentId: 'text-0', offset: 12 } } };
@@ -11,14 +12,22 @@ const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
-function Fixture({ mounted = true, body = 'Keep this guarantee' }: { mounted?: boolean; body?: string }) {
+function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop, bubbleRef = createRef<HTMLDivElement>(), onChange = () => {} }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number; bubbleRef?: RefObject<HTMLDivElement>; onChange?: (body: string) => void }) {
   return <FocusScopeProvider>
+    <div className="conversation-column">
     <div id="messages">
       {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>}
     </div>
-    <ReactionPill source={source} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    {composerAvailable && <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />}
+    </div>
+    <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={bubbleRef} scopeId="test" body={body} available={available} onChange={onChange} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
 }
+function ActivateOtherScope() {
+  const { pushScope } = useFocusScopeCommands();
+  return <button type="button" onClick={() => pushScope('viewer')}>Open viewer</button>;
+}
+
 
 beforeEach(() => {
   offscreen = false;
@@ -27,7 +36,7 @@ beforeEach(() => {
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 600, 500));
   Object.defineProperty(Range.prototype, 'getBoundingClientRect', { configurable: true, value: () => new DOMRect(20, offscreen ? -100 : 100, 150, 20) });
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('reaction pill', () => {
   it('focuses on Enter without appending, but leaves controls and composition alone', () => {
@@ -52,6 +61,37 @@ describe('reaction pill', () => {
     expect(add).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: 'Enter', metaKey: true });
     expect(add).toHaveBeenCalledOnce();
+  });
+
+  it('allows hardware Enter to focus a touch-docked editor', () => {
+    render(<Fixture touchDocked body="" />);
+    const input = screen.getByRole('textbox');
+    expect(input).not.toHaveFocus();
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(input).toHaveFocus();
+  });
+
+  it('keeps hardware Enter active after the touch source leaves view', async () => {
+    offscreen = true;
+    render(<Fixture touchDocked body="" />);
+    const input = screen.getByRole('textbox');
+    await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(input).toHaveFocus();
+  });
+
+  it('releases transcript reservation while another focus scope hides the dock', async () => {
+    render(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
+      <ActivateOtherScope />
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="Retained" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    const scroller = document.getElementById('messages')!;
+    expect(scroller).toHaveClass('reaction-dock-reserved');
+    fireEvent.click(screen.getByRole('button', { name: 'Open viewer' }));
+    await waitFor(() => expect(document.querySelector('.reaction-pill')).not.toBeVisible());
+    expect(scroller).not.toHaveClass('reaction-dock-reserved');
+    expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('');
   });
 
   it('leaves Enter to native disclosure controls and custom focus stops', () => {
@@ -93,6 +133,27 @@ describe('reaction pill', () => {
     expect(screen.getByRole('textbox')).not.toHaveFocus();
   });
 
+  it('keeps an unavailable reaction editable when desktop source return fails', async () => {
+    navigate.mockResolvedValue(false);
+    const change = vi.fn();
+    render(<Fixture mounted={false} available={false} body="Retained desktop note" onChange={change} />);
+    const returnButton = await screen.findByRole('button', { name: /Return to passage/ });
+    expect(returnButton).toHaveTextContent('draft unavailable; retained');
+    const input = screen.getByRole('textbox');
+    expect(input).toHaveValue('Retained desktop note');
+    expect(input).toBeEnabled();
+    fireEvent.keyDown(input, { key: 'Enter', metaKey: true });
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true });
+    expect(add).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: 'Still editable' } });
+    expect(change).toHaveBeenCalledWith('Still editable');
+    fireEvent.click(returnButton);
+    await waitFor(() => expect(returnButton).toHaveTextContent('Passage unavailable. Your reaction is saved here.'));
+    expect(screen.getByRole('textbox')).toHaveValue('Retained desktop note');
+    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
+    expect(add).not.toHaveBeenCalled();
+  });
+
   it('keeps the dock usable after an asynchronous load failure and aborts on unmount', async () => {
     let finish!: (found: boolean) => void;
     navigate.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
@@ -107,6 +168,50 @@ describe('reaction pill', () => {
     view.unmount();
     expect(signal.aborted).toBe(true);
     await act(async () => { finish(false); });
+  });
+
+  it('shows touch users a retryable source-return failure', async () => {
+    let finish!: (found: boolean) => void;
+    navigate.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    render(<Fixture mounted={false} touchDocked />);
+    const retry = screen.getByRole('button', { name: /Return to passage/ });
+    fireEvent.click(retry);
+    expect(retry).toHaveTextContent('Returning…');
+    expect(retry).toBeDisabled();
+    await act(async () => { finish(false); });
+    await waitFor(() => expect(retry).toHaveTextContent('Passage unavailable. Your reaction is saved here.'));
+    expect(retry).toBeEnabled();
+  });
+
+  it('clears a touch return error when the source mounts through another retry path', async () => {
+    let finish!: (found: boolean) => void;
+    navigate.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const view = render(<Fixture mounted={false} touchDocked />);
+    const retry = screen.getByRole('button', { name: /Return to passage/ });
+    fireEvent.click(retry);
+    expect(retry).toHaveTextContent('Returning…');
+    expect(retry).toBeDisabled();
+    await act(async () => { finish(false); });
+    await waitFor(() => expect(retry).toHaveTextContent('Passage unavailable. Your reaction is saved here.'));
+    expect(retry).toBeEnabled();
+    view.rerender(<Fixture touchDocked />);
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Return to passage/ })).not.toBeInTheDocument());
+    view.rerender(<Fixture mounted={false} touchDocked />);
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('“second”');
+  });
+
+  it('reserves transcript space equal to the touch dock height and releases it on unmount', () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    const view = render(<Fixture touchDocked />);
+    const scroller = document.getElementById('messages')!;
+    expect(scroller).toHaveClass('reaction-dock-reserved');
+    expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('78px');
+    view.unmount();
+    expect(scroller).not.toHaveClass('reaction-dock-reserved');
+    expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('');
   });
 
   it('automatically undocks on manual return and preserves the same one-line editor for long text', async () => {
@@ -126,6 +231,318 @@ describe('reaction pill', () => {
     expect(add).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: 'Enter', metaKey: true });
     expect(add).toHaveBeenCalledOnce();
+  });
+
+  it('uses the unfocused editor dock on touch and captures the source before focus', () => {
+    const captureSource = vi.fn();
+    render(<Fixture touchDocked captureSource={captureSource} body="" />);
+    const dock = screen.getByRole('region', { name: 'Docked reaction' });
+    const input = screen.getByRole('textbox', { name: 'Your reaction' });
+    expect(dock).toHaveTextContent('“second”');
+    expect(input).not.toHaveFocus();
+    expect(screen.queryByRole('button', { name: /Return to passage/ })).not.toBeInTheDocument();
+    fireEvent.pointerDown(input, { pointerType: 'touch' });
+    expect(captureSource).toHaveBeenCalledOnce();
+    input.focus();
+    expect(input).toHaveFocus();
+  });
+
+  it('keeps the touch dock above the composer as the visual viewport resizes for the keyboard', async () => {
+    const listeners = new Map<string, EventListener>();
+    const viewport = {
+      offsetLeft: 0,
+      offsetTop: 0,
+      width: 390,
+      height: 700,
+      addEventListener: vi.fn((type: string, listener: EventListener) => listeners.set(type, listener)),
+      removeEventListener: vi.fn(),
+    };
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport });
+    let composerTop = 620;
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, composerTop, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<Fixture touchDocked body="" />);
+    const dock = screen.getByRole('region', { name: 'Docked reaction' });
+    expect(dock).toHaveStyle({ top: '554px' });
+    screen.getByRole('textbox').focus();
+    viewport.height = 420;
+    composerTop = 340;
+    act(() => listeners.get('resize')?.(new Event('resize')));
+    await waitFor(() => expect(dock).toHaveStyle({ top: '274px' }));
+    expect(screen.getByRole('textbox')).toHaveFocus();
+  });
+
+  it('re-resolves composer geometry after an unavailable composer remounts and the keyboard resizes the viewport', async () => {
+    const listeners = new Map<string, EventListener>();
+    const viewport = {
+      offsetLeft: 0, offsetTop: 0, width: 390, height: 700,
+      addEventListener: vi.fn((type: string, listener: EventListener) => listeners.set(type, listener)),
+      removeEventListener: vi.fn(),
+    };
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport });
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, Number(this.dataset['composerTop']), 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    const bubbleRef = createRef<HTMLDivElement>();
+    const view = render(<Fixture touchDocked body="Retained" composerKey="ordinary" composerTop={620} bubbleRef={bubbleRef} />);
+    const dock = screen.getByRole('region', { name: 'Docked reaction' });
+    const input = screen.getByRole('textbox');
+    expect(dock).toHaveStyle({ top: '554px' });
+    expect(input).not.toHaveFocus();
+    const originalComposer = document.getElementById('input-area')!;
+
+    view.rerender(<Fixture touchDocked body="Retained" available={false} composerAvailable={false} bubbleRef={bubbleRef} />);
+    await waitFor(() => expect(document.getElementById('input-area')).toBeNull());
+    expect(input).toHaveValue('Retained');
+    expect(input).not.toHaveFocus();
+    expect(screen.getByRole('status')).toHaveTextContent('Draft unavailable. Your reaction is retained.');
+    expect(screen.getByText('“second” · draft unavailable; retained')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
+
+    viewport.height = 420;
+    view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={340} bubbleRef={bubbleRef} />);
+    expect(document.getElementById('input-area')).not.toBe(originalComposer);
+    act(() => listeners.get('resize')?.(new Event('resize')));
+    await waitFor(() => expect(dock).toHaveStyle({ top: '274px' }));
+    const restoredInput = screen.getByRole('textbox');
+    expect(restoredInput).toHaveValue('Retained');
+    expect(restoredInput).not.toHaveFocus();
+    expect(screen.queryByText('Draft unavailable · reaction retained')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeEnabled();
+    expect(add).not.toHaveBeenCalled();
+    viewport.height = 700;
+  });
+
+  it('anchors a portaled touch dock to the transcript when the composer is absent', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'messages') return new DOMRect(0, 0, 390, 620);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, Number.parseFloat(this.style.top) || 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<FocusScopeProvider>
+      <div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div>
+      {createPortal(<ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="Retained" available={false} onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />, document.body)}
+    </FocusScopeProvider>);
+    const dock = screen.getByRole('region', { name: 'Docked reaction' });
+    expect(dock.parentElement).toBe(document.body);
+    expect(dock).toHaveStyle({ top: '554px' });
+    expect(document.getElementById('messages')).toHaveClass('reaction-dock-reserved');
+    for (let i = 0; i < 3; i++) {
+      fireEvent.scroll(window);
+      await act(async () => { await new Promise(requestAnimationFrame); });
+      expect(dock).toHaveStyle({ top: '554px' });
+    }
+  });
+
+  it('stays above visible controls between the transcript and composer', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 500, 390, 80);
+      if (this.id === 'work-controls') return new DOMRect(0, 470, 390, 30);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<FocusScopeProvider>
+      <div className="conversation-column">
+        <div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div>
+        <div id="work-controls" />
+        <footer id="input-area" />
+      </div>
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ top: '404px' }));
+  });
+
+  it('stays above embedded composer controls when the transcript has a separate layout owner', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 500, 390, 80);
+      if (this.id === 'embedded-work-controls') return new DOMRect(0, 460, 390, 40);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<FocusScopeProvider>
+      <main className="product-conversation-page">
+        <section><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div></section>
+        <div className="product-conversation-page__composer">
+          <div className="conversation-column">
+            <div id="embedded-work-controls" />
+            <footer id="input-area" />
+          </div>
+        </div>
+      </main>
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ top: '394px' }));
+  });
+
+  it('rebinds dock reservation when the transcript remounts', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 620, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    const view = render(<Fixture touchDocked body="Retained" />);
+    const original = document.getElementById('messages')!;
+    expect(original).toHaveClass('reaction-dock-reserved');
+    view.rerender(<FocusScopeProvider>
+      <div className="conversation-column">
+        <div key="replacement" id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div>
+        <footer id="input-area" />
+      </div>
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="Retained" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    const replacement = document.getElementById('messages')!;
+    expect(replacement).not.toBe(original);
+    await waitFor(() => expect(replacement).toHaveClass('reaction-dock-reserved'));
+    expect(original).not.toHaveClass('reaction-dock-reserved');
+  });
+
+  it('repositions when a preceding rendered message resizes around the selected passage', async () => {
+    const observers: TestResizeObserver[] = [];
+    class TestResizeObserver implements ResizeObserver {
+      readonly observed = new Set<Element>();
+      constructor(private readonly callback: ResizeObserverCallback) { observers.push(this); }
+      observe(target: Element) { this.observed.add(target); }
+      unobserve(target: Element) { this.observed.delete(target); }
+      disconnect() { this.observed.clear(); }
+      trigger(target: Element) {
+        this.callback([{ target } as ResizeObserverEntry], this);
+      }
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+    let rangeBottom = 300;
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockImplementation(() => new DOMRect(0, rangeBottom - 50, 200, 50));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 580, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages">
+        <div data-testid="preceding" data-inline-reaction-message="earlier" data-message-occurrence="earlier:earlier"><div className="agent-text-block" data-fragment-id="text-0">Earlier row</div></div>
+        <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>
+      </div><footer id="input-area" /></div>
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    const preceding = screen.getByTestId('preceding');
+    const observer = observers.find((candidate) => candidate.observed.has(preceding));
+    expect(observer).toBeDefined();
+    expect(screen.queryByRole('button', { name: /Return to passage/ })).not.toBeInTheDocument();
+    rangeBottom = 620;
+    act(() => observer!.trigger(preceding));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
+    expect(screen.getByRole('textbox')).not.toHaveFocus();
+    expect(add).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unpinned bottom selection above the touch dock after later scrolling', async () => {
+    const listeners = new Map<string, EventListener>();
+    let rangeBottom = 600;
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockImplementation(() => new DOMRect(0, rangeBottom - 50, 200, 50));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 580, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    vi.spyOn(window, 'addEventListener').mockImplementation((type, listener) => {
+      if (typeof listener === 'function') listeners.set(type, listener);
+    });
+    const scrollTranscriptBy = vi.fn();
+    const stableBubbleRef = createRef<HTMLDivElement>();
+    const view = render(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
+      <ReactionPill source={source} touchDocked scrollTranscriptBy={scrollTranscriptBy} bubbleRef={stableBubbleRef} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    await waitFor(() => expect(scrollTranscriptBy).toHaveBeenCalledWith(98));
+    view.rerender(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
+      <ReactionPill source={source} touchDocked scrollTranscriptBy={scrollTranscriptBy} bubbleRef={stableBubbleRef} scopeId="test" body="rerendered" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    rangeBottom = 620;
+    act(() => listeners.get('scroll')?.(new Event('scroll')));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
+    expect(scrollTranscriptBy).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('textbox')).not.toHaveFocus();
+  });
+
+  it('does not block the first later scroll when initial placement was already clear', async () => {
+    const listeners = new Map<string, EventListener>();
+    let rangeBottom = 300;
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockImplementation(() => new DOMRect(0, rangeBottom - 50, 200, 50));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 580, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    vi.spyOn(window, 'addEventListener').mockImplementation((type, listener) => {
+      if (typeof listener === 'function') listeners.set(type, listener);
+    });
+    const scrollTranscriptBy = vi.fn();
+    render(<FocusScopeProvider>
+      <div className="conversation-column"><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div><footer id="input-area" /></div>
+      <ReactionPill source={source} touchDocked scrollTranscriptBy={scrollTranscriptBy} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    expect(scrollTranscriptBy).not.toHaveBeenCalled();
+    rangeBottom = 620;
+    act(() => listeners.get('scroll')?.(new Event('scroll')));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument());
+    expect(scrollTranscriptBy).not.toHaveBeenCalled();
+  });
+
+  it('uses shifted composer geometry without duplicating the top safe-area spacer', () => {
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
+      offsetLeft: 0, offsetTop: 0, width: 390, height: 700,
+      addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    } });
+    document.documentElement.style.setProperty('--safe-area-top', '47px');
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('app-safe-area-top')) return new DOMRect(0, 0, 390, 47);
+      if (this.id === 'messages') return new DOMRect(0, 47, 390, 593);
+      if (this.id === 'input-area') return new DOMRect(0, 640, 390, 60);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<><div className="app-safe-area-top" aria-hidden="true" /><Fixture touchDocked body="" /></>);
+    expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ top: '574px' });
+    document.documentElement.style.removeProperty('--safe-area-top');
+  });
+
+  it('clamps the touch dock inside visual-viewport safe-area insets', () => {
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
+      offsetLeft: 0, offsetTop: 0, width: 390, height: 700,
+      addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    } });
+    document.documentElement.style.setProperty('--safe-area-top', '20px');
+    document.documentElement.style.setProperty('--safe-area-right', '18px');
+    document.documentElement.style.setProperty('--safe-area-bottom', '24px');
+    document.documentElement.style.setProperty('--safe-area-left', '16px');
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 640, 390, 60);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 332, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<Fixture touchDocked body="" />);
+    expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ left: '28px', top: '574px', width: '332px' });
+    document.documentElement.style.removeProperty('--safe-area-top');
+    document.documentElement.style.removeProperty('--safe-area-right');
+    document.documentElement.style.removeProperty('--safe-area-bottom');
+    document.documentElement.style.removeProperty('--safe-area-left');
+  });
+
+  it('keeps or discards a typed touch-dock reaction without changing its source', () => {
+    render(<Fixture touchDocked />);
+    expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveTextContent('“second”');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss reaction' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Keep' }));
+    expect(screen.getByRole('textbox')).toHaveValue('Keep this guarantee');
+    expect(screen.getByText('“second”')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss reaction' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Discard' }));
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it.each([true, false])('offers explicit keep/discard when the source is mounted=%s', (mounted) => {

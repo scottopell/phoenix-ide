@@ -5,10 +5,13 @@ import { restoreReactionRange } from './reactionRange';
 import { useFocusScope, useKeyboardRouterShortcut, useRegisterFocusScope } from '../hooks/useFocusScope';
 import './ReactionPill.css';
 
-export function ReactionPill({ source, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
+export function ReactionPill({ source, sourceRange, touchDocked = false, captureSource, onSourceReturnStateChange, scrollTranscriptBy, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
   useRegisterFocusScope(scopeId);
   const { activeScope } = useFocusScope();
-  const [docked, setDocked] = useState(false);
+  const [sourceDocked, setSourceDocked] = useState(false);
+  const docked = touchDocked || sourceDocked;
+  const hidden = Boolean(activeScope && activeScope !== scopeId);
+  const dockActive = touchDocked && !hidden;
   const [discard, setDiscard] = useState(false);
   const [error, setError] = useState('');
   const returning = useRef(false);
@@ -20,12 +23,13 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
     return () => {
       returnRequest.current?.abort();
       returning.current = false;
+      onSourceReturnStateChange?.(false);
     };
-  }, [source]);
+  }, [source, onSourceReturnStateChange]);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (docked || discard || (activeScope && activeScope !== scopeId)) return;
+    if ((sourceDocked && !touchDocked) || discard || hidden) return;
     const focusFromSelection = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.key !== 'Enter' || event.isComposing || event.keyCode === 229
         || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
@@ -38,7 +42,7 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
     };
     document.addEventListener('keydown', focusFromSelection);
     return () => document.removeEventListener('keydown', focusFromSelection);
-  }, [activeScope, bubbleRef, discard, docked, scopeId]);
+  }, [bubbleRef, discard, hidden, scopeId, sourceDocked, touchDocked]);
   const requestClose = () => body ? setDiscard(true) : onClose();
   useKeyboardRouterShortcut({
     id: `${scopeId}:escape`, scopeId, key: 'Escape', layer: 'passive-content',
@@ -52,18 +56,64 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
 
   useLayoutEffect(() => {
     const el = bubbleRef.current;
-    const scroller = document.getElementById('messages');
+    let scroller = document.getElementById('messages');
     if (!el || !scroller) return;
     let frame = 0;
+    let observedComposer: Element | null = null;
+    let observedScroller: HTMLElement = scroller;
+    let initialClearancePending = dockActive;
+    let observedObstructions = new Set<Element>();
+    let observedMessages = new Set<Element>();
+    const initialComposer = document.getElementById('input-area');
+    const scrollerAncestors = new Set<Element>();
+    for (let ancestor: Element | null = scroller; ancestor; ancestor = ancestor.parentElement) scrollerAncestors.add(ancestor);
+    let layoutOwner: Element = initialComposer ?? document.body;
+    while (layoutOwner.parentElement && !scrollerAncestors.has(layoutOwner)) layoutOwner = layoutOwner.parentElement;
+    if (!scrollerAncestors.has(layoutOwner)) layoutOwner = document.body;
+    const childWithin = (element: Element | null, owner: Element) => {
+      let child = element;
+      while (child?.parentElement && child.parentElement !== owner) child = child.parentElement;
+      return child?.parentElement === owner ? child : null;
+    };
     const position = () => {
       frame = 0;
       const viewport = window.visualViewport;
-      const left = viewport?.offsetLeft ?? 0;
-      const top = viewport?.offsetTop ?? 0;
-      const width = viewport?.width ?? window.innerWidth;
-      const bottom = top + (viewport?.height ?? window.innerHeight);
-      const transcript = scroller.getBoundingClientRect();
-      const range = restoreReactionRange(source);
+      const liveScroller = document.getElementById('messages');
+      if (liveScroller && liveScroller !== observedScroller) {
+        observedScroller.classList.remove('reaction-dock-reserved');
+        observedScroller.style.removeProperty('--reaction-dock-height');
+        observedScroller.closest<HTMLElement>('#main-area')?.style.removeProperty('--reaction-dock-height');
+        resize.unobserve(observedScroller);
+        observedScroller = liveScroller;
+        scroller = liveScroller;
+        resize.observe(observedScroller);
+        if (dockActive) observedScroller.classList.add('reaction-dock-reserved');
+      }
+      const composer = document.getElementById('input-area');
+      if (composer !== observedComposer) {
+        if (observedComposer) resize.unobserve(observedComposer);
+        observedComposer = composer;
+        if (observedComposer) resize.observe(observedComposer);
+      }
+      const renderedMessages = new Set<Element>(observedScroller.querySelectorAll('[data-inline-reaction-message]'));
+      for (const message of observedMessages) if (!renderedMessages.has(message)) resize.unobserve(message);
+      for (const message of renderedMessages) if (!observedMessages.has(message)) resize.observe(message);
+      observedMessages = renderedMessages;
+      const styles = getComputedStyle(document.documentElement);
+      const safeTop = Number.parseFloat(styles.getPropertyValue('--safe-area-top')) || 0;
+      const safeRight = Number.parseFloat(styles.getPropertyValue('--safe-area-right')) || 0;
+      const safeBottom = Number.parseFloat(styles.getPropertyValue('--safe-area-bottom')) || 0;
+      const safeLeft = Number.parseFloat(styles.getPropertyValue('--safe-area-left')) || 0;
+      const viewportLeft = viewport?.offsetLeft ?? 0;
+      const viewportTop = viewport?.offsetTop ?? 0;
+      const left = viewportLeft + safeLeft;
+      const top = viewportTop + safeTop;
+      const width = (viewport?.width ?? window.innerWidth) - safeLeft - safeRight;
+      const bottom = viewportTop + (viewport?.height ?? window.innerHeight) - safeBottom;
+      const transcript = observedScroller.getBoundingClientRect();
+      const restoredRange = restoreReactionRange(source);
+      const fallbackOwner = sourceRange?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]');
+      const range = restoredRange ?? (sourceRange && fallbackOwner && observedScroller.contains(fallbackOwner) ? sourceRange : null);
       const rect = range?.getBoundingClientRect();
       if (returning.current && rect && rect.height > 0) {
         returning.current = false;
@@ -72,33 +122,82 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
       }
       const visibleTop = Math.max(top, transcript.top);
       const visibleBottom = Math.min(bottom, transcript.bottom);
-      const visible = Boolean(rect && rect.height > 0 && rect.bottom > visibleTop && rect.top < visibleBottom);
-      setDocked(!visible);
-      el.style.width = `${Math.min(420, width - 24)}px`;
+      const viewportVisible = Boolean(rect && rect.height > 0 && rect.bottom > visibleTop && rect.top < visibleBottom);
+      let sourceVisible = viewportVisible;
+      const pillWidth = Math.min(420, width - 24);
+      el.style.width = `${pillWidth}px`;
       const height = el.getBoundingClientRect().height || 46;
+      if (dockActive) {
+        const dockHeight = `${height + 24}px`;
+        observedScroller.style.setProperty('--reaction-dock-height', dockHeight);
+        observedScroller.closest<HTMLElement>('#main-area')?.style.setProperty('--reaction-dock-height', dockHeight);
+      }
       let y = Math.min(visibleBottom, bottom) - height - 12;
-      let x = transcript.right - Math.min(420, width - 24) - 12;
-      if (visible && rect) {
+      let x = transcript.right - pillWidth - 12;
+      if (dockActive) {
+        let obstructionTop = composer?.getBoundingClientRect().top ?? transcript.bottom;
+        const nextObstructions = new Set<Element>();
+        if (composer) {
+          const composerOwner = composer.closest('.conversation-column') ?? layoutOwner;
+          const composerChild = childWithin(composer, composerOwner);
+          const transcriptChild = composerOwner.contains(scroller) ? childWithin(scroller, composerOwner) : null;
+          for (let sibling = transcriptChild?.nextElementSibling ?? composerOwner.firstElementChild;
+            sibling && sibling !== composerChild;
+            sibling = sibling.nextElementSibling) {
+            if (sibling === el || sibling.contains(el)) continue;
+            const siblingRect = sibling.getBoundingClientRect();
+            if (siblingRect.height > 0) {
+              obstructionTop = Math.min(obstructionTop, siblingRect.top);
+              nextObstructions.add(sibling);
+            }
+          }
+        }
+        for (const obstruction of observedObstructions) {
+          if (!nextObstructions.has(obstruction)) resize.unobserve(obstruction);
+        }
+        for (const obstruction of nextObstructions) {
+          if (!observedObstructions.has(obstruction)) resize.observe(obstruction);
+        }
+        observedObstructions = nextObstructions;
+        y = Math.min(bottom, obstructionTop) - height - 12;
+        const sourceBoundary = y - 12;
+        if (initialClearancePending) {
+          if (viewportVisible && rect && rect.bottom > sourceBoundary) {
+            const delta = rect.bottom - sourceBoundary;
+            if (scrollTranscriptBy) scrollTranscriptBy(delta);
+            else observedScroller.scrollTop += delta;
+          }
+          initialClearancePending = false;
+        } else if (rect && rect.bottom > sourceBoundary) {
+          sourceVisible = false;
+        }
+      } else if (viewportVisible && rect) {
         x = rect.left;
         y = rect.bottom + 16;
         if (y + height > visibleBottom - 8) y = rect.top - height - 16;
       }
-      el.style.left = `${Math.max(left + 12, Math.min(x, left + width - Math.min(420, width - 24) - 12))}px`;
+      setSourceDocked(!sourceVisible);
+      el.style.left = `${Math.max(left + 12, Math.min(x, left + width - pillWidth - 12))}px`;
       el.style.top = `${Math.max(top + 12, Math.min(y, bottom - height - 12))}px`;
     };
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(position); };
-    position();
+    if (dockActive) scroller.classList.add('reaction-dock-reserved');
     const mutations = new MutationObserver(schedule);
-    mutations.observe(scroller, { childList: true, subtree: true });
+    mutations.observe(layoutOwner, { childList: true, subtree: true });
     const resize = new ResizeObserver(schedule);
+    position();
     resize.observe(scroller);
     resize.observe(el);
+
     window.addEventListener('scroll', schedule, true);
     window.addEventListener('resize', schedule);
     window.visualViewport?.addEventListener('resize', schedule);
     window.visualViewport?.addEventListener('scroll', schedule);
     return () => {
       cancelAnimationFrame(frame);
+      observedScroller.classList.remove('reaction-dock-reserved');
+      observedScroller.style.removeProperty('--reaction-dock-height');
+      observedScroller.closest<HTMLElement>('#main-area')?.style.removeProperty('--reaction-dock-height');
       mutations.disconnect();
       resize.disconnect();
       window.removeEventListener('scroll', schedule, true);
@@ -106,17 +205,19 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
       window.visualViewport?.removeEventListener('resize', schedule);
       window.visualViewport?.removeEventListener('scroll', schedule);
     };
-  }, [source, bubbleRef]);
+  }, [source, sourceRange, touchDocked, dockActive, scrollTranscriptBy, bubbleRef]);
 
   useEffect(() => {
-    if (!docked) setError('');
-  }, [docked]);
+    if (!sourceDocked) setError('');
+  }, [sourceDocked]);
 
   const returnToPassage = async () => {
+    captureSource?.();
     returnRequest.current?.abort();
     const request = new AbortController();
     returnRequest.current = request;
     returning.current = true;
+    onSourceReturnStateChange?.(true);
     setReturnPending(true);
     setError('');
     try {
@@ -132,12 +233,16 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
         setError('Passage unavailable. Your reaction is saved here.');
       }
     } finally {
-      if (!request.signal.aborted) setReturnPending(false);
+      if (returnRequest.current === request) {
+        returnRequest.current = null;
+        setReturnPending(false);
+        onSourceReturnStateChange?.(false);
+      }
     }
   };
 
   return (
-    <div ref={bubbleRef} className="reaction-pill" role="region" aria-label={docked ? 'Docked reaction' : 'React to selected text'} hidden={Boolean(activeScope && activeScope !== scopeId)}>
+    <div ref={bubbleRef} className="reaction-pill" role="region" aria-label={docked ? 'Docked reaction' : 'React to selected text'} hidden={hidden}>
       {discard ? (
         <>
           <span className="reaction-pill-label">Discard reaction?</span>
@@ -146,27 +251,35 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
         </>
       ) : (
         <>
-          {docked ? (
-            <button type="button" className="reaction-pill-return" onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
+          {sourceDocked && !touchDocked && available ? (
+            <button type="button" className="reaction-pill-return" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
               <ArrowUpRight size={18} aria-hidden="true" />
               <span>{returnPending ? 'Returning to passage…' : error || `Return to passage · ${body || source.quote}`}</span>
             </button>
           ) : (
             <>
+              {(touchDocked || !available) && (sourceDocked ? (
+                <button type="button" className="reaction-pill-source" aria-label={`Return to passage: ${source.quote}`} title="Return to passage" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending}>
+                  {returnPending ? 'Returning…' : error || `“${source.quote}”${available ? '' : ' · draft unavailable; retained'}`}
+                </button>
+              ) : (
+                <span className="reaction-pill-source" title={available ? source.quote : `${source.quote} · Draft unavailable. Reaction retained.`}>“{source.quote}”{available ? '' : ' · draft unavailable; retained'}</span>
+              ))}
               <input
                 ref={inputRef}
                 type="text"
                 aria-label="Your reaction"
-                placeholder="Your reaction… (Enter to focus)"
+                placeholder={touchDocked ? 'React to selection…' : 'Your reaction… (Enter to focus)'}
                 title={available ? source.quote : 'Draft unavailable. Your reaction is retained.'}
                 value={body}
+                onPointerDown={captureSource}
                 onChange={(event) => onChange(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.nativeEvent.isComposing || event.keyCode === 229) return;
                   if (event.key === 'Enter') {
                     event.stopPropagation();
                     event.preventDefault();
-                    if ((event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) onAdd();
+                    if ((event.metaKey || event.ctrlKey) && available && body.trim() && !event.nativeEvent.isComposing) onAdd();
                   }
                 }}
               />

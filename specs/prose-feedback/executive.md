@@ -2,13 +2,13 @@
 
 ## Approved pill integration
 
-The approved single-line `ReactionPill` is integrated into ordinary conversation transcripts. The production-component fixture retains its long virtualized history. Enter focuses an anchored pill without automatic focus on selection; Cmd/Ctrl+Enter appends. The dock loads older history when needed and restores the exact source occurrence and its unfinished reaction, and explicit dismissal offers Keep/Discard. The fixture-only presentation override and the earlier large bubble have been removed.
+The approved single-line `ReactionPill` is integrated into ordinary conversation transcripts. Fine-pointer and keyboard selection retains the floating pill; touch/coarse-pointer selection immediately uses the same pill as an unfocused dock above the current composer, with a short source preview. The dock follows composer and visual-viewport geometry when the software keyboard opens. The production-component fixture retains its long virtualized history. Enter focuses an anchored pill without automatic focus on selection; Cmd/Ctrl+Enter appends. Source return loads older history when needed and restores the exact source occurrence and its unfinished reaction, and explicit dismissal offers Keep/Discard. The fixture-only presentation override and the earlier large bubble have been removed.
 
 ## Requirements Summary
 
 Inline conversation reactions (REQ-PF-018–021) are implemented by `InlineMessageReaction`, with a conversation-keyed, session-local `InlineReactionStore` for unfinished text and the existing `DraftStore` for appended feedback. The production-page fixture `product-conversation--inline-message-reactions` includes a long answer, code, a table, historical messages with repeated sequence numbers, and an existing draft. The action uses ListPlus with the label Add to draft; `MessageReviewAction` provides explicit message-review entry on touch and desktop.
 
-Focused tests cover source pinning, draft edits during reaction entry, duplicate activation, destination loss, navigation/remount retention, native context-menu pass-through, IME handling, Escape, and lossless fenced quotations. Browser verification in Chromium covers actual mouse selection, draft append with unchanged transcript scroll position, native copying of a multiline code selection, repeated appends, and the existing historical-message reviewer and older-answer append at 390px width. The required `./dev.py check` passed all 16 checks. Native iOS Safari/PWA and Android selection-menu, handle, and software-keyboard acceptance is **not yet verified on devices**; desktop viewport emulation is not a substitute.
+Focused tests cover source pinning, draft edits during reaction entry, duplicate activation, destination loss, navigation/remount retention, native context-menu pass-through, IME handling, Escape, lossless fenced quotations, touch-versus-desktop presentation, source capture before focus, no autofocus, and visual-viewport/composer placement. Browser verification in Chromium covers actual mouse selection, draft append with unchanged transcript scroll position, native copying of a multiline code selection, repeated appends, and the existing historical-message reviewer and older-answer append at 390px width. Native iOS Safari/PWA and Android selection-menu, handle, scrolling, and software-keyboard acceptance is **not yet verified on devices**; desktop viewport or touch emulation is not a substitute.
 
 The Prose Feedback feature enables users to browse project files and provide structured, line-level feedback to the AI agent. On mobile/tablet, users open a file browser overlay from the conversation interface, navigate directories, and select text files to review. On desktop, the File Explorer Panel (`specs/file-explorer/`) provides persistent file browsing. Selected files display in a reading view with appropriate formatting (rendered markdown, syntax-highlighted code, or plain text). Long-pressing on any line opens an annotation dialog where users type a note about that specific content. Notes accumulate in a session-local collection, visible via a badge and expandable notes panel. Users can review, delete, or jump to annotated lines before sending. When ready, tapping Send formats all notes into a structured message showing the absolute file path, line numbers, and complete raw line content (for greppability), then injects this into the message input. Additionally, patch tool output displays a summary of modified files with change counts, allowing users to click any file to review it with all modifications highlighted. Closing the reader with unsaved notes prompts for confirmation.
 
@@ -41,8 +41,12 @@ Task approval is a separate component, `TaskApprovalReader`, not part of the Met
 | **REQ-PF-015:** System-Triggered Prose Reader for Task Approval | ❌ Not Started | Auto-opens on AwaitingTaskApproval state entry |
 | **REQ-PF-016:** Approve, Discard, and Feedback Actions for Task Approval | ❌ Not Started | Three-action toolbar; iterative feedback loop |
 | **REQ-PF-017:** Focused Markdown Review | ✅ Complete | Wide-desktop prose/message/review takeover; bounded send/discard/keep feedback resolution |
+| **REQ-PF-018:** Inline Conversation Reactions | ✅ Complete | Floating desktop pill; composer-anchored touch dock; exact source return |
+| **REQ-PF-019:** Add Reaction to Draft | ✅ Complete | Lossless exactly-once append without send or composer focus |
+| **REQ-PF-020:** Temporary Reaction Ownership | ✅ Complete | Conversation-scoped session ownership with Keep/Discard |
+| **REQ-PF-021:** Touch Access to Message Review | ✅ Complete | Explicit Review action with existing reviewer workflow |
 
-**Progress:** 15 of 17 complete
+**Progress:** 19 of 21 complete
 
 ## Prerequisites
 
