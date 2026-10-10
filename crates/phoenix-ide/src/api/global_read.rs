@@ -2670,8 +2670,11 @@ mod previous_transcripts_tests {
         ));
     }
 
-    #[tokio::test]
-    async fn targeted_read_continuation_skips_hidden_rows_but_rejects_explicit_hidden_target() {
+    async fn hidden_continuation_fixture() -> (
+        crate::db::Database,
+        GlobalReadService,
+        PreviousTranscriptsBinding,
+    ) {
         let (db, service, binding) = fixture().await;
         db.add_message(
             "prev-target",
@@ -2709,6 +2712,12 @@ mod previous_transcripts_tests {
         )
         .await
         .unwrap();
+        (db, service, binding)
+    }
+
+    #[tokio::test]
+    async fn targeted_read_continuation_skips_hidden_rows_but_rejects_explicit_hidden_target() {
+        let (db, service, binding) = hidden_continuation_fixture().await;
         let target = "@transcript:prev-root#message-prev-target";
         let first = service
             .previous_transcripts(
