@@ -2715,6 +2715,57 @@ mod previous_transcripts_tests {
         (db, service, binding)
     }
 
+    async fn assert_invalid_hidden_cursors(
+        db: &crate::db::Database,
+        service: &GlobalReadService,
+        binding: &PreviousTranscriptsBinding,
+        target: &str,
+    ) {
+        let malformed_hidden_cursor = encode_previous_cursor(&PreviousCursor {
+            scope: previous_scope(&binding),
+            target: Some(previous_cursor_target(target)),
+            sequence: db
+                .get_message_by_id_in_conversation("prev-root", "prev-hidden-middle")
+                .await
+                .unwrap()
+                .sequence_id,
+            byte_offset: 1,
+            message_id: Some(sha256_hex("prev-hidden-middle")),
+        });
+        assert_eq!(
+            service
+                .previous_transcripts(
+                    &binding,
+                    PreviousTranscriptsRequest::Read {
+                        transcript_ref: target.into(),
+                        cursor: Some(malformed_hidden_cursor),
+                    },
+                )
+                .await,
+            PreviousTranscriptsOutput::InvalidCursor
+        );
+
+        let explicit_hidden_target = "@transcript:prev-root#message-prev-hidden-middle";
+        assert_eq!(
+            service
+                .previous_transcripts(
+                    &binding,
+                    PreviousTranscriptsRequest::Read {
+                        transcript_ref: explicit_hidden_target.into(),
+                        cursor: Some(encode_previous_cursor(&PreviousCursor {
+                            scope: previous_scope(&binding),
+                            target: Some(previous_cursor_target(explicit_hidden_target)),
+                            sequence: 1,
+                            byte_offset: 0,
+                            message_id: Some(sha256_hex("prev-hidden-middle")),
+                        })),
+                    },
+                )
+                .await,
+            PreviousTranscriptsOutput::InvalidTarget
+        );
+    }
+
     #[tokio::test]
     async fn targeted_read_continuation_skips_hidden_rows_but_rejects_explicit_hidden_target() {
         let (db, service, binding) = hidden_continuation_fixture().await;
@@ -2779,49 +2830,7 @@ mod previous_transcripts_tests {
             }
         );
 
-        let malformed_hidden_cursor = encode_previous_cursor(&PreviousCursor {
-            scope: previous_scope(&binding),
-            target: Some(previous_cursor_target(target)),
-            sequence: db
-                .get_message_by_id_in_conversation("prev-root", "prev-hidden-middle")
-                .await
-                .unwrap()
-                .sequence_id,
-            byte_offset: 1,
-            message_id: Some(sha256_hex("prev-hidden-middle")),
-        });
-        assert_eq!(
-            service
-                .previous_transcripts(
-                    &binding,
-                    PreviousTranscriptsRequest::Read {
-                        transcript_ref: target.into(),
-                        cursor: Some(malformed_hidden_cursor),
-                    },
-                )
-                .await,
-            PreviousTranscriptsOutput::InvalidCursor
-        );
-
-        let explicit_hidden_target = "@transcript:prev-root#message-prev-hidden-middle";
-        assert_eq!(
-            service
-                .previous_transcripts(
-                    &binding,
-                    PreviousTranscriptsRequest::Read {
-                        transcript_ref: explicit_hidden_target.into(),
-                        cursor: Some(encode_previous_cursor(&PreviousCursor {
-                            scope: previous_scope(&binding),
-                            target: Some(previous_cursor_target(explicit_hidden_target)),
-                            sequence: 1,
-                            byte_offset: 0,
-                            message_id: Some(sha256_hex("prev-hidden-middle")),
-                        })),
-                    },
-                )
-                .await,
-            PreviousTranscriptsOutput::InvalidTarget
-        );
+        assert_invalid_hidden_cursors(&db, &service, &binding, target).await;
     }
 
     #[tokio::test]
