@@ -37,7 +37,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [023](023_projects-accept-taskmd-and-plain-markdown-briefs.md) | Projects accept taskmd files by default and plain markdown briefs through one task-source seam | Accepted | REQ-PROJ-003, REQ-PROJ-004, REQ-PROJ-006, REQ-PROJ-012, REQ-PROJ-033, REQ-PROJ-034, REQ-PROJ-037 |
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 | [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
-| [026](026_workscope-owned-lifecycle-unifies-conversation-handoffs.md) | Product conversation lifecycle is separate from WorkScope resource ownership | Accepted | REQ-BED-019, REQ-BED-028, REQ-BED-029, REQ-BED-030, REQ-PROJ-004, REQ-PROJ-015, REQ-PROJ-WS-001, REQ-WL-001, REQ-WL-002, REQ-PRA-000, REQ-CHN-008, REQ-GR-001 |
+| [026](026_workscope-owned-lifecycle-unifies-conversation-handoffs.md) | Product conversation lifecycle is separate from WorkScope resource ownership | Partially superseded by ADR-088 | REQ-BED-019, REQ-BED-028, REQ-BED-029, REQ-BED-030, REQ-PROJ-004, REQ-PROJ-015, REQ-PROJ-WS-001, REQ-WL-001, REQ-WL-002, REQ-PRA-000, REQ-CHN-008, REQ-GR-001 |
 | [027](027_write-capable-product-conversations-use-global-evidence.md) | Write-capable ProductConversations use bounded global evidence | Partially superseded by ADR-066 | REQ-GR-004, REQ-GR-007, REQ-GR-012 |
 | [028](028_ios-companion-includes-read-only-project-context-and-prose-review.md) | The iOS companion includes read-only project context and prose review | Superseded by ADR-029 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [029](029_ios-companion-uses-session-scoped-prose-feedback.md) | The iOS companion uses session-scoped prose feedback | Superseded by ADR-030 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
@@ -51,9 +51,9 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [037](037_legacy-direct-turn-terminal-ambiguity-is-retired.md) | Legacy direct-turn terminal ambiguity is retired as failure | Accepted | REQ-DWF-CHAT-013, REQ-DWF-CHAT-014, REQ-COMP-004 |
 | [038](038_commission-review-is-retired-with-forward-history-recovery.md) | Commission review is retired with forward history recovery | Accepted | REQ-CR-001–018, REQ-COMP-001–005, REQ-VS-006/016 |
 | [039](039_durable-runtime-resource-identity-fails-closed.md) | Durable runtime resource identity fails closed outside proven containment | Accepted | REQ-WL-002b, REQ-WL-002d, REQ-COMP-001 |
-| [040](040_close-uses-scope-gates-and-tmux-only-durable-identity.md) | Close uses WorkScope gates and tmux-only durable identity | Accepted | REQ-WL-002b, REQ-WL-002d, REQ-PROJ-WS-001 |
-| [041](041_minimal-history-finalization.md) | Minimal History finalization | Accepted | REQ-WL-002b, REQ-CONV-001 |
-| [042](042_close-directory-retirement-trusts-private-namespace.md) | Close directory retirement trusts its private namespace | Accepted | REQ-WL-002b |
+| [040](040_close-uses-scope-gates-and-tmux-only-durable-identity.md) | Close uses WorkScope gates and tmux-only durable identity | Partially superseded by ADR-088 | REQ-WL-002b, REQ-WL-002d, REQ-PROJ-WS-001 |
+| [041](041_minimal-history-finalization.md) | Minimal History finalization | Partially superseded by ADR-088 | REQ-WL-002b, REQ-CONV-001 |
+| [042](042_close-directory-retirement-trusts-private-namespace.md) | Close directory retirement trusts its private namespace | Partially superseded by ADR-088 | REQ-WL-002b |
 | [043](043_creation-staging-uses-a-private-locked-namespace.md) | Creation staging uses a private locked namespace | Accepted | REQ-CCR-005; product-creation worktree ownership and cleanup |
 | [044](044_creation-publication-uses-request-bound-identity-and-immutable-pins.md) | Creation publication uses request-bound identity and immutable starting pins | Accepted | REQ-CCR-001/002/003/005/005A/006A, REQ-DWF-CREATE-001/002/003/004, REQ-PROJ-017/022, REQ-GITREP-003 |
 | [045](045_provider-prompts-use-persisted-generation-fenced-projections.md) | Provider prompts use persisted generation-fenced projections | Accepted | REQ-BED-018A, REQ-BED-020, REQ-BED-030A |
@@ -93,7 +93,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [077](077_committed-paired-finalization-is-publication-only.md) | Committed paired finalization is publication-only; recovered startup checkpoints forbid snapshot replay | Accepted | REQ-LDD-017, REQ-LDD-018, REQ-PD-018, REQ-PD-020, REQ-COMP-003 |
 | [078](078_kache-first-automatic-compiler-cache.md) | Automatic compiler caching prefers released Kache | Superseded by ADR-079 | development methodology; REQ-COMP-001 |
 | [079](079_kache-explicit-pending-debug-fidelity.md) | Kache remains explicit pending restored debug fidelity | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
-| [080](080_close-stops-bound-fsmonitor-daemons.md) | Close stops bound fsmonitor daemons instead of reconfiguring Git | Accepted | REQ-WL-002b; Close retirement quarantine and descriptor scan |
+| [080](080_close-stops-bound-fsmonitor-daemons.md) | Close stops bound fsmonitor daemons instead of reconfiguring Git | Partially superseded by ADR-088 | REQ-WL-002b; Close retirement quarantine and descriptor scan |
 | [081](081_global-coordinator-borrows-workscope-svg-source-authority.md) | Global Coordinator borrows WorkScope SVG source authority | Accepted | REQ-SVG-001, REQ-GR-007 |
 | [082](082_legacy-auq-waits-retain-identity-absence.md) | Legacy AUQ waits retain identity absence | Accepted | REQ-AUQ-009, REQ-COMP-001; `QuestionRequestId`, `AwaitingUserResponse` |
 | [083](083_federation-instance-identity-and-known-credential-query-exclusions.md) | Federation establishes stable instance identity and excludes known credentials from agent SQL | Accepted | REQ-GR-011A; federation instance identity |
@@ -101,7 +101,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [085](085_codex-continuation-requires-an-identified-account.md) | Codex continuation requires an identified account | Accepted | REQ-LLM-004h, REQ-LLM-004i; account-bound route admission |
 | [086](086_mcp-credential-removal-has-durable-intent.md) | MCP credential removal has durable intent | Accepted | REQ-MCP-012; credential-removal recovery |
 | [087](087_tmux-effects-go-through-a-backend-seam.md) | Tmux effects go through a backend seam, and tests use an in-memory fake | Accepted | tmux registry and `tmux_run`; Close retirement of tmux servers |
-| [088](088_touch-reactions-dock-away-from-native-selection.md) | Touch reactions dock away from native selection | Accepted | REQ-PF-018, REQ-PF-020 |
+| [088](088_close-stops-on-failure-and-separates-cleanup-from-lifecycle.md) | Close stops on failure and separates cleanup from lifecycle | Accepted; partially supersedes 026/040/041/042/080 | REQ-BED-029/030A, REQ-WL-002/002a/002b/002c/002d/004, REQ-PROJ-028a, REQ-WAB-007; Close run ordinals and mandatory Global failure delivery |
+| [089](089_touch-reactions-dock-away-from-native-selection.md) | Touch reactions dock away from native selection | Accepted | REQ-PF-018, REQ-PF-020 |
 
 ## For agents: which decisions bind your task
 
@@ -117,6 +118,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
+| Specifying Close failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 088 supersedes the Close recovery/finalization consequences of 026/040/041/042/080; retain their identity and ownership safeguards |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |

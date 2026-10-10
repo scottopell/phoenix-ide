@@ -66,7 +66,7 @@ function CloseStatusPanel({
   onRetry: () => void;
 }) {
   const close = snapshot.close;
-  if (!close) return null;
+  if (!close || close.run_status === 'stopped' || close.phase === 'completed') return null;
   if (close.phase === 'awaiting_loss_confirmation') {
     return (
       <section className="work-actions-close-status" aria-label="Close loss confirmation">
@@ -310,7 +310,8 @@ export function WorkControlBar({
   const closeSnapshotRequestRef = useRef(0);
   const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
-  const readOnly = !mutationEnabled;
+  const readOnly = !mutationEnabled || closeSnapshot?.close?.outcome === 'close_incomplete'
+    || closeSnapshot?.ordinary_lifecycle === 'history';
   const { openDiffFullscreen } = useViewerSlotCommands();
   const openSelectorFromFallback = () => {
     fallbackSelectorOriginRef.current = true;
@@ -548,6 +549,7 @@ export function WorkControlBar({
       code === 'close_loss_confirmation_required'
       || code === 'close_inspection_failed'
       || code === 'close_retirement_needs_repair'
+      || code === 'close_incomplete'
       || code === 'close_stop_work_confirmation_required'
       || code === 'close_settlement_in_progress'
       || code === 'stale_close_inspection'
@@ -557,6 +559,7 @@ export function WorkControlBar({
         const snapshot = await api.getProductConversationSnapshot(conversationId);
         if (request === closeSnapshotRequestRef.current) {
           setCloseSnapshot(snapshot.close ? snapshot : null);
+          if (snapshot.close?.phase === 'completed') onCloseCompleted?.();
         }
         return false;
       } catch (snapshotError) {
