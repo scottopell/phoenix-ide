@@ -40,7 +40,11 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
     ].filter((identity): identity is string => Boolean(identity)));
     const refresh = () => setProductSnapshotRetry((value) => value + 1);
     const unsubscribes = [...identities].map((identity) => subscribeProductConversationSnapshotChanged(identity, refresh));
-    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+    window.addEventListener('phoenix:automatic-continuation-updated', refresh);
+    return () => {
+      unsubscribes.forEach((unsubscribe) => unsubscribe());
+      window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
+    };
   }, [productConversationId, productSnapshot?.snapshot.product_conversation_id]);
   const directExactMember = routeSlug
     && ownedProductSnapshot?.requested_transcript_row_id === routeSlug

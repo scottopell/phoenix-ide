@@ -1,7 +1,6 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiResponseError, type ProductConversationSnapshotView } from '../api';
-import { notifyProductConversationSnapshotChanged } from '../notifications';
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
 const snapshot = (product: string, member: string) => ({ product_conversation_id: product, requested_transcript_row_id: member, latest_transcript_row_id: 'latest' }) as ProductConversationSnapshotView;
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
@@ -30,7 +29,7 @@ describe('desktop validated route ownership', () => {
       .mockResolvedValueOnce({ ...snapshot('product', 'root'), latest_transcript_row_id: 'continued' });
     const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
     await waitFor(() => expect(result.current).toBe('latest'));
-    act(() => { notifyProductConversationSnapshotChanged('product'); });
+    act(() => { window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated')); });
     await waitFor(() => expect(result.current).toBe('continued'));
     expect(get).toHaveBeenCalledTimes(2);
   });
