@@ -29,7 +29,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if ((sourceDocked && !touchDocked) || discard || hidden) return;
+    if ((sourceDocked && !touchDocked && available) || discard || hidden) return;
     const focusFromSelection = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.key !== 'Enter' || event.isComposing || event.keyCode === 229
         || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
@@ -42,7 +42,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     };
     document.addEventListener('keydown', focusFromSelection);
     return () => document.removeEventListener('keydown', focusFromSelection);
-  }, [bubbleRef, discard, hidden, scopeId, sourceDocked, touchDocked]);
+  }, [available, bubbleRef, discard, hidden, scopeId, sourceDocked, touchDocked]);
   const requestClose = () => body ? setDiscard(true) : onClose();
   useKeyboardRouterShortcut({
     id: `${scopeId}:escape`, scopeId, key: 'Escape', layer: 'passive-content',

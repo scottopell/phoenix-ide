@@ -154,6 +154,25 @@ describe('reaction pill', () => {
     expect(add).not.toHaveBeenCalled();
   });
 
+  it('focuses an unavailable offscreen fine-pointer editor with unmodified Enter only', async () => {
+    render(<Fixture mounted={false} available={false} body="Retained desktop note" />);
+    const input = screen.getByRole('textbox', { name: 'Your reaction' });
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
+    expect(input).not.toHaveFocus();
+    fireEvent.keyDown(document, { key: 'Enter', shiftKey: true });
+    expect(input).not.toHaveFocus();
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(input).toHaveFocus();
+    expect(add).not.toHaveBeenCalled();
+  });
+
+  it('leaves Enter unclaimed for an available source-only fine-pointer dock', async () => {
+    render(<Fixture mounted={false} body="Retained desktop note" />);
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Your reaction' })).not.toBeInTheDocument();
+    expect(fireEvent.keyDown(document, { key: 'Enter' })).toBe(true);
+  });
+
   it('keeps the dock usable after an asynchronous load failure and aborts on unmount', async () => {
     let finish!: (found: boolean) => void;
     navigate.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
