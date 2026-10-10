@@ -12,7 +12,7 @@ const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
-function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number }) {
+function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop, onChange = () => {} }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number; onChange?: (body: string) => void }) {
   return <FocusScopeProvider>
     <div className="conversation-column">
     <div id="messages">
@@ -20,7 +20,7 @@ function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = f
     </div>
     {composerAvailable && <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />}
     </div>
-    <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available={available} onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available={available} onChange={onChange} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
 }
 function ActivateOtherScope() {
@@ -133,10 +133,21 @@ describe('reaction pill', () => {
     expect(screen.getByRole('textbox')).not.toHaveFocus();
   });
 
-  it('explains an unavailable draft from the desktop source-return dock', async () => {
-    render(<Fixture mounted={false} available={false} />);
-    expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('Draft unavailable · reaction retained');
-    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+  it('keeps an unavailable reaction editable when desktop source return fails', async () => {
+    navigate.mockResolvedValue(false);
+    const change = vi.fn();
+    render(<Fixture mounted={false} available={false} body="Retained desktop note" onChange={change} />);
+    const returnButton = await screen.findByRole('button', { name: /Return to passage/ });
+    expect(returnButton).toHaveTextContent('draft unavailable; retained');
+    const input = screen.getByRole('textbox');
+    expect(input).toHaveValue('Retained desktop note');
+    expect(input).toBeEnabled();
+    fireEvent.change(input, { target: { value: 'Still editable' } });
+    expect(change).toHaveBeenCalledWith('Still editable');
+    fireEvent.click(returnButton);
+    await waitFor(() => expect(returnButton).toHaveTextContent('Passage unavailable. Your reaction is saved here.'));
+    expect(screen.getByRole('textbox')).toHaveValue('Retained desktop note');
+    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
     expect(add).not.toHaveBeenCalled();
   });
 
