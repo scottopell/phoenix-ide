@@ -30,6 +30,15 @@ function sameReactionSource(a: ReactionSource | undefined, b: ReactionSource): b
     && a.textAnchor?.end.offset === b.textAnchor?.end.offset;
 }
 
+function sourceIsVisible(source: ReactionSource): boolean {
+  const range = restoreReactionRange(source);
+  if (!range) return false;
+  const rect = range.getBoundingClientRect();
+  const viewportTop = window.visualViewport?.offsetTop ?? 0;
+  const viewportBottom = viewportTop + (window.visualViewport?.height ?? window.innerHeight);
+  return rect.height > 0 && rect.bottom > viewportTop && rect.top < viewportBottom;
+}
+
 export function InlineMessageReaction(props: Props) {
   const store = useContext(InlineReactionContext);
   return store ? <ReactionSession key={props.scopeKey} {...props} store={store} /> : null;
@@ -43,6 +52,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
   const selectedRange = useRef<Range | null>(null);
   const pillFocusPending = useRef(false);
   const selecting = useRef(false);
+  const gestureActive = useRef(false);
   const selectionInput = useRef<'touch' | 'fine' | null>(null);
   const selectionChangedDuringGesture = useRef(false);
   const { activeScope } = useFocusScope();
@@ -79,13 +89,15 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
           store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation });
         }
         setNotice('');
-      } else if (current && (current.presentation === 'floating'
+      } else if (!gestureActive.current && current && (current.presentation === 'floating'
         || Boolean(nativeSelection && nativeSelection.rangeCount > 0 && !nativeSelection.isCollapsed)
-        || Boolean(restoreReactionRange(current.source)))) {
+        || sourceIsVisible(current.source))) {
         store.dispatch(scopeKey, { type: 'clear' });
       }
-      selectionInput.current = null;
-      selectionChangedDuringGesture.current = false;
+      if (!gestureActive.current) {
+        selectionInput.current = null;
+        selectionChangedDuringGesture.current = false;
+      }
     };
     const schedule = () => {
       cancelAnimationFrame(frame);
@@ -95,9 +107,14 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       if (bubbleRef.current?.contains(event.target as Node)) return;
       selectionInput.current = event.pointerType === 'touch' ? 'touch' : 'fine';
       selectionChangedDuringGesture.current = false;
+      gestureActive.current = true;
       selecting.current = event.pointerType !== 'touch';
     };
-    const up = () => { selecting.current = false; schedule(); };
+    const up = () => {
+      gestureActive.current = false;
+      selecting.current = false;
+      schedule();
+    };
     const keydown = (event: KeyboardEvent) => {
       if (event.shiftKey || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a')) selectionInput.current = 'fine';
     };

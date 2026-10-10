@@ -246,14 +246,14 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       ) : (
         <>
           {sourceDocked && !touchDocked && available ? (
-            <button type="button" className="reaction-pill-return" onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
+            <button type="button" className="reaction-pill-return" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
               <ArrowUpRight size={18} aria-hidden="true" />
               <span>{returnPending ? 'Returning to passage…' : error || `Return to passage · ${body || source.quote}`}</span>
             </button>
           ) : (
             <>
               {(touchDocked || !available) && (sourceDocked ? (
-                <button type="button" className="reaction-pill-source" aria-label={`Return to passage: ${source.quote}`} title="Return to passage" onClick={returnToPassage} disabled={returnPending}>
+                <button type="button" className="reaction-pill-source" aria-label={`Return to passage: ${source.quote}`} title="Return to passage" onPointerDown={captureSource} onClick={returnToPassage} disabled={returnPending}>
                   {returnPending ? 'Returning…' : error || `“${source.quote}”${available ? '' : ' · draft unavailable; retained'}`}
                 </button>
               ) : (

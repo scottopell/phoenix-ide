@@ -99,6 +99,7 @@ describe('inline message reactions', () => {
     const text = screen.getByTestId('old').firstChild!;
     fireEvent.pointerDown(text, { pointerType: 'touch' });
     select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
     const input = await screen.findByRole('textbox', { name: 'Your reaction' });
     const source = store.getSnapshot('conversation-a')?.source;
     expect(source).toBeDefined();
@@ -119,6 +120,7 @@ describe('inline message reactions', () => {
     const text = screen.getByTestId('old').firstChild!;
     fireEvent.pointerDown(text, { pointerType: 'touch' });
     select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
     const dock = await screen.findByRole('region', { name: 'Docked reaction' });
     const input = screen.getByRole('textbox', { name: 'Your reaction' });
     expect(dock).toHaveTextContent('Deterministic state patterns');
@@ -207,6 +209,29 @@ describe('inline message reactions', () => {
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
   });
 
+  it('retains gesture modality through a provisional native collapse', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'mouse' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'mouse' });
+    expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    window.getSelection()?.removeAllRanges();
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+  });
+
   it('keeps keyboard selection in the floating pill on a hybrid device', async () => {
     setCoarsePointer(true);
     render(<Harness store={new InlineReactionStore()} append={vi.fn()} />);
@@ -222,6 +247,7 @@ describe('inline message reactions', () => {
     const text = screen.getByTestId('old').firstChild!;
     fireEvent.pointerDown(text, { pointerType: 'touch' });
     select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
     fireEvent.change(await screen.findByRole('textbox'), { target: { value: 'Retain this' } });
     const owned = store.getSnapshot('conversation-a');
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss reaction' }));
@@ -240,6 +266,7 @@ describe('inline message reactions', () => {
     const text = screen.getByTestId('old').firstChild!;
     fireEvent.pointerDown(text, { pointerType: 'touch' });
     select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
     fireEvent.change(await screen.findByRole('textbox'), { target: { value: 'Retain presentation' } });
     view.rerender(<Harness store={store} scope="conversation-b" append={append} />);
     view.rerender(<Harness store={store} append={append} />);
@@ -255,6 +282,7 @@ describe('inline message reactions', () => {
     const text = screen.getByTestId('old').firstChild!;
     fireEvent.pointerDown(text, { pointerType: 'touch' });
     select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
     expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     const owned = store.getSnapshot('conversation-a');
     expect(owned?.body).toBe('');
@@ -341,13 +369,32 @@ describe('inline message reactions', () => {
     expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
   });
 
-  it('clears an empty touch reaction when its mounted selection collapses', async () => {
+  it('retains an empty touch reaction when its mounted source is offscreen', async () => {
     setCoarsePointer(true);
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, -120, 100, 20));
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} />);
     const text = screen.getByTestId('old').firstChild!;
     fireEvent.pointerDown(text, { pointerType: 'touch' });
     select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
+    const retained = store.getSnapshot('conversation-a');
+    window.getSelection()?.removeAllRanges();
+    act(() => { fireEvent(document, new Event('selectionchange')); });
+    expect(store.getSnapshot('conversation-a')).toEqual(retained);
+    expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
+  });
+
+  it('clears an empty touch reaction when its mounted selection collapses', async () => {
+    setCoarsePointer(true);
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 100, 100, 20));
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
     expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     window.getSelection()?.removeAllRanges();
     act(() => { fireEvent(document, new Event('selectionchange')); });
@@ -361,6 +408,7 @@ describe('inline message reactions', () => {
     const text = screen.getByTestId('old').firstChild!;
     fireEvent.pointerDown(text, { pointerType: 'touch' });
     select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
     expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     const unrelatedText = screen.getByTestId('unrelated').firstChild!;
     const range = document.createRange();
