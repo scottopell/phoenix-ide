@@ -184,10 +184,11 @@ describe('inline message reactions', () => {
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
     const source = store.getSnapshot('conversation-a')?.source;
     const dispatch = vi.spyOn(store, 'dispatch');
-    fireEvent.pointerDown(screen.getByTestId('unrelated'), { pointerType: 'touch' });
+    const scrollTarget = screen.getByTestId('new').firstChild!;
+    fireEvent.pointerDown(scrollTarget, { pointerType: 'touch' });
     fireEvent(document, new Event('selectionchange'));
     await act(async () => { await new Promise(requestAnimationFrame); });
-    fireEvent.pointerUp(screen.getByTestId('unrelated'), { pointerType: 'touch' });
+    fireEvent.pointerUp(scrollTarget, { pointerType: 'touch' });
     await act(async () => { await new Promise(requestAnimationFrame); });
     expect(dispatch).not.toHaveBeenCalled();
     expect(store.getSnapshot('conversation-a')?.source).toBe(source);

@@ -59,6 +59,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
   const gestureActive = useRef(false);
   const selectionInput = useRef<'touch' | 'fine' | null>(null);
   const selectionChangedDuringGesture = useRef(false);
+  const gestureStartedOnCurrentSource = useRef(false);
   const { activeScope } = useFocusScope();
   const setSourceReturnActive = useCallback((active: boolean) => { sourceReturnActive.current = active; }, []);
   const focusScope = `inline-reaction:${scopeKey}`;
@@ -71,6 +72,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       selectionInput.current = null;
       selectionChangedDuringGesture.current = false;
       selecting.current = false;
+      gestureStartedOnCurrentSource.current = false;
       return;
     }
     const read = () => {
@@ -103,6 +105,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       if (!gestureActive.current) {
         selectionInput.current = null;
         selectionChangedDuringGesture.current = false;
+        gestureStartedOnCurrentSource.current = false;
       }
     };
     const schedule = () => {
@@ -117,6 +120,10 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       if (!sourceMessage || !transcript?.contains(sourceMessage)) return;
       selectionInput.current = event.pointerType === 'touch' ? 'touch' : 'fine';
       selectionChangedDuringGesture.current = false;
+      const currentSource = store.getSnapshot(scopeKey)?.source;
+      gestureStartedOnCurrentSource.current = Boolean(currentSource
+        && sourceMessage.getAttribute('data-inline-reaction-message') === currentSource.messageId
+        && sourceMessage.getAttribute('data-message-occurrence') === currentSource.occurrenceToken);
       gestureActive.current = true;
       selecting.current = event.pointerType !== 'touch';
     };
@@ -129,8 +136,14 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       if (event.shiftKey || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a')) selectionInput.current = 'fine';
     };
     const selectionChange = () => {
-      if (selectionInput.current !== null) selectionChangedDuringGesture.current = true;
       const nativeSelection = window.getSelection();
+      if (selectionInput.current !== null) {
+        const selected = readReactionSelection(nativeSelection, messages);
+        const currentSource = store.getSnapshot(scopeKey)?.source;
+        if (gestureStartedOnCurrentSource.current || Boolean(selected && !sameReactionSource(currentSource, selected.source))) {
+          selectionChangedDuringGesture.current = true;
+        }
+      }
       if (selectionInput.current === null && (!nativeSelection || nativeSelection.rangeCount === 0 || nativeSelection.isCollapsed)) {
         cancelAnimationFrame(frame);
         read();
