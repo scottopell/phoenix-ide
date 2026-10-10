@@ -627,9 +627,9 @@ rule InterceptedToolNotSole {
 -- CORE 3. TOOL EXECUTION (REQ-BED-004)
 -- ===========================================================
 
--- BashWaitSettlementDeadlineReached is the runtime clock trigger for the
--- active Bash wait invocation. It carries the exact active tool call and is
--- neither a retry nor a command-dispatch event.
+-- BashWaitSettlementDeadlineReached is the soft runtime fallback trigger for
+-- an active Bash wait invocation. BashWaitSettlementPersistenceCutoffReached
+-- is the non-renewing hard cutoff for its authoritative settlement.
 
 rule BashWaitSettlementDeadlineFires {
     when: BashWaitSettlementDeadlineReached(conversation, tool_call)
@@ -645,11 +645,30 @@ rule BashWaitSettlementDeadlineFires {
     ensures: not CommandReexecuted(tool_call)
 
     @guidance
-        -- Arm the runtime deadline from the wait request's supported duration plus
-        -- a short result-delivery grace. Abort only the wait invocation task, then
-        -- feed one Failed outcome carrying the original tool id through the normal
-        -- generation-checked ToolCompletes transition. Do not kill or rerun the
-        -- process identified by the handle; independent jobs remain untouched.
+        -- Arm the fallback from the wait request's supported duration plus a short
+        -- execution grace. Abort only the wait invocation task, then feed one Failed
+        -- outcome carrying the original tool id through the normal generation-checked
+        -- ToolCompletes transition. Do not kill or rerun the process identified by the
+        -- handle; independent jobs remain untouched. Settlement remains bounded by the
+        -- original absolute persistence cutoff.
+}
+
+rule BashWaitSettlementPersistenceCutoffFires {
+    when: BashWaitSettlementPersistenceCutoffReached(conversation, tool_call)
+    requires: conversation.core_status = executing_tools
+    requires: tool_call = conversation.current_tool
+    requires: tool_call.name = "bash"
+    requires: tool_call.input.op = "wait"
+    ensures: ProcessLocalAuthorityClosed(conversation)
+    ensures: not PersistenceReceiptFabricated(tool_call)
+    ensures: not AmbiguousPersistenceRetried(tool_call)
+    ensures: not FurtherWorkAdmitted(conversation)
+    ensures: not FurtherSemanticStatePublished(conversation)
+
+    @guidance
+        -- Apply REQ-BED-033 at the shared RuntimeManager authority fence. The
+        -- indeterminate write may have produced no durable tool result; do not infer
+        -- one, retry the ambiguous SQLite write, or continue only this conversation.
 }
 
 rule ToolCompletesWithMoreRemaining {
@@ -3294,6 +3313,10 @@ surface UserConversation {
                     awaiting_recovery
                  }
         BashWaitSettlementDeadlineReached(conversation, conversation.current_tool)
+            when conversation.core_status = executing_tools
+             and conversation.current_tool.name = "bash"
+             and conversation.current_tool.input.op = "wait"
+        BashWaitSettlementPersistenceCutoffReached(conversation, conversation.current_tool)
             when conversation.core_status = executing_tools
              and conversation.current_tool.name = "bash"
              and conversation.current_tool.input.op = "wait"

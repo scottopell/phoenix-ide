@@ -269,6 +269,52 @@ impl ToolExecutor for MockToolExecutor {
     }
 }
 
+pub struct GatedDefinitionsToolExecutor {
+    definitions_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    definitions_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl GatedDefinitionsToolExecutor {
+    pub fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                definitions_started: Mutex::new(Some(started_tx)),
+                definitions_release: Mutex::new(Some(release_rx)),
+            }),
+            started_rx,
+            release_tx,
+        )
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for GatedDefinitionsToolExecutor {
+    async fn execute(
+        &self,
+        _call: crate::runtime::deny_gate::CheckedToolCall,
+        _ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        None
+    }
+
+    async fn definitions(&self) -> Vec<ToolDefinition> {
+        if let Some(started) = self.definitions_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.definitions_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        Vec::new()
+    }
+}
+
 // ============================================================================
 // Delayed Mock LLM Client (for cancellation testing)
 // ============================================================================

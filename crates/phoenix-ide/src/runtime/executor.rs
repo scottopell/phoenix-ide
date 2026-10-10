@@ -3597,19 +3597,46 @@ where
     ) -> Result<Vec<Event>, String> {
         let remaining = self.bash_wait_transition_remaining(&result.new_state);
         if let Some(remaining) = remaining {
-            if !remaining.is_zero() {
+            let dispatch_index = result.effects.iter().position(|effect| {
+                matches!(effect, Effect::RequestLlm | Effect::ExecuteTool { .. })
+            });
+            let (settlement, downstream_dispatch) = if let Some(index) = dispatch_index {
+                let mut settlement = result;
+                let downstream = settlement.effects.split_off(index);
+                (settlement, downstream)
+            } else {
+                (result, Vec::new())
+            };
+            let mut generated = if remaining.is_zero() {
+                None
+            } else {
                 let cutoff = tokio::time::sleep(remaining);
                 tokio::pin!(cutoff);
                 tokio::select! {
                     biased;
-                    () = &mut cutoff => {}
-                    applied = self.apply_transition_result_inner(result) => return applied,
+                    () = &mut cutoff => None,
+                    applied = self.apply_transition_result_inner(settlement) => Some(applied?),
+                }
+            };
+            let Some(mut generated) = generated.take() else {
+                self.fatal_local_authority_fence
+                    .close("bash_wait_transition_deadline");
+                return Err("bash wait transition exceeded its absolute settlement deadline; fatal local authority fence closed"
+                    .to_string());
+            };
+            for effect in downstream_dispatch {
+                let is_llm_dispatch = matches!(effect, Effect::RequestLlm);
+                match Box::pin(self.execute_effect(effect)).await {
+                    Ok(Some(event)) => generated.push(event),
+                    Ok(None) => {}
+                    Err(error) if is_llm_dispatch => {
+                        self.pending_trusted_tool_results.clear();
+                        generated.push(self.llm_dispatch_failure_event(error));
+                    }
+                    Err(error) => return Err(error),
                 }
             }
-            self.fatal_local_authority_fence
-                .close("bash_wait_transition_deadline");
-            return Err("bash wait transition exceeded its absolute settlement deadline; fatal local authority fence closed"
-                .to_string());
+            return Ok(generated);
         }
         self.apply_transition_result_inner(result).await
     }
@@ -18418,14 +18445,31 @@ mod explore_prompt_cache_shape_tests {
 mod steer_drain_detector_tests {
     #![allow(clippy::large_futures)]
     use super::*;
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::testing::{
+        GatedDefinitionsToolExecutor, InMemoryStorage, MockLlmClient, MockToolExecutor,
+    };
     use crate::state_machine::event::SteerEntry;
+    struct NoLlm;
+
+    impl phoenix_core::llm_service::LlmSelector for NoLlm {
+        fn get(
+            &self,
+            _model_id: &str,
+        ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+
+        fn default_service(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+    }
+
     use crate::state_machine::state::{
         AssistantMessage, PendingSubAgent, SubAgentMode, ToolCall, ToolInput,
     };
     use crate::state_machine::transition::TransitionResult;
     use crate::state_machine::ConvContext;
-    use crate::tools::BrowserSessionManager;
+    use crate::tools::{BrowserSessionManager, Tool};
     use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -18644,6 +18688,74 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("started");
+        let registry = Arc::new(crate::tools::BashHandleRegistry::new());
+        let context = ToolContext::new(
+            CancellationToken::new(),
+            "real-bash-wait".to_string(),
+            temp.path().to_path_buf(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::clone(&registry),
+            Arc::new(NoLlm),
+            crate::terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            None,
+            phoenix_core::work_scope::WorkScopeId::parse("real-bash-wait").unwrap(),
+        );
+        let bash = crate::tools::BashTool;
+        let run = bash
+            .run(
+                serde_json::json!({
+                    "op": "run",
+                    "cmd": "printf x >> started; sleep 3",
+                    "wait_seconds": 0
+                }),
+                context.clone(),
+            )
+            .await;
+        let run_value: serde_json::Value = serde_json::from_str(run.output()).unwrap();
+        assert_eq!(run_value["status"], "still_running");
+        let handle = run_value["handle"].as_str().unwrap();
+
+        for wait_seconds in [0, 1] {
+            let waited = bash
+                .run(
+                    serde_json::json!({
+                        "op": "wait",
+                        "handle": handle,
+                        "wait_seconds": wait_seconds
+                    }),
+                    context.clone(),
+                )
+                .await;
+            let waited_value: serde_json::Value = serde_json::from_str(waited.output()).unwrap();
+            assert_eq!(waited_value["status"], "still_running");
+            assert_eq!(waited_value["handle"], handle);
+        }
+
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+        assert_eq!(registry.snapshot_live_pgids().await.len(), 1);
+        let exited = bash
+            .run(
+                serde_json::json!({
+                    "op": "wait",
+                    "handle": handle,
+                    "wait_seconds": 5
+                }),
+                context,
+            )
+            .await;
+        let exited_value: serde_json::Value = serde_json::from_str(exited.output()).unwrap();
+        assert_eq!(exited_value["status"], "tombstoned");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("started")).unwrap(),
+            "x"
+        );
+    }
+
+    #[tokio::test]
     async fn elapsed_bash_wait_timer_retains_settlement_grace() {
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "bash-wait-elapsed",
@@ -18779,6 +18891,73 @@ mod steer_drain_detector_tests {
         rt.state = cancelling_second;
         rt.manage_deadline(&cancelling_first);
         assert_eq!(rt.deadline, Some(original));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_wait_is_not_fenced_by_slow_downstream_definitions() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let (tools, definitions_started, definitions_release) = GatedDefinitionsToolExecutor::new();
+        let context = ConvContext::new(
+            "wait-slow-definitions",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+        );
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let mut rt = ConversationRuntime::new(
+            context,
+            bash_wait_executing_state("wait-slow-definitions", "b-slow", Some(0)),
+            Arc::clone(&storage),
+            Arc::new(MockLlmClient::new("test-model")),
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(1);
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        let settlement = tokio::spawn(async move {
+            let result = rt
+                .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Failed {
+                    tool_use_id: "wait-slow-definitions".to_string(),
+                    error: "bounded wait elapsed".to_string(),
+                }))
+                .await;
+            (rt, result)
+        });
+
+        definitions_started.await.unwrap();
+        assert_eq!(
+            storage
+                .get_all_messages("wait-slow-definitions")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            1
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!fence.is_closed());
+        definitions_release.send(()).unwrap();
+
+        let (_rt, result) = settlement.await.unwrap();
+        assert!(result.is_ok());
+        assert!(!fence.is_closed());
+        assert_eq!(
+            storage
+                .get_all_messages("wait-slow-definitions")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
