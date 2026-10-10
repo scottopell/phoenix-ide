@@ -361,6 +361,7 @@ fn decode_previous_cursor(
     if cursor.scope != initial.scope
         || cursor.target != initial.target
         || cursor.sequence < 0
+        || (cursor.sequence == 0 && (cursor.byte_offset != 0 || cursor.message_id.is_some()))
         || (target.is_some() && cursor.sequence > 0 && cursor.message_id.is_none())
         || (target.is_none() && cursor.message_id.is_some())
     {
@@ -590,7 +591,7 @@ impl GlobalReadService {
         predecessors: &[Conversation],
         query: String,
     ) -> PreviousTranscriptsOutput {
-        if query.trim().is_empty() || query.len() > 1024 {
+        if query.trim().is_empty() || query.chars().count() > 1024 {
             return PreviousTranscriptsOutput::InvalidTarget;
         }
         if predecessors.is_empty() {
@@ -604,8 +605,12 @@ impl GlobalReadService {
             Ok(true) => {}
             Ok(false) | Err(_) => return PreviousTranscriptsOutput::SearchUnavailable,
         }
-        let request =
-            RetrievalRequest::natural_language(query, RetrievalScope::Conversations(ids), 8);
+        const MAX_SEARCH_RESULTS: usize = 8;
+        let request = RetrievalRequest::natural_language(
+            query,
+            RetrievalScope::Conversations(ids),
+            MAX_SEARCH_RESULTS + 1,
+        );
         let Ok(hits) = self.message_retriever.retrieve(request).await else {
             return PreviousTranscriptsOutput::SearchUnavailable;
         };
@@ -613,8 +618,8 @@ impl GlobalReadService {
             return PreviousTranscriptsOutput::NoMatches { index_fresh: true };
         }
         let mut results = Vec::new();
-        let mut truncated = false;
-        for hit in hits {
+        let mut truncated = hits.len() > MAX_SEARCH_RESULTS;
+        for hit in hits.into_iter().take(MAX_SEARCH_RESULTS) {
             if !predecessors.iter().any(|c| c.id == hit.conversation_id) {
                 return PreviousTranscriptsOutput::Unavailable;
             }
@@ -2616,6 +2621,55 @@ mod previous_transcripts_tests {
     }
 
     #[tokio::test]
+    async fn predecessor_search_accepts_schema_valid_multibyte_query() {
+        let (_db, service, binding) = fixture().await;
+        let result = service
+            .previous_transcripts(
+                &binding,
+                PreviousTranscriptsRequest::Search {
+                    query: "🦀".repeat(400),
+                },
+            )
+            .await;
+        assert_ne!(result, PreviousTranscriptsOutput::InvalidTarget);
+    }
+
+    #[tokio::test]
+    async fn predecessor_search_reports_rank_limit_truncation() {
+        let (db, service, binding) = fixture().await;
+        for index in 0..9 {
+            db.add_message(
+                &format!("ranked-{index}"),
+                "prev-root",
+                &MessageContent::User(UserContent::new(format!(
+                    "ranked predecessor evidence {index}"
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.fts_retriever().reconcile().await.unwrap();
+        let result = service
+            .previous_transcripts(
+                &binding,
+                PreviousTranscriptsRequest::Search {
+                    query: "ranked predecessor evidence".into(),
+                },
+            )
+            .await;
+        let PreviousTranscriptsOutput::SearchResults {
+            results, truncated, ..
+        } = result
+        else {
+            panic!("{result:?}")
+        };
+        assert_eq!(results.len(), 8);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
     async fn predecessor_search_bounds_oversized_message_identity() {
         let (db, service, binding) = fixture().await;
         let message_id = format!("search-long-{}", "x".repeat(PREVIOUS_RESULT_BYTES));
@@ -2648,6 +2702,29 @@ mod previous_transcripts_tests {
                     message_id_sha256: sha256_hex(&message_id),
                 }
         }));
+    }
+
+    #[test]
+    fn predecessor_read_cursor_rejects_contradictory_sentinel_position() {
+        let binding = PreviousTranscriptsBinding::new(
+            phoenix_core::domain::product_conversation::ProductConversationId::parse("product")
+                .unwrap(),
+            "current".into(),
+        );
+        let target = "@transcript:prev";
+        for (byte_offset, message_id) in [(1, None), (0, Some(sha256_hex("message")))] {
+            let malformed = encode_previous_cursor(&PreviousCursor {
+                scope: previous_scope(&binding),
+                target: Some(previous_cursor_target(target)),
+                sequence: 0,
+                byte_offset,
+                message_id,
+            });
+            assert!(matches!(
+                decode_previous_cursor(Some(&malformed), &binding, Some(target)),
+                Err(PreviousTranscriptsOutput::InvalidCursor)
+            ));
+        }
     }
 
     #[test]
