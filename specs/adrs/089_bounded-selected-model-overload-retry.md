@@ -1,4 +1,4 @@
-# ADR-086: Selected-model overload uses a durable bounded retry window
+# ADR-089: Selected-model overload uses a durable bounded retry window
 
 - **Status:** Accepted
 - **Date:** 2026-09-20

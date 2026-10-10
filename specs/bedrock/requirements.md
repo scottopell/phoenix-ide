@@ -1132,23 +1132,44 @@ THE SYSTEM SHALL expose the initial Close conversation action
 AND SHALL create the durable Close attempt without stopping work immediately
 AND SHALL require explicit stop-work confirmation before settlement begins
 
-WHEN Close conversation completes for an ordinary Open ProductConversation with an attached `WorkScope`
+WHEN Close succeeds or stops on failure for an ordinary Open ProductConversation
+AND positive evidence confirms that conversation execution and its owned processes have stopped
 THE SYSTEM SHALL transition that ProductConversation aggregate to History state
-AND the latest transcript row in that aggregate SHALL NOT accept new user messages
-AND SHALL durably persist one Close-outcome system message in the finalization transaction before the aggregate lifecycle announcement is emitted
+AND SHALL record resource disposition separately from lifecycle completion
+AND SHALL expose conspicuous `cleanup_attention` in History when resource cleanup failed or remains uncertain
+AND SHALL NOT represent retained resources as successfully retired merely because lifecycle ended
 
-WHEN a ProductConversation enters History after successful Close completion
+WHEN Close cannot confirm both conversation execution and owned-process shutdown
+THE SYSTEM SHALL keep that ProductConversation Open with typed `CloseIncomplete` status
+AND SHALL NOT enter History or imply that shutdown succeeded
+
+WHEN Close completes or records a confirmed-shutdown cleanup failure
+THE SYSTEM SHALL retain the transcript as read-only History
+AND SHALL persist the exact run outcome, shutdown evidence, residual cleanup information, and any `cleanup_attention` in the lifecycle finalization transaction
+AND SHALL publish lifecycle announcements only after that transaction commits
+
+WHEN a ProductConversation is in History
+THE SYSTEM SHALL NOT accept new execution or user messages in its transcript
+
+WHEN a Close run outcome is finalized
+THE SYSTEM SHALL durably persist one exact-run Close-outcome system message before emitting its aggregate lifecycle announcement
+AND SHALL distinguish successful resource retirement from lifecycle completion with `cleanup_attention`
+
+WHEN a ProductConversation enters History through Close
 THE SYSTEM SHALL emit one aggregate lifecycle announcement for downstream consumers
 AND that ProductConversation SHALL remain visible in the sidebar for reference
 AND the user SHALL be able to start a new ProductConversation on the same project
 
 EACH Close operation SHALL carry one durable Close-attempt identity bound to that exact ProductConversation identity
 AND THE SYSTEM SHALL permit at most one non-completed Close attempt for a given ProductConversation at a time
-AND SHALL bind every Close phase transition, confirmation, cancellation, settlement, inspection, retirement, retry, and finalization event to that exact Close-attempt identity
+AND SHALL create one durable run with ordinal `1` for the normal Close attempt
+AND SHALL bind every Close phase transition, confirmation, cancellation, settlement, inspection, retirement, and finalization event to that exact Close-attempt identity and run ordinal
+AND SHALL permit explicit safe retry only as a fresh run with a monotonically increasing ordinal under the original Close authority, according to `specs/work-lifecycle/requirements.md` REQ-WL-002c
 AND SHALL retain completed Close attempts as historical records until permanent Delete removes their ProductConversation aggregate
 AND SHALL create a new Close-attempt identity after cancellation only when no earlier Close attempt for that ProductConversation remains active
 AND SHALL allocate every Close-attempt identity uniquely across active and historical attempts
 AND SHALL retain a typed terminal outcome of `archived` or `cancelled` whenever an attempt becomes completed
+AND SHALL retain every stopped run's typed failure, shutdown evidence, and residual cleanup status without rewriting it as retry success
 AND SHALL retain the last bound inspection generation and fingerprint on a completed `archived` attempt
 AND SHALL omit that aggregate inspection pair from a completed `cancelled` attempt while preserving any normalized exact-attempt inspection and loss evidence already recorded before cancellation
 AND SHALL snapshot the exact ordered parent transcript-row continuation topology of that ProductConversation when the attempt is admitted
@@ -1159,9 +1180,23 @@ AND SHALL preserve that admitted snapshot unchanged when later topology changes 
 WHILE a non-completed Close attempt exists for a ProductConversation
 THE SYSTEM SHALL NOT permit a continuation successor to be created for that ProductConversation
 
-**Rationale:** Closing is the one product-facing way to retire active work. The
-conversation moves to History because its owned live environment is gone; there is no
-separate in-Phoenix merged-versus-abandoned lifecycle.
+WHEN any Close run encounters its first failure or an interruption
+THE SYSTEM SHALL stop further Close mutation and dispatch for that run, including settlement, resource retirement, repair, and retry
+AND SHALL invalidate queued or in-flight effect authority for further Close work in that run
+AND SHALL retain truthful partial outcomes rather than attempting automatic convergence
+AND SHALL durably record each distinct failure and its mandatory once-per-failure Global event through the unified delivery path described in REQ-WL-004
+
+WHILE Close execution admission is sealed for a ProductConversation
+THE SYSTEM SHALL NOT dispatch ordinary restart recovery, queued input, continuation, or child work for that aggregate as a way to bypass stopped Close authority
+AND SHALL preserve that seal while shutdown or cleanup remains unresolved
+
+WHEN Phoenix starts and finds an interrupted or stopped Close run
+THE SYSTEM SHALL observe and record its shutdown and residual status only
+AND SHALL NOT resume settlement, destructive cleanup, recovery, or retry
+AND SHALL NOT infer confirmed shutdown from absence of a runtime row, PID, or path alone
+AND SHALL classify confirmed conversation-and-process shutdown as History with `cleanup_attention` and uncertain shutdown as Open with `CloseIncomplete`
+
+**Rationale:** Closing ends the product lifecycle when shutdown is proven. Resource retirement is separate truth; cleanup failure must remain visible without keeping safely ended conversations in Open or granting automatic recovery authority.
 
 ---
 
@@ -1246,7 +1281,8 @@ THE SYSTEM SHALL reconcile every ordinary ProductConversation lifecycle from tha
 AND SHALL preserve every ProductConversation, transcript member, message, and subordinate participant row during reconciliation
 AND SHALL leave coordinator lifecycle structurally inapplicable
 AND SHALL persist sealed Close participant capture time as a nonnegative INTEGER in an explicitly unit-named Unix-microseconds column under REQ-COMP-005
-AND SHALL preserve a durable cancel request across compatibility upgrade in its cancellation-settlement phase so recovery completes it with the cancelled outcome only after every owned authority releases
+AND SHALL preserve a durable cancel request across compatibility upgrade without granting startup settlement authority
+AND SHALL complete it with the cancelled outcome only after every owned authority releases through an explicitly admitted Close run
 
 **Rationale:** Aggregate identity, membership, navigation, lifecycle, and presentation are distinct from transcript-owned continuation edges and member execution authority. Keeping one authority for each prevents a transcript segment from becoming a second ProductConversation or lifecycle owner and prevents the aggregate from becoming a duplicate transcript, SSE, runtime, or provider-session authority.
 

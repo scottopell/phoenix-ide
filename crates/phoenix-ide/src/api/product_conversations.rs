@@ -21,7 +21,8 @@ use super::types::{
     AutomaticContinuationView, OrdinaryProductConversationLifecycleView,
     ProductConversationChainQaCompatibilityView, ProductConversationCloseActionView,
     ProductConversationCloseInspectionView, ProductConversationCloseLossView,
-    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
+    ProductConversationCloseOutcomeView, ProductConversationClosePhaseView,
+    ProductConversationCloseResidualView, ProductConversationCloseRunStatusView,
     ProductConversationCloseUnavailableReasonView, ProductConversationCloseView,
     ProductConversationCreationAllowedActionView, ProductConversationCreationRecoveryResponse,
     ProductConversationCreationRecoveryRow, ProductConversationHandoffView,
@@ -621,6 +622,7 @@ fn close_action_view(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn snapshot_view(
     state: &AppState,
     mut aggregate: ProductConversationAggregate,
@@ -635,7 +637,28 @@ async fn snapshot_view(
         .ordinary_lifecycle()
         .expect("ordinary aggregate read returned Coordinator");
     let writable = close.is_none();
-    let close = close.map(close_view);
+    let close = match close {
+        Some(projection) => {
+            use phoenix_core::domain::close::CloseCompletionOutcome;
+            let failures = if matches!(
+                projection.obligation.close_outcome(),
+                Some(
+                    CloseCompletionOutcome::ArchivedCleanupAttention
+                        | CloseCompletionOutcome::CloseIncomplete
+                )
+            ) {
+                state
+                    .db
+                    .list_close_cleanup_failures(projection.obligation.attempt_id().as_str())
+                    .await
+                    .map_err(db_to_app)?
+            } else {
+                Vec::new()
+            };
+            Some(close_view(projection, failures))
+        }
+        None => None,
+    };
     let generation = aggregate_generation(&aggregate);
     let segment_ceilings = cursor.as_ref().map_or_else(
         || aggregate_segment_ceilings(&aggregate),
@@ -978,8 +1001,73 @@ fn validate_cursor(
     Ok(())
 }
 
-fn close_view(projection: crate::db::CloseProjection) -> ProductConversationCloseView {
-    use phoenix_core::domain::close::ClosePhase;
+fn close_failure_view(
+    failure: crate::db::CloseCleanupFailure,
+) -> super::types::ProductConversationCloseFailureView {
+    use super::types::{
+        ProductConversationCloseFailureReasonView as Reason, ProductConversationCloseFailureView,
+        ProductConversationCloseRemainingResourceView,
+        ProductConversationCloseResourceDispositionView as Disposition,
+        ProductConversationCloseResourceKindView as Kind,
+        ProductConversationCloseStopCertaintyView as Stop,
+    };
+    use crate::db::CloseCleanupResourceDisposition;
+    use phoenix_core::domain::close::{
+        CloseStopCertainty, RetiredResourceKind, RetirementFailureReason,
+    };
+
+    let occurrence = failure.occurrence;
+    ProductConversationCloseFailureView {
+        occurrence_id: occurrence.failure_occurrence_id,
+        reason: match occurrence.reason {
+            RetirementFailureReason::RemovalFailed => Reason::RemovalFailed,
+            RetirementFailureReason::StillSharedByLiveOwner => Reason::StillSharedByLiveOwner,
+            RetirementFailureReason::ResidualProcessAlive => Reason::ResidualProcessAlive,
+            RetirementFailureReason::IdentityNotProven => Reason::IdentityNotProven,
+            RetirementFailureReason::Interrupted => Reason::Interrupted,
+            RetirementFailureReason::ManualRepairRequired => Reason::ManualRepairRequired,
+        },
+        detail: occurrence.detail,
+        stop_certainty: match occurrence.stop_certainty {
+            CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us } => {
+                Stop::ConversationAndProcessesStopped {
+                    confirmed_at_us: confirmed_at_us.to_string(),
+                }
+            }
+            CloseStopCertainty::ShutdownUncertain => Stop::ShutdownUncertain,
+        },
+        remaining_resources: occurrence
+            .remaining_resources
+            .into_iter()
+            .map(|resource| ProductConversationCloseRemainingResourceView {
+                scope: resource.scope.as_str().to_owned(),
+                resource_kind: match resource.resource.kind() {
+                    RetiredResourceKind::Worktree => Kind::Worktree,
+                    RetiredResourceKind::WorkScope => Kind::WorkScope,
+                    RetiredResourceKind::BashProcessGroup => Kind::BashProcessGroup,
+                    RetiredResourceKind::TmuxServer => Kind::TmuxServer,
+                    RetiredResourceKind::PtySession => Kind::PtySession,
+                    RetiredResourceKind::BrowserSession => Kind::BrowserSession,
+                    RetiredResourceKind::EquivalentLiveResource => Kind::EquivalentLiveResource,
+                },
+                identity: resource.resource.identity().value(),
+                disposition: match resource.disposition {
+                    CloseCleanupResourceDisposition::Failed => Disposition::Failed,
+                    CloseCleanupResourceDisposition::Residual => Disposition::Residual,
+                    CloseCleanupResourceDisposition::Unattempted => Disposition::Unattempted,
+                    CloseCleanupResourceDisposition::Unknown => Disposition::Unknown,
+                },
+            })
+            .collect(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn close_view(
+    projection: crate::db::CloseProjection,
+    failures: Vec<crate::db::CloseCleanupFailure>,
+) -> ProductConversationCloseView {
+    use phoenix_core::domain::close::{CloseCompletionOutcome, ClosePhase, CloseRunStatus};
 
     let obligation = projection.obligation;
 
@@ -1005,8 +1093,32 @@ fn close_view(projection: crate::db::CloseProjection) -> ProductConversationClos
         ClosePhase::Completed => ProductConversationClosePhaseView::Completed,
     };
     ProductConversationCloseView {
+        failure: failures
+            .into_iter()
+            .rev()
+            .find(|failure| {
+                failure.run_ordinal == projection.latest_run.run.ordinal
+                    && failure.occurrence.attempt_id == projection.latest_run.run.attempt_id
+            })
+            .map(close_failure_view),
         attempt_id: obligation.attempt_id().to_string(),
         phase,
+        outcome: obligation.close_outcome().map(|outcome| match outcome {
+            CloseCompletionOutcome::Archived => ProductConversationCloseOutcomeView::Archived,
+            CloseCompletionOutcome::Cancelled => ProductConversationCloseOutcomeView::Cancelled,
+            CloseCompletionOutcome::ArchivedCleanupAttention => {
+                ProductConversationCloseOutcomeView::ArchivedCleanupAttention
+            }
+            CloseCompletionOutcome::CloseIncomplete => {
+                ProductConversationCloseOutcomeView::CloseIncomplete
+            }
+        }),
+        run_ordinal: i64::from(projection.latest_run.run.ordinal).to_string(),
+        run_status: match projection.latest_run.status {
+            CloseRunStatus::Running => ProductConversationCloseRunStatusView::Running,
+            CloseRunStatus::Stopped => ProductConversationCloseRunStatusView::Stopped,
+            CloseRunStatus::Completed => ProductConversationCloseRunStatusView::Completed,
+        },
         confirmation_snapshot: obligation.snapshot().map(|snapshot| {
             ProductConversationCloseInspectionView {
                 scope: "aggregate".to_string(),
@@ -1135,6 +1247,328 @@ mod tests {
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
+
+    fn close_failure_fixture() -> crate::db::CloseCleanupFailure {
+        use crate::db::{
+            CloseCleanupFailure, CloseCleanupFailureAuthority, CloseCleanupFailureResource,
+            CloseCleanupResourceDisposition as Disposition,
+            TerminalizeInitialCloseCleanupFailureRequest,
+        };
+        use phoenix_core::domain::close::*;
+        use phoenix_core::work_scope::WorkScopeId;
+        let resources = [
+            (
+                "scope-1",
+                RetiredResourceKind::BashProcessGroup,
+                "epoch:failed",
+                Disposition::Failed,
+            ),
+            (
+                "scope-2",
+                RetiredResourceKind::WorkScope,
+                "scope-2",
+                Disposition::Unattempted,
+            ),
+            (
+                "scope-1",
+                RetiredResourceKind::PtySession,
+                "epoch:unknown",
+                Disposition::Unknown,
+            ),
+            (
+                "scope-3",
+                RetiredResourceKind::BrowserSession,
+                "browser:residual",
+                Disposition::Residual,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(scope, kind, identity, disposition)| CloseCleanupFailureResource {
+                scope: WorkScopeId::parse(scope).unwrap(),
+                resource: RetiredResourceIdentity::parse(
+                    kind,
+                    LossItemIdentity::Opaque(OpaqueIdentity::parse(identity).unwrap()),
+                )
+                .unwrap(),
+                disposition,
+            },
+        )
+        .collect::<Vec<_>>();
+        CloseCleanupFailure {
+            run_ordinal: CloseRunOrdinal::parse(2).unwrap(),
+            occurrence: TerminalizeInitialCloseCleanupFailureRequest {
+                failure_occurrence_id: "close-failure:2:durable-close".into(),
+                attempt_id: CloseAttemptId::parse("durable-close").unwrap(),
+                source_product_conversation_id: ProductConversationId::parse("product").unwrap(),
+                authority: CloseCleanupFailureAuthority::ObservedProcessResource {
+                    scope: resources[0].scope.clone(),
+                    resource: resources[0].resource.clone(),
+                },
+                remaining_resources: resources,
+                reason: RetirementFailureReason::ResidualProcessAlive,
+                detail: "Exact process shutdown failure".into(),
+                stop_certainty: CloseStopCertainty::ShutdownUncertain,
+                occurred_at_us: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn close_failure_view_preserves_ordered_multi_scope_evidence_and_stop_certainty() {
+        use phoenix_core::domain::close::CloseStopCertainty;
+        for certainty in [
+            CloseStopCertainty::ShutdownUncertain,
+            CloseStopCertainty::ConversationAndProcessesStopped {
+                confirmed_at_us: i64::MAX,
+            },
+        ] {
+            let mut failure = close_failure_fixture();
+            failure.occurrence.stop_certainty = certainty;
+            let wire = serde_json::to_value(close_failure_view(failure)).unwrap();
+            assert_eq!(wire["occurrence_id"], "close-failure:2:durable-close");
+            assert_eq!(wire["reason"], "residual_process_alive");
+            assert_eq!(wire["detail"], "Exact process shutdown failure");
+            assert_eq!(wire["stop_certainty"]["kind"], certainty.as_str());
+            assert_eq!(
+                wire["stop_certainty"]["confirmed_at_us"],
+                serde_json::json!(certainty.confirmed_at_us().map(|value| value.to_string()))
+            );
+            assert_eq!(
+                wire["remaining_resources"],
+                serde_json::json!([
+                    {"scope": "scope-1", "resource_kind": "bash_process_group", "identity": "epoch:failed", "disposition": "failed"},
+                    {"scope": "scope-2", "resource_kind": "work_scope", "identity": "scope-2", "disposition": "unattempted"},
+                    {"scope": "scope-1", "resource_kind": "pty_session", "identity": "epoch:unknown", "disposition": "unknown"},
+                    {"scope": "scope-3", "resource_kind": "browser_session", "identity": "browser:residual", "disposition": "residual"}
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn close_failure_view_projects_attempt_interruption_without_remaining_resources() {
+        use crate::db::CloseCleanupFailureAuthority;
+        use phoenix_core::domain::close::RetirementFailureReason;
+        let mut failure = close_failure_fixture();
+        failure.occurrence.authority = CloseCleanupFailureAuthority::AttemptInterrupted;
+        failure.occurrence.remaining_resources.clear();
+        failure.occurrence.reason = RetirementFailureReason::Interrupted;
+        failure.occurrence.detail = "Close was interrupted before resource capture".into();
+        let wire = serde_json::to_value(close_failure_view(failure)).unwrap();
+        assert_eq!(wire["reason"], "interrupted");
+        assert_eq!(wire["remaining_resources"], serde_json::json!([]));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn snapshot_projects_preinventory_process_and_captured_failures_read_only() {
+        use crate::db::{
+            CloseCleanupFailureAuthority, CloseCleanupFailureResource,
+            CloseCleanupResourceDisposition,
+        };
+        use phoenix_core::domain::close::*;
+        for captured in [false, true] {
+            let state = make_test_state().await;
+            let root = state
+                .db
+                .create_conversation("root", "root", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let scope = root.attached_work_scope_id.clone().unwrap();
+            state
+                .db
+                .begin_close_foundation(
+                    &root.product_conversation_id,
+                    &TranscriptConversationId::parse("root").unwrap(),
+                    "durable-close",
+                )
+                .await
+                .unwrap();
+            sqlx::query("UPDATE close_obligations SET phase = 'settling_active_work' WHERE attempt_id = 'durable-close'")
+                .execute(state.db.pool()).await.unwrap();
+            let mut failure = close_failure_fixture().occurrence;
+            failure.failure_occurrence_id = "close-failure:1:durable-close".into();
+            failure.source_product_conversation_id = root.product_conversation_id.clone();
+            let resource = RetiredResourceIdentity::parse(
+                if captured {
+                    RetiredResourceKind::WorkScope
+                } else {
+                    RetiredResourceKind::BashProcessGroup
+                },
+                LossItemIdentity::Opaque(
+                    OpaqueIdentity::parse(if captured {
+                        scope.as_str()
+                    } else {
+                        "epoch:failed"
+                    })
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+            failure.authority = if captured {
+                CloseCleanupFailureAuthority::CapturedScope {
+                    scope: scope.clone(),
+                    resource: resource.clone(),
+                }
+            } else {
+                CloseCleanupFailureAuthority::ObservedProcessResource {
+                    scope: scope.clone(),
+                    resource: resource.clone(),
+                }
+            };
+            failure.remaining_resources = vec![CloseCleanupFailureResource {
+                scope: scope.clone(),
+                resource,
+                disposition: CloseCleanupResourceDisposition::Failed,
+            }];
+            state
+                .db
+                .terminalize_initial_close_cleanup_failure(&failure)
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let response = create_router(state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!(
+                                "/api/product-conversations/{}",
+                                root.product_conversation_id
+                            ))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let snapshot: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(snapshot["ordinary_lifecycle"], "open");
+                assert!(snapshot["writable_transcript_row_id"].is_null());
+                assert_eq!(snapshot["close"]["outcome"], "close_incomplete");
+                assert!(snapshot["close"]["confirmation_snapshot"].is_null());
+                assert_eq!(snapshot["close"]["residuals"], serde_json::json!([]));
+                let evidence = &snapshot["close"]["failure"];
+                assert_eq!(evidence["occurrence_id"], failure.failure_occurrence_id);
+                assert_eq!(evidence["reason"], "residual_process_alive");
+                assert_eq!(evidence["detail"], failure.detail);
+                assert_eq!(evidence["stop_certainty"]["kind"], "shutdown_uncertain");
+                assert_eq!(
+                    evidence["remaining_resources"],
+                    serde_json::json!([{
+                        "scope": scope.as_str(), "resource_kind": if captured { "work_scope" } else { "bash_process_group" },
+                        "identity": if captured { scope.as_str() } else { "epoch:failed" }, "disposition": "failed"
+                    }])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn close_view_preserves_durable_outcome_and_latest_run() {
+        use phoenix_core::domain::close::{
+            CloseAttemptId, CloseCompletionOutcome, CloseObligation, ClosePhase,
+            CloseRetirementSnapshot, CloseRun, CloseRunOrdinal, CloseRunRef, CloseRunStatus,
+            ProductConversationId,
+        };
+
+        for (outcome, status, expected_outcome, expected_status) in [
+            (None, CloseRunStatus::Running, None, "running"),
+            (
+                Some(CloseCompletionOutcome::Archived),
+                CloseRunStatus::Completed,
+                Some("archived"),
+                "completed",
+            ),
+            (
+                Some(CloseCompletionOutcome::Cancelled),
+                CloseRunStatus::Completed,
+                Some("cancelled"),
+                "completed",
+            ),
+            (
+                Some(CloseCompletionOutcome::ArchivedCleanupAttention),
+                CloseRunStatus::Stopped,
+                Some("archived_cleanup_attention"),
+                "stopped",
+            ),
+            (
+                Some(CloseCompletionOutcome::CloseIncomplete),
+                CloseRunStatus::Stopped,
+                Some("close_incomplete"),
+                "stopped",
+            ),
+        ] {
+            let now = chrono::Utc::now();
+            let attempt_id = CloseAttemptId::parse("durable-close").unwrap();
+            let phase = if outcome.is_some() {
+                ClosePhase::Completed
+            } else {
+                ClosePhase::SettlingActiveWork
+            };
+            let snapshot = matches!(
+                outcome,
+                Some(
+                    CloseCompletionOutcome::Archived
+                        | CloseCompletionOutcome::ArchivedCleanupAttention
+                )
+            )
+            .then(|| CloseRetirementSnapshot::parse("generation", "fingerprint").unwrap());
+            let obligation = CloseObligation::parse(
+                attempt_id.clone(),
+                ProductConversationId::parse("product").unwrap(),
+                phase,
+                snapshot,
+                now,
+                now,
+                outcome.map(|_| now),
+                outcome,
+            )
+            .unwrap();
+            let projection = CloseProjection {
+                obligation,
+                latest_run: CloseRun {
+                    run: CloseRunRef {
+                        attempt_id,
+                        ordinal: CloseRunOrdinal::parse(2).unwrap(),
+                    },
+                    status,
+                },
+                inspections: vec![],
+                losses: vec![],
+                residuals: vec![],
+            };
+            let mut previous = close_failure_fixture();
+            previous.run_ordinal = CloseRunOrdinal::parse(1).unwrap();
+            let mut later = close_failure_fixture();
+            later.run_ordinal = CloseRunOrdinal::parse(3).unwrap();
+            let absent = close_view(projection.clone(), vec![previous.clone(), later.clone()]);
+            assert!(
+                absent.failure.is_none(),
+                "must not project a failure from another run"
+            );
+            let view = close_view(projection, vec![previous, close_failure_fixture(), later]);
+            let wire = serde_json::to_value(view).unwrap();
+            assert_eq!(
+                wire["failure"]["occurrence_id"],
+                "close-failure:2:durable-close"
+            );
+            assert_eq!(wire["attempt_id"], "durable-close");
+            assert_eq!(wire["outcome"], serde_json::json!(expected_outcome));
+            assert_eq!(wire["run_ordinal"], "2");
+            assert_eq!(wire["run_status"], expected_status);
+            assert_eq!(
+                wire["phase"],
+                if outcome.is_some() {
+                    "completed"
+                } else {
+                    "settling_active_work"
+                }
+            );
+        }
+    }
 
     async fn create_completed_continuation(
         state: &AppState,

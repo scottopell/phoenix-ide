@@ -1041,7 +1041,7 @@ export interface ForkProposalSummary {
   refinement_conversation_id?: string;
 }
 
-export type McpConnState = 'ready' | 'unauthorized' | 'failed';
+export type McpConnState = 'ready' | 'unauthorized' | 'failed' | 'removing';
 export type McpTransportKind = 'stdio' | 'http';
 export type McpAuthKind = 'none' | 'static' | 'oauth';
 
@@ -1072,6 +1072,7 @@ export interface McpReloadFailure {
 export interface McpReloadResult {
   added: string[];
   removed: string[];
+  pending_removals: string[];
   restarted: string[];
   unchanged: string[];
   failed: McpReloadFailure[];

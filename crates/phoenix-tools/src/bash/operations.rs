@@ -60,8 +60,8 @@ pub const KILL_RESPONSE_TIMEOUT_SECONDS: u64 = 30;
 /// is supplied.
 pub const DEFAULT_PEEK_LINES: usize = 200;
 
-/// REQ-BASH-002 / REQ-BASH-010: soft cap on the optional run-call
-/// `label` length. Over-cap labels surface as `error: "label_too_long"`.
+/// REQ-BASH-002 / REQ-BASH-010: display bound for the optional run-call
+/// `label`. Longer presentation metadata is deterministically shortened.
 pub const MAX_LABEL_LENGTH: usize = 64;
 
 // Hint text for the cap-rejection envelope (REQ-BASH-005).
@@ -138,11 +138,6 @@ pub enum BashError {
     SpawnFailed {
         error_message: String,
     },
-    /// Run call carried a label longer than `MAX_LABEL_LENGTH`
-    /// (REQ-BASH-002 / REQ-BASH-010).
-    LabelTooLong {
-        max: usize,
-    },
     /// Catch-all for input-shape failures the schema didn't catch:
     /// missing/invalid `op`, missing required peer field for the chosen
     /// op, invalid `lines` value, etc. (REQ-BASH-010). The variant name
@@ -205,10 +200,6 @@ impl BashError {
             BashError::SpawnFailed { error_message } => {
                 BashErrorResponse::SpawnFailed { error_message }
             }
-            BashError::LabelTooLong { max } => BashErrorResponse::LabelTooLong {
-                error_message: format!("label exceeds the {max}-character cap"),
-                max_label_length: max,
-            },
             BashError::MutuallyExclusiveModes {
                 message,
                 conflicting_args,
@@ -287,7 +278,7 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
                     extra: None,
                 }
             })?;
-            let label = parse_label(raw.label)?;
+            let label = parse_label(raw.label);
             let wait_seconds = resolve_wait_seconds(raw.wait_seconds)?;
             Ok(BashRequest::Run {
                 cmd,
@@ -337,19 +328,22 @@ fn resolve_handle(raw: &BashToolInput, op: BashOp) -> Result<String, BashError> 
         })
 }
 
-/// Validate and normalize the optional `label` for `op=run`. Empty
-/// strings (a frequent default-fill emission) are treated as absent;
-/// over-cap labels are rejected with `label_too_long` per REQ-BASH-002.
-fn parse_label(raw: Option<String>) -> Result<Option<String>, BashError> {
-    let Some(label) = raw.filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-    if label.chars().count() > MAX_LABEL_LENGTH {
-        return Err(BashError::LabelTooLong {
-            max: MAX_LABEL_LENGTH,
-        });
+/// Normalize the optional presentation-only `label` for `op=run`. Empty
+/// strings (a frequent default-fill emission) are treated as absent.
+fn parse_label(raw: Option<String>) -> Option<String> {
+    const ELLIPSIS: char = '…';
+    let label = raw.filter(|s| !s.is_empty())?;
+    let chars: Vec<char> = label.chars().collect();
+    if chars.len() <= MAX_LABEL_LENGTH {
+        return Some(label);
     }
-    Ok(Some(label))
+    let prefix_len = (MAX_LABEL_LENGTH - 1) * 3 / 4;
+    let suffix_len = MAX_LABEL_LENGTH - 1 - prefix_len;
+    let mut normalized = String::with_capacity(MAX_LABEL_LENGTH * 4);
+    normalized.extend(chars[..prefix_len].iter());
+    normalized.push(ELLIPSIS);
+    normalized.extend(chars[chars.len() - suffix_len..].iter());
+    Some(normalized)
 }
 
 fn parse_read_args(lines: Option<i64>, since: Option<i64>) -> Result<ReadArgs, BashError> {
