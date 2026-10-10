@@ -7,7 +7,7 @@ describe('parseConversationState recovery', () => {
     const state = parseConversationState({
       type: 'server_overload_retrying',
       retry: {
-        target: { type: 'ordinary' },
+        target: 'ordinary',
         phase: { type: 'waiting', retry_at: '2026-01-01T00:00:30Z' },
         attempt: 3,
       },
@@ -18,7 +18,7 @@ describe('parseConversationState recovery', () => {
       attempt: 3,
       maxAttempts: 5,
       retryAt: Date.parse('2026-01-01T00:00:30Z'),
-      target: { type: 'ordinary' },
+      target: 'ordinary',
     });
     expect(isAgentWorking(state)).toBe(true);
     expect(canCancelConversationState(state)).toBe(true);
@@ -37,7 +37,7 @@ describe('parseConversationState recovery', () => {
       attempt: 2,
       maxAttempts: 5,
       retryAt: null,
-      target: { type: 'continuation', operation_id: '', rejected_tool_calls: [] },
+      target: 'continuation',
     });
   });
 

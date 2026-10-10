@@ -559,7 +559,7 @@ export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
   | { type: 'llm_requesting'; attempt: number }
-  | { type: 'server_overload_retrying'; attempt: number; maxAttempts: number; retryAt: number | null; target: ServerOverloadTarget }
+  | { type: 'server_overload_retrying'; attempt: number; maxAttempts: number; retryAt: number | null; target: 'ordinary' | 'continuation' }
   | { type: 'seeded_llm_requesting'; seed_message_id: string; attempt: number }
   | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
   | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }

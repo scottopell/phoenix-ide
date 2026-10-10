@@ -495,7 +495,7 @@ describe('InputArea cancellation affordance', () => {
         {...props}
         convState={{
           type: 'server_overload_retrying',
-          target: { type: 'ordinary' },
+          target: 'ordinary',
           attempt: 2,
           maxAttempts: 5,
           retryAt: null,
@@ -509,7 +509,7 @@ describe('InputArea cancellation affordance', () => {
         {...props}
         convState={{
           type: 'server_overload_retrying',
-          target: { type: 'continuation', operation_id: 'summary-op', rejected_tool_calls: [] },
+          target: 'continuation',
           attempt: 2,
           maxAttempts: 5,
           retryAt: null,
