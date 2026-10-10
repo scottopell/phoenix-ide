@@ -67,6 +67,7 @@ phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
 # `#[tokio::test]` runtime for the async persistence tests.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3"
+phoenix-tls = { path = "../phoenix-tls" }
 tracing-subscriber = "0.3"
 
 [lints]

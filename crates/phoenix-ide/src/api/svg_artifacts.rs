@@ -135,6 +135,8 @@ mod tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             sessions,
             credential_helper: None,
             password: Some("svg-test-password".into()),

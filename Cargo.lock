@@ -2943,6 +2943,10 @@ dependencies = [
  "chrono",
  "libc",
  "nono",
+ "phoenix-tls",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2953,6 +2957,7 @@ dependencies = [
  "ts-rs",
  "url",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2965,6 +2970,7 @@ dependencies = [
  "libsqlite3-sys",
  "phoenix-core",
  "phoenix-svg",
+ "phoenix-tls",
  "phoenix-workflow",
  "rand 0.10.1",
  "serde",
@@ -3187,6 +3193,7 @@ dependencies = [
  "proptest",
  "pulldown-cmark",
  "rand 0.10.1",
+ "rcgen",
  "reqwest 0.13.4",
  "rust-embed",
  "rustls",
@@ -3865,6 +3872,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",

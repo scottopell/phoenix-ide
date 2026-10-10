@@ -611,6 +611,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "close_cleanup_failures",
         sql: MIGRATION_119,
     },
+    Migration {
+        version: 120,
+        name: "persist_federation_peer_tls_trust",
+        sql: MIGRATION_120,
+    },
+    Migration {
+        version: 121,
+        name: "support_ipv6_federation_peer_hosts",
+        sql: MIGRATION_121,
+    },
 ];
 
 const MIGRATION_119: &str = r"
@@ -1468,6 +1478,135 @@ const MIGRATION_117: &str = concat!(
     include_str!("tool_availability.sql"),
     include_str!("responses_replay.sql")
 );
+
+const MIGRATION_120: &str = r"
+ALTER TABLE federation_peer_connections
+ADD COLUMN tls_ca_certificate_pem TEXT
+CHECK (
+    tls_ca_certificate_pem IS NULL
+    OR (
+        typeof(tls_ca_certificate_pem) = 'text'
+        AND length(tls_ca_certificate_pem) BETWEEN 1 AND 32768
+        AND tls_ca_certificate_pem LIKE '-----BEGIN CERTIFICATE-----%'
+        AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
+    )
+);
+";
+
+const MIGRATION_121: &str = r"
+CREATE TEMP TABLE federation_peer_connections_v121 (
+    peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
+        typeof(peer_instance_id) = 'text'
+        AND length(peer_instance_id) = 36
+        AND peer_instance_id = lower(peer_instance_id)
+        AND substr(peer_instance_id, 9, 1) = '-'
+        AND substr(peer_instance_id, 14, 1) = '-'
+        AND substr(peer_instance_id, 15, 1) = '4'
+        AND substr(peer_instance_id, 19, 1) = '-'
+        AND substr(peer_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(peer_instance_id, 24, 1) = '-'
+        AND length(replace(peer_instance_id, '-', '')) = 32
+        AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
+    domain_or_ipv4_host TEXT CHECK(
+        domain_or_ipv4_host IS NULL
+        OR (
+            typeof(domain_or_ipv4_host) = 'text'
+            AND length(domain_or_ipv4_host) > 0
+            AND domain_or_ipv4_host NOT GLOB '*[^A-Za-z0-9.-]*'
+        )
+    ),
+    ipv6_host BLOB CHECK(
+        ipv6_host IS NULL
+        OR (typeof(ipv6_host) = 'blob' AND length(ipv6_host) = 16)
+    ),
+    port INTEGER NOT NULL CHECK(
+        typeof(port) = 'integer' AND port BETWEEN 1 AND 65535
+    ),
+    bearer_credential TEXT NOT NULL UNIQUE CHECK(
+        bearer_credential GLOB 'phx_peer_*'
+        AND length(bearer_credential) = 52
+        AND substr(bearer_credential, 10) NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    tls_ca_certificate_pem TEXT CHECK(
+        tls_ca_certificate_pem IS NULL
+        OR (
+            typeof(tls_ca_certificate_pem) = 'text'
+            AND length(tls_ca_certificate_pem) BETWEEN 1 AND 32768
+            AND tls_ca_certificate_pem LIKE '-----BEGIN CERTIFICATE-----%'
+            AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
+        )
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    CHECK((domain_or_ipv4_host IS NULL) <> (ipv6_host IS NULL)),
+    UNIQUE(domain_or_ipv4_host, port),
+    UNIQUE(ipv6_host, port)
+);
+INSERT INTO federation_peer_connections_v121 (
+    peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+    bearer_credential, tls_ca_certificate_pem, created_at_us
+)
+SELECT peer_instance_id, peer_display_name, host, NULL, port,
+       bearer_credential, tls_ca_certificate_pem, created_at_us
+FROM federation_peer_connections;
+DROP TABLE federation_peer_connections;
+CREATE TABLE federation_peer_connections (
+    peer_instance_id TEXT PRIMARY KEY NOT NULL CHECK(
+        typeof(peer_instance_id) = 'text'
+        AND length(peer_instance_id) = 36
+        AND peer_instance_id = lower(peer_instance_id)
+        AND substr(peer_instance_id, 9, 1) = '-'
+        AND substr(peer_instance_id, 14, 1) = '-'
+        AND substr(peer_instance_id, 15, 1) = '4'
+        AND substr(peer_instance_id, 19, 1) = '-'
+        AND substr(peer_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+        AND substr(peer_instance_id, 24, 1) = '-'
+        AND length(replace(peer_instance_id, '-', '')) = 32
+        AND replace(peer_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    peer_display_name TEXT NOT NULL CHECK(length(trim(peer_display_name)) > 0),
+    domain_or_ipv4_host TEXT CHECK(
+        domain_or_ipv4_host IS NULL
+        OR (
+            typeof(domain_or_ipv4_host) = 'text'
+            AND length(domain_or_ipv4_host) > 0
+            AND domain_or_ipv4_host NOT GLOB '*[^A-Za-z0-9.-]*'
+        )
+    ),
+    ipv6_host BLOB CHECK(
+        ipv6_host IS NULL
+        OR (typeof(ipv6_host) = 'blob' AND length(ipv6_host) = 16)
+    ),
+    port INTEGER NOT NULL CHECK(
+        typeof(port) = 'integer' AND port BETWEEN 1 AND 65535
+    ),
+    bearer_credential TEXT NOT NULL UNIQUE CHECK(
+        bearer_credential GLOB 'phx_peer_*'
+        AND length(bearer_credential) = 52
+        AND substr(bearer_credential, 10) NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    tls_ca_certificate_pem TEXT CHECK(
+        tls_ca_certificate_pem IS NULL
+        OR (
+            typeof(tls_ca_certificate_pem) = 'text'
+            AND length(tls_ca_certificate_pem) BETWEEN 1 AND 32768
+            AND tls_ca_certificate_pem LIKE '-----BEGIN CERTIFICATE-----%'
+            AND tls_ca_certificate_pem LIKE '%-----END CERTIFICATE-----%'
+        )
+    ),
+    created_at_us INTEGER NOT NULL CHECK(
+        typeof(created_at_us) = 'integer' AND created_at_us >= 0
+    ),
+    CHECK((domain_or_ipv4_host IS NULL) <> (ipv6_host IS NULL)),
+    UNIQUE(domain_or_ipv4_host, port),
+    UNIQUE(ipv6_host, port)
+);
+INSERT INTO federation_peer_connections SELECT * FROM federation_peer_connections_v121;
+DROP TABLE federation_peer_connections_v121;
+";
 
 const MIGRATION_113: &str = "";
 
@@ -12766,6 +12905,142 @@ mod tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn migration_120_preserves_existing_peers_as_platform_root_trust() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(MIGRATION_116).execute(&pool).await.unwrap();
+        let peer = phoenix_core::domain::instance_identity::InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections
+                 (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
+             VALUES (?1, 'peer', 'peer.example', 443, ?2, 1)",
+        )
+        .bind(peer.to_string())
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_120).execute(&pool).await.unwrap();
+        let trust: Option<String> = sqlx::query_scalar(
+            "SELECT tls_ca_certificate_pem FROM federation_peer_connections
+             WHERE peer_instance_id = ?1",
+        )
+        .bind(peer.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(trust, None);
+    }
+
+    #[tokio::test]
+    async fn migration_121_preserves_peers_and_admits_only_typed_ipv6_hosts() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(MIGRATION_116).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_120).execute(&pool).await.unwrap();
+        let existing_peer = phoenix_core::domain::instance_identity::InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections
+                 (peer_instance_id, peer_display_name, host, port, bearer_credential, created_at_us)
+             VALUES (?1, 'existing', 'peer.example', 443, ?2, 1)",
+        )
+        .bind(existing_peer.to_string())
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE TABLE legacy_schema_dependency (value TEXT);
+             CREATE TRIGGER legacy_schema_dependency_trigger
+             AFTER INSERT ON legacy_schema_dependency
+             BEGIN
+                 SELECT missing_column FROM conversations;
+             END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let legacy_trigger_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'legacy_schema_dependency_trigger'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_121).execute(&pool).await.unwrap();
+        let preserved: (String, Option<Vec<u8>>, String) = sqlx::query_as(
+            "SELECT domain_or_ipv4_host, ipv6_host, bearer_credential
+             FROM federation_peer_connections WHERE peer_instance_id = ?1",
+        )
+        .bind(existing_peer.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "peer.example".to_string(),
+                None,
+                format!("phx_peer_{}", "a".repeat(43)),
+            )
+        );
+        let preserved_trigger_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'legacy_schema_dependency_trigger'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved_trigger_sql, legacy_trigger_sql);
+
+        let ipv6_peer = phoenix_core::domain::instance_identity::InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections
+                 (peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+                  bearer_credential, created_at_us)
+             VALUES (?1, 'ipv6', NULL, ?2, 8031, ?3, 2)",
+        )
+        .bind(ipv6_peer.to_string())
+        .bind(
+            "2001:db8::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec(),
+        )
+        .bind(format!("phx_peer_{}", "b".repeat(43)))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (domain_host, ipv6_host) in [
+            (Some("peer:example"), None),
+            (None, Some(vec![0; 15])),
+            (Some("peer.example"), Some(vec![0; 16])),
+            (None, None),
+        ] {
+            assert!(
+                sqlx::query(
+                    "INSERT INTO federation_peer_connections
+                     (peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port,
+                      bearer_credential, created_at_us)
+                 VALUES (?1, 'invalid', ?2, ?3, 443, ?4, 3)",
+                )
+                .bind(phoenix_core::domain::instance_identity::InstanceId::new().to_string())
+                .bind(domain_host)
+                .bind(&ipv6_host)
+                .bind(format!("phx_peer_{}", "c".repeat(43)))
+                .execute(&pool)
+                .await
+                .is_err(),
+                "{domain_host:?} {ipv6_host:?}"
+            );
+        }
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
@@ -12773,14 +13048,14 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
             vec![
+                (121, "support_ipv6_federation_peer_hosts"),
+                (120, "persist_federation_peer_tls_trust"),
                 (119, "close_cleanup_failures"),
                 (118, "persist_mcp_token_removals"),
                 (117, "persist_conversation_tool_policy"),
                 (116, "federation_peer_connections"),
                 (115, "federation_enrollments"),
                 (114, "persist_instance_identity"),
-                (113, "settle_historical_continuation_openings"),
-                (112, "input_source_tool_call"),
             ]
         );
     }

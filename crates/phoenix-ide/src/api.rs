@@ -11,7 +11,7 @@ mod chains;
 pub mod codex_login;
 mod deployment;
 mod discovery;
-mod federation;
+pub(crate) mod federation;
 mod git_handlers;
 pub(crate) mod global_read;
 pub(crate) mod handlers;
@@ -83,6 +83,7 @@ pub struct AppState {
     /// once at startup.
     #[allow(dead_code)] // Consumed by the chain Q&A agent loop (REQ-CHN-009, Phase 2)
     pub message_retriever: Arc<dyn MessageRetriever>,
+    pub federation_tls_trust: phoenix_core::domain::instance_identity::PeerTlsTrust,
     /// In-flight Codex/ChatGPT login flows. See [`codex_login`].
     pub codex_login: Arc<codex_login::CodexLoginManager>,
     /// Static deployment facts (binding, TLS, on-disk layout) resolved once at
@@ -213,6 +214,7 @@ impl AppState {
         deployment: Arc<DeploymentConfig>,
         runtime_env: Arc<PhoenixRuntimeEnvironment>,
         suggest_token: String,
+        federation_tls_trust: phoenix_core::domain::instance_identity::PeerTlsTrust,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Conversation-retrieval index: bring it in line with `messages` once
         // at startup (REQ-RET-003) off the request path.
@@ -364,6 +366,7 @@ impl AppState {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust,
             codex_login,
             deployment,
             runtime_env,
