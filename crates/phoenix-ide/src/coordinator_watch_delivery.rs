@@ -232,6 +232,104 @@ mod tests {
         assert_eq!(after, 1);
     }
 
+    #[tokio::test]
+    async fn stale_global_target_cannot_accept_wait_and_next_pass_targets_successor() {
+        use crate::platform::PlatformCapability;
+        use crate::tools::mcp::McpClientManager;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_llm::ModelRegistry;
+
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        let old = db
+            .get_or_create_coordinator(None, Default::default())
+            .await
+            .unwrap();
+        let source = db
+            .create_conversation("race-wait", "Race wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::AwaitingTaskApproval {
+                task_file: "tasks/12345-p1-ready--example.md".into(),
+                title: "Example".into(),
+                priority: phoenix_core::task_source::Priority::P1,
+                plan: "Review".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let event = db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .remove(0);
+        let stale_target = db.coordinator_watch_target().await.unwrap().unwrap();
+        db.update_conversation_state(
+            &old.id,
+            &ConvState::ContextExhausted {
+                summary: "Continue".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let successor = match db.continue_conversation(&old.id).await.unwrap() {
+            phoenix_db::ContinueOutcome::Created(next) => next,
+            other @ (phoenix_db::ContinueOutcome::AlreadyContinued(_)
+            | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        let outcome = SendChatApplicationService::new(db.clone(), runtime.clone())
+            .send(SendChatRequest {
+                conversation_id: stale_target,
+                origin: InputOrigin::SubscriptionEvent {
+                    event_id: event.event_id.clone(),
+                },
+                text: notification(&event),
+                message_id: event.event_id.clone(),
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            })
+            .await;
+        assert!(!matches!(
+            outcome,
+            Ok(SendChatOutcome::Delivered
+                | SendChatOutcome::AlreadyPersisted
+                | SendChatOutcome::QueuedAsSteering)
+        ));
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+        deliver_pass(&runtime).await;
+        let accepted: String = sqlx::query_scalar(
+            "SELECT accepted_transcript_id FROM coordinator_watch_events WHERE event_id = ?1",
+        )
+        .bind(&event.event_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(accepted, successor.id);
+        let stale_inputs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND origin_subscription_event_id = ?2")
+            .bind(&old.id).bind(&event.event_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(stale_inputs, 0);
+    }
+
     fn failure(stop: CloseFailureStop) -> PendingWatchEvent {
         PendingWatchEvent {
             route: WatchEventRoute::MandatoryCloseFailure {

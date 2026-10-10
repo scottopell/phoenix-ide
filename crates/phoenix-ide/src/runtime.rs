@@ -13393,6 +13393,13 @@ mod scope_liveness_tests {
         let terminal: String = sqlx::query_scalar(
             "SELECT terminal_kind FROM durable_turns WHERE origin_subscription_event_id = ?1 AND conversation_id = ?2",
         ).bind(&event.event_id).bind(&global.id).fetch_one(manager.db().pool()).await.unwrap();
+        let unconsumed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND terminal_kind IS NULL",
+        ).bind(&global.id).fetch_one(manager.db().pool()).await.unwrap();
+        assert_eq!(
+            unconsumed, 0,
+            "duplicate passes must leave no queued turn to execute later"
+        );
         assert_eq!(terminal, "Completed");
     }
 

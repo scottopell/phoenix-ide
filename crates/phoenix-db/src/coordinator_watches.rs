@@ -669,7 +669,9 @@ mod tests {
 
     #[tokio::test]
     async fn wait_outbox_and_state_rollback_together_before_delivery() {
-        let db = Database::open_in_memory().await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wait.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
         let source = db
             .create_conversation("rollback-wait", "rollback-wait", "/tmp", true, None, None)
             .await
@@ -698,6 +700,13 @@ mod tests {
             .fetch_one(&mut *tx)
             .await
             .unwrap();
+        assert!(
+            db.pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "another connection must not discover an uncommitted wait event"
+        );
         assert_eq!(inside, 1);
         tx.rollback().await.unwrap();
         assert!(db
@@ -714,10 +723,34 @@ mod tests {
         db.update_conversation_state(&source.id, &waiting)
             .await
             .unwrap();
+        let original = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(original.len(), 1);
+        db.pool().close().await;
+        let restored = Database::open(path.to_str().unwrap()).await.unwrap();
+        restored
+            .update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        let replay = restored.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_id, original[0].event_id);
+        restored
+            .update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        restored
+            .update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
         assert_eq!(
-            db.pending_coordinator_watch_events(16).await.unwrap().len(),
-            1
+            restored
+                .pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .len(),
+            2
         );
+        restored.pool().close().await;
     }
 
     #[tokio::test]
