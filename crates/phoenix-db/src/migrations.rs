@@ -611,6 +611,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "close_cleanup_failures",
         sql: MIGRATION_119,
     },
+    Migration {
+        version: 120,
+        name: "coordinator_question_wait_events",
+        sql: include_str!("coordinator_watches/question_wait_outbox.sql"),
+    },
 ];
 
 const MIGRATION_119: &str = r"
@@ -12771,8 +12776,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(9).copied().collect::<Vec<_>>(),
             vec![
+                (120, "coordinator_question_wait_events"),
                 (119, "close_cleanup_failures"),
                 (118, "persist_mcp_token_removals"),
                 (117, "persist_conversation_tool_policy"),
@@ -17726,7 +17732,8 @@ mod tests {
                     (108, 'temporarily_skip_authority_timestamp_storage_class'),
                     (111, 'temporarily_skip_coordinator_watches'),
                     (113, 'temporarily_skip_historical_continuation_settlement'),
-                    (119, 'temporarily_skip_close_cleanup_failures')",
+                    (119, 'temporarily_skip_close_cleanup_failures'),
+                    (120, 'temporarily_skip_coordinator_question_wait_events')",
         )
         .execute(&pool)
         .await
@@ -18626,7 +18633,8 @@ mod tests {
                     (108, 'temporarily_skip_authority_timestamp_storage_class'),
                     (111, 'temporarily_skip_coordinator_watches'),
                     (113, 'temporarily_skip_historical_continuation_settlement'),
-                    (119, 'temporarily_skip_close_cleanup_failures')",
+                    (119, 'temporarily_skip_close_cleanup_failures'),
+                    (120, 'temporarily_skip_coordinator_question_wait_events')",
         )
         .execute(pool)
         .await
