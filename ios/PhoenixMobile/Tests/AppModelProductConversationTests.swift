@@ -4,6 +4,18 @@ import XCTest
 
 @MainActor
 final class AppModelProductConversationTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-product-tests-\(UUID().uuidString)")
+    }
+
+    private func model(baseURL: URL = URL(string: "http://127.0.0.1:1")!) -> AppModel {
+        let model = AppModel()
+        model.installAPIForTesting(baseURL: baseURL)
+        return model
+    }
+
     private func conversation(
         id: String,
         aggregateId: String? = nil,
@@ -43,24 +55,32 @@ final class AppModelProductConversationTests: XCTestCase {
             runtime_role: runtimeRole)
     }
 
-    private func persistReadableSnapshot(conversation: Conversation) {
+    private func persistReadableSnapshot(
+        conversation: Conversation,
+        credentialGeneration: UUID = ConversationSession.defaultTestingCredentialGeneration
+    ) {
         struct Snapshot: Codable {
+            var persistenceScope: String
             var conversation: Conversation?
             var messages: [Message]
             var lastSequenceId: Int64
             var transcriptGeneration: Int64?
             var syncedAt: Date?
         }
+        let api = PhoenixAPI(
+            baseURL: URL(string: "http://127.0.0.1:1")!, password: nil, allowSelfSigned: false)!
 
         DiskStore.saveVersioned(
             Snapshot(
+                persistenceScope: ConversationSession.persistenceScope(
+                    for: api, credentialGeneration: credentialGeneration),
                 conversation: conversation,
                 messages: [],
                 lastSequenceId: 0,
                 transcriptGeneration: 1,
                 syncedAt: Date()),
             name: "conv-\(conversation.id)",
-            version: 1)
+            version: 2)
     }
 
     private func message(_ id: String, sequence: Int64) -> Message {
@@ -191,28 +211,55 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(evidence)
     }
 
-    func testAPIRebuildRestartsAggregateReconciliationAfterPermanentFailure() {
-        let model = AppModel()
+    func testAPIRebuildRestartsAggregateReconciliationAfterPermanentFailure() async {
+        let model = model()
+        model.serverURLString = "http://127.0.0.1:1"
+        _ = await model.awaitAggregateRecoveryStartupForTesting()
         model.cancelAggregateReconciliationForTesting()
         XCTAssertNil(model.aggregateReconciliationId)
 
+        let startupGeneration = model.aggregateRecoveryStartupGenerationForTesting
         model.rebuildAPIForTesting()
+        let completedGeneration = await model.awaitAggregateRecoveryStartupForTesting()
 
-        XCTAssertNotNil(model.aggregateReconciliationId)
+        XCTAssertEqual(completedGeneration, startupGeneration + 1)
     }
 
-    func testInstallAPIForTestingInvalidatesInheritedAPIWorkBeforeReplacement() {
-        let originalURL = UserDefaults.standard.string(forKey: "phoenix.serverURL")
-        UserDefaults.standard.set("http://127.0.0.1:2", forKey: "phoenix.serverURL")
-        defer {
-            if let originalURL {
-                UserDefaults.standard.set(originalURL, forKey: "phoenix.serverURL")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "phoenix.serverURL")
-            }
-        }
-        let model = AppModel()
+    func testClearCacheReclassifiesNewGenerationBeforeForegroundRecovery() async {
+        let model = model()
+        model.serverURLString = "http://127.0.0.1:1"
+        _ = await model.awaitAggregateRecoveryStartupForTesting()
+        let startupGeneration = model.aggregateRecoveryStartupGenerationForTesting
+
+        await model.clearCacheAndAwaitRecoveryForTesting()
+
+        XCTAssertEqual(
+            model.aggregateRecoveryStartupGenerationForTesting,
+            startupGeneration + 1)
+    }
+
+    func testForegroundRetriesRecoveryAfterUnreadableFenceIsRepaired() async throws {
+        let aggregateId = "pc-retry-fence"
+        let fenceName = ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId)
+        try Data("not a fence".utf8).write(to: DiskStore.url(for: fenceName))
+        let model = model()
+        model.serverURLString = "http://127.0.0.1:1"
+        _ = await model.awaitAggregateRecoveryStartupForTesting()
+        XCTAssertEqual(model.aggregateRecoveryStartupGenerationForTesting, 0)
+
+        DiskStore.remove(name: fenceName)
+        model.backgrounded()
+        model.foregrounded()
+        let completed = await model.awaitAggregateRecoveryStartupForTesting()
+
+        XCTAssertEqual(completed, 1)
+    }
+
+    func testInstallAPIForTestingInvalidatesInheritedAPIWorkBeforeReplacement() async {
+        let model = model()
         let inheritedGeneration = model.apiGenerationForTesting
+        await model.startAggregateEventStreamForTesting()
+        _ = model.prepareAggregateReconciliationForTesting()
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
         XCTAssertNotNil(model.aggregateReconciliationId)
 
@@ -223,17 +270,17 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(model.aggregateReconciliationId)
     }
 
-    func testConnectivityRestoreDefersReconciliationUntilStreamIsOpen() {
-        let model = AppModel()
+    func testConnectivityRestoreReclassifiesBeforeStartingReconciliation() async {
+        let model = model()
         model.installAPIForTesting()
         model.connectivity.setOnlineForTesting(false)
-        model.startAggregateEventStreamForTesting()
+        await model.startAggregateEventStreamForTesting()
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
 
         model.connectivity.setOnlineForTesting(true)
 
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
-        XCTAssertNil(model.aggregateReconciliationId)
+        XCTAssertNotNil(model.aggregateReconciliationId)
     }
 
     func testProductConversationDeleteOutcomeCarriesEveryAuthoritativeMember() throws {
@@ -248,19 +295,20 @@ final class AppModelProductConversationTests: XCTestCase {
             .deleted(conversationIds: ["root", "agent"]))
     }
 
-    func testForegroundRestoreDefersReconciliationUntilStreamIsReady() {
-        let model = AppModel()
+    func testForegroundRestoreReclassifiesBeforeStreamAdmission() async {
+        let model = model()
         model.installAPIForTesting()
         model.backgrounded()
 
         model.foregrounded()
+        _ = await model.awaitAggregateRecoveryStartupForTesting()
 
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
-        XCTAssertNil(model.aggregateReconciliationId)
+        XCTAssertNotNil(model.aggregateReconciliationId)
     }
 
     func testStaleAggregateReconciliationCannotOverwriteNewerAppliedList() async {
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let staleId = model.prepareAggregateReconciliationForTesting()
         let currentId = model.prepareAggregateReconciliationForTesting()
@@ -279,7 +327,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testCancelledAggregateReconciliationCannotApplyFetchedList() async {
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let reconciliationId = model.prepareAggregateReconciliationForTesting()
         let stale = [conversation(id: "old", aggregateId: "pc-old")]
@@ -352,7 +400,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testAggregateReconciliationPreservesProvisioningShellOmittedFromProductList() async {
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let shell = conversation(
             id: "shell-row",
@@ -385,7 +433,7 @@ final class AppModelProductConversationTests: XCTestCase {
         persistReadableSnapshot(conversation: conversation(
             id: "coordinator-row",
             aggregateId: "pc-coordinator"))
-        let model = AppModel()
+        let model = model()
         model.listStore.upsert(conversation(
             id: "coordinator-row",
             aggregateId: "pc-coordinator"))
@@ -463,7 +511,7 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(saved)
         XCTAssertNil(ProductHistorySnapshotStore.load(productConversationId: "different-aggregate"))
 
-        let model = AppModel()
+        let model = model()
         model.connectivity.setOnlineForTesting(false)
         let reopened = try await model.loadProductHistory(productConversationId: "pc-history")
 
@@ -490,7 +538,7 @@ final class AppModelProductConversationTests: XCTestCase {
             CachedProductHistory(snapshot: snapshot, fetchedAt: Date()), revision: revision)
         XCTAssertTrue(saved)
 
-        let model = AppModel()
+        let model = model()
         let cached = model.cachedProductHistory(productConversationId: "pc-history")
 
         XCTAssertEqual(cached?.snapshot.segments[0].messages.map(\.message_id), ["cached"])
@@ -508,6 +556,35 @@ final class AppModelProductConversationTests: XCTestCase {
         }
     }
 
+    func testFailedHistoryRemovalRetainsFenceUntilRestartRetry() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-history-removal-failure-\(UUID().uuidString)")
+        let aggregateId = "pc-history-failure"
+        let row = conversation(id: "row-history-failure", aggregateId: aggregateId)
+        let history = historySnapshot(aggregateId: aggregateId, segments: [])
+        let writer = ProductHistorySnapshotStore.writer(productConversationId: aggregateId)
+        let historySaved = await writer.save(
+            CachedProductHistory(snapshot: history, fetchedAt: Date()),
+            revision: writer.reserveRevision())
+        XCTAssertTrue(historySaved)
+        let model = model()
+        model.listStore.upsert(row)
+        model.historyRemovalOverrideForTesting = { _ in }
+
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId, transcriptIds: [row.id])
+
+        XCTAssertFalse(removed)
+        XCTAssertNotNil(model.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+        XCTAssertNotNil(ProductHistorySnapshotStore.load(productConversationId: aggregateId))
+
+        let restarted = self.model()
+        let recovered = await restarted.recoverProductHistoryDeletionFencesForTesting()
+        XCTAssertTrue(recovered)
+        XCTAssertNil(restarted.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+        XCTAssertNil(ProductHistorySnapshotStore.load(productConversationId: aggregateId))
+    }
+
     func testAuthoritativeProductHistoryRemovalCleansAggregateState() async throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-product-history-tests-\(UUID().uuidString)")
@@ -523,7 +600,7 @@ final class AppModelProductConversationTests: XCTestCase {
             revision: revision)
         XCTAssertTrue(historySaved)
 
-        let model = AppModel()
+        let model = model()
         model.serverURLString = "http://localhost"
         model.listStore.upsert(row)
         XCTAssertNotNil(model.session(for: row.id))
@@ -543,8 +620,8 @@ final class AppModelProductConversationTests: XCTestCase {
     func testAggregateDeletionEventCleansAllExactTranscriptOwnersAndConfirmation() async {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-aggregate-event-tests-\(UUID().uuidString)")
-        let model = AppModel()
-        model.serverURLString = "http://localhost"
+        let model = model()
+        model.installAPIForTesting(baseURL: URL(string: "http://localhost")!)
         let aggregateId = "pc-deleted"
         let root = conversation(id: "root", aggregateId: aggregateId)
         let leaf = conversation(id: "leaf", aggregateId: aggregateId)
@@ -574,6 +651,270 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(DiskStore.listNames(prefix: "outbox-").contains("outbox-leaf"))
     }
 
+    func testRestartRecoversPersistedAggregateDeletionFenceBeforeDelivery() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-aggregate-fence-restart-\(UUID().uuidString)")
+        let generation = UUID()
+        let baseURL = URL(string: "http://localhost")!
+        let api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)!
+        let aggregateId = "pc-fence"
+        let fence = PersistedProductHistoryDeletionFence(
+            persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: generation),
+            productConversationId: aggregateId,
+            transcriptIds: ["row-fence"])
+        let writer = ProductHistoryDeletionFenceStore.writer(productConversationId: aggregateId)
+        _ = await writer.save(fence, revision: writer.reserveRevision())
+
+        let restarted = AppModel()
+        restarted.installAPIForTesting(baseURL: baseURL, credentialGeneration: generation)
+
+        let recovered = await restarted.recoverProductHistoryDeletionFencesForTesting()
+        XCTAssertTrue(recovered)
+        XCTAssertNil(DiskStore.loadVersioned(
+            PersistedProductHistoryDeletionFence.self,
+            name: ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId),
+            version: ProductHistoryDeletionFenceStore.schemaVersion))
+    }
+
+    func testUnreadableFencePreventsForegroundRestartFromDrainingPersistedOutbox() async {
+        let aggregateId = "pc-unreadable-restart"
+        let fenceURL = DiskStore.url(for: ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId))
+        try! FileManager.default.createDirectory(
+            at: fenceURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try! Data("not a fence".utf8).write(to: fenceURL)
+        let writer = Outbox(conversationId: "deleted-owner")
+        _ = await writer.enqueue(text: "must not post while recovery is blocked")
+        let persisted = await writer.flushPersistence()
+        XCTAssertTrue(persisted)
+
+        let restarted = model()
+        let recovered = await restarted.foregroundAfterRecoveryForTesting()
+        await restarted.drainSessionForTesting(conversationId: "deleted-owner")?.awaitOutboxDrainForTesting()
+
+        XCTAssertFalse(recovered)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fenceURL.path))
+        let outbox = Outbox(conversationId: "deleted-owner")
+        XCTAssertEqual(outbox.entries.first?.attemptCount, 0)
+        XCTAssertEqual(outbox.visibleEntries.map(\.text), ["must not post while recovery is blocked"])
+    }
+
+    func testUnreadableDeletionFenceBlocksRecoveryWithoutRemovingQueuedData() async {
+        let aggregateId = "pc-unreadable-fence"
+        let fenceName = ProductHistoryDeletionFenceStore.name(productConversationId: aggregateId)
+        let fenceURL = DiskStore.url(for: fenceName)
+        try! FileManager.default.createDirectory(
+            at: fenceURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try! Data("not a fence".utf8).write(to: fenceURL)
+        let writer = Outbox(conversationId: "surviving-owner")
+        _ = await writer.enqueue(text: "preserve while fence is unreadable")
+        let persisted = await writer.flushPersistence()
+        XCTAssertTrue(persisted)
+
+        let recovered = await model().recoverProductHistoryDeletionFencesForTesting()
+
+        XCTAssertFalse(recovered)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fenceURL.path))
+        XCTAssertEqual(
+            Outbox(conversationId: "surviving-owner").visibleEntries.map(\.text),
+            ["preserve while fence is unreadable"])
+    }
+
+    func testDeletionCleansMembersFromPreexistingWiderFence() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-wider-fence-\(UUID().uuidString)")
+        let generation = ConversationSession.defaultTestingCredentialGeneration
+        let baseURL = URL(string: "http://localhost")!
+        let api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)!
+        let aggregateId = "pc-wider"
+        let wider = PersistedProductHistoryDeletionFence(
+            persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: generation),
+            productConversationId: aggregateId,
+            transcriptIds: ["narrow", "queued-owner"])
+        let writer = ProductHistoryDeletionFenceStore.writer(productConversationId: aggregateId)
+        _ = await writer.save(wider, revision: writer.reserveRevision())
+        persistReadableSnapshot(conversation: conversation(id: "queued-owner", aggregateId: aggregateId))
+        let queued = OutboxEntry(
+            localId: "queued-id", conversationId: "queued-owner", text: "preserve only until deletion",
+            images: [], status: .pending, acceptedByServer: false, createdAt: Date(),
+            acceptedAt: nil, lastError: nil, attemptCount: 0)
+        XCTAssertTrue(DiskStore.saveVersioned(
+            [queued], name: "outbox-queued-owner", version: Outbox.schemaVersion))
+
+        let model = model(baseURL: baseURL)
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId, transcriptIds: ["narrow"])
+
+        XCTAssertTrue(removed)
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "queued-owner"))
+        XCTAssertEqual(Outbox(conversationId: "queued-owner").visibleEntries, [])
+        XCTAssertNil(model.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+    }
+
+    func testFailedListPersistenceRetainsFenceUntilRecoveryCompletes() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-fence-\(UUID().uuidString)")
+        let aggregateId = "pc-list-failure"
+        let deletedRow = conversation(id: "row-list", aggregateId: aggregateId)
+        let unrelated = OutboxEntry(
+            localId: "unrelated-id", conversationId: "unrelated-owner", text: "retain me",
+            images: [], status: .pending, acceptedByServer: false, createdAt: Date(),
+            acceptedAt: nil, lastError: nil, attemptCount: 0)
+        let model = model()
+        model.listStore.replaceAndPersistForTesting([deletedRow])
+        XCTAssertTrue(DiskStore.saveVersioned(
+            Outbox.ScopedEntries(persistenceScope: "testing", entries: [unrelated]),
+            name: "outbox-unrelated-owner", version: Outbox.schemaVersion))
+        model.listStore.persistCacheOverrideForTesting = { false }
+
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId, transcriptIds: ["row-list"])
+
+        XCTAssertFalse(removed)
+        XCTAssertNotNil(model.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+        XCTAssertTrue(ConversationListStore().conversations.contains { $0.aggregateIdentity == aggregateId })
+
+        let restarted = self.model()
+        let recovered = await restarted.recoverProductHistoryDeletionFencesForTesting()
+        XCTAssertTrue(recovered)
+        XCTAssertNil(restarted.persistedProductHistoryDeletionFenceForTesting(productConversationId: aggregateId))
+        XCTAssertFalse(ConversationListStore().conversations.contains { $0.aggregateIdentity == aggregateId })
+        XCTAssertEqual(Outbox(conversationId: "unrelated-owner").visibleEntries.map(\.text), ["retain me"])
+    }
+
+    func testUnscopedV2OutboxWithoutSnapshotIsNotAdmittedAcrossCredentialChange() async throws {
+        let conversationId = "v2-cross-credential"
+        let queued = OutboxEntry(
+            localId: "v2-entry", conversationId: conversationId, text: "must remain quarantined",
+            images: [], status: .pending, acceptedByServer: false, createdAt: Date(),
+            acceptedAt: nil, lastError: nil, attemptCount: 0)
+        XCTAssertTrue(DiskStore.saveVersioned(
+            [queued], name: "outbox-\(conversationId)", version: 2))
+
+        let model = self.model()
+        await model.installAPIAndAwaitRecoveryForTesting(
+            baseURL: URL(string: "http://127.0.0.1:1")!, credentialGeneration: UUID())
+        model.drainPersistedOutboxesForTesting()
+
+        XCTAssertNil(model.drainSessionForTesting(conversationId: conversationId))
+        XCTAssertTrue(DiskStore.loadVersioned(
+            [OutboxEntry].self, name: "outbox-\(conversationId)", version: 2)?.contains {
+                $0.localId == queued.localId
+            } == true)
+    }
+
+    func testAuthoritativeSnapshotMigratesV2OutboxToScopedV3() async throws {
+        let conversationId = "v2-authoritative"
+        let queued = OutboxEntry(
+            localId: "v2-authoritative-entry", conversationId: conversationId,
+            text: "migrate only with authority", images: [], status: .pending,
+            acceptedByServer: false, createdAt: Date(), acceptedAt: nil, lastError: nil,
+            attemptCount: 0)
+        let credentialGeneration = UUID()
+        let conversation = self.conversation(id: conversationId)
+        persistReadableSnapshot(
+            conversation: conversation, credentialGeneration: credentialGeneration)
+        XCTAssertTrue(DiskStore.saveVersioned(
+            [queued], name: "outbox-\(conversationId)", version: 2))
+
+        let model = self.model()
+        await model.installAPIAndAwaitRecoveryForTesting(
+            baseURL: URL(string: "http://127.0.0.1:1")!, credentialGeneration: credentialGeneration)
+        model.drainPersistedOutboxesForTesting()
+
+        let owner = try XCTUnwrap(model.drainSessionForTesting(conversationId: conversationId))
+        XCTAssertEqual(owner.outbox.visibleEntries.map(\.text), ["migrate only with authority"])
+        let migrated = DiskStore.loadVersioned(
+            Outbox.ScopedEntries.self, name: "outbox-\(conversationId)", version: 3)
+        XCTAssertEqual(migrated?.entries.map(\.localId), [queued.localId])
+    }
+
+    func testLegacyOutboxWithoutReadableSnapshotIsNotAdmittedByPersistedSweep() async throws {
+        for snapshot in ["missing", "unreadable", "newer"] {
+            DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("phoenix-legacy-outbox-\(snapshot)-\(UUID().uuidString)")
+            let conversationId = "legacy-\(snapshot)"
+            let legacy = OutboxEntry(
+                localId: "legacy-entry", conversationId: conversationId, text: "must not post",
+                images: [], status: .pending, acceptedByServer: false, createdAt: Date(),
+                acceptedAt: nil, lastError: nil, attemptCount: 0)
+            XCTAssertTrue(DiskStore.saveVersioned(
+                [legacy], name: "outbox-\(conversationId)", version: 1))
+            switch snapshot {
+            case "unreadable":
+                try Data("not a snapshot".utf8).write(to: DiskStore.url(for: "conv-\(conversationId)"))
+            case "newer":
+                XCTAssertTrue(DiskStore.saveVersioned(
+                    ["newer"], name: "conv-\(conversationId)", version: 3))
+            default: break
+            }
+
+            let model = self.model()
+            model.installAPIForTesting(baseURL: URL(string: "http://127.0.0.1:1")!)
+            model.drainPersistedOutboxesForTesting()
+
+            XCTAssertNil(model.drainSessionForTesting(conversationId: conversationId))
+            XCTAssertTrue(DiskStore.loadVersioned(
+                [OutboxEntry].self, name: "outbox-\(conversationId)", version: 1)?.contains {
+                    $0.localId == legacy.localId
+                } == true)
+        }
+    }
+
+    func testFenceAppearingBeforeDrainPreventsPersistedOutboxAdmission() async throws {
+        let conversationId = "fenced-before-drain"
+        let baseURL = URL(string: "http://127.0.0.1:1")!
+        let api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)!
+        let credentialGeneration = UUID()
+        let scope = ConversationSession.persistenceScope(
+            for: api, credentialGeneration: credentialGeneration)
+        let writer = Outbox(conversationId: conversationId, persistenceScope: scope)
+        _ = await writer.enqueue(text: "do not drain after fence")
+        let persisted = await writer.flushPersistence()
+        XCTAssertTrue(persisted)
+        let model = self.model()
+        await model.installAPIAndAwaitRecoveryForTesting(
+            baseURL: baseURL, credentialGeneration: credentialGeneration)
+        model.beforePersistedOutboxDrainForTesting = {
+            let fence = PersistedProductHistoryDeletionFence(
+                persistenceScope: scope,
+                productConversationId: "pc-before-drain",
+                transcriptIds: [conversationId])
+            _ = DiskStore.saveVersioned(
+                fence,
+                name: ProductHistoryDeletionFenceStore.name(productConversationId: "pc-before-drain"),
+                version: ProductHistoryDeletionFenceStore.schemaVersion)
+        }
+        model.drainPersistedOutboxesForTesting()
+
+        let owner = try XCTUnwrap(model.drainSessionForTesting(conversationId: conversationId))
+        await owner.awaitOutboxDrainForTesting()
+        XCTAssertEqual(owner.outbox.entries.first?.attemptCount, 0)
+    }
+
+    func testPersistedOutboxIsEnumeratedAndReloadedByItsOwner() async throws {
+        let conversationId = "c1"
+        let baseURL = URL(string: "http://127.0.0.1:1")!
+        let api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)!
+        let credentialGeneration = UUID()
+        let writer = Outbox(
+            conversationId: conversationId,
+            persistenceScope: ConversationSession.persistenceScope(
+                for: api, credentialGeneration: credentialGeneration))
+        _ = await writer.enqueue(text: "deliver after restart")
+        let persisted = await writer.flushPersistence()
+        XCTAssertTrue(persisted)
+        XCTAssertTrue(DiskStore.names(withPrefix: "outbox-").contains("outbox-\(conversationId)"))
+
+        let model = self.model()
+        await model.installAPIAndAwaitRecoveryForTesting(
+            baseURL: baseURL, credentialGeneration: credentialGeneration)
+        model.drainPersistedOutboxesForTesting()
+
+        let owner = try XCTUnwrap(model.drainSessionForTesting(conversationId: conversationId))
+        XCTAssertEqual(owner.conversationId, conversationId)
+        XCTAssertEqual(owner.outbox.visibleEntries.map(\.text), ["deliver after restart"])
+    }
+
     func testAggregateDeletionTerminalizesRetainedOwnersMissingFromAliases() async throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-retained-delete-tests-\(UUID().uuidString)")
@@ -582,7 +923,7 @@ final class AppModelProductConversationTests: XCTestCase {
         let drainRow = conversation(id: "drain-row", aggregateId: aggregateId)
         persistReadableSnapshot(conversation: openRow)
         persistReadableSnapshot(conversation: drainRow)
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let openOwner = try XCTUnwrap(model.session(for: openRow.id))
         let drainOwner = try XCTUnwrap(model.installDrainSessionForTesting(conversationId: drainRow.id))
@@ -609,7 +950,7 @@ final class AppModelProductConversationTests: XCTestCase {
         let retained = conversation(id: "retained-row", aggregateId: aggregateId)
         persistReadableSnapshot(conversation: cached)
         persistReadableSnapshot(conversation: retained)
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         model.listStore.upsert(listed)
         XCTAssertNotNil(model.session(for: retained.id))
@@ -682,7 +1023,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testArchivedTranscriptNotificationAliasRoutesToProductHistoryAggregate() {
-        let model = AppModel()
+        let model = model()
         model.listStore.upsert(conversation(id: "root-row", aggregateId: "pc-history"))
         model.listStore.upsert(conversation(
             id: "latest-row", aggregateId: "pc-history", archived: true))
@@ -747,7 +1088,7 @@ final class AppModelProductConversationTests: XCTestCase {
     func testCloseRehydrationFencesEveryListedActiveAggregateBeforeSelectingPrompt() async throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-close-rehydration-fence-tests-\(UUID().uuidString)")
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let first = conversation(
             id: "row-a",
@@ -782,7 +1123,7 @@ final class AppModelProductConversationTests: XCTestCase {
     func testCloseRehydrationClearsAbsentFencePromptAndReconciliationButPreservesActive() async throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-authoritative-close-tests-\(UUID().uuidString)")
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let absent = conversation(id: "absent-row", aggregateId: "absent")
         let active = conversation(
@@ -839,7 +1180,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testForegroundAttentionSeedInvalidatesBackgroundEvidenceGeneration() {
-        let model = AppModel()
+        let model = model()
         let backgroundGeneration = model.attentionEvidenceGenerationForTesting
         model.listStore.upsert(conversation(
             id: "visible",
@@ -893,7 +1234,7 @@ final class AppModelProductConversationTests: XCTestCase {
     func testClearCacheClearsPendingCloseAndInFlightResolution() async {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-close-reset-tests-\(UUID().uuidString)")
-        let model = AppModel()
+        let model = model()
         let pending = PendingProductCloseConfirmation(
             productConversationId: "product",
             transcriptRowId: "latest",
@@ -908,10 +1249,41 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(model.isResolvingPendingProductClose)
     }
 
+    func testClearCacheRetainsInMemoryStateWhenDirectoryRemovalFails() async {
+        let model = model()
+        model.installAPIForTesting()
+        XCTAssertNotNil(model.installDrainSessionForTesting(conversationId: "retain"))
+        let pending = PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: "latest",
+            close: closeSnapshot(phase: .awaiting_stop_work_confirmation))
+        model.installPendingProductCloseConfirmationForTesting(pending, resolving: true)
+        model.cacheRemovalOverrideForTesting = { false }
+
+        await model.clearCache()
+
+        XCTAssertNotNil(model.drainSessionForTesting(conversationId: "retain"))
+        XCTAssertNotNil(model.pendingProductCloseConfirmation)
+        XCTAssertTrue(model.isResolvingPendingProductClose)
+    }
+
+    func testSignOutFailureRetainsContextAndQueuedOwner() async {
+        let model = model()
+        model.serverURLString = "http://original.invalid"
+        model.installAPIForTesting()
+        XCTAssertNotNil(model.installDrainSessionForTesting(conversationId: "retain"))
+        model.cacheRemovalOverrideForTesting = { false }
+
+        await model.signOut()
+
+        XCTAssertEqual(model.serverURLString, "http://original.invalid")
+        XCTAssertNotNil(model.drainSessionForTesting(conversationId: "retain"))
+    }
+
     func testRepairNotNowKeepsAggregateMessageAdmissionFenced() async throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-close-repair-fence-tests-\(UUID().uuidString)")
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         model.connectivity.setOnlineForTesting(true)
         let row = conversation(id: "latest", aggregateId: "product")
@@ -931,7 +1303,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testActiveCloseFenceAppliesToSessionCreatedAfterRehydration() throws {
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let row = conversation(id: "latest", aggregateId: "product")
         model.listStore.upsert(row)
@@ -948,7 +1320,7 @@ final class AppModelProductConversationTests: XCTestCase {
             .appendingPathComponent("phoenix-cached-close-fence-tests-\(UUID().uuidString)")
         persistReadableSnapshot(conversation: conversation(id: "open", aggregateId: "product"))
         persistReadableSnapshot(conversation: conversation(id: "drain", aggregateId: "product"))
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let openOwner = try XCTUnwrap(model.session(for: "open"))
         let drainOwner = try XCTUnwrap(model.installDrainSessionForTesting(conversationId: "drain"))
@@ -967,7 +1339,7 @@ final class AppModelProductConversationTests: XCTestCase {
             .appendingPathComponent("phoenix-cancel-close-fence-tests-\(UUID().uuidString)")
         let row = conversation(id: "latest", aggregateId: "product")
         persistReadableSnapshot(conversation: row)
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let session = try XCTUnwrap(model.session(for: row.id))
         model.fenceProductCloseForTesting(productConversationId: "product", fenced: true)
@@ -989,7 +1361,7 @@ final class AppModelProductConversationTests: XCTestCase {
             .appendingPathComponent("phoenix-close-conflict-fence-tests-\(UUID().uuidString)")
         let row = conversation(id: "latest", aggregateId: "product")
         persistReadableSnapshot(conversation: row)
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let session = try XCTUnwrap(model.session(for: row.id))
 
@@ -1006,7 +1378,7 @@ final class AppModelProductConversationTests: XCTestCase {
             .appendingPathComponent("phoenix-close-conflict-reconcile-tests-\(UUID().uuidString)")
         let row = conversation(id: "latest", aggregateId: "product")
         persistReadableSnapshot(conversation: row)
-        let model = AppModel()
+        let model = model()
         model.installAPIForTesting()
         let session = try XCTUnwrap(model.session(for: row.id))
         model.recordCloseConfirmationRequiredForTesting(productConversationId: "product")
@@ -1027,7 +1399,7 @@ final class AppModelProductConversationTests: XCTestCase {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-close-outbox-tests-\(UUID().uuidString)")
         DiskStore.save(["queued"], name: "outbox-latest")
-        let model = AppModel()
+        let model = model()
         model.serverURLString = "http://127.0.0.1:1"
         model.connectivity.setOnlineForTesting(true)
         model.installPendingProductCloseConfirmationForTesting(PendingProductCloseConfirmation(
@@ -1045,7 +1417,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testOfflineCloseConfirmationFailsImmediatelyWithExplanation() async {
-        let model = AppModel()
+        let model = model()
         model.connectivity.setOnlineForTesting(false)
 
         await model.resolvePendingProductCloseConfirmation(confirm: true)
@@ -1116,7 +1488,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testBackgroundIntegrationPreservesAuthoritativeAggregateIdentityAfterLegacyCache() {
-        let model = AppModel()
+        let model = model()
         let aggregateProjection = conversation(
             id: "latest-row",
             aggregateId: "pc-1",
@@ -1139,7 +1511,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testBackgroundIntegrationPreservesCanonicalRootMetadataAcrossLiveUpdate() {
-        let model = AppModel()
+        let model = model()
         let aggregateProjection = conversation(
             id: "latest-row",
             aggregateId: "pc-1",
@@ -1172,7 +1544,7 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testBackgroundIntegrationIgnoresDivergentSuccessorTaskTitle() {
-        let model = AppModel()
+        let model = model()
         let aggregateProjection = conversation(
             id: "latest-row",
             aggregateId: "pc-1",
@@ -1205,7 +1577,7 @@ final class AppModelProductConversationTests: XCTestCase {
         persistReadableSnapshot(conversation: coordinator)
         UserDefaults.standard.set("coordinator-row", forKey: "phoenix.coordinatorConversationId")
 
-        let model = AppModel()
+        let model = model()
 
         XCTAssertEqual(model.listStore.conversations.filter(\.isCoordinator).count, 0)
         let coordinatorId = await model.openCoordinator()
@@ -1217,7 +1589,7 @@ final class AppModelProductConversationTests: XCTestCase {
             .appendingPathComponent("phoenix-appmodel-tests-\(UUID().uuidString)")
         let predecessor = conversation(id: "row-1", aggregateId: "pc-1", slug: "root", title: "Root")
         persistReadableSnapshot(conversation: predecessor)
-        let model = AppModel()
+        let model = model()
         model.listStore.upsert(predecessor)
         model.listStore.upsert(conversation(id: "row-2", aggregateId: "pc-1", slug: "root", title: "Root"))
         model.connectivity.setOnlineForTesting(false)
@@ -1233,7 +1605,7 @@ final class AppModelProductConversationTests: XCTestCase {
             .appendingPathComponent("phoenix-appmodel-tests-\(UUID().uuidString)")
         let predecessor = conversation(id: "row-1", aggregateId: "pc-1", slug: "root", title: "Root")
         persistReadableSnapshot(conversation: predecessor)
-        let model = AppModel()
+        let model = model()
         model.listStore.upsert(predecessor)
         model.listStore.upsert(conversation(id: "row-2", aggregateId: "pc-1", slug: "root", title: "Root"))
         model.connectivity.setOnlineForTesting(false)
@@ -1250,7 +1622,7 @@ final class AppModelProductConversationTests: XCTestCase {
             .appendingPathComponent("phoenix-appmodel-tests-\(UUID().uuidString)")
         let predecessor = conversation(id: "row-1", aggregateId: "pc-1", slug: "root", title: "Root")
         persistReadableSnapshot(conversation: predecessor)
-        let model = AppModel()
+        let model = model()
         model.listStore.upsert(predecessor)
         model.listStore.upsert(conversation(id: "row-2", aggregateId: "pc-1", slug: "root", title: "Root"))
         let aggregateConversation = model.listStore.conversations.first!
@@ -1259,7 +1631,7 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(model.navigationConversationId(for: aggregateConversation), "row-1")
     }
 
-    func testOfflineNavigationUsesCachedAggregateMemberAfterRestart() {
+    func testOfflineNavigationUsesCacheWithMatchingTestingScopeAfterRestart() {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-appmodel-tests-\(UUID().uuidString)")
         let predecessor = conversation(id: "row-1", aggregateId: "pc-1", slug: "root", title: "Root")
@@ -1271,6 +1643,7 @@ final class AppModelProductConversationTests: XCTestCase {
             startedAt: first.listStore.externalRefreshToken())
 
         let reloaded = AppModel()
+        reloaded.installAPIForTesting(baseURL: URL(string: "http://127.0.0.1:1")!)
         reloaded.connectivity.setOnlineForTesting(false)
         let aggregateConversation = reloaded.listStore.conversations.first!
 

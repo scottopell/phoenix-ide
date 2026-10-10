@@ -35,6 +35,176 @@ final class ConversationSessionReducerTests: XCTestCase {
             from: Data("{\"message_id\":\"\(id)\",\"sequence_id\":2,\"message_type\":\"\(type)\",\"content\":\(content)}".utf8))
     }
 
+    private struct LegacySnapshot: Codable {
+        var conversation: Conversation?
+        var messages: [Message]
+        var lastSequenceId: Int64
+        var transcriptGeneration: Int64?
+        var syncedAt: Date?
+    }
+
+    @MainActor
+    func testVersionOneSnapshotRendersReadOnlyUntilAuthoritativeInit() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-legacy-\(UUID().uuidString)")
+        XCTAssertTrue(DiskStore.saveVersioned(
+            LegacySnapshot(
+                conversation: try conversation(),
+                messages: [try message(id: "legacy", content: "[]")],
+                lastSequenceId: 2,
+                transcriptGeneration: 1,
+                syncedAt: Date()),
+            name: "conv-c1",
+            version: 1))
+
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        let credential = Keychain.CredentialRecord(
+            password: "", legacyServerURL: api.baseURL.absoluteString)
+        let session = ConversationSession(
+            conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
+            credentialGeneration: credential.generation,
+            legacyPersistenceScope: credential.legacyPersistenceScope(serverURL: api.baseURL))
+
+        XCTAssertEqual(session.messages.map(\.message_id), ["legacy"])
+        XCTAssertNil(session.snapshotLoadError)
+        XCTAssertFalse(session.acceptsConversationActions)
+        let didQueue = await session.send(text: "must not queue")
+        XCTAssertFalse(didQueue)
+
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(), messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 3,
+            pendingAnchorSequenceId: 3, pendingEvents: [], pendingTruncated: false)))
+        await session.awaitSnapshotPersistenceForTesting()
+
+        XCTAssertTrue(session.acceptsConversationActions)
+    }
+
+    @MainActor
+    func testWrongConversationInitCannotClearAuthorityFence() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-wrong-init-\(UUID().uuidString)")
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        struct ForeignSnapshot: Codable {
+            let persistenceScope: String
+            let conversation: Conversation?
+            let messages: [Message]
+            let lastSequenceId: Int64
+            let transcriptGeneration: Int64?
+            let syncedAt: Date?
+        }
+        XCTAssertTrue(DiskStore.saveVersioned(
+            ForeignSnapshot(
+                persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: UUID()),
+                conversation: try conversation(), messages: [], lastSequenceId: 0,
+                transcriptGeneration: nil, syncedAt: Date()),
+            name: "conv-c1", version: 2))
+        let session = ConversationSession(
+            conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
+            credentialGeneration: UUID())
+
+        let wrongConversation = try JSONDecoder().decode(
+            Conversation.self, from: Data("{\"id\":\"c2\",\"slug\":\"c2\",\"state\":{\"type\":\"idle\"}}".utf8))
+        session.receive(.initSnapshot(.init(
+            conversation: wrongConversation, messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+
+        XCTAssertFalse(session.acceptsConversationActions)
+        let persisted = await session.flushSnapshotPersistence()
+        XCTAssertFalse(persisted)
+        XCTAssertNil(session.conversation)
+    }
+
+    @MainActor
+    func testForeignVersionTwoSnapshotFencesPersistedOutboxDelivery() async throws {
+        struct ScopedSnapshot: Codable {
+            let persistenceScope: String
+            let conversation: Conversation?
+            let messages: [Message]
+            let lastSequenceId: Int64
+            let transcriptGeneration: Int64?
+            let syncedAt: Date?
+        }
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-foreign-v2-\(UUID().uuidString)")
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        let foreignGeneration = UUID()
+        let currentGeneration = UUID()
+        XCTAssertTrue(DiskStore.saveVersioned(
+            ScopedSnapshot(
+                persistenceScope: ConversationSession.persistenceScope(for: api, credentialGeneration: foreignGeneration),
+                conversation: try conversation(), messages: [], lastSequenceId: 2,
+                transcriptGeneration: 1, syncedAt: Date()),
+            name: "conv-c1", version: 2))
+        let entry = await Outbox(
+            conversationId: "c1",
+            persistenceScope: ConversationSession.persistenceScope(
+                for: api, credentialGeneration: currentGeneration))
+            .enqueue(text: "keep but do not send")
+        XCTAssertNotNil(entry)
+
+        let session = ConversationSession(
+            conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
+            credentialGeneration: currentGeneration)
+
+        session.drainOutbox()
+        await session.awaitOutboxDrainForTesting()
+
+        XCTAssertEqual(session.outbox.visibleEntries.map(\.text), ["keep but do not send"])
+        XCTAssertEqual(session.outbox.entries.first?.attemptCount, 0)
+    }
+
+    @MainActor
+    func testVersionOneSnapshotRejectsMissingAndForeignLegacyProvenance() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-rejected-\(UUID().uuidString)")
+        XCTAssertTrue(DiskStore.saveVersioned(
+            LegacySnapshot(
+                conversation: try conversation(), messages: [try message(id: "legacy", content: "[]")],
+                lastSequenceId: 2, transcriptGeneration: 1, syncedAt: Date()),
+            name: "conv-c1", version: 1))
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false)!
+        let credential = Keychain.CredentialRecord(password: "")
+        let scope = ConversationSession.persistenceScope(for: api, credentialGeneration: credential.generation)
+        for proof in [nil, "https://other.invalid|\(credential.generation.uuidString)", "\(api.baseURL)|\(UUID())"] as [String?] {
+            let session = ConversationSession(
+                conversationId: "c1", api: api, connectivity: ConnectivityMonitor(),
+                credentialGeneration: credential.generation, legacyPersistenceScope: proof)
+            XCTAssertNil(session.conversation)
+            XCTAssertTrue(session.messages.isEmpty)
+            XCTAssertNotNil(session.snapshotLoadError)
+            XCTAssertNotNil(session.lastErrorToast)
+            XCTAssertFalse(session.acceptsConversationActions)
+            let queued = await session.send(text: "must not queue")
+            XCTAssertFalse(queued)
+            let saved = await session.flushSnapshotPersistence()
+            XCTAssertFalse(saved)
+            XCTAssertNil(ConversationSession.cachedConversation(
+                conversationId: "c1", persistenceScope: scope, legacyPersistenceScope: proof))
+        }
+        XCTAssertNotNil(ConversationSession.cachedConversation(
+            conversationId: "c1", persistenceScope: scope, legacyPersistenceScope: scope))
+        XCTAssertTrue(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
+    }
+
+    @MainActor
+    func testPersistenceScopeUsesOnlyOpaqueGenerationNotPassword() {
+        let firstAPI = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!, password: "first-secret", allowSelfSigned: false)!
+        let secondAPI = PhoenixAPI(
+            baseURL: firstAPI.baseURL, password: "second-secret", allowSelfSigned: false)!
+        let generation = UUID()
+        let scope = ConversationSession.persistenceScope(for: firstAPI, credentialGeneration: generation)
+        XCTAssertEqual(scope, "\(firstAPI.baseURL)|\(generation.uuidString)")
+        XCTAssertEqual(scope, ConversationSession.persistenceScope(for: secondAPI, credentialGeneration: generation))
+        XCTAssertNotEqual(scope, ConversationSession.persistenceScope(for: firstAPI, credentialGeneration: UUID()))
+    }
+
     @MainActor
     func testMessageUpdateWaitsForMessageIdentity() throws {
         let session = makeSession()
@@ -120,16 +290,17 @@ final class ConversationSessionReducerTests: XCTestCase {
             pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
         let initialSnapshotSaved = await session.flushSnapshotPersistence()
         XCTAssertTrue(initialSnapshotSaved)
-        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertTrue(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
+        await session.awaitSnapshotRemovalForTesting()
 
         XCTAssertTrue(session.isHardDeleted)
         XCTAssertTrue(session.messages.isEmpty)
         XCTAssertNil(session.conversation)
         XCTAssertTrue(session.outbox.entries.isEmpty)
         XCTAssertEqual(deletedId, "c1")
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertFalse(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor
@@ -138,7 +309,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         session.pauseForBackground()
         let emptySnapshotSaved = await session.flushSnapshotPersistence()
         XCTAssertTrue(emptySnapshotSaved)
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertFalse(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
 
         session.receive(.initSnapshot(.init(
             conversation: try conversation(), messages: [], agentWorking: false,
@@ -146,7 +317,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
         let authoritativeSnapshotSaved = await session.flushSnapshotPersistence()
         XCTAssertTrue(authoritativeSnapshotSaved)
-        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertTrue(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor
@@ -160,7 +331,7 @@ final class ConversationSessionReducerTests: XCTestCase {
 
         await session.clearCachedSnapshotAndWait()
 
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertFalse(ConversationSession.hasAnyCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor

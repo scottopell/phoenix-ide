@@ -21,6 +21,18 @@ final class DiskStoreVersioningTests: XCTestCase {
     }
 
     @MainActor
+    func testNameDiscoveryReportsUnreadableDirectory() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-name-discovery-\(UUID().uuidString)")
+        try Data("not a directory".utf8).write(to: file)
+        DiskStore.baseDirectory = file
+
+        guard case .unreadable = DiskStore.discoverNames(withPrefix: "outbox-") else {
+            return XCTFail("file-backed persistence root must not look like an empty directory")
+        }
+    }
+
+    @MainActor
     func testSameVersionRoundTrips() {
         freshDiskStore()
         let value = [Record(name: "a", count: 1), Record(name: "b", count: 2)]
@@ -122,10 +134,107 @@ final class DiskStoreVersioningTests: XCTestCase {
     }
 
     @MainActor
+    func testSignOutResetFencesPendingHardDeleteFenceSaveBeforePublication() async throws {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-signout-fence-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let destination = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+            .appendingPathComponent("hard-delete-pending")
+            .appendingPathExtension("json")
+        let writer = context.writer(destinationURL: destination, version: 1)
+        let pendingSaveRevision = writer.reserveRevision()
+        let pendingRecord = Record(name: "pending", count: 1)
+
+        await context.removeAllAndWait()
+        let lateSaveCompleted = await writer.save(pendingRecord, revision: pendingSaveRevision)
+
+        XCTAssertTrue(lateSaveCompleted)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    @MainActor
+    func testProductionResetFencesPendingDefaultWriterBeforePublication() async {
+        freshDiskStore()
+        let writer = DiskStore.versionedWriter(name: "pending", version: 1)
+        let revision = writer.reserveRevision()
+
+        await DiskStore.removeAllAndWait()
+        _ = await writer.save(Record(name: "pending", count: 1), revision: revision)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: writer.destinationURL.path))
+    }
+
+    @MainActor
+    func testConditionalReplaceCannotPublishAfterNewerFence() async {
+        freshDiskStore()
+        let writer = DiskStore.versionedWriter(name: "records", version: 1)
+        let staleRevision = writer.reserveRevision()
+        await writer.fence(revision: writer.reserveRevision())
+
+        let outcome = await writer.replace(
+            expected: Optional<Record>.none,
+            replacement: Record(name: "stale", count: 1),
+            revision: staleRevision)
+
+        XCTAssertEqual(outcome, .expectationMismatch)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: writer.destinationURL.path))
+    }
+
+    @MainActor
+    func testSupersededSaveReportsFailureWhenNewerRevisionDidNotCommit() async throws {
+        freshDiskStore()
+        let context = DiskStore.versionedContext()
+        let first = context.writer(name: "records", version: 2)
+        let replacement = context.writer(name: "records", version: 1)
+        XCTAssertTrue(DiskStore.saveVersioned([Record(name: "future", count: 3)], name: "records", version: 3))
+        let oldRevision = first.reserveRevision()
+        let newRevision = replacement.reserveRevision()
+
+        let newerCommitted = await replacement.save(
+            [Record(name: "new", count: 2)], revision: newRevision)
+        let supersededCommitted = await first.save(
+            [Record(name: "old", count: 1)], revision: oldRevision)
+
+        XCTAssertFalse(newerCommitted)
+        XCTAssertFalse(supersededCommitted)
+    }
+
+    @MainActor
+    func testWriterConditionalReplaceAndRetireRequireExactCurrentContent() async {
+        freshDiskStore()
+        let context = DiskStore.versionedContext()
+        let writer = context.writer(name: "records", version: 1)
+        let first = Record(name: "first", count: 1)
+        let widened = Record(name: "widened", count: 2)
+
+        let created = await writer.replace(
+            expected: Optional<Record>.none, replacement: first, revision: writer.reserveRevision())
+        guard case .replaced = created else { return XCTFail("expected create") }
+
+        let staleCreate = await writer.replace(
+            expected: Optional<Record>.none, replacement: widened, revision: writer.reserveRevision())
+        guard case .expectationMismatch = staleCreate else { return XCTFail("expected stale create mismatch") }
+
+        let replaced = await writer.replace(
+            expected: first, replacement: widened, revision: writer.reserveRevision())
+        guard case .replaced = replaced else { return XCTFail("expected exact replacement") }
+
+        let staleRetire = await writer.replace(
+            expected: first, replacement: Optional<Record>.none, revision: writer.reserveRevision())
+        guard case .expectationMismatch = staleRetire else { return XCTFail("expected stale retire mismatch") }
+
+        let retired = await writer.replace(
+            expected: widened, replacement: Optional<Record>.none, revision: writer.reserveRevision())
+        guard case .replaced = retired else { return XCTFail("expected exact retirement") }
+        XCTAssertNil(DiskStore.loadVersioned(Record.self, name: "records", version: 1))
+    }
+
+    @MainActor
     func testWriterHandlesShareOneDestinationRevisionFence() async {
         freshDiskStore()
-        let first = DiskStore.versionedWriter(name: "records", version: 1)
-        let replacement = DiskStore.versionedWriter(name: "records", version: 1)
+        let context = DiskStore.versionedContext()
+        let first = context.writer(name: "records", version: 1)
+        let replacement = context.writer(name: "records", version: 1)
         let oldRevision = first.reserveRevision()
         let newRevision = replacement.reserveRevision()
 

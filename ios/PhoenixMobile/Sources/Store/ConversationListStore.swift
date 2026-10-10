@@ -47,6 +47,10 @@ final class ConversationListStore {
     /// Aggregate identities removed or archived after the current full refresh began.
     private var exclusionsDuringRefresh: Set<String> = []
 
+    #if DEBUG
+    var persistCacheOverrideForTesting: (() -> Bool)?
+    #endif
+
     init() {
         if let cache = DiskStore.loadVersioned(
             Cache.self, name: Self.cacheName, version: Self.schemaVersion)
@@ -137,6 +141,14 @@ final class ConversationListStore {
         return confirmed
     }
 
+    #if DEBUG
+    func replaceAndPersistForTesting(_ conversations: [Conversation]) {
+        self.conversations = conversations
+        lastRefreshed = Date()
+        _ = persistCache()
+    }
+    #endif
+
     nonisolated static func preservingMissing(
         _ preserved: [String: Conversation],
         in fresh: [Conversation]
@@ -185,19 +197,21 @@ final class ConversationListStore {
         conversations.contains { $0.aggregateIdentity == aggregateId }
     }
 
+    private static func snapshotMetadata(name: String) -> SnapshotMetadata? {
+        DiskStore.loadVersioned(SnapshotMetadata.self, name: name, version: 2)
+            ?? DiskStore.loadVersioned(SnapshotMetadata.self, name: name, version: 1)
+    }
+
     private func hydrateIndexesFromSnapshots() {
         for name in DiskStore.listNames(prefix: "conv-") {
 
-            guard let snapshot = DiskStore.loadVersioned(
-                SnapshotMetadata.self,
-                name: name,
-                version: 1),
+            guard let snapshot = Self.snapshotMetadata(name: name),
                 let conversation = snapshot.conversation,
                 let aggregateId = conversation.product_conversation_id,
                 aggregateExists(aggregateId)
             else { continue }
             transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateId
-            if ConversationSession.hasCachedSnapshot(conversationId: conversation.transcriptRowIdentity) {
+            if ConversationSession.hasAnyCachedSnapshot(conversationId: conversation.transcriptRowIdentity) {
                 aggregateToCachedTranscript[aggregateId] = conversation.transcriptRowIdentity
             }
         }
@@ -254,7 +268,7 @@ final class ConversationListStore {
             transcriptToAggregate[transcriptId] = aggregateId
         }
         for (aggregateId, cachedTranscriptId) in priorCached where aggregateExists(aggregateId) {
-            if ConversationSession.hasCachedSnapshot(conversationId: cachedTranscriptId) {
+            if ConversationSession.hasAnyCachedSnapshot(conversationId: cachedTranscriptId) {
                 aggregateToCachedTranscript[aggregateId] = cachedTranscriptId
             }
         }
@@ -304,7 +318,7 @@ final class ConversationListStore {
             upsertsDuringRefresh[aggregateIdentity] = conversation
         }
         transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateIdentity
-        if ConversationSession.hasCachedSnapshot(conversationId: conversation.transcriptRowIdentity)
+        if ConversationSession.hasAnyCachedSnapshot(conversationId: conversation.transcriptRowIdentity)
             || aggregateToCachedTranscript[aggregateIdentity] == nil
         {
             aggregateToCachedTranscript[aggregateIdentity] = conversation.transcriptRowIdentity
@@ -355,7 +369,8 @@ final class ConversationListStore {
             runtime_role: existing.runtime_role))
     }
 
-    func remove(aggregateId: String) {
+    @discardableResult
+    func removeAndPersist(aggregateId: String) -> Bool {
         externalMutationGeneration += 1
         upsertsDuringRefresh[aggregateId] = nil
         if isRefreshing {
@@ -364,7 +379,11 @@ final class ConversationListStore {
         conversations.removeAll { $0.aggregateIdentity == aggregateId }
         transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateId }
         aggregateToCachedTranscript[aggregateId] = nil
-        persistCache()
+        return persistCache()
+    }
+
+    func remove(aggregateId: String) {
+        _ = removeAndPersist(aggregateId: aggregateId)
     }
 
     func aggregateId(forTranscriptRowId transcriptRowId: String) -> String? {
@@ -381,17 +400,33 @@ final class ConversationListStore {
         aggregateToCachedTranscript[aggregateId]
     }
 
-    func cachedNavigationTranscriptRowId(forAggregateId aggregateId: String, latestTranscriptRowId: String) -> String {
-        if ConversationSession.hasCachedSnapshot(conversationId: latestTranscriptRowId) {
+    func cachedNavigationTranscriptRowId(
+        forAggregateId aggregateId: String,
+        latestTranscriptRowId: String,
+        persistenceScope: String?,
+        legacyPersistenceScope: String?
+    ) -> String {
+        if ConversationSession.hasCachedSnapshot(
+            conversationId: latestTranscriptRowId,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacyPersistenceScope)
+        {
             return latestTranscriptRowId
         }
         if let cached = aggregateToCachedTranscript[aggregateId],
-           ConversationSession.hasCachedSnapshot(conversationId: cached)
+           ConversationSession.hasCachedSnapshot(
+            conversationId: cached,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacyPersistenceScope)
         {
             return cached
         }
         for (transcriptId, mappedAggregateId) in transcriptToAggregate where mappedAggregateId == aggregateId {
-            if ConversationSession.hasCachedSnapshot(conversationId: transcriptId) {
+            if ConversationSession.hasCachedSnapshot(
+                conversationId: transcriptId,
+                persistenceScope: persistenceScope,
+                legacyPersistenceScope: legacyPersistenceScope)
+            {
                 return transcriptId
             }
         }
@@ -418,9 +453,18 @@ final class ConversationListStore {
         lastError = nil
     }
 
-    private func persistCache() {
-        guard let lastRefreshed else { return }
-        DiskStore.saveVersioned(
+    @discardableResult
+    private func persistCache() -> Bool {
+        #if DEBUG
+        if let persistCacheOverrideForTesting { return persistCacheOverrideForTesting() }
+        #endif
+        guard let lastRefreshed else {
+            if case .missing = DiskStore.loadVersionedResult(
+                Cache.self, name: Self.cacheName, version: Self.schemaVersion)
+            { return true }
+            return false
+        }
+        return DiskStore.saveVersioned(
             Cache(
                 conversations: conversations,
                 transcriptToAggregate: transcriptToAggregate,

@@ -7,6 +7,45 @@ struct CachedProductHistory: Codable, Equatable, Sendable {
     var fetchedAt: Date
 }
 
+struct PersistedProductHistoryDeletionFence: Codable, Equatable, Sendable {
+    let persistenceScope: String
+    let productConversationId: String
+    let transcriptIds: Set<String>
+}
+
+@MainActor
+enum ProductHistoryDeletionFenceStore {
+    static let schemaVersion = 1
+    static let prefix = "product-history-delete-"
+
+    static func name(productConversationId: String) -> String { "\(prefix)\(productConversationId)" }
+
+    static func writer(productConversationId: String) -> VersionedDiskWriter {
+        DiskStore.versionedWriter(name: name(productConversationId: productConversationId), version: schemaVersion)
+    }
+
+    enum Discovery {
+        case fences([PersistedProductHistoryDeletionFence])
+        case unreadable
+    }
+
+    static func discover() -> Discovery {
+        var fences: [PersistedProductHistoryDeletionFence] = []
+        for name in DiskStore.names(
+            in: DiskStore.phoenixMobileDirectory(baseDirectory: DiskStore.baseDirectory), withPrefix: prefix)
+        {
+            switch DiskStore.loadVersionedResult(
+                PersistedProductHistoryDeletionFence.self, name: name, version: schemaVersion)
+            {
+            case let .value(fence): fences.append(fence)
+            case .missing: continue
+            case .incompatible, .unreadable: return .unreadable
+            }
+        }
+        return .fences(fences)
+    }
+}
+
 @MainActor
 enum ProductHistorySnapshotStore {
     static let schemaVersion = 2
@@ -276,7 +315,6 @@ final class AppModel {
 
     private static let serverURLKey = "phoenix.serverURL"
     private static let trustSelfSignedKey = "phoenix.trustSelfSigned"
-    private static let passwordAccount = "server-password"
     /// Shared with NewConversationView's @AppStorage. Cleared on sign-out:
     /// the value is a server-local filesystem path and must not leak (or be
     /// sent) to a different server configured later.
@@ -291,6 +329,25 @@ final class AppModel {
     }
 
     private(set) var password: String
+    private var credential: Keychain.CredentialRecord?
+    private var credentialLoadFailed = false
+
+    private var legacySnapshotPersistenceScope: String? {
+        guard let url = URL(string: serverURLString) else { return nil }
+        return credential?.legacyPersistenceScope(serverURL: url)
+    }
+
+    private var persistenceScope: String? {
+        guard let api, let credential else { return nil }
+        return ConversationSession.persistenceScope(for: api, credentialGeneration: credential.generation)
+    }
+
+    private func cachedConversation(conversationId: String) -> Conversation? {
+        ConversationSession.cachedConversation(
+            conversationId: conversationId,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
+    }
 
     var trustSelfSigned: Bool {
         didSet {
@@ -312,6 +369,21 @@ final class AppModel {
     private var apiGeneration = 0
     private var aggregateEventTask: Task<Void, Never>?
     private var aggregateEventTaskId: UUID?
+    private var aggregateRecoveryStartupTask: Task<Void, Never>?
+    private var aggregateRecoveryStartupGeneration = 0
+    private var aggregateRecoveryAllowedGeneration: Int?
+
+    #if DEBUG
+    var historyRemovalOverrideForTesting: ((VersionedDiskWriter) async -> Void)?
+    #endif
+
+    #if DEBUG
+    var beforePersistedOutboxDrainForTesting: (() -> Void)?
+    #endif
+
+    #if DEBUG
+    var cacheRemovalOverrideForTesting: (() async -> Bool)?
+    #endif
     private var aggregateReconciliationTask: Task<Bool, Never>?
     private(set) var aggregateReconciliationId: UUID?
     private var isForeground = true
@@ -338,8 +410,16 @@ final class AppModel {
     }
 
     init() {
-        serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
-        password = Keychain.password(account: Self.passwordAccount) ?? ""
+        let persistedServerURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
+        serverURLString = persistedServerURL
+        do {
+            let loaded = try Keychain.loadCredential(persistedServerURL: persistedServerURL)
+            credential = loaded
+            password = loaded.password
+        } catch {
+            password = ""
+            credentialLoadFailed = true
+        }
         trustSelfSigned = UserDefaults.standard.object(forKey: Self.trustSelfSignedKey) as? Bool ?? true
         attention = AttentionMonitor(
             currentConversations: listStore.conversations,
@@ -354,11 +434,15 @@ final class AppModel {
 
     private func rebuildAPI() {
         apiGeneration += 1
+        aggregateRecoveryAllowedGeneration = nil
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
         cancelAggregateReconciliation()
-        guard let url = URL(string: serverURLString), url.host != nil else {
+        aggregateRecoveryStartupTask?.cancel()
+        aggregateRecoveryStartupTask = nil
+        guard !credentialLoadFailed, credential != nil,
+              let url = URL(string: serverURLString), url.host != nil else {
             api = nil
             return
         }
@@ -368,11 +452,24 @@ final class AppModel {
             allowSelfSigned: trustSelfSigned)
         api = rebuiltAPI
         guard let rebuiltAPI else { return }
-        for session in sessions.values { session.replaceAPI(rebuiltAPI) }
-        for session in drainSessions.values { session.replaceAPI(rebuiltAPI) }
-        if isForeground {
-            startAggregateEventStream(api: rebuiltAPI, generation: apiGeneration)
-            startAggregateReconciliation()
+        for session in sessions.values { session.replaceAPI(rebuiltAPI, credentialGeneration: credential?.generation) }
+        for session in drainSessions.values { session.replaceAPI(rebuiltAPI, credentialGeneration: credential?.generation) }
+        startAggregateRecoveryIfForeground()
+    }
+
+    private func startAggregateRecoveryIfForeground() {
+        guard aggregateRecoveryStartupTask == nil, isForeground, let api else { return }
+        let generation = apiGeneration
+        aggregateRecoveryStartupTask = Task { [weak self] in
+            defer { self?.aggregateRecoveryStartupTask = nil }
+            guard let self,
+                  await self.recoverProductHistoryDeletionFences(
+                    persistenceScope: self.persistenceScope, generation: generation),
+                  self.apiGeneration == generation
+            else { return }
+            self.startAggregateEventStream(api: api, generation: generation)
+            self.aggregateRecoveryStartupGeneration &+= 1
+            self.startAggregateReconciliation()
         }
     }
 
@@ -382,7 +479,11 @@ final class AppModel {
     }
 
     func configure(serverURL: String, password: String, trustSelfSigned: Bool) throws {
-        try Keychain.setPassword(password, account: Self.passwordAccount)
+        let replacement = Keychain.CredentialRecord(password: password)
+        try Keychain.saveCredential(replacement)
+        Keychain.deletePassword(account: Keychain.legacyPasswordAccount)
+        credential = replacement
+        credentialLoadFailed = false
         self.password = password
         self.trustSelfSigned = trustSelfSigned
         serverURLString = serverURL
@@ -391,7 +492,7 @@ final class AppModel {
     func session(for conversationId: String) -> ConversationSession? {
         guard let api else { return nil }
         let aggregateId = aggregateIdentity(forTranscriptRowId: conversationId)
-            ?? ConversationSession.cachedConversation(conversationId: conversationId)?
+            ?? cachedConversation(conversationId: conversationId)?
                 .product_conversation_id
         guard !deletedProductHistoryIds.contains(conversationId),
               aggregateId.map({ !deletedProductHistoryIds.contains($0) }) ?? true
@@ -412,6 +513,8 @@ final class AppModel {
         } else {
             session = ConversationSession(
                 conversationId: conversationId, api: api, connectivity: connectivity,
+                credentialGeneration: credential?.generation,
+                legacyPersistenceScope: legacySnapshotPersistenceScope,
                 onConversationUpdate: onConversationUpdate,
                 onHardDeleted: onHardDeleted)
         }
@@ -496,11 +599,7 @@ final class AppModel {
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
-        guard let api else { return }
-        startAggregateEventStream(
-            api: api,
-            generation: apiGeneration,
-            reconcileOnOpen: true)
+        startAggregateRecoveryIfForeground()
     }
 
     private func startAggregateEventStream(
@@ -508,7 +607,9 @@ final class AppModel {
         generation: Int,
         reconcileOnOpen: Bool = false
     ) {
-        guard aggregateEventTask == nil else { return }
+        guard aggregateRecoveryAllowedGeneration == generation,
+              aggregateEventTask == nil
+        else { return }
         let taskId = UUID()
         aggregateEventTaskId = taskId
         aggregateEventTask = Task { [weak self] in
@@ -575,6 +676,28 @@ final class AppModel {
         }
     }
 
+    private func recoverProductHistoryDeletionFences(
+        persistenceScope: String?, generation: Int
+    ) async -> Bool {
+        guard let persistenceScope,
+              case let .fences(fences) = ProductHistoryDeletionFenceStore.discover()
+        else {
+            if apiGeneration == generation { aggregateRecoveryAllowedGeneration = nil }
+            return false
+        }
+        for fence in fences where fence.persistenceScope == persistenceScope {
+            guard await removeProductHistoryLocally(
+                productConversationId: fence.productConversationId,
+                transcriptIds: fence.transcriptIds,
+                startedGeneration: generation,
+                expectedFence: fence)
+            else { return false }
+        }
+        guard apiGeneration == generation else { return false }
+        aggregateRecoveryAllowedGeneration = generation
+        return true
+    }
+
     private func handleAggregateHardDeleted(
         _ deletion: ProductConversationDeletionEvent,
         generation: Int
@@ -612,7 +735,7 @@ final class AppModel {
     ) -> Bool {
         aggregateIdentity(forTranscriptRowId: transcriptId) == productConversationId
             || session.conversation?.product_conversation_id == productConversationId
-            || ConversationSession.cachedConversation(conversationId: transcriptId)?
+            || cachedConversation(conversationId: transcriptId)?
                 .product_conversation_id == productConversationId
     }
 
@@ -790,7 +913,9 @@ final class AppModel {
         guard let aggregateId else { return latestTranscriptRowId }
         return listStore.cachedNavigationTranscriptRowId(
             forAggregateId: aggregateId,
-            latestTranscriptRowId: latestTranscriptRowId)
+            latestTranscriptRowId: latestTranscriptRowId,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
     }
 
     func cachedProductHistory(productConversationId: String) -> CachedProductHistory? {
@@ -966,7 +1091,7 @@ final class AppModel {
         let coordinator = await Self.coordinatorAttentionEvidence(
             rememberedId: coordinatorConversationId,
             fetch: { _ in try await api.getCoordinatorProjection() },
-            cached: { ConversationSession.cachedConversation(conversationId: $0) })
+            cached: { cachedConversation(conversationId: $0) })
         guard isCurrent() else { return false }
         if let coordinator {
             await attention.refreshAdditionalEvidenceAndNotifyIfNeeded(
@@ -1012,7 +1137,7 @@ final class AppModel {
     private func rememberedCoordinatorAggregateIds() -> Set<String> {
         guard let coordinatorConversationId else { return [] }
         let aggregateId = listStore.aggregateId(forTranscriptRowId: coordinatorConversationId)
-            ?? ConversationSession.cachedConversation(conversationId: coordinatorConversationId)?
+            ?? cachedConversation(conversationId: coordinatorConversationId)?
                 .aggregateIdentity
             ?? coordinatorConversationId
         return [aggregateId]
@@ -1028,7 +1153,10 @@ final class AppModel {
 
     var coordinatorAvailableOffline: Bool {
         guard let id = coordinatorConversationId else { return false }
-        return ConversationSession.hasCachedSnapshot(conversationId: id)
+        return ConversationSession.hasCachedSnapshot(
+            conversationId: id,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
     }
 
 
@@ -1054,7 +1182,11 @@ final class AppModel {
                 if let apiError = error as? APIError,
                    apiError.isTransport,
                    let cached = coordinatorConversationId,
-                   ConversationSession.hasCachedSnapshot(conversationId: cached) {
+                   ConversationSession.hasCachedSnapshot(
+                    conversationId: cached,
+                    persistenceScope: persistenceScope,
+                    legacyPersistenceScope: legacySnapshotPersistenceScope)
+                {
                     return cached
                 }
                 lastActionError = (error as? APIError)?.errorDescription
@@ -1063,7 +1195,11 @@ final class AppModel {
             }
         }
         if let cached = coordinatorConversationId,
-           ConversationSession.hasCachedSnapshot(conversationId: cached) {
+           ConversationSession.hasCachedSnapshot(
+            conversationId: cached,
+            persistenceScope: persistenceScope,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
+        {
             return cached
         }
         lastActionError = "Opening the Coordinator offline needs a cached conversation."
@@ -1449,13 +1585,18 @@ final class AppModel {
         return try await fetch(conversation.transcriptRowIdentity).canonical_root.transcript_row_id
     }
 
+    private func verifiedRemoval(writer: VersionedDiskWriter) -> Bool {
+        writer.isMissing()
+    }
+
     private func removeProductHistoryLocally(
         productConversationId: String,
         transcriptIds: Set<String>,
         startedGeneration: Int,
-        tombstonesInstalled: (() -> Void)? = nil
+        tombstonesInstalled: (() -> Void)? = nil,
+        expectedFence: PersistedProductHistoryDeletionFence? = nil
     ) async -> Bool {
-        guard apiGeneration == startedGeneration else { return false }
+        guard apiGeneration == startedGeneration, let persistenceScope else { return false }
 
         let retainedTranscriptIds = Set(sessions.compactMap { transcriptId, session in
             sessionBelongsToAggregate(
@@ -1469,18 +1610,47 @@ final class AppModel {
                 productConversationId: productConversationId) ? transcriptId : nil
         })
         let allTranscriptIds = transcriptIds.union(retainedTranscriptIds)
+        let fence = PersistedProductHistoryDeletionFence(
+            persistenceScope: persistenceScope,
+            productConversationId: productConversationId,
+            transcriptIds: allTranscriptIds)
+        let fenceWriter = ProductHistoryDeletionFenceStore.writer(productConversationId: productConversationId)
+        let currentFence = DiskStore.loadVersioned(
+            PersistedProductHistoryDeletionFence.self,
+            name: ProductHistoryDeletionFenceStore.name(productConversationId: productConversationId),
+            version: ProductHistoryDeletionFenceStore.schemaVersion)
+        guard expectedFence == nil || expectedFence == currentFence else { return false }
+        let mergedFence = PersistedProductHistoryDeletionFence(
+            persistenceScope: persistenceScope,
+            productConversationId: productConversationId,
+            transcriptIds: (currentFence?.transcriptIds ?? []).union(fence.transcriptIds))
+        let fenceRevision = fenceWriter.reserveRevision()
+        guard await fenceWriter.replace(
+            expected: currentFence, replacement: mergedFence, revision: fenceRevision) == .replaced
+        else { return false }
+        let fencedTranscriptIds = mergedFence.transcriptIds
         deletedProductHistoryIds.insert(productConversationId)
-        deletedProductHistoryIds.formUnion(allTranscriptIds)
+        deletedProductHistoryIds.formUnion(fencedTranscriptIds)
         tombstonesInstalled?()
 
         _ = productHistoryGenerations.begin(productConversationId: productConversationId)
         let historyWriter = ProductHistorySnapshotStore.writer(
             productConversationId: productConversationId)
         let revision = historyWriter.reserveRevision()
+        #if DEBUG
+        if let historyRemovalOverrideForTesting {
+            await historyRemovalOverrideForTesting(historyWriter)
+        } else {
+            await historyWriter.remove(revision: revision)
+        }
+        #else
         await historyWriter.remove(revision: revision)
-        guard apiGeneration == startedGeneration else { return false }
+        #endif
+        guard verifiedRemoval(writer: historyWriter),
+              apiGeneration == startedGeneration
+        else { return false }
 
-        for transcriptId in allTranscriptIds {
+        for transcriptId in fencedTranscriptIds {
             guard apiGeneration == startedGeneration else { return false }
             let openOwner = sessions.removeValue(forKey: transcriptId)
             let drainOwner = drainSessions.removeValue(forKey: transcriptId)
@@ -1494,12 +1664,21 @@ final class AppModel {
                 await session.outbox.clearAndWait()
                 guard apiGeneration == startedGeneration else { return false }
             }
-            DiskStore.remove(name: "conv-\(transcriptId)")
-            DiskStore.remove(name: "outbox-\(transcriptId)")
+            let snapshotName = "conv-\(transcriptId)"
+            let snapshotWriter = DiskStore.versionedWriter(name: snapshotName, version: 2)
+            await snapshotWriter.remove(revision: snapshotWriter.reserveRevision())
+            guard verifiedRemoval(writer: snapshotWriter) else { return false }
+            let outboxName = "outbox-\(transcriptId)"
+            let outboxWriter = DiskStore.versionedWriter(name: outboxName, version: 1)
+            await outboxWriter.remove(revision: outboxWriter.reserveRevision())
+            DiskStore.remove(name: outboxName)
+            guard verifiedRemoval(writer: outboxWriter),
+                  !DiskStore.listNames(prefix: outboxName).contains(outboxName)
+            else { return false }
         }
 
         guard apiGeneration == startedGeneration else { return false }
-        listStore.remove(aggregateId: productConversationId)
+        guard listStore.removeAndPersist(aggregateId: productConversationId) else { return false }
         if pendingProductCloseConfirmation?.productConversationId == productConversationId {
             pendingProductCloseConfirmation = nil
             pendingProductCloseResolution.reset()
@@ -1511,22 +1690,44 @@ final class AppModel {
             productConversationId: "pending-close-confirmation")
         closeConfirmationReconciliationProductConversationIds.remove(productConversationId)
         if pendingOpenConversationId == productConversationId
-            || allTranscriptIds.contains(pendingOpenConversationId ?? "")
+            || fencedTranscriptIds.contains(pendingOpenConversationId ?? "")
         {
             pendingOpenConversationId = nil
         }
         removeAttentionNotifications(productConversationId: productConversationId)
+        let retirementRevision = fenceWriter.reserveRevision()
+        guard await fenceWriter.replace(
+            expected: mergedFence, replacement: nil, revision: retirementRevision) == .replaced
+        else { return false }
         return true
     }
 
     #if DEBUG
-    func installAPIForTesting(baseURL: URL = URL(string: "http://127.0.0.1:1")!) {
+    func installAPIForTesting(
+        baseURL: URL = URL(string: "http://127.0.0.1:1")!,
+        credentialGeneration: UUID = ConversationSession.defaultTestingCredentialGeneration
+    ) {
         apiGeneration &+= 1
+        aggregateRecoveryAllowedGeneration = nil
+        aggregateRecoveryStartupTask?.cancel()
+        aggregateRecoveryStartupTask = nil
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
         cancelAggregateReconciliation()
+        let testCredential = Keychain.CredentialRecord(password: "", generation: credentialGeneration)
+        credential = testCredential
+        credentialLoadFailed = false
         api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)
+    }
+
+    func installAPIAndAwaitRecoveryForTesting(
+        baseURL: URL = URL(string: "http://127.0.0.1:1")!,
+        credentialGeneration: UUID = ConversationSession.defaultTestingCredentialGeneration
+    ) async {
+        installAPIForTesting(baseURL: baseURL, credentialGeneration: credentialGeneration)
+        startAggregateRecoveryIfForeground()
+        await aggregateRecoveryStartupTask?.value
     }
 
     var apiGenerationForTesting: Int { apiGeneration }
@@ -1573,9 +1774,18 @@ final class AppModel {
         aggregateEventTask != nil
     }
 
-    func startAggregateEventStreamForTesting() {
-        guard let api else { return }
-        startAggregateEventStream(api: api, generation: apiGeneration)
+    func awaitAggregateRecoveryStartupForTesting() async -> Int {
+        await aggregateRecoveryStartupTask?.value
+        return aggregateRecoveryStartupGeneration
+    }
+
+    var aggregateRecoveryStartupGenerationForTesting: Int {
+        aggregateRecoveryStartupGeneration
+    }
+
+    func startAggregateEventStreamForTesting() async {
+        startAggregateRecoveryIfForeground()
+        await aggregateRecoveryStartupTask?.value
     }
 
     func fenceProductCloseForTesting(
@@ -1612,7 +1822,9 @@ final class AppModel {
         let session = ConversationSession(
             conversationId: conversationId,
             api: api,
-            connectivity: connectivity)
+            connectivity: connectivity,
+            credentialGeneration: credential?.generation,
+            legacyPersistenceScope: legacySnapshotPersistenceScope)
         drainSessions[conversationId] = session
         return session
     }
@@ -1653,6 +1865,41 @@ final class AppModel {
             transcriptIds: transcriptIds,
             startedGeneration: apiGeneration,
             tombstonesInstalled: tombstonesInstalled)
+    }
+
+    func recoverProductHistoryDeletionFencesForTesting() async -> Bool {
+        await recoverProductHistoryDeletionFences(
+            persistenceScope: persistenceScope, generation: apiGeneration)
+    }
+
+    func persistedProductHistoryDeletionFenceForTesting(
+        productConversationId: String
+    ) -> PersistedProductHistoryDeletionFence? {
+        DiskStore.loadVersioned(
+            PersistedProductHistoryDeletionFence.self,
+            name: ProductHistoryDeletionFenceStore.name(productConversationId: productConversationId),
+            version: ProductHistoryDeletionFenceStore.schemaVersion)
+    }
+
+    func clearCacheAndAwaitRecoveryForTesting() async {
+        await clearCache()
+        await aggregateRecoveryStartupTask?.value
+    }
+
+    func foregroundAfterRecoveryForTesting() async -> Bool {
+        let recovered = await recoverProductHistoryDeletionFences(
+            persistenceScope: persistenceScope, generation: apiGeneration)
+        foregrounded()
+        drainPersistedOutboxes()
+        return recovered
+    }
+
+    func drainSessionForTesting(conversationId: String) -> ConversationSession? {
+        drainSessions[conversationId]
+    }
+
+    func drainPersistedOutboxesForTesting() {
+        drainPersistedOutboxes()
     }
 
     func handleAggregateHardDeletedForTesting(
@@ -1744,12 +1991,7 @@ final class AppModel {
 
     func foregrounded() {
         isForeground = true
-        if let api {
-            startAggregateEventStream(
-                api: api,
-                generation: apiGeneration,
-                reconcileOnOpen: true)
-        }
+        startAggregateRecoveryIfForeground()
     }
 
     private func locallyOwnedOrdinaryAggregates() -> [String: Set<String>] {
@@ -1786,7 +2028,7 @@ final class AppModel {
                 String($0.dropFirst("conv-".count))
             })
         for transcriptId in ownedTranscriptIds {
-            let cached = ConversationSession.cachedConversation(conversationId: transcriptId)
+            let cached = cachedConversation(conversationId: transcriptId)
             guard transcriptId != rememberedCoordinatorTranscriptId,
                   cached?.isCoordinator != true
             else { continue }
@@ -1810,7 +2052,9 @@ final class AppModel {
 
     @discardableResult
     private func startAggregateReconciliation() -> Task<Bool, Never>? {
-        guard isForeground, connectivity.isOnline, api != nil else { return nil }
+        guard aggregateRecoveryAllowedGeneration == apiGeneration,
+              isForeground, connectivity.isOnline, api != nil
+        else { return nil }
         aggregateReconciliationTask?.cancel()
         for session in sessions.values { session.suspendDeliveryForReconciliation() }
         for session in drainSessions.values { session.suspendDeliveryForReconciliation() }
@@ -1989,23 +2233,45 @@ final class AppModel {
     /// half of the offline queue. Sessions created here don't start an SSE
     /// stream; they exist to drain (their outbox reconciles on next open).
     private func drainPersistedOutboxes() {
-        guard let api else { return }
-        for name in DiskStore.names(withPrefix: "outbox-") {
+        guard aggregateRecoveryAllowedGeneration == apiGeneration,
+              let api
+        else { return }
+        guard case let .names(names) = DiskStore.discoverNames(withPrefix: "outbox-") else { return }
+        for name in names {
             let conversationId = String(name.dropFirst("outbox-".count))
             guard !conversationId.isEmpty, sessions[conversationId] == nil else {
                 // Open sessions already drain via their own triggers.
                 continue
             }
-            guard let entries = DiskStore.loadVersioned(
-                [OutboxEntry].self, name: name, version: Outbox.schemaVersion),
-                  entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
+            let currentScope = ConversationSession.persistenceScope(
+                for: api, credentialGeneration: credential?.generation)
+            let entries: [OutboxEntry]
+            if let stored = DiskStore.loadVersioned(
+                Outbox.ScopedEntries.self, name: name, version: Outbox.schemaVersion),
+               stored.persistenceScope == currentScope
+            {
+                entries = stored.entries
+            } else if let legacyEntries = DiskStore.loadVersioned(
+                [OutboxEntry].self, name: name, version: 2),
+                ConversationSession.hasAuthoritativeSnapshot(
+                    conversationId: conversationId, persistenceScope: currentScope),
+                Outbox.migrateV2(
+                    conversationId: conversationId,
+                    persistenceScope: currentScope,
+                    entries: legacyEntries)
+            {
+                entries = legacyEntries
+            } else { continue }
+            guard entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
             else { continue }
             let drainSession: ConversationSession
             if let existing = drainSessions[conversationId] {
                 drainSession = existing
             } else {
                 drainSession = ConversationSession(
-                    conversationId: conversationId, api: api, connectivity: connectivity)
+                    conversationId: conversationId, api: api, connectivity: connectivity,
+                    credentialGeneration: credential?.generation,
+                    legacyPersistenceScope: legacySnapshotPersistenceScope)
                 drainSessions[conversationId] = drainSession
                 for aggregateId in closeAdmissionFencedProductConversationIds where sessionBelongsToAggregate(
                     drainSession,
@@ -2015,6 +2281,14 @@ final class AppModel {
                     drainSession.setCloseAdmissionFenced(true)
                 }
             }
+            #if DEBUG
+            beforePersistedOutboxDrainForTesting?()
+            #endif
+            guard case let .fences(fences) = ProductHistoryDeletionFenceStore.discover(),
+                  !fences.contains(where: {
+                      $0.persistenceScope == currentScope && $0.transcriptIds.contains(conversationId)
+                  })
+            else { return }
             drainSession.drainOutbox()
         }
     }
@@ -2042,7 +2316,7 @@ final class AppModel {
         nudgeAuthorizationHint = nil
         UserDefaults.standard.removeObject(forKey: Self.nudgesEnabledKey)
         BackgroundRefresh.cancelPending()
-        await clearCache()
+        guard await clearCache() else { return }
         pendingOpenConversationId = nil
         let notificationCenter = UNUserNotificationCenter.current()
         notificationCenter.removeAllDeliveredNotifications()
@@ -2052,16 +2326,31 @@ final class AppModel {
         coordinatorConversationId = nil
         CertPinStore.forget()
         password = ""
-        Keychain.deletePassword(account: Self.passwordAccount)
+        Keychain.deleteCredential()
+        credential = nil
+        credentialLoadFailed = false
         serverURLString = ""
     }
 
-    func clearCache() async {
+    func clearCache() async -> Bool {
         apiGeneration += 1
+        aggregateRecoveryAllowedGeneration = nil
+        aggregateRecoveryStartupTask?.cancel()
+        aggregateRecoveryStartupTask = nil
         cancelAggregateReconciliation()
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
+        #if DEBUG
+        let removed = if let cacheRemovalOverrideForTesting {
+            await cacheRemovalOverrideForTesting()
+        } else {
+            await DiskStore.removeAllAndWait()
+        }
+        #else
+        let removed = await DiskStore.removeAllAndWait()
+        #endif
+        guard removed else { return false }
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
         for session in ownedSessions { session.stop() }
         for session in ownedSessions { await session.clearCachedSnapshotAndWait() }
@@ -2077,12 +2366,13 @@ final class AppModel {
         closeAdmissionFencedProductConversationIds.removeAll()
         closeAdmissionFencedTranscriptIds.removeAll()
         closeConfirmationReconciliationProductConversationIds.removeAll()
-        await DiskStore.removeAllAndWait()
         listStore.reset()
         deletedProductHistoryIds.removeAll()
         attention.reset()
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
         coordinatorConversationId = nil
+        startAggregateRecoveryIfForeground()
+        return true
     }
 
     #if DEBUG
@@ -2090,7 +2380,7 @@ final class AppModel {
         if let bundleIdentifier = Bundle.main.bundleIdentifier {
             UserDefaults.standard.removePersistentDomain(forName: bundleIdentifier)
         }
-        Keychain.deletePassword(account: Self.passwordAccount)
+        Keychain.deleteCredential()
         DiskStore.removeAll()
         let center = UNUserNotificationCenter.current()
         center.removeAllDeliveredNotifications()
