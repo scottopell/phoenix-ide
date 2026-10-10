@@ -486,7 +486,7 @@ fn anthropic_http_error(status: u16, headers: &HeaderMap, body: &str) -> LlmErro
         })
         .is_some_and(|error_type| error_type == "overloaded_error");
 
-    if overloaded {
+    if status == 529 || overloaded {
         LlmError::server_overloaded_with_retry_after(
             "Anthropic is overloaded for this model. Try a different model or retry later.",
             retry_after_from_headers(headers),
@@ -2638,17 +2638,37 @@ mod tests {
     }
 
     #[test]
-    fn http_overload_preserves_retry_guidance_without_conflating_rate_limits() {
+    fn http_529_is_overload_regardless_of_body_and_preserves_retry_guidance() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", "7".parse().unwrap());
-        let overload = anthropic_http_error(
-            529,
+        for body in [
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "",
+            "{malformed",
+            "<html><body>upstream overloaded</body></html>",
+        ] {
+            let overload = anthropic_http_error(529, &headers, body);
+            assert_eq!(overload.kind, crate::LlmErrorKind::ServerOverloaded);
+            assert_eq!(
+                overload.retry_after(),
+                Some(crate::RetryAfter::WithinLimit(Duration::from_secs(7)))
+            );
+        }
+    }
+
+    #[test]
+    fn http_overload_body_does_not_conflate_quota_or_ordinary_server_errors() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+
+        let typed_overload = anthropic_http_error(
+            503,
             &headers,
             r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
         );
-        assert_eq!(overload.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(typed_overload.kind, crate::LlmErrorKind::ServerOverloaded);
         assert_eq!(
-            overload.retry_after(),
+            typed_overload.retry_after(),
             Some(crate::RetryAfter::WithinLimit(Duration::from_secs(7)))
         );
 
@@ -2659,6 +2679,12 @@ mod tests {
         );
         assert_eq!(quota.kind, crate::LlmErrorKind::RateLimit);
         assert_eq!(quota.retry_after(), None);
+
+        for status in [500, 502, 503] {
+            let ordinary = anthropic_http_error(status, &headers, "<html>proxy failure</html>");
+            assert_eq!(ordinary.kind, crate::LlmErrorKind::ServerError);
+            assert_eq!(ordinary.retry_after(), None);
+        }
     }
 
     #[tokio::test]
