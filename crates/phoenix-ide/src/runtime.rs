@@ -3781,6 +3781,7 @@ impl RuntimeManager {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn settle_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
         let conversation_ids = self.startup_llm_recovery_conversation_ids().await?;
         for conversation_id in conversation_ids {
@@ -3826,17 +3827,7 @@ impl RuntimeManager {
             let stored_model_id = conversation
                 .model
                 .unwrap_or_else(|| self.llm_registry.default_model_id());
-            let persisted_overload_model = match &conversation.state {
-                ConvState::ServerOverloadRetrying { retry } => Some(retry.model_id.as_str()),
-                ConvState::AwaitingRecovery {
-                    resume:
-                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
-                            retry,
-                        },
-                    ..
-                } => Some(retry.model_id.as_str()),
-                _ => None,
-            };
+            let persisted_overload_model = persisted_overload_model(&conversation.state);
             let model_to_initialize = persisted_overload_model.unwrap_or(&stored_model_id);
             let model_resolution = self.llm_registry.resolve_model_id(model_to_initialize);
             let initialization_error = match (&model_resolution, persisted_overload_model) {
@@ -5702,17 +5693,9 @@ impl RuntimeManager {
         // An overload incident owns its already-resolved model identity. Do not
         // run that identity through catalog replacement after restart: doing so
         // would silently move the admitted request to another selected model.
-        let persisted_overload_model = match &conv.state {
-            ConvState::ServerOverloadRetrying { retry } => Some(retry.model_id.clone()),
-            ConvState::AwaitingRecovery {
-                resume:
-                    phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { retry },
-                ..
-            } => Some(retry.model_id.clone()),
-            _ => None,
-        };
+        let persisted_overload_model = persisted_overload_model(&conv.state);
         let model_id = if let Some(model_id) = persisted_overload_model {
-            model_id
+            model_id.to_string()
         } else {
             let stored_model_id = conv
                 .model
@@ -7306,6 +7289,18 @@ async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> Stri
         }
     }
     current_id
+}
+
+fn persisted_overload_model(state: &ConvState) -> Option<&str> {
+    match state {
+        ConvState::ServerOverloadRetrying { retry }
+        | ConvState::AwaitingRecovery {
+            resume:
+                phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { retry },
+            ..
+        } => Some(retry.model_id.as_str()),
+        _ => None,
+    }
 }
 
 /// Convert a database `ConvMode` into a `ModeContext` for the system prompt.
