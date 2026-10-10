@@ -12776,8 +12776,9 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(
-            ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
+            ledger.iter().rev().take(9).copied().collect::<Vec<_>>(),
             vec![
+                (120, "coordinator_question_wait_events"),
                 (119, "close_cleanup_failures"),
                 (118, "persist_mcp_token_removals"),
                 (117, "persist_conversation_tool_policy"),
