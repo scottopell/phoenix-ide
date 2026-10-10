@@ -211,6 +211,11 @@ for fragment in [
         raise SystemExit(f'missing stable/RC publication contract: {fragment}')
 if 'gh release create' in publish_script:
     raise SystemExit('release creation must use explicit channel and latest metadata')
+if 'notes_args=()' in publish_script or '"${publication_args[@]}"' not in publish_script:
+    raise SystemExit('publication arguments must be nonempty under macOS Bash 3.2 nounset')
+publisher_tests = Path('scripts/test-publish-release-assets.sh').read_text()
+if 'PUBLISH_BASH=${PUBLISH_BASH:-/bin/bash}' not in publisher_tests or '"$PUBLISH_BASH" "$root/scripts/publish-release-assets.sh"' not in publisher_tests:
+    raise SystemExit('publisher regressions must default to the actual macOS system Bash')
 
 verify_script = Path('scripts/verify-published-release.sh').read_text()
 for fragment in [
@@ -258,6 +263,52 @@ for fragment in [
 ]:
     if fragment not in workflow:
         raise SystemExit('failure upload must contain only a sanitized receipt, not private runtime data')
+
+receipt_names = {}
+for outcome, step_name in [('success', 'Retain successful headless acceptance receipt'),
+                           ('failure', 'Retain failed headless acceptance receipt')]:
+    section = build_macos_job.split(f'      - name: {step_name}\n', 1)[1].split('      - ', 1)[0]
+    name = re.search(r'^          name: (.+)$', section, re.MULTILINE).group(1)
+    if '${{ github.run_id }}' not in name or '${{ github.run_attempt }}' not in name:
+        raise SystemExit('receipt names must preserve evidence across runs and rerun attempts')
+    if not name.endswith('-' + outcome):
+        raise SystemExit('success and failure receipt uploads must not collide within one attempt')
+    receipt_names[outcome] = name
+seen_names = set()
+for target in ['aarch64-apple-darwin', 'x86_64-apple-darwin']:
+    for run in ['100', '101']:
+        for attempt in ['1', '2']:
+            for outcome, template in receipt_names.items():
+                name = template
+                for key, value in {'matrix.target': target, 'needs.gate.outputs.commit': 'a' * 40,
+                                   'github.run_id': run, 'github.run_attempt': attempt}.items():
+                    name = name.replace('${{ ' + key + ' }}', value)
+                if name in seen_names:
+                    raise SystemExit('receipt uploads must be distinct for every arch/run/attempt/outcome')
+                seen_names.add(name)
+
+allium = Path('specs/desktop-release/desktop-release.allium').read_text()
+for rule, variable in [('CompleteInaccessiblePublicationBecomesVerified', 'release'),
+                       ('VerifiedInaccessiblePublicationBecomesPublic', 'publication'),
+                       ('ExactPublicRetryIsIdempotent', 'publication')]:
+    section = allium.split('rule ' + rule + ' {', 1)[1].split('\n}', 1)[0]
+    if f'requires: required_native_pairs_passed({variable})' not in section:
+        raise SystemExit(f'{rule} must require both native acceptance passes')
+for fragment in [
+    'native_acceptance: NativeAcceptanceState',
+    'rule NativeAcceptanceRequiresUnchangedVerifiedPair {',
+    'requires: protected_signing_material_removed(pair)',
+    'requires: native_isolated_artifact_checks_pass(pair)',
+    'ensures: sanitized_native_receipt_retained(pair)',
+    'rule NativeAcceptanceFailureBlocksPair {',
+    'ensures: pair.native_acceptance = failed',
+    'invariant PassedNativeAcceptanceHasVerifiedUnchangedPair {',
+    'invariant VerifiedPreparationHasNativeAcceptance {',
+    'preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))',
+    'required_native_pairs_passed(ReleasePublication) and',
+]:
+    if fragment not in allium:
+        raise SystemExit(f'missing native acceptance model contract: {fragment}')
 
 if '        if:' in acceptance:
     raise SystemExit('native headless acceptance must gate preparation and release on default success')

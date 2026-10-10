@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+PUBLISH_BASH=${PUBLISH_BASH:-/bin/bash}
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 tmp=$(mktemp -d)
@@ -261,7 +262,7 @@ PY
 write_checksums
 
 publish() {
-  bash "$root/scripts/publish-release-assets.sh" \
+  "$PUBLISH_BASH" "$root/scripts/publish-release-assets.sh" \
     "$FAKE_REPO" "$FAKE_TAG" "$EXPECTED_COMMIT" "$FAKE_CHANNEL" "$asset" "$checksums"
 }
 

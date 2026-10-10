@@ -42,14 +42,14 @@ fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-notes_args=()
+publication_args=(-F draft=false -F prerelease="$expected_prerelease" -f make_latest="$make_latest")
 if [[ -n "${RELEASE_NOTES_FILE:-}" ]]; then
   [[ -f "$RELEASE_NOTES_FILE" && -s "$RELEASE_NOTES_FILE" ]] || {
     echo "error: requested release notes must be a nonempty file" >&2
     exit 2
   }
   cp "$RELEASE_NOTES_FILE" "$work/release-notes.md"
-  notes_args=(-F "body=@$work/release-notes.md")
+  publication_args+=(-F "body=@$work/release-notes.md")
 fi
 expected_digests="$work/expected-digests.tsv"
 release_inventory="$work/releases.json"
@@ -324,10 +324,7 @@ verify_complete_private_release "$metadata_file"
 assert_private_release "$metadata_file"
 assert_stable_is_newest_before_publication
 gh api --method PATCH "repos/$repo/releases/$release_id" \
-  -F draft=false \
-  -F prerelease="$expected_prerelease" \
-  -f make_latest="$make_latest" \
-  "${notes_args[@]}" >/dev/null
+  "${publication_args[@]}" >/dev/null
 verify_release_assets false
 verify_tag
 verify_latest_relationship

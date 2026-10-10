@@ -411,7 +411,7 @@ jobs:
       - name: Retain successful headless acceptance receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}
+          name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-success
           path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json
           if-no-files-found: error
           retention-days: 14
@@ -419,7 +419,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}
+          name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-failure
           path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json
           if-no-files-found: ignore
           retention-days: 14
