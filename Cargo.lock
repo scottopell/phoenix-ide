@@ -3193,6 +3193,7 @@ dependencies = [
  "proptest",
  "pulldown-cmark",
  "rand 0.10.1",
+ "rcgen",
  "reqwest 0.13.4",
  "rust-embed",
  "rustls",

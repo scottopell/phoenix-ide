@@ -296,19 +296,15 @@ fn validate_peer_ca_certificate(der: &[u8]) -> Result<(), PeerCaCertificatePemEr
         .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_BASIC_CONSTRAINTS)
         .map_err(|_| PeerCaCertificatePemError::Invalid)?
         .ok_or(PeerCaCertificatePemError::NotCertificateAuthority)?;
-    let (basic_constraints_remainder, basic_constraints) =
-        x509_parser::extensions::BasicConstraints::from_der(basic_constraints.value)
-            .map_err(|_| PeerCaCertificatePemError::Invalid)?;
-    if !remainder.is_empty() || !basic_constraints_remainder.is_empty() {
+    if !remainder.is_empty() {
         return Err(PeerCaCertificatePemError::Invalid);
     }
-    if !basic_constraints.ca {
-        return Err(PeerCaCertificatePemError::NotCertificateAuthority);
-    }
+    validate_basic_constraints_der(basic_constraints.value)?;
     if let Some(key_usage) = certificate
         .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_KEY_USAGE)
         .map_err(|_| PeerCaCertificatePemError::Invalid)?
     {
+        validate_key_usage_der(key_usage.value)?;
         let (key_usage_remainder, key_usage) =
             x509_parser::extensions::KeyUsage::from_der(key_usage.value)
                 .map_err(|_| PeerCaCertificatePemError::Invalid)?;
@@ -320,6 +316,97 @@ fn validate_peer_ca_certificate(der: &[u8]) -> Result<(), PeerCaCertificatePemEr
         }
     }
     Ok(())
+}
+
+fn validate_basic_constraints_der(value: &[u8]) -> Result<(), PeerCaCertificatePemError> {
+    let (sequence, remainder) = strict_der_value(value, 0x30)?;
+    if !remainder.is_empty() {
+        return Err(PeerCaCertificatePemError::Invalid);
+    }
+    if sequence.is_empty() {
+        return Err(PeerCaCertificatePemError::NotCertificateAuthority);
+    }
+    if !sequence.starts_with(&[0x01, 0x01, 0xff]) {
+        return Err(PeerCaCertificatePemError::Invalid);
+    }
+    validate_optional_path_length(&sequence[3..])
+}
+
+fn validate_optional_path_length(remainder: &[u8]) -> Result<(), PeerCaCertificatePemError> {
+    if remainder.is_empty() {
+        return Ok(());
+    }
+    let (path_length, remainder) = strict_der_value(remainder, 0x02)?;
+    if !remainder.is_empty()
+        || path_length.is_empty()
+        || path_length[0] & 0x80 != 0
+        || (path_length.len() > 1 && path_length[0] == 0 && path_length[1] & 0x80 == 0)
+    {
+        return Err(PeerCaCertificatePemError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_key_usage_der(value: &[u8]) -> Result<(), PeerCaCertificatePemError> {
+    let (bit_string, remainder) = strict_der_value(value, 0x03)?;
+    if !remainder.is_empty() || !(2..=3).contains(&bit_string.len()) {
+        return Err(PeerCaCertificatePemError::Invalid);
+    }
+    let unused_bits = bit_string[0];
+    let last = *bit_string
+        .last()
+        .ok_or(PeerCaCertificatePemError::Invalid)?;
+    if unused_bits > 7
+        || last == 0
+        || unused_bits != u8::try_from(last.trailing_zeros()).unwrap_or(u8::MAX)
+    {
+        return Err(PeerCaCertificatePemError::Invalid);
+    }
+    Ok(())
+}
+
+fn strict_der_value(
+    input: &[u8],
+    expected_tag: u8,
+) -> Result<(&[u8], &[u8]), PeerCaCertificatePemError> {
+    let (&tag, after_tag) = input
+        .split_first()
+        .ok_or(PeerCaCertificatePemError::Invalid)?;
+    if tag != expected_tag {
+        return Err(PeerCaCertificatePemError::Invalid);
+    }
+    let (&first_length, after_first_length) = after_tag
+        .split_first()
+        .ok_or(PeerCaCertificatePemError::Invalid)?;
+    let (length, content) = if first_length & 0x80 == 0 {
+        (usize::from(first_length), after_first_length)
+    } else {
+        let length_octets = usize::from(first_length & 0x7f);
+        if length_octets == 0 || length_octets > std::mem::size_of::<usize>() {
+            return Err(PeerCaCertificatePemError::Invalid);
+        }
+        if after_first_length.len() < length_octets {
+            return Err(PeerCaCertificatePemError::Invalid);
+        }
+        let (encoded_length, content) = after_first_length.split_at(length_octets);
+        if encoded_length[0] == 0 {
+            return Err(PeerCaCertificatePemError::Invalid);
+        }
+        let length = encoded_length.iter().try_fold(0usize, |length, octet| {
+            length
+                .checked_mul(256)
+                .and_then(|length| length.checked_add(usize::from(*octet)))
+        });
+        let length = length.ok_or(PeerCaCertificatePemError::Invalid)?;
+        if length < 128 {
+            return Err(PeerCaCertificatePemError::Invalid);
+        }
+        (length, content)
+    };
+    if content.len() < length {
+        return Err(PeerCaCertificatePemError::Invalid);
+    }
+    Ok(content.split_at(length))
 }
 
 impl serde::Serialize for PeerCaCertificatePem {
@@ -519,6 +606,30 @@ mod tests {
                 .push(rcgen::CustomExtension::from_oid_content(
                     oid,
                     content.to_vec(),
+                ));
+            assert_eq!(
+                PeerCaCertificatePem::parse(params.self_signed(&key_pair).unwrap().pem())
+                    .unwrap_err(),
+                PeerCaCertificatePemError::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn peer_private_ca_rejects_non_der_basic_constraints() {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        for content in [
+            vec![0x30, 0x03, 0x21, 0x01, 0xff],
+            vec![0x30, 0x03, 0x01, 0x01, 0x01],
+        ] {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+                .expect("empty SAN list is valid for CA certificates");
+            params.is_ca = rcgen::IsCa::NoCa;
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[2, 5, 29, 19],
+                    content,
                 ));
             assert_eq!(
                 PeerCaCertificatePem::parse(params.self_signed(&key_pair).unwrap().pem())

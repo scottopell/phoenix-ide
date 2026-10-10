@@ -18049,6 +18049,72 @@ mod wake_handler_tests {
     }
 
     #[tokio::test]
+    async fn peer_import_rejects_non_der_basic_constraints_without_persisting() {
+        use base64::Engine as _;
+        use phoenix_core::domain::instance_identity::InstanceId;
+        use tower::ServiceExt as _;
+
+        let mut state = hard_delete_cascade_tests::make_test_state().await;
+        state.password = Some("owner-password".to_string());
+        let local = state.db.instance_id().await.unwrap();
+        for content in [
+            vec![0x30, 0x03, 0x21, 0x01, 0xff],
+            vec![0x30, 0x03, 0x01, 0x01, 0x01],
+        ] {
+            let peer = InstanceId::new();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+                .expect("empty SAN list is valid for CA certificates");
+            params.is_ca = rcgen::IsCa::NoCa;
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[2, 5, 29, 19],
+                    content,
+                ));
+            let key_pair = rcgen::KeyPair::generate().unwrap();
+            let certificate = params.self_signed(&key_pair).unwrap();
+            let certificate_pem = format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                base64::engine::general_purpose::STANDARD.encode(certificate.der())
+            );
+            let body = serde_json::json!({
+                "peer_display_name": "peer",
+                "base_url": "https://peer.example",
+                "enrollment": {
+                    "receiver_instance_id": peer,
+                    "caller_instance_id": local,
+                    "token": format!("phx_peer_{}", "a".repeat(43)),
+                    "tls_trust": {
+                        "kind": "private_ca",
+                        "certificate_pem": certificate_pem,
+                    },
+                }
+            });
+
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/federation/peers/import")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer owner-password")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(state
+                .db
+                .federation_peer_connection(peer)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn peer_query_database_requires_peer_auth_and_destination_identity() {
         use axum::body::to_bytes;
         use tower::ServiceExt as _;
