@@ -91,10 +91,61 @@ pub(crate) struct Paths {
 
 pub(crate) struct LoadedConfig {
     pub server: ServerConfig,
+    server_certs: Vec<CertificateDer<'static>>,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub ca_cert_path: Option<PathBuf>,
     pub mode: &'static str,
+}
+
+impl LoadedConfig {
+    pub(crate) fn federation_tls_trust(
+        &self,
+    ) -> Result<phoenix_core::domain::instance_identity::PeerTlsTrust, Box<dyn Error>> {
+        let Some(path) = self.ca_cert_path.as_ref() else {
+            return Ok(phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots);
+        };
+        let certificate_pem = phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+            fs::read_to_string(path)?,
+        )?;
+        verify_server_chain_uses_private_ca(
+            &self.server_certs,
+            &self.server,
+            path,
+            &certificate_pem,
+        )?;
+        Ok(phoenix_core::domain::instance_identity::PeerTlsTrust::PrivateCa { certificate_pem })
+    }
+}
+
+fn verify_server_chain_uses_private_ca(
+    server_certs: &[CertificateDer<'static>],
+    server: &ServerConfig,
+    ca_cert_path: &Path,
+    certificate_pem: &phoenix_core::domain::instance_identity::PeerCaCertificatePem,
+) -> Result<(), Box<dyn Error>> {
+    let Some((end_entity, intermediates)) = server_certs.split_first() else {
+        return Err("server certificate chain is empty".into());
+    };
+    let ca_certificate = CertificateDer::from_pem_slice(certificate_pem.expose().as_bytes())?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_certificate)?;
+    let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
+    let provider = server.crypto_provider();
+    rustls::client::verify_server_cert_signed_by_trust_anchor(
+        &parsed,
+        &roots,
+        intermediates,
+        rustls_pki_types::UnixTime::now(),
+        provider.signature_verification_algorithms.all,
+    )
+    .map_err(|error| {
+        format!(
+            "configured TLS server certificate chain does not terminate at {}: {error}",
+            ca_cert_path.display()
+        )
+        .into()
+    })
 }
 
 /// Whether a configured TLS host is a loopback name/address rather than an
@@ -180,9 +231,10 @@ pub(crate) fn load_config(source: &ConfigSource) -> Result<LoadedConfig, Box<dyn
 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+        .with_single_cert(certs.clone(), key)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(LoadedConfig {
+        server_certs: certs,
         server: config,
         cert_path: paths.cert_path,
         key_path: paths.key_path,
@@ -579,5 +631,61 @@ mod bounded_drain_tests {
 
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert!(join.await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod federation_trust_tests {
+    use super::*;
+
+    fn loaded_manual_config(
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        ca_cert_path: PathBuf,
+    ) -> LoadedConfig {
+        let certs = load_certs(&cert_path).unwrap();
+        let key = load_key(&key_path).unwrap();
+        LoadedConfig {
+            server: ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs.clone(), key)
+                .unwrap(),
+            server_certs: certs,
+            cert_path,
+            key_path,
+            ca_cert_path: Some(ca_cert_path),
+            mode: "manual",
+        }
+    }
+
+    #[test]
+    fn federation_tls_trust_requires_ca_to_issue_server_chain() {
+        let trusted = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let server_cert = trusted.path().join("server.pem");
+        let server_key = trusted.path().join("server-key.pem");
+        phoenix_tls::issue_leaf(
+            trusted.path(),
+            &server_cert,
+            &server_key,
+            &["localhost".to_string()],
+        )
+        .unwrap();
+
+        let matching = loaded_manual_config(
+            server_cert.clone(),
+            server_key.clone(),
+            phoenix_tls::ca_paths(trusted.path()).cert_path,
+        );
+        assert!(matches!(
+            matching.federation_tls_trust().unwrap(),
+            phoenix_core::domain::instance_identity::PeerTlsTrust::PrivateCa { .. }
+        ));
+
+        let unrelated_ca = phoenix_tls::ensure_ca(other.path()).unwrap().cert_path;
+        let mismatched = loaded_manual_config(server_cert.clone(), server_key, unrelated_ca);
+        std::fs::remove_file(server_cert).unwrap();
+        let error = mismatched.federation_tls_trust().unwrap_err().to_string();
+        assert!(error.contains("does not terminate"), "{error}");
     }
 }

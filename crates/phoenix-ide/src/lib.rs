@@ -847,15 +847,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         Some(source) => Some(tls::load_config(source)?),
         None => None,
     };
-    let federation_tls_trust = match loaded_tls
-        .as_ref()
-        .and_then(|tls| tls.ca_cert_path.as_ref())
-    {
-        Some(path) => phoenix_core::domain::instance_identity::PeerTlsTrust::PrivateCa {
-            certificate_pem: phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
-                std::fs::read_to_string(path)?,
-            )?,
-        },
+    let federation_tls_trust = match loaded_tls.as_ref() {
+        Some(tls) => tls.federation_tls_trust()?,
         None => phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
     };
 

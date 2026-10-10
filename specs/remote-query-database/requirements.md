@@ -76,6 +76,7 @@ IF the selected peer's TLS trust cannot be established
 THE SYSTEM SHALL fail the operation without an insecure transport fallback.
 
 THE owner-authorized enrollment transfer SHALL identify platform roots or carry exactly one bounded public private-CA certificate whose Basic Constraints identify it as a certificate authority and whose Key Usage permits certificate signing when that extension is present
+AND SHALL verify that a carried private CA terminates the configured server certificate chain before making that trust available for enrollment
 AND SHALL NOT carry a private key, infer trust on first use, or replace an enrolled trust anchor without an explicit owner-authorized import.
 
 THE owner SHALL supply the peer origin during import
