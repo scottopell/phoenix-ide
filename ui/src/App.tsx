@@ -127,7 +127,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     aggregateResolutionUnavailable: boolean;
   } | null>(null);
   const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
-  const [exactMember, setExactMember] = useState<{ reference: string; transcript: string; open: boolean } | null>(null);
+  const [exactMember, setExactMember] = useState<{ reference: string; transcript: string; lifecycleOpen: boolean; mutationEnabled: boolean } | null>(null);
   const [pinError, setPinError] = useState<string | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
@@ -169,12 +169,22 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             if (source.product_conversation_id !== snapshot.product_conversation_id || source.requested_transcript_row_id !== pinned) {
               throw new Error('Transcript is not a member of this conversation');
             }
-            if (!cancelled) setExactMember({ reference, transcript: pinned, open: pinned === snapshot.writable_transcript_row_id });
+            if (!cancelled) setExactMember({
+              reference,
+              transcript: pinned,
+              lifecycleOpen: snapshot.ordinary_lifecycle === 'open',
+              mutationEnabled: pinned === snapshot.writable_transcript_row_id,
+            });
             return;
           }
           if (!location.pathname.startsWith('/product-conversations/') &&
               snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
-            setExactMember({ reference, transcript: reference, open: reference === snapshot.writable_transcript_row_id });
+            setExactMember({
+              reference,
+              transcript: reference,
+              lifecycleOpen: snapshot.ordinary_lifecycle === 'open',
+              mutationEnabled: reference === snapshot.writable_transcript_row_id,
+            });
             return;
           }
           setResolvedProduct({ reference, id: snapshot.product_conversation_id });
@@ -207,7 +217,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
 
   if (exactMember && exactMember.reference === reference) {
     return <EmbeddedConversationPage slug={exactMember.transcript} suppressCanonicalization routePrefix="/c"
-      aggregateLifecycleOpen={exactMember.open} mutationEnabled={exactMember.open} />;
+      aggregateLifecycleOpen={exactMember.lifecycleOpen} mutationEnabled={exactMember.mutationEnabled} />;
   }
 
   if (resolvedProduct && resolvedProduct.reference === reference && !activeFallback) {

@@ -32,7 +32,14 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
   }, [productConversationId, productSnapshotRetry, search]);
   const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
   const hasPin = new URLSearchParams(search).has('source_transcript');
-  const activeSlug = hasPin ? (validatedPin?.owner === productConversationId && validatedPin.query === search ? validatedPin.id : null) : ownedProductSnapshot?.latest_transcript_row_id ?? routeSlug;
+  const directExactMember = routeSlug
+    && ownedProductSnapshot?.requested_transcript_row_id === routeSlug
+    && routeSlug !== ownedProductSnapshot.product_conversation_id
+    ? routeSlug
+    : null;
+  const activeSlug = hasPin
+    ? (validatedPin?.owner === productConversationId && validatedPin.query === search ? validatedPin.id : null)
+    : directExactMember ?? ownedProductSnapshot?.latest_transcript_row_id ?? routeSlug;
   useEffect(() => {
     if (!productConversationId || ownedProductSnapshot || productNotFound === productConversationId) return;
     const retry = () => setProductSnapshotRetry((value) => value + 1);

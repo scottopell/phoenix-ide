@@ -1,4 +1,4 @@
-# ADR-090: Touch reactions dock away from native selection
+# ADR-091: Touch reactions dock away from native selection
 
 - **Status:** Accepted
 - **Date:** 2026-09-20

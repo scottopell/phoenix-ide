@@ -480,6 +480,24 @@ describe('reaction pill', () => {
     expect(scrollTranscriptBy).not.toHaveBeenCalled();
   });
 
+  it('uses shifted composer geometry without duplicating the top safe-area spacer', () => {
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
+      offsetLeft: 0, offsetTop: 0, width: 390, height: 700,
+      addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    } });
+    document.documentElement.style.setProperty('--safe-area-top', '47px');
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('app-safe-area-top')) return new DOMRect(0, 0, 390, 47);
+      if (this.id === 'messages') return new DOMRect(0, 47, 390, 593);
+      if (this.id === 'input-area') return new DOMRect(0, 640, 390, 60);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<><div className="app-safe-area-top" aria-hidden="true" /><Fixture touchDocked body="" /></>);
+    expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ top: '574px' });
+    document.documentElement.style.removeProperty('--safe-area-top');
+  });
+
   it('clamps the touch dock inside visual-viewport safe-area insets', () => {
     Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
       offsetLeft: 0, offsetTop: 0, width: 390, height: 700,

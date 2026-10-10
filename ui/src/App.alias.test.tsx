@@ -146,6 +146,18 @@ describe('ProductConversationAliasRedirect', () => {
     expect(screen.queryByTestId('product-page')).toBeNull();
   });
 
+  it('keeps an open current member live while direct messages are temporarily blocked', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      latest_transcript_row_id: 'current-member', writable_transcript_row_id: null, requested_transcript_row_id: 'current-member',
+    } as never);
+    renderAlias('current-member', '/c/current-member?source_transcript=current-member');
+    await screen.findByTestId('embedded-fallback');
+    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({
+      slug: 'current-member', aggregateLifecycleOpen: true, mutationEnabled: false,
+    }));
+  });
+
   it.each(['/c/product-1', '/product-conversations/product-1', '/c/legacy-slug'])('honors an encoded predecessor pin on %s', async (path) => {
     vi.mocked(api.getProductConversationSnapshot).mockImplementation(async (reference) => ({
       product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',

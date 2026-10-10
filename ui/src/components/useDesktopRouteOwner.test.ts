@@ -13,6 +13,16 @@ describe('desktop validated route ownership', () => {
     await act(async () => {});
     expect(result.current).toBeNull();
   });
+  it('keeps an exact historical /c member as the desktop owner', async () => {
+    vi.spyOn(api, 'getProductConversationSnapshot').mockResolvedValue(snapshot('product', 'historical'));
+    const { result } = renderHook(() => useDesktopRouteOwner('historical', 'historical', ''));
+    await waitFor(() => expect(result.current).toBe('historical'));
+  });
+  it('uses latest ownership for the canonical product route', async () => {
+    vi.spyOn(api, 'getProductConversationSnapshot').mockResolvedValue(snapshot('product', 'root'));
+    const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
+    await waitFor(() => expect(result.current).toBe('latest'));
+  });
   it('stops retrying an authoritative 404 including online events', async () => {
     vi.useFakeTimers();
     const get = vi.spyOn(api, 'getProductConversationSnapshot').mockRejectedValue(new ApiResponseError('missing', 404));
