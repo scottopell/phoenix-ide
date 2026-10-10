@@ -5,7 +5,7 @@ import { restoreReactionRange } from './reactionRange';
 import { useFocusScope, useKeyboardRouterShortcut, useRegisterFocusScope } from '../hooks/useFocusScope';
 import './ReactionPill.css';
 
-export function ReactionPill({ source, sourceRange, touchDocked = false, captureSource, scrollTranscriptBy, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
+export function ReactionPill({ source, sourceRange, touchDocked = false, captureSource, onSourceReturnStateChange, scrollTranscriptBy, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
   useRegisterFocusScope(scopeId);
   const { activeScope } = useFocusScope();
   const [sourceDocked, setSourceDocked] = useState(false);
@@ -23,8 +23,9 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     return () => {
       returnRequest.current?.abort();
       returning.current = false;
+      onSourceReturnStateChange?.(false);
     };
-  }, [source]);
+  }, [source, onSourceReturnStateChange]);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -216,6 +217,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     const request = new AbortController();
     returnRequest.current = request;
     returning.current = true;
+    onSourceReturnStateChange?.(true);
     setReturnPending(true);
     setError('');
     try {
@@ -231,7 +233,11 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         setError('Passage unavailable. Your reaction is saved here.');
       }
     } finally {
-      if (!request.signal.aborted) setReturnPending(false);
+      if (returnRequest.current === request) {
+        returnRequest.current = null;
+        setReturnPending(false);
+        onSourceReturnStateChange?.(false);
+      }
     }
   };
 

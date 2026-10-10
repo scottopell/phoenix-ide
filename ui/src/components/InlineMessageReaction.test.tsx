@@ -39,7 +39,7 @@ function OtherScope() {
   return <button type="button">Other scope control</button>;
 }
 
-function Harness({ store, scope = 'conversation-a', append, sourceMounted = true, otherScope = false, returnToSource }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined; sourceMounted?: boolean; otherScope?: boolean; returnToSource?: () => boolean }) {
+function Harness({ store, scope = 'conversation-a', append, sourceMounted = true, otherScope = false, returnToSource }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined; sourceMounted?: boolean; otherScope?: boolean; returnToSource?: () => boolean | Promise<boolean> }) {
   return (
     <FocusScopeProvider>
       <InlineReactionContext.Provider value={store}>
@@ -185,6 +185,8 @@ describe('inline message reactions', () => {
     const source = store.getSnapshot('conversation-a')?.source;
     const dispatch = vi.spyOn(store, 'dispatch');
     fireEvent.pointerDown(screen.getByTestId('unrelated'), { pointerType: 'touch' });
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => { await new Promise(requestAnimationFrame); });
     fireEvent.pointerUp(screen.getByTestId('unrelated'), { pointerType: 'touch' });
     await act(async () => { await new Promise(requestAnimationFrame); });
     expect(dispatch).not.toHaveBeenCalled();
@@ -369,9 +371,12 @@ describe('inline message reactions', () => {
     expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
   });
 
-  it('retains an empty touch reaction when its mounted source is offscreen', async () => {
+  it('retains an empty touch reaction when its mounted source is clipped by the transcript', async () => {
     setCoarsePointer(true);
-    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, -120, 100, 20));
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 100, 100, 20));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return this.id === 'messages' ? new DOMRect(0, 200, 600, 500) : new DOMRect(0, 0, 600, 500);
+    });
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} />);
     const text = screen.getByTestId('old').firstChild!;
@@ -386,9 +391,39 @@ describe('inline message reactions', () => {
     expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
   });
 
+  it('protects a reaction until delayed source return completes', async () => {
+    setCoarsePointer(true);
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, -120, 100, 20));
+    let finish!: (found: boolean) => void;
+    const returnToSource = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} returnToSource={returnToSource} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
+    const returnButton = await screen.findByRole('button', { name: /Return to passage/ });
+    fireEvent.pointerDown(returnButton, { pointerType: 'touch' });
+    fireEvent.click(returnButton);
+    window.getSelection()?.removeAllRanges();
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => {
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+    });
+    expect(store.getSnapshot('conversation-a')).not.toBeNull();
+    expect(screen.getByRole('button', { name: /Return to passage/ })).toBeDisabled();
+    await act(async () => { finish(false); });
+    expect(store.getSnapshot('conversation-a')).not.toBeNull();
+  });
+
   it('clears an empty touch reaction when its mounted selection collapses', async () => {
     setCoarsePointer(true);
     vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 100, 100, 20));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return this.id === 'messages' ? new DOMRect(0, 0, 600, 500) : new DOMRect(0, 0, 600, 500);
+    });
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} />);
     const text = screen.getByTestId('old').firstChild!;

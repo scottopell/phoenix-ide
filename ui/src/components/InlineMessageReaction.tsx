@@ -36,7 +36,10 @@ function sourceIsVisible(source: ReactionSource): boolean {
   const rect = range.getBoundingClientRect();
   const viewportTop = window.visualViewport?.offsetTop ?? 0;
   const viewportBottom = viewportTop + (window.visualViewport?.height ?? window.innerHeight);
-  return rect.height > 0 && rect.bottom > viewportTop && rect.top < viewportBottom;
+  const transcriptRect = document.getElementById('messages')?.getBoundingClientRect();
+  const visibleTop = Math.max(viewportTop, transcriptRect?.top ?? viewportTop);
+  const visibleBottom = Math.min(viewportBottom, transcriptRect?.bottom ?? viewportBottom);
+  return rect.height > 0 && rect.bottom > visibleTop && rect.top < visibleBottom;
 }
 
 export function InlineMessageReaction(props: Props) {
@@ -51,16 +54,19 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
   const bubbleRef = useRef<HTMLDivElement>(null);
   const selectedRange = useRef<Range | null>(null);
   const pillFocusPending = useRef(false);
+  const sourceReturnActive = useRef(false);
   const selecting = useRef(false);
   const gestureActive = useRef(false);
   const selectionInput = useRef<'touch' | 'fine' | null>(null);
   const selectionChangedDuringGesture = useRef(false);
   const { activeScope } = useFocusScope();
+  const setSourceReturnActive = useCallback((active: boolean) => { sourceReturnActive.current = active; }, []);
   const focusScope = `inline-reaction:${scopeKey}`;
   const [notice, setNotice] = useState('');
 
   useEffect(() => {
     let frame = 0;
+    const transcript = document.getElementById('messages');
     if (activeScope && activeScope !== focusScope) {
       selectionInput.current = null;
       selectionChangedDuringGesture.current = false;
@@ -69,7 +75,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
     }
     const read = () => {
       frame = 0;
-      if (selecting.current || pillFocusPending.current || !destination || (activeScope && activeScope !== focusScope)) return;
+      if (selecting.current || pillFocusPending.current || sourceReturnActive.current || !destination || (activeScope && activeScope !== focusScope)) return;
       if (bubbleRef.current?.contains(document.activeElement)) return;
       const current = store.getSnapshot(scopeKey);
       if (current?.body) return;
@@ -104,7 +110,11 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       frame = requestAnimationFrame(read);
     };
     const down = (event: PointerEvent) => {
-      if (bubbleRef.current?.contains(event.target as Node)) return;
+      const target = event.target as Node;
+      if (bubbleRef.current?.contains(target)) return;
+      const targetElement = target instanceof Element ? target : target.parentElement;
+      const sourceMessage = targetElement?.closest('[data-inline-reaction-message]');
+      if (!sourceMessage || !transcript?.contains(sourceMessage)) return;
       selectionInput.current = event.pointerType === 'touch' ? 'touch' : 'fine';
       selectionChangedDuringGesture.current = false;
       gestureActive.current = true;
@@ -190,6 +200,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
               store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: reaction.presentation });
             }
           }}
+          onSourceReturnStateChange={setSourceReturnActive}
           returnToSource={returnToSource}
           scrollTranscriptBy={scrollTranscriptBy}
           body={reaction.body}
@@ -210,6 +221,7 @@ export interface ReactionPillProps {
   sourceRange?: Range | null;
   touchDocked?: boolean;
   captureSource?: () => void;
+  onSourceReturnStateChange?: (active: boolean) => void;
   scrollTranscriptBy?: ((delta: number) => void) | undefined;
   returnToSource?: ((source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>) | undefined;
   bubbleRef: React.RefObject<HTMLDivElement>;
