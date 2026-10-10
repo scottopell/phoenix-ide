@@ -1264,7 +1264,7 @@ async fn read_conversation_page(
 ) -> Result<String, DbError> {
     let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
-        format!("Conversation @conv:{id}\nconversation link: /product-conversations/{id}\n")
+        format!("Conversation @conv:{id}\nconversation link: /c/{id}\n")
     });
     let title = stable.as_ref().map_or_else(
         || {
@@ -1310,7 +1310,7 @@ async fn read_conversation_around_message(
 
     let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
-        format!("Conversation @conv:{id}\nconversation link: /product-conversations/{id}\n")
+        format!("Conversation @conv:{id}\nconversation link: /c/{id}\n")
     });
     let title = stable.as_ref().map_or_else(
         || {
@@ -1407,7 +1407,7 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
 }
 
 fn conversation_href(conv: &Conversation) -> String {
-    format!("/c/{}", conv.slug.as_deref().unwrap_or(&conv.id))
+    format!("/c/{}?source_transcript={}", conv.id, conv.id)
 }
 
 fn conversation_message_href(conv: &Conversation, message: Option<(&str, MessageType)>) -> String {
@@ -1801,22 +1801,206 @@ async fn resolve_work_scope(
     )
 }
 
+fn decode_route_value(value: &str) -> Result<String, AppError> {
+    let url = reqwest::Url::parse(&format!(
+        "http://route.invalid/?value={}",
+        value.replace('+', "%2B")
+    ))
+    .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(url
+        .query_pairs()
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default())
+}
+
+enum WebReferenceResolution {
+    Product(String),
+    Exact(ResolveGlobalReferenceResponse),
+    NotWeb,
+}
+
+fn parse_transcript_pins(query: &str) -> Result<Vec<String>, AppError> {
+    let parsed = reqwest::Url::parse(&format!("http://route.invalid/?{query}"))
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let pins: Vec<_> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key == "source_transcript")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    if pins.len() > 1
+        || pins
+            .first()
+            .is_some_and(|pin| pin.is_empty() || pin.trim() != pin)
+    {
+        return Err(AppError::BadRequest(
+            "Invalid exact transcript reference".into(),
+        ));
+    }
+    Ok(pins)
+}
+
+async fn exact_global_domain(
+    service: &GlobalReadService,
+    conv: &Conversation,
+    global: bool,
+) -> Result<bool, AppError> {
+    let coordinator = service
+        .db
+        .product_conversation_kind(&conv.product_conversation_id)
+        .await
+        .map_err(map_db_not_found)?
+        == Some(phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator);
+    if global
+        && (!coordinator
+            || conv.parent_conversation_id.is_some()
+            || conv.runtime_role != phoenix_core::work_scope::RuntimeRole::User)
+    {
+        return Err(AppError::BadRequest(
+            "Global route requires a Coordinator conversation".into(),
+        ));
+    }
+    let global = coordinator
+        && conv.parent_conversation_id.is_none()
+        && conv.runtime_role == phoenix_core::work_scope::RuntimeRole::User;
+    Ok(global)
+}
+
+async fn resolve_anchored_product_member(
+    service: &GlobalReadService,
+    product: Option<&phoenix_core::domain::product_conversation::ProductConversationId>,
+    message_id: Option<&str>,
+) -> Result<Option<Conversation>, AppError> {
+    let (Some(product), Some(message_id)) = (product, message_id) else {
+        return Ok(None);
+    };
+    let message = service
+        .db
+        .get_message_by_id(&decode_route_value(message_id)?)
+        .await
+        .map_err(map_db_not_found)?;
+    let owner = load_conversation_by_slug_or_id(service, &message.conversation_id).await?;
+    if *product != owner.product_conversation_id {
+        return Err(AppError::NotFound(
+            "message is not a member of this conversation".into(),
+        ));
+    }
+    Ok(Some(owner))
+}
+
+async fn resolve_web_reference(
+    service: &GlobalReadService,
+    raw: &str,
+) -> Result<WebReferenceResolution, AppError> {
+    let reference = raw.trim();
+    let mut canonical_product = None;
+    if let Some(rest) = reference
+        .strip_prefix("/c/")
+        .or_else(|| reference.strip_prefix("/product-conversations/"))
+        .or_else(|| reference.strip_prefix("/global/"))
+    {
+        let (base, fragment) = split_fragment(rest);
+        let (encoded_id, query) = base.split_once('?').unwrap_or((base, ""));
+        let id = decode_route_value(encoded_id)?;
+        if id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "Conversation reference must not be empty".into(),
+            ));
+        }
+        let pins = parse_transcript_pins(query)?;
+        let global = reference.starts_with("/global/");
+        let product = service.db.resolve_ordinary_product_conversation(&id).await;
+        if let Err(error) = &product {
+            if !matches!(error, DbError::ConversationNotFound(_)) {
+                return Err(AppError::Internal(error.to_string()));
+            }
+        }
+        if pins.is_empty()
+            && !global
+            && (fragment.is_none() || fragment.and_then(message_id_fragment).is_none())
+        {
+            if let Ok(product) = &product {
+                if product.product_conversation_id.as_str() == id
+                    || reference.starts_with("/product-conversations/")
+                {
+                    canonical_product = Some(product.product_conversation_id.to_string());
+                }
+            }
+        }
+        if canonical_product.is_none() {
+            let anchored_owner = resolve_anchored_product_member(
+                service,
+                product
+                    .as_ref()
+                    .ok()
+                    .map(|product| &product.product_conversation_id),
+                if pins.is_empty() {
+                    fragment.and_then(message_id_fragment)
+                } else {
+                    None
+                },
+            )
+            .await?;
+            let conv = match anchored_owner {
+                Some(owner) => owner,
+                None => {
+                    load_conversation_by_slug_or_id(service, pins.first().unwrap_or(&id)).await?
+                }
+            };
+            if product.is_ok()
+                && (conv.parent_conversation_id.is_some()
+                    || conv.runtime_role != phoenix_core::work_scope::RuntimeRole::User)
+            {
+                return Err(AppError::NotFound(
+                    "transcript is not an ordinary conversation member".into(),
+                ));
+            }
+            let global = exact_global_domain(service, &conv, global).await?;
+            if let Some(pin) = pins.first() {
+                if conv.id != *pin {
+                    return Err(AppError::BadRequest(
+                        "Exact transcript must identify a transcript row".into(),
+                    ));
+                }
+                let owner = load_conversation_by_slug_or_id(service, &id).await;
+                let same_product = match &product {
+                    Ok(product) => conv.product_conversation_id == product.product_conversation_id,
+                    Err(_) => owner.as_ref().is_ok_and(|owner| {
+                        owner.product_conversation_id == conv.product_conversation_id
+                    }),
+                };
+                if !same_product {
+                    return Err(AppError::BadRequest(
+                        "Transcript is not a member of this conversation".into(),
+                    ));
+                }
+            }
+            if let Some(message_id) = fragment.and_then(message_id_fragment) {
+                return resolve_message(service, conv, &decode_route_value(message_id)?, global)
+                    .await
+                    .map(WebReferenceResolution::Exact);
+            }
+            return Ok(WebReferenceResolution::Exact(
+                resolve_conversation(service, conv, global).await,
+            ));
+        }
+    }
+    Ok(canonical_product.map_or(
+        WebReferenceResolution::NotWeb,
+        WebReferenceResolution::Product,
+    ))
+}
+
 async fn resolve_reference_impl(
     service: &GlobalReadService,
     raw: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let reference = raw.trim();
-    if let Some(rest) = reference
-        .strip_prefix("/c/")
-        .or_else(|| reference.strip_prefix("/global/"))
-    {
-        let (slug, fragment) = split_fragment(rest);
-        let conv = load_conversation_by_slug_or_id(service, slug).await?;
-        if let Some(message_id) = fragment.and_then(message_id_fragment) {
-            return resolve_message(service, conv, message_id, true).await;
-        }
-        return Ok(resolve_conversation(service, conv, true).await);
-    }
+    let canonical_product = match resolve_web_reference(service, reference).await? {
+        WebReferenceResolution::Product(id) => Some(id),
+        WebReferenceResolution::Exact(resolved) => return Ok(resolved),
+        WebReferenceResolution::NotWeb => None,
+    };
     if let Some(rest) = reference
         .strip_prefix("/chains/")
         .or_else(|| reference.strip_prefix("@chain:"))
@@ -1826,7 +2010,7 @@ async fn resolve_reference_impl(
     }
     if let Some(id) = reference
         .strip_prefix("@conv:")
-        .or_else(|| reference.strip_prefix("/product-conversations/"))
+        .or(canonical_product.as_deref())
     {
         if id.contains('#') {
             return Err(AppError::BadRequest(
@@ -1857,7 +2041,7 @@ async fn resolve_reference_impl(
         return Ok(ResolveGlobalReferenceResponse {
             kind: "product_conversation".to_string(),
             id: typed_id.to_string(),
-            href: Some(format!("/product-conversations/{typed_id}")),
+            href: Some(format!("/c/{typed_id}")),
             title: aggregate
                 .root
                 .conversation
@@ -3565,8 +3749,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
+    async fn continued_scope_fixture() -> (
+        GlobalReadService,
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        phoenix_core::work_scope::WorkScopeId,
+        phoenix_core::work_scope::WorkScopeId,
+    ) {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         db.create_conversation("root-scope", "root-scope", "/tmp/root", true, None, None)
             .await
@@ -3620,6 +3808,13 @@ mod tests {
             .unwrap();
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
 
+        (service, product_id, root_scope_id, current_scope_id)
+    }
+
+    #[tokio::test]
+    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
+        let (service, product_id, root_scope_id, current_scope_id) =
+            continued_scope_fixture().await;
         let stable = service
             .resolve_reference(&format!("@conv:{product_id}"))
             .await
@@ -3636,6 +3831,18 @@ mod tests {
                 path_semantics: ServerPathSemantics::ServerFilesystem,
             }
         );
+        for reference in [
+            format!("/c/{product_id}"),
+            format!("/c/{product_id}?viewer=inspect"),
+            format!("/product-conversations/{product_id}"),
+            format!("/product-conversations/{product_id}?viewer=inspect#section"),
+            "/product-conversations/root-scope".to_string(),
+        ] {
+            let canonical = service.resolve_reference(&reference).await.unwrap();
+            assert_eq!(canonical.id, stable.id);
+            assert_eq!(canonical.work_scope, stable.work_scope);
+            assert_eq!(canonical.href, Some(format!("/c/{product_id}")));
+        }
         let stable_json = serde_json::to_value(&stable).unwrap();
         assert_eq!(stable_json["work_scope"]["status"], "available");
         assert_eq!(
@@ -3648,6 +3855,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
+            exact.href.as_deref(),
+            Some("/c/root-scope?source_transcript=root-scope")
+        );
+        let pinned = service
+            .resolve_reference(exact.href.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(pinned.id, exact.id);
+        assert_eq!(pinned.work_scope, exact.work_scope);
+        for path in [
+            format!("/c/{product_id}"),
+            format!("/product-conversations/{product_id}"),
+        ] {
+            let pinned = service
+                .resolve_reference(&format!(
+                    "{path}?source_transcript=root%2Dscope&viewer=inspect"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(pinned.id, exact.id);
+            assert_eq!(pinned.work_scope, exact.work_scope);
+            for suffix in [
+                "source_transcript=",
+                "source_transcript=missing",
+                "source_transcript=root-scope&source_transcript=other",
+            ] {
+                assert!(service
+                    .resolve_reference(&format!("{path}?{suffix}"))
+                    .await
+                    .is_err());
+            }
+        }
+
+        assert_eq!(
             exact.work_scope,
             ResolvedWorkScope::Available {
                 work_scope_id: root_scope_id,
@@ -3659,6 +3900,78 @@ mod tests {
                 path_semantics: ServerPathSemantics::ServerFilesystem,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn product_message_anchor_checks_owner_and_rejects_foreign_messages() {
+        let (service, product, _, _) = continued_scope_fixture().await;
+        let root_message = service
+            .db
+            .add_message(
+                "root:message",
+                "root-scope",
+                &crate::db::MessageContent::user("historical prompt"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .db
+            .create_conversation("foreign-anchor", "foreign-anchor", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        service
+            .db
+            .add_message(
+                "foreign-message",
+                "foreign-anchor",
+                &crate::db::MessageContent::user("foreign prompt"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for prefix in ["/c/", "/product-conversations/"] {
+            let found = service
+                .resolve_reference(&format!("{prefix}{product}#message-root%3Amessage"))
+                .await
+                .unwrap();
+            assert_eq!(found.id, root_message.message_id);
+            assert!(found.href.unwrap().contains("source_transcript=root-scope"));
+            assert!(service
+                .resolve_reference(&format!("{prefix}{product}#message-foreign-message"))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_product_pin_rejects_child_with_shared_product_identity() {
+        let (service, product, _, _) = continued_scope_fixture().await;
+        let child = service
+            .db
+            .create_conversation(
+                "child-pin",
+                "child-pin",
+                "/tmp",
+                false,
+                Some("root-scope"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(child.parent_conversation_id.is_some());
+        for prefix in ["/c/", "/product-conversations/"] {
+            assert!(service
+                .resolve_reference(&format!("{prefix}{product}?source_transcript=child-pin"))
+                .await
+                .is_err());
+        }
+        assert!(service
+            .resolve_reference("/global/child-pin")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
