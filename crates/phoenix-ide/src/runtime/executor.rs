@@ -18755,6 +18755,212 @@ mod steer_drain_detector_tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn conversation_runtime_dispatches_real_zero_and_normal_bash_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("runtime-started");
+        let release = temp.path().join("release");
+        let registry = Arc::new(crate::tools::BashHandleRegistry::new());
+        let context = ConvContext::new(
+            "runtime-real-bash-wait",
+            temp.path().to_path_buf(),
+            "test-model",
+            200_000,
+        );
+        let setup_context = ToolContext::new_with_resource_scope(
+            CancellationToken::new(),
+            context.conversation_id.clone(),
+            temp.path().to_path_buf(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::clone(&registry),
+            Arc::new(NoLlm),
+            crate::terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            context.work_scope_worktree.clone(),
+            context.resource_scope.clone(),
+            context.resource_authority,
+        );
+        let bash = crate::tools::BashTool;
+        let run = bash
+            .run(
+                serde_json::json!({
+                    "op": "run",
+                    "cmd": "printf x >> runtime-started; while [ ! -f release ]; do sleep 0.05; done",
+                    "wait_seconds": 0
+                }),
+                setup_context.clone(),
+            )
+            .await;
+        let run_value: serde_json::Value = serde_json::from_str(run.output()).unwrap();
+        assert_eq!(run_value["status"], "still_running");
+        let handle = run_value["handle"].as_str().unwrap().to_string();
+
+        let wait_zero = ToolCall::new(
+            "runtime-wait-zero",
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                handle: handle.clone(),
+                wait_seconds: Some(0),
+                lines: None,
+                since: None,
+            }),
+        );
+        let wait_one = ToolCall::new(
+            "runtime-wait-one",
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                handle: handle.clone(),
+                wait_seconds: Some(1),
+                lines: None,
+                since: None,
+            }),
+        );
+        let initial_state = ConvState::ToolExecuting {
+            current_tool: wait_zero.clone(),
+            remaining_tools: vec![wait_one],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "runtime-wait-zero".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"op":"wait","handle":handle,"wait_seconds":0}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "runtime-wait-one".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"op":"wait","handle":handle,"wait_seconds":1}),
+                    },
+                ],
+                ..AssistantMessage::default()
+            },
+        };
+        let registry_tools = crate::tools::ToolRegistry::direct(vec![]);
+        let tool_definitions = registry_tools.definitions();
+        let tools = Arc::new(crate::runtime::traits::ToolRegistryExecutor::builtin_only(
+            registry_tools,
+            Arc::from([]),
+        ));
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.seed_tool_admission_policy(
+            "runtime-real-bash-wait",
+            phoenix_core::domain::tool_availability::ToolAvailability::all(tool_definitions),
+        );
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        for text in ["waits observed", "next turn completed"] {
+            llm.queue_response(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text(text)],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+        }
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let broadcaster = SseBroadcaster::new(128, 0);
+        let mut state_rx = broadcaster.subscribe();
+        let mut rt = ConversationRuntime::new(
+            context,
+            initial_state,
+            Arc::clone(&storage),
+            llm,
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::clone(&registry),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx.clone(),
+            broadcaster,
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.dispatch_tool_execution(wait_zero, &mut admitted)
+            .await
+            .unwrap();
+        drop(admitted);
+        let runtime = tokio::spawn(rt.run_inner());
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(SseEvent::StateChange {
+                        state: ConvState::Idle,
+                        ..
+                    }) = state_rx.recv().await
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("runtime did not reach the expected idle lifecycle boundary");
+            if storage
+                .get_all_messages("runtime-real-bash-wait")
+                .iter()
+                .any(|message| {
+                    matches!(
+                        &message.content,
+                        MessageContent::User(user_message) if user_message.text == "next permitted turn"
+                    )
+                })
+            {
+                break;
+            }
+            event_tx
+                .send(Event::UserMessage {
+                    text: "next permitted turn".to_string(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "runtime-next-turn".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        for expected_id in ["runtime-wait-zero", "runtime-wait-one"] {
+            let results: Vec<_> = storage
+                .get_all_messages("runtime-real-bash-wait")
+                .into_iter()
+                .filter_map(|message| match message.content {
+                    MessageContent::Tool(tool) if tool.tool_use_id == expected_id => Some(tool),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(results.len(), 1);
+            assert!(!results[0].is_error);
+            assert!(results[0].content.contains("still_running"));
+        }
+        assert!(storage
+            .get_all_messages("runtime-real-bash-wait")
+            .iter()
+            .any(|message| matches!(
+                &message.content,
+                MessageContent::User(user_message) if user_message.text == "next permitted turn"
+            )));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+        assert_eq!(registry.snapshot_live_pgids().await.len(), 1);
+
+        std::fs::write(&release, "release").unwrap();
+        let exited = tokio::time::timeout(
+            Duration::from_secs(5),
+            bash.run(
+                serde_json::json!({"op":"wait","handle":handle,"wait_seconds":5}),
+                setup_context,
+            ),
+        )
+        .await
+        .expect("released child did not settle");
+        let exited_value: serde_json::Value = serde_json::from_str(exited.output()).unwrap();
+        assert_eq!(exited_value["status"], "tombstoned");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+        runtime.abort();
+    }
+
     #[tokio::test]
     async fn elapsed_bash_wait_timer_retains_settlement_grace() {
         let (mut rt, storage) = build_runtime_with_state_and_queue(
