@@ -591,6 +591,7 @@ impl GlobalReadService {
         predecessors: &[Conversation],
         query: String,
     ) -> PreviousTranscriptsOutput {
+        const MAX_SEARCH_RESULTS: usize = 8;
         if query.trim().is_empty() || query.chars().count() > 1024 {
             return PreviousTranscriptsOutput::InvalidTarget;
         }
@@ -605,7 +606,6 @@ impl GlobalReadService {
             Ok(true) => {}
             Ok(false) | Err(_) => return PreviousTranscriptsOutput::SearchUnavailable,
         }
-        const MAX_SEARCH_RESULTS: usize = 8;
         let request = RetrievalRequest::natural_language(
             query,
             RetrievalScope::Conversations(ids),
