@@ -299,7 +299,10 @@ fn validate_peer_ca_certificate(der: &[u8]) -> Result<(), PeerCaCertificatePemEr
     let (basic_constraints_remainder, basic_constraints) =
         x509_parser::extensions::BasicConstraints::from_der(basic_constraints.value)
             .map_err(|_| PeerCaCertificatePemError::Invalid)?;
-    if !remainder.is_empty() || !basic_constraints_remainder.is_empty() || !basic_constraints.ca {
+    if !remainder.is_empty() || !basic_constraints_remainder.is_empty() {
+        return Err(PeerCaCertificatePemError::Invalid);
+    }
+    if !basic_constraints.ca {
         return Err(PeerCaCertificatePemError::NotCertificateAuthority);
     }
     if let Some(key_usage) = certificate
@@ -489,45 +492,40 @@ mod tests {
             .unwrap_err(),
             PeerCaCertificatePemError::NotCertificateAuthority
         );
-        let mut ca_with_malformed_key_usage = rcgen::CertificateParams::new(Vec::<String>::new())
-            .expect("empty SAN list is valid for CA certificates");
-        ca_with_malformed_key_usage.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_with_malformed_key_usage.custom_extensions.push(
-            rcgen::CustomExtension::from_oid_content(
-                &[2, 5, 29, 15],
-                vec![0x03, 0x02, 0x02, 0x04, 0x05, 0x00],
+    }
+
+    #[test]
+    fn peer_private_ca_rejects_trailing_der_in_relevant_extensions() {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        for (oid, content) in [
+            (
+                &[2, 5, 29, 15][..],
+                &[0x03, 0x02, 0x02, 0x04, 0x05, 0x00][..],
             ),
-        );
-        assert_eq!(
-            PeerCaCertificatePem::parse(
-                ca_with_malformed_key_usage
-                    .self_signed(&key_pair)
-                    .unwrap()
-                    .pem(),
-            )
-            .unwrap_err(),
-            PeerCaCertificatePemError::Invalid
-        );
-        let mut ca_with_malformed_basic_constraints =
-            rcgen::CertificateParams::new(Vec::<String>::new())
+            (
+                &[2, 5, 29, 19][..],
+                &[0x30, 0x03, 0x01, 0x01, 0xff, 0x05, 0x00][..],
+            ),
+        ] {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
                 .expect("empty SAN list is valid for CA certificates");
-        ca_with_malformed_basic_constraints.is_ca = rcgen::IsCa::NoCa;
-        ca_with_malformed_basic_constraints.custom_extensions.push(
-            rcgen::CustomExtension::from_oid_content(
-                &[2, 5, 29, 19],
-                vec![0x30, 0x03, 0x01, 0x01, 0xff, 0x05, 0x00],
-            ),
-        );
-        assert_eq!(
-            PeerCaCertificatePem::parse(
-                ca_with_malformed_basic_constraints
-                    .self_signed(&key_pair)
-                    .unwrap()
-                    .pem(),
-            )
-            .unwrap_err(),
-            PeerCaCertificatePemError::Invalid
-        );
+            params.is_ca = if oid == [2, 5, 29, 19] {
+                rcgen::IsCa::NoCa
+            } else {
+                rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained)
+            };
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    oid,
+                    content.to_vec(),
+                ));
+            assert_eq!(
+                PeerCaCertificatePem::parse(params.self_signed(&key_pair).unwrap().pem())
+                    .unwrap_err(),
+                PeerCaCertificatePemError::Invalid
+            );
+        }
     }
 
     #[test]
