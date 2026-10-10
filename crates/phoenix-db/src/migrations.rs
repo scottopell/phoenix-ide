@@ -12953,19 +12953,25 @@ mod tests {
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let expected_tail = [
+            (120, "admit_server_overload_retrying_state"),
+            (119, "close_cleanup_failures"),
+            (118, "persist_mcp_token_removals"),
+            (117, "persist_conversation_tool_policy"),
+            (116, "federation_peer_connections"),
+            (115, "federation_enrollments"),
+            (114, "persist_instance_identity"),
+            (113, "settle_historical_continuation_openings"),
+            (112, "input_source_tool_call"),
+        ];
         assert_eq!(
-            ledger.iter().rev().take(8).copied().collect::<Vec<_>>(),
-            vec![
-                (120, "admit_server_overload_retrying_state"),
-                (119, "close_cleanup_failures"),
-                (118, "persist_mcp_token_removals"),
-                (117, "persist_conversation_tool_policy"),
-                (116, "federation_peer_connections"),
-                (115, "federation_enrollments"),
-                (114, "persist_instance_identity"),
-                (113, "settle_historical_continuation_openings"),
-                (112, "input_source_tool_call"),
-            ]
+            ledger
+                .iter()
+                .rev()
+                .take(expected_tail.len())
+                .copied()
+                .collect::<Vec<_>>(),
+            expected_tail
         );
     }
 
