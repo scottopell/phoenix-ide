@@ -382,6 +382,34 @@ jobs:
           [[ ! -e "$RUNNER_TEMP/developer-id.p12" ]]
           [[ ! -e "$RUNNER_TEMP/phoenix-notary-api-key.p8" ]]
           exit "$cleanup_failed"
+      - name: Check isolated signed-helper startup
+        if: needs.gate.outputs.preparation == 'true'
+        timeout-minutes: 5
+        run: |
+          umask 077
+          short_commit="${{ needs.gate.outputs.commit }}"
+          short_commit=${short_commit:0:12}
+          qa="$GITHUB_WORKSPACE/target/signed-helper-acceptance/${{ matrix.target }}"
+          mkdir -p "$qa"
+          standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}-prepared-$short_commit"
+          archive="$RUNNER_TEMP/release-assets/Phoenix-macos-${{ matrix.target }}-prepared-$short_commit.zip"
+          node scripts/check-signed-helper.cjs \
+            "$archive" \
+            "$standalone" \
+            "${{ needs.gate.outputs.commit }}" \
+            "${{ needs.gate.outputs.version }}" \
+            "${{ matrix.target }}" \
+            "$qa/runtime"
+          cp "$qa/runtime/acceptance-receipt.json" \
+            "$RUNNER_TEMP/release-assets/HEADLESS-ACCEPTANCE-${{ matrix.target }}.json"
+      - name: Retain failed headless acceptance receipt
+        if: ${{ failure() && needs.gate.outputs.preparation == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}
+          path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json
+          if-no-files-found: ignore
+          retention-days: 14
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: needs.gate.outputs.release == 'true'
         with:

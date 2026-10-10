@@ -231,6 +231,31 @@ for forbidden in ['MINOR + 1', '^[0-9]+\\.[0-9]+\\.[0-9]+$']:
     if forbidden in tag_script:
         raise SystemExit(f'tag release script bypasses shared version contract: {forbidden}')
 
+acceptance = workflow[workflow.index('      - name: Check isolated signed-helper startup'):
+                      workflow.index('      - name: Retain failed headless acceptance receipt')]
+for fragment in [
+    "if: needs.gate.outputs.preparation == 'true'",
+    'node scripts/check-signed-helper.cjs',
+    '"${{ needs.gate.outputs.commit }}"',
+    '"${{ needs.gate.outputs.version }}"',
+    '"${{ matrix.target }}"',
+    '"$archive" \\',
+    '"$standalone" \\',
+    'HEADLESS-ACCEPTANCE-${{ matrix.target }}.json',
+]:
+    if fragment not in acceptance:
+        raise SystemExit(f'missing preparation-only unchanged-artifact acceptance: {fragment}')
+if not (workflow.index('      - name: Remove protected material') <
+        workflow.index('      - name: Check isolated signed-helper startup') <
+        workflow.index('          name: desktop-preparation-${{ matrix.target }}-${{ needs.gate.outputs.commit }}')):
+    raise SystemExit('runtime acceptance must follow signing cleanup and gate successful retention')
+for fragment in [
+    "failure() && needs.gate.outputs.preparation == 'true'",
+    'path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json',
+]:
+    if fragment not in workflow:
+        raise SystemExit('failure upload must contain only a sanitized receipt, not private runtime data')
+
 package_script = Path('macos/Phoenix/scripts/package-desktop-release.sh').read_text()
 for fragment in [
     '"operation": "prepare-main"',
@@ -271,6 +296,9 @@ for fragment in [
     'scripts/test-publish-release-assets.sh',
     'scripts/test-verify-published-release.sh',
     'scripts/test-desktop-release-workflow.py',
+    'node --test scripts/test-check-signed-helper.cjs',
+    '"scripts/check-signed-helper.cjs"',
+    '"scripts/test-check-signed-helper.cjs"',
 ]:
     if fragment not in macos_workflow:
         raise SystemExit(f'missing macOS workflow regression check: {fragment}')
