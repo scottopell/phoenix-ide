@@ -478,13 +478,33 @@ mod tests {
 
     #[test]
     fn subscription_message_has_no_cleanup_evidence() {
-        let mut event = failure(CloseFailureStop::ShutdownUncertain);
-        event.route = WatchEventRoute::Subscription;
-        let text = notification(&event);
-        assert!(text.starts_with("Watched conversation terminal event."));
-        assert!(!text.contains("Cleanup run ordinal"));
-        assert!(!text.contains("Remaining resources"));
-        assert!(!text.contains("Shutdown uncertain"));
+        for (outcome, kind, reason) in [
+            (phoenix_db::WatchOutcome::Completed, "direct_turn", None),
+            (
+                phoenix_db::WatchOutcome::AwaitingUserResponse,
+                "question_request",
+                Some("question_request"),
+            ),
+            (
+                phoenix_db::WatchOutcome::AwaitingTaskApproval,
+                "task_approval_wait",
+                Some("task_approval_wait"),
+            ),
+        ] {
+            let mut event = failure(CloseFailureStop::ShutdownUncertain);
+            event.route = WatchEventRoute::Subscription;
+            event.outcome = outcome;
+            event.source_occurrence_kind = kind.into();
+            let text = notification(&event);
+            assert!(text.starts_with("Watched conversation event."));
+            assert!(text.contains(&format!("Outcome: {}.", event.outcome.label())));
+            assert_eq!(event.outcome.reason(), reason);
+            assert!(!text.contains("terminal event"));
+            assert!(!text.contains("Cleanup run ordinal"));
+            assert!(!text.contains("Remaining resources"));
+            assert!(!text.contains("Shutdown uncertain"));
+            assert!(!text.contains("cleanup_failed"));
+        }
     }
 
     #[test]
