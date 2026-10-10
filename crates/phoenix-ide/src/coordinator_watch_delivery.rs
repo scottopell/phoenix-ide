@@ -160,7 +160,7 @@ mod tests {
 
         let db = phoenix_db::Database::open_in_memory().await.unwrap();
         let global = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
         let source = db
@@ -241,7 +241,7 @@ mod tests {
 
         let db = phoenix_db::Database::open_in_memory().await.unwrap();
         let old = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
         let source = db

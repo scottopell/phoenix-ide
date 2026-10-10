@@ -672,6 +672,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wait.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         let source = db
             .create_conversation("rollback-wait", "rollback-wait", "/tmp", true, None, None)
             .await
@@ -727,6 +730,9 @@ mod tests {
         assert_eq!(original.len(), 1);
         db.pool().close().await;
         let restored = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(restored.pool())
+            .await
+            .unwrap();
         restored
             .update_conversation_state(&source.id, &waiting)
             .await

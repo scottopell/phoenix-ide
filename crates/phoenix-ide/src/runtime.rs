@@ -13325,7 +13325,10 @@ mod scope_liveness_tests {
         let manager = Arc::new(test_manager_with_recording_llm(llm.clone()).await);
         let global = manager
             .db()
-            .get_or_create_coordinator(Some("claude-sonnet-5"), Default::default())
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
             .await
             .unwrap();
         let source = manager
