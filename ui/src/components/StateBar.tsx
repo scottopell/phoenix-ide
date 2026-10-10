@@ -611,6 +611,9 @@ export function StateBar({
     }, 1000);
     return () => window.clearInterval(interval);
   }, [phaseIsWorking, phaseStateUpdatedAt]);
+  const overloadRetrySeconds = convState.type === 'server_overload_retrying' && convState.retryAt != null
+    ? Math.max(0, Math.ceil((convState.retryAt - Date.now()) / 1000))
+    : null;
 
   // Heartbeat watchdog (REQ-WPV-004). When the connection is healthy
   // AND the agent is working AND no SSE event of any kind (typed
@@ -684,6 +687,7 @@ export function StateBar({
     ) {
       const wasStreaming =
         (convState.type === "llm_requesting" ||
+          convState.type === "server_overload_retrying" ||
           convState.type === "seeded_llm_requesting" ||
           convState.type === "awaiting_llm") &&
         firstByteRequestId != null;
@@ -717,6 +721,11 @@ export function StateBar({
     turnRetryContext != null
       ? ` (retry ${turnRetryContext.attempt}/${turnRetryContext.maxAttempts} after ${turnRetryContext.reasonText})`
       : "";
+  const retrySuffixForPhase = (phase: ConversationState): string =>
+    retrySuffix || (phase.type === 'server_overload_retrying'
+      ? ` (retry ${phase.attempt}/${phase.maxAttempts} after model overloaded)`
+      : "");
+  const effectiveRetrySuffix = retrySuffixForPhase(convState);
 
   // Format the working-phase reason as "<base> Ns <retry?>" (e.g.
   // "awaiting LLM response 4s (retry 2/3 after rate limit)",
@@ -732,7 +741,7 @@ export function StateBar({
     // carried through. Used for the frozen last-known-activity display so a
     // mid-stream disconnect doesn't regress to "awaiting LLM response Ns".
     if (streaming) {
-      return `streaming${retrySuffix}`;
+      return `streaming${retrySuffixForPhase(phase)}`;
     }
     // Strip a trailing `...` from the base label: descriptions for
     // working phases (`llm_requesting` → "awaiting LLM response...")
@@ -743,7 +752,7 @@ export function StateBar({
       elapsedSeconds > 0
         ? `${base} ... ${formatElapsed(elapsedSeconds)}`
         : base;
-    return `${withElapsed}${retrySuffix}`;
+    return `${withElapsed}${retrySuffixForPhase(phase)}`;
   };
 
   if (!conversation) {
@@ -862,6 +871,7 @@ export function StateBar({
             break;
           case "awaiting_llm":
           case "llm_requesting":
+          case "server_overload_retrying":
           case "seeded_llm_requesting":
           case "tool_executing":
           case "awaiting_sub_agents":
@@ -886,6 +896,7 @@ export function StateBar({
             // sub-agent phases retain their elapsed counter.
             if (
               (convState.type === "llm_requesting" ||
+                convState.type === "server_overload_retrying" ||
                 convState.type === "seeded_llm_requesting" ||
                 convState.type === "awaiting_llm") &&
               firstByteRequestId != null
@@ -895,7 +906,9 @@ export function StateBar({
               // is now streaming should still surface "(retry 2/3 …)"
               // so the user has the full context for "why has this
               // taken so long?".
-              stateText = `streaming${retrySuffix}`;
+              stateText = `streaming${effectiveRetrySuffix}`;
+            } else if (convState.type === 'server_overload_retrying' && overloadRetrySeconds != null) {
+              stateText = `model overloaded — retrying in ${overloadRetrySeconds}s${effectiveRetrySuffix}`;
             } else {
               stateText = formatWorkingReason(convState, phaseElapsedSeconds);
             }

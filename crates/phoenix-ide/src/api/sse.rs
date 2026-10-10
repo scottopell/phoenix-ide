@@ -246,7 +246,9 @@ fn sse_event_to_axum(event: SseEvent) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ConvMode, Conversation, Message, MessageContent, MessageType, UsageData};
+    use crate::db::{
+        ConvMode, Conversation, ErrorKind, Message, MessageContent, MessageType, UsageData,
+    };
     use crate::runtime::user_facing_error::UserFacingError;
     use crate::runtime::{ConversationMetadataUpdate, EnrichedConversation};
     use crate::state_machine::state::ConvState;
@@ -361,7 +363,7 @@ mod tests {
                 if let Some(error_kind) = state.error_kind() {
                     obj["error"] = json!({
                         "kind": error_kind,
-                        "can_auto_retry": error_kind.is_auto_retryable(),
+                        "can_auto_retry": error_kind.is_generic_auto_retryable(),
                         "can_user_resume": error_kind.is_user_resumable(),
                     });
                 }
@@ -915,6 +917,25 @@ mod tests {
         assert_parity(&event);
         let typed = typed_sse_event_to_value(&event);
         assert_eq!(typed["error"]["kind"], "invalid_request");
+        assert_eq!(typed["error"]["can_auto_retry"], false);
+        assert_eq!(typed["error"]["can_user_resume"], true);
+    }
+
+    #[test]
+    fn parity_terminal_overload_does_not_expose_generic_auto_retry() {
+        let event = SseEvent::StateChange {
+            sequence_id: 14,
+            state: ConvState::Error {
+                message: "capacity retry exhausted".to_string(),
+                error_kind: ErrorKind::ServerOverloaded,
+                resets_at: None,
+            },
+            presentation_mode: "error".to_string(),
+            state_updated_at: ts(),
+        };
+        assert_parity(&event);
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(typed["error"]["kind"], "server_overloaded");
         assert_eq!(typed["error"]["can_auto_retry"], false);
         assert_eq!(typed["error"]["can_user_resume"], true);
     }

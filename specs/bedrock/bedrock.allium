@@ -77,6 +77,17 @@ value QuestionRequestAuthority {
     request_id: String?
 }
 
+value ServerOverloadIncident {
+    target_kind: ordinary | continuation
+    phase: waiting | in_flight
+    attempt: Integer
+    retry_at: Timestamp?
+    started_at: Timestamp
+    deadline_at: Timestamp
+    continuation_operation_id: String?
+    rejected_tool_calls: List<ToolCall>
+}
+
 value TaskProposalSnapshot {
     task_file: String
     title: String
@@ -143,7 +154,7 @@ enum ConversationErrorKind {
 enum ToolOutcome { success | error | cancelled }
 enum SubAgentOutcome { success | implicit_completion | failure | timed_out }
 enum RecoveryKind { credential }
-enum RecoveryResumeTarget { conversation_turn | continuation_summary }
+enum RecoveryResumeTarget { conversation_turn | continuation_summary | server_overload_retry }
 enum TaskApprovalDecision {
     approved_continue_current
     | approved_start_fresh
@@ -322,7 +333,7 @@ entity Conversation {
     seed_label:  String?
 
     -- Core status (shared by both variants)
-    core_status: idle | llm_requesting | executing_tools
+    core_status: idle | llm_requesting | server_overload_retrying | executing_tools
                 | cancelling_tool | awaiting_sub_agents | cancelling_sub_agents
                 | error | awaiting_continuation | recoverable_continuation_failure
 
@@ -345,8 +356,16 @@ entity Conversation {
         error -> llm_requesting
         error -> idle
         llm_requesting -> idle
+        llm_requesting -> server_overload_retrying
         llm_requesting -> executing_tools
         llm_requesting -> error
+        server_overload_retrying -> server_overload_retrying
+        server_overload_retrying -> idle
+        server_overload_retrying -> executing_tools
+        server_overload_retrying -> error
+        server_overload_retrying -> awaiting_continuation
+        server_overload_retrying -> recoverable_continuation_failure
+        awaiting_continuation -> server_overload_retrying
         executing_tools -> llm_requesting
         executing_tools -> awaiting_sub_agents
         executing_tools -> cancelling_tool
@@ -368,6 +387,7 @@ entity Conversation {
 
     -- Core state-dependent fields
     retry_attempt: Integer when core_status = llm_requesting | awaiting_continuation | recoverable_continuation_failure
+    overload_retry: ServerOverloadIncident when core_status = server_overload_retrying
     tool_queue: List<ToolCall> when core_status = executing_tools
     tool_results: List<ToolResult> when core_status = executing_tools | cancelling_tool
     accumulated_sub_agents: Set<Conversation> when core_status = executing_tools
@@ -416,9 +436,9 @@ entity Conversation {
     write_capable_sub_agents: sub_agents where execution_authority = write_capable
 
     -- Derived
-    is_busy: core_status in { llm_requesting, executing_tools,
-                              awaiting_sub_agents, cancelling_tool,
-                              cancelling_sub_agents }
+    is_busy: core_status in { llm_requesting, server_overload_retrying,
+                              executing_tools, awaiting_sub_agents,
+                              cancelling_tool, cancelling_sub_agents }
     task_proposal_eligible: environment_kind = git_backed
         and is_git_repository(working_dir)
     context_warning: context_usage_ratio >= config.context_warning_threshold
@@ -450,6 +470,7 @@ variant Parent : Conversation {
     pending_question_authority: QuestionRequestAuthority when parent_status = awaiting_user_response
     recovery_kind: RecoveryKind when parent_status = awaiting_recovery
     recovery_resume_target: RecoveryResumeTarget when parent_status = awaiting_recovery
+    recovery_overload_retry: ServerOverloadIncident when parent_status = awaiting_recovery and recovery_resume_target = server_overload_retry
     recovery_message: String when parent_status = awaiting_recovery
     continuation_summary: String when parent_status = context_exhausted
     successor: Parent when parent_status = handed_off
@@ -489,8 +510,10 @@ variant Parent : Conversation {
     --   awaiting_task_approval -> idle            (approve into fresh conversation exits source)
     --   awaiting_user_response -> idle            (user question exits)
     --   awaiting_recovery      -> idle            (conversation-turn recovery exits)
+    --   awaiting_recovery      -> server_overload_retrying (overload recovery succeeds before its deadline and attempt cap)
+    --   awaiting_recovery      -> error            (ordinary overload recovery expires or exhausts)
     --   awaiting_recovery      -> awaiting_continuation (continuation recovery succeeds)
-    --   awaiting_recovery      -> recoverable_continuation_failure (continuation recovery fails)
+    --   awaiting_recovery      -> recoverable_continuation_failure (continuation recovery fails, expires, or exhausts)
     --   awaiting_continuation  -> context_exhausted (continuation checkpoint)
     --   context_exhausted and handed_off are row conditions inside an Open
     --   product conversation, not product-lifecycle History.
@@ -881,6 +904,65 @@ rule RetryTimeoutFires {
     ensures: LlmRequestDispatched(conversation)
 }
 
+rule FirstConversationTurnOverloadStartsIncident {
+    when: ServerOverloadObserved(conversation, failed_attempt, detected_at, retry_at, deadline_at)
+    requires: conversation.core_status = llm_requesting
+    requires: failed_attempt < 5
+    requires: retry_at < deadline_at
+    ensures: conversation.core_status = server_overload_retrying
+    ensures: conversation.overload_retry.target_kind = ordinary
+    ensures: conversation.overload_retry.phase = waiting
+    ensures: conversation.overload_retry.attempt = failed_attempt + 1
+    ensures: conversation.overload_retry.retry_at = retry_at
+    ensures: conversation.overload_retry.started_at = detected_at
+    ensures: conversation.overload_retry.deadline_at = deadline_at
+}
+
+rule OverloadRetryTimerDispatchesPersistedAttempt {
+    when: OverloadRetryTimeoutExpires(conversation, attempt)
+    requires: conversation.core_status = server_overload_retrying
+    requires: conversation.overload_retry.phase = waiting
+    requires: conversation.overload_retry.attempt = attempt
+    requires: Now() < conversation.overload_retry.deadline_at
+    ensures: conversation.overload_retry.phase = in_flight
+    ensures: conversation.overload_retry.attempt = attempt
+    ensures: OverloadTargetRequestDispatched(conversation, conversation.overload_retry)
+}
+
+rule RepeatedOverloadPreservesIncidentWindow {
+    when: ServerOverloadObserved(conversation, failed_attempt, detected_at, retry_at, deadline_at)
+    requires: conversation.core_status = server_overload_retrying
+    requires: conversation.overload_retry.phase = in_flight
+    requires: conversation.overload_retry.attempt = failed_attempt
+    requires: failed_attempt < 5
+    requires: retry_at < conversation.overload_retry.deadline_at
+    ensures: conversation.overload_retry.phase = waiting
+    ensures: conversation.overload_retry.attempt = failed_attempt + 1
+    ensures: conversation.overload_retry.retry_at = retry_at
+    ensures: conversation.overload_retry.started_at = previous(conversation.overload_retry.started_at)
+    ensures: conversation.overload_retry.deadline_at = previous(conversation.overload_retry.deadline_at)
+    ensures: conversation.overload_retry.target_kind = previous(conversation.overload_retry.target_kind)
+}
+
+rule RestoreOverloadRetryBeforeDeadline {
+    when: RuntimeStarts(conversation)
+    requires: conversation.core_status = server_overload_retrying
+    requires: Now() < conversation.overload_retry.deadline_at
+    ensures: ExactlyOneOverloadStartupAction(
+        conversation,
+        conversation.overload_retry.phase,
+        conversation.overload_retry.retry_at)
+    ensures: conversation.overload_retry.deadline_at = previous(conversation.overload_retry.deadline_at)
+}
+
+rule ExpireOverloadRetryOnRestart {
+    when: RuntimeStarts(conversation)
+    requires: conversation.core_status = server_overload_retrying
+    requires: Now() >= conversation.overload_retry.deadline_at
+    ensures: OverloadRetryCannotContinue(conversation, deadline_exhausted)
+    ensures: not ProviderRequestDispatched(conversation)
+}
+
 -- REQ-BED-006: User dismisses a persisted error, returning the conversation
 -- to idle without resuming the turn. This is the "Dismiss" affordance on the
 -- error banner, distinct from retry (error -> llm_requesting, realised by
@@ -1193,6 +1275,70 @@ rule ContinuationAuthErrorWithActiveRecovery {
     ensures: conversation.recovery_resume_target = continuation_summary
     ensures: conversation.recovery_message = error
     ensures: conversation.continuation_operation_id = operation_id
+}
+
+rule OverloadRetryAuthErrorWithActiveRecovery {
+    when: LlmErrors(conversation, message, error_class, attempt)
+    requires: conversation.core_status = server_overload_retrying
+    requires: conversation.overload_retry.phase = in_flight
+    requires: conversation.overload_retry.attempt = attempt
+    requires: error_kind = auth
+    requires: CredentialHelperIsRunning
+    ensures: conversation.parent_status = awaiting_recovery
+    ensures: conversation.recovery_kind = credential
+    ensures: conversation.recovery_resume_target = server_overload_retry
+    ensures: conversation.recovery_overload_retry = previous(conversation.overload_retry)
+    ensures: conversation.recovery_message = message
+}
+
+rule OverloadRecoverySucceededWithinBudget {
+    when: CredentialBecameAvailable(conversation)
+    requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = server_overload_retry
+    requires: conversation.recovery_overload_retry.attempt < 5
+    requires: Now() < conversation.recovery_overload_retry.deadline_at
+    ensures: conversation.core_status = server_overload_retrying
+    ensures: conversation.overload_retry = previous(conversation.recovery_overload_retry)
+    ensures: conversation.overload_retry.attempt = previous(conversation.recovery_overload_retry.attempt) + 1
+    ensures: conversation.overload_retry.phase = in_flight
+    ensures: OverloadTargetRequestDispatched(conversation, conversation.overload_retry)
+}
+
+rule OverloadRecoveryStopsAtAttemptCap {
+    when: CredentialBecameAvailable(conversation)
+    requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = server_overload_retry
+    requires: conversation.recovery_overload_retry.attempt >= 5
+    ensures: OverloadRetryCannotContinue(conversation, attempts_exhausted)
+    ensures: not ProviderRequestDispatched(conversation)
+}
+
+rule OverloadRecoveryDeadlineExpires {
+    when: OverloadRetryDeadlineExpires(conversation)
+    requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = server_overload_retry
+    requires: Now() >= conversation.recovery_overload_retry.deadline_at
+    ensures: OverloadRetryCannotContinue(conversation, deadline_exhausted)
+    ensures: not ProviderRequestDispatched(conversation)
+}
+
+rule RestoreOverloadRecoveryDeadline {
+    when: RuntimeStarts(conversation)
+    requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = server_overload_retry
+    requires: Now() < conversation.recovery_overload_retry.deadline_at
+    ensures: OverloadRecoveryDeadlineArmed(
+        conversation,
+        conversation.recovery_overload_retry.deadline_at)
+}
+
+rule ExpireOverloadRecoveryOnRestart {
+    when: RuntimeStarts(conversation)
+    requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = server_overload_retry
+    requires: Now() >= conversation.recovery_overload_retry.deadline_at
+    ensures: OverloadRetryCannotContinue(conversation, deadline_exhausted)
+    ensures: not ProviderRequestDispatched(conversation)
 }
 
 rule ConversationTurnRecoverySucceeded {
@@ -1668,6 +1814,56 @@ rule RejectCancelDuringContinuation {
     ensures: not LlmAborted(conversation)
 }
 
+-- Continuation summary generation uses the request's one retry loop. Generic
+-- transient failures retain the generic policy; selected-model capacity uses
+-- the persisted overload policy in specs/llm/llm.allium without opening a
+-- second loop at the continuation boundary.
+rule ContinuationServerOverload {
+    when: ContinuationServerOverloadObserved(conversation, operation_id, target_attempt)
+    requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
+    ensures: conversation.core_status = server_overload_retrying
+    ensures: conversation.overload_retry.target_kind = continuation
+    ensures: conversation.overload_retry.continuation_operation_id = operation_id
+    ensures: conversation.overload_retry.attempt = target_attempt
+    ensures: SameContinuationOperationOverloadRetryScheduled(conversation, operation_id, target_attempt)
+    ensures: not SecondOverloadLoopOpened(conversation, operation_id)
+}
+
+rule RestoreContinuationOverloadRetry {
+    when: RuntimeStartsWithContinuationOverload(conversation, operation_id, deadline_at)
+    requires: conversation.core_status = server_overload_retrying
+    requires: conversation.overload_retry.target_kind = continuation
+    requires: conversation.overload_retry.continuation_operation_id = operation_id
+    requires: conversation.overload_retry.deadline_at = deadline_at
+    requires: Now() < deadline_at
+    ensures: ExactlyOneContinuationOverloadStartupAction(conversation, operation_id)
+    ensures: ContinuationOverloadDeadlinePreserved(conversation, operation_id, deadline_at)
+}
+
+rule ExpireContinuationOverloadRetryOnRestart {
+    when: RuntimeStartsWithContinuationOverload(conversation, operation_id, deadline_at)
+    requires: conversation.core_status = server_overload_retrying
+    requires: conversation.overload_retry.target_kind = continuation
+    requires: conversation.overload_retry.continuation_operation_id = operation_id
+    requires: conversation.overload_retry.deadline_at = deadline_at
+    requires: Now() >= deadline_at
+    ensures: conversation.core_status = recoverable_continuation_failure
+    ensures: conversation.continuation_operation_id = operation_id
+    ensures: not ProviderRequestDispatched(conversation)
+}
+
+rule ContinuationOverloadStopsRecoverably {
+    when: ContinuationOverloadCannotContinue(conversation, operation_id, reason)
+    requires: conversation.core_status = server_overload_retrying
+    requires: conversation.overload_retry.target_kind = continuation
+    requires: conversation.overload_retry.continuation_operation_id = operation_id
+    requires: reason in { attempts_exhausted, retry_after_over_30_seconds, deadline_exhausted }
+    ensures: conversation.core_status = recoverable_continuation_failure
+    ensures: conversation.continuation_operation_id = operation_id
+    ensures: ContinuationRetryOffered(conversation, operation_id)
+}
+
 rule ContinuationRetryableError {
     when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = awaiting_continuation
@@ -1986,6 +2182,13 @@ rule CloseSettlementCapturesExactDirectTurnTargets {
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     ensures: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id, run_ordinal)
     ensures: not AdditionalCloseDirectTurnSettlementTargetMayBeCaptured(product_conversation, attempt_id, run_ordinal)
+}
+
+rule CloseSettlementRetiresOverloadAuthority {
+    when: CloseSettlementRequested(product_conversation, attempt_id)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
+    ensures: OverloadTimerAuthorityRetired(product_conversation)
+    ensures: OverloadProviderAdmissionRetired(product_conversation)
 }
 
 rule CloseObligationCanBeCancelledBeforeSettlementStarts {

@@ -937,6 +937,27 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(7);
     });
 
+    it('reconnect preserves streamingBuffer for an in-flight overload retry', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 7,
+        phase: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: null },
+        streamingBuffer: { text: 'Retrying ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
+        conversationId: 'conv-1',
+      };
+      const payload = makeInitPayload({
+        phase: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: null },
+        lastAppliedEventSeq: 7,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [tokenEntry(7, 'Retrying ')],
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer).toEqual(atom.streamingBuffer);
+      expect(next.lastAppliedEventSeq).toBe(7);
+    });
+
     // Companion to the above: if the gap is real (server emitted tokens
     // 8, 9 while the atom was offline), pending tokens above the floor
     // extend the preserved buffer.
@@ -1580,6 +1601,82 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(13);
     });
 
+    it('clears retry context on every terminal error state change', () => {
+      const retryContext = {
+        attempt: 3,
+        maxAttempts: 5,
+        reason: 'server_overloaded' as const,
+        reasonText: 'server overloaded',
+        backingOffMs: 4_000,
+        resetsAt: null,
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        turnRetryContext: retryContext,
+      };
+      const waiting = dispatch(atom, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'server_overload_retrying', attempt: 3, maxAttempts: 5, retryAt: Date.now() + 4_000 },
+        stateUpdatedAt: 1,
+      });
+      expect(waiting.turnRetryContext).toBe(retryContext);
+
+      for (const phase of [
+        {
+          type: 'error',
+          message: 'bad request',
+          error_kind: 'invalid_request',
+        },
+        {
+          type: 'recoverable_continuation_failure',
+          message: 'connection reset',
+          error_kind: 'network',
+          operation_id: 'op-1',
+          attempt: 3,
+        },
+      ] as const) {
+        const terminal = dispatch(atom, {
+          type: 'sse_state_change',
+          sequenceId: 1,
+          phase,
+          stateUpdatedAt: 1,
+        });
+        expect(terminal.turnRetryContext).toBeNull();
+        expect(terminal.phase).toEqual(phase);
+      }
+    });
+
+    it('clears an overload in-flight buffer when retry returns to waiting or terminates', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: null },
+        streamingBuffer: {
+          text: 'partial retry response',
+          lastSequence: 2,
+          startedAt: 1,
+          requestId: 'overload-attempt-2',
+        },
+        lastAppliedEventSeq: 2,
+      };
+
+      const waiting = dispatch(atom, {
+        type: 'sse_state_change',
+        sequenceId: 3,
+        phase: { type: 'server_overload_retrying', attempt: 3, maxAttempts: 5, retryAt: 5_000 },
+        stateUpdatedAt: 3,
+      });
+      expect(waiting.streamingBuffer).toBeNull();
+
+      const terminal = dispatch(atom, {
+        type: 'sse_state_change',
+        sequenceId: 3,
+        phase: { type: 'error', message: 'capacity exhausted', error_kind: 'server_overloaded' },
+        stateUpdatedAt: 3,
+      });
+      expect(terminal.streamingBuffer).toBeNull();
+    });
+
     it('is a no-op for sequenceId already seen', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 10 };
 
@@ -1913,6 +2010,38 @@ describe('conversationReducer', () => {
 
       expect(s2.streamingBuffer?.text).toBe('Hello world');
       expect(s2.lastAppliedEventSeq).toBe(2);
+    });
+
+    it('accepts tokens during an in-flight ordinary overload retry', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: null },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 1,
+        delta: 'resumed',
+        requestId: 'overload-attempt-2',
+      });
+
+      expect(next.streamingBuffer?.text).toBe('resumed');
+    });
+
+    it('drops tokens while an overload retry is still waiting', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: Date.now() + 10_000 },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 1,
+        delta: 'premature',
+        requestId: 'overload-attempt-2',
+      });
+
+      expect(next.streamingBuffer).toBeNull();
     });
 
     it('is a no-op for duplicate or out-of-order sequence', () => {

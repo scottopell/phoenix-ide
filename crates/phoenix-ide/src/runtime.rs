@@ -1767,6 +1767,23 @@ pub struct CachedPrSummary {
 /// Produces the same JSON shape as the old `conversation_to_json()` `Value`:
 /// all `Conversation` fields at the top level (via `#[serde(flatten)]`) plus
 /// the extra display fields.
+pub(crate) fn public_conversation_state(state: &ConvState) -> serde_json::Value {
+    match state {
+        ConvState::ServerOverloadRetrying { retry } => serde_json::json!({
+            "type": "server_overload_retrying",
+            "attempt": retry.attempt,
+            "max_attempts": phoenix_core::domain::retry_policy::OVERLOAD_MAX_ATTEMPTS,
+            "retry_at": match &retry.phase {
+                phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting { retry_at } => {
+                    Some(retry_at)
+                }
+                phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight => None,
+            },
+        }),
+        _ => serde_json::to_value(state).unwrap_or(serde_json::Value::Null),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PresentationConversation(pub crate::db::Conversation);
 
@@ -1780,6 +1797,10 @@ impl serde::Serialize for PresentationConversation {
             .as_object_mut()
             .ok_or_else(|| serde::ser::Error::custom("Conversation must serialize as an object"))?;
         object.remove("product_conversation_id");
+        object.insert(
+            "state".to_string(),
+            public_conversation_state(&self.0.state),
+        );
         value.serialize(serializer)
     }
 }
@@ -3760,6 +3781,7 @@ impl RuntimeManager {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn settle_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
         let conversation_ids = self.startup_llm_recovery_conversation_ids().await?;
         for conversation_id in conversation_ids {
@@ -3795,10 +3817,27 @@ impl RuntimeManager {
                     has_resumable_occurrence,
                 )
                 .await?;
+            if matches!(
+                &conversation.state,
+                ConvState::ServerOverloadRetrying { retry } if retry.deadline_at <= chrono::Utc::now()
+            ) {
+                self.settle_persisted_llm_request(&conversation_id).await?;
+                continue;
+            }
             let stored_model_id = conversation
                 .model
                 .unwrap_or_else(|| self.llm_registry.default_model_id());
-            if let Err(error) = self.llm_registry.resolve_model_id(&stored_model_id) {
+            let persisted_overload_model = persisted_overload_model(&conversation.state);
+            let model_to_initialize = persisted_overload_model.unwrap_or(&stored_model_id);
+            let model_resolution = self.llm_registry.resolve_model_id(model_to_initialize);
+            let initialization_error = match (&model_resolution, persisted_overload_model) {
+                (Err(error), _) => Some(error.clone()),
+                (Ok(resolved), Some(exact)) if resolved != exact => Some(format!(
+                    "Overload recovery cannot replace selected model '{exact}' with '{resolved}'"
+                )),
+                _ => None,
+            };
+            if let Some(error) = initialization_error {
                 tracing::error!(
                     conv_id = %conversation_id,
                     %error,
@@ -4917,6 +4956,17 @@ impl RuntimeManager {
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
         self.require_local_authority_admission()?;
+        if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
+            return Ok(handle);
+        }
+        let conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(parent_id) = conversation.parent_conversation_id.as_deref() {
+            Box::pin(self.get_or_create(parent_id)).await?;
+        }
         self.get_or_create_inner(conversation_id, None).await
     }
 
@@ -5640,12 +5690,19 @@ impl RuntimeManager {
             )
         };
 
-        // Resolve model once: use conversation's stored model, or fall back to registry default
-        let stored_model_id = conv
-            .model
-            .clone()
-            .unwrap_or_else(|| self.llm_registry.default_model_id());
-        let model_id = self.llm_registry.resolve_model_id(&stored_model_id)?;
+        // An overload incident owns its already-resolved model identity. Do not
+        // run that identity through catalog replacement after restart: doing so
+        // would silently move the admitted request to another selected model.
+        let persisted_overload_model = persisted_overload_model(&conv.state);
+        let model_id = if let Some(model_id) = persisted_overload_model {
+            model_id.to_string()
+        } else {
+            let stored_model_id = conv
+                .model
+                .clone()
+                .unwrap_or_else(|| self.llm_registry.default_model_id());
+            self.llm_registry.resolve_model_id(&stored_model_id)?
+        };
         let context_window = self.llm_registry.context_window(&model_id);
         let approved_task_objective = self
             .db
@@ -6103,6 +6160,7 @@ impl RuntimeManager {
             broadcaster.clone(),
         );
         let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
+
         let runtime = runtime
             .with_wake_registrar(self.wake_registrar())
             .with_startup_llm_recovery(startup_llm_recovery)
@@ -6996,7 +7054,8 @@ impl RuntimeManager {
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
-            | ConvState::SeededLlmRequesting { .. } => true,
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ServerOverloadRetrying { .. } => true,
             ConvState::Error { error_kind, .. } => error_kind.is_user_resumable(),
             _ => false,
         };
@@ -7255,6 +7314,18 @@ async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> Stri
         }
     }
     current_id
+}
+
+fn persisted_overload_model(state: &ConvState) -> Option<&str> {
+    match state {
+        ConvState::ServerOverloadRetrying { retry }
+        | ConvState::AwaitingRecovery {
+            resume:
+                phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { retry },
+            ..
+        } => Some(retry.model_id.as_str()),
+        _ => None,
+    }
 }
 
 /// Convert a database `ConvMode` into a `ModeContext` for the system prompt.
@@ -11521,6 +11592,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_materializes_persisted_continuation_operations() {
         let manager = Arc::new(test_manager().await);
         for (id, state) in [
@@ -11564,6 +11636,89 @@ mod scope_liveness_tests {
                         },
                 },
             ),
+            (
+                "ordinary-overload",
+                ConvState::ServerOverloadRetrying {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                            retry_at: Utc::now() + chrono::Duration::minutes(1),
+                        },
+                        attempt: 2,
+                        started_at: Utc::now(),
+                        deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                        logical_request_id: "logical-request".to_string(),
+                        model_id: "test-model".to_string(),
+                    },
+                },
+            ),
+            (
+                "continuation-overload",
+                ConvState::ServerOverloadRetrying {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target:
+                            phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation {
+                                operation_id: "op-overload".to_string(),
+                                rejected_tool_calls: Vec::new(),
+                            },
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                            retry_at: Utc::now() + chrono::Duration::minutes(1),
+                        },
+                        attempt: 2,
+                        started_at: Utc::now(),
+                        deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                        logical_request_id: "logical-request".to_string(),
+                        model_id: "test-model".to_string(),
+                    },
+                },
+            ),
+            (
+                "ordinary-overload-auth",
+                ConvState::AwaitingRecovery {
+                    message: "authentication required".to_string(),
+                    error_kind: crate::db::ErrorKind::Auth,
+                    recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                    resume:
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                                target:
+                                    phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                                phase:
+                                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                                attempt: 3,
+                                started_at: Utc::now(),
+                                deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                                logical_request_id: "logical-request".to_string(),
+                                model_id: "test-model".to_string(),
+                            },
+                        },
+                },
+            ),
+            (
+                "continuation-overload-auth",
+                ConvState::AwaitingRecovery {
+                    message: "authentication required".to_string(),
+                    error_kind: crate::db::ErrorKind::Auth,
+                    recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                    resume:
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                                target:
+                                    phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation {
+                                        operation_id: "op-overload-auth".to_string(),
+                                        rejected_tool_calls: Vec::new(),
+                                    },
+                                phase:
+                                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                                attempt: 3,
+                                started_at: Utc::now(),
+                                deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                                logical_request_id: "logical-request".to_string(),
+                                model_id: "test-model".to_string(),
+                            },
+                        },
+                },
+            ),
         ] {
             manager
                 .db()
@@ -11579,6 +11734,31 @@ mod scope_liveness_tests {
         manager
             .db()
             .create_conversation("idle", "idle", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .create_conversation(
+                "legacy-conversation-turn-recovery",
+                "legacy-conversation-turn-recovery",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                "legacy-conversation-turn-recovery",
+                &ConvState::AwaitingRecovery {
+                    message: "authentication required".to_string(),
+                    error_kind: crate::db::ErrorKind::Auth,
+                    recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                    resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ConversationTurn,
+                },
+            )
             .await
             .unwrap();
         let coordinator = manager
@@ -11601,13 +11781,49 @@ mod scope_liveness_tests {
             .await
             .unwrap();
 
-        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 4);
+        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 8);
         let runtimes = manager.runtimes.read().await;
         assert!(runtimes.contains_key("awaiting-continuation"));
         assert!(runtimes.contains_key("recoverable-continuation"));
         assert!(runtimes.contains_key("awaiting-continuation-auth"));
+        assert!(runtimes.contains_key("ordinary-overload"));
+        assert!(runtimes.contains_key("continuation-overload"));
+        let ordinary_overload_auth_tx = runtimes
+            .get("ordinary-overload-auth")
+            .expect("ordinary overload recovery is materialized")
+            .event_tx
+            .clone();
+        let continuation_overload_auth_tx = runtimes
+            .get("continuation-overload-auth")
+            .expect("continuation overload recovery is materialized")
+            .event_tx
+            .clone();
         assert!(runtimes.contains_key(&coordinator.id));
         assert!(!runtimes.contains_key("idle"));
+        assert!(!runtimes.contains_key("legacy-conversation-turn-recovery"));
+        let materialized_count = runtimes.len();
+        drop(runtimes);
+
+        manager.resume_pending_continuations().await.unwrap();
+        let runtimes = manager.runtimes.read().await;
+        assert_eq!(
+            runtimes.len(),
+            materialized_count,
+            "runtime keys changed: {:?}",
+            runtimes.keys().collect::<Vec<_>>()
+        );
+        assert!(ordinary_overload_auth_tx.same_channel(
+            &runtimes
+                .get("ordinary-overload-auth")
+                .expect("ordinary overload recovery remains materialized once")
+                .event_tx
+        ));
+        assert!(continuation_overload_auth_tx.same_channel(
+            &runtimes
+                .get("continuation-overload-auth")
+                .expect("continuation overload recovery remains materialized once")
+                .event_tx
+        ));
     }
 
     #[tokio::test]
@@ -11847,6 +12063,14 @@ mod scope_liveness_tests {
         let conversation_id = "single-flight-one-error";
         let broadcaster = mgr.conversation_broadcaster(conversation_id).await;
         let mut receiver = broadcaster.subscribe();
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        mgr.runtime_materialization_panics
+            .lock()
+            .await
+            .insert(conversation_id.to_string());
 
         let first = {
             let mgr = Arc::clone(&mgr);
@@ -11859,7 +12083,11 @@ mod scope_liveness_tests {
         assert!(first.await.expect("first caller joins").is_err());
         assert!(second.await.expect("second caller joins").is_err());
 
-        assert!(matches!(receiver.try_recv(), Ok(SseEvent::Error { .. })));
+        let first_event = receiver.try_recv();
+        assert!(
+            matches!(first_event, Ok(SseEvent::Error { .. })),
+            "expected one materialization error event, got {first_event:?}"
+        );
         assert!(matches!(
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
@@ -15414,6 +15642,43 @@ mod scope_liveness_tests {
             .await
             .expect("reconstruct committed skill steer");
         assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_overload_retry() {
+        use phoenix_core::domain::sm_state::{
+            ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+        };
+
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("overload", "overload", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let started_at = Utc::now();
+        let expected = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Ordinary,
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 3,
+                started_at,
+                deadline_at: started_at + chrono::Duration::minutes(5),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
+            },
+        };
+        mgr.db()
+            .update_conversation_state("overload", &expected)
+            .await
+            .expect("persist overload retry");
+
+        let (state, _ts, needs_auto_continue) = mgr
+            .determine_resume_state("overload")
+            .await
+            .expect("resume overload retry");
+        assert_eq!(state, expected);
         assert!(!needs_auto_continue);
     }
 

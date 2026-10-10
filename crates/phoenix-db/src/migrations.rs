@@ -616,6 +616,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_question_wait_events",
         sql: include_str!("coordinator_watches/question_wait_outbox.sql"),
     },
+    Migration {
+        version: 121,
+        name: "admit_server_overload_retrying_state",
+        sql: MIGRATION_121,
+    },
 ];
 
 const MIGRATION_119: &str = r"
@@ -1749,6 +1754,114 @@ BEGIN
       (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = NEW.id);
 END;
 ";
+
+const MIGRATION_121: &str = r"
+UPDATE sqlite_schema
+SET sql = replace(
+    sql,
+    '''idle'', ''llm_requesting'', ''tool_executing''',
+    '''idle'', ''llm_requesting'', ''server_overload_retrying'', ''tool_executing'''
+)
+WHERE type = 'table'
+  AND name = 'conversations'
+  AND instr(sql, '''idle'', ''llm_requesting'', ''tool_executing''') > 0
+  AND instr(sql, '''server_overload_retrying''') = 0;
+
+UPDATE sqlite_schema
+SET sql = replace(
+    sql,
+    '''idle'', ''llm_requesting'', ''tool_executing''',
+    '''idle'', ''llm_requesting'', ''server_overload_retrying'', ''tool_executing'''
+)
+WHERE type = 'table'
+  AND name = 'close_attempt_members'
+  AND instr(sql, '''idle'', ''llm_requesting'', ''tool_executing''') > 0
+  AND instr(sql, '''server_overload_retrying''') = 0
+";
+
+#[cfg(test)]
+mod migration_121_tests {
+    use super::{run_pending_migrations, MIGRATIONS};
+    use sqlx::{sqlite::SqlitePoolOptions, Row};
+
+    #[tokio::test]
+    async fn migrates_pre_overload_schema_and_records_rollback_boundary() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                state_kind TEXT NOT NULL CHECK (state_kind IN ('idle', 'llm_requesting', 'tool_executing'))
+             );
+             CREATE TABLE close_attempt_members (
+                attempt_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                captured_state_kind TEXT NOT NULL CHECK (captured_state_kind IN ('idle', 'llm_requesting', 'tool_executing'))
+             );
+             CREATE TABLE _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 120)
+        {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let schema: String =
+            sqlx::query("SELECT sql FROM sqlite_schema WHERE name = 'conversations'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("sql");
+        assert!(schema.contains("'server_overload_retrying'"));
+        let close_schema: String =
+            sqlx::query("SELECT sql FROM sqlite_schema WHERE name = 'close_attempt_members'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("sql");
+        assert!(close_schema.contains("'server_overload_retrying'"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 121")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query("INSERT INTO conversations (id, state_kind) VALUES ('retry', 'server_overload_retrying')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO close_attempt_members (attempt_id, conversation_id, captured_state_kind) VALUES ('close', 'retry', 'server_overload_retrying')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        let captured: String = sqlx::query_scalar(
+            "SELECT captured_state_kind FROM close_attempt_members WHERE attempt_id = 'close'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(captured, "server_overload_retrying");
+    }
+}
 
 const MIGRATION_110: &str = r"
 ALTER TABLE messages ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
@@ -11157,6 +11270,70 @@ async fn apply_migration_body(
     Ok(())
 }
 
+async fn run_migration_121(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        let mut tx = guard.connection().begin().await?;
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+            .fetch_one(&mut *tx)
+            .await?;
+        let schema: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'conversations'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let close_schema: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'close_attempt_members'",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let conversations_need_update = !schema.contains("'server_overload_retrying'");
+        let close_needs_update = close_schema
+            .as_deref()
+            .is_some_and(|schema| !schema.contains("'server_overload_retrying'"));
+        if conversations_need_update || close_needs_update {
+            sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+            let updated_conversations: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'conversations'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let updated_close: Option<String> = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'close_attempt_members'",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if !updated_conversations.contains("'server_overload_retrying'")
+                || updated_close
+                    .as_deref()
+                    .is_some_and(|schema| !schema.contains("'server_overload_retrying'"))
+            {
+                return Err(DbError::Serialization(
+                    "migration 121 expected overload-compatible conversation and Close schemas"
+                        .to_string(),
+                ));
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA schema_version = {}",
+                schema_version + 1
+            )))
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+            .bind(migration.version)
+            .bind(migration.name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -11217,6 +11394,12 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
         if migration.version == 119 {
             run_migration_119(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 121 {
+            run_migration_121(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -12775,19 +12958,26 @@ mod tests {
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let expected_tail = [
+            (121, "admit_server_overload_retrying_state"),
+            (120, "coordinator_question_wait_events"),
+            (119, "close_cleanup_failures"),
+            (118, "persist_mcp_token_removals"),
+            (117, "persist_conversation_tool_policy"),
+            (116, "federation_peer_connections"),
+            (115, "federation_enrollments"),
+            (114, "persist_instance_identity"),
+            (113, "settle_historical_continuation_openings"),
+            (112, "input_source_tool_call"),
+        ];
         assert_eq!(
-            ledger.iter().rev().take(9).copied().collect::<Vec<_>>(),
-            vec![
-                (120, "coordinator_question_wait_events"),
-                (119, "close_cleanup_failures"),
-                (118, "persist_mcp_token_removals"),
-                (117, "persist_conversation_tool_policy"),
-                (116, "federation_peer_connections"),
-                (115, "federation_enrollments"),
-                (114, "persist_instance_identity"),
-                (113, "settle_historical_continuation_openings"),
-                (112, "input_source_tool_call"),
-            ]
+            ledger
+                .iter()
+                .rev()
+                .take(expected_tail.len())
+                .copied()
+                .collect::<Vec<_>>(),
+            expected_tail
         );
     }
 

@@ -625,6 +625,24 @@ mod random_walk {
                 },
             },
 
+            ConvState::ServerOverloadRetrying { retry } => match retry.phase {
+                phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting { .. } => {
+                    Event::RetryTimeout {
+                        attempt: retry.attempt,
+                    }
+                }
+                phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight => {
+                    Event::ServerOverloaded {
+                        message: "still overloaded".to_string(),
+                        detected_at: chrono::Utc::now(),
+                        guidance: None,
+
+                        logical_request_id: "logical-request".to_string(),
+                        model_id: "test-model".to_string(),
+                    }
+                }
+            },
+
             ConvState::LlmRequesting { attempt }
             | ConvState::SeededLlmRequesting { attempt, .. } => {
                 match rng.random_range(0..4) {
@@ -660,6 +678,7 @@ mod random_walk {
                             error_kind,
                             attempt: *attempt,
                             recovery_in_progress: recovery,
+                            observed_at: chrono::Utc::now(),
                             resets_at: None,
                         }
                     }
@@ -790,7 +809,9 @@ mod random_walk {
             }
 
             ConvState::AwaitingRecovery { .. } => match rng.random_range(0..3) {
-                0 => Event::CredentialBecameAvailable,
+                0 => Event::CredentialBecameAvailable {
+                    observed_at: chrono::Utc::now(),
+                },
                 1 => Event::CredentialHelperFailed {
                     message: random_string(rng, 15),
                 },
@@ -817,6 +838,7 @@ mod random_walk {
                         error_kind,
                         attempt: request.attempt,
                         recovery_in_progress: false,
+                        observed_at: chrono::Utc::now(),
                         resets_at: None,
                     }
                 }

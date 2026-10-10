@@ -73,7 +73,7 @@ impl ErrorPresentation {
     fn from_kind(kind: &ErrorKind) -> Self {
         Self {
             kind: kind.clone(),
-            can_auto_retry: kind.is_auto_retryable(),
+            can_auto_retry: kind.is_generic_auto_retryable(),
             can_user_resume: kind.is_user_resumable(),
         }
     }
@@ -556,7 +556,7 @@ impl From<SseEvent> for SseWireEvent {
                 let error = state.error_kind().map(ErrorPresentation::from_kind);
                 SseWireEvent::StateChange {
                     sequence_id,
-                    state: serde_json::to_value(&state).unwrap_or(Value::Null),
+                    state: crate::runtime::public_conversation_state(&state),
                     presentation_mode,
                     state_updated_at,
                     error,
