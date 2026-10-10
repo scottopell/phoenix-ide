@@ -492,7 +492,9 @@ impl GlobalReadService {
                         position.message_id = Some(sha256_hex(&message.message_id));
                     }
                 }
-                let continuation_target = if transcript_ref.len() <= 1024 {
+                let continuation_target = if serde_json::to_vec(&transcript_ref)
+                    .is_ok_and(|encoded| encoded.len() <= 1024)
+                {
                     transcript_ref.clone()
                 } else {
                     bounded_transcript_ref(target)
@@ -779,12 +781,13 @@ fn bounded_message_provenance(transcript_id: &str, message_id: &str) -> Previous
         "{}#message-{message_id}",
         bounded_transcript_ref(transcript_id)
     );
-    if message_ref.len() <= 1024
-        && message_id
-            .chars()
-            .all(|character| !character.is_whitespace() && character != '#')
+    let typed_reference = PreviousMessageProvenance::MessageRef { message_ref };
+    if message_id
+        .chars()
+        .all(|character| !character.is_whitespace() && character != '#')
+        && serde_json::to_vec(&typed_reference).is_ok_and(|encoded| encoded.len() <= 1024)
     {
-        PreviousMessageProvenance::MessageRef { message_ref }
+        typed_reference
     } else {
         PreviousMessageProvenance::MessageIdSha256 {
             message_id_sha256: sha256_hex(message_id),
@@ -2552,6 +2555,64 @@ mod previous_transcripts_tests {
             decode_previous_cursor(Some(&encoded), &binding, Some("prev#message-b")),
             Err(PreviousTranscriptsOutput::InvalidCursor)
         ));
+    }
+
+    #[tokio::test]
+    async fn predecessor_read_pages_escaped_identity_and_body_without_truncation() {
+        let (db, service, binding) = fixture().await;
+        let message_id = "\u{1}".repeat(900);
+        let body = "\u{1}".repeat(4_096);
+        db.add_message(
+            &message_id,
+            "prev-root",
+            &MessageContent::User(UserContent::new(body.clone())),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut target = format!("@transcript:prev-root#message-{message_id}");
+        let mut cursor = None;
+        let mut collected = String::new();
+        let mut pages = 0;
+        loop {
+            let page = service
+                .previous_transcripts(
+                    &binding,
+                    PreviousTranscriptsRequest::Read {
+                        transcript_ref: target.clone(),
+                        cursor,
+                    },
+                )
+                .await;
+            assert_ne!(page, PreviousTranscriptsOutput::ResultTruncated);
+            assert!(serialize_previous_output(&page).len() <= PREVIOUS_RESULT_BYTES);
+            let PreviousTranscriptsOutput::ReadPage {
+                transcript_ref,
+                provenance,
+                content,
+                next_cursor,
+            } = page
+            else {
+                panic!("{page:?}")
+            };
+            assert_eq!(
+                provenance,
+                Some(PreviousMessageProvenance::MessageIdSha256 {
+                    message_id_sha256: sha256_hex(&message_id)
+                })
+            );
+            collected.push_str(&content);
+            pages += 1;
+            target = transcript_ref;
+            cursor = next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(pages < 10);
+        }
+        assert_eq!(collected.matches('\u{1}').count(), body.len());
+        assert!(pages > 1);
     }
 
     #[tokio::test]

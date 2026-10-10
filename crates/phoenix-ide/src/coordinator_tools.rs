@@ -19,8 +19,36 @@ mod previous_transcripts_tool_tests {
     use super::*;
 
     #[tokio::test]
-    async fn schema_is_closed_and_does_not_accept_scope_or_mutation_arguments() {
-        let schema = PreviousTranscriptsTool {
+    async fn host_injected_schema_is_provider_compatible_and_closed() {
+        let tool = previous_transcripts_tool(
+            test_service().await,
+            phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                "test-product",
+            )
+            .unwrap(),
+            "test-transcript".into(),
+        );
+        let schema = tool.input_schema();
+        assert_eq!(tool.name(), "previous_transcripts");
+        assert_eq!(schema["type"], "object");
+        for rejected in ["oneOf", "allOf", "anyOf"] {
+            assert!(
+                schema.get(rejected).is_none(),
+                "root {rejected} is rejected by Anthropic"
+            );
+        }
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], serde_json::json!(["op"]));
+        assert!(schema["properties"]
+            .get("product_conversation_id")
+            .is_none());
+        assert!(schema["properties"].get("conversation_id").is_none());
+        assert!(schema["properties"].get("write").is_none());
+    }
+
+    #[tokio::test]
+    async fn rust_request_validation_enforces_closed_operation_shapes() {
+        let tool = PreviousTranscriptsTool {
             service: test_service().await,
             binding: PreviousTranscriptsBinding::new(
                 phoenix_core::domain::product_conversation::ProductConversationId::parse(
@@ -29,15 +57,47 @@ mod previous_transcripts_tool_tests {
                 .unwrap(),
                 "test-transcript".into(),
             ),
+        };
+        for invalid in [
+            serde_json::json!({"op":"search"}),
+            serde_json::json!({"op":"read"}),
+            serde_json::json!({"op":"list","query":"widen"}),
+            serde_json::json!({"op":"delete"}),
+        ] {
+            let output = tool.run(invalid, test_context()).await;
+            assert!(
+                matches!(output, ToolOutput::Error { .. }),
+                "invalid operation shape must be rejected"
+            );
         }
-        .input_schema();
-        let serialized = schema.to_string();
-        assert!(!serialized.contains("product_conversation_id"));
-        assert!(!serialized.contains("conversation_id"));
-        assert!(!serialized.contains("write"));
-        for branch in schema["oneOf"].as_array().unwrap() {
-            assert_eq!(branch["additionalProperties"], false);
+    }
+
+    fn test_context() -> ToolContext {
+        struct NoLlm;
+        impl phoenix_core::llm_service::LlmSelector for NoLlm {
+            fn get(
+                &self,
+                _model_id: &str,
+            ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+                None
+            }
+
+            fn default_service(
+                &self,
+            ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+                None
+            }
         }
+
+        ToolContext::new_without_filesystem(
+            tokio_util::sync::CancellationToken::new(),
+            "test-transcript".into(),
+            Arc::new(crate::tools::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+        )
     }
 
     async fn test_service() -> GlobalReadService {
@@ -68,11 +128,15 @@ impl Tool for PreviousTranscriptsTool {
 
     fn input_schema(&self) -> Value {
         json!({
-            "oneOf": [
-                {"type":"object","properties":{"op":{"const":"list"},"cursor":{"type":"string"}},"required":["op"],"additionalProperties":false},
-                {"type":"object","properties":{"op":{"const":"search"},"query":{"type":"string","minLength":1,"maxLength":1024}},"required":["op","query"],"additionalProperties":false},
-                {"type":"object","properties":{"op":{"const":"read"},"transcript_ref":{"type":"string","pattern":"^@transcript(?:-sha256)?:[^\\s#]+(?:#message-[^\\s#]+)?$"},"cursor":{"type":"string"}},"required":["op","transcript_ref"],"additionalProperties":false}
-            ]
+            "type": "object",
+            "properties": {
+                "op": {"type":"string","enum":["list","search","read"]},
+                "cursor": {"type":"string"},
+                "query": {"type":"string","minLength":1,"maxLength":1024},
+                "transcript_ref": {"type":"string","pattern":"^@transcript(?:-sha256)?:[^\\s#]+(?:#message-[^\\s#]+)?$"}
+            },
+            "required": ["op"],
+            "additionalProperties": false
         })
     }
 
