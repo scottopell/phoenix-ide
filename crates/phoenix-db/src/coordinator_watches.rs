@@ -378,6 +378,7 @@ pub(crate) async fn record_wait_entry_tx(
         ConvState::Idle
         | ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
+        | ConvState::ServerOverloadRetrying { .. }
         | ConvState::Provisioning { .. }
         | ConvState::CreationCancelled { .. }
         | ConvState::ToolExecuting { .. }
@@ -604,6 +605,60 @@ mod tests {
             panic!("turn was not created")
         };
         turn_id.0
+    }
+
+    #[tokio::test]
+    async fn overload_retry_is_active_work_not_a_wait_event() {
+        use phoenix_core::domain::sm_state::{
+            ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-overload", "watch-overload", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let turn_id = source_turn(&db, &source.id, "active-overload-turn").await;
+        let started_at = Utc::now();
+        let retrying = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Ordinary,
+                phase: ServerOverloadPhase::Waiting {
+                    retry_at: started_at + chrono::Duration::seconds(4),
+                },
+                attempt: 2,
+                started_at,
+                deadline_at: started_at + chrono::Duration::seconds(120),
+                logical_request_id: "watch-overload-request".into(),
+                model_id: "test-model".into(),
+            },
+        };
+
+        db.update_conversation_state(&source.id, &retrying)
+            .await
+            .unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none(), "overload retry must remain active work");
+
+        db.update_conversation_state(&source.id, &ConvState::Completed { result: None })
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, WatchOutcome::Completed);
     }
 
     #[tokio::test]
