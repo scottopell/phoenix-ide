@@ -7,7 +7,7 @@ describe('parseConversationState recovery', () => {
     const state = parseConversationState({
       type: 'server_overload_retrying',
       retry: {
-        target: { type: 'ordinary' },
+        target: 'ordinary',
         phase: { type: 'waiting', retry_at: '2026-01-01T00:00:30Z' },
         attempt: 3,
       },
@@ -18,10 +18,27 @@ describe('parseConversationState recovery', () => {
       attempt: 3,
       maxAttempts: 5,
       retryAt: Date.parse('2026-01-01T00:00:30Z'),
+      target: 'ordinary',
     });
     expect(isAgentWorking(state)).toBe(true);
     expect(canCancelConversationState(state)).toBe(true);
     expect(canChangeModelInState(state)).toBe(false);
+  });
+
+  it('parses the public continuation overload discriminator without private target payload', () => {
+    expect(parseConversationState({
+      type: 'server_overload_retrying',
+      attempt: 2,
+      max_attempts: 5,
+      retry_at: null,
+      target: 'continuation',
+    })).toEqual({
+      type: 'server_overload_retrying',
+      attempt: 2,
+      maxAttempts: 5,
+      retryAt: null,
+      target: 'continuation',
+    });
   });
 
   it('preserves an overload recovery resume target without semantic substitution', () => {
@@ -41,6 +58,8 @@ describe('parseConversationState recovery', () => {
           attempt: 3,
           started_at: '2026-01-01T00:00:00Z',
           deadline_at: '2026-01-01T00:02:00Z',
+          logical_request_id: 'logical-request-7',
+          model_id: 'resolved-model-7',
         },
       },
     });
@@ -61,6 +80,8 @@ describe('parseConversationState recovery', () => {
           attempt: 3,
           started_at: '2026-01-01T00:00:00Z',
           deadline_at: '2026-01-01T00:02:00Z',
+          logical_request_id: 'logical-request-7',
+          model_id: 'resolved-model-7',
         },
       },
     });

@@ -389,6 +389,11 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         ConvState::Error { .. } => Err(TransitionError::NonResumableError),
 
         // transition_core: AgentBusy
+        ConvState::ServerOverloadRetrying { retry }
+            if matches!(retry.target, ServerOverloadTarget::Continuation { .. }) =>
+        {
+            Err(TransitionError::ContextExhausted)
+        }
         ConvState::LlmRequesting { .. }
         | ConvState::ServerOverloadRetrying { .. }
         | ConvState::SeededLlmRequesting { .. }
@@ -463,6 +468,11 @@ pub fn transition(
         });
     }
     if let ConvState::ServerOverloadRetrying { retry } = state {
+        if matches!(retry.target, ServerOverloadTarget::Continuation { .. })
+            && matches!(&event, Event::UserMessage { .. })
+        {
+            return Err(TransitionError::ContextExhausted);
+        }
         if matches!(retry.phase, ServerOverloadPhase::InFlight) {
             if let Event::LlmResponse { .. } = event {
                 if context.is_sub_agent {
@@ -4515,6 +4525,49 @@ mod tests {
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    #[test]
+    fn overload_admission_distinguishes_ordinary_and_continuation_targets() {
+        let now = chrono::Utc::now();
+        let retry = |target| ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target,
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 2,
+                started_at: now,
+                deadline_at: now + chrono::Duration::seconds(120),
+                logical_request_id: "admission-request".into(),
+                model_id: "test-model".into(),
+            },
+        };
+        let event = Event::UserMessage {
+            text: "follow up".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "admission-message".into(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let ordinary = retry(ServerOverloadTarget::Ordinary);
+        assert!(matches!(
+            check_user_message_acceptable(&ordinary),
+            Err(TransitionError::AgentBusy)
+        ));
+
+        let continuation = retry(ServerOverloadTarget::Continuation {
+            operation_id: "summary-op".into(),
+            rejected_tool_calls: vec![],
+        });
+        assert!(matches!(
+            check_user_message_acceptable(&continuation),
+            Err(TransitionError::ContextExhausted)
+        ));
+        assert!(matches!(
+            transition(&continuation, &test_context(), event),
+            Err(TransitionError::ContextExhausted)
+        ));
     }
 
     fn test_tool_call(id: &str) -> ToolCall {

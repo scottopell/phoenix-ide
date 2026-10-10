@@ -39,7 +39,7 @@ final class ConversationStateTests: XCTestCase {
         """)
         XCTAssertEqual(
             waiting,
-            .serverOverloadRetrying(attempt: 3, maxAttempts: 5, retryAt: "2026-01-01T00:00:20Z"))
+            .serverOverloadRetrying(attempt: 3, maxAttempts: 5, retryAt: "2026-01-01T00:00:20Z", continuationTarget: false))
         XCTAssertTrue(waiting.isKnownWorkingState)
         XCTAssertTrue(waiting.isCancellable)
         XCTAssertTrue(waiting.acceptsChatMessage)
@@ -48,7 +48,27 @@ final class ConversationStateTests: XCTestCase {
             parse("""
             {"type":"server_overload_retrying","retry":{"attempt":4,"phase":{"type":"in_flight"}}}
             """),
-            .serverOverloadRetrying(attempt: 4, maxAttempts: 5, retryAt: nil))
+            .serverOverloadRetrying(attempt: 4, maxAttempts: 5, retryAt: nil, continuationTarget: false))
+    }
+
+    func testContinuationOverloadDoesNotAcceptChatMessage() throws {
+        let continuation = try XCTUnwrap(parse("""
+        {
+          "type":"server_overload_retrying",
+          "attempt":2,
+          "max_attempts":5,
+          "retry_at":null,
+          "target":"continuation"
+        }
+        """))
+        XCTAssertEqual(
+            continuation,
+            .serverOverloadRetrying(
+                attempt: 2,
+                maxAttempts: 5,
+                retryAt: nil,
+                continuationTarget: true))
+        XCTAssertFalse(continuation.acceptsChatMessage)
     }
 
     func testOverloadRetryCountdownParsesFractionalServerTimestamp() throws {

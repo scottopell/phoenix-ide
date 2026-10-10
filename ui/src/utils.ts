@@ -243,7 +243,9 @@ function parseRecoveryResumeTarget(raw: Record<string, unknown>): RecoveryResume
       || !phase
       || typeof retry['attempt'] !== 'number'
       || typeof retry['started_at'] !== 'string'
-      || typeof retry['deadline_at'] !== 'string') return null;
+      || typeof retry['deadline_at'] !== 'string'
+      || typeof retry['logical_request_id'] !== 'string'
+      || typeof retry['model_id'] !== 'string') return null;
     return {
       type: 'server_overload_retry',
       retry: {
@@ -252,6 +254,8 @@ function parseRecoveryResumeTarget(raw: Record<string, unknown>): RecoveryResume
         attempt: retry['attempt'],
         started_at: retry['started_at'],
         deadline_at: retry['deadline_at'],
+        logical_request_id: retry['logical_request_id'],
+        model_id: retry['model_id'],
       },
     };
   }
@@ -292,6 +296,8 @@ export function parseConversationState(raw: unknown): ConversationState {
       return { type, attempt: (obj['attempt'] as number) ?? 1 };
     case 'server_overload_retrying': {
       const retry = isRecord(obj['retry']) ? obj['retry'] : obj;
+      const publicTarget = retry['target'];
+      const target = publicTarget === 'continuation' ? 'continuation' : 'ordinary';
       const phase = isRecord(retry['phase']) ? retry['phase'] : null;
       const retryAtRaw = phase?.['retry_at'] ?? obj['retry_at'];
       const retryAt = typeof retryAtRaw === 'string' ? Date.parse(retryAtRaw) : null;
@@ -300,6 +306,7 @@ export function parseConversationState(raw: unknown): ConversationState {
         attempt: typeof retry['attempt'] === 'number' ? retry['attempt'] : 1,
         maxAttempts: typeof obj['max_attempts'] === 'number' ? obj['max_attempts'] : 5,
         retryAt: retryAt !== null && Number.isFinite(retryAt) ? retryAt : null,
+        target: target ?? { type: 'ordinary' },
       };
     }
     case 'seeded_llm_requesting': {
