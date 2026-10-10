@@ -1,5 +1,5 @@
 import { Suspense, useState } from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProductConversationAliasRedirect } from './App';
@@ -64,9 +64,12 @@ describe('ProductConversationAliasRedirect', () => {
   });
 
   it('routes a historical Global member before ordinary snapshot lookup and retains its anchor', async () => {
-    vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: 'current-global' });
+    let finishRoute!: (route: { coordinator_id: string }) => void;
+    vi.mocked(api.resolveCoordinatorRoute).mockImplementation(() => new Promise((resolve) => { finishRoute = resolve; }));
     renderAlias('historical-global', '/c/historical-global#tool-source-call');
-    expect(await screen.findByTestId('location')).toHaveTextContent('/global/historical-global#tool-source-call');
+    expect(screen.getByTestId('location')).toHaveTextContent('/c/historical-global#tool-source-call');
+    await act(async () => { finishRoute({ coordinator_id: 'current-global' }); });
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/global/historical-global#tool-source-call'));
     expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
     expect(embeddedSpy).not.toHaveBeenCalled();
   });
@@ -83,9 +86,9 @@ describe('ProductConversationAliasRedirect', () => {
 
     renderAlias(alias, `/c/${alias}?from=search#message-m-1`);
 
-    expect(await screen.findByTestId('location')).toHaveTextContent(
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent(
       '/product-conversations/product-1?from=search#message-m-1',
-    );
+    ));
     expect(embeddedSpy).not.toHaveBeenCalled();
   });
 

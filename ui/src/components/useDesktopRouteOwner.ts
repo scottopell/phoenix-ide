@@ -13,23 +13,50 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
       return;
     }
     let cancelled = false;
-    setValidatedPin(null);
-    api.getProductConversationSnapshot(productConversationId, { message_limit: 1 })
-      .then(async (snapshot) => {
+    let retryTimeout: number | undefined;
+    const load = async () => {
+      try {
+        const snapshot = await api.getProductConversationSnapshot(productConversationId, { message_limit: 1 });
         const pins = new URLSearchParams(search).getAll('source_transcript');
         if (pins.length === 1 && pins[0]) {
-          const selected = await api.getProductConversationSnapshot(pins[0], { message_limit: 1 });
-          if (selected.product_conversation_id === snapshot.product_conversation_id && selected.requested_transcript_row_id === pins[0] && !cancelled) {
-            setValidatedPin({ owner: productConversationId, query: search, id: pins[0] });
+          let selected: ProductConversationSnapshotView;
+          try {
+            selected = await api.getProductConversationSnapshot(pins[0], { message_limit: 1 });
+          } catch (error: unknown) {
+            if (error instanceof ApiResponseError && error.status === 404) {
+              if (!cancelled) {
+                setValidatedPin(null);
+                setProductSnapshot({ ownerId: productConversationId, snapshot });
+              }
+              return;
+            }
+            throw error;
           }
+          if (!cancelled) {
+            const valid = selected.product_conversation_id === snapshot.product_conversation_id
+              && selected.requested_transcript_row_id === pins[0];
+            setValidatedPin(valid ? { owner: productConversationId, query: search, id: pins[0] } : null);
+          }
+        } else if (!cancelled) {
+          setValidatedPin(null);
         }
         if (!cancelled) setProductSnapshot({ ownerId: productConversationId, snapshot });
-      })
-      .catch((error: unknown) => {
-        if (!cancelled && error instanceof ApiResponseError && error.status === 404) setProductNotFound(productConversationId);
-        if (!cancelled) setProductSnapshot(null);
-      });
-    return () => { cancelled = true; };
+      } catch (error: unknown) {
+        if (cancelled) return;
+        if (error instanceof ApiResponseError && error.status === 404) {
+          setProductNotFound(productConversationId);
+          setValidatedPin(null);
+          setProductSnapshot(null);
+        } else {
+          retryTimeout = window.setTimeout(() => setProductSnapshotRetry((value) => value + 1), 2_000);
+        }
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+      if (retryTimeout !== undefined) window.clearTimeout(retryTimeout);
+    };
   }, [productConversationId, productSnapshotRetry, search]);
   const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
   const hasPin = new URLSearchParams(search).has('source_transcript');

@@ -36,9 +36,13 @@ function sourceIsVisible(source: ReactionSource): boolean {
   const rect = range.getBoundingClientRect();
   const viewportTop = window.visualViewport?.offsetTop ?? 0;
   const viewportBottom = viewportTop + (window.visualViewport?.height ?? window.innerHeight);
-  const transcriptRect = document.getElementById('messages')?.getBoundingClientRect();
+  const transcript = document.getElementById('messages');
+  const transcriptRect = transcript?.getBoundingClientRect();
+  const dockHeight = transcript?.classList.contains('reaction-dock-reserved')
+    ? Number.parseFloat(transcript.style.getPropertyValue('--reaction-dock-height')) || 0
+    : 0;
   const visibleTop = Math.max(viewportTop, transcriptRect?.top ?? viewportTop);
-  const visibleBottom = Math.min(viewportBottom, transcriptRect?.bottom ?? viewportBottom);
+  const visibleBottom = Math.min(viewportBottom, transcriptRect?.bottom ?? viewportBottom) - dockHeight;
   return rect.height > 0 && rect.bottom > visibleTop && rect.top < visibleBottom;
 }
 
@@ -59,7 +63,8 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
   const gestureActive = useRef(false);
   const selectionInput = useRef<'touch' | 'fine' | null>(null);
   const selectionChangedDuringGesture = useRef(false);
-  const gestureStartedOnCurrentSource = useRef(false);
+  const gestureStartedInsideCurrentSelection = useRef(false);
+  const gestureInitialSource = useRef<ReactionSource | null>(null);
   const { activeScope } = useFocusScope();
   const setSourceReturnActive = useCallback((active: boolean) => { sourceReturnActive.current = active; }, []);
   const focusScope = `inline-reaction:${scopeKey}`;
@@ -72,15 +77,24 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       selectionInput.current = null;
       selectionChangedDuringGesture.current = false;
       selecting.current = false;
-      gestureStartedOnCurrentSource.current = false;
+      gestureStartedInsideCurrentSelection.current = false;
+      gestureInitialSource.current = null;
       return;
     }
     const read = () => {
       frame = 0;
       if (selecting.current || pillFocusPending.current || sourceReturnActive.current || !destination || (activeScope && activeScope !== focusScope)) return;
-      if (bubbleRef.current?.contains(document.activeElement)) return;
       const current = store.getSnapshot(scopeKey);
-      if (current?.body) return;
+      if (current?.body) {
+        if (!gestureActive.current) {
+          selectionInput.current = null;
+          selectionChangedDuringGesture.current = false;
+          gestureStartedInsideCurrentSelection.current = false;
+          gestureInitialSource.current = null;
+        }
+        return;
+      }
+      if (bubbleRef.current?.contains(document.activeElement)) return;
       const nativeSelection = window.getSelection();
       const selected = readReactionSelection(nativeSelection, messages);
       if (selected) {
@@ -105,7 +119,8 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       if (!gestureActive.current) {
         selectionInput.current = null;
         selectionChangedDuringGesture.current = false;
-        gestureStartedOnCurrentSource.current = false;
+        gestureStartedInsideCurrentSelection.current = false;
+        gestureInitialSource.current = null;
       }
     };
     const schedule = () => {
@@ -121,9 +136,13 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       selectionInput.current = event.pointerType === 'touch' ? 'touch' : 'fine';
       selectionChangedDuringGesture.current = false;
       const currentSource = store.getSnapshot(scopeKey)?.source;
-      gestureStartedOnCurrentSource.current = Boolean(currentSource
-        && sourceMessage.getAttribute('data-inline-reaction-message') === currentSource.messageId
-        && (sourceMessage.getAttribute('data-message-occurrence') ?? undefined) === currentSource.occurrenceToken);
+      const currentRange = currentSource ? restoreReactionRange(currentSource) : null;
+      const currentRect = currentRange?.getBoundingClientRect();
+      gestureStartedInsideCurrentSelection.current = Boolean(currentRect
+        && currentRect.height > 0
+        && event.clientX >= currentRect.left && event.clientX <= currentRect.right
+        && event.clientY >= currentRect.top && event.clientY <= currentRect.bottom);
+      gestureInitialSource.current = readReactionSelection(window.getSelection(), messages)?.source ?? null;
       gestureActive.current = true;
       selecting.current = event.pointerType !== 'touch';
     };
@@ -132,15 +151,24 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       selecting.current = false;
       schedule();
     };
-    const keydown = (event: KeyboardEvent) => {
-      if (event.shiftKey || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a')) selectionInput.current = 'fine';
-    };
     const selectionChange = () => {
+      if (store.getSnapshot(scopeKey)?.body) {
+        selectionInput.current = null;
+        selectionChangedDuringGesture.current = false;
+        gestureStartedInsideCurrentSelection.current = false;
+        gestureInitialSource.current = null;
+        return;
+      }
       const nativeSelection = window.getSelection();
+      const selected = readReactionSelection(nativeSelection, messages);
       if (selectionInput.current !== null) {
-        const selected = readReactionSelection(nativeSelection, messages);
+        if (selected && (gestureStartedInsideCurrentSelection.current || !sameReactionSource(gestureInitialSource.current ?? undefined, selected.source))) {
+          selectionChangedDuringGesture.current = true;
+        }
+      } else if (selected && !sourceReturnActive.current && !pillFocusPending.current && !bubbleRef.current?.contains(document.activeElement)) {
         const currentSource = store.getSnapshot(scopeKey)?.source;
-        if (gestureStartedOnCurrentSource.current || Boolean(selected && !sameReactionSource(currentSource, selected.source))) {
+        if (!sameReactionSource(currentSource, selected.source)) {
+          selectionInput.current = 'fine';
           selectionChangedDuringGesture.current = true;
         }
       }
@@ -152,14 +180,12 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       schedule();
     };
     document.addEventListener('selectionchange', selectionChange);
-    document.addEventListener('keydown', keydown, true);
     document.addEventListener('pointerdown', down, { passive: true });
     document.addEventListener('pointerup', up, { passive: true });
     document.addEventListener('pointercancel', up, { passive: true });
     return () => {
       cancelAnimationFrame(frame);
       document.removeEventListener('selectionchange', selectionChange);
-      document.removeEventListener('keydown', keydown, true);
       document.removeEventListener('pointerdown', down);
       document.removeEventListener('pointerup', up);
       document.removeEventListener('pointercancel', up);

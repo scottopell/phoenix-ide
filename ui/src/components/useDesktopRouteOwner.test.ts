@@ -33,6 +33,43 @@ describe('desktop validated route ownership', () => {
     await waitFor(() => expect(result.current).toBe('continued'));
     expect(get).toHaveBeenCalledTimes(2);
   });
+  it('keeps the last owner while a continuation refresh retries', async () => {
+    vi.useFakeTimers();
+    const get = vi.spyOn(api, 'getProductConversationSnapshot')
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockRejectedValueOnce(new Error('temporary'))
+      .mockResolvedValueOnce({ ...snapshot('product', 'root'), latest_transcript_row_id: 'continued' });
+    const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
+    await act(async () => {});
+    expect(result.current).toBe('latest');
+    act(() => { window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated')); });
+    await act(async () => {});
+    expect(result.current).toBe('latest');
+    await act(async () => { vi.advanceTimersByTime(2_000); });
+    await act(async () => {});
+    expect(result.current).toBe('continued');
+    expect(get).toHaveBeenCalledTimes(3);
+  });
+  it('keeps a validated pin while its continuation refresh retries', async () => {
+    vi.useFakeTimers();
+    const get = vi.spyOn(api, 'getProductConversationSnapshot')
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockResolvedValueOnce(snapshot('product', 'old'))
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockRejectedValueOnce(new Error('temporary'))
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockResolvedValueOnce(snapshot('product', 'old'));
+    const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', '?source_transcript=old'));
+    await act(async () => {});
+    expect(result.current).toBe('old');
+    act(() => { window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated')); });
+    await act(async () => {});
+    expect(result.current).toBe('old');
+    await act(async () => { vi.advanceTimersByTime(2_000); });
+    await act(async () => {});
+    expect(result.current).toBe('old');
+    expect(get).toHaveBeenCalledTimes(6);
+  });
   it('stops retrying an authoritative 404 including online events', async () => {
     vi.useFakeTimers();
     const get = vi.spyOn(api, 'getProductConversationSnapshot').mockRejectedValue(new ApiResponseError('missing', 404));

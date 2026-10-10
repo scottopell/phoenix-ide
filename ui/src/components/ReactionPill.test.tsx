@@ -1,4 +1,4 @@
-import { createRef } from 'react';
+import { createRef, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,7 +12,7 @@ const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
-function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop, onChange = () => {} }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number; onChange?: (body: string) => void }) {
+function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop, bubbleRef = createRef<HTMLDivElement>(), onChange = () => {} }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number; bubbleRef?: RefObject<HTMLDivElement>; onChange?: (body: string) => void }) {
   return <FocusScopeProvider>
     <div className="conversation-column">
     <div id="messages">
@@ -20,7 +20,7 @@ function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = f
     </div>
     {composerAvailable && <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />}
     </div>
-    <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available={available} onChange={onChange} onAdd={add} onClose={close} returnToSource={navigate} />
+    <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={bubbleRef} scopeId="test" body={body} available={available} onChange={onChange} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
 }
 function ActivateOtherScope() {
@@ -276,14 +276,15 @@ describe('reaction pill', () => {
       if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
       return new DOMRect(0, 0, 390, 700);
     });
-    const view = render(<Fixture touchDocked body="Retained" composerKey="ordinary" composerTop={620} />);
+    const bubbleRef = createRef<HTMLDivElement>();
+    const view = render(<Fixture touchDocked body="Retained" composerKey="ordinary" composerTop={620} bubbleRef={bubbleRef} />);
     const dock = screen.getByRole('region', { name: 'Docked reaction' });
     const input = screen.getByRole('textbox');
     expect(dock).toHaveStyle({ top: '554px' });
     expect(input).not.toHaveFocus();
     const originalComposer = document.getElementById('input-area')!;
 
-    view.rerender(<Fixture touchDocked body="Retained" available={false} composerAvailable={false} />);
+    view.rerender(<Fixture touchDocked body="Retained" available={false} composerAvailable={false} bubbleRef={bubbleRef} />);
     await waitFor(() => expect(document.getElementById('input-area')).toBeNull());
     expect(input).toHaveValue('Retained');
     expect(input).not.toHaveFocus();
@@ -292,7 +293,7 @@ describe('reaction pill', () => {
     expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
 
     viewport.height = 420;
-    view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={340} />);
+    view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={340} bubbleRef={bubbleRef} />);
     expect(document.getElementById('input-area')).not.toBe(originalComposer);
     act(() => listeners.get('resize')?.(new Event('resize')));
     await waitFor(() => expect(dock).toHaveStyle({ top: '274px' }));

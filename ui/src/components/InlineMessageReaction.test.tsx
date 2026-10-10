@@ -15,6 +15,7 @@ const messages: Message[] = ['old', 'new'].map((id) => ({
   content: [{ type: 'text', text: 'Deterministic state patterns' }],
   display_data: { productOccurrenceToken: `row-${id}:${id}` },
 }));
+const initialVisualViewport = window.visualViewport;
 
 function select(start: Node, end = start) {
   const range = document.createRange();
@@ -62,13 +63,22 @@ function Harness({ store, scope = 'conversation-a', append, sourceMounted = true
 }
 
 beforeEach(() => {
-  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 600, 500));
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains('reaction-pill')
+      ? new DOMRect(0, 0, 420, 54)
+      : new DOMRect(0, 0, 600, 500);
+  });
   Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
     configurable: true,
     value: () => ({ left: 50, top: 50, bottom: 80, right: 300, width: 250, height: 30 }),
   });
 });
-afterEach(() => { cleanup(); window.getSelection()?.removeAllRanges(); vi.restoreAllMocks(); });
+afterEach(() => {
+  cleanup();
+  window.getSelection()?.removeAllRanges();
+  Object.defineProperty(window, 'visualViewport', { configurable: true, value: initialVisualViewport });
+  vi.restoreAllMocks();
+});
 
 describe('inline message reactions', () => {
   it('opens without focus, appends to the latest draft exactly once, and retains stable historical identity', async () => {
@@ -185,8 +195,8 @@ describe('inline message reactions', () => {
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
     const source = store.getSnapshot('conversation-a')?.source;
     const dispatch = vi.spyOn(store, 'dispatch');
-    const scrollTarget = screen.getByTestId('new').firstChild!;
-    fireEvent.pointerDown(scrollTarget, { pointerType: 'touch' });
+    const scrollTarget = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(scrollTarget, { pointerType: 'touch', clientX: 400, clientY: 100 });
     fireEvent(document, new Event('selectionchange'));
     await act(async () => { await new Promise(requestAnimationFrame); });
     fireEvent.pointerUp(scrollTarget, { pointerType: 'touch' });
@@ -206,7 +216,7 @@ describe('inline message reactions', () => {
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'mouse' });
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
-    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    fireEvent.pointerDown(text, { pointerType: 'touch', clientX: 100, clientY: 60 });
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'touch' });
     expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
@@ -223,7 +233,7 @@ describe('inline message reactions', () => {
     fireEvent.pointerUp(text, { pointerType: 'mouse' });
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
 
-    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    fireEvent.pointerDown(text, { pointerType: 'touch', clientX: 100, clientY: 60 });
     select(text);
     await act(async () => { await new Promise(requestAnimationFrame); });
     window.getSelection()?.removeAllRanges();
@@ -246,7 +256,7 @@ describe('inline message reactions', () => {
     fireEvent.pointerUp(text, { pointerType: 'mouse' });
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
     expect(store.getSnapshot('conversation-a')?.source.occurrenceToken).toBeUndefined();
-    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    fireEvent.pointerDown(text, { pointerType: 'touch', clientX: 100, clientY: 60 });
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'touch' });
     expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
@@ -259,6 +269,36 @@ describe('inline message reactions', () => {
     fireEvent.keyDown(document, { key: 'ArrowRight', shiftKey: true });
     select(screen.getByTestId('old').firstChild!);
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+  });
+
+  it('clears ignored pointer modality after a typed reaction gesture', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const passageText = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(passageText, { pointerType: 'touch' });
+    select(passageText);
+    fireEvent.pointerUp(passageText, { pointerType: 'touch' });
+    const input = await screen.findByRole('textbox');
+    fireEvent.change(input, { target: { value: 'Pinned body' } });
+    const retainedSource = structuredClone(store.getSnapshot('conversation-a')!.source);
+    const other = screen.getByTestId('new').firstChild!;
+    fireEvent.pointerDown(other, { pointerType: 'mouse' });
+    select(other);
+    fireEvent.pointerUp(other, { pointerType: 'mouse' });
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')?.source).toEqual(retainedSource);
+    const restored = document.createRange();
+    restored.setStart(passageText, retainedSource.textAnchor!.start.offset);
+    restored.setEnd(passageText, retainedSource.textAnchor!.end.offset);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(restored);
+    fireEvent(document, new Event('selectionchange'));
+    fireEvent.change(input, { target: { value: '' } });
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')?.source).toEqual(retainedSource);
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
   });
 
   it('keeps or discards the exact touch-docked reaction in the existing store', async () => {
@@ -320,8 +360,8 @@ describe('inline message reactions', () => {
     view.rerender(<Harness store={store} append={append} />);
     const restoredText = screen.getByTestId('old').firstChild!;
     const restored = document.createRange();
-    restored.setStart(restoredText, 0);
-    restored.setEnd(restoredText, 28);
+    restored.setStart(restoredText, owned!.source.textAnchor!.start.offset);
+    restored.setEnd(restoredText, owned!.source.textAnchor!.end.offset);
     window.getSelection()!.removeAllRanges();
     window.getSelection()!.addRange(restored);
     fireEvent(document, new Event('selectionchange'));
@@ -378,6 +418,7 @@ describe('inline message reactions', () => {
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
 
     view.rerender(<Harness store={store} append={append} returnToSource={returnToSource} />);
+    fireEvent.keyDown(document, { key: 'Shift', shiftKey: true });
     const returnButton = screen.getByRole('button', { name: /Return to passage/ });
     fireEvent.pointerDown(returnButton, { pointerType: 'mouse' });
     fireEvent.click(returnButton);
@@ -394,7 +435,8 @@ describe('inline message reactions', () => {
     setCoarsePointer(true);
     vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 100, 100, 20));
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
-      return this.id === 'messages' ? new DOMRect(0, 200, 600, 500) : new DOMRect(0, 0, 600, 500);
+      if (this.id === 'messages') return new DOMRect(0, 200, 600, 500);
+      return this.classList.contains('reaction-pill') ? new DOMRect(0, 0, 420, 54) : new DOMRect(0, 0, 600, 500);
     });
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} />);
@@ -408,6 +450,34 @@ describe('inline message reactions', () => {
     act(() => { fireEvent(document, new Event('selectionchange')); });
     expect(store.getSnapshot('conversation-a')).toEqual(retained);
     expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
+  });
+
+  it('retains an empty source inside the reserved dock band of a clipped visual viewport', async () => {
+    setCoarsePointer(true);
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
+      offsetLeft: 0, offsetTop: 0, width: 600, height: 400,
+      addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    } });
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 350, 100, 20));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains('reaction-pill') ? new DOMRect(0, 0, 420, 54) : new DOMRect(0, 0, 600, 500);
+    });
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    const transcript = document.getElementById('messages')!;
+    transcript.classList.add('reaction-dock-reserved');
+    transcript.style.setProperty('--reaction-dock-height', '70px');
+    const retained = store.getSnapshot('conversation-a');
+    expect(retained).not.toBeNull();
+    window.getSelection()?.removeAllRanges();
+    act(() => { fireEvent(document, new Event('selectionchange')); });
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')).toEqual(retained);
   });
 
   it('protects a reaction until delayed source return completes', async () => {
@@ -441,7 +511,7 @@ describe('inline message reactions', () => {
     setCoarsePointer(true);
     vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 100, 100, 20));
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
-      return this.id === 'messages' ? new DOMRect(0, 0, 600, 500) : new DOMRect(0, 0, 600, 500);
+      return this.classList.contains('reaction-pill') ? new DOMRect(0, 0, 420, 54) : new DOMRect(0, 0, 600, 500);
     });
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} />);
