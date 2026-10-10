@@ -2188,6 +2188,14 @@ fn overload_startup_action(
     }
 }
 
+fn continuation_request_identity(conversation_id: &str, operation_id: &str) -> String {
+    if operation_id == phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID {
+        format!("{operation_id}:{conversation_id}")
+    } else {
+        operation_id.to_string()
+    }
+}
+
 fn overload_recovery_deadline_for(state: &ConvState, now: DateTime<Utc>) -> Option<Duration> {
     match state {
         ConvState::AwaitingRecovery {
@@ -9465,7 +9473,7 @@ where
             {
                 retry.logical_request_id.clone()
             }
-            _ => operation_id.clone(),
+            _ => continuation_request_identity(&self.context.conversation_id, &operation_id),
         };
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
@@ -24300,6 +24308,32 @@ mod retry_timer_epoch_tests {
         assert!(
             rt.retry_timeout_is_stale(scheduled_gen),
             "the cancelled timer's fire must now be stale"
+        );
+    }
+
+    #[test]
+    fn legacy_continuation_request_identity_is_stable_and_conversation_scoped() {
+        let first = continuation_request_identity(
+            "conversation-a",
+            phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID,
+        );
+        assert_eq!(
+            first,
+            continuation_request_identity(
+                "conversation-a",
+                phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID,
+            )
+        );
+        assert_ne!(
+            first,
+            continuation_request_identity(
+                "conversation-b",
+                phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID,
+            )
+        );
+        assert_eq!(
+            continuation_request_identity("conversation-a", "normal-operation"),
+            "normal-operation"
         );
     }
 

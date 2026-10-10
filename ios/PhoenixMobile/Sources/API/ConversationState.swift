@@ -90,7 +90,8 @@ enum ConversationState: Equatable {
                 maxAttempts: json["max_attempts"]?.intValue ?? 5,
                 retryAt: json["retry"]?["phase"]?["retry_at"]?.stringValue
                     ?? json["retry_at"]?.stringValue,
-                continuationTarget: json["retry"]?["target"]?["type"]?.stringValue == "continuation")
+                continuationTarget: json["target"]?.stringValue == "continuation"
+                    || json["retry"]?["target"]?["type"]?.stringValue == "continuation")
         case "tool_executing":
             return .toolExecuting(
                 toolName: json["current_tool"]?["name"]?.stringValue ?? "tool",

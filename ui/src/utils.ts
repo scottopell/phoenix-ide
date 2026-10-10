@@ -296,7 +296,10 @@ export function parseConversationState(raw: unknown): ConversationState {
       return { type, attempt: (obj['attempt'] as number) ?? 1 };
     case 'server_overload_retrying': {
       const retry = isRecord(obj['retry']) ? obj['retry'] : obj;
-      const target = parseServerOverloadTarget(retry['target']);
+      const publicTarget = retry['target'];
+      const target = typeof publicTarget === 'string'
+        ? (publicTarget === 'continuation' ? { type: 'continuation' as const, operation_id: '', rejected_tool_calls: [] } : { type: 'ordinary' as const })
+        : parseServerOverloadTarget(publicTarget);
       const phase = isRecord(retry['phase']) ? retry['phase'] : null;
       const retryAtRaw = phase?.['retry_at'] ?? obj['retry_at'];
       const retryAt = typeof retryAtRaw === 'string' ? Date.parse(retryAtRaw) : null;

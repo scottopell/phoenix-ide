@@ -157,6 +157,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const canCancel = !readOnly && canCancelConversationState(convState);
   const isCancelling = isCancellingState(convState);
   const acceptsChatMessage = !readOnly && canAcceptChatMessage(convState);
+  const continuationOverloadReadOnly = convState.type === 'server_overload_retrying'
+    && convState.target.type === 'continuation';
   const setDraft = onDraftChange;
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -727,7 +729,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             placeholder={placeholder}
             rows={1}
             enterKeyHint="send"
-            disabled={!acceptsChatMessage}
+            disabled={continuationOverloadReadOnly}
             value={voiceBase !== null
               ? (voiceBase.trim()
                   ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')

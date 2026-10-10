@@ -451,6 +451,31 @@ describe('InputArea cancellation affordance', () => {
     expect(screen.getByRole('textbox')).toHaveValue('retained follow-up');
   });
 
+  it('keeps recovery drafts editable while submit remains gated', () => {
+    const onDraftChange = vi.fn();
+    render(
+      <InputArea
+        cwd="conv-recovery"
+        scopeKey="conv-recovery"
+        convState={{ type: 'awaiting_recovery', message: 'refreshing credentials', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }}
+        images={[]}
+        setImages={() => {}}
+        isOffline={false}
+        failedMessages={[]}
+        draft="retained draft"
+        onDraftChange={onDraftChange}
+        onSend={vi.fn()}
+        onCancel={() => {}}
+        onRetry={() => {}}
+      />,
+    );
+    const textarea = screen.getByRole('textbox');
+    expect(textarea).toBeEnabled();
+    fireEvent.change(textarea, { target: { value: 'retained draft!' } });
+    expect(onDraftChange).toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /send|queue follow-up/i })).not.toBeInTheDocument();
+  });
+
   it('allows ordinary overload steering but disables continuation overload input', () => {
     const props = {
       cwd: 'conv-overload',

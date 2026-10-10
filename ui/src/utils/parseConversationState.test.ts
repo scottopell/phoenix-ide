@@ -25,6 +25,22 @@ describe('parseConversationState recovery', () => {
     expect(canChangeModelInState(state)).toBe(false);
   });
 
+  it('parses the public continuation overload discriminator without private target payload', () => {
+    expect(parseConversationState({
+      type: 'server_overload_retrying',
+      attempt: 2,
+      max_attempts: 5,
+      retry_at: null,
+      target: 'continuation',
+    })).toEqual({
+      type: 'server_overload_retrying',
+      attempt: 2,
+      maxAttempts: 5,
+      retryAt: null,
+      target: { type: 'continuation', operation_id: '', rejected_tool_calls: [] },
+    });
+  });
+
   it('preserves an overload recovery resume target without semantic substitution', () => {
     const state = parseConversationState({
       type: 'awaiting_recovery',

@@ -55,11 +55,10 @@ final class ConversationStateTests: XCTestCase {
         let continuation = try XCTUnwrap(parse("""
         {
           "type":"server_overload_retrying",
-          "retry":{
-            "attempt":2,
-            "phase":{"type":"in_flight"},
-            "target":{"type":"continuation","operation_id":"summary-op","rejected_tool_calls":[]}
-          }
+          "attempt":2,
+          "max_attempts":5,
+          "retry_at":null,
+          "target":"continuation"
         }
         """))
         XCTAssertEqual(
