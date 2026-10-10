@@ -13,7 +13,7 @@ mod federation_enrollment;
 mod federation_peers;
 pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
-    PendingWatchEvent, WatchEventRoute, WatchSnapshot,
+    PendingWatchEvent, WatchEventRoute, WatchOutcome, WatchSnapshot,
 };
 mod ddl;
 mod git_repository_reconciliation;
@@ -7432,6 +7432,8 @@ impl Database {
                 .fetch_one(&mut *tx)
                 .await?;
 
+        coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
+
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
         )
@@ -10044,6 +10046,7 @@ impl Database {
         for msg in tool_results {
             insert_message_tx(&mut tx, msg).await?;
         }
+        coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
         let state_json = serde_json::to_string(state).unwrap();
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -16665,10 +16668,11 @@ mod tests {
         .unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_kind, "failed");
         assert_eq!(
-            events[0].terminal_reason.as_deref(),
-            Some("context exhausted")
+            events[0].outcome,
+            WatchOutcome::Failed {
+                reason: "context exhausted".into()
+            }
         );
     }
 
@@ -16735,8 +16739,10 @@ mod tests {
         assert_eq!(summary.source_occurrence_id, "summary-operation");
         assert_eq!(summary.source_generation, 1);
         assert_eq!(
-            summary.terminal_reason.as_deref(),
-            Some("continuation summary failed")
+            summary.outcome,
+            WatchOutcome::Failed {
+                reason: "continuation summary failed".into()
+            }
         );
     }
 
@@ -16769,7 +16775,7 @@ mod tests {
             events[0].source_generation,
             i64::try_from(claim.generation).unwrap()
         );
-        assert_eq!(events[0].terminal_kind, "completed");
+        assert_eq!(events[0].outcome, WatchOutcome::Completed);
 
         assert_eq!(
             db.settle_conversation_creation_runtime(

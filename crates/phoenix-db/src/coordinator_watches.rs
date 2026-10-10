@@ -7,6 +7,7 @@ pub use mandatory_close::{
 
 use chrono::Utc;
 use phoenix_core::domain::product_conversation::ProductConversationId;
+use phoenix_core::domain::sm_state::ConvState;
 use serde::Serialize;
 use sqlx::{Row, Sqlite, Transaction};
 
@@ -23,6 +24,58 @@ pub struct WatchSnapshot {
     pub project_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchOutcome {
+    Completed,
+    Failed { reason: String },
+    CleanupFailed { reason: String },
+    Cancelled,
+    AwaitingUserResponse,
+    AwaitingTaskApproval,
+}
+
+impl WatchOutcome {
+    fn decode(kind: &str, reason: Option<String>) -> DbResult<Self> {
+        match (kind, reason) {
+            ("completed", None) => Ok(Self::Completed),
+            ("failed", Some(reason)) => Ok(Self::Failed { reason }),
+            ("cleanup_failed", Some(reason)) => Ok(Self::CleanupFailed { reason }),
+            ("cancelled", None) => Ok(Self::Cancelled),
+            ("awaiting_user_response", Some(reason)) if reason == "question_request" => {
+                Ok(Self::AwaitingUserResponse)
+            }
+            ("awaiting_task_approval", Some(reason)) if reason == "task_approval_wait" => {
+                Ok(Self::AwaitingTaskApproval)
+            }
+            _ => Err(DbError::Serialization(
+                "invalid watch outcome/reason pair".into(),
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed { .. } => "failed",
+            Self::CleanupFailed { .. } => "cleanup_failed",
+            Self::Cancelled => "cancelled",
+            Self::AwaitingUserResponse => "awaiting_user_response",
+            Self::AwaitingTaskApproval => "awaiting_task_approval",
+        }
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed { reason } | Self::CleanupFailed { reason } => Some(reason),
+            Self::AwaitingUserResponse => Some("question_request"),
+            Self::AwaitingTaskApproval => Some("task_approval_wait"),
+            Self::Completed | Self::Cancelled => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingWatchEvent {
     pub route: WatchEventRoute,
@@ -32,8 +85,7 @@ pub struct PendingWatchEvent {
     pub source_occurrence_kind: String,
     pub source_occurrence_id: String,
     pub source_generation: i64,
-    pub terminal_kind: String,
-    pub terminal_reason: Option<String>,
+    pub outcome: WatchOutcome,
     pub occurred_at_us: i64,
 }
 
@@ -197,8 +249,10 @@ impl Database {
                     source_occurrence_kind: row.try_get("source_occurrence_kind")?,
                     source_occurrence_id: row.try_get("source_occurrence_id")?,
                     source_generation: row.try_get("source_generation")?,
-                    terminal_kind: row.try_get("terminal_kind")?,
-                    terminal_reason: row.try_get("terminal_reason")?,
+                    outcome: WatchOutcome::decode(
+                        row.try_get("terminal_kind")?,
+                        row.try_get("terminal_reason")?,
+                    )?,
                     occurred_at_us: row.try_get("occurred_at_us")?,
                 })
             })
@@ -305,6 +359,85 @@ pub(crate) async fn record_steering_event_tx(
     .await
 }
 
+pub(crate) async fn record_wait_entry_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript_id: &str,
+    state: &ConvState,
+) -> DbResult<()> {
+    let (kind, outcome, identified_request) = match state {
+        ConvState::AwaitingUserResponse {
+            request_authority, ..
+        } => (
+            "question_request",
+            "awaiting_user_response",
+            request_authority.request_id(),
+        ),
+        ConvState::AwaitingTaskApproval { .. } => {
+            ("task_approval_wait", "awaiting_task_approval", None)
+        }
+        ConvState::Idle
+        | ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::CreationCancelled { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::Error { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::RecoverableContinuationFailure { .. }
+        | ConvState::ContextExhausted { .. }
+        | ConvState::HandedOff { .. }
+        | ConvState::Terminal => return Ok(()),
+    };
+    let previous: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+        .bind(transcript_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let previous: ConvState = serde_json::from_str(&previous)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let same_occurrence = match (identified_request, &previous) {
+        (
+            Some(request_id),
+            ConvState::AwaitingUserResponse {
+                request_authority, ..
+            },
+        ) => request_authority.request_id() == Some(request_id),
+        (None, _) => &previous == state,
+        _ => false,
+    };
+    if same_occurrence {
+        return Ok(());
+    }
+    let occurrence_id =
+        identified_request.map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
+    let watch_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT w.id FROM conversations c JOIN coordinator_watches w
+         ON w.source_product_conversation_id = c.product_conversation_id
+         WHERE c.id = ?1 AND w.ended_at_us IS NULL",
+    )
+    .bind(transcript_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for watch_id in watch_ids {
+        sqlx::query("INSERT INTO coordinator_watch_events
+            (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
+             source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
+            VALUES (?1, ?2, ?6, ?3, 0, ?4, ?7, ?6, ?5)
+            ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(watch_id)
+            .bind(&occurrence_id).bind(transcript_id)
+            .bind(chrono::Utc::now().timestamp_micros()).bind(kind).bind(outcome)
+            .execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn record_summary_failure_tx(
     tx: &mut Transaction<'_, Sqlite>,
     transcript_id: &str,
@@ -405,6 +538,23 @@ async fn record_watch_event_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_preserves_mandatory_cleanup_failure_alongside_waits() {
+        assert_eq!(
+            WatchOutcome::decode("cleanup_failed", Some("resource preserved".into())).unwrap(),
+            WatchOutcome::CleanupFailed {
+                reason: "resource preserved".into()
+            }
+        );
+        assert!(WatchOutcome::decode("cleanup_failed", None).is_err());
+        assert_eq!(
+            WatchOutcome::decode("awaiting_user_response", Some("question_request".into()))
+                .unwrap(),
+            WatchOutcome::AwaitingUserResponse
+        );
+    }
+
     use crate::workflow::AcceptAuthoritativeTurn;
     use phoenix_core::domain::db_schema::InputOrigin;
     use phoenix_core::domain::sm_event::{
@@ -457,6 +607,352 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_question_wait_is_emitted_once_per_request_without_settling_turn() {
+        use phoenix_core::domain::sm_state::{QuestionRequestAuthority, UserQuestion};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-wait", "watch-wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let turn_id = source_turn(&db, &source.id, "active-question-turn").await;
+        let waiting = |authority| ConvState::AwaitingUserResponse {
+            tool_use_id: "provider-reused-tool-id".into(),
+            request_authority: authority,
+            questions: vec![UserQuestion {
+                question: "Choose".into(),
+                header: "Choice".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+        };
+        let first = waiting(QuestionRequestAuthority::new());
+        db.update_conversation_state(&source.id, &first)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &first)
+            .await
+            .unwrap();
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        db.update_conversation_state(&source.id, &restored)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one durable request must produce one wait event"
+        );
+        assert_eq!(events[0].outcome.label(), "awaiting_user_response");
+        assert_eq!(events[0].outcome.reason(), Some("question_request"));
+        db.update_conversation_state(&source.id, &waiting(QuestionRequestAuthority::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            2
+        );
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            terminal.is_none(),
+            "waiting must not settle the active turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_without_provider_replay_persists_approval_event_atomically() {
+        use phoenix_core::domain::db_schema::{Message, MessageContent, MessageType};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation(
+                "checkpoint-wait",
+                "Checkpoint wait",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let turn = source_turn(&db, &source.id, "checkpoint-turn").await;
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let assistant = Message {
+            origin: InputOrigin::UnknownHistorical,
+            message_id: "checkpoint-assistant".into(),
+            conversation_id: source.id.clone(),
+            sequence_id: 10,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        sqlx::query("CREATE TRIGGER reject_wait_checkpoint BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'checkpoint test failure'); END")
+            .execute(db.pool()).await.unwrap();
+        assert!(db
+            .persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .is_err());
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db.get_message_by_id(&assistant.message_id).await.is_err());
+        sqlx::query("DROP TRIGGER reject_wait_checkpoint")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, WatchOutcome::AwaitingTaskApproval);
+        assert_eq!(
+            db.get_conversation(&source.id).await.unwrap().state,
+            waiting
+        );
+        assert!(db.get_message_by_id(&assistant.message_id).await.is_ok());
+        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_outbox_and_state_rollback_together_before_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wait.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let source = db
+            .create_conversation("rollback-wait", "rollback-wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let mut tx = db.pool().begin().await.unwrap();
+        record_wait_entry_tx(&mut tx, &source.id, &waiting)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?3 WHERE id = ?2")
+            .bind(serde_json::to_string(&waiting).unwrap())
+            .bind(&source.id)
+            .bind(crate::conv_state_kind(&waiting))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let inside: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_events")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert!(
+            db.pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "another connection must not discover an uncommitted wait event"
+        );
+        assert_eq!(inside, 1);
+        tx.rollback().await.unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        let state: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+            .bind(&source.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_ne!(serde_json::from_str::<ConvState>(&state).unwrap(), waiting);
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        let original = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(original.len(), 1);
+        db.pool().close().await;
+        let restored = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(restored.pool())
+            .await
+            .unwrap();
+        restored
+            .update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        let replay = restored.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_id, original[0].event_id);
+        restored
+            .update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        restored
+            .update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        restored.pool().close().await;
+    }
+
+    #[tokio::test]
+    async fn task_and_legacy_wait_entries_deduplicate_without_replaying_enrollment() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("fallback-waits", "fallback-waits", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let approval = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let legacy: ConvState = serde_json::from_value(serde_json::json!({
+            "type": "awaiting_user_response", "tool_use_id": "reused", "questions": []
+        }))
+        .unwrap();
+        db.update_conversation_state(&source.id, &approval)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &approval)
+            .await
+            .unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        db.update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let turn_id = source_turn(&db, &source.id, "fallback-turn").await;
+        for (index, wait) in [&approval, &legacy].into_iter().enumerate() {
+            db.update_conversation_state(&source.id, &ConvState::Idle)
+                .await
+                .unwrap();
+            db.update_conversation_state(&source.id, wait)
+                .await
+                .unwrap();
+            let restored: ConvState =
+                serde_json::from_str(&serde_json::to_string(wait).unwrap()).unwrap();
+            db.update_conversation_state(&source.id, &restored)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.pending_coordinator_watch_events(16).await.unwrap().len(),
+                index * 2 + 1
+            );
+            db.update_conversation_state(&source.id, &ConvState::Idle)
+                .await
+                .unwrap();
+            db.update_conversation_state(&source.id, wait)
+                .await
+                .unwrap();
+            let events = db.pending_coordinator_watch_events(16).await.unwrap();
+            assert_eq!(events.len(), index * 2 + 2);
+            assert_ne!(
+                events[index * 2].source_occurrence_id,
+                events[index * 2 + 1].source_occurrence_id
+            );
+        }
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none());
+    }
+
+    #[tokio::test]
+    async fn enrolling_during_a_question_wait_does_not_replay_it() {
+        use phoenix_core::domain::sm_state::{QuestionRequestAuthority, UserQuestion};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation(
+                "pending-before-watch",
+                "pending-before-watch",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let waiting = ConvState::AwaitingUserResponse {
+            tool_use_id: "tool".into(),
+            request_authority: QuestionRequestAuthority::new(),
+            questions: vec![UserQuestion {
+                question: "Choose".into(),
+                header: "Choice".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+        };
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn recorded_cancel_overrides_idle_completion_without_inventing_actor() {
         let db = Database::open_in_memory().await.unwrap();
         let source = db
@@ -478,8 +974,8 @@ mod tests {
         tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_kind, "cancelled");
-        assert_eq!(events[0].terminal_reason, None);
+        assert_eq!(events[0].outcome.label(), "cancelled");
+        assert_eq!(events[0].outcome.reason(), None);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_cancel_observations")
                 .fetch_one(db.pool())
@@ -540,7 +1036,7 @@ mod tests {
         tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_reason.as_deref(), Some("model failed"));
+        assert_eq!(events[0].outcome.reason(), Some("model failed"));
         assert!(db.unwatch_product_conversation(&id).await.unwrap());
         assert!(!db.unwatch_product_conversation(&id).await.unwrap());
         assert!(db
@@ -636,11 +1132,8 @@ mod tests {
         assert_eq!(delivered[0].source_occurrence_kind, "direct_turn");
         assert_eq!(delivered[0].source_occurrence_id, turn.to_string());
         assert_eq!(delivered[0].source_generation, 0);
-        assert_eq!(delivered[0].terminal_kind, "failed");
-        assert_eq!(
-            delivered[0].terminal_reason.as_deref(),
-            Some("context exhausted")
-        );
+        assert_eq!(delivered[0].outcome.label(), "failed");
+        assert_eq!(delivered[0].outcome.reason(), Some("context exhausted"));
         assert_eq!(delivered[0].source_transcript_id, source.id);
     }
 
@@ -974,7 +1467,7 @@ mod tests {
         assert_eq!(exposed.len(), 1);
         assert_eq!(exposed[0].source_occurrence_kind, "direct_turn");
         assert_eq!(exposed[0].source_occurrence_id, turn.to_string());
-        assert_eq!(exposed[0].terminal_kind, "cancelled");
+        assert_eq!(exposed[0].outcome.label(), "cancelled");
     }
 
     #[tokio::test]
