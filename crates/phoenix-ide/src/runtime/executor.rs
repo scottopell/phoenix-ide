@@ -3111,20 +3111,23 @@ where
             return;
         };
         let status = helper.credential_status().await;
-        let event = if status == phoenix_llm::credential_helper::CredentialStatus::Valid {
-            tracing::info!("Credential helper succeeded, retrying LLM request");
-            Event::CredentialBecameAvailable {
-                observed_at: Utc::now(),
-            }
-        } else {
-            tracing::info!(
-                ?status,
-                "Credential helper settled without valid credential"
-            );
-            Event::CredentialHelperFailed {
-                message: "Authentication failed — click Retry to try again".to_string(),
-            }
-        };
+        let event =
+            if overload_recovery_deadline_for(&self.state, Utc::now()) == Some(Duration::ZERO) {
+                Event::OverloadRetryDeadlineExpired
+            } else if status == phoenix_llm::credential_helper::CredentialStatus::Valid {
+                tracing::info!("Credential helper succeeded, retrying LLM request");
+                Event::CredentialBecameAvailable {
+                    observed_at: Utc::now(),
+                }
+            } else {
+                tracing::info!(
+                    ?status,
+                    "Credential helper settled without valid credential"
+                );
+                Event::CredentialHelperFailed {
+                    message: "Authentication failed — click Retry to try again".to_string(),
+                }
+            };
         if let Err(e) = self.process_event(event).await {
             tracing::error!(error = %e, "Error handling credential settlement event");
         }
@@ -24428,6 +24431,61 @@ mod retry_timer_epoch_tests {
         assert!(fatally_aborted.retry_generation > fatal_generation);
         assert!(!route_retry_timeout(&mut fatally_aborted, fatal_generation, 2).await);
         assert_eq!(fatal_fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_settlement_rechecks_expired_overload_deadline_before_adoption() {
+        let helper =
+            phoenix_llm::CredentialHelper::new("exit 1".to_string(), Duration::from_secs(60));
+        let stream = Arc::clone(&helper).run_and_stream().await;
+        let _events: Vec<_> = tokio_stream::StreamExt::collect(stream).await;
+        helper.wait_for_settlement().await;
+        assert_eq!(
+            helper.credential_status().await,
+            phoenix_llm::credential_helper::CredentialStatus::Failed
+        );
+
+        let mut rt = runtime_requesting().with_credential_helper(Some(helper));
+        let storage = Arc::clone(&rt.storage);
+        let now = Utc::now();
+        rt.state = ConvState::AwaitingRecovery {
+            message: "refreshing credentials".into(),
+            error_kind: crate::db::ErrorKind::Auth,
+            recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+            resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                    target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                    phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                    attempt: 3,
+                    started_at: now - chrono::Duration::seconds(121),
+                    deadline_at: now - chrono::Duration::seconds(1),
+                    logical_request_id: "expired-invalid-helper".into(),
+                    model_id: "test-model".into(),
+                },
+            },
+        };
+
+        rt.handle_credential_settlement().await;
+
+        assert!(matches!(
+            rt.state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::ServerOverloaded,
+                ref message,
+                ..
+            } if message.contains("deadline elapsed")
+        ));
+        assert!(matches!(
+            storage
+                .get_state_snapshot(&rt.context.conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::ServerOverloaded,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
