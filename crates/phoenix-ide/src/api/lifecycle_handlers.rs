@@ -461,16 +461,27 @@ pub(crate) async fn confirm_close_loss_retirement(
             ))));
         }
     }
-    state
+    if let Err(error) = state
         .runtime
-        .retire_close_runtime_resources(attempt_id)
+        .retire_close_runtime_resources(attempt_id.clone())
         .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error,
-                "close_retirement_needs_repair",
-            )))
-        })?;
+    {
+        let current = state
+            .db
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
+        let error_type = if current.close_outcome()
+            == Some(phoenix_core::domain::close::CloseCompletionOutcome::CloseIncomplete)
+        {
+            "close_incomplete"
+        } else {
+            "close_retirement_needs_repair"
+        };
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            error, error_type,
+        ))));
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -927,7 +938,11 @@ async fn run_legacy_close_compat(
                         .get_close_obligation(obligation.attempt_id().as_str())
                         .await
                         .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
-                    let error_type = if current.phase() == ClosePhase::NeedsRepair {
+                    let error_type = if current.close_outcome()
+                        == Some(CloseCompletionOutcome::CloseIncomplete)
+                    {
+                        "close_incomplete"
+                    } else if current.phase() == ClosePhase::NeedsRepair {
                         "close_retirement_needs_repair"
                     } else {
                         "close_inspection_failed"
@@ -949,16 +964,27 @@ async fn run_legacy_close_compat(
                 ))));
             }
             ClosePhase::RetirementRequested => {
-                state
+                if let Err(error) = state
                     .runtime
                     .retire_close_runtime_resources(obligation.attempt_id().clone())
                     .await
-                    .map_err(|error| {
-                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                            error,
-                            "close_retirement_needs_repair",
-                        )))
-                    })?;
+                {
+                    let current = state
+                        .db
+                        .get_close_obligation(obligation.attempt_id().as_str())
+                        .await
+                        .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
+                    let error_type = if current.close_outcome()
+                        == Some(CloseCompletionOutcome::CloseIncomplete)
+                    {
+                        "close_incomplete"
+                    } else {
+                        "close_retirement_needs_repair"
+                    };
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        error, error_type,
+                    ))));
+                }
                 return Ok(());
             }
             ClosePhase::NeedsRepair => {
@@ -969,7 +995,16 @@ async fn run_legacy_close_compat(
             }
             ClosePhase::Completed => {
                 return match obligation.close_outcome() {
-                    Some(CloseCompletionOutcome::Archived) => Ok(()),
+                    Some(
+                        CloseCompletionOutcome::Archived
+                        | CloseCompletionOutcome::ArchivedCleanupAttention,
+                    ) => Ok(()),
+                    Some(CloseCompletionOutcome::CloseIncomplete) => {
+                        Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            "Close could not confirm that conversation and process shutdown completed",
+                            "close_incomplete",
+                        ))))
+                    }
                     Some(CloseCompletionOutcome::Cancelled) => {
                         Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                             "Close was cancelled before archival completed",

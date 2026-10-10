@@ -18,13 +18,14 @@ runSurfaceCapture({
     const main = row.locator('.conv-item-main');
     const title = row.locator('.conv-item-title');
     const meta = row.locator('.product-conversation-list-row__meta');
-    const actions = row.locator('.conv-actions');
+    const trigger = row.locator('.product-conversation-actions > button');
+    const actions = row.locator('.conv-item-actions');
     const actionButtons = actions.locator('.conv-action-btn');
     const metrics = await row.evaluate((element) => {
       const mainElement = element.querySelector('.conv-item-main');
       const titleElement = element.querySelector('.conv-item-title');
       const metaElement = element.querySelector('.product-conversation-list-row__meta');
-      const actionsElement = element.querySelector('.conv-actions');
+      const actionsElement = element.querySelector('.product-conversation-actions > button');
       if (!(mainElement instanceof HTMLElement)
         || !(titleElement instanceof HTMLElement)
         || !(metaElement instanceof HTMLElement)
@@ -63,6 +64,10 @@ runSurfaceCapture({
     if (viewport.name === 'mobile' && metrics.rowHeight > 80) {
       throw new Error(`Product aggregate row lost compact mobile density: ${JSON.stringify(metrics)}`);
     }
+    const triggerBox = await trigger.boundingBox();
+    if (!triggerBox || triggerBox.width < 44 || triggerBox.height < 44) throw new Error('Actions trigger smaller than 44px');
+    await trigger.click();
+    await actions.waitFor();
     const expectedActionCount = isHistory ? 1 : 2;
     if ((await actionButtons.count()) !== expectedActionCount) {
       throw new Error(`${isHistory ? 'History' : 'Open'} aggregate must expose ${expectedActionCount} action target(s)`);

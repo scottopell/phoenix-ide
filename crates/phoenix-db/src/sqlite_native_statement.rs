@@ -870,6 +870,7 @@ fn with_c_string<T>(raw: *const c_char, use_value: impl FnOnce(Option<&str>) -> 
 
 fn is_runtime_state_name(name: &str) -> bool {
     name == "conversations"
+        || name == "close_cleanup_failures"
         || name.starts_with("conversation_creation_")
         || name == "continuation_dispatch_intents"
         || name == "startup_parent_actions"
@@ -879,6 +880,7 @@ fn is_runtime_state_name(name: &str) -> bool {
         || name == "auth_sessions"
         || name == "mcp_disabled_servers"
         || name == "mcp_oauth_tokens"
+        || name == "mcp_oauth_removals"
         || name == "sub_agent_personas"
         || name == "notification_settings"
         || name == "app_settings"
@@ -2457,6 +2459,15 @@ mod tests {
         assert_eq!(occupied.len(), 1);
         assert_eq!(occupied[0].1.writer_concurrency_peak, 1);
         assert!(report.writer_occupancy_gap_count >= 1);
+    }
+
+    #[test]
+    fn cleanup_failure_occurrence_is_classified_as_runtime_state() {
+        let name = CString::new("close_cleanup_failures").unwrap();
+        assert_eq!(
+            classify_schema_object(name.as_ptr()),
+            SqliteWorkloadCategory::RuntimeState
+        );
     }
 
     #[test]

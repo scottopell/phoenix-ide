@@ -365,3 +365,34 @@
   border-radius: 8px;
   vertical-align: middle;
 }
+
+.product-conversation-actions {
+  display: contents;
+}
+
+.product-conversation-actions > button.conv-action-btn {
+  position: static;
+  min-width: 44px;
+  min-height: 44px;
+  align-self: start;
+}
+
+.product-conversation-actions .conv-item-actions {
+  grid-column: 1 / -1;
+  position: static;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+}
+
+.product-conversation-actions .conv-item-actions .conv-action-btn {
+  color: var(--text-primary);
+  justify-content: flex-start;
+  text-align: left;
+  white-space: normal;
+}
+
+.product-conversation-actions .conv-item-actions .conv-action-btn:disabled {
+  color: var(--text-muted);
+}

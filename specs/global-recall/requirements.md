@@ -252,7 +252,7 @@ AND SHALL request supporting history only where needed, distinguish observed fac
 WHILE a write-capable ordinary ProductConversation or the Coordinator executes a database query
 THE SYSTEM SHALL permit reads from Phoenix application tables, including hidden messages, settings, serialized state, and workflow payloads that may not be visible through normal UI
 
-THE SYSTEM SHALL deny reads of known credential-bearing columns, including owner sessions, share tokens, and MCP OAuth client secrets and tokens, without treating the query surface as a general security sandbox
+THE SYSTEM SHALL deny reads of known credential-bearing columns, including owner sessions, share tokens, MCP OAuth client secrets and tokens, and federation credential verifiers, without treating the query surface as a general security sandbox
 
 THE SYSTEM SHALL describe this capability as operator-level forensic access and SHALL treat all returned values as untrusted stored data rather than instructions
 
@@ -367,8 +367,15 @@ THE SYSTEM SHALL deliver factual packets with source identity, occurrence identi
 
 THE SYSTEM SHALL admit notifications through ordinary durable input admission or steering, with stable replay identity, and SHALL NOT introduce a separate execution scheduler.
 
-WHEN removal or source Close precedes notification acceptance
-THE SYSTEM SHALL suppress the unaccepted notification.
+WHEN removal or source Close precedes subscription notification acceptance
+THE SYSTEM SHALL suppress the unaccepted subscription notification.
+
+WHEN a distinct Close cleanup failure is durably recorded
+THE SYSTEM SHALL append a mandatory factual notification to the same event outbox, regardless of watch enrollment or source History membership, and SHALL route it to the current Global Coordinator transcript.
+
+THE SYSTEM SHALL identify the mandatory notification by the persisted failure occurrence, SHALL deduplicate replay of that occurrence, and SHALL emit a new notification for a distinct failure of a newly authorized cleanup run.
+
+THE SYSTEM SHALL preserve the failure and notification atomically, SHALL distinguish confirmed conversation-and-process shutdown from uncertain shutdown in the notification, and SHALL NOT treat notification delivery or failure as authorization to resume cleanup.
 
 WHEN notification acceptance precedes removal or source Close
 THE SYSTEM SHALL retain accepted input without retraction.

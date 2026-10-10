@@ -28,8 +28,8 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-010 | Client Identity Acquisition | Complete | Cached registrations keyed by authorization server are reused; a pre-configured public client (Claude Code's top-level `oauth.clientId`, no secret — PKCE only) seeds the registration once discovery resolves the issuer; RFC 7591 DCR is the fallback. Phoenix hosts no Client ID Metadata Document, so that step resolves to nothing (logged at `debug`) and falls through to DCR. |
 | REQ-MCP-011 | Authorization Code Flow with PKCE | Complete | Native flow in `mcp.rs` (`begin_oauth_flow` / `complete_oauth_authorization`): S256 PKCE (refused when not advertised), unguessable `state` bound to the pending flow, `iss` validation, RFC 8707 `resource` on both requests, and callback at `GET /api/mcp/oauth/callback`. `OAuthConfig` preserves Claude Code-compatible `oauth.scopes`; configured and challenge-required scopes are unioned, Protected Resource Metadata is the fallback when neither is present, and prior grants are always retained during re-authorization. |
 | REQ-MCP-012 | Token Storage, Refresh, Invalidation, and Step-Up | Complete | `mcp_oauth_registrations` + `mcp_oauth_tokens` (phoenix-db migration 22, plaintext); bearer on every request via the shared cell; silent restore (resource-matched, unexpired-or-refreshable); refresh with rotation persisted; refresh rejection discards and re-prompts; 403 `insufficient_scope` steps up with the scope union while the triggering call waits on the supervisor recovery epoch. |
-| REQ-MCP-013 | Authorization Status Surfaced to the UI | Complete | `GET /api/mcp/status` carries each server's `state` (`ready`/`unauthorized`/`failed`), `transport`, `auth`, and the native flow's structured `pending_oauth_url` (the stdio `mcp-remote` path still feeds the same map from its stderr drain). |
-| REQ-MCP-014 | Tool Exposure and Live Resolution | Complete | `tool_definitions` / `create_mcp_tool_by_name`; live resolution via `ToolRegistryExecutor`. HTTP servers ride this unchanged. |
+| REQ-MCP-013 | Authorization Status Surfaced to the UI | Complete | `GET /api/mcp/status` carries each server's `state` (`ready`/`unauthorized`/`failed`/`removing`), `transport`, `auth`, and the native flow's structured `pending_oauth_url` (the stdio `mcp-remote` path still feeds the same map from its stderr drain). |
+| REQ-MCP-014 | Tool Exposure and Live Resolution | Complete | `tool_definitions` / `create_mcp_tool_by_name`; live resolution via `ToolRegistryExecutor`. Schema-bound calls retain the selected supervisor and recheck its serving catalog before dispatch and recovery retry. Queued-call and respawn regressions verify rejection without replacement I/O. |
 | REQ-MCP-015 | Config Reload Reconciliation | Complete | `reload_from_actor_configs` sends reconfigure/remove commands to per-server supervisors; epoch checks discard stale connect/recovery completions. The `PartialEq` comparison spans the `Stdio | Http` config variants and `timeoutSeconds`. |
 | REQ-MCP-016 | Per-Server Enable/Disable | Complete | `disable_server` / `enable_server`; persisted in `mcp_disabled_servers` (`crates/phoenix-db/src/lib.rs`). |
 | REQ-MCP-017 | Tool Call Cancellation and Error Surfacing | Complete | `McpTool::run` passes cancellation into `McpClientManager`; the per-server supervisor returns cancellation independently for each waiter and requires a new recovery epoch before stdio serves another call. `tools/call` honors `isError`. |
@@ -74,6 +74,82 @@ This spec set is M0 of the native HTTP MCP build-out. The milestones:
 
 ## Allium Spec
 
+OAuth recovery claims its epoch before authenticated teardown. The supervisor
+retains the old transport privately, refreshes or awaits re-authorization, and
+uses the new bearer for cleanup before connecting a replacement. Coverage in
+`phoenix-mcp` includes `tool_call_401_refreshes_and_replays_the_call`,
+`concurrent_oauth_recovery_refreshes_once_and_cleans_up_with_fresh_bearer`,
+`transient_oauth_refresh_retries_before_session_cleanup`,
+`refresh_rejection_discards_token_and_reprompts`, and
+`oauth_refresh_keeps_failed_delete_owned_and_blocks_replacement`. Scope step-up
+uses the same retained ownership; its end-to-end regression requires the
+upgraded bearer on DELETE. The gated supervisor test
+`oauth_callback_cleanup_and_restart_cannot_supersede_queued_reload` covers a
+reload queued while callback cleanup is blocked.
+`oauth_refresh_mutations_are_serialized_with_reload_for_success_and_rejection`
+gates token responses and covers both initial refresh and background retry,
+ensuring newer credentials and cancelled flows survive the old recovery.
+`replacement_oauth_connection_cannot_publish_a_flow_after_reload` gates the
+replacement handshake while a configuration reload is queued, then verifies
+that the new endpoint is ready without an obsolete OAuth token or prompt.
+`failed_removal_preserves_oauth_cleanup_owner_for_callback` covers a callback
+after failed removal and proves it completes removal without reconnecting.
+`readding_a_server_restores_reconnect_intent_after_failed_removal` covers an
+explicitly restored configuration. Supervisor regressions cover cancellation before cleanup
+and preservation of unrelated stale transport credentials.
+`oauth_prompt_binds_cleanup_owner_before_recovery_returns` verifies prompt
+ownership and authenticated cleanup for an immediate callback after rejected
+refresh or scope step-up preparation.
+`queued_removal_uses_the_bearer_recovered_by_refresh` covers removal queued
+during token refresh. `slow_connection_does_not_block_another_servers_oauth_refresh`
+verifies that one blocked handshake does not serialize another server's recovery.
+`removed_oauth_owner_is_forgotten_after_denial_cleanup_succeeds` covers denial
+with successful and failed removal cleanup, including re-authorization after
+re-adding a denied removal while DELETE still requires a fresh bearer.
+`readding_removed_owner_reconnects_after_callback_token_delete_failure` covers
+re-addition after a token-store deletion error.
+`oauth_claim_quiesces_http_stream_without_deleting_the_session` verifies that
+retained sessions stop their server-initiated stream before credential recovery.
+`denied_step_up_can_reauthorize_on_unchanged_reload` covers a denied scope
+upgrade, preserved scopes on explicit reload, stale callback rejection, and
+authenticated cleanup before replacement publication.
+`oauth_refresh_persistence_retry_does_not_repeat_rotating_grant` covers repeated
+store-write failures after rotation, one grant exchange, and fresh authenticated
+cleanup after the response is persisted.
+`configuration_invalidates_unpersisted_refresh_even_when_store_lookup_fails`
+verifies that local lookup errors cannot retain a response invalidated by config.
+`oauth_quiescence_failure_settles_failed_and_retains_cleanup` covers a visible
+failed state and retained teardown ownership when stream quiescence fails.
+`oauth_failure_takes_over_failed_transport_cleanup_from_same_epoch` covers
+transport recovery winning leadership before OAuth recovery, with expired
+DELETE followed by refreshed DELETE and a ready replacement.
+`rejected_refresh_with_unstartable_authorization_settles_failed` verifies
+visible failure without an endless retry, followed by explicit authorization retry.
+`unstartable_step_up_preserves_scope_union_for_explicit_retry` covers the
+equivalent scope-upgrade setup failure without losing the requested grants.
+`removal_preserves_transient_refresh_until_cleanup_or_readdition` covers removal
+between retries, removal after successful refresh, restored reconnect intent
+on re-addition, and cleanup-only authorization after the grant is rejected.
+`denied_authorization_retry_preserves_challenge_directed_discovery` requires a
+nonstandard metadata URI across denial and explicit reload.
+`changed_configuration_waits_for_transient_oauth_cleanup` verifies both refresh
+success and rejected-grant authorization before applying a new resource.
+`changed_configuration_replaces_pending_cleanup_authorization` covers fresh
+nonce and preserved scopes when a pending or denied flow is reconfigured.
+`replacement_handshake_reauthorization_is_owned_and_visible` verifies owned,
+visible authorization when replacement initialization rejects the refreshed grant.
+`replacement_tools_list_401_and_failed_delete_can_reauthorize` covers a
+session-bearing replacement's tools/list 401, failed DELETE, denial, explicit
+retry, and fresh authenticated cleanup. `startup_tools_list_401_and_failed_delete_refresh_silently`
+covers the same handshake failure with successful and transient startup refresh.
+`refreshed_handshake_cleanup_preserves_auth_cause_without_repeating_grant`
+covers a rejected tools/list after one silent grant and preserved authorization
+provenance through fresh-recovery teardown failure.
+`refreshed_handshake_with_successful_teardown_does_not_repeat_grant` covers
+initialize and tools/list rejection after the first refresh when cleanup succeeds,
+with one grant followed by an owned prompt preserving prior granted scopes
+and successful browser authorization.
+
 Behavioral specification: `specs/mcp/mcp.allium`
 
 Models the per-server `ConnState` lifecycle
@@ -83,3 +159,91 @@ recovery), the `OAuthPhase` authorization sub-lifecycle
 the `McpServer` / `OAuthRegistration` / `OAuthToken` entities, and invariants
 binding session ids and tokens to the HTTP/OAuth servers that own them.
 </content>
+
+`startup_refresh_after_successful_teardown_retries_transient_failure` verifies
+owned retry after token endpoint and token persistence failures, including a
+rotating refresh grant. `handshake_non_auth_failure_with_delete_401_uses_cleanup_challenge`
+verifies DELETE-only authorization rejection, challenge discovery, and fresh
+bearer cleanup. The successful-teardown refresh regression also verifies changed
+replacement discovery metadata and scope preservation.
+
+`handshake_and_delete_challenges_survive_refresh_rejection` verifies metadata
+retention and scope union through immediate and background grant rejection.
+Both clean and failed replacement teardown preserve initial discovery metadata
+when replacement challenges omit it.
+
+`retained_refresh_continuation_preserves_discovery_and_scopes` verifies the
+immediate and background successful-refresh continuations, including clean and
+failed replacement teardown, inherit discovery metadata and required scopes.
+
+`failed_removal_callback_retains_grant_and_authorization_retry` covers step-up
+and rejected-refresh removal callbacks, failed cleanup, complete grant retention,
+and explicit reauthorization after recovered credentials expire.
+`removal_callback_persistence_failure_retains_authorization_retry` verifies a
+failed recovered-grant write settles visibly and retains the same scope plan for
+explicit reauthorization.
+
+`ready_oauth_removal_refreshes_before_deleting_grant` covers expired Ready
+removal, transient endpoint and grant persistence retries, authenticated cleanup,
+and cleanup-only completion. `ready_oauth_removal_cleanup_failure_retries_with_retained_grant`
+verifies explicit failed cleanup retries retain the rotated grant.
+`ready_oauth_removal_delete_challenge_can_authorize_cleanup` verifies DELETE
+challenge metadata and scope union survive refresh rejection and reauthorization.
+It also covers DELETE `403 insufficient_scope`, which requests broader owned
+authorization without refreshing the insufficient grant again.
+`queued_reconfiguration_supersedes_the_original_tool_invocation` verifies an
+OAuth recovery can publish a changed endpoint while failing the old invocation,
+including rejection of a stale dispatch in the supervisor before network I/O.
+`ready_removal_cleanup_reauthorization_retains_prior_scopes` covers immediate
+and background cleanup rejection after refresh narrows the grant's scopes; the
+retry preserves previously required scopes and the latest DELETE challenge.
+The retained-refresh continuation matrix explicitly narrows the refreshed grant
+and verifies the replacement authorization still includes prior required scopes.
+
+`stream_quiescence_failure_blocks_handshake_oauth_cleanup` verifies a panicked
+stream retains its session without DELETE or automatic OAuth recovery, with
+the supervisor handoff retaining failed ownership and an OAuth retry plan until
+explicit cleanup retry, which preserves typed 401/403 classification.
+The pending-configuration authorization matrix verifies later token expiry on
+the applied OAuth configuration refreshes and replays normally.
+The transient-removal matrix verifies `pending_removals` and removing status.
+`McpStatusPanel` polling coverage verifies a later cleanup authorization remains
+visible with another ready server present and polling settles after removal,
+including removal of the last server and failed removal that later completes.
+
+`hung_handshake_can_be_reconfigured_or_shutdown_without_releasing_rpc` covers
+same-server reload and shutdown during blocked initialize and tools/list.
+The replacement OAuth connection regression requires reload to complete before
+releasing the obsolete initialization, without stale grant or flow publication.
+`concurrent_scope_challenge_survives_refresh_and_replacement_handshake` verifies
+scope followers joining a refresh or its replacement request the complete grant
+before retry. `stale_scope_challenge_cannot_mutate_replacement_oauth_plan` verifies
+configuration-bound plan publication rejects scopes and discovery from an old resource.
+`failed_removal_retries_valid_access_token_without_refresh_or_authorization` covers
+transient DELETE failure with and without a refresh token; retry reuses the valid
+access token and deletes the grant only after cleanup succeeds.
+
+`unchanged_reload_retries_refreshed_cleanup_without_browser_authorization`
+verifies DELETE failure after successful refresh retries authenticated cleanup
+on unchanged-config reload, including another access-token expiry before retry.
+`queued_configuration_invalidation_failure_blocks_old_grant_restore` covers
+refresh and authorization callback completion, lookup and deletion failure, and
+same-resource client/scope changes. Failed invalidation preserves the old
+configuration; explicit retry invalidates the grant before new authorization.
+`expired_cleanup_retry_preserves_challenge_discovery_and_completed_step_up`
+requires challenge-only discovery for expired cleanup retry after refresh or
+completed scope upgrade, covering both reconnect and removal without repeat sign-in.
+
+`deferred_removal_token_failure_stays_visible_and_resumes_after_restart` covers
+credential deletion failure after authenticated cleanup, visible failed ownership,
+live retry, startup retry failure and success, and cancellation on re-addition.
+`denied_removal_keeps_failed_credential_completion_visible` verifies denied
+authorization follows the same atomic completion contract.
+`mcp_removal_intent_survives_restart_and_commits_atomically` verifies SQLite
+intent survives grant rotation and reopening, failed completion rolls back token
+deletion, and cancellation preserves the grant. Migration 118 adds durable
+removal intents; ADR-086 bounds restart recovery to stored credentials and intent.
+
+`startup_readdition_cancellation_failure_remains_visible_until_retry` covers
+failed removal cancellation at startup: status stays failed, the grant and intent
+remain intact, and retry reconnects without a duplicate status entry.

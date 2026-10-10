@@ -26,6 +26,7 @@ ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 libc = "0.2"
 nono = { version = "0.53", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 thiserror = "2"
 tracing = "0.1"
 

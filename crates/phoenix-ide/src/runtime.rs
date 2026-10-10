@@ -3362,103 +3362,6 @@ impl RuntimeManager {
         Ok(())
     }
 
-    /// Rebuilds persisted server-owned loss inspection. Inspection is recovery
-    /// only: it never confirms loss or begins destructive retirement.
-    pub async fn resume_pending_close_inspections(self: &Arc<Self>) -> Result<usize, String> {
-        let obligations = self
-            .db
-            .list_pending_close_obligations()
-            .await
-            .map_err(|error| error.to_string())?;
-        let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
-            let manager = Arc::clone(&manager);
-            async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                ) {
-                    return Ok(false);
-                }
-                match manager
-                    .inspect_close_retirement(obligation.attempt_id().clone())
-                    .await
-                {
-                    Ok(_) => Ok(true),
-                    Err(error) => {
-                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
-                            "Close retirement inspection could not be rebuilt");
-                        Ok(false)
-                    }
-                }
-            }
-        })
-        .await
-    }
-
-    /// Replays exact runtime-resource permits for sealed Close retirements. It
-    /// never finalizes product lifecycle or unblocks History.
-    pub async fn resume_pending_close_runtime_retirements(
-        self: &Arc<Self>,
-    ) -> Result<usize, String> {
-        let obligations = self
-            .db
-            .list_pending_close_obligations()
-            .await
-            .map_err(|error| error.to_string())?;
-        let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
-            let manager = Arc::clone(&manager);
-            async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::RetirementRequested
-                        | phoenix_core::domain::close::ClosePhase::NeedsRepair
-                ) {
-                    return Ok(false);
-                }
-                let retried = if obligation.phase()
-                    == phoenix_core::domain::close::ClosePhase::NeedsRepair
-                {
-                    manager
-                        .db
-                        .retry_close_retirement(obligation.attempt_id())
-                        .await
-                        .map_err(|error| error.to_string())?
-                } else {
-                    obligation.clone()
-                };
-                if retried.phase()
-                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                {
-                    return match manager
-                        .inspect_close_retirement(retried.attempt_id().clone())
-                        .await
-                    {
-                        Ok(_) => Ok(true),
-                        Err(error) => {
-                            tracing::warn!(attempt_id = %retried.attempt_id(), %error,
-                                "Close retirement inspection could not be rebuilt during repair recovery");
-                            Ok(false)
-                        }
-                    };
-                }
-                match manager
-                    .retire_close_runtime_resources(retried.attempt_id().clone())
-                    .await
-                {
-                    Ok(()) => Ok(true),
-                    Err(error) => {
-                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
-                            "Close runtime-resource retirement remains in repair state");
-                        Ok(false)
-                    }
-                }
-            }
-        })
-        .await
-    }
-
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
         let obligations = self
             .db
@@ -8712,7 +8615,6 @@ mod scope_liveness_tests {
 
     async fn prepare_clean_close_with_tmux(
         manager: &RuntimeManager,
-        owner: &phoenix_tools::tmux::test_server::TestTmuxServerOwner,
         conversation_id: &str,
         attempt: &str,
     ) -> (
@@ -8763,7 +8665,7 @@ mod scope_liveness_tests {
             .tmux_registry()
             .ensure_live(
                 &ResourceScopeKey::Work(scope.clone()),
-                owner.path(),
+                &worktree,
                 None,
                 None,
             )
@@ -9039,75 +8941,38 @@ mod scope_liveness_tests {
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
 
+    /// The sealed server dies and a replacement with a new token starts at
+    /// the same socket path.
     async fn replace_tmux_server(
         manager: &RuntimeManager,
-        owner: &phoenix_tools::tmux::test_server::TestTmuxServerOwner,
+        fake: &phoenix_tools::tmux::fake_backend::FakeTmuxBackend,
         scope: &WorkScopeId,
         socket: &std::path::Path,
         stale_token: &str,
     ) -> String {
-        manager
-            .tmux_registry()
-            .reopen_after_repair(&ResourceScopeKey::Work(scope.clone()))
-            .await;
-        let old_socket = std::fs::metadata(socket).unwrap();
-        let old_server_pid = tokio::process::Command::new("tmux")
-            .args([
-                "-S",
-                &socket.to_string_lossy(),
-                "display-message",
-                "-p",
-                "#{pid}",
-            ])
-            .output()
-            .await
-            .unwrap();
-        assert!(old_server_pid.status.success());
-        let old_server_pid = String::from_utf8(old_server_pid.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let old_server = phoenix_core::process_identity::current_process_identity(old_server_pid)
-            .expect("capture old tmux server identity");
-        let output = tokio::process::Command::new("tmux")
-            .args(["-S", &socket.to_string_lossy(), "kill-server"])
-            .output()
-            .await
-            .unwrap();
-        assert!(output.status.success(), "kill stale server: {output:?}");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while phoenix_core::process_identity::process_identity_matches(old_server) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "exact stale tmux server remained after successful kill-server"
-            );
-            tokio::task::yield_now().await;
-        }
-        if let Ok(observed) = std::fs::metadata(socket) {
-            assert_eq!(
-                std::os::unix::fs::MetadataExt::dev(&observed),
-                std::os::unix::fs::MetadataExt::dev(&old_socket)
-            );
-            assert_eq!(
-                std::os::unix::fs::MetadataExt::ino(&observed),
-                std::os::unix::fs::MetadataExt::ino(&old_socket)
-            );
-            std::fs::remove_file(socket).unwrap();
-        }
+        let scope = ResourceScopeKey::Work(scope.clone());
+        manager.tmux_registry().reopen_after_repair(&scope).await;
+        fake.kill_server(socket);
         let replacement = manager
             .tmux_registry()
-            .ensure_live(
-                &ResourceScopeKey::Work(scope.clone()),
-                owner.path(),
-                None,
-                None,
-            )
+            .ensure_live(&scope, std::path::Path::new("/"), None, None)
             .await
             .unwrap();
         let replacement_token = replacement.read().await.server_token.clone();
+        assert_eq!(replacement.read().await.socket_path, socket);
         assert_ne!(replacement_token, stale_token);
         replacement_token
+    }
+
+    fn fake_tmux_registry(
+        socket_dir: &std::path::Path,
+        fake: &Arc<phoenix_tools::tmux::fake_backend::FakeTmuxBackend>,
+    ) -> Arc<TmuxRegistry> {
+        Arc::new(TmuxRegistry::with_backend(
+            socket_dir.to_path_buf(),
+            fake.clone(),
+            None,
+        ))
     }
 
     async fn assert_tmux_absence_proof(manager: &RuntimeManager, attempt_id: &CloseAttemptId) {
@@ -9122,19 +8987,19 @@ mod scope_liveness_tests {
         assert_eq!(proof_kind, "absence_adopted");
     }
 
+    /// REQ-WL-002d: Close retirement of a sealed tmux identity whose server
+    /// was replaced persists an absence proof and leaves the replacement
+    /// registered and running.
     #[tokio::test]
     async fn live_tmux_replacement_persists_absence_proof_and_survives() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-        let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let fake = phoenix_tools::tmux::fake_backend::FakeTmuxBackend::new();
         let mut manager = test_manager().await;
-        manager.tmux_registry = Arc::new(owner.registry());
+        manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
         let (_repository, attempt_id, scope, socket, stale_token) =
-            prepare_clean_close_with_tmux(&manager, &owner, "live-tmux-close", "live-tmux-attempt")
-                .await;
+            prepare_clean_close_with_tmux(&manager, "live-tmux-close", "live-tmux-attempt").await;
         let replacement_token =
-            replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
+            replace_tmux_server(&manager, &fake, &scope, &socket, &stale_token).await;
 
         manager
             .retire_close_runtime_resources(attempt_id.clone())
@@ -9153,31 +9018,32 @@ mod scope_liveness_tests {
                 .server_token,
             replacement_token
         );
-        owner.shutdown();
+        let survivor = fake.server(&socket).unwrap();
+        assert!(survivor.live);
+        assert_eq!(survivor.token, Some(replacement_token));
+        assert_eq!(fake.kill_server_count(&socket), 0);
     }
 
+    /// REQ-WL-002d: after a restart (fresh registry, no live lease), Close
+    /// rehydrates the sealed tmux identity, proves the original server
+    /// absent, persists that proof, and leaves the replacement untouched.
     #[tokio::test]
     async fn restarted_tmux_rehydration_persists_absence_proof_and_leaves_replacement_untouched() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-        let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let fake = phoenix_tools::tmux::fake_backend::FakeTmuxBackend::new();
         let mut manager = test_manager().await;
-        manager.tmux_registry = Arc::new(owner.registry());
-        let (_repository, attempt_id, scope, socket, stale_token) = prepare_clean_close_with_tmux(
-            &manager,
-            &owner,
-            "restart-tmux-close",
-            "restart-tmux-attempt",
-        )
-        .await;
-        replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
+        manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
+        let (_repository, attempt_id, scope, socket, stale_token) =
+            prepare_clean_close_with_tmux(&manager, "restart-tmux-close", "restart-tmux-attempt")
+                .await;
+        let replacement_token =
+            replace_tmux_server(&manager, &fake, &scope, &socket, &stale_token).await;
         manager
             .close_retirement_leases
             .lock()
             .await
             .retain(|(lease_attempt, _), _| lease_attempt != attempt_id.as_str());
-        manager.tmux_registry = Arc::new(owner.registry());
+        manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
 
         manager
             .retire_close_runtime_resources(attempt_id.clone())
@@ -9185,24 +9051,18 @@ mod scope_liveness_tests {
             .unwrap();
 
         assert_tmux_absence_proof(&manager, &attempt_id).await;
-        let output = tokio::process::Command::new("tmux")
-            .args(["-S", &socket.to_string_lossy(), "list-sessions"])
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "replacement was retired: {output:?}"
-        );
-        owner.shutdown();
+        let survivor = fake.server(&socket).unwrap();
+        assert!(survivor.live, "replacement was retired");
+        assert_eq!(survivor.token, Some(replacement_token));
+        assert_eq!(fake.kill_server_count(&socket), 0);
     }
 
     #[tokio::test]
     async fn failed_pre_runtime_worktree_reinspection_persists_typed_residual() {
         #![allow(clippy::too_many_lines)]
         use phoenix_core::domain::close::{
-            CapturedWorktreeIdentity, CloseAttemptId, ClosePhase, RetiredResourceKind,
-            RetirementFailureReason, RetirementOutcome,
+            CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome, ClosePhase,
+            CloseRunRef, RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
         };
 
         let manager = test_manager().await;
@@ -9301,7 +9161,27 @@ mod scope_liveness_tests {
             .get_close_obligation(attempt_id.as_str())
             .await
             .unwrap();
-        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
+        assert_eq!(obligation.phase(), ClosePhase::Completed);
+        assert_eq!(
+            obligation.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        let failure_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_cleanup_failures WHERE attempt_id = ?1")
+                .bind(attempt_id.as_str())
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(failure_count, 1);
+        let mandatory_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events
+             WHERE mandatory_failure_occurrence_id = ?1",
+        )
+        .bind(CloseRunRef::initial(attempt_id.clone()).failure_occurrence_id())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(mandatory_event_count, 1);
         let evidence = manager
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())
@@ -12553,11 +12433,11 @@ mod scope_liveness_tests {
             .expect("valid replay response")
             .with_owner_message_id("direct-final-response".into());
         mgr.db()
-            .update_state_and_provider_replay(
+            .update_state_and_replay(
                 conversation_id,
                 &ConvState::LlmRequesting { attempt: 1 },
                 Utc::now(),
-                &phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(
+                &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Anthropic(
                     replay_response,
                 ),
             )

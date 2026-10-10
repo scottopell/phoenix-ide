@@ -25,6 +25,8 @@ import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '..
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
+import { useConnection } from '../hooks/useConnection';
+import type { SSEAction } from '../conversation/atom';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import {
   getProductConversationSnapshotChangeSequence,
@@ -53,6 +55,15 @@ const ChainQaColumn = lazy(() =>
   import('./ChainPage').then((m) => ({ default: m.ChainQaColumn })),
 );
 
+
+const discardCloseLiveUpdateAction = (_action: SSEAction): void => {
+  void _action;
+};
+
+function CloseLiveUpdateOwner({ conversationId }: { conversationId: string }) {
+  useConnection({ conversationId, dispatch: discardCloseLiveUpdateAction });
+  return null;
+}
 
 async function fetchOlderSnapshotWithFreshCursor(
   productConversationId: string,
@@ -444,6 +455,8 @@ function RecallPanel({
     const handleEvent = (evt: ChainSseEventData) => {
       if (evt.type === 'chain_qa_token') {
         dispatch({ type: 'TOKEN_APPENDED', chainQaId: evt.chain_qa_id, delta: evt.delta });
+      } else if (evt.type === 'chain_qa_answer_reset') {
+        dispatch({ type: 'ANSWER_RESET', chainQaId: evt.chain_qa_id });
       } else if (evt.type === 'chain_qa_completed') {
         dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
         void refreshChain(chainRootId);
@@ -976,8 +989,11 @@ function ProductConversationPageInner() {
     ].filter((id): id is string => Boolean(id)));
     if (notificationIds.size === 0) return;
     const refresh = (source: 'close' | 'stream') => {
-      const closeIsActive = snapshot?.close != null && snapshot.close.phase !== 'completed';
-      if (source === 'close' || closeIsActive) setSnapshotRetry((retry) => retry + 1);
+      const closeNeedsLiveRefresh = snapshot?.close != null
+        && (snapshot.close.phase !== 'completed'
+          || snapshot.close.outcome === 'close_incomplete'
+          || snapshot.close.outcome === 'archived_cleanup_attention');
+      if (source === 'close' || closeNeedsLiveRefresh) setSnapshotRetry((retry) => retry + 1);
     };
     const unsubscribes = [...notificationIds].map((id) =>
       subscribeCloseSnapshotChanged(id, refresh));
@@ -1093,7 +1109,10 @@ function ProductConversationPageInner() {
   }, [currentLatestProjection?.conversationId, historyGeneration, loadingOlder, productConversationId, snapshot]);
 
   const messages = aggregateMessages;
-  const closeInProgress = snapshot?.close != null && snapshot.close.phase !== 'completed';
+  const closeIncomplete = snapshot?.close?.outcome === 'close_incomplete';
+  const cleanupAttention = snapshot?.close?.outcome === 'archived_cleanup_attention';
+  const closeNeedsLiveUpdateOwner = closeIncomplete || cleanupAttention;
+  const closeInProgress = snapshot?.close != null && (snapshot.close.phase !== 'completed' || closeIncomplete);
   const convState = useMemo(
     () => snapshot?.ordinary_lifecycle === 'history' || closeInProgress
       ? ({ type: 'idle' } satisfies ConversationState)
@@ -1200,6 +1219,33 @@ function ProductConversationPageInner() {
         messages={messages}
         recallDisabled={!liveControlsEnabled}
       />
+      {snapshot.close && (snapshot.close.outcome === 'archived_cleanup_attention' || closeIncomplete) && (
+        <section className="product-conversation-page__close-status" role="alert" aria-label="Close status">
+          <strong>{closeIncomplete
+            ? 'Close incomplete — shutdown could not be confirmed'
+            : 'Closed — cleanup needs attention'}</strong>
+          <div>Run {snapshot.close.run_ordinal} · {snapshot.close.run_status}. No automatic retry.</div>
+          {snapshot.close.failure && (
+            <>
+              <div>{snapshot.close.failure.reason.replaceAll('_', ' ')} — {snapshot.close.failure.detail}</div>
+              <div>{snapshot.close.failure.stop_certainty.kind === 'conversation_and_processes_stopped'
+                ? 'Conversation and processes stopped.' : 'Shutdown uncertain.'}</div>
+              <div>Failure <code>{snapshot.close.failure.occurrence_id}</code></div>
+              <details>
+                <summary>Remaining resources ({snapshot.close.failure.remaining_resources.length})</summary>
+                <ol>
+                  {snapshot.close.failure.remaining_resources.map((resource, ordinal) => (
+                    <li key={ordinal}>
+                      <code>{resource.scope}: {resource.resource_kind.replaceAll('_', ' ')} · {resource.identity}</code>
+                      {' · '}{resource.disposition}
+                    </li>
+                  ))}
+                </ol>
+              </details>
+            </>
+          )}
+        </section>
+      )}
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">
           {olderError ?? error ?? 'The linked message is not available in this conversation history.'}
@@ -1210,8 +1256,8 @@ function ProductConversationPageInner() {
           messages={messages}
           pendingMessages={currentLatestProjection?.pendingMessages ?? []}
           convState={convState}
-          onRetry={currentLatestProjection?.onRetryPending ?? (() => {})}
-          onCancelSteering={currentLatestProjection?.onCancelSteering}
+          onRetry={liveControlsEnabled ? currentLatestProjection?.onRetryPending ?? (() => {}) : () => {}}
+          onCancelSteering={liveControlsEnabled ? currentLatestProjection?.onCancelSteering : undefined}
           onOpenFile={currentLatestProjection?.onOpenFile}
           filePathRootDir={currentLatestProjection?.filePathRootDir}
           systemPrompt={currentLatestProjection?.systemPrompt}
@@ -1236,8 +1282,11 @@ function ProductConversationPageInner() {
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
-      {isOpen && snapshot.latest_transcript_row_id ? (
-        <div className="product-conversation-page__composer" data-testid="product-conversation-composer">
+      {isOpen && !closeIncomplete && snapshot.latest_transcript_row_id && (
+        <div
+          className="product-conversation-page__composer"
+          data-testid="product-conversation-composer"
+        >
           <EmbeddedConversationPage
             slug={snapshot.latest_transcript_row_id}
             showTranscript={false}
@@ -1251,8 +1300,16 @@ function ProductConversationPageInner() {
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
         </div>
-      ) : (
-        <div className="product-conversation-page__composer-placeholder" data-testid="product-conversation-history">History is read-only.</div>
+      )}
+      {closeNeedsLiveUpdateOwner && snapshot.latest_transcript_row_id && (
+        <div data-testid="product-conversation-close-live-update-owner" hidden>
+          <CloseLiveUpdateOwner conversationId={snapshot.latest_transcript_row_id} />
+        </div>
+      )}
+      {(!isOpen || closeIncomplete) && (
+        <div className="product-conversation-page__composer-placeholder" data-testid={closeIncomplete ? 'product-conversation-close-incomplete' : 'product-conversation-history'}>
+          {closeIncomplete ? 'Conversation controls are disabled until shutdown is resolved.' : 'History is read-only.'}
+        </div>
       )}
 
       {aggregateMessageSlot && (

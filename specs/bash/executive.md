@@ -35,6 +35,18 @@ to Phoenix rather than init; at shutdown, a kill-tree pass SIGKILLs every
 live handle's process group. This replaces the prior draft's wrong
 assumption that SIGHUP cascade would clean up children when Phoenix died.
 
+## Input-failure evidence
+
+A bounded read-only corpus query on the local Phoenix application database covered
+2026-09-08T06:58:06Z through 2026-10-07T23:56:53Z. It found 17,846 persisted
+Bash calls: 13,201 `run`, 76 `peek`, 4,454 `wait`, and 115 `kill`. All 17,846
+carried labels, and zero persisted calls had labels longer than 64 Unicode scalar
+values. This is expected for the reported `label_too_long` class: provider/schema
+rejections occur before tool execution and therefore do not appear as accepted Bash
+calls. The corpus establishes the denominator and confirms runtime-only truncation
+cannot prevent those pre-execution retries; it is not a post-deploy effectiveness
+measurement and contains no raw command or label payloads.
+
 ## Technical Summary
 
 `BashTool` is a stateless `Tool` backed by an in-memory registry. Each process is
@@ -71,7 +83,10 @@ re-timeout (no handle proliferation). The agent operation is `op="run"`;
 the internal OS-level fork/exec is still called "spawn" where the
 distinction matters. Optional `label` annotation is attached at run time
 and echoed on every later response carrying the handle, plus on each
-entry of `live_handles[]` in the cap-reached error.
+entry of `live_handles[]` in the cap-reached error. The schema guides callers
+to keep this presentation-only field within 64 characters without asking
+providers to reject longer values; the tool deterministically shortens longer
+labels by Unicode scalar count while preserving a recognizable prefix and suffix.
 re-timeout (no handle proliferation). Kill sends a signal to the process
 group leader (set via `pre_exec` setpgid), waits up to
 `KILL_RESPONSE_TIMEOUT_SECONDS` (30) for exit, and either returns the

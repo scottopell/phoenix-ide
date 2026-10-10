@@ -60,7 +60,13 @@ pub const CHAIN_SSE_BROADCAST_CAPACITY: usize = 4096;
 #[derive(Debug, Clone)]
 pub enum ChainSseEvent {
     /// A streaming token chunk for an in-flight Q&A.
-    Token { chain_qa_id: String, delta: String },
+    Token {
+        chain_qa_id: String,
+        delta: String,
+    },
+    AnswerReset {
+        chain_qa_id: String,
+    },
     /// Stream completed cleanly. `full_answer` is the assembled text already
     /// persisted into `chain_qa.answer` by the time this event fires.
     Completed {
@@ -82,6 +88,7 @@ impl ChainSseEvent {
     pub fn chain_qa_id(&self) -> &str {
         match self {
             Self::Token { chain_qa_id, .. }
+            | Self::AnswerReset { chain_qa_id }
             | Self::Completed { chain_qa_id, .. }
             | Self::Failed { chain_qa_id, .. } => chain_qa_id,
         }

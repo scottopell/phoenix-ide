@@ -12,6 +12,12 @@ Code anchors for that current reality include `crates/phoenix-ide/src/api/chains
 
 ## Technical Summary
 
+The answer phase streams tokens immediately and emits `chain_qa_answer_reset`
+between rejected tool-calling attempts when a retry follows. Both page listeners
+clear only the matching question through `chainReducer`; failure preserves only
+the last attempt's partial text. Coverage includes the denied-call QA event
+sequence, request-budget exhaustion, wire serialization, and reducer isolation.
+
 Chains remain a derived layer over `conversations.continued_in_conv_id` plus persisted `chain_name` and `chain_qa` data. The chain page still resolves work identity from the active member, and chain-scoped SSE/Q&A remain separate from ordinary conversation SSE.
 
 ## Status Summary

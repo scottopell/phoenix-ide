@@ -103,10 +103,11 @@ THE SYSTEM SHALL reject the call with `error: "wait_seconds_out_of_range"`
 AND state the bound in the error
 
 WHEN agent supplies `label=<string>` on the run call
-THE SYSTEM SHALL attach the label to the handle
-AND echo it on every response that carries the handle (`still_running`,
-`exited`, `tombstoned`, `kill_pending_kernel`) and on each entry of the
-`live_handles[]` array in the `handle_cap_reached` error response
+THE SYSTEM SHALL normalize the label according to the `MAX_LABEL_LENGTH`
+contract and attach that normalized label to the handle
+AND echo the normalized label on every response that carries the handle
+(`still_running`, `exited`, `tombstoned`, `kill_pending_kernel`) and on each
+entry of the `live_handles[]` array in the `handle_cap_reached` error response
 
 THE tool description SHALL state explicitly that `wait_seconds` is **NOT** a
 process-kill timeout: the process is **never** killed when `wait_seconds`
@@ -569,9 +570,11 @@ THE SYSTEM SHALL provide the bash tool schema with these properties:
 - `label` (optional string): human-readable annotation for the spawned
   handle. Used with `op=run`. Echoed on every response that carries the
   handle (`still_running`, `exited`, `tombstoned`, `kill_pending_kernel`)
-  and on each entry of `live_handles[]` in `handle_cap_reached`. Length
-  capped at `MAX_LABEL_LENGTH` (default 64); over-cap labels are rejected
-  with `error: "label_too_long"`.
+  and on each entry of `live_handles[]` in `handle_cap_reached`. Callers are
+  guided to keep labels within `MAX_LABEL_LENGTH` (default 64). Longer labels
+  are shortened at the tool boundary to 64 Unicode scalar values while
+  preserving a recognizable prefix and suffix; command execution and operation
+  identity are unchanged. The provider-facing schema does not pre-reject them.
 - `wait_seconds` (optional integer, default 30): time to block for the
   foreground answer. Range [0, MAX_WAIT_SECONDS]. Used with `op=run` and
   `op=wait`.
@@ -1024,5 +1027,5 @@ already available.
 | `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | Time Phoenix waits at shutdown for SIGKILL'd groups to exit |
 | `TOMBSTONE_TAIL_LINES` | 2000 | Lines retained in `final_tail` after exit demotion |
 | `DEFAULT_PEEK_LINES` | 200 | Lines returned when peek has no read modifier |
-| `MAX_LABEL_LENGTH` | 64 | Soft cap on `label` length; over-cap labels rejected with `error: "label_too_long"` |
+| `MAX_LABEL_LENGTH` | 64 | Display bound on `label`; longer labels are deterministically shortened at the tool boundary |
 | `DEFAULT_WAIT_SECONDS` | 30 | Default `wait_seconds` when omitted |

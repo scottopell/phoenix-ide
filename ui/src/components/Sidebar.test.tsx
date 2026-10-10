@@ -213,6 +213,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-continued"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Old Product' })));
     fireEvent.click(getByRole('button', { name: /Rename conversation Old Product/ }));
     const input = getByRole('textbox');
     fireEvent.change(input, { target: { value: 'Renamed Product Title' } });
@@ -239,6 +240,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-continued"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Old Product' })));
     fireEvent.click(getByRole('button', { name: /Close conversation Old Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
@@ -260,6 +262,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-single"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Single Product' })));
     fireEvent.click(getByRole('button', { name: /Close conversation Single Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
@@ -285,6 +288,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-race"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Race Product' })));
     fireEvent.click(getByRole('button', { name: /Close conversation Race Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
@@ -298,13 +302,14 @@ describe('Sidebar — ProductConversation navigation', () => {
       })],
     });
 
-    const { queryByRole, container } = render(
+    const { getByRole, queryByRole, container } = render(
       <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
         <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
       </MemoryRouter>,
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /^Actions for conversation/ }));
     expect(queryByRole('button', { name: /Rename conversation/ })).toBeNull();
     expect(queryByRole('button', { name: /Close conversation/ })).toBeNull();
   });
@@ -329,6 +334,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
     fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
@@ -357,6 +363,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
     fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
@@ -383,6 +390,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
     fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
     const confirm = getByRole('button', { name: 'Delete' });
     fireEvent.click(confirm);
@@ -413,6 +421,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
     fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
@@ -445,6 +454,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
     await waitFor(() => expect(apiMock.getProductConversationSnapshot).toHaveBeenCalledWith('middle-slug', { message_limit: 1 }));
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
     fireEvent.click(await waitFor(() => getByRole('button', { name: /Delete conversation History Product/ })));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
@@ -475,6 +485,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
 
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Old Product' })));
     fireEvent.click(await findByRole('button', { name: /Rename conversation Old Product/ }));
     fireEvent.change(getByRole('textbox'), { target: { value: 'New Product' } });
     fireEvent.click(getByRole('button', { name: 'Rename' }));
@@ -497,6 +508,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-conflict"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Old Product' })));
     fireEvent.click(getByRole('button', { name: /Rename conversation Old Product/ }));
     fireEvent.change(getByRole('textbox'), { target: { value: 'new-product' } });
     fireEvent.click(getByRole('button', { name: 'Rename' }));
@@ -523,6 +535,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-close-conflict"]')).not.toBeNull());
+    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Close Product' })));
     fireEvent.click(getByRole('button', { name: /Close conversation Close Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 

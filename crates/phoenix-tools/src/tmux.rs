@@ -9,13 +9,13 @@
 //! `specs/tmux-integration/tmux-integration.allium` for the
 //! authoritative behavioural specification.
 
+pub mod backend;
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake_backend;
 pub mod invoke;
 pub mod probe;
 pub mod registry;
 pub mod run;
-
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_server;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -489,9 +489,10 @@ mod tests {
     #[tokio::test]
     async fn binary_unavailable_returns_error_envelope() {
         let tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
+        let registry = Arc::new(TmuxRegistry::with_backend(
             tmp.path().to_path_buf(),
-            false,
+            crate::tmux::fake_backend::FakeTmuxBackend::unavailable(),
+            None,
         ));
         let result = TmuxTool
             .run(
@@ -506,9 +507,10 @@ mod tests {
     #[tokio::test]
     async fn wait_seconds_validation_precedes_registry_resolution() {
         let tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
+        let registry = Arc::new(TmuxRegistry::with_backend(
             tmp.path().to_path_buf(),
-            false,
+            crate::tmux::fake_backend::FakeTmuxBackend::unavailable(),
+            None,
         ));
         let result = TmuxTool
             .run(

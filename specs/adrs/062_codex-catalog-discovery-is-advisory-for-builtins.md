@@ -1,6 +1,6 @@
 # ADR-062: Codex catalog discovery is advisory for supported built-ins
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-085
 - **Date:** 2026-09-27
 - **Affects:** REQ-LLM-003, REQ-LLM-004h; `ModelRegistry`
 

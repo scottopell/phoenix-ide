@@ -288,6 +288,8 @@ fn read_allowed(table: &str, column: &str) -> bool {
                 | ("share_tokens", "token")
                 | ("mcp_oauth_registrations", "client_secret")
                 | ("mcp_oauth_tokens", "access_token" | "refresh_token")
+                | ("federation_enrollments", "credential_verifier")
+                | ("federation_peer_connections", "bearer_credential")
         )
 }
 
@@ -688,6 +690,8 @@ mod tests {
             ("mcp_oauth_registrations", "client_secret"),
             ("mcp_oauth_tokens", "access_token"),
             ("mcp_oauth_tokens", "refresh_token"),
+            ("federation_enrollments", "credential_verifier"),
+            ("federation_peer_connections", "bearer_credential"),
         ] {
             assert!(!read_allowed(table, column), "{table}.{column}");
         }
