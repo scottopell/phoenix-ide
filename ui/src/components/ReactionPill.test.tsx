@@ -12,7 +12,7 @@ const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
-function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, composerAvailable = true, composerKey = 'composer', composerTop }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; composerAvailable?: boolean; composerKey?: string; composerTop?: number }) {
+function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, available = true, composerAvailable = true, composerKey = 'composer', composerTop }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; available?: boolean; composerAvailable?: boolean; composerKey?: string; composerTop?: number }) {
   return <FocusScopeProvider>
     <div className="conversation-column">
     <div id="messages">
@@ -20,7 +20,7 @@ function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = f
     </div>
     {composerAvailable && <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />}
     </div>
-    <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available={available} onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
 }
 function ActivateOtherScope() {
@@ -262,10 +262,12 @@ describe('reaction pill', () => {
     expect(input).not.toHaveFocus();
     const originalComposer = document.getElementById('input-area')!;
 
-    view.rerender(<Fixture touchDocked body="Retained" composerAvailable={false} />);
+    view.rerender(<Fixture touchDocked body="Retained" available={false} composerAvailable={false} />);
     await waitFor(() => expect(document.getElementById('input-area')).toBeNull());
     expect(input).toHaveValue('Retained');
     expect(input).not.toHaveFocus();
+    expect(screen.getByRole('status')).toHaveTextContent('Draft unavailable · reaction retained');
+    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
 
     viewport.height = 420;
     view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={340} />);
@@ -274,6 +276,8 @@ describe('reaction pill', () => {
     await waitFor(() => expect(dock).toHaveStyle({ top: '274px' }));
     expect(input).toHaveValue('Retained');
     expect(input).not.toHaveFocus();
+    expect(screen.queryByText('Draft unavailable · reaction retained')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add to draft' })).toBeEnabled();
     expect(add).not.toHaveBeenCalled();
     viewport.height = 700;
   });

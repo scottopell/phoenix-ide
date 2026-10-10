@@ -276,6 +276,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
                   }
                 }}
               />
+              {!available && <span className="reaction-pill-unavailable" role="status">Draft unavailable · reaction retained</span>}
               <button type="button" aria-label="Add to draft" title={available ? 'Add to draft (Cmd/Ctrl+Enter)' : 'Draft unavailable. Your reaction is retained.'} disabled={!available || !body.trim()} onClick={onAdd}>
                 <ListPlus size={20} aria-hidden="true" />
               </button>
@@ -284,7 +285,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
           <button type="button" aria-label="Dismiss reaction" title="Dismiss reaction" onClick={requestClose}><X size={16} aria-hidden="true" /></button>
         </>
       )}
-      {(error || !available) && <span className="reaction-pill-sr" role="status">{error || 'Draft unavailable. Your reaction is retained.'}</span>}
+      {error && <span className="reaction-pill-sr" role="status">{error}</span>}
     </div>
   );
 }

@@ -79,6 +79,16 @@
   text-overflow: ellipsis;
 }
 
+.reaction-pill-unavailable {
+  flex: 0 1 30%;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .reaction-pill-label { flex: 1; }
 
 .reaction-pill-sr {
