@@ -383,7 +383,6 @@ jobs:
           [[ ! -e "$RUNNER_TEMP/phoenix-notary-api-key.p8" ]]
           exit "$cleanup_failed"
       - name: Check isolated signed-helper startup
-        if: needs.gate.outputs.preparation == 'true'
         timeout-minutes: 5
         run: |
           umask 077
@@ -391,8 +390,13 @@ jobs:
           short_commit=${short_commit:0:12}
           qa="$GITHUB_WORKSPACE/target/signed-helper-acceptance/${{ matrix.target }}"
           mkdir -p "$qa"
-          standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}-prepared-$short_commit"
-          archive="$RUNNER_TEMP/release-assets/Phoenix-macos-${{ matrix.target }}-prepared-$short_commit.zip"
+          if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then
+            standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}-prepared-$short_commit"
+            archive="$RUNNER_TEMP/release-assets/Phoenix-macos-${{ matrix.target }}-prepared-$short_commit.zip"
+          else
+            standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
+            archive="$RUNNER_TEMP/release-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip"
+          fi
           node scripts/check-signed-helper.cjs \
             "$archive" \
             "$standalone" \
@@ -400,13 +404,22 @@ jobs:
             "${{ needs.gate.outputs.version }}" \
             "${{ matrix.target }}" \
             "$qa/runtime"
-          cp "$qa/runtime/acceptance-receipt.json" \
-            "$RUNNER_TEMP/release-assets/HEADLESS-ACCEPTANCE-${{ matrix.target }}.json"
-      - name: Retain failed headless acceptance receipt
-        if: ${{ failure() && needs.gate.outputs.preparation == 'true' }}
+          if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then
+            cp "$qa/runtime/acceptance-receipt.json" \
+              "$RUNNER_TEMP/release-assets/HEADLESS-ACCEPTANCE-${{ matrix.target }}.json"
+          fi
+      - name: Retain successful headless acceptance receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}
+          name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-success
+          path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain failed headless acceptance receipt
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-failure
           path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json
           if-no-files-found: ignore
           retention-days: 14
@@ -414,7 +427,9 @@ jobs:
         if: needs.gate.outputs.release == 'true'
         with:
           name: macos-${{ matrix.target }}
-          path: ${{ runner.temp }}/release-assets/*
+          path: |
+            ${{ runner.temp }}/release-assets/${{ matrix.asset }}
+            ${{ runner.temp }}/release-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: needs.gate.outputs.preparation == 'true'
@@ -435,6 +450,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: '*-release-assets'
@@ -462,6 +478,12 @@ jobs:
           done
           sha256sum "${required[@]}" > SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq "${#required[@]}"
+
+          notes_source="${{ needs.gate.outputs.commit }}:docs/releases/${{ needs.gate.outputs.tag }}.md"
+          if git cat-file -e "$notes_source" 2>/dev/null; then
+            export RELEASE_NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+            git show "$notes_source" > "$RELEASE_NOTES_FILE"
+          fi
 
           assets=("${required[@]}" SHA256SUMS)
           bash scripts/publish-release-assets.sh \

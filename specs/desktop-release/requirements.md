@@ -33,6 +33,11 @@ SHALL staple and validate the notarization ticket,
 SHALL pass Gatekeeper assessment,
 AND SHALL reject the release when protected configuration is unavailable or any check fails.
 
+BEFORE retaining a successfully verified macOS architecture pair for preparation or release,
+THE SYSTEM SHALL execute unchanged artifact copies on the matching native host with isolated home, state, database, temporary paths, authentication, and a fresh loopback port,
+SHALL verify exact source/version/architecture and instance identity, normal authentication, graceful stop and listener closure, database integrity and foreign keys, and unchanged artifact digests,
+AND SHALL retain only sanitized headless verification receipts as separate workflow artifacts, not additional public release assets.
+
 ## REQ-DESKTOP-REL-004 — Publish architecture-specific archives
 
 THE SYSTEM SHALL build one desktop archive for Apple Silicon and one for Intel,
@@ -63,6 +68,10 @@ THE SYSTEM SHALL fail without replacing its assets or moving its tag.
 
 IF the version tag identifies a different commit,
 THE SYSTEM SHALL refuse the release from the current commit.
+
+WHEN the immutable tagged source supplies reviewed release notes,
+THE SYSTEM SHALL include those notes in the request that makes the verified private release public,
+AND SHALL NOT rely on a subsequent edit of a public release to disclose acceptance limitations.
 
 ## REQ-DESKTOP-REL-008 — Stamp release-specific app versions truthfully
 

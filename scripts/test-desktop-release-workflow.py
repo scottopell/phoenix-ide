@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 workflow = Path('.github/workflows/release.yml').read_text()
@@ -208,6 +211,11 @@ for fragment in [
         raise SystemExit(f'missing stable/RC publication contract: {fragment}')
 if 'gh release create' in publish_script:
     raise SystemExit('release creation must use explicit channel and latest metadata')
+if 'notes_args=()' in publish_script or '"${publication_args[@]}"' not in publish_script:
+    raise SystemExit('publication arguments must be nonempty under macOS Bash 3.2 nounset')
+publisher_tests = Path('scripts/test-publish-release-assets.sh').read_text()
+if 'PUBLISH_BASH=${PUBLISH_BASH:-/bin/bash}' not in publisher_tests or '"$PUBLISH_BASH" "$root/scripts/publish-release-assets.sh"' not in publisher_tests:
+    raise SystemExit('publisher regressions must default to the actual macOS system Bash')
 
 verify_script = Path('scripts/verify-published-release.sh').read_text()
 for fragment in [
@@ -232,9 +240,9 @@ for forbidden in ['MINOR + 1', '^[0-9]+\\.[0-9]+\\.[0-9]+$']:
         raise SystemExit(f'tag release script bypasses shared version contract: {forbidden}')
 
 acceptance = workflow[workflow.index('      - name: Check isolated signed-helper startup'):
-                      workflow.index('      - name: Retain failed headless acceptance receipt')]
+                      workflow.index('      - name: Retain successful headless acceptance receipt')]
 for fragment in [
-    "if: needs.gate.outputs.preparation == 'true'",
+    'if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then',
     'node scripts/check-signed-helper.cjs',
     '"${{ needs.gate.outputs.commit }}"',
     '"${{ needs.gate.outputs.version }}"',
@@ -244,17 +252,160 @@ for fragment in [
     'HEADLESS-ACCEPTANCE-${{ matrix.target }}.json',
 ]:
     if fragment not in acceptance:
-        raise SystemExit(f'missing preparation-only unchanged-artifact acceptance: {fragment}')
+        raise SystemExit(f'missing unchanged-artifact acceptance: {fragment}')
 if not (workflow.index('      - name: Remove protected material') <
         workflow.index('      - name: Check isolated signed-helper startup') <
         workflow.index('          name: desktop-preparation-${{ matrix.target }}-${{ needs.gate.outputs.commit }}')):
     raise SystemExit('runtime acceptance must follow signing cleanup and gate successful retention')
 for fragment in [
-    "failure() && needs.gate.outputs.preparation == 'true'",
+    'if: failure()',
     'path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json',
 ]:
     if fragment not in workflow:
         raise SystemExit('failure upload must contain only a sanitized receipt, not private runtime data')
+
+receipt_names = {}
+for outcome, step_name in [('success', 'Retain successful headless acceptance receipt'),
+                           ('failure', 'Retain failed headless acceptance receipt')]:
+    section = build_macos_job.split(f'      - name: {step_name}\n', 1)[1].split('      - ', 1)[0]
+    name = re.search(r'^          name: (.+)$', section, re.MULTILINE).group(1)
+    if '${{ github.run_id }}' not in name or '${{ github.run_attempt }}' not in name:
+        raise SystemExit('receipt names must preserve evidence across runs and rerun attempts')
+    if not name.endswith('-' + outcome):
+        raise SystemExit('success and failure receipt uploads must not collide within one attempt')
+    receipt_names[outcome] = name
+seen_names = set()
+for target in ['aarch64-apple-darwin', 'x86_64-apple-darwin']:
+    for run in ['100', '101']:
+        for attempt in ['1', '2']:
+            for outcome, template in receipt_names.items():
+                name = template
+                for key, value in {'matrix.target': target, 'needs.gate.outputs.commit': 'a' * 40,
+                                   'github.run_id': run, 'github.run_attempt': attempt}.items():
+                    name = name.replace('${{ ' + key + ' }}', value)
+                if name in seen_names:
+                    raise SystemExit('receipt uploads must be distinct for every arch/run/attempt/outcome')
+                seen_names.add(name)
+
+allium = Path('specs/desktop-release/desktop-release.allium').read_text()
+for rule, variable in [('CompleteInaccessiblePublicationBecomesVerified', 'release'),
+                       ('VerifiedInaccessiblePublicationBecomesPublic', 'publication'),
+                       ('ExactPublicRetryIsIdempotent', 'publication')]:
+    section = allium.split('rule ' + rule + ' {', 1)[1].split('\n}', 1)[0]
+    if f'requires: required_native_pairs_passed({variable})' not in section:
+        raise SystemExit(f'{rule} must require both native acceptance passes')
+for fragment in [
+    'native_acceptance: NativeAcceptanceState',
+    'rule NativeAcceptanceRequiresUnchangedVerifiedPair {',
+    'requires: protected_signing_material_removed(pair)',
+    'requires: native_isolated_artifact_checks_pass(pair)',
+    'ensures: sanitized_native_receipt_retained(pair)',
+    'rule NativeAcceptanceFailureBlocksPair {',
+    'ensures: pair.native_acceptance = failed',
+    'invariant PassedNativeAcceptanceHasVerifiedUnchangedPair {',
+    'invariant VerifiedPreparationHasNativeAcceptance {',
+    'preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))',
+    'required_native_pairs_passed(ReleasePublication) and',
+]:
+    if fragment not in allium:
+        raise SystemExit(f'missing native acceptance model contract: {fragment}')
+
+for helper, next_helper in [
+    ('required_architecture_pairs_validated(publication)', 'public_release_is_exact(publication)'),
+    ('preparation_uses_release_security_path(preparation)', 'preparation_has_no_release_authority(preparation)'),
+]:
+    contract = allium.split('-- ' + helper + ' -> Boolean\n', 1)[1].split('-- ' + next_helper, 1)[0]
+    if 'native_acceptance state, read through' not in contract or 'required_native_pairs_passed' not in contract:
+        raise SystemExit(f'{helper} must defer native acceptance to its typed authority')
+    for duplicate in ['native isolated artifact checks', 'sanitized receipts retained', 'native_acceptance = passed']:
+        if duplicate in contract:
+            raise SystemExit(f'{helper} must not duplicate native acceptance checks or results')
+notes_helper = 'reviewed_notes_attached_atomically_when_supplied(publication)'
+notes_contract = allium.split('-- ' + notes_helper + ' -> Boolean\n', 1)[1].split('-- preparation_identity_is_current_main', 1)[0]
+for fragment in ['immutable tagged source', 'nonempty notes', 'visibility/channel fields',
+                 'no reviewed notes', 'true without', 'existing generated notes remain',
+                 'No subsequent public']:
+    if fragment not in notes_contract:
+        raise SystemExit(f'atomic optional notes contract missing: {fragment}')
+public_transition = allium.split('rule VerifiedInaccessiblePublicationBecomesPublic {', 1)[1].split('\n}', 1)[0]
+if 'requires: ' + notes_helper not in public_transition:
+    raise SystemExit('private-to-public transition must carry supplied notes in its publication request')
+public_retry = allium.split('rule ExactPublicRetryIsIdempotent {', 1)[1].split('\n}', 1)[0]
+if notes_helper in public_retry:
+    raise SystemExit('already-public retries must not require a notes mutation')
+
+if '        if:' in acceptance:
+    raise SystemExit('native headless acceptance must gate preparation and release on default success')
+release_upload = build_macos_job.split('          name: macos-${{ matrix.target }}', 1)[1].split('      - uses:', 1)[0]
+if 'release-assets/*' in release_upload or 'HEADLESS-ACCEPTANCE' in release_upload:
+    raise SystemExit('release payload artifact must not include headless receipts')
+for fragment in [
+    '${{ runner.temp }}/release-assets/${{ matrix.asset }}',
+    '${{ runner.temp }}/release-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip',
+]:
+    if fragment not in release_upload:
+        raise SystemExit('release upload must contain the exact architecture pair')
+if workflow.index('      - name: Retain successful headless acceptance receipt') > workflow.index('          name: macos-${{ matrix.target }}'):
+    raise SystemExit('release payload retention must depend on successful receipt retention')
+if 'notes_source="${{ needs.gate.outputs.commit }}:docs/releases/${{ needs.gate.outputs.tag }}.md"' not in publish_job:
+    raise SystemExit('reviewed notes must come from immutable gated source, not current retry tooling')
+if 'git show "$notes_source" > "$RELEASE_NOTES_FILE"' not in publish_job or 'fetch-depth: 0' not in publish_job:
+    raise SystemExit('publisher must retain immutable tagged notes for historical retries')
+notes = Path('docs/releases/v0.13.0-rc.2.md').read_text()
+for fragment in ['macOS GUI/clean-host desktop pass', 'physical iPhone Safari', 'Known acceptance gaps', 'not new RC2-byte acceptance']:
+    if fragment not in notes:
+        raise SystemExit(f'missing RC2 disclosure: {fragment}')
+
+# Execute the real workflow shell with a node double: prove each mode selects its
+# own bytes and a failed native check cannot retain a successful payload receipt.
+acceptance_shell = acceptance.split('        run: |\n', 1)[1]
+acceptance_shell = '\n'.join(line[10:] for line in acceptance_shell.splitlines())
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    bin_dir = base / 'bin'
+    bin_dir.mkdir()
+    node = bin_dir / 'node'
+    node.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+Path(os.environ['CALLS']).write_text(json.dumps(sys.argv[1:]))
+if os.environ.get('FAIL_CHECK') == '1':
+    raise SystemExit(1)
+runtime = Path(sys.argv[-1])
+runtime.mkdir(parents=True, exist_ok=True)
+(runtime / 'acceptance-receipt.json').write_text('{}')
+''')
+    node.chmod(0o755)
+    for target in ['aarch64-apple-darwin', 'x86_64-apple-darwin']:
+        for preparation in ['true', 'false']:
+            for fail in ['0', '1']:
+                case = base / f'{target}-{preparation}-{fail}'
+                assets_dir = case / 'release-assets'
+                assets_dir.mkdir(parents=True)
+                substitutions = {
+                    'needs.gate.outputs.commit': 'a' * 40,
+                    'needs.gate.outputs.version': '0.13.0-rc.2',
+                    'needs.gate.outputs.tag': 'v0.13.0-rc.2',
+                    'needs.gate.outputs.preparation': preparation,
+                    'matrix.target': target,
+                    'matrix.asset': f'phoenix_ide-{target}',
+                }
+                shell = acceptance_shell
+                for key, value in substitutions.items():
+                    shell = shell.replace('${{ ' + key + ' }}', value)
+                env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                           GITHUB_WORKSPACE=str(case), RUNNER_TEMP=str(case),
+                           CALLS=str(case / 'calls.json'), FAIL_CHECK=fail)
+                result = subprocess.run(['bash', '-euo', 'pipefail', '-c', shell], env=env, capture_output=True, text=True)
+                assert result.returncode == (1 if fail == '1' else 0), result.stderr
+                calls = json.loads((case / 'calls.json').read_text())
+                suffix = '-prepared-' + 'a' * 12 if preparation == 'true' else ''
+                archive_suffix = suffix if preparation == 'true' else '-v0.13.0-rc.2'
+                assert calls[1] == str(assets_dir / f'Phoenix-macos-{target}{archive_suffix}.zip')
+                assert calls[2] == str(assets_dir / f'phoenix_ide-{target}{suffix}')
+                assert calls[3:6] == ['a' * 40, '0.13.0-rc.2', target]
+                receipt = assets_dir / f'HEADLESS-ACCEPTANCE-{target}.json'
+                assert receipt.exists() == (preparation == 'true' and fail == '0')
 
 package_script = Path('macos/Phoenix/scripts/package-desktop-release.sh').read_text()
 for fragment in [
