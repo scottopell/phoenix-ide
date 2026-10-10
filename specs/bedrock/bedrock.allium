@@ -574,6 +574,10 @@ rule InterceptedToolNotSole {
 -- CORE 3. TOOL EXECUTION (REQ-BED-004)
 -- ===========================================================
 
+-- BashWaitSettlementDeadlineReached is the runtime clock trigger for the
+-- active Bash wait invocation. It carries the exact active tool call and is
+-- neither a retry nor a command-dispatch event.
+
 rule BashWaitSettlementDeadlineFires {
     when: BashWaitSettlementDeadlineReached(conversation, tool_call)
     requires: conversation.core_status = executing_tools
@@ -2966,6 +2970,10 @@ surface UserConversation {
                     awaiting_task_approval,
                     awaiting_recovery
                  }
+        BashWaitSettlementDeadlineReached(conversation, conversation.current_tool)
+            when conversation.core_status = executing_tools
+             and conversation.current_tool.name = "bash"
+             and conversation.current_tool.input.op = "wait"
         TaskApprovalDecided(conversation, decision)
             when conversation.parent_status = awaiting_task_approval
         UserAnswersQuestion(conversation, request_id?, answers, annotations?)
