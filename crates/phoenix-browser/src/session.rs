@@ -2436,6 +2436,17 @@ impl BrowserSessionManager {
         permit: &BrowserRetirementPermit,
     ) -> BrowserRetirementOutcome {
         let state = self.state.read().await;
+        if !state
+            .retirements
+            .get(&Self::permit_fence_key(permit))
+            .is_some_and(|retirement| {
+                retirement.fenced && retirement.generation == permit.generation.get()
+            })
+        {
+            return BrowserRetirementOutcome::Residual {
+                reason: "browser retirement generation is stale".to_string(),
+            };
+        }
         if permit.instances.is_empty() {
             if let Some(actor_key) = &permit.actor_session_key {
                 if state.sessions.contains_key(actor_key) {
@@ -2672,10 +2683,8 @@ impl BrowserSessionManager {
 
         let mut failures = Vec::new();
         if matches_current_generation {
-            let mut started = Vec::new();
-            let mut already_requested = Vec::new();
             for expected in &permit.instances {
-                match self
+                let failure = match self
                     .spawn_kill_session_by_key(
                         expected.session_key.clone(),
                         permit.work_scope.clone(),
@@ -2683,48 +2692,30 @@ impl BrowserSessionManager {
                     )
                     .await
                 {
-                    KillSessionOutcome::Absent => {}
+                    KillSessionOutcome::Absent => None,
                     KillSessionOutcome::Started {
                         key,
                         handle,
                         attempt,
-                    } => started.push((key, handle, attempt)),
-                    KillSessionOutcome::AlreadyRequested { attempt } => {
-                        already_requested.push(attempt);
-                    }
-                }
-            }
-
-            for (key, attempt, result) in futures::future::join_all(
-                started
-                    .into_iter()
-                    .map(|(key, handle, attempt)| async move { (key, attempt, handle.await) }),
-            )
-            .await
-            {
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => failures.push(error.to_string()),
-                    Err(error) => {
-                        self.complete_kill_failure(
-                            &key,
-                            &attempt,
-                            format!("browser kill task failed: {error}"),
-                        )
-                        .await;
-                        failures.push(format!("browser kill task failed: {error}"));
-                    }
-                }
-            }
-            for result in futures::future::join_all(
-                already_requested
-                    .into_iter()
-                    .map(|attempt| self.wait_for_kill_completion(attempt)),
-            )
-            .await
-            {
-                if let Err(error) = result {
-                    failures.push(error.to_string());
+                    } => match handle.await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(error) => {
+                            let detail = format!("browser kill task failed: {error}");
+                            self.complete_kill_failure(&key, &attempt, detail.clone())
+                                .await;
+                            Some(detail)
+                        }
+                    },
+                    KillSessionOutcome::AlreadyRequested { attempt } => self
+                        .wait_for_kill_completion(attempt)
+                        .await
+                        .err()
+                        .map(|error| error.to_string()),
+                };
+                if let Some(failure) = failure {
+                    failures.push(failure);
+                    break;
                 }
             }
         }
@@ -3402,7 +3393,9 @@ mod lifecycle_hook_tests {
         assert_eq!(current.generation().get(), 2);
         assert_eq!(
             manager.complete_retirement(&stale).await,
-            super::BrowserRetirementOutcome::AbsenceVerified
+            super::BrowserRetirementOutcome::Residual {
+                reason: "browser retirement generation is stale".to_string()
+            }
         );
         assert!(manager.is_retirement_fenced(&scope).await);
         assert!(matches!(

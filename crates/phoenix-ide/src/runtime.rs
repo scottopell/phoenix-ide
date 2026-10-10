@@ -3362,103 +3362,6 @@ impl RuntimeManager {
         Ok(())
     }
 
-    /// Rebuilds persisted server-owned loss inspection. Inspection is recovery
-    /// only: it never confirms loss or begins destructive retirement.
-    pub async fn resume_pending_close_inspections(self: &Arc<Self>) -> Result<usize, String> {
-        let obligations = self
-            .db
-            .list_pending_close_obligations()
-            .await
-            .map_err(|error| error.to_string())?;
-        let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
-            let manager = Arc::clone(&manager);
-            async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                ) {
-                    return Ok(false);
-                }
-                match manager
-                    .inspect_close_retirement(obligation.attempt_id().clone())
-                    .await
-                {
-                    Ok(_) => Ok(true),
-                    Err(error) => {
-                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
-                            "Close retirement inspection could not be rebuilt");
-                        Ok(false)
-                    }
-                }
-            }
-        })
-        .await
-    }
-
-    /// Replays exact runtime-resource permits for sealed Close retirements. It
-    /// never finalizes product lifecycle or unblocks History.
-    pub async fn resume_pending_close_runtime_retirements(
-        self: &Arc<Self>,
-    ) -> Result<usize, String> {
-        let obligations = self
-            .db
-            .list_pending_close_obligations()
-            .await
-            .map_err(|error| error.to_string())?;
-        let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
-            let manager = Arc::clone(&manager);
-            async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::RetirementRequested
-                        | phoenix_core::domain::close::ClosePhase::NeedsRepair
-                ) {
-                    return Ok(false);
-                }
-                let retried = if obligation.phase()
-                    == phoenix_core::domain::close::ClosePhase::NeedsRepair
-                {
-                    manager
-                        .db
-                        .retry_close_retirement(obligation.attempt_id())
-                        .await
-                        .map_err(|error| error.to_string())?
-                } else {
-                    obligation.clone()
-                };
-                if retried.phase()
-                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                {
-                    return match manager
-                        .inspect_close_retirement(retried.attempt_id().clone())
-                        .await
-                    {
-                        Ok(_) => Ok(true),
-                        Err(error) => {
-                            tracing::warn!(attempt_id = %retried.attempt_id(), %error,
-                                "Close retirement inspection could not be rebuilt during repair recovery");
-                            Ok(false)
-                        }
-                    };
-                }
-                match manager
-                    .retire_close_runtime_resources(retried.attempt_id().clone())
-                    .await
-                {
-                    Ok(()) => Ok(true),
-                    Err(error) => {
-                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
-                            "Close runtime-resource retirement remains in repair state");
-                        Ok(false)
-                    }
-                }
-            }
-        })
-        .await
-    }
-
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
         let obligations = self
             .db
@@ -5937,12 +5840,21 @@ impl RuntimeManager {
                     self.db.clone(),
                     self.message_retriever.clone(),
                 );
+                if conv.runtime_role != crate::work_scope::RuntimeRole::User {
+                    return Err("ordinary parent tool registry requires user runtime role".into());
+                }
                 let send_chat =
                     Arc::new(crate::send_chat_service::SendChatApplicationService::new(
                         self.db.clone(),
                         self.clone(),
                     ));
-                let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
+                let writing_tools =
+                    crate::coordinator_tools::writing_tools(global_read.clone(), send_chat);
+                let predecessor_tool = crate::coordinator_tools::previous_transcripts_tool(
+                    global_read,
+                    conv.product_conversation_id.clone(),
+                    conv.id.clone(),
+                );
                 let approved_registry = approved_managed_registry(
                     &conv.conv_mode,
                     context.resource_authority,
@@ -5985,12 +5897,14 @@ impl RuntimeManager {
                         None,
                     ),
                 };
+                let registry = registry.try_with_host_bound_tool(predecessor_tool.clone())?;
                 ToolRegistryExecutor::with_mcp(
                     registry,
                     self.mcp_manager.clone(),
                     agent_catalog.clone(),
                 )
                 .with_writing_tools(upgrade_writing_tools)
+                .with_predecessor_tool(predecessor_tool)
             }
         };
 
@@ -6199,6 +6113,20 @@ impl RuntimeManager {
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
             .with_agent_config(agent_config);
+        let runtime = if !is_sub_agent && !is_coordinator {
+            runtime.with_previous_transcripts(
+                crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                ),
+                crate::api::global_read::PreviousTranscriptsBinding::new(
+                    conv.product_conversation_id.clone(),
+                    conv.id.clone(),
+                ),
+            )
+        } else {
+            runtime
+        };
         let runtime = if let Some(parent_conversation_id) = conv.parent_conversation_id.clone() {
             runtime.with_parent_dispatch(
                 parent_conversation_id,
@@ -9158,8 +9086,8 @@ mod scope_liveness_tests {
     async fn failed_pre_runtime_worktree_reinspection_persists_typed_residual() {
         #![allow(clippy::too_many_lines)]
         use phoenix_core::domain::close::{
-            CapturedWorktreeIdentity, CloseAttemptId, ClosePhase, RetiredResourceKind,
-            RetirementFailureReason, RetirementOutcome,
+            CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome, ClosePhase,
+            CloseRunRef, RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
         };
 
         let manager = test_manager().await;
@@ -9258,7 +9186,27 @@ mod scope_liveness_tests {
             .get_close_obligation(attempt_id.as_str())
             .await
             .unwrap();
-        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
+        assert_eq!(obligation.phase(), ClosePhase::Completed);
+        assert_eq!(
+            obligation.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        let failure_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_cleanup_failures WHERE attempt_id = ?1")
+                .bind(attempt_id.as_str())
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(failure_count, 1);
+        let mandatory_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events
+             WHERE mandatory_failure_occurrence_id = ?1",
+        )
+        .bind(CloseRunRef::initial(attempt_id.clone()).failure_occurrence_id())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(mandatory_event_count, 1);
         let evidence = manager
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())
@@ -13392,6 +13340,95 @@ mod scope_liveness_tests {
 
             assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn watch_wait_input_is_claimed_executed_and_settled_once() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(llm.clone()).await);
+        let global = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("claude-sonnet-5"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let source = manager
+            .db()
+            .create_conversation(
+                "worker-wait-source",
+                "Worker wait source",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        manager
+            .db()
+            .update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        let event = manager
+            .db()
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .remove(0);
+        crate::coordinator_watch_delivery::deliver_pass(&manager).await;
+        let handle = manager.get_or_create(&global.id).await.unwrap();
+        let mut states = handle.state_rx.clone();
+        manager.dispatch_standalone_turn(&global.id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if *states.borrow_and_update() == ConvState::Idle {
+                    let terminal: Option<String> = sqlx::query_scalar(
+                        "SELECT terminal_kind FROM durable_turns WHERE origin_subscription_event_id = ?1",
+                    ).bind(&event.event_id).fetch_one(manager.db().pool()).await.unwrap();
+                    if terminal.is_some() { break; }
+                }
+                states.changed().await.expect("runtime remains live through settlement");
+            }
+        }).await.expect("watch input settles through real worker and executor");
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(&source.id)
+                .await
+                .unwrap()
+                .state,
+            waiting
+        );
+        crate::coordinator_watch_delivery::deliver_pass(&manager).await;
+        manager.dispatch_standalone_turn(&global.id).await.unwrap();
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let terminal: String = sqlx::query_scalar(
+            "SELECT terminal_kind FROM durable_turns WHERE origin_subscription_event_id = ?1 AND conversation_id = ?2",
+        ).bind(&event.event_id).bind(&global.id).fetch_one(manager.db().pool()).await.unwrap();
+        let unconsumed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND terminal_kind IS NULL",
+        ).bind(&global.id).fetch_one(manager.db().pool()).await.unwrap();
+        assert_eq!(
+            unconsumed, 0,
+            "duplicate passes must leave no queued turn to execute later"
+        );
+        assert_eq!(terminal, "Completed");
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ import { useConnection } from './useConnection';
 import type { SSEAction } from '../conversation/atom';
 import { ConversationStore } from '../conversation/ConversationStore';
 import { clearCodexQuota, getCodexQuotaSnapshot } from '../codexQuota';
+import { subscribeCloseSnapshotChanged } from '../notifications';
 import type { SseWireEvent } from '../generated/sse';
 
 const WIRE_EVENT_TYPES: Record<SseWireEvent['type'], true> = {
@@ -164,6 +165,23 @@ describe('useConnection epoch stamping (task 08683)', () => {
 
     const expected = [...Object.keys(WIRE_EVENT_TYPES), 'open', 'ping'].sort();
     expect(FakeEventSource.instances[0]!.registeredEventTypes()).toEqual(expected);
+  });
+
+  it('turns a live conversation update into a Close snapshot refresh notification', () => {
+    const refresh = vi.fn();
+    const unsubscribe = subscribeCloseSnapshotChanged('conv-A', refresh);
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch: vi.fn() }));
+
+    act(() => {
+      FakeEventSource.instances[0]!.emit('conversation_update', {
+        sequence_id: 1,
+        conversation: { archived: true },
+      });
+    });
+
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledWith('stream');
+    unsubscribe();
   });
 
   it('opens the legacy stream URL when no replay cursor is available', () => {

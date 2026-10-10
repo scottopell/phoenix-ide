@@ -269,6 +269,52 @@ impl ToolExecutor for MockToolExecutor {
     }
 }
 
+pub struct GatedDefinitionsToolExecutor {
+    definitions_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    definitions_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl GatedDefinitionsToolExecutor {
+    pub fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                definitions_started: Mutex::new(Some(started_tx)),
+                definitions_release: Mutex::new(Some(release_rx)),
+            }),
+            started_rx,
+            release_tx,
+        )
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for GatedDefinitionsToolExecutor {
+    async fn execute(
+        &self,
+        _call: crate::runtime::deny_gate::CheckedToolCall,
+        _ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        None
+    }
+
+    async fn definitions(&self) -> Vec<ToolDefinition> {
+        if let Some(started) = self.definitions_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.definitions_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        Vec::new()
+    }
+}
+
 // ============================================================================
 // Delayed Mock LLM Client (for cancellation testing)
 // ============================================================================
@@ -635,7 +681,11 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    state_update_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    state_update_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_tool_round_persist: Mutex<bool>,
+    tool_round_persist_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    tool_round_persist_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -643,6 +693,9 @@ pub struct InMemoryStorage {
     metrics_write_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     metrics_write_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     llm_request_metrics: Mutex<Vec<phoenix_llm::LlmAttemptMetrics>>,
+    turn_usages: Mutex<Vec<(String, phoenix_llm::Usage)>>,
+    provider_replay_updates:
+        Mutex<Vec<phoenix_core::domain::provider_replay::ProviderReplayUpdate>>,
     metrics_written: tokio::sync::Notify,
     steering_drain_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
@@ -718,7 +771,11 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            state_update_started: Mutex::new(None),
+            state_update_release: Mutex::new(None),
             fail_tool_round_persist: Mutex::new(false),
+            tool_round_persist_started: Mutex::new(None),
+            tool_round_persist_release: Mutex::new(None),
             fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
@@ -726,6 +783,8 @@ impl InMemoryStorage {
             metrics_write_started: Mutex::new(None),
             metrics_write_release: Mutex::new(None),
             llm_request_metrics: Mutex::new(Vec::new()),
+            turn_usages: Mutex::new(Vec::new()),
+            provider_replay_updates: Mutex::new(Vec::new()),
             metrics_written: tokio::sync::Notify::new(),
             steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
@@ -817,6 +876,32 @@ impl InMemoryStorage {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.prompt_projection_load_started.lock().unwrap() = Some(started_tx);
         *self.prompt_projection_load_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
+    }
+
+    pub fn gate_state_update(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.state_update_started.lock().unwrap() = Some(started_tx);
+        *self.state_update_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
+    }
+
+    pub fn gate_tool_round_persist(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.tool_round_persist_started.lock().unwrap() = Some(started_tx);
+        *self.tool_round_persist_release.lock().unwrap() = Some(release_rx);
         (started_rx, release_tx)
     }
 
@@ -1875,6 +1960,13 @@ impl MessageStore for InMemoryStorage {
         if *self.fail_tool_round_persist.lock().unwrap() {
             return Err("injected tool round persist failure".to_string());
         }
+        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.tool_round_persist_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();
         bucket.push(assistant.clone());
@@ -1985,6 +2077,13 @@ impl StateStore for InMemoryStorage {
     ) -> Result<(), String> {
         if *self.fail_state_update.lock().unwrap() {
             return Err("injected state update failure".to_string());
+        }
+        if let Some(started) = self.state_update_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.state_update_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
         }
         self.state_updated_ats
             .lock()
@@ -2331,8 +2430,12 @@ impl StateStore for InMemoryStorage {
         conversation_id: &str,
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
-        _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> Result<(), String> {
+        self.provider_replay_updates
+            .lock()
+            .unwrap()
+            .push(update.clone());
         self.update_state(conversation_id, state, state_updated_at)
             .await
     }
@@ -2386,12 +2489,16 @@ impl StateStore for InMemoryStorage {
         &self,
         _conversation_id: &str,
         _root_conversation_id: &str,
-        _model: &str,
+        model: &str,
         _effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
         _service_tier: phoenix_core::domain::llm_types::ServiceTier,
-        _usage: &phoenix_llm::Usage,
+        usage: &phoenix_llm::Usage,
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
+        self.turn_usages
+            .lock()
+            .unwrap()
+            .push((model.to_string(), usage.clone()));
         Ok(())
     }
 
@@ -2552,7 +2659,9 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
         let llm = Arc::new(self.llm.unwrap_or_else(|| MockLlmClient::new("test-model")));
         let tools = Arc::new(self.tools.unwrap_or_default());
 
-        let context = ConvContext::new(&self.conv_id, self.working_dir, "test-model", 200_000);
+        let model_id = llm.model_id().to_string();
+        let context = ConvContext::new(&self.conv_id, self.working_dir, model_id, 200_000);
+
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = crate::runtime::SseBroadcaster::new(128, 0);
         let broadcast_rx = broadcaster.subscribe();
@@ -2658,6 +2767,16 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     /// Get all messages from storage
     pub fn messages(&self) -> Vec<Message> {
         self.storage.get_all_messages("test-conv")
+    }
+
+    pub fn turn_usages(&self) -> Vec<(String, phoenix_llm::Usage)> {
+        self.storage.turn_usages.lock().unwrap().clone()
+    }
+
+    pub fn provider_replay_updates(
+        &self,
+    ) -> Vec<phoenix_core::domain::provider_replay::ProviderReplayUpdate> {
+        self.storage.provider_replay_updates.lock().unwrap().clone()
     }
 }
 
@@ -2839,6 +2958,71 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].message_type, MessageType::User);
         assert_eq!(msgs[1].message_type, MessageType::Agent);
+    }
+
+    #[tokio::test]
+    async fn quiet_reasoning_end_turn_settles_and_allows_next_same_model_turn() {
+        let llm = MockLlmClient::new("gpt-6-astra");
+        llm.queue_response(LlmResponse {
+            provider_replay: Some(
+                phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+            ),
+            content: vec![],
+            end_turn: true,
+            usage: Usage {
+                input_tokens: 1000,
+                output_tokens: 18,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                reasoning_tokens: Some(18),
+            },
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("next turn succeeded")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+
+        let mut runtime = TestRuntime::new().llm(llm).build();
+        runtime.send_message("finish privately").await;
+        assert!(runtime.wait_for_done(Duration::from_secs(2)).await);
+
+        let first_turn_messages = runtime.messages();
+        assert_eq!(first_turn_messages.len(), 1);
+        assert_eq!(first_turn_messages[0].message_type, MessageType::User);
+        assert!(matches!(
+            runtime.storage.get_current_state("test-conv"),
+            Some(ConvState::Idle)
+        ));
+        assert_eq!(runtime.llm.recorded_requests().len(), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.turn_usages().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quiet-turn usage should be persisted");
+        let first_usage = runtime.turn_usages();
+        assert_eq!(first_usage[0].0, "gpt-6-astra");
+        assert_eq!(first_usage[0].1.output_tokens, 18);
+        assert_eq!(first_usage[0].1.reasoning_tokens, Some(18));
+        assert_eq!(
+            runtime.provider_replay_updates(),
+            vec![phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear]
+        );
+
+        runtime.send_message("continue on the same model").await;
+        assert!(runtime.wait_for_done(Duration::from_secs(2)).await);
+
+        let messages = runtime.messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].message_type, MessageType::User);
+        assert_eq!(messages[2].message_type, MessageType::Agent);
+        assert_eq!(runtime.llm.recorded_requests().len(), 2);
+        assert_eq!(runtime.turn_usages()[0].0, "gpt-6-astra");
     }
 
     #[tokio::test]

@@ -377,12 +377,24 @@ THE SYSTEM SHALL durably record a factual notification obligation with its sourc
 
 THE SYSTEM SHALL exclude successful continuation handoff and awaiting-question or awaiting-approval states from stop notifications.
 
+WHEN a watched conversation durably enters an awaiting-question or awaiting-task-approval state
+THE SYSTEM SHALL record a distinct wait-entry outcome through the same event outbox without settling the active execution as terminal.
+
+THE SYSTEM SHALL identify a question wait by its authoritative request identity when present. For a wait without a request identity, THE SYSTEM SHALL allocate its occurrence identity atomically with the committed wait entry and its notification obligations. Re-persisting an identical pending wait SHALL NOT create another occurrence; leaving and re-entering that wait SHALL create a new occurrence. Enrollment during an already-persisted wait SHALL NOT replay that wait.
+
 THE SYSTEM SHALL deliver factual packets with source identity, occurrence identity, outcome, time, and supported cause information, without behavioral instructions or recovery recommendations. Natural-language derived facts are permitted.
 
 THE SYSTEM SHALL admit notifications through ordinary durable input admission or steering, with stable replay identity, and SHALL NOT introduce a separate execution scheduler.
 
-WHEN removal or source Close precedes notification acceptance
-THE SYSTEM SHALL suppress the unaccepted notification.
+WHEN removal or source Close precedes subscription notification acceptance
+THE SYSTEM SHALL suppress the unaccepted subscription notification.
+
+WHEN a distinct Close cleanup failure is durably recorded
+THE SYSTEM SHALL append a mandatory factual notification to the same event outbox, regardless of watch enrollment or source History membership, and SHALL route it to the current Global Coordinator transcript.
+
+THE SYSTEM SHALL identify the mandatory notification by the persisted failure occurrence, SHALL deduplicate replay of that occurrence, and SHALL emit a new notification for a distinct failure of a newly authorized cleanup run.
+
+THE SYSTEM SHALL preserve the failure and notification atomically, SHALL distinguish confirmed conversation-and-process shutdown from uncertain shutdown in the notification, and SHALL NOT treat notification delivery or failure as authorization to resume cleanup.
 
 WHEN notification acceptance precedes removal or source Close
 THE SYSTEM SHALL retain accepted input without retraction.

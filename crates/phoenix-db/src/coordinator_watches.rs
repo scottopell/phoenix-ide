@@ -1,5 +1,13 @@
+mod mandatory_close;
+use mandatory_close::decode_route;
+pub use mandatory_close::{
+    append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
+    WatchEventRoute,
+};
+
 use chrono::Utc;
 use phoenix_core::domain::product_conversation::ProductConversationId;
+use phoenix_core::domain::sm_state::ConvState;
 use serde::Serialize;
 use sqlx::{Row, Sqlite, Transaction};
 
@@ -16,16 +24,68 @@ pub struct WatchSnapshot {
     pub project_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchOutcome {
+    Completed,
+    Failed { reason: String },
+    CleanupFailed { reason: String },
+    Cancelled,
+    AwaitingUserResponse,
+    AwaitingTaskApproval,
+}
+
+impl WatchOutcome {
+    fn decode(kind: &str, reason: Option<String>) -> DbResult<Self> {
+        match (kind, reason) {
+            ("completed", None) => Ok(Self::Completed),
+            ("failed", Some(reason)) => Ok(Self::Failed { reason }),
+            ("cleanup_failed", Some(reason)) => Ok(Self::CleanupFailed { reason }),
+            ("cancelled", None) => Ok(Self::Cancelled),
+            ("awaiting_user_response", Some(reason)) if reason == "question_request" => {
+                Ok(Self::AwaitingUserResponse)
+            }
+            ("awaiting_task_approval", Some(reason)) if reason == "task_approval_wait" => {
+                Ok(Self::AwaitingTaskApproval)
+            }
+            _ => Err(DbError::Serialization(
+                "invalid watch outcome/reason pair".into(),
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed { .. } => "failed",
+            Self::CleanupFailed { .. } => "cleanup_failed",
+            Self::Cancelled => "cancelled",
+            Self::AwaitingUserResponse => "awaiting_user_response",
+            Self::AwaitingTaskApproval => "awaiting_task_approval",
+        }
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed { reason } | Self::CleanupFailed { reason } => Some(reason),
+            Self::AwaitingUserResponse => Some("question_request"),
+            Self::AwaitingTaskApproval => Some("task_approval_wait"),
+            Self::Completed | Self::Cancelled => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingWatchEvent {
+    pub route: WatchEventRoute,
     pub event_id: String,
     pub product_conversation_id: ProductConversationId,
     pub source_transcript_id: String,
     pub source_occurrence_kind: String,
     pub source_occurrence_id: String,
     pub source_generation: i64,
-    pub terminal_kind: String,
-    pub terminal_reason: Option<String>,
+    pub outcome: WatchOutcome,
     pub occurred_at_us: i64,
 }
 
@@ -133,7 +193,7 @@ impl Database {
     /// # Errors
     /// Returns a database error if suppression fails.
     pub async fn suppress_stale_watch_event(&self, event_id: &str) -> DbResult<()> {
-        sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed' WHERE event_id = ?1 AND delivery_state = 'pending' AND NOT EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p ON p.id = w.source_product_conversation_id WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open')")
+        sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed' WHERE event_id = ?1 AND route_kind = 'subscription' AND delivery_state = 'pending' AND NOT EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p ON p.id = w.source_product_conversation_id WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open')")
             .bind(event_id).execute(self.pool()).await?;
         Ok(())
     }
@@ -158,21 +218,30 @@ impl Database {
         &self,
         limit: i64,
     ) -> DbResult<Vec<PendingWatchEvent>> {
-        let rows = sqlx::query("SELECT e.event_id, w.source_product_conversation_id,
+        let rows = sqlx::query("SELECT e.event_id, e.route_kind,
+                  COALESCE(w.source_product_conversation_id, f.source_product_conversation_id) AS source_product_conversation_id,
                   e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
-                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us
-             FROM coordinator_watch_events e JOIN coordinator_watches w ON w.id = e.watch_id
-             JOIN product_conversations p ON p.id = w.source_product_conversation_id
-             WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none' AND w.ended_at_us IS NULL
-               AND p.ordinary_lifecycle = 'open'
-               AND NOT EXISTS (SELECT 1 FROM close_obligations o
-                               WHERE o.product_conversation_id = p.id AND o.phase != 'completed')
+                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
+                  f.authority_kind, f.scope, f.resource_kind, f.identity_kind, f.identity_codec, f.identity_value,
+                  f.detail, f.cleanup_run_ordinal, f.stop_certainty, f.confirmed_at_us AS stop_confirmed_at_unix_us
+             FROM coordinator_watch_events e
+             LEFT JOIN coordinator_watches w ON w.id = e.watch_id
+             LEFT JOIN product_conversations p ON p.id = w.source_product_conversation_id
+             LEFT JOIN close_cleanup_failures f ON f.failure_occurrence_id = e.mandatory_failure_occurrence_id
+             WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none'
+               AND (e.route_kind = 'mandatory_close_failure' OR
+                    (e.route_kind = 'subscription' AND w.ended_at_us IS NULL
+                     AND p.ordinary_lifecycle = 'open'
+                     AND NOT EXISTS (SELECT 1 FROM close_obligations o
+                                     WHERE o.product_conversation_id = p.id AND o.phase != 'completed')))
              ORDER BY e.occurred_at_us, e.event_id LIMIT ?1")
             .bind(limit).fetch_all(&self.pool).await?;
-        rows.into_iter()
+        let mut events = rows
+            .into_iter()
             .map(|row| {
                 let product_id: String = row.try_get("source_product_conversation_id")?;
                 Ok(PendingWatchEvent {
+                    route: decode_route(&row)?,
                     event_id: row.try_get("event_id")?,
                     product_conversation_id: ProductConversationId::parse(product_id)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
@@ -180,12 +249,26 @@ impl Database {
                     source_occurrence_kind: row.try_get("source_occurrence_kind")?,
                     source_occurrence_id: row.try_get("source_occurrence_id")?,
                     source_generation: row.try_get("source_generation")?,
-                    terminal_kind: row.try_get("terminal_kind")?,
-                    terminal_reason: row.try_get("terminal_reason")?,
+                    outcome: WatchOutcome::decode(
+                        row.try_get("terminal_kind")?,
+                        row.try_get("terminal_reason")?,
+                    )?,
                     occurred_at_us: row.try_get("occurred_at_us")?,
                 })
             })
-            .collect()
+            .collect::<DbResult<Vec<_>>>()?;
+        for event in &mut events {
+            if let WatchEventRoute::MandatoryCloseFailure {
+                remaining_resources,
+                ..
+            } = &mut event.route
+            {
+                *remaining_resources =
+                    mandatory_close::remaining_resources(&self.pool, &event.source_occurrence_id)
+                        .await?;
+            }
+        }
+        Ok(events)
     }
 
     /// Find the active coordinator transcript that receives watch events.
@@ -274,6 +357,85 @@ pub(crate) async fn record_steering_event_tx(
         reason == Some("context exhausted"),
     )
     .await
+}
+
+pub(crate) async fn record_wait_entry_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript_id: &str,
+    state: &ConvState,
+) -> DbResult<()> {
+    let (kind, outcome, identified_request) = match state {
+        ConvState::AwaitingUserResponse {
+            request_authority, ..
+        } => (
+            "question_request",
+            "awaiting_user_response",
+            request_authority.request_id(),
+        ),
+        ConvState::AwaitingTaskApproval { .. } => {
+            ("task_approval_wait", "awaiting_task_approval", None)
+        }
+        ConvState::Idle
+        | ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::CreationCancelled { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::Error { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::RecoverableContinuationFailure { .. }
+        | ConvState::ContextExhausted { .. }
+        | ConvState::HandedOff { .. }
+        | ConvState::Terminal => return Ok(()),
+    };
+    let previous: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+        .bind(transcript_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let previous: ConvState = serde_json::from_str(&previous)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let same_occurrence = match (identified_request, &previous) {
+        (
+            Some(request_id),
+            ConvState::AwaitingUserResponse {
+                request_authority, ..
+            },
+        ) => request_authority.request_id() == Some(request_id),
+        (None, _) => &previous == state,
+        _ => false,
+    };
+    if same_occurrence {
+        return Ok(());
+    }
+    let occurrence_id =
+        identified_request.map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
+    let watch_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT w.id FROM conversations c JOIN coordinator_watches w
+         ON w.source_product_conversation_id = c.product_conversation_id
+         WHERE c.id = ?1 AND w.ended_at_us IS NULL",
+    )
+    .bind(transcript_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for watch_id in watch_ids {
+        sqlx::query("INSERT INTO coordinator_watch_events
+            (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
+             source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
+            VALUES (?1, ?2, ?6, ?3, 0, ?4, ?7, ?6, ?5)
+            ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(watch_id)
+            .bind(&occurrence_id).bind(transcript_id)
+            .bind(chrono::Utc::now().timestamp_micros()).bind(kind).bind(outcome)
+            .execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn record_summary_failure_tx(
@@ -376,6 +538,23 @@ async fn record_watch_event_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_preserves_mandatory_cleanup_failure_alongside_waits() {
+        assert_eq!(
+            WatchOutcome::decode("cleanup_failed", Some("resource preserved".into())).unwrap(),
+            WatchOutcome::CleanupFailed {
+                reason: "resource preserved".into()
+            }
+        );
+        assert!(WatchOutcome::decode("cleanup_failed", None).is_err());
+        assert_eq!(
+            WatchOutcome::decode("awaiting_user_response", Some("question_request".into()))
+                .unwrap(),
+            WatchOutcome::AwaitingUserResponse
+        );
+    }
+
     use crate::workflow::AcceptAuthoritativeTurn;
     use phoenix_core::domain::db_schema::InputOrigin;
     use phoenix_core::domain::sm_event::{
@@ -428,6 +607,352 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_question_wait_is_emitted_once_per_request_without_settling_turn() {
+        use phoenix_core::domain::sm_state::{QuestionRequestAuthority, UserQuestion};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-wait", "watch-wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let turn_id = source_turn(&db, &source.id, "active-question-turn").await;
+        let waiting = |authority| ConvState::AwaitingUserResponse {
+            tool_use_id: "provider-reused-tool-id".into(),
+            request_authority: authority,
+            questions: vec![UserQuestion {
+                question: "Choose".into(),
+                header: "Choice".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+        };
+        let first = waiting(QuestionRequestAuthority::new());
+        db.update_conversation_state(&source.id, &first)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &first)
+            .await
+            .unwrap();
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        db.update_conversation_state(&source.id, &restored)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one durable request must produce one wait event"
+        );
+        assert_eq!(events[0].outcome.label(), "awaiting_user_response");
+        assert_eq!(events[0].outcome.reason(), Some("question_request"));
+        db.update_conversation_state(&source.id, &waiting(QuestionRequestAuthority::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            2
+        );
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            terminal.is_none(),
+            "waiting must not settle the active turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_without_provider_replay_persists_approval_event_atomically() {
+        use phoenix_core::domain::db_schema::{Message, MessageContent, MessageType};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation(
+                "checkpoint-wait",
+                "Checkpoint wait",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let turn = source_turn(&db, &source.id, "checkpoint-turn").await;
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let assistant = Message {
+            origin: InputOrigin::UnknownHistorical,
+            message_id: "checkpoint-assistant".into(),
+            conversation_id: source.id.clone(),
+            sequence_id: 10,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        sqlx::query("CREATE TRIGGER reject_wait_checkpoint BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'checkpoint test failure'); END")
+            .execute(db.pool()).await.unwrap();
+        assert!(db
+            .persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .is_err());
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db.get_message_by_id(&assistant.message_id).await.is_err());
+        sqlx::query("DROP TRIGGER reject_wait_checkpoint")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, WatchOutcome::AwaitingTaskApproval);
+        assert_eq!(
+            db.get_conversation(&source.id).await.unwrap().state,
+            waiting
+        );
+        assert!(db.get_message_by_id(&assistant.message_id).await.is_ok());
+        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_outbox_and_state_rollback_together_before_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wait.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let source = db
+            .create_conversation("rollback-wait", "rollback-wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let mut tx = db.pool().begin().await.unwrap();
+        record_wait_entry_tx(&mut tx, &source.id, &waiting)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?3 WHERE id = ?2")
+            .bind(serde_json::to_string(&waiting).unwrap())
+            .bind(&source.id)
+            .bind(crate::conv_state_kind(&waiting))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let inside: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_events")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert!(
+            db.pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "another connection must not discover an uncommitted wait event"
+        );
+        assert_eq!(inside, 1);
+        tx.rollback().await.unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        let state: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+            .bind(&source.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_ne!(serde_json::from_str::<ConvState>(&state).unwrap(), waiting);
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        let original = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(original.len(), 1);
+        db.pool().close().await;
+        let restored = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(restored.pool())
+            .await
+            .unwrap();
+        restored
+            .update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        let replay = restored.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_id, original[0].event_id);
+        restored
+            .update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        restored
+            .update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        restored.pool().close().await;
+    }
+
+    #[tokio::test]
+    async fn task_and_legacy_wait_entries_deduplicate_without_replaying_enrollment() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("fallback-waits", "fallback-waits", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let approval = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        let legacy: ConvState = serde_json::from_value(serde_json::json!({
+            "type": "awaiting_user_response", "tool_use_id": "reused", "questions": []
+        }))
+        .unwrap();
+        db.update_conversation_state(&source.id, &approval)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &approval)
+            .await
+            .unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        db.update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let turn_id = source_turn(&db, &source.id, "fallback-turn").await;
+        for (index, wait) in [&approval, &legacy].into_iter().enumerate() {
+            db.update_conversation_state(&source.id, &ConvState::Idle)
+                .await
+                .unwrap();
+            db.update_conversation_state(&source.id, wait)
+                .await
+                .unwrap();
+            let restored: ConvState =
+                serde_json::from_str(&serde_json::to_string(wait).unwrap()).unwrap();
+            db.update_conversation_state(&source.id, &restored)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.pending_coordinator_watch_events(16).await.unwrap().len(),
+                index * 2 + 1
+            );
+            db.update_conversation_state(&source.id, &ConvState::Idle)
+                .await
+                .unwrap();
+            db.update_conversation_state(&source.id, wait)
+                .await
+                .unwrap();
+            let events = db.pending_coordinator_watch_events(16).await.unwrap();
+            assert_eq!(events.len(), index * 2 + 2);
+            assert_ne!(
+                events[index * 2].source_occurrence_id,
+                events[index * 2 + 1].source_occurrence_id
+            );
+        }
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none());
+    }
+
+    #[tokio::test]
+    async fn enrolling_during_a_question_wait_does_not_replay_it() {
+        use phoenix_core::domain::sm_state::{QuestionRequestAuthority, UserQuestion};
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation(
+                "pending-before-watch",
+                "pending-before-watch",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let waiting = ConvState::AwaitingUserResponse {
+            tool_use_id: "tool".into(),
+            request_authority: QuestionRequestAuthority::new(),
+            questions: vec![UserQuestion {
+                question: "Choose".into(),
+                header: "Choice".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+        };
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn recorded_cancel_overrides_idle_completion_without_inventing_actor() {
         let db = Database::open_in_memory().await.unwrap();
         let source = db
@@ -449,8 +974,8 @@ mod tests {
         tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_kind, "cancelled");
-        assert_eq!(events[0].terminal_reason, None);
+        assert_eq!(events[0].outcome.label(), "cancelled");
+        assert_eq!(events[0].outcome.reason(), None);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_cancel_observations")
                 .fetch_one(db.pool())
@@ -511,7 +1036,7 @@ mod tests {
         tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_reason.as_deref(), Some("model failed"));
+        assert_eq!(events[0].outcome.reason(), Some("model failed"));
         assert!(db.unwatch_product_conversation(&id).await.unwrap());
         assert!(!db.unwatch_product_conversation(&id).await.unwrap());
         assert!(db
@@ -607,11 +1132,8 @@ mod tests {
         assert_eq!(delivered[0].source_occurrence_kind, "direct_turn");
         assert_eq!(delivered[0].source_occurrence_id, turn.to_string());
         assert_eq!(delivered[0].source_generation, 0);
-        assert_eq!(delivered[0].terminal_kind, "failed");
-        assert_eq!(
-            delivered[0].terminal_reason.as_deref(),
-            Some("context exhausted")
-        );
+        assert_eq!(delivered[0].outcome.label(), "failed");
+        assert_eq!(delivered[0].outcome.reason(), Some("context exhausted"));
         assert_eq!(delivered[0].source_transcript_id, source.id);
     }
 
@@ -945,7 +1467,226 @@ mod tests {
         assert_eq!(exposed.len(), 1);
         assert_eq!(exposed[0].source_occurrence_kind, "direct_turn");
         assert_eq!(exposed[0].source_occurrence_id, turn.to_string());
-        assert_eq!(exposed[0].terminal_kind, "cancelled");
+        assert_eq!(exposed[0].outcome.label(), "cancelled");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mandatory_failure_loads_ordered_resources_until_acceptance() {
+        use crate::{
+            CloseCleanupFailureAuthority, CloseCleanupFailureResource,
+            CloseCleanupResourceDisposition as Disposition,
+            TerminalizeInitialCloseCleanupFailureRequest,
+        };
+        use phoenix_core::domain::close::{
+            CloseAttemptId, CloseRunOrdinal, CloseStopCertainty, LossItemIdentity, OpaqueIdentity,
+            RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
+            TranscriptConversationId,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let ordinary = db
+            .create_conversation("ordinary", "ordinary", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&ordinary.product_conversation_id)
+            .await
+            .unwrap();
+        let turn = source_turn(&db, &ordinary.id, "ordinary-turn").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        record_terminal_event_tx(&mut tx, turn, 0, &ordinary.id, "Completed", None, false)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let ordinary_event_id = db.pending_coordinator_watch_events(16).await.unwrap()[0]
+            .event_id
+            .clone();
+
+        let source = db
+            .create_conversation("close-source", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope = source.attached_work_scope_id.clone().unwrap();
+        let other_scope = phoenix_core::work_scope::WorkScopeId::parse("other-scope").unwrap();
+        sqlx::query("INSERT INTO work_scopes (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+            SELECT ?1, authority_kind, lifecycle, 'unowned_cwd', '/tmp/child', created_at, updated_at FROM work_scopes WHERE id = ?2")
+            .bind(other_scope.as_str()).bind(scope.as_str()).execute(db.pool()).await.unwrap();
+        let mut latest = source.clone();
+        latest.id = "close-latest".into();
+        latest.slug = Some("close-latest".into());
+        latest.attached_work_scope_id = Some(other_scope.clone());
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO product_continuation_reservations (predecessor_conversation_id, successor_conversation_id, product_conversation_id) VALUES (?1, ?2, ?3)")
+            .bind(&source.id).bind(&latest.id).bind(source.product_conversation_id.as_str()).execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind(&latest.id)
+            .bind(&source.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        crate::insert_conversation_tx(&mut tx, &latest)
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(&source.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        db.begin_close_foundation(
+            &source.product_conversation_id,
+            &TranscriptConversationId::parse(latest.id.clone()).unwrap(),
+            "watch-failure",
+        )
+        .await
+        .unwrap();
+        let resources = [
+            (
+                &scope,
+                RetiredResourceKind::BashProcessGroup,
+                "epoch:failed",
+                Disposition::Failed,
+            ),
+            (
+                &other_scope,
+                RetiredResourceKind::BrowserSession,
+                "epoch:residual",
+                Disposition::Residual,
+            ),
+            (
+                &scope,
+                RetiredResourceKind::PtySession,
+                "epoch:unattempted",
+                Disposition::Unattempted,
+            ),
+            (
+                &other_scope,
+                RetiredResourceKind::EquivalentLiveResource,
+                "epoch:unknown",
+                Disposition::Unknown,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(scope, kind, identity, disposition)| CloseCleanupFailureResource {
+                scope: scope.clone(),
+                resource: RetiredResourceIdentity::parse(
+                    kind,
+                    LossItemIdentity::Opaque(OpaqueIdentity::parse(identity).unwrap()),
+                )
+                .unwrap(),
+                disposition,
+            },
+        )
+        .collect::<Vec<_>>();
+        let request = TerminalizeInitialCloseCleanupFailureRequest {
+            failure_occurrence_id: "close-failure:1:watch-failure".into(),
+            attempt_id: CloseAttemptId::parse("watch-failure").unwrap(),
+            source_product_conversation_id: source.product_conversation_id.clone(),
+            authority: CloseCleanupFailureAuthority::ObservedProcessResource {
+                scope,
+                resource: resources[0].resource.clone(),
+            },
+            remaining_resources: resources.clone(),
+            reason: RetirementFailureReason::ResidualProcessAlive,
+            detail: "shutdown failed".into(),
+            stop_certainty: CloseStopCertainty::ShutdownUncertain,
+            occurred_at_us: 1,
+        };
+        db.terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .unwrap();
+        db.terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .unwrap();
+        db.suppress_stale_watch_event(&request.failure_occurrence_id)
+            .await
+            .unwrap();
+        assert!(!db
+            .unwatch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap());
+        let expected = resources
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<mandatory_close::CloseFailureRemainingResource>>();
+        for _ in 0..2 {
+            let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+            assert_eq!(pending.len(), 2);
+            assert_eq!(pending[0].event_id, request.failure_occurrence_id);
+            assert_eq!(pending[1].event_id, ordinary_event_id);
+            assert!(matches!(pending[1].route, WatchEventRoute::Subscription));
+            let WatchEventRoute::MandatoryCloseFailure {
+                run_ordinal,
+                remaining_resources,
+                stop,
+                ..
+            } = &pending[0].route
+            else {
+                panic!("expected mandatory route");
+            };
+            assert_eq!(*run_ordinal, CloseRunOrdinal::INITIAL);
+            assert_eq!(*remaining_resources, expected);
+            assert!(matches!(stop, CloseFailureStop::ShutdownUncertain));
+            let limited = db.pending_coordinator_watch_events(1).await.unwrap();
+            assert_eq!(limited.len(), 1);
+            assert_eq!(limited[0].event_id, request.failure_occurrence_id);
+        }
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let admission = "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text, origin_kind, origin_subscription_event_id)
+                         VALUES (?1, ?2, ?3, 'failure with resources', 'subscription_event', ?4)";
+        assert!(sqlx::query(admission)
+            .bind("wrong-target")
+            .bind(&ordinary.id)
+            .bind(0)
+            .bind(&request.failure_occurrence_id)
+            .execute(db.pool())
+            .await
+            .is_err());
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            2
+        );
+        sqlx::query(admission)
+            .bind("accepted-failure")
+            .bind(&coordinator.id)
+            .bind(0)
+            .bind(&request.failure_occurrence_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(sqlx::query(admission)
+            .bind("duplicate-failure")
+            .bind(&coordinator.id)
+            .bind(1)
+            .bind(&request.failure_occurrence_id)
+            .execute(db.pool())
+            .await
+            .is_err());
+        db.terminalize_initial_close_cleanup_failure(&request)
+            .await
+            .unwrap();
+        let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_id, ordinary_event_id);
+        assert_eq!(
+            mandatory_close::remaining_resources(db.pool(), &request.failure_occurrence_id)
+                .await
+                .unwrap(),
+            expected
+        );
+        let accepted: (String, String) = sqlx::query_as("SELECT delivery_state, accepted_transcript_id FROM coordinator_watch_events WHERE event_id = ?1")
+            .bind(&request.failure_occurrence_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(accepted, ("accepted".into(), coordinator.id));
     }
 
     #[tokio::test]
