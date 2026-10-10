@@ -410,10 +410,95 @@ pub struct RetryCloseRetirementRequest {
 pub struct ProductConversationCloseView {
     pub attempt_id: String,
     pub phase: ProductConversationClosePhaseView,
+    pub outcome: Option<ProductConversationCloseOutcomeView>,
+    pub run_ordinal: String,
+    pub run_status: ProductConversationCloseRunStatusView,
+    pub failure: Option<ProductConversationCloseFailureView>,
     pub confirmation_snapshot: Option<ProductConversationCloseInspectionView>,
     pub inspections: Vec<ProductConversationCloseInspectionView>,
     pub losses: Vec<ProductConversationCloseLossView>,
     pub residuals: Vec<ProductConversationCloseResidualView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseFailureView {
+    pub occurrence_id: String,
+    pub reason: ProductConversationCloseFailureReasonView,
+    pub detail: String,
+    pub stop_certainty: ProductConversationCloseStopCertaintyView,
+    pub remaining_resources: Vec<ProductConversationCloseRemainingResourceView>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseFailureReasonView {
+    RemovalFailed,
+    StillSharedByLiveOwner,
+    ResidualProcessAlive,
+    IdentityNotProven,
+    Interrupted,
+    ManualRepairRequired,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseStopCertaintyView {
+    ConversationAndProcessesStopped { confirmed_at_us: String },
+    ShutdownUncertain,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseRemainingResourceView {
+    pub scope: String,
+    pub resource_kind: ProductConversationCloseResourceKindView,
+    pub identity: String,
+    pub disposition: ProductConversationCloseResourceDispositionView,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseResourceKindView {
+    Worktree,
+    WorkScope,
+    BashProcessGroup,
+    TmuxServer,
+    PtySession,
+    BrowserSession,
+    EquivalentLiveResource,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseResourceDispositionView {
+    Failed,
+    Residual,
+    Unattempted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseOutcomeView {
+    Archived,
+    Cancelled,
+    ArchivedCleanupAttention,
+    CloseIncomplete,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseRunStatusView {
+    Running,
+    Stopped,
+    Completed,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

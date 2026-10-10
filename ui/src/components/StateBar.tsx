@@ -1360,21 +1360,7 @@ export function StateBar({
     }`
     : undefined;
 
-  const compactStatus = conversationExtension && !watchdogStale ? (() => {
-    switch (connectionState) {
-      case "connected":
-        return { text: "Connected", dotClass: "dot idle" };
-      case "reconnected":
-        return { text: "Reconnected", dotClass: "dot reconnected" };
-      case "reconnecting":
-        return { text: "Reconnecting", dotClass: "dot reconnecting" };
-      case "offline":
-        return { text: "Disconnected", dotClass: "dot offline" };
-      case "connecting":
-      case "disconnected":
-        return { text: "Connecting", dotClass: "dot connecting" };
-    }
-  })() : { text: stateText, dotClass };
+
 
   if (usesCompactLayout) {
     const toggleMobileExpanded = () => setMobileExpanded((v) => !v);
@@ -1412,12 +1398,12 @@ export function StateBar({
               <span className="statebar-slug">&mdash;</span>
             )}
             <div
-              className={`statebar-mobile-status${conversationExtension ? " statebar-mobile-status--transport" : ""}`}
-              title={compactStatus.text}
+              className={`statebar-mobile-status${conversationExtension ? " statebar-mobile-status--conversation" : ""}`}
+              title={stateText}
             >
-              <span className={compactStatus.dotClass}></span>
+              <span className={dotClass}></span>
               {(!mobileExpanded || conversationExtension) && (
-                <span className="state-text">{compactStatus.text}</span>
+                <span className="state-text">{stateText}</span>
               )}
             </div>
             <div className="statebar-mobile-actions">

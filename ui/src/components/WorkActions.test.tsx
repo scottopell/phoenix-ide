@@ -185,6 +185,10 @@ describe('WorkControlBar — persisted Close recovery', () => {
     close: {
       attempt_id: 'attempt-close',
       phase,
+      outcome: null,
+      run_ordinal: '1',
+      run_status: 'running',
+      failure: null,
       confirmation_snapshot: null,
       inspections: [],
       losses: [],
@@ -282,6 +286,43 @@ describe('WorkControlBar — persisted Close recovery', () => {
 
     resolveInitial({ close: null });
     await waitFor(() => expect(screen.getByLabelText('Close repair required')).toBeVisible());
+  });
+
+  it.each(['archived_cleanup_attention', 'close_incomplete'])('does not offer same-run retry for stopped %s', async (outcome) => {
+    const snapshot = closeSnapshot('completed');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      ordinary_lifecycle: outcome === 'close_incomplete' ? 'open' : 'history',
+      close: { ...snapshot.close, outcome, run_status: 'stopped' },
+    } as never);
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stopped" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+    await waitFor(() => expect(screen.getByTestId('clean-up-button')).toBeDisabled());
+    expect(screen.queryByRole('button', { name: 'Retry exact Close attempt' })).not.toBeInTheDocument();
+    expect(api.retryCloseRetirement).not.toHaveBeenCalled();
+  });
+
+  it('refreshes a Close incomplete conflict instead of leaving ordinary controls writable', async () => {
+    const onCloseCompleted = vi.fn();
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(Object.assign(new Error('Shutdown uncertain'), { code: 'close_incomplete' }));
+    const snapshot = closeSnapshot('completed');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce({ close: null } as never)
+      .mockResolvedValueOnce({
+        ...snapshot,
+        ordinary_lifecycle: 'open',
+        close: { ...snapshot.close, outcome: 'close_incomplete', run_status: 'stopped' },
+      } as never);
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-incomplete" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle({ found: false })} onCloseCompleted={onCloseCompleted} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByTestId('abandon-button'));
+    await waitFor(() => expect(screen.getByTestId('abandon-button')).toBeDisabled());
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(onCloseCompleted).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: 'Retry exact Close attempt' })).not.toBeInTheDocument();
   });
 
   it('renders exact residual repair evidence after reload', async () => {

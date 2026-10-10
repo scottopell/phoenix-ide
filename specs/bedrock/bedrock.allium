@@ -173,7 +173,8 @@ enum ClosePhase {
     | awaiting_retirement_inspection
     | awaiting_loss_confirmation
     | retirement_requested
-    | needs_repair
+    | close_incomplete
+    | cleanup_attention
     | completed
 }
 
@@ -225,8 +226,8 @@ entity CloseObligation {
     product_conversation: ProductConversation
     phase: ClosePhase
     outcome: CloseOutcome when phase = completed
-    inspection_generation: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair } or (phase = completed and outcome = archived)
-    inspection_fingerprint: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair } or (phase = completed and outcome = archived)
+    inspection_generation: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, close_incomplete, cleanup_attention } or (phase = completed and outcome = archived)
+    inspection_fingerprint: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, close_incomplete, cleanup_attention } or (phase = completed and outcome = archived)
 
     transitions phase {
         awaiting_blocker_resolution -> awaiting_stop_work_confirmation
@@ -243,13 +244,65 @@ entity CloseObligation {
         awaiting_loss_confirmation -> awaiting_retirement_inspection
         awaiting_loss_confirmation -> retirement_requested
         awaiting_loss_confirmation -> completed
-        retirement_requested -> needs_repair
-        retirement_requested -> awaiting_retirement_inspection
-        needs_repair -> awaiting_retirement_inspection
+        awaiting_blocker_resolution -> close_incomplete
+        awaiting_blocker_resolution -> cleanup_attention
+        awaiting_stop_work_confirmation -> close_incomplete
+        awaiting_stop_work_confirmation -> cleanup_attention
+        settling_active_work -> close_incomplete
+        settling_active_work -> cleanup_attention
+        cancel_requested_during_settlement -> close_incomplete
+        cancel_requested_during_settlement -> cleanup_attention
+        awaiting_retirement_inspection -> close_incomplete
+        awaiting_retirement_inspection -> cleanup_attention
+        awaiting_loss_confirmation -> close_incomplete
+        awaiting_loss_confirmation -> cleanup_attention
+        retirement_requested -> close_incomplete
+        retirement_requested -> cleanup_attention
+        close_incomplete -> settling_active_work
+        close_incomplete -> cleanup_attention
+        cleanup_attention -> awaiting_retirement_inspection
         retirement_requested -> completed
-        needs_repair -> completed
         terminal: completed
     }
+}
+
+-- REQ-BED-029: attempt_id denotes original Close authority; run ordinal denotes
+-- one execution. A stopped run cannot become running again.
+entity CloseRun {
+    obligation: CloseObligation
+    ordinal: Integer
+    status: running | stopped | completed
+
+    transitions status {
+        running -> stopped
+        running -> completed
+        terminal: stopped, completed
+    }
+}
+
+-- residual_evidence and exact_remaining_effects are opaque identifiers of typed,
+-- normalized evidence/plan records, not serialized child collections or summaries.
+entity CloseRunFailure {
+    run: CloseRun
+    failed_step: String
+    reason: String
+    shutdown: confirmed | uncertain
+    residual_evidence: String
+}
+
+-- Delivery references failure evidence rather than duplicating it.
+entity CloseFailureGlobalDelivery {
+    failure: CloseRunFailure
+    status: pending | accepted
+}
+
+entity CloseRetrySafetyEvidence {
+    failed_run: CloseRun
+    observed_at: Timestamp
+    unresolved_precondition: Boolean
+    original_authority_sufficient: Boolean
+    exact_remaining_effects: String
+    requires_proposal: Boolean
 }
 
 entity CloseAttemptMember {
@@ -1529,6 +1582,7 @@ rule FailedAutomaticContinuationUsesPersistedWinner {
 
 rule ServerRestartResumesAdmittedAutomaticContinuation {
     when: ServerRestarted(conversation)
+    requires: not close_execution_admission_sealed(conversation.product_conversation)
     for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, superseded, failed }:
         ensures: AutomaticContinuationAdmissionRuns(admission, auto_continuation_successor_identity(admission))
 }
@@ -1847,12 +1901,17 @@ rule UserRequestsCloseConversation {
                 awaiting_retirement_inspection,
                 awaiting_loss_confirmation,
                 retirement_requested,
-                needs_repair
+                close_incomplete, cleanup_attention
             }
     ensures: CloseObligation.created(
         attempt_id: attempt_id,
         product_conversation: conversation.product_conversation,
         phase: awaiting_blocker_resolution
+    )
+    ensures: CloseRun.created(
+        obligation: CloseObligation{product_conversation: conversation.product_conversation, attempt_id: attempt_id},
+        ordinal: 1,
+        status: running
     )
     ensures:
         for transcript_row in Parent{product_conversation: conversation.product_conversation}:
@@ -1867,7 +1926,7 @@ rule UserRequestsCloseConversation {
                     transcript_row
                 )
             )
-    ensures: CloseEvaluationRequested(conversation.product_conversation, attempt_id)
+    ensures: CloseEvaluationRequested(conversation.product_conversation, attempt_id, 1)
 
     @guidance
         -- Close is a durable aggregate-owned obligation separate from row-local
@@ -1876,7 +1935,7 @@ rule UserRequestsCloseConversation {
         -- one durable attempt_id, and at most one non-completed attempt may exist
         -- per ProductConversation. Creation of the durable obligation and emission
         -- of the aggregate-scoped
-        -- CloseEvaluationRequested(product_conversation, attempt_id) event are one
+        -- CloseEvaluationRequested(product_conversation, attempt_id, run_ordinal) event are one
         -- atomic decision boundary so busy and idle branches advance from the same
         -- committed attempt without an emit-vs-persist race.
         -- Admission uses close_eligible rather than row_accepts_user_messages so the
@@ -1886,7 +1945,8 @@ rule UserRequestsCloseConversation {
 }
 
 rule CloseObligationRequiresExplicitStopWorkConfirmation {
-    when: CloseEvaluationRequested(product_conversation, attempt_id)
+    when: CloseEvaluationRequested(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_blocker_resolution
     requires: exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_stop_work_confirmation
@@ -1894,21 +1954,26 @@ rule CloseObligationRequiresExplicitStopWorkConfirmation {
 }
 
 rule CloseObligationUserConfirmsStopWork {
-    when: UserConfirmsStopWorkAndContinueClosing(product_conversation, attempt_id)
+    when: UserConfirmsStopWorkAndContinueClosing(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_stop_work_confirmation
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
-    ensures: CloseSettlementRequested(product_conversation, attempt_id)
+    ensures: CloseSettlementRequested(product_conversation, attempt_id, run_ordinal)
 }
 
 rule CloseSettlementCapturesExactDirectTurnTargets {
-    when: CloseSettlementRequested(product_conversation, attempt_id)
+    when: CloseSettlementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
-    ensures: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
-    ensures: not AdditionalCloseDirectTurnSettlementTargetMayBeCaptured(product_conversation, attempt_id)
+    ensures: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id, run_ordinal)
+    ensures: not AdditionalCloseDirectTurnSettlementTargetMayBeCaptured(product_conversation, attempt_id, run_ordinal)
 }
 
 rule CloseObligationCanBeCancelledBeforeSettlementStarts {
-    when: UserCancelsClose(product_conversation, attempt_id)
+    when: UserCancelsClose(product_conversation, attempt_id, run_ordinal)
+    requires: product_conversation.lifecycle = open
+    requires: run_ordinal = 1
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation.exists(product_conversation: product_conversation, attempt_id: attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
         awaiting_blocker_resolution,
@@ -1918,31 +1983,37 @@ rule CloseObligationCanBeCancelledBeforeSettlementStarts {
     }
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.outcome = cancelled
-    ensures: CloseObligationCancelled(product_conversation, attempt_id)
+    ensures: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = completed
+    ensures: CloseObligationCancelled(product_conversation, attempt_id, run_ordinal)
 }
 
 rule CloseObligationQueuesCancellationDuringSettlement {
-    when: UserCancelsClose(product_conversation, attempt_id)
+    when: UserCancelsClose(product_conversation, attempt_id, run_ordinal)
+    requires: product_conversation.lifecycle = open
+    requires: run_ordinal = 1
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
-    ensures: CloseSettlementCancellationQueued(product_conversation, attempt_id)
+    ensures: CloseSettlementCancellationQueued(product_conversation, attempt_id, run_ordinal)
 }
 
 rule RepeatedCloseCancellationDuringSettlementIsIdempotent {
-    when: UserCancelsClose(product_conversation, attempt_id)
+    when: UserCancelsClose(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
-    ensures: CloseCancellationAlreadyPending(product_conversation, attempt_id)
-    ensures: not AdditionalCloseSettlementCancellationQueued(product_conversation, attempt_id)
+    ensures: CloseCancellationAlreadyPending(product_conversation, attempt_id, run_ordinal)
+    ensures: not AdditionalCloseSettlementCancellationQueued(product_conversation, attempt_id, run_ordinal)
 }
 
 rule CloseObligationBeginsSettlementWithoutBusyWork {
-    when: CloseEvaluationRequested(product_conversation, attempt_id)
+    when: CloseEvaluationRequested(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_blocker_resolution
     requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
-    ensures: CloseSettlementRequested(product_conversation, attempt_id)
-    ensures: CloseSettlementProgressed(product_conversation, attempt_id)
+    ensures: CloseSettlementRequested(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseSettlementProgressed(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Entering settlement without ordinary busy ownership still emits one
@@ -1951,17 +2022,19 @@ rule CloseObligationBeginsSettlementWithoutBusyWork {
 }
 
 rule CloseObligationWaitsForSettlement {
-    when: CloseSettlementProgressed(product_conversation, attempt_id)
+    when: CloseSettlementProgressed(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { settling_active_work, cancel_requested_during_settlement }
-    requires: exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id)
+    requires: exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id, run_ordinal)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase
 }
 
 rule CloseObligationWaitsForOtherSettlementAuthority {
-    when: CloseSettlementProgressed(product_conversation, attempt_id)
+    when: CloseSettlementProgressed(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
-    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
-    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id)
+    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id, run_ordinal)
+    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id, run_ordinal)
     requires: not all_close_owned_authorities_released(product_conversation)
     ensures: CloseSettlementStillOwed(product_conversation)
 
@@ -1973,24 +2046,27 @@ rule CloseObligationWaitsForOtherSettlementAuthority {
 }
 
 rule CloseObligationRequestsRetirementInspectionAfterSettlement {
-    when: CloseSettlementProgressed(product_conversation, attempt_id)
+    when: CloseSettlementProgressed(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
-    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
-    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id)
+    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id, run_ordinal)
+    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id, run_ordinal)
     requires: all_close_owned_authorities_released(product_conversation)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
-    ensures: RetirementInspectionRequested(product_conversation, attempt_id)
+    ensures: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
 }
 
 rule CloseSettlementCancellationCompletesAfterBusyOwnershipReleased {
-    when: CloseSettlementProgressed(product_conversation, attempt_id)
+    when: CloseSettlementProgressed(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
-    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
-    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id)
+    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id, run_ordinal)
+    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id, run_ordinal)
     requires: all_close_owned_authorities_released(product_conversation)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.outcome = cancelled
-    ensures: CloseObligationCancelled(product_conversation, attempt_id)
+    ensures: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = completed
+    ensures: CloseObligationCancelled(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- A cancellation request during settlement does not interrupt the same
@@ -2003,24 +2079,39 @@ rule CloseSettlementCancellationCompletesAfterBusyOwnershipReleased {
 }
 
 rule RetirementInspectionShowsNoConfirmationRequired {
-    when: RetirementInspectionCompletedWithoutConfirmation(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    when: RetirementInspectionCompletedWithoutConfirmation(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
-    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
 }
 
 rule RetirementInspectionRequiresLossConfirmation {
-    when: RetirementInspectionRequiresConfirmation(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    when: RetirementInspectionRequiresConfirmation(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
+    requires: run_ordinal = 1
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
 }
 
+rule FreshRetryCannotInheritOrExpandDiscardAuthority {
+    when: RetirementInspectionRequiresConfirmation(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
+    let run = CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}
+    requires: run.status = running
+    requires: run_ordinal > 1
+    ensures: CloseRunFailed(product_conversation, attempt_id, run_ordinal,
+        failed_step: "retry_loss_inspection", reason: "discard_requires_proposal",
+        shutdown: observed_close_shutdown(run), residual_evidence: observed_close_residuals(run))
+    ensures: ConcreteCloseRepairProposalRequired(product_conversation, attempt_id)
+}
+
 rule BoundLossConfirmationRequestsRetirement {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
 
@@ -2032,51 +2123,208 @@ rule BoundLossConfirmationRequestsRetirement {
 }
 
 rule ChangedInspectionInvalidatesOutstandingConfirmation {
-    when: RetirementInspectionChanged(product_conversation, attempt_id)
+    when: RetirementInspectionChanged(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
-    ensures: RetirementInspectionRequested(product_conversation, attempt_id)
+    ensures: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
 }
 
 rule CloseRetirementCompletionFinalizesAggregateHistory {
-    when: ResourceRetirementCompleted(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { retirement_requested, needs_repair }
-    requires: product_conversation.lifecycle = open
-    ensures: CloseOutcomeSystemMessagePersisted(product_conversation, attempt_id)
+    when: ResourceRetirementCompleted(product_conversation, attempt_id, run_ordinal)
+    requires: CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
+    let obligation = CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}
+    let run = CloseRun{obligation: obligation, ordinal: run_ordinal}
+    requires: obligation.phase = retirement_requested
+    requires: run.status = running
+    requires: conversation_and_owned_process_shutdown_confirmed(run)
+    ensures: CloseOutcomeSystemMessagePersisted(product_conversation, attempt_id, run_ordinal)
     ensures: product_conversation.lifecycle = history
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
-    ensures: ProductConversationEnteredHistory(product_conversation, attempt_id)
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.outcome = archived
+    ensures: run.status = completed
+    ensures: obligation.phase = completed
+    ensures: obligation.outcome = archived
+    ensures: AllRequiredResourcesRetired(run)
+    ensures: ProductConversationHistoryCleanupAttentionCleared(product_conversation)
+    ensures:
+        if previous(product_conversation.lifecycle) = open:
+            ProductConversationEnteredHistory(product_conversation, attempt_id)
 
     @guidance
-        -- Close finalization is one transaction boundary: first persist the durable
-        -- synthetic Close-outcome message on the aggregate transcript, then commit the
-        -- aggregate lifecycle transition to History, then complete the Close obligation,
-        -- and only then expose the aggregate-entered-History event for downstream
-        -- announcement and SSE projection.
+        -- Persist exact-run outcome and resource disposition, commit History and the
+        -- completed obligation, then publish only after commit. A cleanup retry on
+        -- an already historical aggregate clears attention without a second History
+        -- transition or reopening execution.
 }
 
-rule CloseRetirementFailureLeavesOpenNeedsRepair {
-    when: ResourceRetirementFailed(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { retirement_requested, needs_repair }
+rule CloseFailureStopsRunAndCreatesMandatoryGlobalDelivery {
+    when: CloseRunFailed(product_conversation, attempt_id, run_ordinal, failed_step, reason, shutdown, residual_evidence)
+    let obligation = CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}
+    let run = CloseRun{obligation: obligation, ordinal: run_ordinal}
+    requires: run.status = running
+    ensures: run.status = stopped
+    ensures: CloseRunFailure.created(run: run, failed_step: failed_step, reason: reason, shutdown: shutdown, residual_evidence: residual_evidence)
+    ensures: CloseFailureGlobalDelivery.created(failure: CloseRunFailure{run: run}, status: pending)
+    ensures: AllFurtherCloseEffectAuthorityRevoked(run)
+    ensures: CloseFailureRecorded(product_conversation, attempt_id, run_ordinal)
+
+    @guidance
+        -- Atomically stop the run, retain the first failure, and enqueue the mandatory
+        -- Global observation through the unified durable delivery path. Drain only
+        -- observation delivery, never Close effects. Delivery survives History and
+        -- watch removal, is deduplicated by failure identity, and grants no mutation.
+}
+
+rule MandatoryGlobalFailureDeliveryRecordsAcceptance {
+    when: UnifiedGlobalFailureDeliveryAccepted(delivery)
+    requires: delivery.status = pending
+    ensures: delivery.status = accepted
+    ensures: not CloseMutationAuthorizedByReceipt(delivery.failure.run)
+
+    @guidance
+        -- The unified durable observation outbox retries delivery until acceptance,
+        -- not Close machinery. Global receives exact identity, shutdown disposition,
+        -- residuals, and read-only investigation guidance even without a source watch.
+}
+
+rule DuplicateCloseFailureObservationDoesNotCreateAnotherEvent {
+    when: CloseRunFailed(product_conversation, attempt_id, run_ordinal, failed_step, reason, shutdown, residual_evidence)
+    let run = CloseRun{obligation: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}
+    requires: run.status = stopped
+    ensures: not AdditionalCloseRunFailureCreated(run)
+    ensures: not AdditionalMandatoryGlobalDeliveryCreated(run)
+    ensures: not CloseMutationDispatched(run)
+}
+
+rule ConfirmedShutdownFailureEntersHistoryWithCleanupAttention {
+    when: CloseFailureRecorded(product_conversation, attempt_id, run_ordinal)
+    let obligation = CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}
+    let run = CloseRun{obligation: obligation, ordinal: run_ordinal}
+    requires: run.status = stopped
+    requires: CloseRunFailure{run: run}.shutdown = confirmed
+    ensures: product_conversation.lifecycle = history
+    ensures: obligation.phase = cleanup_attention
+    ensures: CloseCleanupAttentionVisible(product_conversation, attempt_id, run_ordinal)
+    ensures:
+        if previous(product_conversation.lifecycle) = open:
+            ProductConversationEnteredHistory(product_conversation, attempt_id)
+    ensures: CloseOutcomeSystemMessagePersisted(product_conversation, attempt_id, run_ordinal)
+
+    @guidance
+        -- Record shutdown proof and residual cleanup without reporting resource
+        -- success. Commit outcome, History, and attention atomically before lifecycle
+        -- publication. Publish entered-History only on an actual Open-to-History change.
+}
+
+rule UncertainShutdownFailureRemainsOpenCloseIncomplete {
+    when: CloseFailureRecorded(product_conversation, attempt_id, run_ordinal)
+    let obligation = CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}
+    let run = CloseRun{obligation: obligation, ordinal: run_ordinal}
+    requires: run.status = stopped
+    requires: CloseRunFailure{run: run}.shutdown = uncertain
     requires: product_conversation.lifecycle = open
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
-    ensures: CloseNeedsRepairVisible(product_conversation, attempt_id)
+    ensures: obligation.phase = close_incomplete
+    ensures: CloseIncompleteVisible(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseOutcomeSystemMessagePersisted(product_conversation, attempt_id, run_ordinal)
+    ensures: not ProductConversationEnteredHistory(product_conversation, attempt_id)
 }
 
-rule CloseNeedsRepairRetriesThroughReinspection {
-    when: CloseRetirementRetryRequested(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
-    requires: CloseNeedsRepairVisible(product_conversation, attempt_id)
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
-    ensures: RetirementInspectionRequested(product_conversation, attempt_id)
+rule StartupObservesInterruptedCloseWithoutRecovery {
+    when: PhoenixStartupObservedCloseRun(run)
+    requires: run.status = running
+    ensures: CloseRunFailed(run.obligation.product_conversation, run.obligation.attempt_id, run.ordinal,
+        failed_step: interrupted_close_step(run), reason: "interrupted",
+        shutdown: observed_close_shutdown(run), residual_evidence: observed_close_residuals(run))
+    ensures: not CloseMutationDispatched(run)
 
     @guidance
-        -- Retry preserves exact-attempt retirement and dispatch evidence while reinspection
-        -- refreshes the worktree snapshot and reseals resources admitted during repair.
-        -- User retry and startup recovery use this same exact-attempt branch. Recovery
-        -- dispatches inspection immediately after reopening the attempt; it does not wait
-        -- for another restart or synthesize a replacement Close attempt.
+        -- Startup records observations only. It never resumes settlement, kills
+        -- processes, reseals a cleanup executor, removes files, or drives a retry.
+}
+
+rule StartupReobservesStoppedCloseWithoutDuplicateFailure {
+    when: PhoenixStartupObservedCloseRun(run)
+    requires: run.status = stopped
+    ensures: CloseResidualObservationRecorded(run)
+    ensures: not AdditionalCloseRunFailureCreated(run)
+    ensures: not AdditionalMandatoryGlobalDeliveryCreated(run)
+    ensures: not CloseMutationDispatched(run)
+}
+
+rule ReadOnlyObservationConfirmsStoppedConversationShutdown {
+    when: PhoenixStartupObservedCloseRun(run)
+    requires: run.status = stopped
+    requires: run.obligation.phase = close_incomplete
+    requires: conversation_and_owned_process_shutdown_confirmed(run)
+    ensures: run.obligation.product_conversation.lifecycle = history
+    ensures: run.obligation.phase = cleanup_attention
+    ensures: CloseShutdownObservationPersisted(run)
+    ensures: CloseCleanupAttentionVisible(run.obligation.product_conversation, run.obligation.attempt_id, run.ordinal)
+    ensures: ProductConversationEnteredHistory(run.obligation.product_conversation, run.obligation.attempt_id)
+    ensures: not CloseMutationDispatched(run)
+
+    @guidance
+        -- Atomically record fresh shutdown observation and lifecycle disposition,
+        -- retaining the original uncertain failure and its one Global delivery.
+        -- Observation is not process stopping, cleanup, repair, or retry authority.
+}
+
+-- REQ-WL-002c: this command is supplied only by an explicit user or Global
+-- operator action. PhoenixStartupObservedCloseRun and notification acceptance
+-- never supply it. Its safety evidence is produced by read-only investigation.
+rule ExplicitSafeRetryCreatesFreshRunUnderOriginalCloseAuthority {
+    when: CloseSafeRetryRequested(product_conversation, attempt_id, failed_run_ordinal, safety_evidence)
+    let obligation = CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}
+    let failed_run = CloseRun{obligation: obligation, ordinal: failed_run_ordinal}
+    requires: obligation.phase in { close_incomplete, cleanup_attention }
+    requires: failed_run.status = stopped
+    requires: failed_run_ordinal = latest_close_run_ordinal(obligation)
+    requires: not exists CloseRun{obligation: obligation, status: running}
+    requires: safety_evidence.failed_run = failed_run
+    requires: fresh_safe_retry_evidence(safety_evidence)
+    requires: not safety_evidence.unresolved_precondition
+    requires: safety_evidence.original_authority_sufficient
+    requires: not safety_evidence.requires_proposal
+    let fresh_ordinal = failed_run_ordinal + 1
+    ensures: CloseRun.created(obligation: obligation, ordinal: fresh_ordinal, status: running)
+    ensures: CloseSafeRetryAdmitted(product_conversation, attempt_id, fresh_ordinal)
+    ensures: OriginalCloseAuthorityAndTargetsUnchanged(obligation)
+    ensures: AllPriorRunEvidenceUnchanged(obligation)
+    ensures: failed_run.status = stopped
+
+    @guidance
+        -- Read-only investigation and Global notification receipt confer no retry
+        -- authority. Explicit user or Global retry admission consumes fresh proof of
+        -- the resolved failure and a bounded original-authority residual effect plan.
+        -- Unique/uncertain discard, changed risk, new targets/effects, and DB surgery
+        -- require a concrete separately approved proposal instead.
+}
+
+rule SafeRetryOfIncompleteShutdownStartsFreshSettlement {
+    when: CloseSafeRetryAdmitted(product_conversation, attempt_id, run_ordinal)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = close_incomplete
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
+    ensures: CloseSettlementRequested(product_conversation, attempt_id, run_ordinal)
+}
+
+rule SafeRetryOfHistoryCleanupStartsFreshInspection {
+    when: CloseSafeRetryAdmitted(product_conversation, attempt_id, run_ordinal)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cleanup_attention
+    requires: product_conversation.lifecycle = history
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
+    ensures: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
+    ensures: product_conversation.lifecycle = history
+    ensures: CloseCleanupAttentionRemainsVisibleUntilSuccessfulRetirement(product_conversation)
+}
+
+rule UnsafeRetryRequiresConcreteProposal {
+    when: CloseSafeRetryRequested(product_conversation, attempt_id, failed_run_ordinal, safety_evidence)
+    requires: not fresh_safe_retry_evidence(safety_evidence)
+        or safety_evidence.unresolved_precondition
+        or not safety_evidence.original_authority_sufficient
+        or safety_evidence.requires_proposal
+    ensures: CloseSafeRetryRejected(product_conversation, attempt_id, failed_run_ordinal)
+    ensures: not FreshCloseRunDispatched(product_conversation, attempt_id)
+    ensures: ConcreteCloseRepairProposalRequired(product_conversation, attempt_id)
 }
 
 ------------------------------------------------------------
@@ -2339,7 +2587,8 @@ rule UserHardDeletesConversationRule {
         -- transition is owned by ProductConversationTransitionsToHistory, and
         -- WorkScope-owned worktree/terminal retirement remains owned by the
         -- Close retirement path. Branches remain observed repository facts.
-        -- History itself owns no resources.
+        -- History is lifecycle truth, not proof of resource retirement. Retained
+        -- cleanup_attention resources do not grant this cascade extra Close authority.
         -- UI-only state changes (close-tab, blur) do NOT trigger this rule
         -- — tmux servers and browser sessions deliberately survive them
         -- (specs/tmux-integration/ REQ-TMUX-008; specs/browser-tool/
@@ -2600,6 +2849,42 @@ rule ModeChangeNotification {
 --       reaches `target`. The relation is transitive and never treats a row as
 --       reachable from itself without traversing an actual cycle.
 --
+--   close_execution_admission_sealed(product_conversation: ProductConversation)
+--       -> Boolean
+--       True after settlement begins or a run stops with unresolved shutdown or
+--       cleanup. False for pre-stop confirmation/cancelled operations. Ordinary
+--       recovery and queued work cannot bypass this aggregate execution seal.
+--
+--   latest_close_run_ordinal(obligation: CloseObligation) -> Integer
+--       The highest retained run ordinal for this original Close authority.
+--       It is derived from CloseRun rows, not a second mutable current-run field.
+--
+--   fresh_safe_retry_evidence(evidence: CloseRetrySafetyEvidence) -> Boolean
+--       True only when read-only investigation freshly verifies the exact original
+--       target identities, remaining effect kinds, ownership, resolved failed
+--       precondition, shutdown, reconstructibility, and loss risk at admission.
+--       Every dispatched effect rechecks that evidence immediately before mutation.
+--       The plan excludes completed effects and new targets. Changed risk, unique or
+--       uncertain discard, and DB surgery set requires_proposal; notification receipt
+--       is not evidence or approval. Admission is atomic with ordinal allocation.
+--
+--   conversation_and_owned_process_shutdown_confirmed(run: CloseRun) -> Boolean
+--       True only with positive evidence that the original aggregate's execution
+--       admission is sealed, accepted turns and child/tool/wake work are settled,
+--       and all owned processes including persistent tmux are stopped. PID reuse,
+--       missing runtime/permit/path, inaccessible probes, and unknown ownership do
+--       not prove shutdown. Retained valid shutdown proof is not invalidated solely
+--       by uncertainty about nonexecuting filesystem cleanup in a later retry.
+--
+--   interrupted_close_step(run: CloseRun) -> String
+--   observed_close_residuals(run: CloseRun) -> String
+--       Read-only observation of the exact interrupted phase/step and retained
+--       resource identities; no discovery-based expansion of mutation authority.
+--
+--   observed_close_shutdown(run: CloseRun) -> confirmed | uncertain
+--       Confirmed iff conversation_and_owned_process_shutdown_confirmed(run).
+--       Otherwise uncertain; startup observations never stop processes or clean up.
+--
 --   next_close_attempt_id(product_conversation: ProductConversation) -> String
 --       Returns an identity unequal to every historical or active
 --       CloseObligation.attempt_id. Freshness is global because attempt-bound
@@ -2652,6 +2937,7 @@ rule RuntimeRecreatesUserResumableError {
 
 rule ServerRestartOrdinaryConversation {
     when: ServerRestarted(conversation)
+    requires: not close_execution_admission_sealed(conversation.product_conversation)
     requires: conversation.is_busy
     requires: not committed_steering_turn_awaiting_first_response(conversation)
     requires: not active_materialized_turn_owns_conversation(conversation)
@@ -2667,6 +2953,7 @@ rule ServerRestartOrdinaryConversation {
 
 rule ServerRestartOwedDirectTurn {
     when: ServerRestarted(conversation)
+    requires: not close_execution_admission_sealed(conversation.product_conversation)
     requires: active_materialized_turn_owns_conversation(conversation)
     requires: recoverable_tool_results_await_model_step(conversation)
     requires: not restart_recovery_exhausted(conversation)
@@ -2683,6 +2970,7 @@ rule ServerRestartOwedDirectTurn {
 
 rule ServerRestartExhaustedDirectTurn {
     when: ServerRestarted(conversation)
+    requires: not close_execution_admission_sealed(conversation.product_conversation)
     requires: active_materialized_turn_owns_conversation(conversation)
     requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: not newer_queued_steering_awaits_dispatch(conversation)
@@ -2694,6 +2982,7 @@ rule ServerRestartExhaustedDirectTurn {
 
 rule ServerRestartWithoutDurableOwner {
     when: ServerRestarted(conversation)
+    requires: not close_execution_admission_sealed(conversation.product_conversation)
     requires: not active_materialized_turn_owns_conversation(conversation)
     requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: transcript_suggests_unfinished_work(conversation)
@@ -2702,6 +2991,7 @@ rule ServerRestartWithoutDurableOwner {
 
 rule ServerRestartCommittedSteeringTurn {
     when: ServerRestarted(conversation)
+    requires: not close_execution_admission_sealed(conversation.product_conversation)
     requires: conversation.core_status = llm_requesting
     requires: committed_steering_turn_awaiting_first_response(conversation)
     ensures: LlmRequestDispatched(conversation) or conversation.core_status = error
@@ -2722,6 +3012,7 @@ rule ServerRestartCommittedSteeringTurn {
 
 rule ServerRestartPendingContinuation {
     when: ServerRestarted(conversation)
+    requires: not close_execution_admission_sealed(conversation.product_conversation)
     requires: conversation.core_status in {
         awaiting_continuation,
         recoverable_continuation_failure
@@ -2889,6 +3180,38 @@ invariant CloseAttemptMemberOrdinalsAreContiguous {
         and member.continuation_ordinal < count(CloseAttemptMember where obligation = member.obligation)
 }
 
+invariant CloseRunOrdinalsAreUniqueAndPositive {
+    for a in CloseRun:
+        a.ordinal >= 1
+        and for b in CloseRun:
+            (a.obligation = b.obligation and a.ordinal = b.ordinal) implies a = b
+}
+
+invariant CloseAuthorityHasAtMostOneRunningRun {
+    for close in CloseObligation:
+        count(CloseRun where obligation = close and status = running) <= 1
+}
+
+invariant StoppedCloseRunHasNoFurtherMutationAuthority {
+    for run in CloseRun:
+        run.status = stopped implies not CloseMutationMayDispatch(run)
+}
+
+invariant EachFailureHasExactlyOneMandatoryGlobalDelivery {
+    for f in CloseRunFailure:
+        count(CloseFailureGlobalDelivery where failure = f) = 1
+}
+
+invariant EachStoppedRunRetainsOneDistinctFailure {
+    for stopped_run in CloseRun:
+        stopped_run.status = stopped implies count(CloseRunFailure where run = stopped_run) = 1
+}
+
+invariant FailureShutdownDeterminesLifecycleDisposition {
+    for failure in CloseRunFailure:
+        failure.shutdown = confirmed implies failure.run.obligation.product_conversation.lifecycle = history
+}
+
 invariant CloseAttemptIdentityIsGloballyUnique {
     for a in CloseObligation:
         for b in CloseObligation:
@@ -2905,7 +3228,7 @@ invariant ProductConversationHasAtMostOneActiveCloseAttempt {
             awaiting_retirement_inspection,
             awaiting_loss_confirmation,
             retirement_requested,
-            needs_repair
+            close_incomplete, cleanup_attention
         }) <= 1
 }
 
@@ -3009,10 +3332,10 @@ surface UserConversation {
                         awaiting_retirement_inspection,
                         awaiting_loss_confirmation,
                         retirement_requested,
-                        needs_repair
+                        close_incomplete, cleanup_attention
                      }
 
-        UserCancelsClose(conversation.product_conversation, close.attempt_id)
+        UserCancelsClose(conversation.product_conversation, close.attempt_id, latest_close_run_ordinal(close))
             when exists close in CloseObligation{product_conversation: conversation.product_conversation}
                  and close.phase in {
                     awaiting_blocker_resolution,
@@ -3022,12 +3345,13 @@ surface UserConversation {
                     settling_active_work,
                     cancel_requested_during_settlement
                  }
-        UserConfirmsStopWorkAndContinueClosing(conversation.product_conversation, close.attempt_id)
+        UserConfirmsStopWorkAndContinueClosing(conversation.product_conversation, close.attempt_id, latest_close_run_ordinal(close))
             when exists close in CloseObligation{product_conversation: conversation.product_conversation}
                  and close.phase = awaiting_stop_work_confirmation
         UserConfirmsCloseAfterRetirementInspection(
             conversation.product_conversation,
             close.attempt_id,
+            latest_close_run_ordinal(close),
             close.inspection_generation,
             close.inspection_fingerprint
         )
