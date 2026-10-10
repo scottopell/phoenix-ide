@@ -123,7 +123,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       const currentSource = store.getSnapshot(scopeKey)?.source;
       gestureStartedOnCurrentSource.current = Boolean(currentSource
         && sourceMessage.getAttribute('data-inline-reaction-message') === currentSource.messageId
-        && sourceMessage.getAttribute('data-message-occurrence') === currentSource.occurrenceToken);
+        && (sourceMessage.getAttribute('data-message-occurrence') ?? undefined) === currentSource.occurrenceToken);
       gestureActive.current = true;
       selecting.current = event.pointerType !== 'touch';
     };

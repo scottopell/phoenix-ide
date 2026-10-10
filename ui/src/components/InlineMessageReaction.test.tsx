@@ -39,19 +39,20 @@ function OtherScope() {
   return <button type="button">Other scope control</button>;
 }
 
-function Harness({ store, scope = 'conversation-a', append, sourceMounted = true, otherScope = false, returnToSource }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined; sourceMounted?: boolean; otherScope?: boolean; returnToSource?: () => boolean | Promise<boolean> }) {
+function Harness({ store, scope = 'conversation-a', append, sourceMounted = true, otherScope = false, returnToSource, tokenless = false }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined; sourceMounted?: boolean; otherScope?: boolean; returnToSource?: () => boolean | Promise<boolean>; tokenless?: boolean }) {
+  const renderedMessages = tokenless ? messages.map((message) => ({ ...message, display_data: {} })) : messages;
   return (
     <FocusScopeProvider>
       <InlineReactionContext.Provider value={store}>
         <div id="messages">
-          {messages.filter((message) => sourceMounted || message.message_id !== 'old').map((message) => (
-            <div key={message.message_id} className="message agent" data-inline-reaction-message={message.message_id} data-message-occurrence={`${message.conversation_id}:${message.message_id}`} data-message-id={message.message_id} data-sequence-id="2">
+          {renderedMessages.filter((message) => sourceMounted || message.message_id !== 'old').map((message) => (
+            <div key={message.message_id} className="message agent" data-inline-reaction-message={message.message_id} data-message-occurrence={tokenless ? undefined : `${message.conversation_id}:${message.message_id}`} data-message-id={message.message_id} data-sequence-id="2">
               <div className="agent-text-block" data-fragment-id="text-0"><p data-testid={message.message_id}>Deterministic state patterns <code>replay(events)</code></p></div>
             </div>
           ))}
         </div>
         <button type="button" data-testid="unrelated">Unrelated surface</button>
-        <InlineMessageReaction scopeKey={scope} messages={messages} destination={append ? { append } : undefined} returnToSource={returnToSource} />
+        <InlineMessageReaction scopeKey={scope} messages={renderedMessages} destination={append ? { append } : undefined} returnToSource={returnToSource} />
         {otherScope && <OtherScope />}
         <MessageContextMenu messages={messages} />
         <FilePathContextMenu />
@@ -229,6 +230,23 @@ describe('inline message reactions', () => {
     fireEvent(document, new Event('selectionchange'));
     await act(async () => { await new Promise(requestAnimationFrame); });
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+  });
+
+  it('uses touch presentation when reselecting a tokenless source', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} tokenless />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'mouse' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'mouse' });
+    expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+    expect(store.getSnapshot('conversation-a')?.source.occurrenceToken).toBeUndefined();
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'touch' });
     expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
