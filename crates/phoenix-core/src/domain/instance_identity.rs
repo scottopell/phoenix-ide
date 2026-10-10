@@ -293,17 +293,28 @@ fn validate_peer_ca_certificate(der: &[u8]) -> Result<(), PeerCaCertificatePemEr
     let (remainder, certificate) = x509_parser::certificate::X509Certificate::from_der(der)
         .map_err(|_| PeerCaCertificatePemError::Invalid)?;
     let basic_constraints = certificate
-        .basic_constraints()
-        .map_err(|_| PeerCaCertificatePemError::Invalid)?;
-    if !remainder.is_empty() || !basic_constraints.is_some_and(|constraints| constraints.value.ca) {
+        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_BASIC_CONSTRAINTS)
+        .map_err(|_| PeerCaCertificatePemError::Invalid)?
+        .ok_or(PeerCaCertificatePemError::NotCertificateAuthority)?;
+    let (basic_constraints_remainder, basic_constraints) =
+        x509_parser::extensions::BasicConstraints::from_der(basic_constraints.value)
+            .map_err(|_| PeerCaCertificatePemError::Invalid)?;
+    if !remainder.is_empty() || !basic_constraints_remainder.is_empty() || !basic_constraints.ca {
         return Err(PeerCaCertificatePemError::NotCertificateAuthority);
     }
-    if certificate
-        .key_usage()
+    if let Some(key_usage) = certificate
+        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_KEY_USAGE)
         .map_err(|_| PeerCaCertificatePemError::Invalid)?
-        .is_some_and(|usage| !usage.value.key_cert_sign())
     {
-        return Err(PeerCaCertificatePemError::NotCertificateAuthority);
+        let (key_usage_remainder, key_usage) =
+            x509_parser::extensions::KeyUsage::from_der(key_usage.value)
+                .map_err(|_| PeerCaCertificatePemError::Invalid)?;
+        if !key_usage_remainder.is_empty() {
+            return Err(PeerCaCertificatePemError::Invalid);
+        }
+        if !key_usage.key_cert_sign() {
+            return Err(PeerCaCertificatePemError::NotCertificateAuthority);
+        }
     }
     Ok(())
 }
@@ -477,6 +488,45 @@ mod tests {
             )
             .unwrap_err(),
             PeerCaCertificatePemError::NotCertificateAuthority
+        );
+        let mut ca_with_malformed_key_usage = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("empty SAN list is valid for CA certificates");
+        ca_with_malformed_key_usage.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_with_malformed_key_usage.custom_extensions.push(
+            rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 15],
+                vec![0x03, 0x02, 0x02, 0x04, 0x05, 0x00],
+            ),
+        );
+        assert_eq!(
+            PeerCaCertificatePem::parse(
+                ca_with_malformed_key_usage
+                    .self_signed(&key_pair)
+                    .unwrap()
+                    .pem(),
+            )
+            .unwrap_err(),
+            PeerCaCertificatePemError::Invalid
+        );
+        let mut ca_with_malformed_basic_constraints =
+            rcgen::CertificateParams::new(Vec::<String>::new())
+                .expect("empty SAN list is valid for CA certificates");
+        ca_with_malformed_basic_constraints.is_ca = rcgen::IsCa::NoCa;
+        ca_with_malformed_basic_constraints.custom_extensions.push(
+            rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 19],
+                vec![0x30, 0x03, 0x01, 0x01, 0xff, 0x05, 0x00],
+            ),
+        );
+        assert_eq!(
+            PeerCaCertificatePem::parse(
+                ca_with_malformed_basic_constraints
+                    .self_signed(&key_pair)
+                    .unwrap()
+                    .pem(),
+            )
+            .unwrap_err(),
+            PeerCaCertificatePemError::Invalid
         );
     }
 
