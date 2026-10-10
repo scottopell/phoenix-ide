@@ -2316,7 +2316,7 @@ final class AppModel {
         nudgeAuthorizationHint = nil
         UserDefaults.standard.removeObject(forKey: Self.nudgesEnabledKey)
         BackgroundRefresh.cancelPending()
-        await clearCache()
+        guard await clearCache() else { return }
         pendingOpenConversationId = nil
         let notificationCenter = UNUserNotificationCenter.current()
         notificationCenter.removeAllDeliveredNotifications()
@@ -2332,7 +2332,7 @@ final class AppModel {
         serverURLString = ""
     }
 
-    func clearCache() async {
+    func clearCache() async -> Bool {
         apiGeneration += 1
         aggregateRecoveryAllowedGeneration = nil
         aggregateRecoveryStartupTask?.cancel()
@@ -2350,7 +2350,7 @@ final class AppModel {
         #else
         let removed = await DiskStore.removeAllAndWait()
         #endif
-        guard removed else { return }
+        guard removed else { return false }
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
         for session in ownedSessions { session.stop() }
         for session in ownedSessions { await session.clearCachedSnapshotAndWait() }
@@ -2372,6 +2372,7 @@ final class AppModel {
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
         coordinatorConversationId = nil
         startAggregateRecoveryIfForeground()
+        return true
     }
 
     #if DEBUG

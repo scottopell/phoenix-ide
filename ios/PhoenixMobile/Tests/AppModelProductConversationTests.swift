@@ -1267,6 +1267,19 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(model.isResolvingPendingProductClose)
     }
 
+    func testSignOutFailureRetainsContextAndQueuedOwner() async {
+        let model = model()
+        model.serverURLString = "http://original.invalid"
+        model.installAPIForTesting()
+        XCTAssertNotNil(model.installDrainSessionForTesting(conversationId: "retain"))
+        model.cacheRemovalOverrideForTesting = { false }
+
+        await model.signOut()
+
+        XCTAssertEqual(model.serverURLString, "http://original.invalid")
+        XCTAssertNotNil(model.drainSessionForTesting(conversationId: "retain"))
+    }
+
     func testRepairNotNowKeepsAggregateMessageAdmissionFenced() async throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-close-repair-fence-tests-\(UUID().uuidString)")
