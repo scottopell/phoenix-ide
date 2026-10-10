@@ -2722,7 +2722,7 @@ mod previous_transcripts_tests {
         target: &str,
     ) {
         let malformed_hidden_cursor = encode_previous_cursor(&PreviousCursor {
-            scope: previous_scope(&binding),
+            scope: previous_scope(binding),
             target: Some(previous_cursor_target(target)),
             sequence: db
                 .get_message_by_id_in_conversation("prev-root", "prev-hidden-middle")
@@ -2735,7 +2735,7 @@ mod previous_transcripts_tests {
         assert_eq!(
             service
                 .previous_transcripts(
-                    &binding,
+                    binding,
                     PreviousTranscriptsRequest::Read {
                         transcript_ref: target.into(),
                         cursor: Some(malformed_hidden_cursor),
@@ -2749,11 +2749,11 @@ mod previous_transcripts_tests {
         assert_eq!(
             service
                 .previous_transcripts(
-                    &binding,
+                    binding,
                     PreviousTranscriptsRequest::Read {
                         transcript_ref: explicit_hidden_target.into(),
                         cursor: Some(encode_previous_cursor(&PreviousCursor {
-                            scope: previous_scope(&binding),
+                            scope: previous_scope(binding),
                             target: Some(previous_cursor_target(explicit_hidden_target)),
                             sequence: 1,
                             byte_offset: 0,
