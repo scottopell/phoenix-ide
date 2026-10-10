@@ -122,31 +122,79 @@ async fn reconcile_startup_continuations(
     if resumed > 0 {
         tracing::info!(resumed, "resumed persisted continuation operations");
     }
-    let settled = runtime
-        .resume_pending_close_settlements()
-        .await
-        .map_err(std::io::Error::other)?;
-    if settled > 0 {
-        tracing::info!(settled, "recovered pending Close active-work settlements");
+    Ok(())
+}
+
+async fn observe_running_close_runs(
+    db: &Database,
+    mut after_commit: impl FnMut(),
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let running = db.list_running_close_runs().await?;
+    let mut classified = 0;
+    for run in running {
+        db.classify_interrupted_close_run(&run).await?;
+        classified += 1;
+        after_commit();
     }
-    let inspected = runtime
-        .resume_pending_close_inspections()
-        .await
-        .map_err(std::io::Error::other)?;
-    if inspected > 0 {
-        tracing::info!(inspected, "rebuilt pending Close retirement inspections");
-    }
-    let runtime_retired = runtime
-        .resume_pending_close_runtime_retirements()
-        .await
-        .map_err(std::io::Error::other)?;
-    if runtime_retired > 0 {
-        tracing::info!(
-            runtime_retired,
-            "replayed pending Close runtime-resource retirements"
+    Ok(classified)
+}
+
+#[allow(clippy::items_after_test_module)]
+#[cfg(test)]
+mod close_startup_tests {
+    use super::*;
+    use phoenix_core::domain::close::TranscriptConversationId;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn startup_observation_classifies_once_and_does_not_start_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("startup-close", "startup-close", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_id = conversation.product_conversation_id;
+        let transcript_id = TranscriptConversationId::parse("startup-close").unwrap();
+        db.begin_close_foundation(&product_id, &transcript_id, "startup-close-attempt")
+            .await
+            .unwrap();
+
+        let commits = Cell::new(0);
+        assert_eq!(
+            observe_running_close_runs(&db, || commits.set(commits.get() + 1))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            observe_running_close_runs(&db, || commits.set(commits.get() + 1))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(commits.get(), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_retirement_resources")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
         );
     }
-    Ok(())
 }
 
 impl AppState {
@@ -181,6 +229,15 @@ impl AppState {
             credential_helper.clone(),
             &runtime_env,
         ));
+        runtime
+            .restore_close_admission_fences()
+            .await
+            .map_err(std::io::Error::other)?;
+        observe_running_close_runs(&db, || {
+            runtime.kick_direct_turn_worker();
+            runtime.kick_wake_worker();
+        })
+        .await?;
         let retired_wakes = db
             .wake_repository()
             .retire_all_registrations(phoenix_workflow::Timestamp(

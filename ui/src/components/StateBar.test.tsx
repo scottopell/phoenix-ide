@@ -189,7 +189,7 @@ describe('StateBar conversation extension', () => {
       },
     });
 
-    expect(screen.getByText('Connected')).toBeVisible();
+    expect(document.querySelector('.statebar-mobile-status .state-text')).toHaveTextContent('ready');
     expect(screen.getByText('Watching 2 Running 1 Auto On')).not.toBeVisible();
     expect(screen.getByText('Global activity details')).not.toBeVisible();
 
@@ -197,50 +197,28 @@ describe('StateBar conversation extension', () => {
 
     expect(screen.getByText('Global activity details')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Collapse status bar' })).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByText('Connected')).toBeVisible();
+    expect(document.querySelector('.statebar-mobile-status .state-text')).toHaveTextContent('ready');
     expect(screen.getByText('Watching 2 Running 1 Auto On')).toBeVisible();
   });
 
-  it('uses transport-owned text and dot for the Global compact indicator', () => {
-    setMobileViewport(true);
-    const { container } = renderStateBar({
-      convState: { type: 'error', message: 'failed', error_kind: 'server_error' },
-      connectionState: 'connected',
-      conversationExtension: {
-        summary: <span>Watching 3</span>,
-        details: <div>Global activity details</div>,
-      },
-    });
-
-    expect(screen.getByText('Connected')).toBeVisible();
-    expect(container.querySelector('.statebar-mobile-status .dot')).toHaveClass('idle');
-    expect(container.querySelector('.statebar-mobile-status .dot')).not.toHaveClass('error');
-    expect(container.querySelector('.statebar-mobile-status')).toHaveClass('statebar-mobile-status--transport');
-  });
-
   it.each([
-    ['connected', 'Connected'],
-    ['reconnected', 'Reconnected'],
-    ['reconnecting', 'Reconnecting'],
-    ['offline', 'Disconnected'],
-  ] as const)('keeps %s transport status visible when collapsed and expanded', (connectionState, label) => {
+    [{ type: 'llm_requesting', attempt: 1 } as const, 'connected'],
+    [{ type: 'awaiting_task_approval', title: 'Approve', priority: 'P1', plan: 'Proceed' } as const, 'connected'],
+    [{ type: 'error', message: 'failed', error_kind: 'server_error' } as const, 'connected'],
+    [{ type: 'idle' } as const, 'offline'],
+    [{ type: 'idle' } as const, 'reconnecting'],
+  ] as const)('shares standard phase/connection projection with subscriptions', (convState, connectionState) => {
     setMobileViewport(true);
-    renderStateBar({
-      connectionState,
-      connectionAttempt: 2,
-      conversationExtension: {
-        summary: <span>Watching 3 Running 1 Auto On · Continuing</span>,
-        details: <div>Global activity details</div>,
-      },
-    });
-
-    expect(screen.getByText(label)).toBeVisible();
-    expect(screen.getByText(/Watching 3/)).not.toBeVisible();
-
+    const ordinary = renderStateBar({ convState, connectionState });
+    const expected = ordinary.container.querySelector('.statebar-mobile-status .state-text')?.textContent;
+    const dot = ordinary.container.querySelector('.statebar-mobile-status .dot')?.className;
+    ordinary.unmount();
+    const global = renderStateBar({ convState, connectionState, conversationExtension: { summary: <span>Watching 3</span>, details: <div>Watch details</div> } });
+    expect(global.container.querySelector('.statebar-mobile-status .state-text')?.textContent).toBe(expected);
+    expect(global.container.querySelector('.statebar-mobile-status .dot')?.className).toBe(dot);
     fireEvent.click(document.querySelector('.statebar-chevron')!);
-
-    expect(screen.getByText(label)).toBeVisible();
-    expect(screen.getByText(/Watching 3/)).toBeVisible();
+    expect(screen.getByText('Watching 3')).toBeVisible();
+    expect(global.container.querySelector('.statebar-mobile-status .state-text')?.textContent).toBe(expected);
   });
 });
 
@@ -1170,14 +1148,14 @@ describe('StateBar working-phase indicators', () => {
       },
     });
 
-    expect(screen.getByText('Connected')).toBeVisible();
+    expect(document.querySelector('.statebar-mobile-status .state-text')).toHaveTextContent('awaiting LLM response');
     act(() => vi.advanceTimersByTime(36_000));
     expect(screen.getByText(/no signal from server for 36s/i)).toBeVisible();
     expect(document.querySelector('.statebar-mobile-status .dot')).toHaveClass('degraded');
 
     lastEventRef.current = Date.now();
     act(() => vi.advanceTimersByTime(1_000));
-    expect(screen.getByText('Connected')).toBeVisible();
+    expect(document.querySelector('.statebar-mobile-status .state-text')).toHaveTextContent('awaiting LLM response');
     expect(screen.queryByText(/no signal from server/i)).not.toBeInTheDocument();
   });
 

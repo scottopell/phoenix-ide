@@ -1,4 +1,4 @@
-# ADR-089: Federation validates CA capability and types IPv6 persistence
+# ADR-090: Federation validates CA capability and types IPv6 persistence
 
 - **Status:** Accepted
 - **Date:** 2026-10-09
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-088 makes imported private-CA trust explicit and peer-scoped. Parsing one certificate and adding it to a rustls root store proves neither that the certificate asserts certificate-authority capability nor that a present Key Usage extension permits certificate signing. Accepting a leaf or a CA forbidden from signing certificates would persist unusable trust and defer the failure until a remote query.
+ADR-089 makes imported private-CA trust explicit and peer-scoped. Parsing one certificate and adding it to a rustls root store proves neither that the certificate asserts certificate-authority capability nor that a present Key Usage extension permits certificate signing. Accepting a leaf or a CA forbidden from signing certificates would persist unusable trust and defer the failure until a remote query.
 
 Peer origins also need to represent IPv6. The peer table stores domain and IPv4 hosts as text under a character constraint that deliberately rejects colons. Widening that text constraint would admit ambiguous or malformed colon-bearing values and would not update databases that already applied the migration which created the table.
 
@@ -20,9 +20,9 @@ Peer origins also need to represent IPv6. The peer table stores domain and IPv4 
 
 Validate imported private-CA certificates before persistence. Basic Constraints must be present and identify a certificate authority. When Key Usage is present, it must permit certificate signing. Duplicate or malformed relevant extensions fail closed.
 
-Persist peer hosts as a relational sum type. A row contains either a domain/IPv4 text host or an IPv6 host encoded as exactly 16 bytes, never both or neither. Migration 120 rebuilds the peer table, classifies existing host rows as domain/IPv4, and preserves the complete peer connection. URL brackets are reconstructed only when creating an HTTPS authority.
+Persist peer hosts as a relational sum type. A row contains either a domain/IPv4 text host or an IPv6 host encoded as exactly 16 bytes, never both or neither. Migration 121 rebuilds the peer table, classifies existing host rows as domain/IPv4, and preserves the complete peer connection. URL brackets are reconstructed only when creating an HTTPS authority.
 
-This keeps certificate capability failure at the enrollment boundary and makes invalid IPv6 persistence states structurally unrepresentable without changing ADR-088's per-peer trust choice.
+This keeps certificate capability failure at the enrollment boundary and makes invalid IPv6 persistence states structurally unrepresentable without changing ADR-089's per-peer trust choice.
 
 ## Consequences
 
@@ -35,11 +35,11 @@ This keeps certificate capability failure at the enrollment boundary and makes i
 
 ## References
 
-- ADR-088
+- ADR-089
 - ADR-083
 - ADR-034
 - `PeerCaCertificatePem::parse`
 - `PeerBaseUrl::host`
 - `Database::save_federation_peer_connection`
-- `MIGRATION_120`
+- `MIGRATION_121`
 - `specs/remote-query-database/requirements.md`

@@ -27,6 +27,31 @@ const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
 const viewerSpy = vi.fn();
 const chainQaColumnSpy = vi.fn();
+class FakeCloseEventSource {
+  static readonly OPEN = 1;
+  static readonly CLOSED = 2;
+  static instances: FakeCloseEventSource[] = [];
+  readonly listeners = new Map<string, Array<(event: MessageEvent) => void>>();
+  readyState = FakeCloseEventSource.OPEN;
+
+  constructor(readonly url: string) {
+    FakeCloseEventSource.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    const callback = listener as (event: MessageEvent) => void;
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), callback]);
+  }
+
+  close(): void {
+    this.readyState = FakeCloseEventSource.CLOSED;
+  }
+
+  emit(type: string, payload: unknown): void {
+    const event = new MessageEvent(type, { data: JSON.stringify(payload) });
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
 const viewportFlags = vi.hoisted(() => ({ isWideDesktop: true }));
 const chainStream = vi.hoisted(() => {
   const close = vi.fn();
@@ -367,10 +392,13 @@ beforeEach(() => {
   chainStream.close.mockClear();
   chainStream.subscribe.mockClear();
   viewportFlags.isWideDesktop = true;
+  FakeCloseEventSource.instances = [];
+  vi.stubGlobal('EventSource', FakeCloseEventSource);
 });
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 async function waitForPageReady() {
@@ -1333,12 +1361,156 @@ describe('ProductConversationPage', () => {
     });
   });
 
+  it.each([
+    ['archived_cleanup_attention', 'history', 'Closed — cleanup needs attention', 'tmux_server'],
+    ['close_incomplete', 'open', 'Close incomplete — shutdown could not be confirmed', 'bash_process_group'],
+    ['close_incomplete', 'open', 'Close incomplete — shutdown could not be confirmed', 'work_scope'],
+  ] as const)('retains %s status and read-only controls on cold load and remount (%s, %s, %s)', async (outcome, lifecycle, label, resourceKind) => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
+      ordinary_lifecycle: lifecycle,
+      writable_transcript_row_id: null,
+      close: {
+        attempt_id: 'stopped-close', phase: 'completed', outcome,
+        run_ordinal: '2', run_status: 'stopped',
+        confirmation_snapshot: null, inspections: [], losses: [],
+        residuals: [],
+        failure: {
+          occurrence_id: 'close-failure:2:stopped-close',
+          reason: 'identity_not_proven', detail: 'Exact failure before inventory',
+          stop_certainty: lifecycle === 'history'
+            ? { kind: 'conversation_and_processes_stopped', confirmed_at_us: '1234567890123456' }
+            : { kind: 'shutdown_uncertain' },
+          remaining_resources: [
+            { scope: 'scope-1', resource_kind: resourceKind, identity: 'epoch:failed', disposition: 'failed' },
+            { scope: 'scope-2', resource_kind: 'worktree', identity: 'worktree:retained', disposition: 'unattempted' },
+            { scope: 'scope-1', resource_kind: 'pty_session', identity: 'epoch:unproven', disposition: 'unknown' },
+            { scope: 'scope-3', resource_kind: 'browser_session', identity: 'browser:residual', disposition: 'residual' },
+          ],
+        },
+      },
+    }));
+
+    const firstMount = renderPage();
+    for (const reload of [false, true]) {
+      if (reload) {
+        firstMount.unmount();
+        localStorage.clear();
+        renderPage();
+      }
+      const status = await screen.findByRole('alert', { name: 'Close status' });
+      expect(status).toHaveTextContent(label);
+      expect(status).toHaveTextContent('Run 2 · stopped. No automatic retry.');
+      expect(status).toHaveTextContent('identity not proven — Exact failure before inventory');
+      expect(status).toHaveTextContent('Failure close-failure:2:stopped-close');
+      expect(status).toHaveTextContent(lifecycle === 'history' ? 'Conversation and processes stopped.' : 'Shutdown uncertain.');
+      fireEvent.click(screen.getByText('Remaining resources (4)'));
+      const resources = status.querySelectorAll('ol li');
+      expect(resources).toHaveLength(4);
+      for (const [index, text] of [
+        `scope-1: ${resourceKind.replaceAll('_', ' ')} · epoch:failed · failed`,
+        'scope-2: worktree · worktree:retained · unattempted',
+        'scope-1: pty session · epoch:unproven · unknown',
+        'scope-3: browser session · browser:residual · residual',
+      ].entries()) {
+        expect(resources[index]).toBeVisible();
+        expect(resources[index]).toHaveTextContent(text);
+      }
+      expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
+      expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
+      expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
+      expect(screen.queryByRole('button', { name: /Retry exact Close/ })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+      await waitFor(() => expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true));
+      expect(conversationNavStackSpy.mock.lastCall?.[0]?.['convState']).toEqual({ type: 'idle' });
+      expect(screen.getByTestId(lifecycle === 'history'
+        ? 'product-conversation-history' : 'product-conversation-close-incomplete')).toBeVisible();
+    }
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshes cleanup-attention History to archived through the mounted conversation stream', async () => {
+    const { api } = await import('../api');
+    const failure = {
+      occurrence_id: 'close-failure:2:stopped-close',
+      reason: 'identity_not_proven' as const,
+      detail: 'Exact cleanup failure',
+      stop_certainty: {
+        kind: 'conversation_and_processes_stopped' as const,
+        confirmed_at_us: '1234567890123456',
+      },
+      remaining_resources: [
+        {
+          scope: 'scope-1',
+          resource_kind: 'worktree' as const,
+          identity: 'worktree:retained',
+          disposition: 'failed' as const,
+        },
+      ],
+    };
+    const cleanupAttention = makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+      close: {
+        attempt_id: 'stopped-close',
+        phase: 'completed',
+        outcome: 'archived_cleanup_attention',
+        run_ordinal: '2',
+        run_status: 'stopped',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+        failure,
+      },
+    });
+    const archived = makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+      close: {
+        attempt_id: 'stopped-close',
+        phase: 'completed',
+        outcome: 'archived',
+        run_ordinal: '3',
+        run_status: 'completed',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+        failure: null,
+      },
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(cleanupAttention)
+      .mockResolvedValueOnce(archived);
+
+    renderPage();
+    expect(await screen.findByRole('alert', { name: 'Close status' }))
+      .toHaveTextContent('Closed — cleanup needs attention');
+    expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
+    expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
+    const stream = FakeCloseEventSource.instances.at(-1);
+    expect(stream?.url).toContain('/api/conversations/row-2/stream');
+
+    act(() => stream?.emit('conversation_update', {
+      sequence_id: 1,
+      conversation: { archived: true },
+    }));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(screen.queryByRole('alert', { name: 'Close status' })).not.toBeInTheDocument();
+      expect(screen.queryByTestId('product-conversation-close-live-update-owner')).not.toBeInTheDocument();
+      expect(screen.getByTestId('product-conversation-history')).toBeVisible();
+    });
+  });
+
   it('disables the ordinary composer while Close is active', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
       close: {
         attempt_id: 'close-active',
-        phase: 'settling_active_work',
+        phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
         confirmation_snapshot: null,
         inspections: [],
         losses: [],
@@ -1357,7 +1529,7 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
       close: {
         attempt_id: 'close-active',
-        phase: 'settling_active_work',
+        phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
         confirmation_snapshot: null,
         inspections: [],
         losses: [],
@@ -1377,7 +1549,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     const activeClose = {
       attempt_id: 'close-active',
-      phase: 'settling_active_work',
+      phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
       confirmation_snapshot: null,
       inspections: [],
       losses: [],
@@ -1406,7 +1578,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     const activeClose = {
       attempt_id: 'close-active',
-      phase: 'settling_active_work',
+      phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
       confirmation_snapshot: null,
       inspections: [],
       losses: [],
@@ -1467,7 +1639,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     const activeClose = {
       attempt_id: 'close-active',
-      phase: 'settling_active_work',
+      phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
       confirmation_snapshot: null,
       inspections: [],
       losses: [],
@@ -1522,7 +1694,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     const activeClose = {
       attempt_id: 'close-active',
-      phase: 'settling_active_work',
+      phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
       confirmation_snapshot: null,
       inspections: [],
       losses: [],
@@ -1547,7 +1719,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     const activeClose = {
       attempt_id: 'close-active',
-      phase: 'settling_active_work',
+      phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
       confirmation_snapshot: null,
       inspections: [],
       losses: [],
@@ -1589,7 +1761,7 @@ describe('ProductConversationPage', () => {
       .mockResolvedValueOnce(makeSnapshot({
         close: {
           attempt_id: 'close-started-elsewhere',
-          phase: 'settling_active_work',
+          phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
           confirmation_snapshot: null,
           inspections: [],
           losses: [],
@@ -1688,7 +1860,7 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
       close: {
         attempt_id: 'attempt-1',
-        phase: 'settling_active_work',
+        phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
         inspections: [],
         losses: [],
         residuals: [],
@@ -1742,7 +1914,7 @@ describe('ProductConversationPage', () => {
   it('preserves multiple loaded pages through Close refresh and stale-cursor recovery', async () => {
     const { api } = await import('../api');
     const activeClose = {
-      attempt_id: 'close-active', phase: 'settling_active_work', confirmation_snapshot: null,
+      attempt_id: 'close-active', phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null, confirmation_snapshot: null,
       inspections: [], losses: [], residuals: [],
     } satisfies ProductConversationCloseView;
     const page = (id: string, ordinal: number, before: string | null, hasOlder: boolean) => makeSnapshot({
@@ -1841,7 +2013,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     const activeClose = {
       attempt_id: 'close-active',
-      phase: 'settling_active_work',
+      phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
       confirmation_snapshot: null,
       inspections: [],
       losses: [],

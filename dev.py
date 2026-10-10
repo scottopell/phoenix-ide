@@ -5446,6 +5446,9 @@ def cmd_check(
     # working cargo toolchain to be present. --all / PHOENIX_CHECK_ALL=1
     # (handled in _gate_lanes) forces every lane.
     active, skipped = _resolve_check_lanes(gate=gate, lanes=lanes)
+    CARGO_TEST_TIMEOUT, cargo_test_timeout_source = (
+        _cargo_test_timeout_secs() if "rust" in active else (DEFAULT_CARGO_TEST_TIMEOUT_SECS, None)
+    )
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["active_lanes"] = sorted(active)
     if lanes is not None and not active:
@@ -5457,6 +5460,11 @@ def cmd_check(
     reporter.info(
         f"check execution: one lane at a time; child worker budget: {_check_cpu_budget()}"
     )
+    if cargo_test_timeout_source is not None:
+        reporter.info(
+            f"cargo test budget: {CARGO_TEST_TIMEOUT}s "
+            f"({CARGO_TEST_TIMEOUT_ENV} from {cargo_test_timeout_source})"
+        )
     if skipped:
         ran = ", ".join(sorted(active))
         reporter.info(f"incremental gating: running [{ran}]")
@@ -5691,8 +5699,8 @@ def cmd_check(
         which runs vite in its own worktree.
 
         Test compilation, codegen, and execution each have separate subprocess
-        budgets. The full test execution step has a fifteen-minute bound;
-        compilation and codegen retain the default ten-minute bound.
+        budgets. Test execution has a 900-second default bound, adjustable
+        per host; compilation and codegen retain the ten-minute bound.
 
         Codegen runs here, but never touches `ui/src/generated/`: the ts-rs
         `export_bindings_*` tests run with TS_RS_EXPORT_DIR pointed at a
@@ -5716,7 +5724,7 @@ def cmd_check(
                           env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
             if rc == 0:
                 codegen_stale_step()
-        run_step("cargo test", test_cmd, timeout=900)
+        run_step("cargo test", test_cmd, timeout=CARGO_TEST_TIMEOUT)
 
     def lane_clippy():
         """Clippy in a bounded, non-incremental target directory.
@@ -6514,7 +6522,9 @@ def cmd_check(
     # Python therefore cannot leave every later lane parked on a lock or multiply
     # the join timeout. daemon=True lets the interpreter exit after recording the
     # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
-    LANE_JOIN_TIMEOUT = (CHECK_TIMEOUT * 6) + 30
+    # The rust lane runs compile and codegen (CHECK_TIMEOUT each) before the
+    # cargo-test step, so a raised cargo-test budget must raise the join too.
+    LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 2 + CARGO_TEST_TIMEOUT) + 30
     stuck = _run_check_threads_sequentially(threads, LANE_JOIN_TIMEOUT)
     # Stop the live renderer before any direct printing below (hung-lane
     # lines, failure dumps, summary) — plain mode's close() is a no-op.
@@ -8357,6 +8367,45 @@ def native_prod_deploy(
     print(f"  Transaction: {transaction_id}")
     print(f"  Candidate: {prepared.identity.version} ({prepared.identity.git_sha})")
     print("  After reconnecting, run: ./dev.py prod status")
+
+CARGO_TEST_TIMEOUT_ENV = "PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS"
+DEFAULT_CARGO_TEST_TIMEOUT_SECS = 900
+# Keep the lane join (two 600s steps + this budget + 30s) within Python's
+# platform-supported Thread.join timeout, even for an extreme override.
+MAX_CARGO_TEST_TIMEOUT_SECS = int(threading.TIMEOUT_MAX) - 1230
+
+
+def _cargo_test_timeout_secs(environ: dict[str, str] | None = None) -> tuple[int, str | None]:
+    """Return the `check` cargo-test step budget and where an override came from.
+
+    The process environment wins over the gitignored, per-host `.phoenix-ide.env`
+    so a single run can be adjusted without editing the file. An override that is
+    not a positive integer is a configuration error, not a reason to fall back.
+    """
+    environ = os.environ if environ is None else environ
+    source = None
+    raw = environ.get(CARGO_TEST_TIMEOUT_ENV)
+    if raw is not None:
+        source = "environment"
+    else:
+        file_env: dict[str, str] = {}
+        loaded = _load_env_file(file_env)
+        raw = file_env.get(CARGO_TEST_TIMEOUT_ENV)
+        if raw is not None:
+            source = loaded
+    if raw is None or raw.strip() == "":
+        return DEFAULT_CARGO_TEST_TIMEOUT_SECS, None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if not 0 < value <= MAX_CARGO_TEST_TIMEOUT_SECS:
+        raise SystemExit(
+            f"{CARGO_TEST_TIMEOUT_ENV} must be a positive integer number of seconds "
+            f"at most {MAX_CARGO_TEST_TIMEOUT_SECS}; got {raw!r} from {source}"
+        )
+    return value, source
+
 
 def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> str | None:
     """Load an env file from project root into env dict. Returns path if loaded.

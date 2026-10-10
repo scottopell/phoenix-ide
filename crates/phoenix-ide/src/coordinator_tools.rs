@@ -34,6 +34,7 @@ pub(crate) fn tools(
     db: crate::db::Database,
 ) -> Vec<Arc<dyn Tool>> {
     let watch_db = send_chat.db().clone();
+    let close_retry = send_chat.clone();
     let mut tools = writing_tools(service.clone(), send_chat)
         .into_tools()
         .collect::<Vec<_>>();
@@ -46,6 +47,7 @@ pub(crate) fn tools(
     tools.push(Arc::new(WatchConversation(watch_db.clone())));
     tools.push(Arc::new(UnwatchConversation(watch_db.clone())));
     tools.push(Arc::new(ListWatchedConversations(watch_db)));
+    tools.push(Arc::new(SafeRetryClose(close_retry)));
     tools.push(Arc::new(AskUserQuestionTool));
     tools
 }
@@ -53,6 +55,7 @@ pub(crate) fn tools(
 struct WatchConversation(crate::db::Database);
 struct UnwatchConversation(crate::db::Database);
 struct ListWatchedConversations(crate::db::Database);
+struct SafeRetryClose(Arc<SendChatApplicationService>);
 
 fn watch_id(
     input: &Value,
@@ -133,6 +136,66 @@ impl Tool for ListWatchedConversations {
         match self.0.list_coordinator_watches().await {
             Ok(watches) => watch_output(watches),
             Err(error) => ToolOutput::error(error.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SafeRetryClose {
+    fn name(&self) -> &'static str {
+        "retry_close_safely"
+    }
+
+    fn description(&self) -> String {
+        "Explicitly authorize one fresh, server-validated retry of an exact stopped Close run. Available only to the current Global Coordinator. The server allocates ordinal N+1, revalidates retained authority and current risk, never expands the original Close target set, and never treats notification delivery as approval. Input identifies the target transcript and exact failed attempt/run; safety evidence is server-produced, not accepted from this input."
+            .into()
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target_conversation_id": {"type": "string", "minLength": 1},
+                "attempt_id": {"type": "string", "minLength": 1},
+                "failed_run_ordinal": {"type": "integer", "minimum": 1}
+            },
+            "required": ["target_conversation_id", "attempt_id", "failed_run_ordinal"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let Some(target_conversation_id) =
+            input.get("target_conversation_id").and_then(Value::as_str)
+        else {
+            return ToolOutput::error("target_conversation_id is required");
+        };
+        let Some(attempt_id) = input.get("attempt_id").and_then(Value::as_str) else {
+            return ToolOutput::error("attempt_id is required");
+        };
+        let Some(failed_run_ordinal) = input.get("failed_run_ordinal").and_then(Value::as_i64)
+        else {
+            return ToolOutput::error("failed_run_ordinal must be an integer");
+        };
+        match self
+            .0
+            .retry_close_as_current_global(
+                &ctx.conversation_id,
+                target_conversation_id,
+                attempt_id,
+                failed_run_ordinal,
+            )
+            .await
+        {
+            Ok(()) => ToolOutput::success(
+                json!({
+                    "attempt_id": attempt_id,
+                    "failed_run_ordinal": failed_run_ordinal,
+                    "status": "retry_completed"
+                })
+                .to_string(),
+            ),
+            Err(error) => ToolOutput::error(error),
         }
     }
 }
@@ -1373,6 +1436,7 @@ mod tests {
                 "watch_conversation",
                 "unwatch_conversation",
                 "list_watched_conversations",
+                "retry_close_safely",
                 "ask_user_question"
             ]
         );
@@ -1389,6 +1453,27 @@ mod tests {
         assert!(present_svg
             .description()
             .contains("owned by this Global Coordinator transcript"));
+    }
+
+    #[tokio::test]
+    async fn safe_retry_tool_rejects_non_current_global_before_target_lookup() {
+        let (_, coordinator) = application_tools().await;
+        let tool = coordinator
+            .into_iter()
+            .find(|tool| tool.name() == "retry_close_safely")
+            .unwrap();
+        let output = tool
+            .run(
+                json!({
+                    "target_conversation_id": "missing-target",
+                    "attempt_id": "missing-attempt",
+                    "failed_run_ordinal": 1
+                }),
+                context("not-current-global"),
+            )
+            .await;
+        assert!(!output.is_success());
+        assert!(output.output().contains("current Global Coordinator"));
     }
 
     #[tokio::test]
@@ -1414,6 +1499,7 @@ mod tests {
                 "watch_conversation",
                 "unwatch_conversation",
                 "list_watched_conversations",
+                "retry_close_safely",
                 "ask_user_question"
             ]
         );

@@ -3362,103 +3362,6 @@ impl RuntimeManager {
         Ok(())
     }
 
-    /// Rebuilds persisted server-owned loss inspection. Inspection is recovery
-    /// only: it never confirms loss or begins destructive retirement.
-    pub async fn resume_pending_close_inspections(self: &Arc<Self>) -> Result<usize, String> {
-        let obligations = self
-            .db
-            .list_pending_close_obligations()
-            .await
-            .map_err(|error| error.to_string())?;
-        let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
-            let manager = Arc::clone(&manager);
-            async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                ) {
-                    return Ok(false);
-                }
-                match manager
-                    .inspect_close_retirement(obligation.attempt_id().clone())
-                    .await
-                {
-                    Ok(_) => Ok(true),
-                    Err(error) => {
-                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
-                            "Close retirement inspection could not be rebuilt");
-                        Ok(false)
-                    }
-                }
-            }
-        })
-        .await
-    }
-
-    /// Replays exact runtime-resource permits for sealed Close retirements. It
-    /// never finalizes product lifecycle or unblocks History.
-    pub async fn resume_pending_close_runtime_retirements(
-        self: &Arc<Self>,
-    ) -> Result<usize, String> {
-        let obligations = self
-            .db
-            .list_pending_close_obligations()
-            .await
-            .map_err(|error| error.to_string())?;
-        let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
-            let manager = Arc::clone(&manager);
-            async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::RetirementRequested
-                        | phoenix_core::domain::close::ClosePhase::NeedsRepair
-                ) {
-                    return Ok(false);
-                }
-                let retried = if obligation.phase()
-                    == phoenix_core::domain::close::ClosePhase::NeedsRepair
-                {
-                    manager
-                        .db
-                        .retry_close_retirement(obligation.attempt_id())
-                        .await
-                        .map_err(|error| error.to_string())?
-                } else {
-                    obligation.clone()
-                };
-                if retried.phase()
-                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                {
-                    return match manager
-                        .inspect_close_retirement(retried.attempt_id().clone())
-                        .await
-                    {
-                        Ok(_) => Ok(true),
-                        Err(error) => {
-                            tracing::warn!(attempt_id = %retried.attempt_id(), %error,
-                                "Close retirement inspection could not be rebuilt during repair recovery");
-                            Ok(false)
-                        }
-                    };
-                }
-                match manager
-                    .retire_close_runtime_resources(retried.attempt_id().clone())
-                    .await
-                {
-                    Ok(()) => Ok(true),
-                    Err(error) => {
-                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
-                            "Close runtime-resource retirement remains in repair state");
-                        Ok(false)
-                    }
-                }
-            }
-        })
-        .await
-    }
-
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
         let obligations = self
             .db
@@ -9158,8 +9061,8 @@ mod scope_liveness_tests {
     async fn failed_pre_runtime_worktree_reinspection_persists_typed_residual() {
         #![allow(clippy::too_many_lines)]
         use phoenix_core::domain::close::{
-            CapturedWorktreeIdentity, CloseAttemptId, ClosePhase, RetiredResourceKind,
-            RetirementFailureReason, RetirementOutcome,
+            CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome, ClosePhase,
+            CloseRunRef, RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
         };
 
         let manager = test_manager().await;
@@ -9258,7 +9161,27 @@ mod scope_liveness_tests {
             .get_close_obligation(attempt_id.as_str())
             .await
             .unwrap();
-        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
+        assert_eq!(obligation.phase(), ClosePhase::Completed);
+        assert_eq!(
+            obligation.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        let failure_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_cleanup_failures WHERE attempt_id = ?1")
+                .bind(attempt_id.as_str())
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(failure_count, 1);
+        let mandatory_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events
+             WHERE mandatory_failure_occurrence_id = ?1",
+        )
+        .bind(CloseRunRef::initial(attempt_id.clone()).failure_occurrence_id())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(mandatory_event_count, 1);
         let evidence = manager
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())

@@ -1,4 +1,4 @@
-# ADR-088: Federation pins imported private-CA trust per peer
+# ADR-089: Federation pins imported private-CA trust per peer
 
 - **Status:** Accepted
 - **Date:** 2026-10-07

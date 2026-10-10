@@ -702,9 +702,10 @@
     max-width: 34vw;
   }
 
-  .statebar-mobile-status--transport {
-    flex: 0 0 auto;
-    max-width: none;
+  .statebar-mobile-status--conversation {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 48vw;
   }
 
   .statebar-mobile-status .state-text,
