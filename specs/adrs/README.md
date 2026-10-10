@@ -102,7 +102,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [086](086_mcp-credential-removal-has-durable-intent.md) | MCP credential removal has durable intent | Accepted | REQ-MCP-012; credential-removal recovery |
 | [087](087_tmux-effects-go-through-a-backend-seam.md) | Tmux effects go through a backend seam, and tests use an in-memory fake | Accepted | tmux registry and `tmux_run`; Close retirement of tmux servers |
 | [088](088_close-stops-on-failure-and-separates-cleanup-from-lifecycle.md) | Close stops on failure and separates cleanup from lifecycle | Accepted; partially supersedes 026/040/041/042/080 | REQ-BED-029/030A, REQ-WL-002/002a/002b/002c/002d/004, REQ-PROJ-028a, REQ-WAB-007; Close run ordinals and mandatory Global failure delivery |
-| [089](089_touch-reactions-dock-away-from-native-selection.md) | Touch reactions dock away from native selection | Accepted | REQ-PF-018, REQ-PF-020 |
+| [089](089_canonical-short-product-navigation.md) | Canonical short ProductConversation navigation with exact evidence selectors | Accepted | REQ-GR-009 |
+| [090](090_touch-reactions-dock-away-from-native-selection.md) | Touch reactions dock away from native selection | Accepted | REQ-PF-018, REQ-PF-020 |
 
 ## For agents: which decisions bind your task
 
