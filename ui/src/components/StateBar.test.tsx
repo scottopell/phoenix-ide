@@ -1079,6 +1079,18 @@ describe('StateBar working-phase indicators', () => {
     expect(screen.getByText(/^streaming \(retry 3\/3 after server error\)$/i)).toBeInTheDocument();
   });
 
+  it('shows streaming for an in-flight overload retry after first byte', () => {
+    renderStateBar({
+      convState: { type: 'server_overload_retrying', attempt: 3, maxAttempts: 5, retryAt: null },
+      phaseStateUpdatedAt: T_NOW - 2_000,
+      lastSseEventAt: T_NOW - 200,
+      firstByteRequestId: 'overload-req-3',
+      turnRetryContext: { attempt: 3, maxAttempts: 5, reasonText: 'server overloaded' },
+    });
+    expect(screen.getByText(/^streaming \(retry 3\/5 after server overloaded\)$/i)).toBeInTheDocument();
+    expect(screen.queryByText(/model overloaded/i)).not.toBeInTheDocument();
+  });
+
   it('appends the retry suffix on tool_executing too (carries across intra-turn transitions)', () => {
     renderStateBar({
       convState: {
@@ -1224,6 +1236,79 @@ describe('StateBar working-phase indicators', () => {
     expect(screen.getByText(/reconnecting \(2\).*last.*awaiting LLM response.*12s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/reconnecting/);
+  });
+
+  it('freezes overload in-flight streaming in the disconnected activity snapshot', () => {
+    const props = {
+      conversation: makeConversation(),
+      convState: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: null } as ConversationState,
+      connectionAttempt: 0,
+      nextRetryIn: null,
+      contextWindowUsed: 0,
+      modelContextWindow: 200_000,
+      phaseStateUpdatedAt: T_NOW - 5_000,
+      lastSseEventAtRef: { current: T_NOW - 100 },
+      firstByteRequestId: 'overload-req-2',
+    };
+    const { rerender } = render(
+      <MemoryRouter><StateBar {...props} connectionState="connected" /></MemoryRouter>,
+    );
+    expect(screen.getByText(/^streaming \(retry 2\/5 after model overloaded\)$/i)).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <StateBar {...props} connectionState="reconnecting" connectionAttempt={2} />
+      </MemoryRouter>,
+    );
+    rerender(
+      <MemoryRouter>
+        <StateBar {...props} connectionState="reconnecting" connectionAttempt={3} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/reconnecting \(3\).*last: streaming/i)).toBeInTheDocument();
+    expect(screen.queryByText(/last: model overloaded/i)).not.toBeInTheDocument();
+  });
+
+  it('renders and decrements the persisted overload countdown after reconnect (REQ-LRV-008)', () => {
+    const retryAt = T_NOW + 10_000;
+    const { rerender } = renderStateBar({
+      convState: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt },
+      phaseStateUpdatedAt: T_NOW,
+      lastSseEventAt: T_NOW,
+      turnRetryContext: { attempt: 2, maxAttempts: 5, reasonText: 'server overloaded' },
+    });
+    expect(screen.getByText(/model overloaded — retrying in 10s.*retry 2\/5/i)).toBeInTheDocument();
+
+    act(() => vi.advanceTimersByTime(3_000));
+    expect(screen.getByText(/model overloaded — retrying in 7s.*retry 2\/5/i)).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW}
+          lastSseEventAtRef={{ current: T_NOW + 3_000 }}
+          turnRetryContext={{ attempt: 2, maxAttempts: 5, reasonText: 'server overloaded' }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/model overloaded — retrying in 7s.*retry 2\/5/i)).toBeInTheDocument();
+  });
+
+  it('renders persisted overload attempt bounds before retry context is reconstructed', () => {
+    renderStateBar({
+      convState: { type: 'server_overload_retrying', attempt: 4, maxAttempts: 5, retryAt: T_NOW + 8_000 },
+      phaseStateUpdatedAt: T_NOW,
+      lastSseEventAt: T_NOW,
+      turnRetryContext: null,
+    });
+    expect(screen.getByText(/model overloaded — retrying in 8s.*retry 4\/5 after model overloaded/i)).toBeInTheDocument();
   });
 
   // Disambiguation: llm_requesting and awaiting_user_response both

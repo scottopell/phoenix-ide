@@ -527,17 +527,37 @@ export interface QuestionOption {
 }
 
 export interface ContinuationSummaryRequest {
+  operation_id: string;
   rejected_tool_calls: ToolCall[];
+  attempt: number;
+}
+
+export type ServerOverloadTarget =
+  | { type: 'ordinary' }
+  | { type: 'continuation'; operation_id: string; rejected_tool_calls: ToolCall[] };
+
+export type ServerOverloadPhase =
+  | { type: 'waiting'; retry_at: string }
+  | { type: 'in_flight' };
+
+export interface ServerOverloadRetry {
+  target: ServerOverloadTarget;
+  phase: ServerOverloadPhase;
+  attempt: number;
+  started_at: string;
+  deadline_at: string;
 }
 
 export type RecoveryResumeTarget =
   | { type: 'conversation_turn' }
-  | { type: 'continuation_summary'; request: ContinuationSummaryRequest };
+  | { type: 'continuation_summary'; request: ContinuationSummaryRequest }
+  | { type: 'server_overload_retry'; retry: ServerOverloadRetry };
 
 export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
   | { type: 'llm_requesting'; attempt: number }
+  | { type: 'server_overload_retrying'; attempt: number; maxAttempts: number; retryAt: number | null }
   | { type: 'seeded_llm_requesting'; seed_message_id: string; attempt: number }
   | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
   | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }
@@ -582,6 +602,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'idle':
     case 'awaiting_llm':
     case 'llm_requesting':
+    case 'server_overload_retrying':
     case 'seeded_llm_requesting':
     case 'tool_executing':
     case 'awaiting_sub_agents':

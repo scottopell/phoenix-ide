@@ -158,6 +158,7 @@ struct FixtureStateInspection: View {
         case .idle: return "idle"
         case .awaitingLlm: return "awaiting_llm"
         case .llmRequesting: return "llm_requesting"
+        case .serverOverloadRetrying: return "server_overload_retrying"
         case .toolExecuting: return "tool_executing"
         case .awaitingSubAgents: return "awaiting_sub_agents"
         case .awaitingContinuation: return "awaiting_continuation"

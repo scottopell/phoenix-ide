@@ -71,10 +71,12 @@ value SteeringMessage {
 -- bedrock's ConvState.
 value Phase {
     type: String
+    retryAt: Timestamp?
 }
 
 -- The in-flight streaming text for an assistant turn. Populated only
--- while phase.type = "llm_requesting". Cleared atomically on sse_message
+-- while the phase accepts streaming tokens: llm_requesting, or an in-flight
+-- server_overload_retrying phase whose retryAt is null. Cleared atomically on sse_message
 -- or sse_agent_done. `lastSequence` is the highest sequence_id this
 -- buffer has ingested — a replay guard against late tokens with stale
 -- ids.
@@ -199,6 +201,8 @@ actor ClientReducer {
 --       calling rule and preserve all other entries.
 --   accumulate_token(buffer, delta, seq) -> StreamingBuffer
 --       Create or extend the buffer with delta and record seq.
+--   phase_accepts_streaming_tokens(phase) -> Boolean
+--       True for llm_requesting and for server_overload_retrying with retryAt null.
 --   upsert_by_id(steering, message) -> List<SteeringMessage>
 --       Replace a matching steering identity in place, or append it.
 --   remove_by_id(steering, messageId) -> List<SteeringMessage>
@@ -339,8 +343,8 @@ rule SseInitReconnectMerge {
     -- yet — keep the atom's current floor so pending entries the
     -- atom has already seen live are dropped as replays.
     --
-    -- streamingBuffer is preserved when payload.phase is
-    -- llm_requesting (the turn is still in flight; pending tokens
+    -- streamingBuffer is preserved when payload.phase accepts streaming
+    -- tokens (the turn is still in flight; pending tokens
     -- with seq > floor will extend the existing buffer, and tokens
     -- at or below the floor are correctly dropped as replays — the
     -- alternative of clearing the buffer creates a blank window
@@ -381,7 +385,7 @@ rule SseInitReconnectMerge {
 
     @guidance
         -- preserve_buffer_after_init(buf, phase, pendingTruncated, localIncarnation, serverIncarnation):
-        --   if phase.type = llm_requesting and not pendingTruncated
+        --   if phase_accepts_streaming_tokens(phase) and not pendingTruncated
         --      and serverIncarnation = localIncarnation
         --     then buf else null
         -- reconnect_cursor_floor(local, localIncarnation, serverIncarnation, anchor):
@@ -398,7 +402,7 @@ rule SseInitReconnectMerge {
         -- Clearing it unconditionally creates a blank-UI window because
         -- the pending tokens that would otherwise rebuild it have seq
         -- at-or-below the existing floor and are dropped by applyIfNewer
-        -- as replays. Preserving when phase=llm_requesting closes that
+        -- as replays. Preserving when the phase accepts tokens closes that
         -- window; clearing for other phases reflects "turn ended while
         -- disconnected." Pending agent_done in phase 2 still clears the
         -- buffer through its own per-event rule, so the final state is
@@ -545,6 +549,7 @@ rule SseStateChangeApplied {
 
     requires: seq > atom.lastSequenceId
 
+    ensures: phase_accepts_streaming_tokens(previous(atom.phase)) and not phase_accepts_streaming_tokens(newPhase) implies atom.streamingBuffer = null
     ensures: atom.phase = newPhase
     ensures: atom.lastSequenceId = seq
 }
@@ -575,14 +580,14 @@ rule SseAgentDoneApplied {
 }
 
 -- `token` — streaming delta. Phase-guarded: only accumulates while the
--- conversation is in llm_requesting. Tokens that arrive outside that
+-- conversation phase accepts streaming tokens. Tokens that arrive outside that
 -- phase (scheduler race, reconnect replay) are silently dropped. This
 -- is the client-side half of the "ghost streaming message" defense.
 -- The applyIfNewer guard handles sequence-id replays.
 rule SseTokenAccumulated {
     when: SseTokenDispatched(atom, delta, seq)
 
-    requires: atom.phase.type = "llm_requesting"
+    requires: phase_accepts_streaming_tokens(atom.phase)
     requires: seq > atom.lastSequenceId
 
     ensures: atom.streamingBuffer = accumulate_token(atom.streamingBuffer, delta, seq)
@@ -598,7 +603,7 @@ rule SseTokenAccumulated {
 rule SseTokenDroppedOutOfPhase {
     when: SseTokenDispatched(atom, delta, seq)
 
-    requires: atom.phase.type != "llm_requesting"
+    requires: not phase_accepts_streaming_tokens(atom.phase)
 
     ensures: atom = atom
 
@@ -981,12 +986,11 @@ invariant SteeringMessagesAreNotDelivered {
                 queued.message_id != delivered.message_id
 }
 
--- The streaming buffer is valid only while the conversation is in the
--- llm_requesting phase. Any transition that moves phase out of
--- llm_requesting must clear the buffer.
+-- The streaming buffer is valid only while the conversation phase accepts
+-- streaming tokens. Any transition that leaves such a phase must clear it.
 invariant StreamingBufferPhaseCoupled {
     for a in ConversationAtoms:
-        a.streamingBuffer != null implies a.phase.type = "llm_requesting"
+        a.streamingBuffer != null implies phase_accepts_streaming_tokens(a.phase)
 }
 
 -- Sequence ids are non-negative.

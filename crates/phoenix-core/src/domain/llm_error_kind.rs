@@ -6,7 +6,9 @@
 //! (which serializes `LlmAttemptReason`). They live in the base crate so those
 //! layers depend *down* onto a common vocabulary instead of onto each other.
 
-use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
+use crate::domain::retry_policy::{
+    AutoRetryPolicy, UserResumePolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
+};
 
 /// Error classification for retry logic.
 ///
@@ -25,7 +27,8 @@ pub enum LlmErrorKind {
     UsageLimitReached,
     /// Server error (5xx) - retryable
     ServerError,
-    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) - NOT retryable
+    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`).
+    /// Retried under its own bounded capacity policy.
     ServerOverloaded,
     /// Authentication failed (401, 403) - not retryable
     Auth,
@@ -68,6 +71,8 @@ pub enum LlmAttemptReason {
     RateLimit,
     /// Server returned 5xx. Retryable; same backoff as `RateLimit`.
     ServerError,
+    /// Selected model is temporarily at capacity.
+    ServerOverloaded,
     /// Network failure. Retryable.
     Network,
     /// Phoenix's absolute provider-attempt deadline elapsed. Retryable.
@@ -100,9 +105,9 @@ impl LlmAttemptReason {
             // server/transport fault from the client's view) rather than
             // adding another retry-visibility reason.
             LlmErrorKind::ServerError | LlmErrorKind::InvalidResponse => Some(Self::ServerError),
+            LlmErrorKind::ServerOverloaded => Some(Self::ServerOverloaded),
             // Non-retryable kinds never reach Effect::ScheduleRetry.
             LlmErrorKind::UsageLimitReached
-            | LlmErrorKind::ServerOverloaded
             | LlmErrorKind::Auth
             | LlmErrorKind::InvalidRequest
             | LlmErrorKind::PromptRejected
@@ -120,9 +125,13 @@ impl LlmErrorKind {
             | Self::TimedOut
             | Self::RateLimit
             | Self::ServerError
-            | Self::InvalidResponse => AutoRetryPolicy::AutoRetryable,
+            | Self::InvalidResponse => AutoRetryPolicy::Generic {
+                max_attempts: GENERIC_MAX_ATTEMPTS,
+            },
+            Self::ServerOverloaded => AutoRetryPolicy::ServerOverloaded {
+                max_attempts: OVERLOAD_MAX_ATTEMPTS,
+            },
             Self::UsageLimitReached
-            | Self::ServerOverloaded
             | Self::Auth
             | Self::InvalidRequest
             | Self::PromptRejected
@@ -140,9 +149,9 @@ impl LlmErrorKind {
     pub fn user_resume_policy(self) -> UserResumePolicy {
         match self {
             // A usage-limit window resets on a clock boundary ("try again at
-            // 1:01 AM"). Like `ServerOverloaded`, the user can resume once the
-            // window clears, so it is user-resumable even though it is never
-            // *auto*-retried (no point hammering a reset-on-clock quota).
+            // 1:01 AM"). It remains user-resumable even though it is never
+            // auto-retried; overload is also resumable after its bounded
+            // automatic policy is exhausted.
             Self::Auth
             | Self::Network
             | Self::TimedOut
@@ -166,7 +175,12 @@ impl LlmErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
+    const GENERIC: AutoRetryPolicy = AutoRetryPolicy::Generic {
+        max_attempts: GENERIC_MAX_ATTEMPTS,
+    };
+    const OVERLOAD: AutoRetryPolicy = AutoRetryPolicy::ServerOverloaded {
+        max_attempts: OVERLOAD_MAX_ATTEMPTS,
+    };
 
     #[test]
     fn all_llm_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
@@ -176,31 +190,15 @@ mod tests {
         };
 
         let cases = [
-            (
-                Network,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
-            (
-                RateLimit,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
+            (Network, GENERIC, UserResumePolicy::Resumable),
+            (RateLimit, GENERIC, UserResumePolicy::Resumable),
             (
                 UsageLimitReached,
                 AutoRetryPolicy::NoAutoRetry,
                 UserResumePolicy::Resumable,
             ),
-            (
-                ServerError,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
-            (
-                ServerOverloaded,
-                AutoRetryPolicy::NoAutoRetry,
-                UserResumePolicy::Resumable,
-            ),
+            (ServerError, GENERIC, UserResumePolicy::Resumable),
+            (ServerOverloaded, OVERLOAD, UserResumePolicy::Resumable),
             (
                 Auth,
                 AutoRetryPolicy::NoAutoRetry,
@@ -216,11 +214,7 @@ mod tests {
                 AutoRetryPolicy::NoAutoRetry,
                 UserResumePolicy::Resumable,
             ),
-            (
-                InvalidResponse,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
+            (InvalidResponse, GENERIC, UserResumePolicy::Resumable),
             (
                 ContentFilter,
                 AutoRetryPolicy::NoAutoRetry,
@@ -246,6 +240,10 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            LlmAttemptReason::from_kind(ServerOverloaded),
+            Some(LlmAttemptReason::ServerOverloaded)
+        );
         assert_eq!(LlmAttemptReason::from_kind(PromptRejected), None);
     }
 }

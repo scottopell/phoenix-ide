@@ -2181,6 +2181,16 @@ impl StateStore for InMemoryStorage {
         if matches!(
             states.get(conv_id),
             Some(ConvState::AwaitingContinuation { request }) if request.operation_id == operation_id
+        ) || matches!(
+            states.get(conv_id),
+            Some(ConvState::ServerOverloadRetrying { retry })
+                if matches!(
+                    &retry.target,
+                    phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation {
+                        operation_id: persisted_operation_id,
+                        ..
+                    } if persisted_operation_id == operation_id
+                )
         ) {
             return Ok(crate::db::ContinuationCommitOutcome::Duplicate);
         }
@@ -2265,10 +2275,21 @@ impl StateStore for InMemoryStorage {
                 crate::db::ContinuationCommitOutcome::Stale
             });
         }
-        if !matches!(
+        if !(matches!(
             &persisted,
             ConvState::AwaitingContinuation { request } if request.operation_id == operation_id
-        ) {
+        ) || matches!(
+            &persisted,
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(retry.phase, phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight)
+                    && matches!(
+                        &retry.target,
+                        phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation {
+                            operation_id: persisted_operation_id,
+                            ..
+                        } if persisted_operation_id == operation_id
+                    )
+        )) {
             return Ok(crate::db::ContinuationCommitOutcome::Stale);
         }
         self.messages

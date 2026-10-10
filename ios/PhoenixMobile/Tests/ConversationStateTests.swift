@@ -33,6 +33,48 @@ final class ConversationStateTests: XCTestCase {
             .llmRequesting(attempt: 1))
     }
 
+    func testServerOverloadRetryingCarriesScheduleAndLifecycleBehavior() {
+        let waiting = parse("""
+        {"type":"server_overload_retrying","retry":{"attempt":3,"phase":{"type":"waiting","retry_at":"2026-01-01T00:00:20Z"}}}
+        """)
+        XCTAssertEqual(
+            waiting,
+            .serverOverloadRetrying(attempt: 3, maxAttempts: 5, retryAt: "2026-01-01T00:00:20Z"))
+        XCTAssertTrue(waiting.isKnownWorkingState)
+        XCTAssertTrue(waiting.isCancellable)
+        XCTAssertTrue(waiting.acceptsChatMessage)
+
+        XCTAssertEqual(
+            parse("""
+            {"type":"server_overload_retrying","retry":{"attempt":4,"phase":{"type":"in_flight"}}}
+            """),
+            .serverOverloadRetrying(attempt: 4, maxAttempts: 5, retryAt: nil))
+    }
+
+    func testOverloadRetryCountdownParsesFractionalServerTimestamp() throws {
+        let now = try XCTUnwrap(ServerTimestamp.parse("2026-01-01T00:00:15Z"))
+
+        XCTAssertEqual(
+            StateDetailBody.overloadRetryText(
+                attempt: 3,
+                maxAttempts: 5,
+                retryAt: "2026-01-01T00:00:20.250Z",
+                now: now),
+            "Model overloaded… (attempt 3/5) — retrying in 6s")
+    }
+
+    func testOverloadRetryCountdownFallsBackToNonfractionalServerTimestamp() throws {
+        let now = try XCTUnwrap(ServerTimestamp.parse("2026-01-01T00:00:15.250Z"))
+
+        XCTAssertEqual(
+            StateDetailBody.overloadRetryText(
+                attempt: 4,
+                maxAttempts: 5,
+                retryAt: "2026-01-01T00:00:20Z",
+                now: now),
+            "Model overloaded… (attempt 4/5) — retrying in 5s")
+    }
+
     func testToolExecutingCarriesToolAndCounts() {
         let raw = """
         {"type":"tool_executing",
