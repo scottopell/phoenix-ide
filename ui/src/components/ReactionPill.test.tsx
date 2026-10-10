@@ -171,17 +171,29 @@ describe('reaction pill', () => {
   });
 
   it('shows touch users a retryable source-return failure', async () => {
-    navigate.mockResolvedValue(false);
+    let finish!: (found: boolean) => void;
+    navigate.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
     render(<Fixture mounted={false} touchDocked />);
-    fireEvent.click(screen.getByRole('button', { name: /Return to passage/ }));
-    expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('Passage unavailable. Your reaction is saved here.');
+    const retry = screen.getByRole('button', { name: /Return to passage/ });
+    fireEvent.click(retry);
+    expect(retry).toHaveTextContent('Returning…');
+    expect(retry).toBeDisabled();
+    await act(async () => { finish(false); });
+    await waitFor(() => expect(retry).toHaveTextContent('Passage unavailable. Your reaction is saved here.'));
+    expect(retry).toBeEnabled();
   });
 
   it('clears a touch return error when the source mounts through another retry path', async () => {
-    navigate.mockResolvedValue(false);
+    let finish!: (found: boolean) => void;
+    navigate.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
     const view = render(<Fixture mounted={false} touchDocked />);
-    fireEvent.click(screen.getByRole('button', { name: /Return to passage/ }));
-    expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('Passage unavailable. Your reaction is saved here.');
+    const retry = screen.getByRole('button', { name: /Return to passage/ });
+    fireEvent.click(retry);
+    expect(retry).toHaveTextContent('Returning…');
+    expect(retry).toBeDisabled();
+    await act(async () => { finish(false); });
+    await waitFor(() => expect(retry).toHaveTextContent('Passage unavailable. Your reaction is saved here.'));
+    expect(retry).toBeEnabled();
     view.rerender(<Fixture touchDocked />);
     await waitFor(() => expect(screen.queryByRole('button', { name: /Return to passage/ })).not.toBeInTheDocument());
     view.rerender(<Fixture mounted={false} touchDocked />);
