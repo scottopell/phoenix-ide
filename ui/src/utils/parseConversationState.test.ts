@@ -18,6 +18,7 @@ describe('parseConversationState recovery', () => {
       attempt: 3,
       maxAttempts: 5,
       retryAt: Date.parse('2026-01-01T00:00:30Z'),
+      target: { type: 'ordinary' },
     });
     expect(isAgentWorking(state)).toBe(true);
     expect(canCancelConversationState(state)).toBe(true);
@@ -41,6 +42,8 @@ describe('parseConversationState recovery', () => {
           attempt: 3,
           started_at: '2026-01-01T00:00:00Z',
           deadline_at: '2026-01-01T00:02:00Z',
+          logical_request_id: 'logical-request-7',
+          model_id: 'resolved-model-7',
         },
       },
     });
@@ -61,6 +64,8 @@ describe('parseConversationState recovery', () => {
           attempt: 3,
           started_at: '2026-01-01T00:00:00Z',
           deadline_at: '2026-01-01T00:02:00Z',
+          logical_request_id: 'logical-request-7',
+          model_id: 'resolved-model-7',
         },
       },
     });

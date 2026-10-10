@@ -451,6 +451,50 @@ describe('InputArea cancellation affordance', () => {
     expect(screen.getByRole('textbox')).toHaveValue('retained follow-up');
   });
 
+  it('allows ordinary overload steering but disables continuation overload input', () => {
+    const props = {
+      cwd: 'conv-overload',
+      scopeKey: 'conv-overload',
+      images: [],
+      setImages: () => {},
+      isOffline: false,
+      failedMessages: [],
+      draft: 'follow up',
+      onDraftChange: () => {},
+      onSend: vi.fn(),
+      onCancel: () => {},
+      onRetry: () => {},
+    };
+    const { rerender } = render(
+      <InputArea
+        {...props}
+        convState={{
+          type: 'server_overload_retrying',
+          target: { type: 'ordinary' },
+          attempt: 2,
+          maxAttempts: 5,
+          retryAt: null,
+        }}
+      />,
+    );
+    expect(screen.getByRole('textbox')).toBeEnabled();
+
+    rerender(
+      <InputArea
+        {...props}
+        convState={{
+          type: 'server_overload_retrying',
+          target: { type: 'continuation', operation_id: 'summary-op', rejected_tool_calls: [] },
+          attempt: 2,
+          maxAttempts: 5,
+          retryAt: null,
+        }}
+      />,
+    );
+    expect(screen.getByRole('textbox')).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Queue follow-up' })).not.toBeInTheDocument();
+  });
+
   it('keeps Stopping disabled while allowing a queued follow-up during tool cancellation', () => {
     const onSend = vi.fn();
     render(

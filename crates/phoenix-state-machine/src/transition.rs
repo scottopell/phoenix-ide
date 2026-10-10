@@ -389,6 +389,11 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         ConvState::Error { .. } => Err(TransitionError::NonResumableError),
 
         // transition_core: AgentBusy
+        ConvState::ServerOverloadRetrying { retry }
+            if matches!(retry.target, ServerOverloadTarget::Continuation { .. }) =>
+        {
+            Err(TransitionError::ContextExhausted)
+        }
         ConvState::LlmRequesting { .. }
         | ConvState::ServerOverloadRetrying { .. }
         | ConvState::SeededLlmRequesting { .. }

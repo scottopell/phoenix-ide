@@ -7099,7 +7099,16 @@ where
                 // suffix in lockstep with the state machine. Emitted
                 // BEFORE the tokio sleep so a client subscribing in the
                 // backoff window observes it via the replay ring.
-                let backing_off_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                let remaining_delay = match &self.state {
+                    ConvState::ServerOverloadRetrying { retry } => match retry.phase {
+                        phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                            retry_at,
+                        } => (retry_at - Utc::now()).to_std().unwrap_or_default(),
+                        phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight => delay,
+                    },
+                    _ => delay,
+                };
+                let backing_off_ms = u64::try_from(remaining_delay.as_millis()).unwrap_or(u64::MAX);
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
@@ -7132,7 +7141,7 @@ where
                 let timer_admission = admitted.reborrow();
                 let handle = tokio::spawn(async move {
                     let _timer_admission = timer_admission;
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(remaining_delay).await;
                     let _ = retry_outcome_tx.send((timer_generation, attempt)).await;
                 });
                 self.retry_timer_handle = Some(handle.abort_handle());
@@ -9456,7 +9465,7 @@ where
             {
                 retry.logical_request_id.clone()
             }
-            _ => uuid::Uuid::new_v4().to_string(),
+            _ => operation_id.clone(),
         };
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
@@ -24295,6 +24304,56 @@ mod retry_timer_epoch_tests {
     }
 
     #[tokio::test]
+    async fn initial_continuation_overload_uses_operation_id_as_logical_request_identity() {
+        let mut rt = runtime_requesting();
+        rt.llm_client
+            .queue_error(phoenix_llm::LlmError::server_overloaded("capacity"));
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        rt.event_tx = event_tx;
+
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "continuation-operation-identity".into(),
+            attempt: 1,
+            rejected_tool_calls: vec![],
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+
+        let storage = Arc::clone(&rt.storage);
+        crate::runtime::traits::MessageStore::add_message_with_seq(
+            storage.as_ref(),
+            "continuation-source",
+            &rt.context.conversation_id,
+            1,
+            &MessageContent::User(crate::db::UserContent::new("summarize this history")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(rt
+            .execute_effect(Effect::RequestContinuation { request })
+            .await
+            .unwrap()
+            .is_none());
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("continuation provider task settles")
+            .expect("mock overload produces a continuation event");
+        assert!(matches!(
+            event,
+            Event::ContinuationServerOverloaded {
+                operation_id,
+                logical_request_id,
+                ..
+            } if operation_id == "continuation-operation-identity"
+                && logical_request_id == operation_id
+        ));
+    }
+
+    #[tokio::test]
     async fn capped_overload_continuation_opening_atomically_settles_direct_turn() {
         let mut rt = runtime_requesting();
         let storage = Arc::clone(&rt.storage);
@@ -24369,6 +24428,41 @@ mod retry_timer_epoch_tests {
                 .unwrap()
                 .state,
             ConvState::RecoverableContinuationFailure { .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_overload_schedule_uses_persisted_remaining_delay() {
+        let mut rt = runtime_requesting();
+        let now = Utc::now();
+        rt.state = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: now - chrono::Duration::seconds(1),
+                },
+                attempt: 2,
+                started_at: now - chrono::Duration::seconds(10),
+                deadline_at: now + chrono::Duration::seconds(110),
+                logical_request_id: "elapsed-retry-delay".into(),
+                model_id: "test-model".into(),
+            },
+        };
+
+        rt.execute_effect(Effect::ScheduleRetry {
+            delay: Duration::from_secs(30),
+            attempt: 2,
+            max_attempts: 5,
+            reason: phoenix_core::domain::llm_error_kind::LlmAttemptReason::ServerOverloaded,
+            resets_at: None,
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            rt.retry_outcome_rx.try_recv(),
+            Ok((_generation, 2))
         ));
     }
 
