@@ -5,8 +5,10 @@ import { subscribeProductConversationSnapshotChanged } from '../notifications';
 export function useDesktopRouteOwner(productConversationId: string | null, routeSlug: string | null, search: string) {
   const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
   const [productNotFound, setProductNotFound] = useState<string | null>(null);
-  const [validatedPin, setValidatedPin] = useState<{ owner: string; query: string; id: string } | null>(null);
+  const [validatedPin, setValidatedPin] = useState<{ owner: string; selector: string; id: string } | null>(null);
   const [productSnapshotRetry, setProductSnapshotRetry] = useState(0);
+  const requestedPins = new URLSearchParams(search).getAll('source_transcript');
+  const requestedPin = requestedPins.length === 1 && requestedPins[0] ? requestedPins[0] : null;
   useEffect(() => {
     if (!productConversationId) {
       setProductSnapshot(null);
@@ -17,11 +19,10 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
     const load = async () => {
       try {
         const snapshot = await api.getProductConversationSnapshot(productConversationId, { message_limit: 1 });
-        const pins = new URLSearchParams(search).getAll('source_transcript');
-        if (pins.length === 1 && pins[0]) {
+        if (requestedPin) {
           let selected: ProductConversationSnapshotView;
           try {
-            selected = await api.getProductConversationSnapshot(pins[0], { message_limit: 1 });
+            selected = await api.getProductConversationSnapshot(requestedPin, { message_limit: 1 });
           } catch (error: unknown) {
             if (error instanceof ApiResponseError && error.status === 404) {
               if (!cancelled) {
@@ -34,8 +35,8 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
           }
           if (!cancelled) {
             const valid = selected.product_conversation_id === snapshot.product_conversation_id
-              && selected.requested_transcript_row_id === pins[0];
-            setValidatedPin(valid ? { owner: productConversationId, query: search, id: pins[0] } : null);
+              && selected.requested_transcript_row_id === requestedPin;
+            setValidatedPin(valid ? { owner: productConversationId, selector: requestedPin, id: requestedPin } : null);
           }
         } else if (!cancelled) {
           setValidatedPin(null);
@@ -57,9 +58,9 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
       cancelled = true;
       if (retryTimeout !== undefined) window.clearTimeout(retryTimeout);
     };
-  }, [productConversationId, productSnapshotRetry, search]);
+  }, [productConversationId, productSnapshotRetry, requestedPin, search]);
   const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
-  const hasPin = new URLSearchParams(search).has('source_transcript');
+  const hasPin = requestedPins.length > 0;
   useEffect(() => {
     const identities = new Set([
       productConversationId,
@@ -79,7 +80,7 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
     ? routeSlug
     : null;
   const activeSlug = hasPin
-    ? (validatedPin?.owner === productConversationId && validatedPin.query === search ? validatedPin.id : null)
+    ? (validatedPin?.owner === productConversationId && validatedPin.selector === requestedPin ? validatedPin.id : null)
     : directExactMember ?? ownedProductSnapshot?.latest_transcript_row_id ?? routeSlug;
   useEffect(() => {
     if (!productConversationId || ownedProductSnapshot || productNotFound === productConversationId) return;

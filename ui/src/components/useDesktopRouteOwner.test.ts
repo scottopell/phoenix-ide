@@ -70,6 +70,22 @@ describe('desktop validated route ownership', () => {
     expect(result.current).toBe('old');
     expect(get).toHaveBeenCalledTimes(6);
   });
+  it('keeps a validated pin when unrelated viewer query changes while refresh is transiently unavailable', async () => {
+    const get = vi.spyOn(api, 'getProductConversationSnapshot')
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockResolvedValueOnce(snapshot('product', 'old'))
+      .mockRejectedValueOnce(new Error('temporary'));
+    const { result, rerender } = renderHook(
+      ({ search }) => useDesktopRouteOwner('product', 'product', search),
+      { initialProps: { search: '?source_transcript=old' } },
+    );
+    await act(async () => {});
+    expect(result.current).toBe('old');
+    rerender({ search: '?source_transcript=old&viewer=README.md' });
+    await act(async () => {});
+    expect(result.current).toBe('old');
+    expect(get).toHaveBeenCalledTimes(3);
+  });
   it('stops retrying an authoritative 404 including online events', async () => {
     vi.useFakeTimers();
     const get = vi.spyOn(api, 'getProductConversationSnapshot').mockRejectedValue(new ApiResponseError('missing', 404));

@@ -137,11 +137,15 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       selectionChangedDuringGesture.current = false;
       const currentSource = store.getSnapshot(scopeKey)?.source;
       const currentRange = currentSource ? restoreReactionRange(currentSource) : null;
-      const currentRect = currentRange?.getBoundingClientRect();
-      gestureStartedInsideCurrentSelection.current = Boolean(currentRect
-        && currentRect.height > 0
-        && event.clientX >= currentRect.left && event.clientX <= currentRect.right
-        && event.clientY >= currentRect.top && event.clientY <= currentRect.bottom);
+      const clientRects = currentRange && typeof currentRange.getClientRects === 'function'
+        ? Array.from(currentRange.getClientRects())
+        : [];
+      const currentRects = clientRects.length > 0
+        ? clientRects
+        : currentRange ? [currentRange.getBoundingClientRect()] : [];
+      gestureStartedInsideCurrentSelection.current = currentRects.some((rect) => rect.height > 0
+        && event.clientX >= rect.left && event.clientX <= rect.right
+        && event.clientY >= rect.top && event.clientY <= rect.bottom);
       gestureInitialSource.current = readReactionSelection(window.getSelection(), messages)?.source ?? null;
       gestureActive.current = true;
       selecting.current = event.pointerType !== 'touch';

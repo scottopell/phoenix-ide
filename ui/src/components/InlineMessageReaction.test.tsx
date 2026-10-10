@@ -72,6 +72,10 @@ beforeEach(() => {
     configurable: true,
     value: () => ({ left: 50, top: 50, bottom: 80, right: 300, width: 250, height: 30 }),
   });
+  Object.defineProperty(Range.prototype, 'getClientRects', {
+    configurable: true,
+    value: () => [new DOMRect(50, 50, 250, 30)],
+  });
 });
 afterEach(() => {
   cleanup();
@@ -184,8 +188,13 @@ describe('inline message reactions', () => {
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('floating');
   });
 
-  it('does not let unrelated touch scrolling retarget an unchanged mouse selection', async () => {
+  it('does not let touch scrolling in a wrapped-selection gap retarget an unchanged mouse selection', async () => {
     setCoarsePointer(true);
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(50, 50, 250, 100));
+    vi.spyOn(Range.prototype, 'getClientRects').mockReturnValue([
+      new DOMRect(50, 50, 250, 20),
+      new DOMRect(50, 130, 250, 20),
+    ] as unknown as DOMRectList);
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} />);
     const text = screen.getByTestId('old').firstChild!;
@@ -196,7 +205,7 @@ describe('inline message reactions', () => {
     const source = store.getSnapshot('conversation-a')?.source;
     const dispatch = vi.spyOn(store, 'dispatch');
     const scrollTarget = screen.getByTestId('old').firstChild!;
-    fireEvent.pointerDown(scrollTarget, { pointerType: 'touch', clientX: 400, clientY: 100 });
+    fireEvent.pointerDown(scrollTarget, { pointerType: 'touch', clientX: 150, clientY: 100 });
     fireEvent(document, new Event('selectionchange'));
     await act(async () => { await new Promise(requestAnimationFrame); });
     fireEvent.pointerUp(scrollTarget, { pointerType: 'touch' });
