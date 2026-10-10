@@ -87,7 +87,7 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
     };
     const unsubscribes = [...identities].map((identity) => subscribeProductConversationSnapshotChanged(identity, refresh));
     const canonicalId = productSnapshot?.snapshot.product_conversation_id;
-    if (canonicalId && canonicalId !== productConversationId && productSnapshot
+    if (canonicalId && productSnapshot
       && productConversationSnapshotChangedSince(canonicalId, productSnapshot.changeSequence)) {
       refresh();
     }

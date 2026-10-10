@@ -34,6 +34,23 @@ describe('desktop validated route ownership', () => {
     await waitFor(() => expect(result.current).toBe('continued'));
     expect(get).toHaveBeenCalledTimes(2);
   });
+  it('catches a second canonical notification while its first refresh is in flight', async () => {
+    let finishRefresh!: (snapshot: ProductConversationSnapshotView) => void;
+    const get = vi.spyOn(api, 'getProductConversationSnapshot')
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve; }))
+      .mockResolvedValueOnce({ ...snapshot('product', 'root'), latest_transcript_row_id: 'continued-2' });
+    const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
+    await waitFor(() => expect(result.current).toBe('latest'));
+    act(() => { notifyProductConversationSnapshotChanged('product'); });
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    act(() => { notifyProductConversationSnapshotChanged('product'); });
+    await act(async () => {
+      finishRefresh({ ...snapshot('product', 'root'), latest_transcript_row_id: 'continued-1' });
+    });
+    await waitFor(() => expect(result.current).toBe('continued-2'));
+    expect(get).toHaveBeenCalledTimes(3);
+  });
   it('catches a canonical snapshot notification received while resolving a route alias', async () => {
     let finishInitial!: (snapshot: ProductConversationSnapshotView) => void;
     const get = vi.spyOn(api, 'getProductConversationSnapshot')
