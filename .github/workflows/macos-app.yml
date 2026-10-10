@@ -20,6 +20,8 @@ on:
       - "scripts/test_release_version.py"
       - "scripts/verify-published-release.sh"
       - "scripts/test-desktop-release-workflow.py"
+      - "scripts/check-signed-helper.cjs"
+      - "scripts/test-check-signed-helper.cjs"
       - "scripts/test-publish-release-assets.sh"
       - "scripts/test-verify-published-release.sh"
   push:
@@ -39,6 +41,8 @@ on:
       - "scripts/test_release_version.py"
       - "scripts/verify-published-release.sh"
       - "scripts/test-desktop-release-workflow.py"
+      - "scripts/check-signed-helper.cjs"
+      - "scripts/test-check-signed-helper.cjs"
       - "scripts/test-publish-release-assets.sh"
       - "scripts/test-verify-published-release.sh"
 
@@ -52,6 +56,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 26
       - name: Test typed macOS core
         run: swift test --package-path macos/Phoenix
       - name: Test sidecar and desktop release packaging contracts
@@ -61,6 +68,7 @@ jobs:
           scripts/test-publish-release-assets.sh
           scripts/test-verify-published-release.sh
           python3 scripts/test-desktop-release-workflow.py
+          node --test scripts/test-check-signed-helper.cjs
           python3 scripts/test_release_version.py
       - name: Build a real unsigned Release package
         run: |

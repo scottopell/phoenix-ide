@@ -36,6 +36,12 @@ No release-specific GitHub variables are required by this path.
 
 The environment policy, values, and approval rules are external configuration. Source presence does not establish that they are configured or authorize access to them.
 
+## Private candidate headless verification
+
+Private `prepare-main` packaging gates retention on a native-host signed-helper headless check in both macOS matrix jobs, after protected signing material is removed. `scripts/check-signed-helper.cjs` executes unchanged copies extracted from the prepared artifacts with isolated home/state/database/temp paths, private in-memory authentication and a fresh loopback port. It checks exact source/version/architecture and instance identity, normal authentication, graceful stop/listener closure, database integrity/foreign keys, and unchanged artifact hashes. Only `HEADLESS-ACCEPTANCE-<target>.json` is added to preparation outputs; the installation manifest remains exactly the standalone and app ZIP. Failures retain a sanitized receipt, never runtime logs/database/cookies.
+
+Regression fixtures exercise control flow and privacy boundaries, not actual Developer ID or candidate runtime acceptance. The headless receipt explicitly excludes GUI, provider, and install/update/rollback acceptance. This check does not extend public-release workflow behavior or make missing dSYM retention a new gate. macOS GUI and physical-iPhone acceptance remain separately disclosed when user-deferred. No new candidate execution is claimed until its exact protected run completes.
+
 ## Excluded scope
 
 This direct-distribution path does not add Mac App Store packaging, DMG or installer production, Sparkle, a desktop updater, or changes to managed launchd/systemd/bare deployment ownership.
