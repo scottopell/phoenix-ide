@@ -156,8 +156,10 @@ body.app-viewport-active #root {
 }
 
 @media (display-mode: standalone) {
-  .app-viewport:not(.desktop-layout) {
-    padding-top: var(--app-safe-area-top);
+  .app-viewport:not(.desktop-layout) > .app-safe-area-top {
+    flex: 0 0 var(--app-safe-area-top);
+    background: var(--bg-primary);
+    pointer-events: none;
   }
 
   .app-viewport:not(.desktop-layout) .product-conversation-page,

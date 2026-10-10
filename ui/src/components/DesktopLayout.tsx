@@ -301,6 +301,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           ownsViewport ? 'app-viewport' : '',
         ].filter(Boolean).join(' ') || undefined}
       >
+        {ownsViewport && !isDesktop && <div className="app-safe-area-top" aria-hidden="true" />}
         {isDesktop && (
           <Sidebar
             collapsed={sidebarPane.collapsed}
