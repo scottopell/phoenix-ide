@@ -74,6 +74,10 @@ REQ-GR-014 is implemented across trusted admission, steering, persisted history,
 
 REQ-GR-015 has explicit Global watch tools, normalized obligations, source-transaction production for direct and initial creation execution, continuation suppression, ordinary durable admission, and Close/unsubscribe ordering. Focused DB coverage includes future-only enrollment, accepted-input deduplication, continuation outcomes, cancelled Close, and creation execution. No subscription scheduler or pause-on-Stop mode is added. Cancellation packets report cancellation without fabricating a human actor where the persisted source lacks that attribution. End-to-end live idle/busy model execution and the full failure-path coverage remain qualification obligations, not implied by focused DB tests.
 
+### Canonical short navigation qualification
+
+The routing candidate makes ordinary stable links canonical at `/c/<product-id>` and carries explicit transcript selectors on historical links. Reconciliation with main `667909a16` preserves predecessor recall, Close read-only projection, and wait-event behavior. The 123 focused alias/desktop-owner/Global/product-page tests, TypeScript checking, and focused ESLint pass; bounded independent source review found no integration blocker. Exact reconciled-head hosted Rust and broader checks remain pending. The retained exact-`3fadb` Debug artifact is available for the single queued RC manual OS-URI/WKWebView check; that manual check is not a source-integration gate and has not been claimed complete. This is candidate status, not a deployed-behavior claim. ADR-089 records the approved identity interpretation.
+
 ## Mandatory Close failure outbox seam
 
 The mandatory Close failure route extends the existing event outbox without enrolling a watch. `append_mandatory_close_failure_event_tx` accepts a persisted failure occurrence ID and reads its authoritative payload and product-root membership in the caller's transaction. The Close owner owns failure immutability, the failure-plus-event transaction, the final migration registration, stop certainty, and post-commit dispatcher wake.

@@ -131,7 +131,7 @@ Structural correction:
 - expands the SQLite `state_kind` domain in migration 121 and preserves the state through startup reset/materialization;
 - projects a narrow public/UI state rather than exposing the persisted continuation request;
 - uses existing generation, operation, and direct-turn ownership fences for cancellation and duplicate suppression;
-- updates normative LLM, retry-visibility, Bedrock, provider Allium, and ADR-089.
+- updates normative LLM, retry-visibility, Bedrock, provider Allium, and ADR-090.
 
 Deterministic regression receipts include:
 
