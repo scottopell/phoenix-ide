@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, ApiResponseError, type ProductConversationSnapshotView } from '../api';
+import { subscribeProductConversationSnapshotChanged } from '../notifications';
 
 export function useDesktopRouteOwner(productConversationId: string | null, routeSlug: string | null, search: string) {
   const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
@@ -32,6 +33,15 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
   }, [productConversationId, productSnapshotRetry, search]);
   const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
   const hasPin = new URLSearchParams(search).has('source_transcript');
+  useEffect(() => {
+    const identities = new Set([
+      productConversationId,
+      productSnapshot?.snapshot.product_conversation_id,
+    ].filter((identity): identity is string => Boolean(identity)));
+    const refresh = () => setProductSnapshotRetry((value) => value + 1);
+    const unsubscribes = [...identities].map((identity) => subscribeProductConversationSnapshotChanged(identity, refresh));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [productConversationId, productSnapshot?.snapshot.product_conversation_id]);
   const directExactMember = routeSlug
     && ownedProductSnapshot?.requested_transcript_row_id === routeSlug
     && routeSlug !== ownedProductSnapshot.product_conversation_id

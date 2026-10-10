@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiResponseError, type ProductConversationSnapshotView } from '../api';
+import { notifyProductConversationSnapshotChanged } from '../notifications';
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
 const snapshot = (product: string, member: string) => ({ product_conversation_id: product, requested_transcript_row_id: member, latest_transcript_row_id: 'latest' }) as ProductConversationSnapshotView;
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
@@ -22,6 +23,16 @@ describe('desktop validated route ownership', () => {
     vi.spyOn(api, 'getProductConversationSnapshot').mockResolvedValue(snapshot('product', 'root'));
     const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
     await waitFor(() => expect(result.current).toBe('latest'));
+  });
+  it('follows the latest desktop owner after continuation without navigation', async () => {
+    const get = vi.spyOn(api, 'getProductConversationSnapshot')
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockResolvedValueOnce({ ...snapshot('product', 'root'), latest_transcript_row_id: 'continued' });
+    const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
+    await waitFor(() => expect(result.current).toBe('latest'));
+    act(() => { notifyProductConversationSnapshotChanged('product'); });
+    await waitFor(() => expect(result.current).toBe('continued'));
+    expect(get).toHaveBeenCalledTimes(2);
   });
   it('stops retrying an authoritative 404 including online events', async () => {
     vi.useFakeTimers();

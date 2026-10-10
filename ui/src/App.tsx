@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
+import { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
@@ -130,6 +130,11 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
   const [exactMember, setExactMember] = useState<{ reference: string; transcript: string; lifecycleOpen: boolean; mutationEnabled: boolean } | null>(null);
   const [pinError, setPinError] = useState<string | null>(null);
   const [retryToken, setRetryToken] = useState(0);
+  const locationRef = useRef(location);
+  locationRef.current = location;
+  const sourcePins = new URLSearchParams(location.search).getAll('source_transcript');
+  const pinned = sourcePins[0];
+  const invalidPin = sourcePins.length > 1 || (pinned !== undefined && (!pinned || pinned.trim() !== pinned));
   const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
 
   useEffect(() => {
@@ -141,9 +146,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     setResolvedProduct(null);
     setFallbackSnapshot(null);
     setPinError(null);
-    const pins = new URLSearchParams(location.search).getAll('source_transcript');
-    const pinned = pins[0];
-    if (pins.length > 1 || (pinned !== undefined && (!pinned || pinned.trim() !== pinned))) {
+    if (invalidPin) {
       setPinError('Invalid exact transcript reference.');
       return;
     }
@@ -156,7 +159,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             const [source, exact] = await Promise.all([api.resolveCoordinatorRoute(pinned), api.getConversation(pinned)]);
             if (exact.conversation.id !== pinned || source.coordinator_id !== coordinator_id) throw new Error('Transcript is not a member of this Global conversation');
           }
-          if (!cancelled) navigate({ pathname: `/global/${pinned ?? reference}`, search: location.search, hash: location.hash }, { replace: true });
+          if (!cancelled) navigate({ pathname: `/global/${pinned ?? reference}`, search: locationRef.current.search, hash: locationRef.current.hash }, { replace: true });
           return null;
         }
         return api.getProductConversationSnapshot(reference, { message_limit: 1 });
@@ -177,7 +180,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             });
             return;
           }
-          if (!location.pathname.startsWith('/product-conversations/') &&
+          if (!locationRef.current.pathname.startsWith('/product-conversations/') &&
               snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
             setExactMember({
               reference,
@@ -188,11 +191,11 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             return;
           }
           setResolvedProduct({ reference, id: snapshot.product_conversation_id });
-          if (location.pathname !== snapshot.canonical_route) {
+          if (locationRef.current.pathname !== snapshot.canonical_route) {
             navigate({
               pathname: snapshot.canonical_route,
-              search: location.search,
-              hash: location.hash,
+              search: locationRef.current.search,
+              hash: locationRef.current.hash,
             }, { replace: true });
           }
         }
@@ -211,7 +214,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
         }
       });
     return () => { cancelled = true; };
-  }, [location.hash, location.pathname, location.search, navigate, reference, retryToken]);
+  }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken]);
 
   if (pinError) return <main><div role="alert">{pinError}</div></main>;
 

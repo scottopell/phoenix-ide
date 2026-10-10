@@ -1,6 +1,6 @@
-import { Suspense } from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
+import { Suspense, useState } from 'react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProductConversationAliasRedirect } from './App';
 import { api, ApiResponseError } from './api';
@@ -23,12 +23,17 @@ vi.mock('./pages/ConversationPage', () => ({
 }));
 
 vi.mock('./pages/ProductConversationPage', () => ({
-  ProductConversationPage: ({ productId }: { productId: string }) => <div data-testid="product-page">{productId}</div>,
+  ProductConversationPage: ({ productId }: { productId: string }) => {
+    const [localState, setLocalState] = useState(0);
+    return <div data-testid="product-page">{productId}<button type="button" onClick={() => setLocalState((value) => value + 1)}>Local {localState}</button></div>;
+  },
 }));
 
 function Location() {
   const location = useLocation();
-  return <div data-testid="location">{location.pathname}{location.search}{location.hash}</div>;
+  const navigate = useNavigate();
+  return <><div data-testid="location">{location.pathname}{location.search}{location.hash}</div>
+    <button type="button" onClick={() => navigate({ pathname: location.pathname, search: '?viewer=file', hash: '#message-m-1' })}>Open viewer</button></>;
 }
 
 function RoutedAlias() {
@@ -82,6 +87,21 @@ describe('ProductConversationAliasRedirect', () => {
       '/product-conversations/product-1?from=search#message-m-1',
     );
     expect(embeddedSpy).not.toHaveBeenCalled();
+  });
+
+  it('preserves the canonical product page across viewer and anchor navigation', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      latest_transcript_row_id: 'latest', writable_transcript_row_id: 'latest', requested_transcript_row_id: 'latest',
+    } as never);
+    renderAlias('product-1');
+    const local = await screen.findByRole('button', { name: 'Local 0' });
+    fireEvent.click(local);
+    expect(screen.getByRole('button', { name: 'Local 1' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Open viewer' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/c/product-1?viewer=file#message-m-1'));
+    expect(screen.getByRole('button', { name: 'Local 1' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
   });
 
   it.each(['root-global', 'historical-global', 'current-global'])('pins Global member %s instead of ordinary navigation', async (pin) => {
