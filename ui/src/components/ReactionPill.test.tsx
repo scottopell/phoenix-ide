@@ -133,6 +133,13 @@ describe('reaction pill', () => {
     expect(screen.getByRole('textbox')).not.toHaveFocus();
   });
 
+  it('explains an unavailable draft from the desktop source-return dock', async () => {
+    render(<Fixture mounted={false} available={false} />);
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('Draft unavailable · reaction retained');
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(add).not.toHaveBeenCalled();
+  });
+
   it('keeps the dock usable after an asynchronous load failure and aborts on unmount', async () => {
     let finish!: (found: boolean) => void;
     navigate.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
@@ -266,7 +273,8 @@ describe('reaction pill', () => {
     await waitFor(() => expect(document.getElementById('input-area')).toBeNull());
     expect(input).toHaveValue('Retained');
     expect(input).not.toHaveFocus();
-    expect(screen.getByRole('status')).toHaveTextContent('Draft unavailable · reaction retained');
+    expect(screen.getByRole('status')).toHaveTextContent('Draft unavailable. Your reaction is retained.');
+    expect(screen.getByText('“second” · draft unavailable; retained')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Add to draft' })).toBeDisabled();
 
     viewport.height = 420;
@@ -274,8 +282,9 @@ describe('reaction pill', () => {
     expect(document.getElementById('input-area')).not.toBe(originalComposer);
     act(() => listeners.get('resize')?.(new Event('resize')));
     await waitFor(() => expect(dock).toHaveStyle({ top: '274px' }));
-    expect(input).toHaveValue('Retained');
-    expect(input).not.toHaveFocus();
+    const restoredInput = screen.getByRole('textbox');
+    expect(restoredInput).toHaveValue('Retained');
+    expect(restoredInput).not.toHaveFocus();
     expect(screen.queryByText('Draft unavailable · reaction retained')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Add to draft' })).toBeEnabled();
     expect(add).not.toHaveBeenCalled();

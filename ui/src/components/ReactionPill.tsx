@@ -247,16 +247,16 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
           {sourceDocked && !touchDocked ? (
             <button type="button" className="reaction-pill-return" onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
               <ArrowUpRight size={18} aria-hidden="true" />
-              <span>{returnPending ? 'Returning to passage…' : error || `Return to passage · ${body || source.quote}`}</span>
+              <span>{returnPending ? 'Returning to passage…' : error || (!available ? 'Draft unavailable · reaction retained · Return to passage' : `Return to passage · ${body || source.quote}`)}</span>
             </button>
           ) : (
             <>
               {touchDocked && (sourceDocked ? (
                 <button type="button" className="reaction-pill-source" aria-label={`Return to passage: ${source.quote}`} title="Return to passage" onClick={returnToPassage} disabled={returnPending}>
-                  {returnPending ? 'Returning…' : error || `“${source.quote}”`}
+                  {returnPending ? 'Returning…' : error || `“${source.quote}”${available ? '' : ' · draft unavailable; retained'}`}
                 </button>
               ) : (
-                <span className="reaction-pill-source" title={source.quote}>“{source.quote}”</span>
+                <span className="reaction-pill-source" title={available ? source.quote : `${source.quote} · Draft unavailable. Reaction retained.`}>“{source.quote}”{available ? '' : ' · draft unavailable; retained'}</span>
               ))}
               <input
                 ref={inputRef}
@@ -276,7 +276,6 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
                   }
                 }}
               />
-              {!available && <span className="reaction-pill-unavailable" role="status">Draft unavailable · reaction retained</span>}
               <button type="button" aria-label="Add to draft" title={available ? 'Add to draft (Cmd/Ctrl+Enter)' : 'Draft unavailable. Your reaction is retained.'} disabled={!available || !body.trim()} onClick={onAdd}>
                 <ListPlus size={20} aria-hidden="true" />
               </button>
@@ -285,7 +284,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
           <button type="button" aria-label="Dismiss reaction" title="Dismiss reaction" onClick={requestClose}><X size={16} aria-hidden="true" /></button>
         </>
       )}
-      {error && <span className="reaction-pill-sr" role="status">{error}</span>}
+      {(error || !available) && <span className="reaction-pill-sr" role="status">{error || 'Draft unavailable. Your reaction is retained.'}</span>}
     </div>
   );
 }
