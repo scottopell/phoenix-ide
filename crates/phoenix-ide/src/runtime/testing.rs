@@ -269,6 +269,52 @@ impl ToolExecutor for MockToolExecutor {
     }
 }
 
+pub struct GatedDefinitionsToolExecutor {
+    definitions_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    definitions_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl GatedDefinitionsToolExecutor {
+    pub fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                definitions_started: Mutex::new(Some(started_tx)),
+                definitions_release: Mutex::new(Some(release_rx)),
+            }),
+            started_rx,
+            release_tx,
+        )
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for GatedDefinitionsToolExecutor {
+    async fn execute(
+        &self,
+        _call: crate::runtime::deny_gate::CheckedToolCall,
+        _ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        None
+    }
+
+    async fn definitions(&self) -> Vec<ToolDefinition> {
+        if let Some(started) = self.definitions_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.definitions_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        Vec::new()
+    }
+}
+
 // ============================================================================
 // Delayed Mock LLM Client (for cancellation testing)
 // ============================================================================
@@ -635,7 +681,11 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    state_update_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    state_update_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_tool_round_persist: Mutex<bool>,
+    tool_round_persist_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    tool_round_persist_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -721,7 +771,11 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            state_update_started: Mutex::new(None),
+            state_update_release: Mutex::new(None),
             fail_tool_round_persist: Mutex::new(false),
+            tool_round_persist_started: Mutex::new(None),
+            tool_round_persist_release: Mutex::new(None),
             fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
@@ -822,6 +876,32 @@ impl InMemoryStorage {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.prompt_projection_load_started.lock().unwrap() = Some(started_tx);
         *self.prompt_projection_load_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
+    }
+
+    pub fn gate_state_update(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.state_update_started.lock().unwrap() = Some(started_tx);
+        *self.state_update_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
+    }
+
+    pub fn gate_tool_round_persist(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.tool_round_persist_started.lock().unwrap() = Some(started_tx);
+        *self.tool_round_persist_release.lock().unwrap() = Some(release_rx);
         (started_rx, release_tx)
     }
 
@@ -1880,6 +1960,13 @@ impl MessageStore for InMemoryStorage {
         if *self.fail_tool_round_persist.lock().unwrap() {
             return Err("injected tool round persist failure".to_string());
         }
+        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.tool_round_persist_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();
         bucket.push(assistant.clone());
@@ -1990,6 +2077,13 @@ impl StateStore for InMemoryStorage {
     ) -> Result<(), String> {
         if *self.fail_state_update.lock().unwrap() {
             return Err("injected state update failure".to_string());
+        }
+        if let Some(started) = self.state_update_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.state_update_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
         }
         self.state_updated_ats
             .lock()

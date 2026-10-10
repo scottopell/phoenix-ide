@@ -233,6 +233,17 @@ THE SYSTEM SHALL update the latest matching durable result in the owning convers
 AND SHALL preserve earlier rounds with the same provider tool ID
 AND SHALL fail if the awaited result is missing.
 
+WHEN a Bash `wait` tool invocation does not settle within its requested wait bound plus the runtime's bounded execution grace
+AND the resulting authoritative settlement completes before its original absolute persistence cutoff
+THE SYSTEM SHALL abort only that wait task
+AND SHALL record exactly one concrete tool error for the existing tool invocation identity
+AND SHALL continue the same conversation without rerunning the waited command or cancelling the represented process or independent jobs.
+
+WHEN that authoritative settlement remains indeterminate at its original absolute persistence cutoff
+THE SYSTEM SHALL apply the process-wide local-authority fail-stop behavior in REQ-BED-033
+AND MAY record no tool result
+AND SHALL NOT fabricate a persistence receipt, retry the ambiguous write, admit further work, or publish further semantic state.
+
 WHEN any tool fails
 THE SYSTEM SHALL include the error in results sent to LLM
 AND allow LLM to handle the error
