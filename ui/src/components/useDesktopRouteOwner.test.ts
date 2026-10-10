@@ -51,6 +51,69 @@ describe('desktop validated route ownership', () => {
     await waitFor(() => expect(result.current).toBe('continued-2'));
     expect(get).toHaveBeenCalledTimes(3);
   });
+  it('catches a second automatic continuation while its first refresh is in flight', async () => {
+    let finishRefresh!: (snapshot: ProductConversationSnapshotView) => void;
+    const get = vi.spyOn(api, 'getProductConversationSnapshot')
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve; }))
+      .mockResolvedValueOnce({ ...snapshot('product', 'root'), latest_transcript_row_id: 'continued-2' });
+    const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
+    await waitFor(() => expect(result.current).toBe('latest'));
+    act(() => { window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated')); });
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    act(() => { window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated')); });
+    await waitFor(() => expect(result.current).toBe('continued-2'));
+    await act(async () => {
+      finishRefresh({ ...snapshot('product', 'root'), latest_transcript_row_id: 'continued-1' });
+    });
+    expect(result.current).toBe('continued-2');
+    expect(get).toHaveBeenCalledTimes(3);
+  });
+  it('catches mixed snapshot and automatic invalidations while a refresh is in flight', async () => {
+    const get = vi.spyOn(api, 'getProductConversationSnapshot')
+      .mockResolvedValueOnce(snapshot('product', 'root'))
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({ ...snapshot('product', 'root'), latest_transcript_row_id: 'mixed-latest' });
+    const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
+    await waitFor(() => expect(result.current).toBe('latest'));
+    act(() => { notifyProductConversationSnapshotChanged('product'); });
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    act(() => { window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated')); });
+    await waitFor(() => expect(result.current).toBe('mixed-latest'));
+    expect(get).toHaveBeenCalledTimes(3);
+  });
+  it('ignores snapshot invalidations for unrelated and previous routes while the new route resolves', async () => {
+    let finishNewRoute!: (snapshot: ProductConversationSnapshotView) => void;
+    const get = vi.spyOn(api, 'getProductConversationSnapshot')
+      .mockResolvedValueOnce(snapshot('old-product', 'root'))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishNewRoute = resolve; }));
+    const { result, rerender } = renderHook(
+      ({ product }) => useDesktopRouteOwner(product, product, ''),
+      { initialProps: { product: 'old-product' } },
+    );
+    await waitFor(() => expect(result.current).toBe('latest'));
+    act(() => { notifyProductConversationSnapshotChanged('unrelated-product'); });
+    expect(get).toHaveBeenCalledTimes(1);
+    rerender({ product: 'new-product' });
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    act(() => { notifyProductConversationSnapshotChanged('old-product'); });
+    expect(get).toHaveBeenCalledTimes(2);
+    await act(async () => { finishNewRoute(snapshot('new-product', 'root')); });
+    expect(result.current).toBe('latest');
+    expect(get).toHaveBeenCalledTimes(2);
+  });
+  it('allows a slow successful initial owner request to settle without timer supersession', async () => {
+    vi.useFakeTimers();
+    const get = vi.spyOn(api, 'getProductConversationSnapshot').mockImplementation(() => (
+      new Promise((resolve) => { window.setTimeout(() => resolve(snapshot('product', 'root')), 1_500); })
+    ));
+    const { result } = renderHook(() => useDesktopRouteOwner('product', 'product', ''));
+    await act(async () => { vi.advanceTimersByTime(1_000); });
+    expect(get).toHaveBeenCalledTimes(1);
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(result.current).toBe('latest');
+    expect(get).toHaveBeenCalledTimes(1);
+  });
   it('catches a canonical snapshot notification received while resolving a route alias', async () => {
     let finishInitial!: (snapshot: ProductConversationSnapshotView) => void;
     const get = vi.spyOn(api, 'getProductConversationSnapshot')

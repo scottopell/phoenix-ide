@@ -75,20 +75,16 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
   const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
   const hasPin = requestedPins.length > 0;
   useEffect(() => {
+    const currentSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot : null;
     const identities = new Set([
       productConversationId,
-      productSnapshot?.snapshot.product_conversation_id,
+      currentSnapshot?.snapshot.product_conversation_id,
     ].filter((identity): identity is string => Boolean(identity)));
-    let refreshed = false;
-    const refresh = () => {
-      if (refreshed) return;
-      refreshed = true;
-      setProductSnapshotRetry((value) => value + 1);
-    };
+    const refresh = () => setProductSnapshotRetry((value) => value + 1);
     const unsubscribes = [...identities].map((identity) => subscribeProductConversationSnapshotChanged(identity, refresh));
-    const canonicalId = productSnapshot?.snapshot.product_conversation_id;
-    if (canonicalId && productSnapshot
-      && productConversationSnapshotChangedSince(canonicalId, productSnapshot.changeSequence)) {
+    const canonicalId = currentSnapshot?.snapshot.product_conversation_id;
+    if (canonicalId && currentSnapshot
+      && productConversationSnapshotChangedSince(canonicalId, currentSnapshot.changeSequence)) {
       refresh();
     }
     window.addEventListener('phoenix:automatic-continuation-updated', refresh);
@@ -108,12 +104,8 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
   useEffect(() => {
     if (!productConversationId || ownedProductSnapshot || productNotFound === productConversationId) return;
     const retry = () => setProductSnapshotRetry((value) => value + 1);
-    const timeout = window.setTimeout(retry, 1_000);
     window.addEventListener('online', retry);
-    return () => {
-      window.clearTimeout(timeout);
-      window.removeEventListener('online', retry);
-    };
+    return () => window.removeEventListener('online', retry);
   }, [ownedProductSnapshot, productConversationId, productSnapshotRetry, productNotFound]);
   return activeSlug;
 }
