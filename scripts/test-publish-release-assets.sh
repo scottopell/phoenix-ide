@@ -118,7 +118,9 @@ if args and args[0] == "api":
             index += 2
         elif args[index] in {"-F", "-f"}:
             key, value = args[index + 1].split("=", 1)
-            if args[index] == "-F" and value in {"true", "false"}:
+            if args[index] == "-F" and value.startswith("@"):
+                value = Path(value[1:]).read_text(encoding="utf-8")
+            elif args[index] == "-F" and value in {"true", "false"}:
                 value = value == "true"
             fields[key] = value
             index += 2
@@ -215,6 +217,9 @@ if args and args[0] == "api":
             "prerelease": os.environ["FAKE_CHANNEL"] == "rc",
             "make_latest": "false" if os.environ["FAKE_CHANNEL"] == "rc" else "true",
         }
+        notes = os.environ.get("RELEASE_NOTES_FILE")
+        if notes:
+            required["body"] = Path(notes).read_text(encoding="utf-8")
         if fields != required:
             raise SystemExit(f"publication metadata is not explicit and exact: {fields!r}")
         if os.environ.get("FAKE_PUBLISH_FAIL") == "1":
@@ -222,6 +227,8 @@ if args and args[0] == "api":
         release["draft"] = fields["draft"]
         release["prerelease"] = fields["prerelease"]
         release["make_latest"] = fields["make_latest"]
+        if "body" in fields:
+            release["body"] = fields["body"]
         save(release)
         raise SystemExit(0)
 raise SystemExit(2)
@@ -261,7 +268,7 @@ publish() {
 reset_state() {
   rm -rf "$FAKE_STATE"
   mkdir -p "$FAKE_STATE"
-  unset FAKE_DIGEST_MISMATCH FAKE_PUBLISH_FAIL FAKE_TAG_MOVE_AFTER FAKE_UPLOAD_FAIL_AFTER FAKE_API_FAILURE FAKE_LATEST_TAG
+  unset FAKE_DIGEST_MISMATCH FAKE_PUBLISH_FAIL FAKE_TAG_MOVE_AFTER FAKE_UPLOAD_FAIL_AFTER FAKE_API_FAILURE FAKE_LATEST_TAG RELEASE_NOTES_FILE
   export FAKE_TAG=v1.2.3
   export FAKE_CHANNEL=stable
 }
@@ -323,6 +330,45 @@ if publish >/dev/null 2>&1; then
   exit 1
 fi
 unset FAKE_LATEST_TAG
+
+# Reviewed notes and disclosure become visible in the same request as publication.
+reset_state
+export FAKE_TAG=v1.2.3-rc.2
+export FAKE_CHANNEL=rc
+export RELEASE_NOTES_FILE="$tmp/notes.md"
+printf '## Known acceptance gaps\nGUI and physical phone checks are pending.\n' > "$RELEASE_NOTES_FILE"
+export FAKE_PUBLISH_FAIL=1
+if publish >/dev/null 2>&1; then
+  echo "expected simulated publication failure with notes" >&2
+  exit 1
+fi
+assert_draft
+unset FAKE_PUBLISH_FAIL
+publish
+assert_published_exact
+python3 - "$FAKE_STATE/release.json" "$RELEASE_NOTES_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+release = json.loads(Path(sys.argv[1]).read_text())
+assert release["body"] == Path(sys.argv[2]).read_text()
+PY
+before=$(cat "$FAKE_STATE/release.json")
+printf 'Different notes must not overwrite an already public release.\n' > "$RELEASE_NOTES_FILE"
+publish
+test "$(cat "$FAKE_STATE/release.json")" = "$before"
+
+# Missing/empty requested notes fail before any remote API action.
+for invalid_notes in "$tmp/missing-notes.md" "$tmp/empty-notes.md"; do
+  reset_state
+  : > "$tmp/empty-notes.md"
+  export RELEASE_NOTES_FILE="$invalid_notes"
+  if publish >/dev/null 2>&1; then
+    echo "expected invalid requested notes to fail" >&2
+    exit 1
+  fi
+  test ! -e "$FAKE_STATE/gh.log"
+done
 
 # Resuming an older stable draft must not replace a newer stable latest release.
 reset_state

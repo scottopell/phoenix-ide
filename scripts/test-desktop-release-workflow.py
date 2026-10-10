@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 workflow = Path('.github/workflows/release.yml').read_text()
@@ -232,9 +235,9 @@ for forbidden in ['MINOR + 1', '^[0-9]+\\.[0-9]+\\.[0-9]+$']:
         raise SystemExit(f'tag release script bypasses shared version contract: {forbidden}')
 
 acceptance = workflow[workflow.index('      - name: Check isolated signed-helper startup'):
-                      workflow.index('      - name: Retain failed headless acceptance receipt')]
+                      workflow.index('      - name: Retain successful headless acceptance receipt')]
 for fragment in [
-    "if: needs.gate.outputs.preparation == 'true'",
+    'if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then',
     'node scripts/check-signed-helper.cjs',
     '"${{ needs.gate.outputs.commit }}"',
     '"${{ needs.gate.outputs.version }}"',
@@ -244,17 +247,90 @@ for fragment in [
     'HEADLESS-ACCEPTANCE-${{ matrix.target }}.json',
 ]:
     if fragment not in acceptance:
-        raise SystemExit(f'missing preparation-only unchanged-artifact acceptance: {fragment}')
+        raise SystemExit(f'missing unchanged-artifact acceptance: {fragment}')
 if not (workflow.index('      - name: Remove protected material') <
         workflow.index('      - name: Check isolated signed-helper startup') <
         workflow.index('          name: desktop-preparation-${{ matrix.target }}-${{ needs.gate.outputs.commit }}')):
     raise SystemExit('runtime acceptance must follow signing cleanup and gate successful retention')
 for fragment in [
-    "failure() && needs.gate.outputs.preparation == 'true'",
+    'if: failure()',
     'path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json',
 ]:
     if fragment not in workflow:
         raise SystemExit('failure upload must contain only a sanitized receipt, not private runtime data')
+
+if '        if:' in acceptance:
+    raise SystemExit('native headless acceptance must gate preparation and release on default success')
+release_upload = build_macos_job.split('          name: macos-${{ matrix.target }}', 1)[1].split('      - uses:', 1)[0]
+if 'release-assets/*' in release_upload or 'HEADLESS-ACCEPTANCE' in release_upload:
+    raise SystemExit('release payload artifact must not include headless receipts')
+for fragment in [
+    '${{ runner.temp }}/release-assets/${{ matrix.asset }}',
+    '${{ runner.temp }}/release-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip',
+]:
+    if fragment not in release_upload:
+        raise SystemExit('release upload must contain the exact architecture pair')
+if workflow.index('      - name: Retain successful headless acceptance receipt') > workflow.index('          name: macos-${{ matrix.target }}'):
+    raise SystemExit('release payload retention must depend on successful receipt retention')
+if 'notes_source="${{ needs.gate.outputs.commit }}:docs/releases/${{ needs.gate.outputs.tag }}.md"' not in publish_job:
+    raise SystemExit('reviewed notes must come from immutable gated source, not current retry tooling')
+if 'git show "$notes_source" > "$RELEASE_NOTES_FILE"' not in publish_job or 'fetch-depth: 0' not in publish_job:
+    raise SystemExit('publisher must retain immutable tagged notes for historical retries')
+notes = Path('docs/releases/v0.13.0-rc.2.md').read_text()
+for fragment in ['macOS GUI/clean-host desktop pass', 'physical iPhone Safari', 'Known acceptance gaps', 'not new RC2-byte acceptance']:
+    if fragment not in notes:
+        raise SystemExit(f'missing RC2 disclosure: {fragment}')
+
+# Execute the real workflow shell with a node double: prove each mode selects its
+# own bytes and a failed native check cannot retain a successful payload receipt.
+acceptance_shell = acceptance.split('        run: |\n', 1)[1]
+acceptance_shell = '\n'.join(line[10:] for line in acceptance_shell.splitlines())
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    bin_dir = base / 'bin'
+    bin_dir.mkdir()
+    node = bin_dir / 'node'
+    node.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+Path(os.environ['CALLS']).write_text(json.dumps(sys.argv[1:]))
+if os.environ.get('FAIL_CHECK') == '1':
+    raise SystemExit(1)
+runtime = Path(sys.argv[-1])
+runtime.mkdir(parents=True, exist_ok=True)
+(runtime / 'acceptance-receipt.json').write_text('{}')
+''')
+    node.chmod(0o755)
+    for target in ['aarch64-apple-darwin', 'x86_64-apple-darwin']:
+        for preparation in ['true', 'false']:
+            for fail in ['0', '1']:
+                case = base / f'{target}-{preparation}-{fail}'
+                assets_dir = case / 'release-assets'
+                assets_dir.mkdir(parents=True)
+                substitutions = {
+                    'needs.gate.outputs.commit': 'a' * 40,
+                    'needs.gate.outputs.version': '0.13.0-rc.2',
+                    'needs.gate.outputs.tag': 'v0.13.0-rc.2',
+                    'needs.gate.outputs.preparation': preparation,
+                    'matrix.target': target,
+                    'matrix.asset': f'phoenix_ide-{target}',
+                }
+                shell = acceptance_shell
+                for key, value in substitutions.items():
+                    shell = shell.replace('${{ ' + key + ' }}', value)
+                env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                           GITHUB_WORKSPACE=str(case), RUNNER_TEMP=str(case),
+                           CALLS=str(case / 'calls.json'), FAIL_CHECK=fail)
+                result = subprocess.run(['bash', '-euo', 'pipefail', '-c', shell], env=env, capture_output=True, text=True)
+                assert result.returncode == (1 if fail == '1' else 0), result.stderr
+                calls = json.loads((case / 'calls.json').read_text())
+                suffix = '-prepared-' + 'a' * 12 if preparation == 'true' else ''
+                archive_suffix = suffix if preparation == 'true' else '-v0.13.0-rc.2'
+                assert calls[1] == str(assets_dir / f'Phoenix-macos-{target}{archive_suffix}.zip')
+                assert calls[2] == str(assets_dir / f'phoenix_ide-{target}{suffix}')
+                assert calls[3:6] == ['a' * 40, '0.13.0-rc.2', target]
+                receipt = assets_dir / f'HEADLESS-ACCEPTANCE-{target}.json'
+                assert receipt.exists() == (preparation == 'true' and fail == '0')
 
 package_script = Path('macos/Phoenix/scripts/package-desktop-release.sh').read_text()
 for fragment in [
