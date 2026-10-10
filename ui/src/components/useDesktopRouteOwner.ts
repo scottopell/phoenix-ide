@@ -1,9 +1,17 @@
 import { useEffect, useState } from 'react';
 import { api, ApiResponseError, type ProductConversationSnapshotView } from '../api';
-import { subscribeProductConversationSnapshotChanged } from '../notifications';
+import {
+  getProductConversationSnapshotChangeSequence,
+  productConversationSnapshotChangedSince,
+  subscribeProductConversationSnapshotChanged,
+} from '../notifications';
 
 export function useDesktopRouteOwner(productConversationId: string | null, routeSlug: string | null, search: string) {
-  const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
+  const [productSnapshot, setProductSnapshot] = useState<{
+    ownerId: string;
+    snapshot: ProductConversationSnapshotView;
+    changeSequence: number;
+  } | null>(null);
   const [productNotFound, setProductNotFound] = useState<string | null>(null);
   const [validatedPin, setValidatedPin] = useState<{ owner: string; selector: string; id: string } | null>(null);
   const [productSnapshotRetry, setProductSnapshotRetry] = useState(0);
@@ -17,6 +25,11 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
     let cancelled = false;
     let retryTimeout: number | undefined;
     const load = async () => {
+      const snapshotChangeSequence = getProductConversationSnapshotChangeSequence();
+      const publishSnapshot = (snapshot: ProductConversationSnapshotView) => {
+        if (cancelled) return;
+        setProductSnapshot({ ownerId: productConversationId, snapshot, changeSequence: snapshotChangeSequence });
+      };
       try {
         const snapshot = await api.getProductConversationSnapshot(productConversationId, { message_limit: 1 });
         if (requestedPin) {
@@ -27,7 +40,7 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
             if (error instanceof ApiResponseError && error.status === 404) {
               if (!cancelled) {
                 setValidatedPin(null);
-                setProductSnapshot({ ownerId: productConversationId, snapshot });
+                publishSnapshot(snapshot);
               }
               return;
             }
@@ -41,7 +54,7 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
         } else if (!cancelled) {
           setValidatedPin(null);
         }
-        if (!cancelled) setProductSnapshot({ ownerId: productConversationId, snapshot });
+        publishSnapshot(snapshot);
       } catch (error: unknown) {
         if (cancelled) return;
         if (error instanceof ApiResponseError && error.status === 404) {
@@ -66,14 +79,24 @@ export function useDesktopRouteOwner(productConversationId: string | null, route
       productConversationId,
       productSnapshot?.snapshot.product_conversation_id,
     ].filter((identity): identity is string => Boolean(identity)));
-    const refresh = () => setProductSnapshotRetry((value) => value + 1);
+    let refreshed = false;
+    const refresh = () => {
+      if (refreshed) return;
+      refreshed = true;
+      setProductSnapshotRetry((value) => value + 1);
+    };
     const unsubscribes = [...identities].map((identity) => subscribeProductConversationSnapshotChanged(identity, refresh));
+    const canonicalId = productSnapshot?.snapshot.product_conversation_id;
+    if (canonicalId && canonicalId !== productConversationId && productSnapshot
+      && productConversationSnapshotChangedSince(canonicalId, productSnapshot.changeSequence)) {
+      refresh();
+    }
     window.addEventListener('phoenix:automatic-continuation-updated', refresh);
     return () => {
       unsubscribes.forEach((unsubscribe) => unsubscribe());
       window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
     };
-  }, [productConversationId, productSnapshot?.snapshot.product_conversation_id]);
+  }, [productConversationId, productSnapshot]);
   const directExactMember = routeSlug
     && ownedProductSnapshot?.requested_transcript_row_id === routeSlug
     && routeSlug !== ownedProductSnapshot.product_conversation_id

@@ -103,9 +103,10 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
         const gesturePresentation = selectionChangedDuringGesture.current && selectionInput.current !== null
           ? selectionInput.current === 'touch'
           : null;
-        const touchDocked = gesturePresentation ?? (sameSource
-          ? current?.presentation === 'touch-docked'
-          : window.matchMedia?.('(any-pointer: coarse)').matches ?? false);
+        const touchDocked = gesturePresentation ?? (current?.presentation === 'touch-docked'
+          || (sameSource
+            ? false
+            : window.matchMedia?.('(any-pointer: coarse)').matches ?? false));
         const presentation = touchDocked ? 'touch-docked' : 'floating';
         if (!sameSource || current?.presentation !== presentation) {
           store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation });
@@ -155,6 +156,19 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       selecting.current = false;
       schedule();
     };
+    const keyDown = (event: KeyboardEvent) => {
+      if (!event.shiftKey || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) return;
+      selectionInput.current = 'fine';
+      selectionChangedDuringGesture.current = false;
+      gestureInitialSource.current = store.getSnapshot(scopeKey)?.source ?? null;
+    };
+    const keyUp = (event: KeyboardEvent) => {
+      if (event.key !== 'Shift' && !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) return;
+      if (!selectionChangedDuringGesture.current) {
+        selectionInput.current = null;
+        gestureInitialSource.current = null;
+      }
+    };
     const selectionChange = () => {
       if (store.getSnapshot(scopeKey)?.body) {
         selectionInput.current = null;
@@ -169,12 +183,6 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
         if (selected && (gestureStartedInsideCurrentSelection.current || !sameReactionSource(gestureInitialSource.current ?? undefined, selected.source))) {
           selectionChangedDuringGesture.current = true;
         }
-      } else if (selected && !sourceReturnActive.current && !pillFocusPending.current && !bubbleRef.current?.contains(document.activeElement)) {
-        const currentSource = store.getSnapshot(scopeKey)?.source;
-        if (!sameReactionSource(currentSource, selected.source)) {
-          selectionInput.current = 'fine';
-          selectionChangedDuringGesture.current = true;
-        }
       }
       if (selectionInput.current === null && (!nativeSelection || nativeSelection.rangeCount === 0 || nativeSelection.isCollapsed)) {
         cancelAnimationFrame(frame);
@@ -184,12 +192,16 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, scro
       schedule();
     };
     document.addEventListener('selectionchange', selectionChange);
+    document.addEventListener('keydown', keyDown);
+    document.addEventListener('keyup', keyUp);
     document.addEventListener('pointerdown', down, { passive: true });
     document.addEventListener('pointerup', up, { passive: true });
     document.addEventListener('pointercancel', up, { passive: true });
     return () => {
       cancelAnimationFrame(frame);
       document.removeEventListener('selectionchange', selectionChange);
+      document.removeEventListener('keydown', keyDown);
+      document.removeEventListener('keyup', keyUp);
       document.removeEventListener('pointerdown', down);
       document.removeEventListener('pointerup', up);
       document.removeEventListener('pointercancel', up);

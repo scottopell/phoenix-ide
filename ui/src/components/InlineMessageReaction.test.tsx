@@ -279,6 +279,20 @@ describe('inline message reactions', () => {
     select(screen.getByTestId('old').firstChild!);
     expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
   });
+  it('preserves touch docking when native selection handles adjust the range without pointer events', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    fireEvent.pointerUp(text, { pointerType: 'touch' });
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    select(screen.getByTestId('new').firstChild!);
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')?.source.messageId).toBe('new');
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+  });
 
   it('clears ignored pointer modality after a typed reaction gesture', async () => {
     setCoarsePointer(true);
