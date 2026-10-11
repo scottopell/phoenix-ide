@@ -14,7 +14,6 @@ pub(crate) use super::observation::ConversationRouteObservations;
 #[allow(clippy::large_enum_variant)]
 pub enum ApplicationState {
     Live(AppState),
-    #[allow(dead_code)] // No observation startup is wired yet.
     Observation(ObservationApplication),
 }
 
@@ -26,17 +25,26 @@ impl From<AppState> for ApplicationState {
 
 #[derive(Clone, Copy)]
 pub enum ObservationAccessPolicy {
-    #[allow(dead_code)] // No observation startup is wired yet.
     LoopbackUnauthenticated,
 }
 
 #[derive(Clone)]
 pub struct ObservationApplication {
-    pub(crate) routes: ConversationRouteObservations,
-    pub access_policy: ObservationAccessPolicy,
+    routes: ConversationRouteObservations,
+    access_policy: ObservationAccessPolicy,
 }
 
 impl ObservationApplication {
+    pub(crate) async fn for_target(
+        db: crate::db::Database,
+        reference: &str,
+    ) -> Result<Self, crate::db::DbError> {
+        Ok(Self {
+            routes: ConversationRouteObservations::for_target(db, reference).await?,
+            access_policy: ObservationAccessPolicy::LoopbackUnauthenticated,
+        })
+    }
+
     pub(crate) fn admit_peer(
         &self,
         peer: Option<SocketAddr>,

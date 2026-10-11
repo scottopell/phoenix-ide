@@ -15,7 +15,6 @@ struct Fixture {
     app: Router,
     product_id: String,
     coordinator_references: Vec<String>,
-    coordinator_id: String,
 }
 
 impl Fixture {
@@ -68,10 +67,11 @@ impl Fixture {
             .await
             .unwrap();
         let original = std::fs::read(&path).unwrap();
-        let application = ApplicationState::Observation(ObservationApplication {
-            routes: ConversationRouteObservations::new(db.clone()),
-            access_policy: ObservationAccessPolicy::LoopbackUnauthenticated,
-        });
+        let application = ApplicationState::Observation(
+            ObservationApplication::for_target(db.clone(), "ordinary")
+                .await
+                .unwrap(),
+        );
         Self {
             _dir: dir,
             path,
@@ -80,7 +80,6 @@ impl Fixture {
             app: create_router(application),
             product_id: ordinary.product_conversation_id.to_string(),
             coordinator_references,
-            coordinator_id: successor.id,
         }
     }
 
@@ -149,12 +148,11 @@ async fn full_router_observes_immutable_id_slug_product_and_coordinator_routes()
     }
     for reference in &fixture.coordinator_references {
         let path = format!("/api/global/coordinator/route/{reference}");
-        let (status, body) =
+        let (status, _) =
             response_json(&fixture.app, loopback_request("GET", &path, Body::empty())).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({"coordinator_id": fixture.coordinator_id}));
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
-    for reference in ["ordinary", "ordinary-slug", "missing"] {
+    for reference in ["ordinary", "ordinary-slug", &fixture.product_id] {
         let path = format!("/api/global/coordinator/route/{reference}");
         let (status, body) =
             response_json(&fixture.app, loopback_request("GET", &path, Body::empty())).await;
@@ -165,6 +163,7 @@ async fn full_router_observes_immutable_id_slug_product_and_coordinator_routes()
         "/api/conversations/missing/route",
         "/api/conversations/by-slug/missing/route",
         "/api/product-conversations/missing/route",
+        "/api/global/coordinator/route/missing",
     ] {
         let (status, _) =
             response_json(&fixture.app, loopback_request("GET", path, Body::empty())).await;

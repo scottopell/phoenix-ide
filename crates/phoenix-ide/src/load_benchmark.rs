@@ -6,12 +6,7 @@
 //! strings containing sanitized wire frames (`event: init\ndata: {...}\n\n`).
 //! Only GET is admitted, including for fixtures. No production router is mounted.
 
-use std::{
-    collections::BTreeMap,
-    net::Ipv4Addr,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, net::Ipv4Addr, path::Path, sync::Arc};
 
 use axum::{
     extract::{Path as RoutePath, Query, Request, State},
@@ -34,6 +29,10 @@ use crate::api::{
         SnapshotQuery,
     },
 };
+
+use crate::immutable_fixture::standalone_path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type PreparedFixtures = BTreeMap<String, (StatusCode, HeaderValue, Vec<u8>)>;
@@ -59,56 +58,6 @@ fn json_content_type() -> String {
 struct ReadState {
     db: Database,
     fixtures: Arc<PreparedFixtures>,
-}
-
-fn standalone_path(path: &Path) -> Result<PathBuf, Error> {
-    if !path.is_absolute() {
-        return Err("benchmark database path must be absolute".into());
-    }
-    let canonical = path.canonicalize()?;
-    if canonical.components().any(|part| {
-        matches!(
-            part.as_os_str().to_str(),
-            Some(".phoenix-ide" | "prod" | "production")
-        )
-    }) || canonical
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("prod"))
-    {
-        return Err("benchmark refuses production database locations".into());
-    }
-    let metadata = std::fs::metadata(&canonical)?;
-    if !metadata.is_file() {
-        return Err("benchmark database must be a regular file".into());
-    }
-    if !metadata.permissions().readonly() {
-        return Err("benchmark database fixture must be chmod read-only".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err("benchmark database must not be hard-linked".into());
-        }
-    }
-    for base in [path, canonical.as_path()] {
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let mut sidecar = base.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            match std::fs::symlink_metadata(PathBuf::from(sidecar)) {
-                Ok(_) => {
-                    return Err(
-                        "benchmark database has SQLite sidecars; supply a standalone snapshot"
-                            .into(),
-                    )
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-    Ok(canonical)
 }
 
 fn load_fixtures(path: &Path) -> Result<PreparedFixtures, Error> {

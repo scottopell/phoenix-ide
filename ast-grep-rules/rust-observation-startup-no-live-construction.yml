@@ -1,0 +1,15 @@
+id: observation-startup-no-live-construction
+language: Rust
+severity: error
+message: |
+  Observation startup must not enter live server construction, provider
+  discovery, migration or execution services. Select composition before these
+  effects and reuse bounded observation services and the shared route table.
+files:
+  - "**/phoenix-ide/src/observation_startup.rs"
+rule:
+  any:
+    - kind: identifier
+      regex: '^(run_server|migrate_database|open_database_with_migrations|run_pending_migrations|AppState|RuntimeManager|ModelRegistry|LlmConfig|ToolRegistry|McpClientManager)$'
+    - kind: type_identifier
+      regex: '^(AppState|RuntimeManager|ModelRegistry|LlmConfig|ToolRegistry|McpClientManager)$'
