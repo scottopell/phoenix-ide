@@ -67,6 +67,15 @@ Validated for Kache 1.0.0 on macOS arm64: version probe, daemon startup over a s
 
 Deterministic tests cover Linux command/environment shaping, and hosted Linux CI exercises the ordinary check suite without requiring either optional executable. Not validated by this comparison: Windows behavior; Linux Kache executable restore/signing/debug-symbol behavior with the released binary; macOS architectures other than arm64; every possible debugger/source shape beyond the representative Phoenix probes; cross-device filesystems without reflinks; remote/S3 caches; or production activation. Phoenix makes no compatibility or performance guarantee for those paths.
 
+### Managed-remote qualification blocker in Kache v1.0.0
+
+Phoenix cannot qualify multiple managed Kache daemon identities against one remote-enabled base store. Pinned release source `7c27329c286e32c17a8dac05cff22442926ff719` establishes two upstream boundaries:
+
+- `Config::load_resolved` calls `isolate_cache_dir_for_trust_domain`; Kache's own `trust_domain_isolates_stores_and_fails_open` test requires an unusable domain path to return the unscoped base store. Distinct identities can therefore converge on one durable `upload-queue` when isolation cannot be created.
+- `Config::cache_dir_for_path` returns configured volume-shard paths directly, and `Config::routed_for_path` installs that path without appending the trust domain. Distinct identities can therefore share configured shards even when their primary stores differ.
+
+A bounded upstream fix must make trust-domain isolation fail closed and apply the domain to configured volume shards. Its tests must prove that two domains cannot select the same primary store or shard and that a queued remote-A intent cannot be consumed under remote-B credentials. Until a released Kache version provides and passes that contract, green Phoenix CI and ordinary distinct-domain paths do not qualify managed-remote no-cross-replay behavior.
+
 ## Release provenance
 
 The qualified Kache v1.0.0 release publishes `kache-aarch64-apple-darwin.tar.gz` with SHA-256 `6d1be0079d0689a85fa04b7fed7eaa94f7e08259cafb8bd361a5c25c4c98c4a3`. Its release tag peels to `7c27329c286e32c17a8dac05cff22442926ff719`, which contains upstream fixes #1168 and #1170. Phoenix's representative validation used that official arm64 release artifact and verified its published checksum before running the two-source journey. The release-tag source contains the corrected `dsymutil` path and dSYM content regression.
