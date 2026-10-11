@@ -109,19 +109,35 @@ function normalizeIdentifier(label: string): string {
   return label.replace(/[\t\n\r ]+/g, ' ').replace(/^ | $/g, '').toLowerCase().toUpperCase();
 }
 
-function referenceContext(source: string, tree: MarkdownRoot): (content: string) => string {
-  const definitions = new Map<string, string>();
-  const collect = (node: MarkdownNode) => {
+function referenceContext(source: string, tree: MarkdownRoot, parse: (text: string) => MarkdownRoot, isCode: (offset: number) => boolean): (content: string) => string {
+  const definitions = new Map<string, { start: number; text: string }>();
+  const collect = (node: MarkdownNode, offset = 0) => {
     if (node.type === 'definition') {
       const start = node.position?.start.offset;
       const end = node.position?.end.offset;
       const identifier = normalizeIdentifier(node.identifier);
-      if (start !== undefined && end !== undefined && !definitions.has(identifier)) {
-        definitions.set(identifier, source.slice(start, end));
+      if (start !== undefined && end !== undefined && offset + start < (definitions.get(identifier)?.start ?? Infinity)) {
+        definitions.set(identifier, { start: offset + start, text: source.slice(offset + start, offset + end) });
       }
-    } else if ('children' in node) node.children.forEach(collect);
+    } else if ('children' in node) node.children.forEach((child) => collect(child, offset));
   };
-  tree.children.forEach(collect);
+  tree.children.forEach((node) => collect(node));
+  for (const node of tree.children) {
+    if (node.type !== 'html' || !(OPENING.test(node.value) || CLOSING.test(node.value))) continue;
+    const offset = node.position?.start.offset;
+    if (offset === undefined) continue;
+    const tags = Array.from(node.value.matchAll(new RegExp(String.raw`<details(?=\s|>)${ATTRIBUTES}>|<\/details\s*>`, 'gi')))
+      .filter((tag) => !isCode(offset + tag.index));
+    for (let index = 0; index < tags.length; index++) {
+      const tag = tags[index]!;
+      if (!CLOSING.test(tag[0])) continue;
+      const start = offset + tag.index + tag[0].length;
+      const end = offset + (tags[index + 1]?.index ?? node.value.length);
+      // Disjoint tails keep definition discovery linear even for adjacent wrappers.
+      const tail = source.slice(start, end);
+      if (tail.trim()) parse(tail).children.forEach((child) => collect(child, start));
+    }
+  }
   return (content) => {
     const referenced = new Set<string>();
     let opening: number | undefined;
@@ -137,14 +153,17 @@ function referenceContext(source: string, tree: MarkdownRoot): (content: string)
       }
     }
     return referenced.size
-      ? `${content}\n\n${Array.from(referenced, (identifier) => definitions.get(identifier)!).join('\n')}`
+      ? `${content}\n\n${Array.from(referenced, (identifier) => definitions.get(identifier)!.text).join('\n')}`
       : content;
   };
 }
 
 /** Parse document definitions once, then supply only a chunk's referenced labels. */
 export function markdownReferenceContext(source: string): (content: string) => string {
-  return referenceContext(source, parser.parse(source));
+  const parse = (text: string) => parser.parse(text);
+  const tree = parse(source);
+  const isCode = /<details(?:\s|>)/i.test(source) ? disclosureCodeRegions(source, parse) : () => false;
+  return referenceContext(source, tree, parse, isCode);
 }
 
 /**
@@ -158,7 +177,7 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
     const pointAt = sourcePoints(source);
     const isCode = disclosureCodeRegions(source, parse);
     const { starts, nestedEnds } = disclosureBoundaries(source, isCode);
-    const withReferences = referenceContext(source, tree);
+    const withReferences = referenceContext(source, tree, parse, isCode);
     const parseContent = (content: string) => {
       const parsed = parse(withReferences(content));
       parsed.children = parsed.children.filter((node) => (node.position?.start.offset ?? 0) < content.length);
@@ -199,6 +218,7 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
       const summarySource = closingSummary ? source.slice(summaryStart, summaryStart + closingSummary.index) : undefined;
       let end: number | undefined;
       let bodyEnd: number | undefined;
+      let unsupportedBody = false;
       const summaryTree = summarySource !== undefined ? parseContent(summarySource) : undefined;
       if (header && closingSummary && summarySource !== undefined && summaryTree && !Array.from(htmlNodes(summaryTree)).some((html) => /<\/?(?:details|summary)\b/i.test(html.value ?? ''))) {
         const bodyStart = summaryStart + closingSummary.index + closingSummary[0].length;
@@ -211,8 +231,9 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
             end = bodyEnd + closing[0].length;
             break;
           }
+          if (/<\/?summary\b/i.test(html.value ?? '')) unsupportedBody = true;
         }
-        if (end !== undefined && bodyEnd !== undefined) {
+        if (!unsupportedBody && end !== undefined && bodyEnd !== undefined) {
           const paragraph = summaryTree.children[0];
           // A summary is phrasing content, not a second block document.
           const summary: Extract<MarkdownNode, { type: 'paragraph' }> = {
@@ -244,7 +265,7 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
       }
       // Recover Markdown that CommonMark bundled into an unclosed HTML block.
       const insertedEscapes: number[] = [];
-      const recoveryEnd = nestedEnds.get(start) ?? Math.min(regionEnd, node.position?.end.offset ?? regionEnd);
+      const recoveryEnd = nestedEnds.get(start) ?? end ?? Math.min(regionEnd, node.position?.end.offset ?? regionEnd);
       let tailEnd = node.position?.end.offset ?? recoveryEnd;
       while (tailEnd < recoveryEnd && pending.length) {
         const consumed = pending.pop()!;

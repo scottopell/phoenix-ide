@@ -100,6 +100,61 @@ describe('buildAgentTextFragments', () => {
   });
 });
 
+describe('Markdown disclosure search blocks', () => {
+  it.each(['', ' open'])('indexes one-line summaries and body paragraphs with original offsets%s', (open) => {
+    const markdown = `Before\r\n\r\n<details${open}><summary>Read **more**</summary>\r\n\r\nBody with *emphasis*.\r\n\r\n</details>\r\n\r\nAfter`;
+    const blocks = buildMarkdownDisplayBlocks(markdown);
+    expect(blocks.map((block) => block.searchableText)).toEqual([
+      'Before', 'Read more', 'Body with emphasis.', 'After',
+    ]);
+    const summaryStart = markdown.indexOf('Read');
+    const bodyStart = markdown.indexOf('Body');
+    expect(blocks[1]).toMatchObject({
+      lineNumber: 3,
+      sourceRange: { start: summaryStart, end: markdown.indexOf('</summary>') + '</summary>'.length },
+      kind: 'paragraph',
+    });
+    expect(blocks[2]).toMatchObject({
+      lineNumber: 5,
+      sourceRange: { start: bodyStart, end: bodyStart + 'Body with *emphasis*.'.length },
+      kind: 'paragraph',
+    });
+    expect(buildAgentTextFragments([{ type: 'text', text: markdown }], 'full', { forSearch: true })[0]?.semanticText)
+      .toBe('Before\nRead more\nBody with emphasis.\nAfter');
+    expect(buildMarkdownDisplayBlocks(markdown)).toEqual(blocks);
+  });
+
+  it('searches summary/body on adjacent lines without blank lines and excludes literal fenced code', () => {
+    const markdown = '<details><summary>Summary needle</summary>\nBody needle\n\n```ts\nconst hiddenNeedle = 1;\n```\n</details>\nAfter needle';
+    const fragments = buildAgentTextFragments([{ type: 'text', text: markdown }], 'full', { forSearch: true });
+    expect(fragments[0]?.semanticText).toBe('Summary needle\nBody needle\nAfter needle');
+    const blocks = buildMarkdownDisplayBlocks(markdown);
+    expect(blocks.find((block) => block.searchableText === 'Body needle')).toMatchObject({
+      lineNumber: 2,
+      sourceRange: { start: markdown.indexOf('Body'), end: markdown.indexOf('Body') + 'Body needle'.length },
+    });
+  });
+
+  it.each([
+    '<details><summary>Unfinished</summary>\nBody **needle**',
+    '<details><summary>Missing end\nBody **needle**',
+    '<details>\nBody **needle**\n</details>',
+  ])('indexes visible malformed fallback and keeps original positions: %s', (disclosure) => {
+    const markdown = `Before\n\n${disclosure}\n\n# After needle`;
+    const blocks = buildMarkdownDisplayBlocks(markdown);
+    expect(blocks.map((block) => block.searchableText).join('\n')).toContain('Body needle');
+    const fallback = blocks.find((block) => block.searchableText.includes('Body needle'))!;
+    expect(fallback.sourceRange).toEqual({ start: markdown.indexOf('<details>'), end: markdown.indexOf('\n\n# After') });
+    expect(fallback.lineNumber).toBe(3);
+    expect(blocks.at(-1)).toMatchObject({
+      searchableText: 'After needle',
+      sourceRange: { start: markdown.indexOf('# After'), end: markdown.length },
+    });
+    expect(buildAgentTextFragments([{ type: 'text', text: markdown }], 'full', { forSearch: true })[0]?.semanticText)
+      .toContain('Body needle');
+  });
+});
+
 describe('buildMarkdownFileSearchProjection', () => {
   it('indexes owned rendered blocks but excludes fenced code without decoration ownership', () => {
     const markdown = '# Visible heading\n\n```ts\nconst hiddenNeedle = true;\n```\n\nVisible paragraph needle';

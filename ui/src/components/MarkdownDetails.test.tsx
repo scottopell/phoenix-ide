@@ -203,6 +203,58 @@ describe('safe basic Markdown disclosures', () => {
     expect(container).toHaveTextContent('Body');
   });
 
+  it.each([
+    '<summary>Extra</summary>',
+    'Inline <summary>Extra</summary> content',
+    'Inline </summary> content',
+    '<div>\n<summary>Extra</summary>\n</div>',
+  ])('rejects additional summary tags anywhere in the body: %s', (extra) => {
+    const source = `<details><summary>Title</summary>\n\n**Visible body**\n\n${extra}\n\n</details>\nAfter`;
+    const { container } = markdown(source);
+    expect(container.querySelector('details')).toBeNull();
+    expect(container).toHaveTextContent('<details><summary>Title</summary>');
+    expect(container.textContent?.replaceAll('\\', '')).toContain(extra.includes('<summary>') ? '<summary>Extra</summary>' : '</summary>');
+    expect(screen.getByText('Visible body')).toBeInTheDocument();
+    expect(container).toHaveTextContent('After');
+    expect(markdownDetailsRanges(source)).toEqual([]);
+  });
+
+  it('does not treat summary tags after the closing wrapper as body markup', () => {
+    const disclosure = '<details><summary>Title</summary>\nBody\n</details>';
+    const source = `${disclosure}\n<summary>Outside</summary>`;
+    const { container } = markdown(source);
+    expect(container.querySelectorAll('details')).toHaveLength(1);
+    expect(container.querySelector('details')).not.toHaveTextContent('Outside');
+    expect(markdownDetailsRanges(source)).toEqual([{ start: 0, end: disclosure.length }]);
+  });
+
+  it('preserves extra summary tags used only as body code literals', () => {
+    const source = '<details><summary>Code</summary>\n\n`<summary>` and `</summary>`\n\n```html\n<summary>Literal</summary>\n```\n\n</details>';
+    const { container } = markdown(source);
+    expect(container.querySelectorAll('details')).toHaveLength(1);
+    expect(Array.from(container.querySelectorAll('details code'), (code) => code.textContent?.trimEnd())).toEqual([
+      '<summary>', '</summary>', '<summary>Literal</summary>',
+    ]);
+    expect(markdownDetailsRanges(source)).toEqual([{ start: 0, end: source.length }]);
+  });
+
+  it.each(['\n', '\r\n'])('recovers reference definitions immediately after a disclosure (%j)', (newline) => {
+    const source = '<details open><summary>[summary][docs]</summary>\n\n[body][docs]\n\n</details>\n[docs]: https://example.com/docs\n\n[docs]: https://example.com/ignored'.replaceAll('\n', newline);
+    const { container } = markdown(source);
+    for (const name of ['summary', 'body']) {
+      expect(screen.getByRole('link', { name })).toHaveAttribute('href', 'https://example.com/docs');
+    }
+    expect(container.querySelectorAll('details a')).toHaveLength(2);
+    expect(markdownReferenceContext(source)('[outside][docs]')).toBe('[outside][docs]\n\n[docs]: https://example.com/docs');
+  });
+
+  it('does not collect reference definitions from closing-tag code literals', () => {
+    const source = '<details><summary>Code</summary>\n\n```text\n</details>\n[docs]: https://example.com/not-a-definition\n```\n\n</details>\n[real]: https://example.com/real';
+    const withReferences = markdownReferenceContext(source);
+    expect(withReferences('[docs]')).toBe('[docs]');
+    expect(withReferences('[real]')).toBe('[real]\n\n[real]: https://example.com/real');
+  });
+
   it('preserves document-level reference links and Markdown images', () => {
     const { container } = markdown('<details open><summary>References</summary>\n\n[guide][docs] ![safe image](https://example.com/image.png)\n\n</details>\n\n[docs]: https://example.com/docs');
     expect(screen.getByRole('link', { name: 'guide' })).toHaveAttribute('href', 'https://example.com/docs');
@@ -267,6 +319,25 @@ describe('safe basic Markdown disclosures', () => {
       expect(paragraph.children[0]?.type).toBe('linkReference');
       expect(paragraph.position?.start.offset).toBe(source.indexOf('[guide]', node.position!.start.offset));
       expect(node.children.some((child) => child.type === 'definition')).toBe(false);
+    }
+    const parsedCharacters = parse.mock.calls.reduce((total, [input]) => total + String(input).length, 0);
+    expect(parsedCharacters).toBeLessThan(source.length * 6);
+  });
+
+  it('bounds reparsing while recovering definitions from 80 adjacent HTML tails', () => {
+    const source = Array.from({ length: 80 }, (_, index) =>
+      `<details><summary>[Item ${index}][docs ${index}]</summary>\n[guide][docs ${index}]\n</details>\n[docs ${index}]: https://example.com/docs/${index}`).join('\n');
+    const processor = unified().use(remarkParse).use(remarkDetails);
+    const parse = vi.spyOn(processor, 'parse');
+    const tree = processor.runSync(processor.parse(source), { value: source });
+    const details = tree.children.filter((node) => node.data?.hName === 'details');
+    expect(details).toHaveLength(80);
+    for (const node of details) {
+      if (!('children' in node)) throw new Error('Missing disclosure body');
+      for (const paragraph of node.children.slice(0, 2)) {
+        if (!('children' in paragraph)) throw new Error('Missing reference paragraph');
+        expect(paragraph.children[0]?.type).toBe('linkReference');
+      }
     }
     const parsedCharacters = parse.mock.calls.reduce((total, [input]) => total + String(input).length, 0);
     expect(parsedCharacters).toBeLessThan(source.length * 6);
@@ -349,6 +420,18 @@ describe('owning conversation Markdown pipelines', () => {
     expect(screen.getByRole('link', { name: 'inside' }).closest('details')).not.toBeNull();
     expect(screen.getByRole('link', { name: 'after' }).closest('details')).toBeNull();
     expect(container.querySelector('code')).toHaveTextContent('[guide][docs]');
+    expect(container.querySelector('code')).not.toHaveTextContent('[docs]:');
+  });
+
+  it('shares a recovered no-blank-line tail definition with streaming disclosure and prose chunks', async () => {
+    const source = '[before][docs]\n\n<details open><summary>[summary][docs]</summary>\n\n[inside][docs]\n\n</details>\n[docs]: https://example.com/docs\n\n```text\n[docs]\n```\n\n[after][docs]';
+    const buffer = { text: source, lastSequence: 1, startedAt: Date.now(), requestId: 'tail-definitions' };
+    const { container } = render(<MemoryRouter><StreamingMessageView buffer={buffer} /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByRole('link', { name: 'inside' })).toHaveAttribute('href', 'https://example.com/docs'));
+    for (const name of ['before', 'summary', 'after']) {
+      expect(screen.getByRole('link', { name })).toHaveAttribute('href', 'https://example.com/docs');
+    }
+    expect(container.querySelector('code')).toHaveTextContent('[docs]');
     expect(container.querySelector('code')).not.toHaveTextContent('[docs]:');
   });
 
