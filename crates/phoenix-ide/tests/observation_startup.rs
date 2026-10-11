@@ -90,6 +90,7 @@ impl Fixture {
                 panic!("parent state: {state_variant}")
             }
         };
+        Self::seed_messages(db, &root, &successor).await;
         db.create_conversation("other", "other-slug", "/fixture", true, None, None)
             .await
             .unwrap();
@@ -159,6 +160,25 @@ impl Fixture {
             .await
             .unwrap();
         (root, successor, coordinator)
+    }
+
+    async fn seed_messages(
+        db: &Database,
+        root: &phoenix_db::Conversation,
+        successor: &phoenix_db::Conversation,
+    ) {
+        for id in [root.id.as_str(), successor.id.as_str()] {
+            let message_id = format!("{id}-message");
+            db.add_message(
+                &message_id,
+                id,
+                &phoenix_core::domain::db_schema::MessageContent::user(&message_id),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
     }
 
     fn command(&self, sentinel: &TcpListener) -> Command {
@@ -409,12 +429,57 @@ async fn normal_executable_observation_scopes_reads_and_never_constructs_live_se
             "{path}"
         );
     }
+    for (reference, requested) in [
+        ("a-root", "a-root"),
+        ("root-slug", "a-root"),
+        (fixture.product.as_str(), "a-root"),
+        (fixture.successor.as_str(), fixture.successor.as_str()),
+        (fixture.successor_slug.as_str(), fixture.successor.as_str()),
+    ] {
+        let response = client
+            .get(format!("{url}/api/product-conversations/{reference}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{reference}");
+        let snapshot = response.json::<Value>().await.unwrap();
+        assert_eq!(snapshot["product_conversation_id"], fixture.product);
+        assert_eq!(snapshot["requested_transcript_row_id"], requested);
+        assert_eq!(snapshot["canonical_root"]["transcript_row_id"], "a-root");
+        assert_eq!(snapshot["latest_transcript_row_id"], fixture.successor);
+        let segments = snapshot["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["messages"][0]["message_id"], "a-root-message");
+        assert_eq!(
+            segments[1]["messages"][0]["message_id"],
+            format!("{}-message", fixture.successor)
+        );
+    }
+    for reference in [
+        "other",
+        "other-slug",
+        "child",
+        "child-slug",
+        "0-disconnected",
+        "disconnected-slug",
+        "missing",
+    ] {
+        assert_eq!(
+            client
+                .get(format!("{url}/api/product-conversations/{reference}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404,
+            "{reference}"
+        );
+    }
     for path in [
         "/api/models",
         "/api/conversations",
         "/api/product-conversations",
         "/api/conversations/a-root/stream",
-        "/api/product-conversations/a-root",
     ] {
         let response = client.get(format!("{url}{path}")).send().await.unwrap();
         assert_eq!(response.status(), 503, "{path}");
@@ -444,6 +509,7 @@ async fn normal_executable_observation_scopes_reads_and_never_constructs_live_se
         "/",
         "/assets/index.js",
         "/api/conversations/a-root/route",
+        "/api/product-conversations/a-root",
     ] {
         for header in ["forwarded", "x-forwarded-for"] {
             assert_eq!(

@@ -3,7 +3,10 @@ pub(crate) struct CoordinatorRouteResponse {
     coordinator_id: Option<String>,
 }
 use super::handlers::AppError;
-use super::types::{ConversationRouteResponse, ProductConversationRouteResponse};
+use super::product_conversations::{read_product_conversation_snapshot, SnapshotQuery};
+use super::types::{
+    ConversationRouteResponse, ProductConversationRouteResponse, ProductConversationSnapshotView,
+};
 use crate::db::{Database, DbError};
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use serde::Serialize;
@@ -87,6 +90,25 @@ impl ConversationRouteObservations {
                 .as_deref();
         }
         Err(DbError::ConversationNotFound(id.to_owned()))
+    }
+
+    pub(crate) async fn get_product_conversation_snapshot(
+        &self,
+        reference: String,
+        query: SnapshotQuery,
+    ) -> Result<ProductConversationSnapshotView, AppError> {
+        let reference = match &self.scope {
+            RouteScope::Live => reference,
+            RouteScope::Product(_) => {
+                self.resolve_reference(&reference)
+                    .await
+                    .map_err(product_route_db_to_app)?
+                    .requested_transcript_row_id
+            }
+        };
+        read_product_conversation_snapshot(&self.db, reference, query)
+            .await
+            .map(|(view, _timing)| view)
     }
 
     pub(crate) async fn get_product_conversation_route(
@@ -452,8 +474,225 @@ mod tests {
                 .id,
             root.id
         );
+        seed_scoped_messages(&db, &root, &successor).await;
         let live = freeze(db, &path).await;
         (dir, path, root, successor, live)
+    }
+
+    async fn seed_scoped_messages(
+        db: &Database,
+        root: &phoenix_db::Conversation,
+        successor: &phoenix_db::Conversation,
+    ) {
+        for id in [
+            root.id.as_str(),
+            successor.id.as_str(),
+            "off-target",
+            "child",
+            "0-disconnected",
+        ] {
+            for ordinal in 1..=2 {
+                let message_id = format!("{id}-message-{ordinal}");
+                db.add_message(
+                    &message_id,
+                    id,
+                    &phoenix_core::domain::db_schema::MessageContent::user(&message_id),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    fn snapshot_query(before: Option<String>) -> SnapshotQuery {
+        SnapshotQuery {
+            before,
+            message_limit: Some(1),
+            open_id: None,
+        }
+    }
+
+    async fn snapshot_response(
+        app: &axum::Router,
+        reference: &str,
+        before: Option<&str>,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let suffix = before.map_or_else(String::new, |cursor| format!("&before={cursor}"));
+        let mut request = axum::http::Request::builder()
+            .uri(format!(
+                "/api/product-conversations/{reference}?message_limit=1{suffix}"
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn immutable_snapshot_service_keeps_live_helper_alias_and_cursor_semantics() {
+        let (_dir, path, root, successor, live) = scoped_fixture().await;
+        let original = std::fs::read(&path).unwrap();
+        for reference in [
+            root.id.as_str(),
+            "root-alias",
+            root.product_conversation_id.as_str(),
+            successor.id.as_str(),
+            successor.slug.as_deref().unwrap(),
+        ] {
+            let expected = read_product_conversation_snapshot(
+                &live.db,
+                reference.to_owned(),
+                snapshot_query(None),
+            )
+            .await
+            .unwrap()
+            .0;
+            let observed = live
+                .get_product_conversation_snapshot(reference.to_owned(), snapshot_query(None))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(observed).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        live.db.pool().close().await;
+        assert_unchanged(&path, &original);
+    }
+
+    async fn assert_snapshot_pagination(
+        app: &axum::Router,
+        db: &Database,
+        reference: &str,
+        target: &str,
+        requested: &str,
+        root: &phoenix_db::Conversation,
+        successor: &phoenix_db::Conversation,
+    ) {
+        use axum::http::StatusCode;
+        let mut before = None;
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let (status, body) = snapshot_response(app, reference, before.as_deref()).await;
+            assert_eq!(status, StatusCode::OK, "{target}: {reference}: {body}");
+            let expected = read_product_conversation_snapshot(
+                db,
+                requested.to_owned(),
+                snapshot_query(before.clone()),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(body, serde_json::to_value(expected).unwrap());
+            assert_eq!(body["requested_transcript_row_id"], requested);
+            assert_eq!(body["canonical_root"]["transcript_row_id"], root.id);
+            assert_eq!(
+                body["canonical_route"],
+                format!("/c/{}", root.product_conversation_id)
+            );
+            assert_eq!(body["latest_transcript_row_id"], successor.id);
+            for segment in body["segments"].as_array().unwrap() {
+                for message in segment["messages"].as_array().unwrap() {
+                    seen.push(message["message_id"].as_str().unwrap().to_owned());
+                }
+            }
+            before = body["before"].as_str().map(str::to_owned);
+            if !body["has_older"].as_bool().unwrap() {
+                break;
+            }
+        }
+        seen.sort();
+        let mut expected_ids = vec![
+            format!("{}-message-1", root.id),
+            format!("{}-message-2", root.id),
+            format!("{}-message-1", successor.id),
+            format!("{}-message-2", successor.id),
+        ];
+        expected_ids.sort();
+        assert_eq!(seen, expected_ids);
+    }
+
+    #[tokio::test]
+    async fn full_router_immutable_target_snapshots_preserve_members_and_cursor_scope() {
+        use crate::api::application_state::{ApplicationState, ObservationApplication};
+        use axum::http::StatusCode;
+        let (_dir, path, root, successor, live) = scoped_fixture().await;
+        let original = std::fs::read(&path).unwrap();
+        let foreign = live
+            .get_product_conversation_snapshot("off-target".into(), snapshot_query(None))
+            .await
+            .unwrap();
+        let foreign_cursor = foreign.before.unwrap();
+        let off_product = live
+            .db
+            .resolve_ordinary_product_conversation("off-target")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let aliases = [
+            root.id.as_str(),
+            "root-alias",
+            root.product_conversation_id.as_str(),
+            successor.id.as_str(),
+            successor.slug.as_deref().unwrap(),
+        ];
+        for target in aliases {
+            let app = crate::api::create_router(ApplicationState::Observation(
+                ObservationApplication::for_target(live.db.clone(), target)
+                    .await
+                    .unwrap(),
+            ));
+            for reference in aliases {
+                let requested = if reference == successor.id
+                    || reference == successor.slug.as_deref().unwrap()
+                {
+                    &successor.id
+                } else {
+                    &root.id
+                };
+                assert_snapshot_pagination(
+                    &app, &live.db, reference, target, requested, &root, &successor,
+                )
+                .await;
+                let (status, body) =
+                    snapshot_response(&app, reference, Some(&foreign_cursor)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(body.get("segments").is_none());
+            }
+            for reference in [
+                "off-target",
+                "off-alias",
+                off_product.as_str(),
+                "child",
+                "child-alias",
+                "0-disconnected",
+                "disconnected-alias",
+                "missing",
+            ] {
+                for before in [None, Some(foreign_cursor.as_str())] {
+                    let (status, body) = snapshot_response(&app, reference, before).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::NOT_FOUND,
+                        "{target}: {reference}: {body}"
+                    );
+                    assert!(body.get("segments").is_none());
+                }
+            }
+            assert_unchanged(&path, &original);
+        }
+        live.db.pool().close().await;
+        assert_unchanged(&path, &original);
     }
 
     #[tokio::test]

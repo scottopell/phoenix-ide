@@ -1,4 +1,4 @@
-use super::application_state::LiveState;
+use super::application_state::{ConversationRouteObservations, LiveState};
 use axum::{
     extract::{Path, Query},
     routing::get,
@@ -429,13 +429,14 @@ pub async fn list_product_conversation_creations(
 }
 
 pub async fn get_product_conversation(
-    LiveState(state): LiveState,
+    observations: ConversationRouteObservations,
     Path(reference): Path<String>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<ProductConversationSnapshotView>, AppError> {
-    read_product_conversation_snapshot(&state.db, reference, query)
+    observations
+        .get_product_conversation_snapshot(reference, query)
         .await
-        .map(|(view, _timing)| Json(view))
+        .map(Json)
 }
 
 pub(crate) async fn read_product_conversation_list(
