@@ -27,7 +27,7 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 | **REQ-API-009:** Model Information | GET /api/models with default | Implemented |
 | **REQ-API-010:** Static Assets | UI assets served from the binary (embedded), with a filesystem fallback | Implemented |
 | **REQ-API-013:** One-Shot Command Suggestion | POST /api/suggest | Implemented |
-| **REQ-API-030:** Observation and Execution Authority | ApplicationState composition, LiveState admission, bounded route observations | Partial: same-router admission and immutable route tests; normal-binary replay startup, shared transcript hydration and capability-aware UI remain pending |
+| **REQ-API-030:** Observation and Execution Authority | ApplicationState composition, LiveState admission, bounded route observations | Partial: normal-binary immutable target startup, same-router admission and executable isolation tests; shared transcript hydration and capability-aware UI remain pending |
 
 ## Verification Notes
 
