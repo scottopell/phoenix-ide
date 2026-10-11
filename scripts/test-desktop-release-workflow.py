@@ -243,7 +243,7 @@ acceptance = workflow[workflow.index('      - name: Check isolated signed-helper
                       workflow.index('      - name: Retain successful headless acceptance receipt')]
 for fragment in [
     'if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then',
-    'node scripts/check-signed-helper.cjs',
+    'require("./scripts/check-signed-helper.cjs")',
     '"${{ needs.gate.outputs.commit }}"',
     '"${{ needs.gate.outputs.version }}"',
     '"${{ matrix.target }}"',
@@ -259,7 +259,7 @@ if not (workflow.index('      - name: Remove protected material') <
     raise SystemExit('runtime acceptance must follow signing cleanup and gate successful retention')
 for fragment in [
     'if: failure()',
-    'path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json',
+    'path: .phoenix/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json',
 ]:
     if fragment not in workflow:
         raise SystemExit('failure upload must contain only a sanitized receipt, not private runtime data')
@@ -356,6 +356,21 @@ for fragment in ['macOS GUI/clean-host desktop pass', 'physical iPhone Safari', 
     if fragment not in notes:
         raise SystemExit(f'missing RC2 disclosure: {fragment}')
 
+qa_root = '$GITHUB_WORKSPACE/.phoenix/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}'
+if f'qa="{qa_root}"' not in acceptance or '/target/signed-helper-acceptance/' in acceptance:
+    raise SystemExit('runtime QA must be run/attempt-qualified outside the Cargo target cache')
+if 'rm -' in acceptance:
+    raise SystemExit('stale runtime directories must not be deleted or reused to satisfy freshness')
+wrapper = acceptance.split("          node --eval '\n", 1)[1].split("          ' \\\n", 1)[0]
+for fragment in ['const { checkSignedHelper } = require("./scripts/check-signed-helper.cjs")',
+                 'checkSignedHelper({ archive, standalone, sha, version, target, output })',
+                 'preflightCodes.has(error.message)', 'acceptance-failed-see-sanitized-receipt',
+                 'process.exitCode = 1']:
+    if fragment not in wrapper:
+        raise SystemExit(f'workflow must retain the tagged checker and safe failure behavior: {fragment}')
+if 'error.stack' in wrapper or 'JSON.stringify(error)' in wrapper:
+    raise SystemExit('workflow must not expose private raw checker diagnostics')
+
 # Execute the real workflow shell with a node double: prove each mode selects its
 # own bytes and a failed native check cannot retain a successful payload receipt.
 acceptance_shell = acceptance.split('        run: |\n', 1)[1]
@@ -376,12 +391,42 @@ runtime.mkdir(parents=True, exist_ok=True)
 (runtime / 'acceptance-receipt.json').write_text('{}')
 ''')
     node.chmod(0o755)
+    # Invoke the actual inline wrapper with the unchanged checker on a rejected
+    # preflight. It must fail closed and expose only an allowlisted static code.
+    result = subprocess.run(['node', '--eval', wrapper, str(base / 'private-archive'),
+                             str(base / 'private-standalone'), 'short', '0.13.0-rc.2',
+                             'aarch64-apple-darwin', str(base / 'private-output')],
+                            capture_output=True, text=True)
+    assert result.returncode == 1
+    assert result.stderr.strip() in {
+        'Signed-helper acceptance failed: requires-macos-host; private details withheld.',
+        'Signed-helper acceptance failed: expected-full-sha-required; private details withheld.',
+    }, result.stderr
+    assert str(base) not in result.stderr and not (base / 'private-output').exists()
+    private_error = 'private diagnostic path=' + str(base) + ' cookie=DO-NOT-LOG'
+    rejection_double = ('require.cache[require.resolve("./scripts/check-signed-helper.cjs")] = '
+                        '{exports: {checkSignedHelper: () => Promise.reject(new Error('
+                        + json.dumps(private_error) + '))}};\n')
+    result = subprocess.run(['node', '--eval', rejection_double + wrapper,
+                             'archive', 'standalone', 'a' * 40, '0.13.0-rc.2',
+                             'aarch64-apple-darwin', str(base / 'private-output')],
+                            capture_output=True, text=True)
+    assert result.returncode == 1
+    assert result.stderr.strip() == 'Signed-helper acceptance failed: acceptance-failed-see-sanitized-receipt; private details withheld.'
+    assert private_error not in result.stderr and not result.stdout
     for target in ['aarch64-apple-darwin', 'x86_64-apple-darwin']:
         for preparation in ['true', 'false']:
             for fail in ['0', '1']:
                 case = base / f'{target}-{preparation}-{fail}'
                 assets_dir = case / 'release-assets'
                 assets_dir.mkdir(parents=True)
+                old_runtime = case / f'target/signed-helper-acceptance/{target}/runtime'
+                old_runtime.mkdir(parents=True)
+                marker = old_runtime / 'prior-proof'
+                marker.write_text('preserve old cache evidence')
+                prior_attempt = case / f'.phoenix/release-qa/100/1/{target}/runtime'
+                prior_attempt.mkdir(parents=True)
+                (prior_attempt / 'prior-proof').write_text('preserve prior attempt evidence')
                 substitutions = {
                     'needs.gate.outputs.commit': 'a' * 40,
                     'needs.gate.outputs.version': '0.13.0-rc.2',
@@ -389,6 +434,8 @@ runtime.mkdir(parents=True, exist_ok=True)
                     'needs.gate.outputs.preparation': preparation,
                     'matrix.target': target,
                     'matrix.asset': f'phoenix_ide-{target}',
+                    'github.run_id': '100',
+                    'github.run_attempt': '2',
                 }
                 shell = acceptance_shell
                 for key, value in substitutions.items():
@@ -401,9 +448,15 @@ runtime.mkdir(parents=True, exist_ok=True)
                 calls = json.loads((case / 'calls.json').read_text())
                 suffix = '-prepared-' + 'a' * 12 if preparation == 'true' else ''
                 archive_suffix = suffix if preparation == 'true' else '-v0.13.0-rc.2'
-                assert calls[1] == str(assets_dir / f'Phoenix-macos-{target}{archive_suffix}.zip')
-                assert calls[2] == str(assets_dir / f'phoenix_ide-{target}{suffix}')
-                assert calls[3:6] == ['a' * 40, '0.13.0-rc.2', target]
+                assert calls[0] == '--eval'
+                assert calls[2] == str(assets_dir / f'Phoenix-macos-{target}{archive_suffix}.zip')
+                assert calls[3] == str(assets_dir / f'phoenix_ide-{target}{suffix}')
+                assert calls[4:7] == ['a' * 40, '0.13.0-rc.2', target]
+                runtime = case / f'.phoenix/release-qa/100/2/{target}/runtime'
+                assert calls[7] == str(runtime)
+                assert (runtime / 'acceptance-receipt.json').exists() == (fail == '0')
+                assert marker.read_text() == 'preserve old cache evidence'
+                assert (prior_attempt / 'prior-proof').read_text() == 'preserve prior attempt evidence'
                 receipt = assets_dir / f'HEADLESS-ACCEPTANCE-{target}.json'
                 assert receipt.exists() == (preparation == 'true' and fail == '0')
 
