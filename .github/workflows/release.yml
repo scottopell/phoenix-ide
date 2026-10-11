@@ -388,7 +388,7 @@ jobs:
           umask 077
           short_commit="${{ needs.gate.outputs.commit }}"
           short_commit=${short_commit:0:12}
-          qa="$GITHUB_WORKSPACE/target/signed-helper-acceptance/${{ matrix.target }}"
+          qa="$GITHUB_WORKSPACE/qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}"
           mkdir -p "$qa"
           if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then
             standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}-prepared-$short_commit"
@@ -397,7 +397,22 @@ jobs:
             standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
             archive="$RUNNER_TEMP/release-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip"
           fi
-          node scripts/check-signed-helper.cjs \
+          node --eval '
+            const { checkSignedHelper } = require("./scripts/check-signed-helper.cjs");
+            const [archive, standalone, sha, version, target, output] = process.argv.slice(1);
+            const preflightCodes = new Set([
+              "requires-macos-host", "expected-full-sha-required", "expected-version-required",
+              "requires-native-matching-host", "qa-workspace-boundary", "output-must-be-fresh",
+              "qa-output-parent-boundary", "production-path-refused"
+            ]);
+            checkSignedHelper({ archive, standalone, sha, version, target, output }).then(() => {
+              console.log("Signed-helper headless acceptance passed; sanitized receipt saved.");
+            }).catch(error => {
+              const code = preflightCodes.has(error.message) ? error.message : "acceptance-failed-see-sanitized-receipt";
+              console.error(`Signed-helper acceptance failed: ${code}; private details withheld.`);
+              process.exitCode = 1;
+            });
+          ' \
             "$archive" \
             "$standalone" \
             "${{ needs.gate.outputs.commit }}" \
@@ -412,7 +427,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-success
-          path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json
+          path: qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json
           if-no-files-found: error
           retention-days: 14
       - name: Retain failed headless acceptance receipt
@@ -420,7 +435,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-failure
-          path: target/signed-helper-acceptance/${{ matrix.target }}/runtime/acceptance-receipt.json
+          path: qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json
           if-no-files-found: ignore
           retention-days: 14
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
