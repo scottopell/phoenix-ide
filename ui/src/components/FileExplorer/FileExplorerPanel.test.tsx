@@ -23,7 +23,9 @@ vi.mock('../McpStatusPanel', () => ({
 }));
 
 vi.mock('../WorkScopePanel', () => ({
-  WorkScopeSection: () => <div data-testid="work-scope" />,
+  WorkScopeSection: ({ executionCapable, scopeKey }: { executionCapable?: boolean; scopeKey: string }) => (
+    <div data-testid="work-scope" data-execution-capable={String(executionCapable)} data-scope-key={scopeKey} />
+  ),
 }));
 
 vi.mock('../useWorkScopeSeed', () => ({
@@ -68,7 +70,7 @@ function skill(name: string, source: string, path: string): SkillEntry {
   return { name, description: `${name} description`, source, path };
 }
 
-function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true, collapsed = false) {
+function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true, collapsed = false, executionCapable?: boolean) {
   return render(
     <MemoryRouter initialEntries={['/c/slug']}>
       <ConversationProvider>
@@ -84,6 +86,8 @@ function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true, col
               branchName="main"
               activeSlug="slug"
               canOpenWorkspaceDiff={canOpenWorkspaceDiff}
+              workScopeKey="work:attached-1"
+              executionCapable={executionCapable ?? false}
             />
           </FileExplorerProvider>
         </ViewerSlotProvider>
@@ -106,6 +110,17 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+});
+
+describe('FileExplorerPanel load capability forwarding', () => {
+  it('defaults fixture/replay direct consumers to false and forwards only explicit capability', () => {
+    const rendered = renderPanel();
+    expect(screen.getByTestId('work-scope').getAttribute('data-execution-capable')).toBe('false');
+    rendered.unmount();
+    renderPanel('conv-1', true, false, true);
+    expect(screen.getByTestId('work-scope').getAttribute('data-execution-capable')).toBe('true');
+    expect(screen.getByTestId('work-scope').getAttribute('data-scope-key')).toBe('work:attached-1');
+  });
 });
 
 describe('FileExplorerPanel grounding detail navigation', () => {

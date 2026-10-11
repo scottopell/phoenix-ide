@@ -43,6 +43,7 @@ import {
 } from './workScopeHelpers';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { GroundingSection } from './GroundingPanel';
+import type { WorkScopeLoadSummary } from '../generated/WorkScopeLoadSummary';
 import './WorkScopePanel.css';
 
 /** Cadence of the running-handle inventory poll. `output_bytes` grows
@@ -51,6 +52,85 @@ import './WorkScopePanel.css';
  *  byte count would otherwise stay frozen. */
 const RUNNING_POLL_INTERVAL_MS = 2000;
 const HEALTH_STALE_AFTER_MS = RUNNING_POLL_INTERVAL_MS * 2;
+const LOAD_POLL_INTERVAL_MS = 5000;
+const LOAD_STALE_AFTER_MS = 15000;
+
+function useWorkScopeLoad(scopeKey: string, conversationId: string, executionCapable: boolean) {
+  const enabled = executionCapable && scopeKey.startsWith('work:') && scopeKey.length > 5 && Boolean(conversationId);
+  const [result, setResult] = useState<{
+    scopeKey: string;
+    conversationId: string;
+    summary: WorkScopeLoadSummary | null;
+    error: boolean;
+  } | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!enabled) return;
+    const controller = new AbortController();
+    let inFlight = false;
+    let cancelled = false;
+    const poll = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const query = new URLSearchParams({ conversation_id: conversationId });
+        const response = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/load?${query}`, { signal: controller.signal });
+        if (!response.ok) throw new Error('Work-scope load unavailable');
+        const summary = await response.json() as WorkScopeLoadSummary;
+        if (!cancelled) setResult({ scopeKey, conversationId, summary: summary.scope_key === scopeKey ? summary : null, error: summary.scope_key !== scopeKey });
+      } catch {
+        if (!cancelled) setResult({ scopeKey, conversationId, summary: null, error: true });
+      } finally {
+        inFlight = false;
+      }
+    };
+    void poll();
+    const timer = setInterval(() => {
+      setNow(Date.now());
+      void poll();
+    }, LOAD_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(timer);
+    };
+  }, [enabled, scopeKey, conversationId]);
+
+  const current = enabled && result?.scopeKey === scopeKey && result.conversationId === conversationId ? result : null;
+  const sampled = current?.summary;
+  const age = sampled ? now - Date.parse(sampled.sampled_at) : NaN;
+  const fresh = !current?.error && Number.isFinite(age) && age >= 0 && age <= LOAD_STALE_AFTER_MS;
+  return enabled ? { summary: fresh ? sampled : null, status: current?.error ? 'unavailable' : sampled && !fresh ? 'stale' : 'loading', now } as const : null;
+}
+
+function formatCores(value: number | null): string {
+  return value != null && Number.isFinite(value) ? `${value.toFixed(2)} cores` : '—';
+}
+
+function WorkScopeLoadIndicator({ load }: { load: NonNullable<ReturnType<typeof useWorkScopeLoad>> }) {
+  const summary = load.summary;
+  if (!summary) return <div className="ws-load" role="status">Load {load.status}</div>;
+  const windows = [
+    ['1m', summary.cpu_one_minute],
+    ['5m', summary.cpu_five_minutes],
+    ['15m', summary.cpu_fifteen_minutes],
+  ] as const;
+  const age = Math.max(0, Math.floor((load.now - Date.parse(summary.sampled_at)) / 1000));
+  const cpuAge = summary.cpu_sampled_at === null ? NaN : load.now - Date.parse(summary.cpu_sampled_at);
+  const cpuFresh = Number.isFinite(cpuAge) && cpuAge >= 0 && cpuAge <= LOAD_STALE_AFTER_MS;
+  const coverage = windows.map(([name, window]) => `${name}: ${Math.round(window.coverage_seconds)}s coverage`).join(' · ');
+  const idle = summary.live_jobs === 0 && summary.cpu_cores_latest === 0;
+  const cpuAgeLabel = idle ? 'CPU idle: no owned live bash jobs' : cpuFresh ? `CPU ${Math.floor(cpuAge / 1000)}s ago` : 'CPU latest unavailable';
+  return (
+    <div className="ws-load" role="status" title={`Sampled ${age}s ago · ${cpuAgeLabel} · ${coverage}`}>
+      <span className="ws-load-label">Load</span>
+      <span>now {formatCores(idle || cpuFresh ? summary.cpu_cores_latest : null)}</span>
+      {windows.map(([name, window]) => <span key={name}>{name} {formatCores(window.average_cores)}</span>)}
+      <span>mem {summary.memory_bytes == null ? '—' : formatBytes(summary.memory_bytes)}</span>
+    </div>
+  );
+}
 
 interface Props {
   /** The scope key to query (`work_scope_key` on the conversation, or the
@@ -58,6 +138,8 @@ interface Props {
   scopeKey: string;
   /** Conversation whose authority filters inventory and lifecycle actions. */
   conversationId: string;
+  /** Explicit live attached-scope execution capability. Replay fixtures omit this. */
+  executionCapable?: boolean;
   /** Live inventory from the conversation atom (SSE-fed). When provided it
    *  overrides the panel's initial fetch — it is at least as fresh. Omit on
    *  the chain page, which has no per-conversation push channel. */
@@ -637,6 +719,7 @@ interface SectionProps {
   /** Live inventory from the conversation atom (SSE-fed). When provided it
    *  overrides the section's initial fetch — it is at least as fresh. */
   liveInventory?: WorkScopeInventory | null | undefined;
+  executionCapable?: boolean;
   expanded: boolean;
   onToggleExpanded: (expanded: boolean) => void;
 }
@@ -647,7 +730,8 @@ interface SectionProps {
  * the header + own-expand-state pattern of `SkillsPanel` / `TasksPanel`; the
  * dense resource body is the shared `WorkScopeBody`.
  */
-export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expanded, onToggleExpanded }: SectionProps) {
+export function WorkScopeSection({ scopeKey, conversationId, liveInventory, executionCapable = false, expanded, onToggleExpanded }: SectionProps) {
+  const load = useWorkScopeLoad(scopeKey, conversationId, executionCapable);
   const { inventory, error, now, retry } = useWorkScopeInventory(
     scopeKey,
     conversationId,
@@ -672,6 +756,7 @@ export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expa
       onToggle={() => onToggleExpanded(!expanded)}
     >
       <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>
+        {load && <WorkScopeLoadIndicator load={load} />}
         <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} conversationId={conversationId} inspectable />
       </div>
     </GroundingSection>
@@ -683,7 +768,8 @@ export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expa
  * no left explorer panel to host a section. Collapsed it is a single
  * live-count badge rail; expanded it shows the shared resource body.
  */
-export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collapsed, onToggle, width }: Props) {
+export function WorkScopePanel({ scopeKey, conversationId, liveInventory, executionCapable = false, collapsed, onToggle, width }: Props) {
+  const load = useWorkScopeLoad(scopeKey, conversationId, executionCapable);
   // An SSE-less surface (no `liveInventory`) keeps ordinary resource polling
   // active while collapsed so the count badge can settle without a push
   // channel. An SSE-backed surface pauses ordinary polling while collapsed;
@@ -750,6 +836,7 @@ export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collap
         <span className="ws-title">Work scope</span>
         <span className={`ws-count-badge${count > 0 ? ' ws-count-badge--active' : ''}`}>{count}</span>
       </div>
+      {load && <WorkScopeLoadIndicator load={load} />}
       <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} conversationId={conversationId} inspectable={false} />
     </aside>
   );

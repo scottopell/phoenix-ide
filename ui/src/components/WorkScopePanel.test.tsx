@@ -10,6 +10,7 @@ import { render, screen, fireEvent, act } from '@testing-library/react';
 import { useEffect } from 'react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import type { WorkScopeInventory, BashHandleInventory } from '../api';
+import type { WorkScopeLoadSummary } from '../generated/WorkScopeLoadSummary';
 import { api } from '../api';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { hasRunningBash, hasLiveResource } from './workScopeHelpers';
@@ -77,7 +78,7 @@ function openBashDetail() {
  *  useLocation) wrapping the viewer-slot context (BashRow's inspect affordance
  *  calls useViewerSlot). Tests render/rerender through this so the section
  *  mounts in the same context the app gives it. */
-function sectionTree(props: { scopeKey: string; conversationId?: string; liveInventory?: WorkScopeInventory | null }) {
+function sectionTree(props: { scopeKey: string; conversationId?: string; liveInventory?: WorkScopeInventory | null; executionCapable?: boolean }) {
   return (
     <MemoryRouter initialEntries={['/c/conv-A']}>
       <Routes>
@@ -90,6 +91,7 @@ function sectionTree(props: { scopeKey: string; conversationId?: string; liveInv
                 scopeKey={props.scopeKey}
                 liveInventory={props.liveInventory ?? null}
                 expanded={true}
+                executionCapable={props.executionCapable ?? false}
                 onToggleExpanded={() => {}}
               />
             </ViewerSlotProvider>
@@ -108,6 +110,147 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe('WorkScope load indicator', () => {
+  const scopeKey = 'work:attached-1';
+  const sample = (over: Partial<WorkScopeLoadSummary> = {}): WorkScopeLoadSummary => ({
+    scope_key: scopeKey,
+    sampled_at: new Date().toISOString(),
+    live_jobs: 2,
+    cpu_cores_latest: 2.5,
+    cpu_sampled_at: new Date().toISOString(),
+    cpu_one_minute: { average_cores: 1.25, coverage_seconds: 40 },
+    cpu_five_minutes: { average_cores: null, coverage_seconds: 40 },
+    cpu_fifteen_minutes: { average_cores: null, coverage_seconds: 40 },
+    memory_bytes: 128 * 1024 * 1024,
+    process_count: 3,
+    ...over,
+  });
+  const reply = (summary: WorkScopeLoadSummary) => ({ ok: true, json: async () => summary });
+  const panel = (key = scopeKey, executionCapable = true) => (
+    <WorkScopePanel scopeKey={key} conversationId="conv-1" executionCapable={executionCapable} liveInventory={inv([])} collapsed={false} onToggle={() => {}} />
+  );
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('renders latest, windows and memory without fabricating unavailable values; reveals coverage and age on hover', async () => {
+    getInv.mockResolvedValue(inv([]));
+    const fetchLoad = vi.fn().mockResolvedValue(reply(sample()));
+    vi.stubGlobal('fetch', fetchLoad);
+    await act(async () => { render(panel()); });
+    expect(fetchLoad).toHaveBeenCalledWith('/api/work-scope/work%3Aattached-1/load?conversation_id=conv-1', expect.anything());
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+    expect(screen.getByRole('status').textContent).toContain('1m 1.25 cores');
+    expect(screen.getByRole('status').textContent).toContain('5m —');
+    expect(screen.getByRole('status').textContent).toContain('15m —');
+    expect(screen.getByRole('status').textContent).toContain('mem 128.0 MB');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('1m: 40s coverage');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('Sampled 0s ago');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU 0s ago');
+  });
+
+  it('shows observed idle zero without requiring a native CPU sample and retains recent history', async () => {
+    getInv.mockResolvedValue(inv([]));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample({
+      live_jobs: 0, cpu_cores_latest: 0, cpu_sampled_at: null, memory_bytes: 0,
+    }))));
+    await act(async () => { render(panel()); });
+    expect(screen.getByRole('status').textContent).toContain('now 0.00 cores');
+    expect(screen.getByRole('status').textContent).toContain('1m 1.25 cores');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU idle: no owned live bash jobs');
+  });
+
+  it('uses the same inline load in the expanded conversation section', async () => {
+    getInv.mockResolvedValue(inv([]));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample())));
+    await act(async () => { render(sectionTree({ scopeKey, executionCapable: true })); });
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+  });
+
+  it('keeps partial coverage and missing memory or latest CPU explicitly unavailable', async () => {
+    getInv.mockResolvedValue(inv([]));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample({
+      cpu_cores_latest: null,
+      cpu_one_minute: { average_cores: 0.5, coverage_seconds: 5 },
+      memory_bytes: null,
+    }))));
+    await act(async () => { render(panel()); });
+    const indicator = screen.getByRole('status');
+    expect(indicator.textContent).toContain('now —');
+    expect(indicator.textContent).toContain('1m 0.50 cores');
+    expect(indicator.textContent).toContain('mem —');
+    expect(indicator.getAttribute('title')).toContain('1m: 5s coverage');
+    expect(indicator.textContent).not.toContain('0.00 cores');
+  });
+
+  it('does not call a recent memory snapshot a fresh CPU sample; retains historical coverage', async () => {
+    getInv.mockResolvedValue(inv([]));
+    const fetchLoad = vi.fn().mockResolvedValue(reply(sample({
+      cpu_sampled_at: null,
+      cpu_cores_latest: 0,
+      cpu_one_minute: { average_cores: 0.5, coverage_seconds: 5 },
+    })));
+    vi.stubGlobal('fetch', fetchLoad);
+    const rendered = render(panel());
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole('status').textContent).toContain('now —');
+    expect(screen.getByRole('status').textContent).toContain('1m 0.50 cores');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU latest unavailable · 1m: 5s coverage');
+
+    await act(async () => { rendered.rerender(panel()); });
+    fetchLoad.mockResolvedValue(reply(sample({ cpu_sampled_at: new Date(Date.now() - 20_000).toISOString() })));
+    await act(async () => { vi.advanceTimersByTime(5000); });
+    expect(screen.getByRole('status').textContent).toContain('now —');
+    expect(screen.getByRole('status').textContent).toContain('1m 1.25 cores');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU latest unavailable');
+  });
+
+  it('shows unavailable rather than stale numbers after an error and hides old samples when aged out', async () => {
+    getInv.mockResolvedValue(inv([]));
+    const fetchLoad = vi.fn().mockResolvedValueOnce(reply(sample()))
+      .mockRejectedValueOnce(new Error('offline'));
+    vi.stubGlobal('fetch', fetchLoad);
+    await act(async () => { render(panel()); });
+    await act(async () => { vi.advanceTimersByTime(5000); });
+    expect(screen.getByRole('status').textContent).toBe('Load unavailable');
+    expect(screen.queryByText(/2.50 cores/)).toBeNull();
+  });
+
+  it('expires old samples even while a slow poll remains in flight and never overlaps that poll', async () => {
+    getInv.mockResolvedValue(inv([]));
+    const fetchLoad = vi.fn().mockResolvedValueOnce(reply(sample()))
+      .mockImplementation(() => new Promise(() => {}));
+    vi.stubGlobal('fetch', fetchLoad);
+    await act(async () => { render(panel()); });
+    await act(async () => { vi.advanceTimersByTime(20000); });
+    expect(fetchLoad).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('status').textContent).toBe('Load stale');
+  });
+
+  it('drops late results after a scope switch and requests only the new attached scope', async () => {
+    getInv.mockResolvedValue(inv([]));
+    let resolveOld!: (value: ReturnType<typeof reply>) => void;
+    const fetchLoad = vi.fn().mockImplementationOnce(() => new Promise<ReturnType<typeof reply>>((resolve) => { resolveOld = resolve; }))
+      .mockResolvedValue(reply(sample({ scope_key: 'work:attached-2', cpu_cores_latest: 0.75 })));
+    vi.stubGlobal('fetch', fetchLoad);
+    const rendered = render(panel());
+    await act(async () => { rendered.rerender(panel('work:attached-2')); });
+    await act(async () => { resolveOld(reply(sample())); });
+    expect(screen.getByRole('status').textContent).toContain('now 0.75 cores');
+    expect(screen.getByRole('status').textContent).not.toContain('2.50 cores');
+  });
+
+  it('never fetches load without explicit execution capability or for an unattached/replay key', async () => {
+    getInv.mockResolvedValue(inv([]));
+    const fetchLoad = vi.fn();
+    vi.stubGlobal('fetch', fetchLoad);
+    const rendered = render(panel(scopeKey, false));
+    await act(async () => { rendered.rerender(panel('unattached:conv-1', true)); });
+    await act(async () => { rendered.rerender(panel('ws-fixture', true)); });
+    expect(fetchLoad).not.toHaveBeenCalled();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
 });
 
 describe('hasRunningBash', () => {
