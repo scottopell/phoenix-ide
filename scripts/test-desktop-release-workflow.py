@@ -259,7 +259,7 @@ if not (workflow.index('      - name: Remove protected material') <
     raise SystemExit('runtime acceptance must follow signing cleanup and gate successful retention')
 for fragment in [
     'if: failure()',
-    'path: .phoenix/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json',
+    'path: qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json',
 ]:
     if fragment not in workflow:
         raise SystemExit('failure upload must contain only a sanitized receipt, not private runtime data')
@@ -356,9 +356,11 @@ for fragment in ['macOS GUI/clean-host desktop pass', 'physical iPhone Safari', 
     if fragment not in notes:
         raise SystemExit(f'missing RC2 disclosure: {fragment}')
 
-qa_root = '$GITHUB_WORKSPACE/.phoenix/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}'
+qa_root = '$GITHUB_WORKSPACE/qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}'
 if f'qa="{qa_root}"' not in acceptance or '/target/signed-helper-acceptance/' in acceptance:
     raise SystemExit('runtime QA must be run/attempt-qualified outside the Cargo target cache')
+if any(part.startswith('.') for part in qa_root.split('/')[1:]):
+    raise SystemExit('receipt parent directories must not depend on hidden-file uploader behavior')
 if 'rm -' in acceptance:
     raise SystemExit('stale runtime directories must not be deleted or reused to satisfy freshness')
 wrapper = acceptance.split("          node --eval '\n", 1)[1].split("          ' \\\n", 1)[0]
@@ -424,7 +426,7 @@ runtime.mkdir(parents=True, exist_ok=True)
                 old_runtime.mkdir(parents=True)
                 marker = old_runtime / 'prior-proof'
                 marker.write_text('preserve old cache evidence')
-                prior_attempt = case / f'.phoenix/release-qa/100/1/{target}/runtime'
+                prior_attempt = case / f'qa-artifacts/release-qa/100/1/{target}/runtime'
                 prior_attempt.mkdir(parents=True)
                 (prior_attempt / 'prior-proof').write_text('preserve prior attempt evidence')
                 substitutions = {
@@ -452,7 +454,7 @@ runtime.mkdir(parents=True, exist_ok=True)
                 assert calls[2] == str(assets_dir / f'Phoenix-macos-{target}{archive_suffix}.zip')
                 assert calls[3] == str(assets_dir / f'phoenix_ide-{target}{suffix}')
                 assert calls[4:7] == ['a' * 40, '0.13.0-rc.2', target]
-                runtime = case / f'.phoenix/release-qa/100/2/{target}/runtime'
+                runtime = case / f'qa-artifacts/release-qa/100/2/{target}/runtime'
                 assert calls[7] == str(runtime)
                 assert (runtime / 'acceptance-receipt.json').exists() == (fail == '0')
                 assert marker.read_text() == 'preserve old cache evidence'

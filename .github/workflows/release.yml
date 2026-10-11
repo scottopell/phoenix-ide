@@ -388,7 +388,7 @@ jobs:
           umask 077
           short_commit="${{ needs.gate.outputs.commit }}"
           short_commit=${short_commit:0:12}
-          qa="$GITHUB_WORKSPACE/.phoenix/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}"
+          qa="$GITHUB_WORKSPACE/qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}"
           mkdir -p "$qa"
           if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then
             standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}-prepared-$short_commit"
@@ -427,7 +427,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-success
-          path: .phoenix/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json
+          path: qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json
           if-no-files-found: error
           retention-days: 14
       - name: Retain failed headless acceptance receipt
@@ -435,7 +435,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: headless-acceptance-${{ matrix.target }}-${{ needs.gate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}-failure
-          path: .phoenix/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json
+          path: qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json
           if-no-files-found: ignore
           retention-days: 14
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
