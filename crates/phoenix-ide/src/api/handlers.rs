@@ -23,6 +23,7 @@ use super::lifecycle_handlers::{
     list_fork_proposals, mark_merged, reject_task, request_changes_on_fork_proposal,
     retry_close_retirement, task_feedback,
 };
+use super::observation::{ConversationRouteObservations, CoordinatorRouteResponse};
 use super::product_conversations::{
     close_product_conversation, get_product_conversation, list_product_conversation_creations,
     list_product_conversations, rename_product_conversation,
@@ -999,48 +1000,14 @@ async fn get_existing_coordinator(
     }))
 }
 
-#[derive(Serialize)]
-struct CoordinatorRouteResponse {
-    coordinator_id: Option<String>,
-}
-
 async fn resolve_coordinator_route(
     State(state): State<AppState>,
     Path(conversation): Path<String>,
 ) -> Result<Json<CoordinatorRouteResponse>, AppError> {
-    let Some(coordinator_id) = state
-        .db
-        .coordinator_conversation_id()
+    ConversationRouteObservations::new(state.db.clone())
+        .resolve_coordinator_route(&conversation)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    else {
-        return Ok(Json(CoordinatorRouteResponse {
-            coordinator_id: None,
-        }));
-    };
-    let root_id = state
-        .db
-        .chain_root_of(&coordinator_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .unwrap_or_else(|| coordinator_id.clone());
-    let members = state
-        .db
-        .chain_members_forward(&root_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let matched = if members.iter().any(|id| id == &conversation) {
-        true
-    } else {
-        match state.db.get_conversation_by_slug(&conversation).await {
-            Ok(candidate) => members.iter().any(|id| id == &candidate.id),
-            Err(DbError::ConversationNotFound(_)) => false,
-            Err(error) => return Err(AppError::Internal(error.to_string())),
-        }
-    };
-    Ok(Json(CoordinatorRouteResponse {
-        coordinator_id: matched.then_some(coordinator_id),
-    }))
+        .map(Json)
 }
 
 async fn ensure_coordinator(
@@ -3866,44 +3833,20 @@ async fn get_conversation_route(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationRouteResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
+    ConversationRouteObservations::new(state.db.clone())
+        .get_conversation_route(&id)
         .await
-        .map_err(product_route_db_to_app)?;
-
-    Ok(Json(ConversationRouteResponse {
-        id: conversation.id,
-        slug: conversation.slug,
-    }))
-}
-
-fn product_route_db_to_app(error: DbError) -> AppError {
-    match error {
-        DbError::ConversationNotFound(id) => AppError::NotFound(id),
-        error => AppError::Internal(error.to_string()),
-    }
+        .map(Json)
 }
 
 async fn get_product_conversation_route(
     State(state): State<AppState>,
     Path(reference): Path<String>,
 ) -> Result<Json<ProductConversationRouteResponse>, AppError> {
-    let db = state.runtime.db();
-    let resolved = db
-        .resolve_ordinary_product_conversation(&reference)
+    ConversationRouteObservations::new(state.db.clone())
+        .get_product_conversation_route(&reference)
         .await
-        .map_err(product_route_db_to_app)?;
-    let conversation = db
-        .get_ordinary_product_conversation(&resolved.product_conversation_id)
-        .await
-        .map_err(product_route_db_to_app)?
-        .root
-        .conversation;
-    Ok(Json(ProductConversationRouteResponse {
-        transcript_row_id: conversation.id,
-    }))
+        .map(Json)
 }
 
 /// `GET /api/work-scope/:scope_key/inventory` — read-projection over the
@@ -7460,17 +7403,10 @@ async fn get_by_slug_route(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Json<ConversationRouteResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation_by_slug(&slug)
+    ConversationRouteObservations::new(state.db.clone())
+        .get_by_slug_route(&slug)
         .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    Ok(Json(ConversationRouteResponse {
-        id: conversation.id,
-        slug: conversation.slug,
-    }))
+        .map(Json)
 }
 
 async fn get_by_slug(

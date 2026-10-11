@@ -1,0 +1,15 @@
+id: observation-no-execution-authority
+language: Rust
+severity: error
+message: |
+  Conversation route observations must not depend on the live application,
+  runtime, providers, MCP or tool execution. Expose bounded observation methods
+  and keep execution authority at application composition/admission boundaries.
+files:
+  - "**/phoenix-ide/src/api/observation.rs"
+rule:
+  any:
+    - kind: type_identifier
+      regex: '^(AppState|RuntimeManager|ToolRegistry|ModelRegistry|McpClientManager)$'
+    - kind: identifier
+      regex: '^(AppState|RuntimeManager|ToolRegistry|ModelRegistry|McpClientManager)$'

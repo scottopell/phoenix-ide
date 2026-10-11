@@ -18,6 +18,7 @@ pub(crate) mod handlers;
 mod installation_ownership;
 mod lifecycle_handlers;
 mod local_reveal;
+pub(crate) mod observation;
 pub(crate) mod pr_monitoring;
 mod process_sample;
 pub(crate) mod product_conversations;
