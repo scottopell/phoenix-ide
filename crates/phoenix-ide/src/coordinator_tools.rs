@@ -996,7 +996,12 @@ mod tests {
         )
     }
 
-    async fn tool_and_context() -> (WorkScopeCoordinatorBash, ToolContext, crate::db::Database) {
+    async fn tool_and_context() -> (
+        WorkScopeCoordinatorBash,
+        ToolContext,
+        crate::db::Database,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("coordinator-bash.db");
         let db = crate::db::Database::open(db_path.to_str().unwrap())
@@ -1006,7 +1011,7 @@ mod tests {
         let retriever = Arc::new(db.fts_retriever());
         let tool = WorkScopeCoordinatorBash(GlobalReadService::new(db.clone(), retriever));
         let context = context("coordinator");
-        (tool, context, db)
+        (tool, context, db, dir)
     }
 
     /// Release-only, opt-in fixture benchmark. It is ignored so normal test
@@ -1857,7 +1862,7 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_bash_schema_requires_work_scope_id_for_run() {
-        let (tool, context, _db) = tool_and_context().await;
+        let (tool, context, _db, fixture_dir) = tool_and_context().await;
         let registry = context.bash_handle_registry().clone();
         let schema = tool.input_schema();
         assert!(schema["properties"].get("cwd").is_none());
@@ -1883,12 +1888,13 @@ mod tests {
             .await;
         assert!(!output.is_success());
         assert!(output.output().contains("requires work_scope_id"));
+        assert!(fixture_dir.path().exists());
         assert!(registry.snapshot_live_pgids().await.is_empty());
     }
 
     #[tokio::test]
     async fn coordinator_bash_rejects_unknown_work_scope_before_process_dispatch() {
-        let (tool, context, db) = tool_and_context().await;
+        let (tool, context, db, fixture_dir) = tool_and_context().await;
         let registry = context.bash_handle_registry().clone();
         let output = tool
             .run(
@@ -1912,6 +1918,7 @@ mod tests {
             "active persisted WorkScope with a live owner not found for Coordinator bash run",
             "unexpected Coordinator WorkScope admission error"
         );
+        assert!(fixture_dir.path().exists());
         let missing: Option<String> =
             sqlx::query_scalar("SELECT id FROM work_scopes WHERE id = 'missing-scope'")
                 .fetch_optional(db.pool())

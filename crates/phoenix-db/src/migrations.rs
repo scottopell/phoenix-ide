@@ -621,7 +621,24 @@ const MIGRATIONS: &[Migration] = &[
         name: "admit_server_overload_retrying_state",
         sql: MIGRATION_121,
     },
+    Migration {
+        version: 122,
+        name: "index_coordinator_event_child_foreign_keys",
+        sql: MIGRATION_122,
+    },
 ];
+
+const MIGRATION_122: &str = r"
+CREATE INDEX IF NOT EXISTS idx_messages_origin_subscription_event_id
+ON messages(origin_subscription_event_id)
+WHERE origin_subscription_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_steering_messages_origin_subscription_event_id
+ON steering_messages(origin_subscription_event_id)
+WHERE origin_subscription_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_durable_turns_origin_subscription_event_id
+ON durable_turns(origin_subscription_event_id)
+WHERE origin_subscription_event_id IS NOT NULL;
+";
 
 const MIGRATION_119: &str = r"
 CREATE TABLE close_runs (
@@ -1427,10 +1444,16 @@ BEGIN
 END;
 ";
 
+async fn index_outbox_children_before_rebuild(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
+    sqlx::raw_sql(MIGRATION_122).execute(&mut **tx).await?;
+    Ok(())
+}
+
 async fn run_migration_119(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
     let result = async {
         let mut tx = guard.connection().begin().await?;
+        index_outbox_children_before_rebuild(&mut tx).await?;
         for (object, source, target) in [
             ("close_obligations", "close_outcome IN ('archived', 'cancelled')", "close_outcome IN ('archived', 'cancelled', 'archived_cleanup_attention', 'close_incomplete')"),
             ("close_obligations_transition_graph", "(OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))", "(OLD.phase = 'settling_active_work' AND (NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection') OR (NEW.phase = 'completed' AND NEW.close_outcome = 'close_incomplete')))"),
@@ -1812,7 +1835,7 @@ mod migration_121_tests {
         .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version <= 120)
+            .filter(|migration| migration.version != 121)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -11254,6 +11277,9 @@ async fn apply_migration_body(
     tx: &mut Transaction<'_, Sqlite>,
     migration: &Migration,
 ) -> DbResult<()> {
+    if migration.version == 120 {
+        index_outbox_children_before_rebuild(tx).await?;
+    }
     if migration.version == 113 {
         settle_historical_continuation::run(tx).await?;
     } else {
@@ -12263,6 +12289,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+        assert_outbox_child_indexes_are_used(db.pool()).await;
+        let ledger: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE version IN (119, 122) ORDER BY version",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(ledger, vec![119, 122]);
     }
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
@@ -12959,6 +12993,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (122, "index_coordinator_event_child_foreign_keys"),
             (121, "admit_server_overload_retrying_state"),
             (120, "coordinator_question_wait_events"),
             (119, "close_cleanup_failures"),
@@ -13266,6 +13301,294 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap()
+    }
+
+    async fn coordinator_event_child_fixture(
+        event_count: i64,
+        null_rows_per_child: i64,
+    ) -> SqlitePool {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE coordinator_watch_events (
+                 event_id TEXT PRIMARY KEY,
+                 event_type TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                 row_id INTEGER PRIMARY KEY,
+                 origin_subscription_event_id TEXT
+                     REFERENCES coordinator_watch_events(event_id)
+             );
+             CREATE TABLE steering_messages (
+                 row_id INTEGER PRIMARY KEY,
+                 origin_subscription_event_id TEXT
+                     REFERENCES coordinator_watch_events(event_id)
+             );
+             CREATE TABLE durable_turns (
+                 row_id INTEGER PRIMARY KEY,
+                 origin_subscription_event_id TEXT
+                     REFERENCES coordinator_watch_events(event_id)
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE n(value) AS (
+                 VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < ?1
+             )
+             INSERT INTO coordinator_watch_events (event_id, event_type)
+             SELECT printf('historical-event-%06d', value), 'historical' FROM n",
+        )
+        .bind(event_count)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {table} (origin_subscription_event_id)
+                 SELECT event_id FROM coordinator_watch_events"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "WITH RECURSIVE n(value) AS (
+                     VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < ?1
+                 )
+                 INSERT INTO {table} (origin_subscription_event_id)
+                 SELECT NULL FROM n"
+            )))
+            .bind(null_rows_per_child)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    async fn outbox_drop_vm_steps(pool: &SqlitePool) -> u64 {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+
+        let steps = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&steps);
+        let mut connection = pool.acquire().await.unwrap();
+        {
+            let mut handle = connection.lock_handle().await.unwrap();
+            handle.set_progress_handler(1, move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        }
+        sqlx::raw_sql(
+            "BEGIN;
+             PRAGMA defer_foreign_keys = ON;
+             DROP TABLE coordinator_watch_events;",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::query("ROLLBACK")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        {
+            let mut handle = connection.lock_handle().await.unwrap();
+            handle.remove_progress_handler();
+        }
+        steps.load(Ordering::Relaxed)
+    }
+
+    async fn assert_outbox_child_indexes_are_used(pool: &SqlitePool) {
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             DELETE FROM coordinator_watch_events
+             WHERE event_id = '__missing_event__'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get("detail"))
+        .collect();
+        for (table, index) in [
+            ("messages", "idx_messages_origin_subscription_event_id"),
+            (
+                "steering_messages",
+                "idx_steering_messages_origin_subscription_event_id",
+            ),
+            (
+                "durable_turns",
+                "idx_durable_turns_origin_subscription_event_id",
+            ),
+        ] {
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains(&format!("SEARCH {table} USING COVERING INDEX {index}"))
+                }),
+                "missing indexed child lookup for {table}: {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_122_replaces_quadratic_outbox_drop_scans_with_indexed_lookups() {
+        let small = coordinator_event_child_fixture(32, 512).await;
+        let large = coordinator_event_child_fixture(64, 1024).await;
+        let small_unindexed = outbox_drop_vm_steps(&small).await;
+        let large_unindexed = outbox_drop_vm_steps(&large).await;
+        eprintln!(
+            "outbox DROP VM steps before indexes: small={small_unindexed}, large={large_unindexed}"
+        );
+        assert!(
+            large_unindexed > small_unindexed * 3,
+            "unindexed parent deletion must exhibit superlinear child scans: small={small_unindexed}, large={large_unindexed}"
+        );
+
+        sqlx::raw_sql(MIGRATION_122).execute(&small).await.unwrap();
+        sqlx::raw_sql(MIGRATION_122).execute(&large).await.unwrap();
+        sqlx::raw_sql(MIGRATION_122).execute(&large).await.unwrap();
+        assert_outbox_child_indexes_are_used(&large).await;
+        let small_indexed = outbox_drop_vm_steps(&small).await;
+        let large_indexed = outbox_drop_vm_steps(&large).await;
+        eprintln!(
+            "outbox DROP VM steps after indexes: small={small_indexed}, large={large_indexed}"
+        );
+        assert!(
+            large_indexed < small_indexed * 3,
+            "indexed parent deletion must remain linear: small={small_indexed}, large={large_indexed}"
+        );
+        assert!(
+            large_unindexed > large_indexed * 10,
+            "indexes must eliminate repeated large child scans: unindexed={large_unindexed}, indexed={large_indexed}"
+        );
+
+        let rows: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM messages),
+                 (SELECT COUNT(*) FROM steering_messages),
+                 (SELECT COUNT(*) FROM durable_turns)",
+        )
+        .fetch_one(&large)
+        .await
+        .unwrap();
+        assert_eq!(rows, (1088, 1088, 1088));
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&large)
+            .await
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_119_preinstalls_child_indexes_atomically_before_outbox_rebuild() {
+        let pool = coordinator_event_child_fixture(4, 8).await;
+        let mut tx = pool.begin().await.unwrap();
+        index_outbox_children_before_rebuild(&mut tx).await.unwrap();
+        let installed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'index' AND name IN (
+                 'idx_messages_origin_subscription_event_id',
+                 'idx_steering_messages_origin_subscription_event_id',
+                 'idx_durable_turns_origin_subscription_event_id'
+             )",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(installed, 3);
+        tx.rollback().await.unwrap();
+        let indexes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'index' AND name IN (
+                 'idx_messages_origin_subscription_event_id',
+                 'idx_steering_messages_origin_subscription_event_id',
+                 'idx_durable_turns_origin_subscription_event_id'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes, 0,
+            "migration-119 failure must roll back preinstalled indexes"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_120_preinstalls_child_indexes_before_its_outbox_drop() {
+        let pool = coordinator_event_child_fixture(4, 8).await;
+        let migration = Migration {
+            version: 120,
+            name: "test_outbox_rebuild",
+            sql: "PRAGMA defer_foreign_keys = ON; DROP TABLE coordinator_watch_events;",
+        };
+        let mut tx = pool.begin().await.unwrap();
+        apply_migration_body(&mut tx, &migration).await.unwrap();
+        let installed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'index' AND name IN (
+                 'idx_messages_origin_subscription_event_id',
+                 'idx_steering_messages_origin_subscription_event_id',
+                 'idx_durable_turns_origin_subscription_event_id'
+             )",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(installed, 3);
+        tx.rollback().await.unwrap();
+        let parent_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(parent_rows, 4);
+        let indexes_after_rollback: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'index' AND name LIKE 'idx_%_origin_subscription_event_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexes_after_rollback, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_122_upgrades_databases_already_at_121() {
+        let pool = coordinator_event_child_fixture(4, 8).await;
+        sqlx::query(
+            "CREATE TABLE _migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 121)
+        {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_outbox_child_indexes_are_used(&pool).await;
+        let recorded: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 122")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, "index_coordinator_event_child_foreign_keys");
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -17923,7 +18246,8 @@ mod tests {
                     (111, 'temporarily_skip_coordinator_watches'),
                     (113, 'temporarily_skip_historical_continuation_settlement'),
                     (119, 'temporarily_skip_close_cleanup_failures'),
-                    (120, 'temporarily_skip_coordinator_question_wait_events')",
+                    (120, 'temporarily_skip_coordinator_question_wait_events'),
+                    (122, 'temporarily_skip_coordinator_event_child_indexes')",
         )
         .execute(&pool)
         .await
@@ -18824,7 +19148,8 @@ mod tests {
                     (111, 'temporarily_skip_coordinator_watches'),
                     (113, 'temporarily_skip_historical_continuation_settlement'),
                     (119, 'temporarily_skip_close_cleanup_failures'),
-                    (120, 'temporarily_skip_coordinator_question_wait_events')",
+                    (120, 'temporarily_skip_coordinator_question_wait_events'),
+                    (122, 'temporarily_skip_coordinator_event_child_indexes')",
         )
         .execute(pool)
         .await
