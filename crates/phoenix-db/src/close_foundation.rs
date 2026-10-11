@@ -5748,20 +5748,26 @@ impl Database {
             ));
         }
         if let Some(snapshot) = snapshot {
-            if (initial && obligation.phase() != ClosePhase::RetirementRequested)
-                || (!initial
-                    && (obligation.phase() != ClosePhase::Completed
-                        || !matches!(
-                            obligation.close_outcome(),
-                            Some(
-                                CloseCompletionOutcome::CloseIncomplete
-                                    | CloseCompletionOutcome::ArchivedCleanupAttention
-                            )
-                        )))
-                || obligation.snapshot() != Some(snapshot)
-            {
+            let valid_phase = if initial {
+                matches!(
+                    obligation.phase(),
+                    ClosePhase::AwaitingRetirementInspection
+                        | ClosePhase::RetirementRequested
+                        | ClosePhase::NeedsRepair
+                )
+            } else {
+                obligation.phase() == ClosePhase::Completed
+                    && matches!(
+                        obligation.close_outcome(),
+                        Some(
+                            CloseCompletionOutcome::CloseIncomplete
+                                | CloseCompletionOutcome::ArchivedCleanupAttention
+                        )
+                    )
+            };
+            if !valid_phase || obligation.snapshot() != Some(snapshot) {
                 return Err(close_precondition(
-                    "expected-resource failure requires the exact active RetirementRequested snapshot",
+                    "expected-resource failure requires an exact active retirement snapshot",
                 ));
             }
         } else if obligation.phase() == ClosePhase::Completed {
@@ -5899,12 +5905,20 @@ impl Database {
             }
         }
         if let Some(snapshot) = snapshot.filter(|_| initial) {
+            let resource_reason = if request.reason == RetirementFailureReason::Interrupted {
+                RetirementFailureReason::ManualRepairRequired
+            } else {
+                request.reason
+            };
             sqlx::query(
                 "INSERT INTO close_retirement_resources (
                 attempt_id, scope, inspection_generation, inspection_fingerprint,
                 resource_kind, identity_kind, identity_codec, identity_value,
                 proof_kind, absence_basis, residual_reason, detail, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11, ?11)
+             ON CONFLICT(attempt_id, scope, inspection_generation, inspection_fingerprint,
+                         resource_kind, identity_kind, identity_value)
+             DO NOTHING",
             )
             .bind(request.attempt_id.as_str())
             .bind(scope.as_str())
@@ -5914,7 +5928,7 @@ impl Database {
             .bind(identity.identity_kind())
             .bind(identity.codec())
             .bind(identity.value())
-            .bind(request.reason.as_str())
+            .bind(resource_reason.as_str())
             .bind(&request.detail)
             .bind(&occurred_at)
             .execute(&mut **tx)
@@ -5924,7 +5938,17 @@ impl Database {
                 attempt_id, scope, inspection_generation, inspection_fingerprint,
                 resource_kind, identity_kind, identity_codec, identity_value,
                 proof_kind, absence_basis, residual_reason, detail, recorded_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11)",
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM close_retirement_resource_history
+                 WHERE attempt_id = ?1 AND scope = ?2
+                   AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                   AND resource_kind = ?5 AND identity_kind = ?6
+                   AND identity_codec = ?7 AND identity_value = ?8
+                   AND proof_kind = 'residual' AND absence_basis IS NULL
+                   AND residual_reason = ?9 AND detail = ?10
+             )",
             )
             .bind(request.attempt_id.as_str())
             .bind(scope.as_str())
@@ -5934,7 +5958,7 @@ impl Database {
             .bind(identity.identity_kind())
             .bind(identity.codec())
             .bind(identity.value())
-            .bind(request.reason.as_str())
+            .bind(resource_reason.as_str())
             .bind(&request.detail)
             .bind(&occurred_at)
             .execute(&mut **tx)
@@ -13388,6 +13412,75 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn initial_interruption_after_return_to_reinspection_terminalizes_exact_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        let request =
+            initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
+        let CloseCleanupFailureAuthority::ExpectedResource {
+            scope,
+            snapshot,
+            resource,
+        } = &request.authority
+        else {
+            panic!("fixture must carry expected-resource authority")
+        };
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: request.attempt_id.clone(),
+            scope: scope.clone(),
+            residual: resource.clone(),
+            reason: request.reason,
+            detail: request.detail.clone(),
+        })
+        .await
+        .unwrap();
+        db.retry_close_retirement(&request.attempt_id)
+            .await
+            .unwrap();
+        let reopened = db
+            .get_close_obligation(request.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(reopened.phase(), ClosePhase::AwaitingRetirementInspection);
+        assert_eq!(reopened.snapshot(), Some(snapshot));
+
+        let run_ref = CloseRunRef::initial(request.attempt_id.clone());
+        let terminal = db.classify_interrupted_close_run(&run_ref).await.unwrap();
+        assert_eq!(
+            terminal.close_outcome(),
+            Some(CloseCompletionOutcome::CloseIncomplete)
+        );
+        assert_eq!(terminal.snapshot(), Some(snapshot));
+        let history: Vec<String> = sqlx::query_scalar(
+            "SELECT residual_reason FROM close_retirement_resource_history
+             WHERE attempt_id = ?1 ORDER BY residual_reason",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(history, vec!["manual_repair_required", "removal_failed"]);
+        let run = db.get_close_run(&run_ref).await.unwrap();
+        assert_eq!(run.status, CloseRunStatus::Stopped);
+        let failure: (String, String, String) = sqlx::query_as(
+            "SELECT stop_certainty, reason, detail
+             FROM close_cleanup_failures WHERE attempt_id = ?1 AND cleanup_run_ordinal = 1",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            failure,
+            (
+                "shutdown_uncertain".into(),
+                "interrupted".into(),
+                "Close run 1 interrupted in awaiting_retirement_inspection; startup observed retained authority only".into()
+            )
+        );
     }
 
     #[allow(clippy::too_many_lines)]
