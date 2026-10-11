@@ -20,7 +20,7 @@
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::SystemTime;
@@ -80,6 +80,12 @@ impl LiveHandleProcessGroup {
             self.launch_identity.stable_identity()
         )
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveHandleSnapshot {
+    pub groups: Vec<LiveHandleProcessGroup>,
+    pub lifecycle_epochs: HashMap<ResourceScopeKey, Option<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +234,7 @@ pub struct ResourceScopeKeyHandles {
     teardown_started: bool,
     /// Cancellation-safe admission count and teardown notification.
     admission: Arc<SpawnAdmission>,
+    lifecycle_epoch: Arc<AtomicU64>,
     /// Monotonic identity of the lifecycle request that most recently fenced admission.
     teardown_generation: u64,
 }
@@ -321,8 +328,14 @@ impl ResourceScopeKeyHandles {
     /// for cap enforcement via [`Self::check_cap`] BEFORE constructing
     /// the OS process. Returns the inserted handle for chaining.
     pub fn insert(&mut self, handle: Arc<Handle>) -> Arc<Handle> {
-        self.handles
-            .insert(handle.handle_id.clone(), handle.clone());
+        handle.bind_lifecycle_epoch(&self.lifecycle_epoch);
+        if let Some(replaced) = self
+            .handles
+            .insert(handle.handle_id.clone(), handle.clone())
+        {
+            replaced.clear_lifecycle_epoch();
+        }
+        self.lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         handle
     }
 
@@ -330,9 +343,17 @@ impl ResourceScopeKeyHandles {
     /// to `BashHandleRegistry::remove`; not currently used by the
     /// hard-delete cascade (which removes the whole `ResourceScopeKey` table) but
     /// kept on the API surface for surgical removal flows.
-    #[allow(dead_code)]
     pub fn remove(&mut self, id: &HandleId) -> Option<Arc<Handle>> {
-        self.handles.remove(id)
+        let removed = self.handles.remove(id);
+        self.record_removal(removed.as_ref());
+        removed
+    }
+
+    fn record_removal(&self, removed: Option<&Arc<Handle>>) {
+        if let Some(handle) = removed {
+            handle.clear_lifecycle_epoch();
+            self.lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     pub fn remove_for_actor(&mut self, actor: &EffectiveResourceAccess) -> Vec<Arc<Handle>> {
@@ -344,9 +365,7 @@ impl ResourceScopeKeyHandles {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        ids.into_iter()
-            .filter_map(|id| self.handles.remove(&id))
-            .collect()
+        ids.into_iter().filter_map(|id| self.remove(&id)).collect()
     }
 
     pub fn remove_restricted_created_by(&mut self, conversation_id: &str) -> Vec<Arc<Handle>> {
@@ -359,13 +378,18 @@ impl ResourceScopeKeyHandles {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        ids.into_iter()
-            .filter_map(|id| self.handles.remove(&id))
-            .collect()
+        ids.into_iter().filter_map(|id| self.remove(&id)).collect()
     }
 
     fn take_all(&mut self) -> Vec<Arc<Handle>> {
-        self.handles.drain().map(|(_, handle)| handle).collect()
+        let removed: Vec<_> = self.handles.drain().map(|(_, handle)| handle).collect();
+        for handle in &removed {
+            handle.clear_lifecycle_epoch();
+        }
+        if !removed.is_empty() {
+            self.lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        removed
     }
 
     /// REQ-BASH-005: enforce the cap before allocating a new handle id /
@@ -743,13 +767,32 @@ impl BashHandleRegistry {
     /// Snapshot live process groups together with their authoritative scope and
     /// handle identity. Read-only and non-creating.
     pub async fn snapshot_live_process_groups(&self) -> Vec<LiveHandleProcessGroup> {
-        let mut out = Vec::new();
+        self.snapshot_live_process_groups_with_epochs().await.groups
+    }
+
+    pub async fn snapshot_lifecycle_epochs(&self) -> HashMap<ResourceScopeKey, Option<u64>> {
+        let map = self.inner.read().await;
+        let mut epochs = HashMap::new();
+        for (owner, entry) in map.iter() {
+            let table = entry.read().await;
+            epochs.insert(
+                owner.clone(),
+                Some(table.lifecycle_epoch.load(Ordering::SeqCst)),
+            );
+        }
+        epochs
+    }
+
+    pub async fn snapshot_live_process_groups_with_epochs(&self) -> LiveHandleSnapshot {
+        let mut groups = Vec::new();
+        let mut lifecycle_epochs = HashMap::new();
         let map = self.inner.read().await;
         for (owner, entry) in map.iter() {
             let scope_handles = entry.read().await;
+            let epoch_before = scope_handles.lifecycle_epoch.load(Ordering::SeqCst);
             for handle in scope_handles.all() {
                 if let Some(pgid) = handle.live_pgid().await {
-                    out.push(LiveHandleProcessGroup {
+                    groups.push(LiveHandleProcessGroup {
                         work_scope: owner.clone(),
                         control_scope: handle.controller_scope.clone(),
                         handle_id: handle.handle_id.clone(),
@@ -758,8 +801,16 @@ impl BashHandleRegistry {
                     });
                 }
             }
+            let epoch_after = scope_handles.lifecycle_epoch.load(Ordering::SeqCst);
+            lifecycle_epochs.insert(
+                owner.clone(),
+                (epoch_before == epoch_after).then_some(epoch_after),
+            );
         }
-        out
+        LiveHandleSnapshot {
+            groups,
+            lifecycle_epochs,
+        }
     }
 
     pub async fn owner_handles(&self, owner: &ResourceScopeKey) -> Vec<RegisteredHandle> {

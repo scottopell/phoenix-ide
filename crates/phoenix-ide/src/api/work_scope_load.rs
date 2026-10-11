@@ -48,6 +48,7 @@ struct CpuPoint {
     readings: BTreeMap<String, BTreeMap<u32, CpuReading>>,
     complete: BTreeMap<String, bool>,
     launches: BTreeMap<String, BTreeSet<String>>,
+    lifecycle_epochs: BTreeMap<String, Option<u64>>,
 }
 
 struct CpuInterval {
@@ -107,7 +108,11 @@ impl WorkScopeLoadService {
     }
 
     async fn tick(&self) {
-        let groups = self.handles.snapshot_live_process_groups().await;
+        let snapshot = self
+            .handles
+            .snapshot_live_process_groups_with_epochs()
+            .await;
+        let groups = &snapshot.groups;
         let mut state = self.cpu.lock().await;
         let now = Instant::now();
         prune_history(&mut state.intervals, now);
@@ -129,6 +134,20 @@ impl WorkScopeLoadService {
             state.latest.clear();
             return;
         };
+        let epochs_after = self.handles.snapshot_lifecycle_epochs().await;
+        let lifecycle_epochs = groups
+            .iter()
+            .map(|group| {
+                let key = group.work_scope.stable_key();
+                let before = snapshot
+                    .lifecycle_epochs
+                    .get(&group.work_scope)
+                    .copied()
+                    .flatten();
+                let after = epochs_after.get(&group.work_scope).copied().flatten();
+                (key, if before == after { before } else { None })
+            })
+            .collect();
         let launches = groups.iter().fold(
             BTreeMap::<String, BTreeSet<String>>::new(),
             |mut by_scope, group| {
@@ -145,6 +164,7 @@ impl WorkScopeLoadService {
             readings,
             complete,
             launches,
+            lifecycle_epochs,
         };
         if let Some(previous) = state.previous.take() {
             let elapsed = now.duration_since(previous.at);
@@ -184,7 +204,11 @@ impl WorkScopeLoadService {
     }
 
     pub async fn summary(&self, scope: &ResourceScopeKey) -> WorkScopeLoadSummary {
-        let groups = self.handles.snapshot_live_process_groups().await;
+        let snapshot = self
+            .handles
+            .snapshot_live_process_groups_with_epochs()
+            .await;
+        let groups = &snapshot.groups;
         let observation = if groups.iter().any(|group| group.work_scope == *scope) {
             Some(
                 self.memory_monitor
@@ -194,10 +218,17 @@ impl WorkScopeLoadService {
         } else {
             None
         };
+        let epochs = self.handles.snapshot_lifecycle_epochs().await;
         let state = self.cpu.lock().await;
         summarize(
             scope,
-            &groups,
+            groups,
+            snapshot
+                .lifecycle_epochs
+                .get(scope)
+                .copied()
+                .flatten()
+                .filter(|epoch| epochs.get(scope) == Some(&Some(*epoch))),
             observation.as_deref(),
             &state,
             Instant::now(),
@@ -217,7 +248,11 @@ impl WorkScopeLoadService {
             .into_iter()
             .filter_map(|id| ResourceScopeKey::from_stable_key(&format!("work:{id}")))
             .collect();
-        let groups = self.handles.snapshot_live_process_groups().await;
+        let snapshot = self
+            .handles
+            .snapshot_live_process_groups_with_epochs()
+            .await;
+        let groups = &snapshot.groups;
         let observation = if groups
             .iter()
             .any(|group| scopes.contains(&group.work_scope))
@@ -230,6 +265,7 @@ impl WorkScopeLoadService {
         } else {
             None
         };
+        let epochs = self.handles.snapshot_lifecycle_epochs().await;
         let state = self.cpu.lock().await;
         let now = Instant::now();
         let sampled_at = Utc::now();
@@ -238,7 +274,13 @@ impl WorkScopeLoadService {
             .map(|scope| {
                 summarize(
                     scope,
-                    &groups,
+                    groups,
+                    snapshot
+                        .lifecycle_epochs
+                        .get(scope)
+                        .copied()
+                        .flatten()
+                        .filter(|epoch| epochs.get(scope) == Some(&Some(*epoch))),
                     observation.as_deref(),
                     &state,
                     now,
@@ -261,6 +303,7 @@ fn prune_history(history: &mut VecDeque<CpuInterval>, now: Instant) {
 fn summarize(
     scope: &ResourceScopeKey,
     groups: &[LiveHandleProcessGroup],
+    lifecycle_epoch: Option<u64>,
     observation: Option<&ResourceObservationGeneration>,
     state: &CpuState,
     now: Instant,
@@ -277,7 +320,10 @@ fn summarize(
         .map(|group| group.stable_resource_identity())
         .collect();
     let recent = state.previous.as_ref().is_some_and(|point| {
-        now.duration_since(point.at) <= CADENCE * 2 && point.launches.get(&key) == Some(&launches)
+        now.duration_since(point.at) <= CADENCE * 2
+            && point.launches.get(&key) == Some(&launches)
+            && lifecycle_epoch.is_some()
+            && point.lifecycle_epochs.get(&key) == Some(&lifecycle_epoch)
     });
     let latest = if active {
         recent
@@ -318,7 +364,7 @@ fn summarize(
         sampled_at: observation.map_or(sampled_at, |value| value.sampled_at),
         live_jobs: scoped.len().try_into().unwrap_or(u32::MAX),
         cpu_cores_latest: latest,
-        cpu_sampled_at: (active && recent && state.latest.contains_key(&key))
+        cpu_sampled_at: (active && recent && latest.is_some())
             .then(|| state.previous.as_ref().map(|point| point.sampled_at))
             .flatten(),
         cpu_one_minute: window(&state.intervals, &key, now, 60),
@@ -425,6 +471,9 @@ fn cpu_deltas(
         let mut valid = after.complete.get(scope) == Some(&true)
             && before.complete.get(scope) == Some(&true)
             && after.launches.get(scope) == before.launches.get(scope)
+            && after.lifecycle_epochs.get(scope).is_some_and(|epoch| {
+                epoch.is_some() && before.lifecycle_epochs.get(scope) == Some(epoch)
+            })
             && before
                 .readings
                 .get(scope)
@@ -657,6 +706,7 @@ mod tests {
             )]),
             complete: BTreeMap::from([("work:a".into(), true)]),
             launches: BTreeMap::from([("work:a".into(), BTreeSet::from(["launch".into()]))]),
+            lifecycle_epochs: BTreeMap::from([("work:a".into(), Some(1))]),
         }
     }
 
@@ -702,6 +752,153 @@ mod tests {
             cpu_deltas(&before, &after, Duration::from_secs(5))["work:a"],
             None
         );
+    }
+
+    #[tokio::test]
+    async fn transient_handle_between_samples_invalidates_only_crossed_interval() {
+        use phoenix_tools::bash::handle::{FinalCause, Handle, HandleId, TOMBSTONE_TAIL_LINES};
+        let registry = BashHandleRegistry::new();
+        let scope =
+            ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse("a").unwrap());
+        let new_handle = |id: &str, pid: u32| {
+            Handle::new_live(
+                scope.clone(),
+                HandleId::new(id),
+                id.into(),
+                None,
+                "/tmp".into(),
+                i32::try_from(pid).unwrap(),
+                pid,
+                1024,
+            )
+        };
+        registry
+            .register_existing_handle(&scope, new_handle("long", 10))
+            .await;
+        let before_snapshot = registry.snapshot_live_process_groups_with_epochs().await;
+        let before_epoch = before_snapshot.lifecycle_epochs[&scope];
+        assert_eq!(before_snapshot.groups.len(), 1);
+        let transient = new_handle("short", 11);
+        registry
+            .register_existing_handle(&scope, transient.clone())
+            .await;
+        assert!(
+            transient
+                .transition_to_terminal(
+                    FinalCause::Exited { exit_code: Some(0) },
+                    Duration::from_secs(1),
+                    std::time::SystemTime::now(),
+                    TOMBSTONE_TAIL_LINES
+                )
+                .await
+        );
+        let after_snapshot = registry.snapshot_live_process_groups_with_epochs().await;
+        let after_epoch = after_snapshot.lifecycle_epochs[&scope];
+        assert_eq!(after_snapshot.groups, before_snapshot.groups);
+        assert_eq!(after_epoch.unwrap(), before_epoch.unwrap() + 2);
+
+        let now = Instant::now();
+        let mut before = point(now, 10.0);
+        before
+            .lifecycle_epochs
+            .insert(scope.stable_key(), before_epoch);
+        let mut after = point(now + CADENCE, 15.0);
+        after
+            .lifecycle_epochs
+            .insert(scope.stable_key(), after_epoch);
+        let live_launches = BTreeSet::from([after_snapshot.groups[0].stable_resource_identity()]);
+        before
+            .launches
+            .insert(scope.stable_key(), live_launches.clone());
+        after
+            .launches
+            .insert(scope.stable_key(), live_launches.clone());
+        assert_eq!(cpu_deltas(&before, &after, CADENCE)["work:a"], None);
+        let mut state = CpuState {
+            previous: Some(after.clone()),
+            latest: cpu_deltas(&before, &after, CADENCE),
+            ..CpuState::default()
+        };
+        state.intervals.push_back(CpuInterval {
+            end: after.at,
+            elapsed: CADENCE,
+            cores: state.latest.clone(),
+        });
+        let summarize_live = |state: &CpuState, at| {
+            summarize(
+                &scope,
+                &after_snapshot.groups,
+                after_epoch,
+                None,
+                state,
+                at,
+                Utc::now(),
+            )
+        };
+        let summary = summarize_live(&state, after.at);
+        assert_eq!(summary.cpu_cores_latest, None);
+        assert_eq!(summary.cpu_sampled_at, None);
+        assert!(summary.cpu_one_minute.coverage_seconds.abs() < f64::EPSILON);
+
+        let mut stable = point(after.at + CADENCE, 20.0);
+        stable
+            .lifecycle_epochs
+            .insert(scope.stable_key(), after_epoch);
+        stable.launches.insert(scope.stable_key(), live_launches);
+        assert_eq!(cpu_deltas(&after, &stable, CADENCE)["work:a"], Some(1.5));
+        state.latest = cpu_deltas(&after, &stable, CADENCE);
+        state.previous = Some(stable.clone());
+        state.intervals.push_back(CpuInterval {
+            end: stable.at,
+            elapsed: CADENCE,
+            cores: state.latest.clone(),
+        });
+        let summary = summarize_live(&state, stable.at);
+        assert_eq!(summary.cpu_cores_latest, Some(1.5));
+        assert!(
+            (summary.cpu_one_minute.coverage_seconds - CADENCE.as_secs_f64()).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn unavailable_latest_has_no_cpu_timestamp() {
+        let now = Instant::now();
+        let scope =
+            ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse("a").unwrap());
+        let groups = vec![group(scope.clone(), "b-1")];
+        let before = point(now.checked_sub(CADENCE).unwrap(), 2.0);
+        let mut after = point(now, 3.0);
+        for invalid in ["membership", "counter"] {
+            after.readings = point(now, 3.0).readings;
+            if invalid == "membership" {
+                after.readings.get_mut("work:a").unwrap().remove(&11);
+            } else {
+                after
+                    .readings
+                    .get_mut("work:a")
+                    .unwrap()
+                    .get_mut(&10)
+                    .unwrap()
+                    .seconds = 1.0;
+            }
+            let mut state = CpuState {
+                previous: Some(after.clone()),
+                latest: cpu_deltas(&before, &after, CADENCE),
+                ..CpuState::default()
+            };
+            state.previous.as_mut().unwrap().launches.insert(
+                scope.stable_key(),
+                BTreeSet::from([groups[0].stable_resource_identity()]),
+            );
+            assert!(state.latest.contains_key(&scope.stable_key()));
+            let summary = summarize(&scope, &groups, Some(1), None, &state, now, Utc::now());
+            assert_eq!(summary.cpu_cores_latest, None, "{invalid}");
+            assert_eq!(summary.cpu_sampled_at, None, "{invalid}");
+            state.latest.insert(scope.stable_key(), Some(0.0));
+            let summary = summarize(&scope, &groups, Some(2), None, &state, now, Utc::now());
+            assert_eq!(summary.cpu_cores_latest, None);
+            assert_eq!(summary.cpu_sampled_at, None);
+        }
     }
 
     #[test]
@@ -801,7 +998,7 @@ mod tests {
             elapsed: Duration::from_secs(5),
             cores: BTreeMap::from([("work:a".into(), Some(1.0))]),
         });
-        let result = summarize(&scope, &[], None, &state, now, Utc::now());
+        let result = summarize(&scope, &[], None, None, &state, now, Utc::now());
         assert_eq!(result.cpu_cores_latest, Some(0.0));
         assert_eq!(result.cpu_sampled_at, None);
         assert_eq!(result.cpu_one_minute.average_cores, Some(1.0));
@@ -826,22 +1023,33 @@ mod tests {
                     scope.stable_key(),
                     BTreeSet::from([groups[0].stable_resource_identity()]),
                 )]),
+                lifecycle_epochs: BTreeMap::from([(scope.stable_key(), Some(1))]),
             }),
             ..CpuState::default()
         };
         state.latest.insert(scope.stable_key(), Some(0.5));
         let memory_at = Utc::now();
-        let result = summarize(&scope, &groups, None, &state, now, memory_at);
+        let result = summarize(&scope, &groups, Some(1), None, &state, now, memory_at);
         assert_eq!(result.sampled_at, memory_at);
         assert_eq!(result.cpu_sampled_at, Some(cpu_at));
         assert_eq!(result.cpu_cores_latest, Some(0.5));
         assert_eq!(
-            summarize(&scope, &groups, None, &state, now + CADENCE * 3, memory_at).cpu_sampled_at,
+            summarize(
+                &scope,
+                &groups,
+                Some(1),
+                None,
+                &state,
+                now + CADENCE * 3,
+                memory_at
+            )
+            .cpu_sampled_at,
             None
         );
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn memory_gaps_are_scoped_not_host_wide() {
         use super::super::deployment::HostResources;
         use super::super::process_sample::ProcessObservation;
@@ -885,8 +1093,24 @@ mod tests {
             incomplete_bash_scopes: BTreeSet::from([b.stable_key()]),
         };
         let state = CpuState::default();
-        let a_summary = summarize(&a, &groups, Some(&observation), &state, now, Utc::now());
-        let b_summary = summarize(&b, &groups, Some(&observation), &state, now, Utc::now());
+        let a_summary = summarize(
+            &a,
+            &groups,
+            None,
+            Some(&observation),
+            &state,
+            now,
+            Utc::now(),
+        );
+        let b_summary = summarize(
+            &b,
+            &groups,
+            None,
+            Some(&observation),
+            &state,
+            now,
+            Utc::now(),
+        );
         assert_eq!(
             (a_summary.memory_bytes, a_summary.process_count),
             (Some(123), Some(1))
@@ -901,18 +1125,45 @@ mod tests {
             pids: BTreeSet::from([10]),
         });
         assert_eq!(
-            summarize(&a, &groups, Some(&observation), &state, now, Utc::now()).memory_bytes,
+            summarize(
+                &a,
+                &groups,
+                None,
+                Some(&observation),
+                &state,
+                now,
+                Utc::now()
+            )
+            .memory_bytes,
             None
         );
         observation.incomplete_bash_scopes.clear();
         assert_eq!(
-            summarize(&b, &groups, Some(&observation), &state, now, Utc::now()).memory_bytes,
+            summarize(
+                &b,
+                &groups,
+                None,
+                Some(&observation),
+                &state,
+                now,
+                Utc::now()
+            )
+            .memory_bytes,
             None
         );
         observation.handles.pop();
         observation.observations.clear();
         assert_eq!(
-            summarize(&a, &groups, Some(&observation), &state, now, Utc::now()).process_count,
+            summarize(
+                &a,
+                &groups,
+                None,
+                Some(&observation),
+                &state,
+                now,
+                Utc::now()
+            )
+            .process_count,
             None
         );
     }

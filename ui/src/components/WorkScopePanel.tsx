@@ -61,9 +61,10 @@ function useWorkScopeLoad(scopeKey: string, conversationId: string, executionCap
     scopeKey: string;
     conversationId: string;
     summary: WorkScopeLoadSummary | null;
+    receivedAt: number;
     error: boolean;
   } | null>(null);
-  const [now, setNow] = useState(() => Date.now());
+  const [now, setNow] = useState(() => performance.now());
 
   useEffect(() => {
     if (!enabled) return;
@@ -79,18 +80,19 @@ function useWorkScopeLoad(scopeKey: string, conversationId: string, executionCap
         if (!response.ok) throw new Error('Work-scope load unavailable');
         const summary = await response.json() as WorkScopeLoadSummary;
         if (!cancelled) {
-          setNow(Date.now());
-          setResult({ scopeKey, conversationId, summary: summary.scope_key === scopeKey ? summary : null, error: summary.scope_key !== scopeKey });
+          const receivedAt = performance.now();
+          setNow(receivedAt);
+          setResult({ scopeKey, conversationId, summary: summary.scope_key === scopeKey ? summary : null, receivedAt, error: summary.scope_key !== scopeKey });
         }
       } catch {
-        if (!cancelled) setResult({ scopeKey, conversationId, summary: null, error: true });
+        if (!cancelled) setResult({ scopeKey, conversationId, summary: null, receivedAt: performance.now(), error: true });
       } finally {
         inFlight = false;
       }
     };
     void poll();
     const timer = setInterval(() => {
-      setNow(Date.now());
+      setNow(performance.now());
       void poll();
     }, LOAD_POLL_INTERVAL_MS);
     return () => {
@@ -102,9 +104,9 @@ function useWorkScopeLoad(scopeKey: string, conversationId: string, executionCap
 
   const current = enabled && result?.scopeKey === scopeKey && result.conversationId === conversationId ? result : null;
   const sampled = current?.summary;
-  const age = sampled ? now - Date.parse(sampled.sampled_at) : NaN;
-  const fresh = !current?.error && Number.isFinite(age) && age >= 0 && age <= LOAD_STALE_AFTER_MS;
-  return enabled ? { summary: fresh ? sampled : null, status: current?.error ? 'unavailable' : sampled && !fresh ? 'stale' : 'loading', now } as const : null;
+  const age = current ? now - current.receivedAt : NaN;
+  const fresh = !current?.error && Number.isFinite(age) && age <= LOAD_STALE_AFTER_MS;
+  return enabled ? { summary: fresh ? sampled : null, status: current?.error ? 'unavailable' : sampled && !fresh ? 'stale' : 'loading', age } as const : null;
 }
 
 function formatCores(value: number | null): string {
@@ -119,14 +121,14 @@ function WorkScopeLoadIndicator({ load }: { load: NonNullable<ReturnType<typeof 
     ['5m', summary.cpu_five_minutes],
     ['15m', summary.cpu_fifteen_minutes],
   ] as const;
-  const age = Math.max(0, Math.floor((load.now - Date.parse(summary.sampled_at)) / 1000));
-  const cpuAge = summary.cpu_sampled_at === null ? NaN : load.now - Date.parse(summary.cpu_sampled_at);
+  const age = Math.max(0, Math.floor(load.age / 1000));
+  const cpuAge = summary.cpu_sampled_at === null ? NaN : Date.parse(summary.sampled_at) - Date.parse(summary.cpu_sampled_at) + load.age;
   const cpuFresh = Number.isFinite(cpuAge) && cpuAge >= 0 && cpuAge <= LOAD_STALE_AFTER_MS;
   const coverage = windows.map(([name, window]) => `${name}: ${Math.round(window.coverage_seconds)}s coverage`).join(' · ');
   const idle = summary.live_jobs === 0 && summary.cpu_cores_latest === 0;
   const cpuAgeLabel = idle ? 'CPU idle: no owned live bash jobs' : cpuFresh ? `CPU ${Math.floor(cpuAge / 1000)}s ago` : 'CPU latest unavailable';
   return (
-    <div className="ws-load" role="status" title={`Sampled ${age}s ago · ${cpuAgeLabel} · ${coverage}`}>
+    <div className="ws-load" role="status" title={`Sampled ${age}s ago · Server sampled at ${summary.sampled_at} · ${cpuAgeLabel} · ${coverage}`}>
       <span className="ws-load-label">Load</span>
       <span>now {formatCores(idle || cpuFresh ? summary.cpu_cores_latest : null)}</span>
       {windows.map(([name, window]) => <span key={name}>{name} {formatCores(window.average_cores)}</span>)}

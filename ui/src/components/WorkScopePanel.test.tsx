@@ -156,10 +156,12 @@ describe('WorkScope load indicator', () => {
     const response = new Promise<ReturnType<typeof reply>>((done) => { resolve = done; });
     vi.stubGlobal('fetch', vi.fn().mockReturnValue(response));
     await act(async () => { render(panel()); });
-    vi.setSystemTime(Date.now() + 200);
-    await act(async () => { resolve(reply(sample())); });
+    await act(async () => { vi.advanceTimersByTime(200); });
+    const timestamp = new Date(Date.now() - 60 * 60_000).toISOString();
+    await act(async () => { resolve(reply(sample({ sampled_at: timestamp, cpu_sampled_at: timestamp }))); });
     expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
-    expect(screen.getByRole('status').textContent).not.toContain('stale');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('Sampled 0s ago');
+    expect(screen.getByRole('status').getAttribute('title')).toContain(`Server sampled at ${timestamp}`);
   });
 
   it('shows observed idle zero without requiring a native CPU sample and retains recent history', async () => {
@@ -196,6 +198,37 @@ describe('WorkScope load indicator', () => {
     expect(indicator.textContent).not.toContain('0.00 cores');
   });
 
+  it.each([-1, 1])('keeps a newly received summary and its same-time CPU valid across %ih server skew', async (direction) => {
+    getInv.mockResolvedValue(inv([]));
+    const serverTime = new Date(Date.now() + direction * 60 * 60_000).toISOString();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(reply(sample({ sampled_at: serverTime, cpu_sampled_at: serverTime })))
+      .mockImplementation(() => new Promise(() => {})));
+    await act(async () => { render(panel()); });
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU 0s ago');
+    expect(screen.getByRole('status').getAttribute('title')).toContain(`Server sampled at ${serverTime}`);
+    vi.setSystemTime(Date.now() - direction * 2 * 60 * 60_000);
+    await act(async () => { vi.advanceTimersByTime(5000); });
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('Sampled 5s ago');
+  });
+
+  it('hides a CPU sample older than 30s in the server clock domain but retains history and fresh memory', async () => {
+    getInv.mockResolvedValue(inv([]));
+    const sampledAt = new Date(Date.now() + 60 * 60_000);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample({
+      sampled_at: sampledAt.toISOString(),
+      cpu_sampled_at: new Date(sampledAt.getTime() - 30_000).toISOString(),
+    }))));
+    await act(async () => { render(panel()); });
+    const indicator = screen.getByRole('status');
+    expect(indicator.textContent).toContain('now —');
+    expect(indicator.textContent).toContain('1m 1.25 cores');
+    expect(indicator.textContent).toContain('mem 128.0 MB');
+    expect(indicator.getAttribute('title')).toContain('Sampled 0s ago');
+    expect(indicator.getAttribute('title')).toContain('CPU latest unavailable');
+  });
+
   it('does not call a recent memory snapshot a fresh CPU sample; retains historical coverage', async () => {
     getInv.mockResolvedValue(inv([]));
     const fetchLoad = vi.fn().mockResolvedValue(reply(sample({
@@ -211,11 +244,15 @@ describe('WorkScope load indicator', () => {
     expect(screen.getByRole('status').getAttribute('title')).toContain('CPU latest unavailable · 1m: 5s coverage');
 
     await act(async () => { rendered.rerender(panel()); });
-    fetchLoad.mockResolvedValue(reply(sample({ cpu_sampled_at: new Date(Date.now() - 20_000).toISOString() })));
+    const serverTime = new Date(Date.now() - 60 * 60_000).toISOString();
+    fetchLoad.mockResolvedValueOnce(reply(sample({ sampled_at: serverTime, cpu_sampled_at: null })));
     await act(async () => { vi.advanceTimersByTime(5000); });
     expect(screen.getByRole('status').textContent).toContain('now —');
     expect(screen.getByRole('status').textContent).toContain('1m 1.25 cores');
     expect(screen.getByRole('status').getAttribute('title')).toContain('CPU latest unavailable');
+    fetchLoad.mockImplementation(() => new Promise(() => {}));
+    await act(async () => { vi.advanceTimersByTime(20000); });
+    expect(screen.getByRole('status').textContent).toBe('Load stale');
   });
 
   it('shows unavailable rather than stale numbers after an error and hides old samples when aged out', async () => {

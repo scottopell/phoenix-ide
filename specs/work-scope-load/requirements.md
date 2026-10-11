@@ -14,7 +14,7 @@ THE SYSTEM SHALL exclude descendants that detach from the owned process group, t
 
 WHILE tracked bash jobs are live, THE SYSTEM SHALL collect consumed CPU using an approximately five-second cadence, without requiring a query. WHILE no tracked jobs are live, THE SYSTEM SHALL perform no native CPU sampling for this history. Background collection SHALL NOT sample memory or host metrics.
 
-THE SYSTEM SHALL expose latest-interval CPU and time-weighted one-, five-, and fifteen-minute averages as cores consumed, where one core represents one fully occupied CPU core. Each window SHALL include actual measured coverage in seconds. Incomplete intervals, process membership changes, counter regressions, and identity changes SHALL contribute no fabricated coverage. A window with no measured coverage SHALL report an unavailable average. A scope with no live jobs SHALL report zero current consumption while retaining unexpired measured history.
+THE SYSTEM SHALL expose latest-interval CPU and time-weighted one-, five-, and fifteen-minute averages as cores consumed, where one core represents one fully occupied CPU core. Each window SHALL include actual measured coverage in seconds. Incomplete intervals, process membership changes, tracked job lifecycle changes (including jobs that start and finish between observations), counter regressions, and identity changes SHALL contribute no fabricated coverage. An unavailable latest interval SHALL carry no CPU sample timestamp. A window with no measured coverage SHALL report an unavailable average. A scope with no live jobs SHALL report zero current consumption while retaining unexpired measured history.
 
 History SHALL be bounded to the rolling fifteen-minute horizon and held only in server memory. Restart SHALL reset coverage. CPU sample freshness SHALL be exposed separately from demand-sampled memory freshness.
 
@@ -30,7 +30,7 @@ THE SYSTEM SHALL expose a resource-summary tool only in the Global Coordinator t
 
 ## REQ-WSLOAD-005: Inline presentation
 
-THE SYSTEM SHALL show compact CPU and memory information inline in the existing WorkScope resource section, without a dedicated page or modal. Coverage and freshness SHALL be available through progressive disclosure. Unavailable values SHALL remain distinct from zero; stale or failed current measurements SHALL NOT appear current.
+THE SYSTEM SHALL show compact CPU and memory information inline in the existing WorkScope resource section, without a dedicated page or modal. Coverage and freshness SHALL be available through progressive disclosure. Unavailable values SHALL remain distinct from zero; stale or failed current measurements SHALL NOT appear current. UI freshness SHALL expire using monotonic elapsed time since client response receipt, not browser/server wall-clock subtraction. CPU age SHALL use the difference between server-generated timestamps plus elapsed time since receipt; server timestamps SHALL remain diagnostic metadata.
 
 The UI SHALL enable collection only from a confirmed live, nonarchived conversation surface with a matching attached WorkScope inventory. Replay or fixture surfaces without this capability SHALL remain inert. Polling SHALL avoid overlapping requests and discard responses after scope or conversation changes.
 
