@@ -1425,7 +1425,7 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
             &generation.observations,
         )
     };
-    let bash = if generation.bash_attribution_available {
+    let bash = if generation.incomplete_bash_scopes.is_empty() {
         build_category_from_observations(
             ManagedResourceCategoryKind::Bash,
             "Bash",

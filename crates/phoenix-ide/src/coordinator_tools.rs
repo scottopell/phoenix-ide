@@ -184,6 +184,7 @@ pub(crate) fn writing_tools(
 pub(crate) fn tools(
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
+    load: Arc<crate::api::work_scope_load::WorkScopeLoadService>,
 ) -> Vec<Arc<dyn Tool>> {
     let watch_db = send_chat.db().clone();
     let close_retry = send_chat.clone();
@@ -192,6 +193,10 @@ pub(crate) fn tools(
         .collect::<Vec<_>>();
     tools.insert(3, Arc::new(ResolveReference(service.clone())));
     tools.push(Arc::new(WorkScopeCoordinatorBash(service.clone())));
+    tools.push(Arc::new(WorkScopeLoadTool {
+        db: watch_db.clone(),
+        load,
+    }));
     tools.push(Arc::new(CoordinatorPresentSvgTool::new(Arc::new(
         GlobalCoordinatorSvgSourceResolver(service),
     ))));
@@ -201,6 +206,66 @@ pub(crate) fn tools(
     tools.push(Arc::new(SafeRetryClose(close_retry)));
     tools.push(Arc::new(AskUserQuestionTool));
     tools
+}
+
+struct WorkScopeLoadTool {
+    db: crate::db::Database,
+    load: Arc<crate::api::work_scope_load::WorkScopeLoadService>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkScopeLoadInput {
+    scope_key: Option<String>,
+}
+
+#[async_trait]
+impl Tool for WorkScopeLoadTool {
+    fn name(&self) -> &'static str {
+        "work_scope_load"
+    }
+
+    fn description(&self) -> String {
+        "Read owned bash process-group CPU cores (latest and 1/5/15-minute available history) and fresh proportional memory for one WorkScope or all WorkScopes. Detached descendants and host resources are excluded.".into()
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{"scope_key":{"type":"string","pattern":"^work:.+$"}},"additionalProperties":false})
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let Ok(conversation) = self.db.get_conversation(&ctx.conversation_id).await else {
+            return ToolOutput::error("conversation not found");
+        };
+        let current = self.db.coordinator_conversation_id().await;
+        if conversation.runtime_role != crate::work_scope::RuntimeRole::Coordinator
+            || !matches!(current, Ok(Some(ref id)) if id == &ctx.conversation_id)
+        {
+            return ToolOutput::error("current Global Coordinator role required");
+        }
+        let Ok(request) = serde_json::from_value::<WorkScopeLoadInput>(input) else {
+            return ToolOutput::error("invalid work_scope_load request");
+        };
+        match request.scope_key {
+            Some(key) => {
+                let Some(scope @ crate::work_scope::ResourceScopeKey::Work(_)) =
+                    crate::work_scope::ResourceScopeKey::from_stable_key(&key)
+                else {
+                    return ToolOutput::error("invalid WorkScope key");
+                };
+                match self.load.contains_scope(&self.db, &scope).await {
+                    Ok(true) => {}
+                    Ok(false) => return ToolOutput::error("active WorkScope not found"),
+                    Err(error) => return ToolOutput::error(error.to_string()),
+                }
+                watch_output(self.load.summary(&scope).await)
+            }
+            None => match self.load.summaries(&self.db).await {
+                Ok(summaries) => watch_output(summaries),
+                Err(error) => ToolOutput::error(error.to_string()),
+            },
+        }
+    }
 }
 
 struct WatchConversation(crate::db::Database);
@@ -992,7 +1057,15 @@ mod tests {
         ));
         (
             writing_tools(service.clone(), send_chat.clone()),
-            tools(service, send_chat),
+            tools(
+                service,
+                send_chat,
+                crate::api::work_scope_load::WorkScopeLoadService::new(
+                    &Arc::new(crate::tools::BashHandleRegistry::new()),
+                    crate::api::resource_monitor::ResourceMonitor::new(),
+                    phoenix_terminal::ActiveTerminals::new(),
+                ),
+            ),
         )
     }
 
@@ -1537,6 +1610,7 @@ mod tests {
                 "resolve_reference",
                 "send_conversation_message",
                 "bash",
+                "work_scope_load",
                 "present_svg",
                 "watch_conversation",
                 "unwatch_conversation",
@@ -1558,6 +1632,43 @@ mod tests {
         assert!(present_svg
             .description()
             .contains("owned by this Global Coordinator transcript"));
+    }
+
+    #[tokio::test]
+    async fn work_scope_load_tool_rechecks_current_global_at_execution() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("ordinary-load", "ordinary-load", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let handles = Arc::new(crate::tools::BashHandleRegistry::new());
+        let tool = WorkScopeLoadTool {
+            db: db.clone(),
+            load: crate::api::work_scope_load::WorkScopeLoadService::new(
+                &handles,
+                crate::api::resource_monitor::ResourceMonitor::new(),
+                phoenix_terminal::ActiveTerminals::new(),
+            ),
+        };
+        assert!(!tool
+            .run(json!({}), context("ordinary-load"))
+            .await
+            .is_success());
+        let global = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        assert!(tool.run(json!({}), context(&global.id)).await.is_success());
+        assert!(!tool
+            .run(
+                json!({"scope_key":"work:does-not-exist"}),
+                context(&global.id)
+            )
+            .await
+            .is_success());
+        assert!(!tool
+            .run(json!({"scope_key":"coordinator"}), context(&global.id))
+            .await
+            .is_success());
     }
 
     #[tokio::test]
@@ -1599,6 +1710,7 @@ mod tests {
                 "resolve_reference",
                 "send_conversation_message",
                 "bash",
+                "work_scope_load",
                 "present_svg",
                 "watch_conversation",
                 "unwatch_conversation",

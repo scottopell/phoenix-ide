@@ -171,6 +171,40 @@ pub(crate) fn group_member_identities_for_sampling(
     )
 }
 
+pub(crate) fn group_identities_by_pgid(
+    pgids: &BTreeSet<i32>,
+) -> Option<BTreeMap<i32, BTreeMap<u32, ProcessIdentity>>> {
+    let members = group_member_pids(pgids)?;
+    let mut groups = BTreeMap::new();
+    for pid in members {
+        if let (Some(pgid), Some(identity)) = (
+            process_group_for_sampling(pid),
+            current_process_identity(pid),
+        ) {
+            if pgids.contains(&pgid) {
+                groups
+                    .entry(pgid)
+                    .or_insert_with(BTreeMap::new)
+                    .insert(pid, identity);
+            }
+        }
+    }
+    Some(groups)
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_for_sampling(pid: u32) -> Option<i32> {
+    proc_pgrp(pid)
+}
+#[cfg(target_os = "macos")]
+fn process_group_for_sampling(pid: u32) -> Option<i32> {
+    proc_pgid(i32::try_from(pid).ok()?)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_group_for_sampling(_pid: u32) -> Option<i32> {
+    None
+}
+
 pub(crate) fn session_member_identities_for_sampling(
     session_ids: &BTreeSet<i32>,
 ) -> Option<BTreeMap<u32, ProcessIdentity>> {
@@ -247,6 +281,10 @@ fn stable_process_cpu_time_seconds(pid: u32, expected_identity: ProcessIdentity)
     let cpu_time_seconds = process_cpu_time_seconds_impl(pid)?;
     let after = current_process_identity(pid)?;
     (after == expected_identity).then_some(cpu_time_seconds)
+}
+
+pub(crate) fn cpu_time_for_identity(identity: ProcessIdentity) -> Option<f64> {
+    stable_process_cpu_time_seconds(identity.pid, identity)
 }
 
 #[cfg(target_os = "linux")]

@@ -105,6 +105,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [089](089_canonical-short-product-navigation.md) | Canonical short ProductConversation navigation with exact evidence selectors | Accepted | REQ-GR-009 |
 | [090](090_bounded-selected-model-overload-retry.md) | Selected-model overload uses a durable bounded retry window | Accepted | REQ-LLM-006/006b, REQ-LRV-002/005/008, REQ-BED-006/007 |
 | [091](091_touch-reactions-dock-away-from-native-selection.md) | Touch reactions dock away from native selection | Accepted | REQ-PF-018, REQ-PF-020 |
+| [092](092_workscope-cpu-history-and-demand-memory.md) | WorkScope CPU history with demand-driven memory | Accepted | REQ-WSLOAD-001–005, REQ-DEPLOY-007a |
 
 ## For agents: which decisions bind your task
 

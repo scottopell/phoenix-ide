@@ -576,6 +576,7 @@ pub struct RuntimeManager {
     /// table inside, so a continuation chain on one worktree shares one
     /// table (REQ-BASH-014, REQ-BASH-WS-001).
     bash_handles: Arc<BashHandleRegistry>,
+    work_scope_load: Arc<crate::api::work_scope_load::WorkScopeLoadService>,
     /// Per-process tmux server registry. Shared by every conversation's
     /// `ToolContext`; each conversation gets its own `Arc<RwLock<TmuxServer>>`
     /// inside, keyed by `conversation_id`. The `which("tmux")` result is
@@ -2360,6 +2361,7 @@ impl RuntimeManager {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_message_retriever_and_runtime_env(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
@@ -2402,6 +2404,15 @@ impl RuntimeManager {
                 db.wake_repository(),
                 wake_kick_tx.clone(),
             ));
+        let bash_handles = Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
+            bash_lifecycle_tx,
+        )));
+        let terminals = crate::terminal::ActiveTerminals::new();
+        let work_scope_load = crate::api::work_scope_load::WorkScopeLoadService::new(
+            &bash_handles,
+            crate::api::resource_monitor::ResourceMonitor::new(),
+            terminals.clone(),
+        );
         Self {
             db,
             llm_registry,
@@ -2412,12 +2423,11 @@ impl RuntimeManager {
                 runtime_env,
             ),
             runtime_home: runtime_env.home().to_path_buf(),
-            bash_handles: Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
-                bash_lifecycle_tx,
-            ))),
+            bash_handles,
+            work_scope_load,
             tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink(Some(tmux_lifecycle_tx))),
             mcp_manager,
-            terminals: crate::terminal::ActiveTerminals::new(),
+            terminals,
             close_retirement_leases: AsyncMutex::new(HashMap::new()),
             close_retirement_execution: ConversationMutexGates::default(),
             runtimes: RwLock::new(HashMap::new()),
@@ -2678,6 +2688,12 @@ impl RuntimeManager {
     /// REQ-BASH-006 hard-delete cascade).
     pub fn bash_handles(&self) -> &Arc<BashHandleRegistry> {
         &self.bash_handles
+    }
+
+    pub(crate) fn work_scope_load(
+        &self,
+    ) -> &Arc<crate::api::work_scope_load::WorkScopeLoadService> {
+        &self.work_scope_load
     }
 
     /// Get the tmux server registry (REQ-TMUX-007 hard-delete cascade,
@@ -5922,7 +5938,11 @@ impl RuntimeManager {
                     );
                 ToolRegistryExecutor::builtin_only(
                     ToolRegistry::coordinator(
-                        crate::coordinator_tools::tools(service, send_chat),
+                        crate::coordinator_tools::tools(
+                            service,
+                            send_chat,
+                            self.work_scope_load.clone(),
+                        ),
                         coordinator_catalog.clone(),
                     ),
                     agent_catalog.clone(),

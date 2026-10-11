@@ -377,6 +377,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/work-scope/:scope_key/inventory",
             get(get_work_scope_inventory),
         )
+        .route("/api/work-scope/:scope_key/load", get(get_work_scope_load))
+        .route("/api/work-scopes/load", get(get_all_work_scope_load))
         .route(
             "/api/work-scope/:scope_key/browser-session",
             delete(stop_work_scope_browser_session),
@@ -3941,6 +3943,75 @@ async fn work_scope_actor(
         .await
         .map(|resolved| resolved.actor)
         .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+async fn load_request_scope(
+    state: &AppState,
+    conversation_id: &str,
+    requested: Option<&crate::work_scope::ResourceScopeKey>,
+) -> Result<(), AppError> {
+    let conversation = state
+        .db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let resolved =
+        crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conversation)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        let current = state
+            .db
+            .coordinator_conversation_id()
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if current.as_deref() == Some(conversation_id) {
+            return Ok(());
+        }
+    }
+    if requested.is_some_and(|scope| {
+        resolved.scope == *scope && matches!(scope, crate::work_scope::ResourceScopeKey::Work(_))
+    }) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden("WorkScope load is limited to the attached scope; across-scope load requires the current Global Coordinator".into()))
+}
+
+async fn get_work_scope_load(
+    State(state): State<AppState>,
+    Path(scope_key): Path<String>,
+    Query(query): Query<WorkScopeActorQuery>,
+) -> Result<Json<super::work_scope_load::WorkScopeLoadSummary>, AppError> {
+    let Some(scope @ crate::work_scope::ResourceScopeKey::Work(_)) =
+        crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
+    else {
+        return Err(AppError::BadRequest("invalid WorkScope key".into()));
+    };
+    load_request_scope(&state, &query.conversation_id, Some(&scope)).await?;
+    if !state
+        .runtime
+        .work_scope_load()
+        .contains_scope(&state.db, &scope)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::NotFound("active WorkScope not found".into()));
+    }
+    Ok(Json(state.runtime.work_scope_load().summary(&scope).await))
+}
+
+async fn get_all_work_scope_load(
+    State(state): State<AppState>,
+    Query(query): Query<WorkScopeActorQuery>,
+) -> Result<Json<Vec<super::work_scope_load::WorkScopeLoadSummary>>, AppError> {
+    load_request_scope(&state, &query.conversation_id, None).await?;
+    let summaries = state
+        .runtime
+        .work_scope_load()
+        .summaries(&state.db)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(Json(summaries))
 }
 
 async fn get_work_scope_inventory(
@@ -12550,6 +12621,133 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(inv.bash.is_empty());
         assert!(inv.tmux.is_none());
         assert!(inv.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn work_scope_load_admits_attached_only_and_current_global_across_scopes() {
+        let state = make_test_state().await;
+        let first = create_inspector_actor(&state, "load-first", "Load first").await;
+        let second = create_inspector_actor(&state, "load-second", "Load second").await;
+        super::load_request_scope(&state, "load-first", Some(&first))
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::load_request_scope(&state, "load-first", Some(&second)).await,
+            Err(super::AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            super::load_request_scope(&state, "load-first", None).await,
+            Err(super::AppError::Forbidden(_))
+        ));
+        let global = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        super::load_request_scope(&state, &global.id, Some(&second))
+            .await
+            .unwrap();
+        super::load_request_scope(&state, &global.id, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::get_work_scope_load(
+                State(state.clone()),
+                Path("work:does-not-exist".into()),
+                Query(super::WorkScopeActorQuery {
+                    conversation_id: global.id.clone()
+                }),
+            )
+            .await,
+            Err(super::AppError::NotFound(_))
+        ));
+        let Json(empty) = super::get_work_scope_load(
+            State(state.clone()),
+            Path(first.stable_key()),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: "load-first".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty.memory_bytes, Some(0));
+        assert_eq!(empty.cpu_one_minute.coverage_seconds, 0.0);
+        let Json(all) = super::get_all_work_scope_load(
+            State(state),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: global.id,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(all
+            .iter()
+            .any(|summary| summary.scope_key == first.stable_key()));
+        assert!(all
+            .iter()
+            .any(|summary| summary.scope_key == second.stable_key()));
+    }
+
+    #[tokio::test]
+    async fn work_scope_load_http_routes_enforce_actor_authority() {
+        use tower::ServiceExt;
+        let state = make_test_state().await;
+        let first = create_inspector_actor(&state, "http-load-first", "Load first").await;
+        let second = create_inspector_actor(&state, "http-load-second", "Load second").await;
+        let global = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let router = super::create_router(state);
+        for (path, expected) in [
+            (
+                format!(
+                    "/api/work-scope/{}/load?conversation_id=http-load-first",
+                    first.stable_key()
+                ),
+                StatusCode::OK,
+            ),
+            (
+                format!(
+                    "/api/work-scope/{}/load?conversation_id=http-load-first",
+                    second.stable_key()
+                ),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/work-scopes/load?conversation_id=http-load-first".into(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                format!(
+                    "/api/work-scope/{}/load?conversation_id={}",
+                    second.stable_key(),
+                    global.id
+                ),
+                StatusCode::OK,
+            ),
+            (
+                format!("/api/work-scopes/load?conversation_id={}", global.id),
+                StatusCode::OK,
+            ),
+            (
+                "/api/work-scopes/load?conversation_id=unknown".into(),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(&path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
     }
 
     #[tokio::test]

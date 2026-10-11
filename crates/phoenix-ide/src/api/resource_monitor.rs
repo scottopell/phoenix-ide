@@ -17,7 +17,7 @@ const FRESHNESS_LEASE: Duration = Duration::from_millis(1_200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservationKey {
-    handles: Vec<(String, String, i32)>,
+    handles: Vec<(String, String, i32, String)>,
     terminal_sessions: Vec<i32>,
 }
 
@@ -33,6 +33,7 @@ impl ObservationKey {
                     group.work_scope.stable_key(),
                     group.handle_id.to_string(),
                     group.pgid,
+                    group.stable_resource_identity(),
                 )
             })
             .collect::<Vec<_>>();
@@ -59,7 +60,7 @@ pub struct ResourceObservationGeneration {
     pub api_pids: BTreeSet<u32>,
     pub terminal_pids: Option<BTreeSet<u32>>,
     pub handles: Vec<HandleObservationTarget>,
-    pub bash_attribution_available: bool,
+    pub incomplete_bash_scopes: BTreeSet<String>,
 }
 
 impl ResourceObservationGeneration {
@@ -130,13 +131,25 @@ impl ResourceMonitor {
     }
 
     pub async fn observe(&self, app: &AppState) -> Arc<ResourceObservationGeneration> {
-        let live_groups = app
-            .runtime
-            .bash_handles()
-            .snapshot_live_process_groups()
-            .await;
-        let terminal_sessions = app
-            .terminals
+        self.observe_sources(app.runtime.bash_handles(), &app.terminals)
+            .await
+    }
+
+    pub async fn observe_sources(
+        &self,
+        handles: &phoenix_tools::bash::registry::BashHandleRegistry,
+        terminals: &phoenix_terminal::ActiveTerminals,
+    ) -> Arc<ResourceObservationGeneration> {
+        let live_groups = handles.snapshot_live_process_groups().await;
+        self.observe_live_groups(live_groups, terminals).await
+    }
+
+    pub async fn observe_live_groups(
+        &self,
+        live_groups: Vec<phoenix_tools::bash::registry::LiveHandleProcessGroup>,
+        terminals: &phoenix_terminal::ActiveTerminals,
+    ) -> Arc<ResourceObservationGeneration> {
+        let terminal_sessions = terminals
             .snapshot_shell_session_ids()
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -173,6 +186,16 @@ impl ResourceMonitor {
     }
 }
 
+fn valid_group_members(
+    group: &phoenix_tools::bash::registry::LiveHandleProcessGroup,
+    identities: &BTreeMap<u32, ProcessIdentity>,
+) -> bool {
+    !identities.is_empty()
+        && !identities
+            .get(&group.launch_identity.process.pid)
+            .is_some_and(|identity| identity.start_time != group.launch_identity.process.start_time)
+}
+
 async fn sample_generation(
     live_groups: Vec<phoenix_tools::bash::registry::LiveHandleProcessGroup>,
     terminal_sessions: BTreeSet<i32>,
@@ -186,11 +209,11 @@ async fn sample_generation(
 
     let mut handles = Vec::with_capacity(live_groups.len());
     let mut bash_identities = BTreeMap::<u32, ProcessIdentity>::new();
-    let mut bash_attribution_available = true;
+    let mut incomplete_bash_scopes = BTreeSet::new();
     for group in live_groups {
         let identities = group_member_identities_for_sampling(&BTreeSet::from([group.pgid]));
         match identities {
-            Some(identities) if !identities.is_empty() => {
+            Some(identities) if valid_group_members(&group, &identities) => {
                 let pids = identities.keys().copied().collect();
                 bash_identities.extend(identities);
                 handles.push(HandleObservationTarget {
@@ -199,7 +222,9 @@ async fn sample_generation(
                     pids,
                 });
             }
-            Some(_) | None => bash_attribution_available = false,
+            Some(_) | None => {
+                incomplete_bash_scopes.insert(group.work_scope.stable_key());
+            }
         }
     }
 
@@ -223,7 +248,7 @@ async fn sample_generation(
         api_pids: api_identities.keys().copied().collect(),
         terminal_pids: terminal_identities.map(|ids| ids.keys().copied().collect()),
         handles,
-        bash_attribution_available,
+        incomplete_bash_scopes,
     }
 }
 
@@ -251,7 +276,7 @@ mod tests {
             api_pids: BTreeSet::new(),
             terminal_pids: Some(BTreeSet::new()),
             handles: Vec::new(),
-            bash_attribution_available: true,
+            incomplete_bash_scopes: BTreeSet::new(),
         }
     }
 
@@ -297,11 +322,21 @@ mod tests {
         let samples = Arc::new(AtomicUsize::new(0));
         for key in [
             ObservationKey {
-                handles: vec![("conversation:c1".into(), "b-1".into(), 10)],
+                handles: vec![(
+                    "conversation:c1".into(),
+                    "b-1".into(),
+                    10,
+                    "launch-a".into(),
+                )],
                 terminal_sessions: Vec::new(),
             },
             ObservationKey {
-                handles: vec![("conversation:c1".into(), "b-2".into(), 20)],
+                handles: vec![(
+                    "conversation:c1".into(),
+                    "b-1".into(),
+                    10,
+                    "launch-b".into(),
+                )],
                 terminal_sessions: Vec::new(),
             },
         ] {
@@ -314,6 +349,41 @@ mod tests {
                 .await;
         }
         assert_eq!(samples.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cache_key_tracks_launch_incarnation_without_pgid_or_handle_change() {
+        use phoenix_core::process_identity::ProcessIdentity as BashProcessIdentity;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        use phoenix_tools::bash::handle::{BashLaunchIdentity, HandleId};
+        let scope = ResourceScopeKey::Work(WorkScopeId::parse("a").unwrap());
+        let mut group = phoenix_tools::bash::registry::LiveHandleProcessGroup {
+            work_scope: scope.clone(),
+            control_scope: scope,
+            handle_id: HandleId::new("b-1"),
+            launch_identity: BashLaunchIdentity {
+                process: BashProcessIdentity {
+                    pid: 10,
+                    start_time: 1,
+                },
+                launch_uuid: "first".into(),
+            },
+            pgid: 10,
+        };
+        let before = ObservationKey::from_sources(&[group.clone()], &BTreeSet::new());
+        group.launch_identity.launch_uuid = "second".into();
+        let after = ObservationKey::from_sources(&[group.clone()], &BTreeSet::new());
+        assert_ne!(before, after);
+        let members = BTreeMap::from([(
+            10,
+            ProcessIdentity {
+                pid: 10,
+                start_time: 1,
+            },
+        )]);
+        assert!(valid_group_members(&group, &members));
+        group.launch_identity.process.start_time = 2;
+        assert!(!valid_group_members(&group, &members));
     }
 
     #[test]

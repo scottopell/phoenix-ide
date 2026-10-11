@@ -1,0 +1,31 @@
+# WorkScope load — executive summary
+
+## Scope and architecture
+
+`WorkScopeLoadService` is runtime-owned and supplies the HTTP API and Global-only `work_scope_load` tool. The WorkScope section consumes the API, showing CPU in cores and memory inline. Attribution covers owned bash process groups only, including Coordinator jobs owned by a target WorkScope. Detached descendants, terminal/browser/shared host resources and disk are excluded.
+
+Background collection reads only cumulative native CPU counters, on blocking workers, approximately every five seconds while jobs are live. A bounded in-memory interval ring yields time-weighted 1/5/15-minute values with measured coverage. Membership/identity changes and incomplete reads are gaps, not zero. History resets on server restart. Fresh memory uses the existing shared `ResourceMonitor` observation lease; the load service and inventory/inspection/deployment surfaces use the same monitor.
+
+## Interfaces
+
+- `GET /api/work-scope/:scope_key/load?conversation_id=...`: attached scope for ordinary callers; current Global may select another active scope. Unknown/inactive scopes are rejected.
+- `GET /api/work-scopes/load?conversation_id=...`: current Global only; returns an array for active persisted WorkScopes with one shared demand generation.
+- Global tool `work_scope_load`: optional `scope_key` (`work:<id>`); omitted means all active persisted scopes. Registration and execution-time role checks restrict it to the current Global.
+
+`WorkScopeLoadSummary` carries `scope_key`, `live_jobs`, latest cores, three `CpuLoadWindow` values (`average_cores`, `coverage_seconds`), nullable `cpu_sampled_at`, `sampled_at` for the demand snapshot, nullable `memory_bytes` and `process_count`. Timestamps are RFC3339 strings. Null is unavailable; an idle scope has zero current consumption and retains recent measured windows. A window without measurements has a null average and zero coverage.
+
+The inline indicator is gated by confirmed live readiness, a nonarchived surface, and an exact matching attached inventory. Direct fixtures omit the capability and remain inert. Polling is bounded at five seconds, avoids overlap and ignores late responses. Coverage and separate CPU/memory age are in the title. No SSE event or automatic context injection is added.
+
+## Verification
+
+| Requirement | Implementation anchors | Coverage |
+|---|---|---|
+| REQ-WSLOAD-001 | `scope_cpu_members`, `cpu_deltas`, `summarize`, shared monitor launch identity | Synthetic reuse, conflicting ownership, deduplication, missing-row and unrelated-gap tests |
+| REQ-WSLOAD-002 | `WorkScopeLoadService::spawn_sampler`, `tick`, `window`, `prune_history` | CPU deltas, clipped/partial windows, restart-empty state, exited scope and idle pruning tests |
+| REQ-WSLOAD-003 | `summary`, `summaries`, `ResourceMonitor::observe_live_groups` | Concurrent lease reuse and shared across-scope generation tests |
+| REQ-WSLOAD-004 | `load_request_scope`, `contains_scope`, `WorkScopeLoadTool`, coordinator registry | HTTP attached/cross-scope admission, Global-only registration/execution and unknown-scope tests |
+| REQ-WSLOAD-005 | `DesktopLayout`, `FileExplorerPanel`, `WorkScopeLoadIndicator` | Formatting, coverage, idle/null/stale values, response ordering, live/canonical/archived/pinned/inert-fixture tests |
+
+Focused validation and broad-check classification are recorded in task 68002. Rendered browser acceptance remains pending; unit/integration rendering is not a browser-layout pass. No production deployment or acceptance is claimed.
+
+Decision rationale: [ADR-092](../adrs/092_workscope-cpu-history-and-demand-memory.md). No Allium lifecycle model is added: this is a bounded read projection over existing resource lifecycles plus ephemeral measurement history, not a new work lifecycle.
