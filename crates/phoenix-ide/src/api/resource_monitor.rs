@@ -190,10 +190,9 @@ fn valid_group_members(
     group: &phoenix_tools::bash::registry::LiveHandleProcessGroup,
     identities: &BTreeMap<u32, ProcessIdentity>,
 ) -> bool {
-    !identities.is_empty()
-        && identities
-            .get(&group.launch_identity.process.pid)
-            .is_none_or(|identity| identity.start_time == group.launch_identity.process.start_time)
+    identities
+        .get(&group.launch_identity.process.pid)
+        .is_some_and(|identity| identity.start_time == group.launch_identity.process.start_time)
 }
 
 async fn sample_generation(
@@ -383,6 +382,35 @@ mod tests {
         )]);
         assert!(valid_group_members(&group, &members));
         group.launch_identity.process.start_time = 2;
+        assert!(!valid_group_members(&group, &members));
+    }
+
+    #[test]
+    fn missing_launch_leader_cannot_attribute_surviving_member_memory() {
+        let group = phoenix_tools::bash::registry::LiveHandleProcessGroup {
+            work_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
+                phoenix_core::work_scope::WorkScopeId::parse("a").unwrap(),
+            ),
+            control_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
+                phoenix_core::work_scope::WorkScopeId::parse("a").unwrap(),
+            ),
+            handle_id: phoenix_tools::bash::handle::HandleId::new("b-1"),
+            launch_identity: phoenix_tools::bash::handle::BashLaunchIdentity {
+                process: phoenix_core::process_identity::ProcessIdentity {
+                    pid: 10,
+                    start_time: 1,
+                },
+                launch_uuid: "launch".into(),
+            },
+            pgid: 10,
+        };
+        let members = BTreeMap::from([(
+            11,
+            ProcessIdentity {
+                pid: 11,
+                start_time: 2,
+            },
+        )]);
         assert!(!valid_group_members(&group, &members));
     }
 

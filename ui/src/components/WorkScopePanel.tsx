@@ -78,7 +78,10 @@ function useWorkScopeLoad(scopeKey: string, conversationId: string, executionCap
         const response = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/load?${query}`, { signal: controller.signal });
         if (!response.ok) throw new Error('Work-scope load unavailable');
         const summary = await response.json() as WorkScopeLoadSummary;
-        if (!cancelled) setResult({ scopeKey, conversationId, summary: summary.scope_key === scopeKey ? summary : null, error: summary.scope_key !== scopeKey });
+        if (!cancelled) {
+          setNow(Date.now());
+          setResult({ scopeKey, conversationId, summary: summary.scope_key === scopeKey ? summary : null, error: summary.scope_key !== scopeKey });
+        }
       } catch {
         if (!cancelled) setResult({ scopeKey, conversationId, summary: null, error: true });
       } finally {

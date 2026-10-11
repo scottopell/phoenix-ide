@@ -150,6 +150,18 @@ describe('WorkScope load indicator', () => {
     expect(screen.getByRole('status').getAttribute('title')).toContain('CPU 0s ago');
   });
 
+  it('dates freshness at response receipt rather than the earlier poll start', async () => {
+    getInv.mockResolvedValue(inv([]));
+    let resolve!: (value: ReturnType<typeof reply>) => void;
+    const response = new Promise<ReturnType<typeof reply>>((done) => { resolve = done; });
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(response));
+    await act(async () => { render(panel()); });
+    vi.setSystemTime(Date.now() + 200);
+    await act(async () => { resolve(reply(sample())); });
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+    expect(screen.getByRole('status').textContent).not.toContain('stale');
+  });
+
   it('shows observed idle zero without requiring a native CPU sample and retains recent history', async () => {
     getInv.mockResolvedValue(inv([]));
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample({

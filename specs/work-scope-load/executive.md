@@ -4,7 +4,7 @@
 
 `WorkScopeLoadService` is runtime-owned and supplies the HTTP API and Global-only `work_scope_load` tool. The WorkScope section consumes the API, showing CPU in cores and memory inline. Attribution covers owned bash process groups only, including Coordinator jobs owned by a target WorkScope. Detached descendants, terminal/browser/shared host resources and disk are excluded.
 
-Background collection reads only cumulative native CPU counters, on blocking workers, approximately every five seconds while jobs are live. A bounded in-memory interval ring yields time-weighted 1/5/15-minute values with measured coverage. Membership/identity changes and incomplete reads are gaps, not zero. History resets on server restart. Fresh memory uses the existing shared `ResourceMonitor` observation lease; the load service and inventory/inspection/deployment surfaces use the same monitor.
+Background collection reads only cumulative native CPU counters, on blocking workers, approximately every five seconds while jobs are live. A bounded in-memory interval ring yields time-weighted 1/5/15-minute values with measured coverage. Membership/identity changes and incomplete reads are gaps, not zero. CPU and memory require the observed group's launch leader PID/start-time match; a missing leader leaves surviving members unattributed and the affected current totals unavailable, without tracking detached descendants. History resets on server restart. Fresh memory uses the existing shared `ResourceMonitor` observation lease; the load service and inventory/inspection/deployment surfaces use the same monitor.
 
 ## Interfaces
 
@@ -20,12 +20,12 @@ The inline indicator is gated by confirmed live readiness, a nonarchived surface
 
 | Requirement | Implementation anchors | Coverage |
 |---|---|---|
-| REQ-WSLOAD-001 | `scope_cpu_members`, `cpu_deltas`, `summarize`, shared monitor launch identity | Synthetic reuse, conflicting ownership, deduplication, missing-row and unrelated-gap tests |
+| REQ-WSLOAD-001 | `scope_cpu_members`, `cpu_deltas`, `summarize`, shared monitor launch identity | Synthetic reuse, absent launch leader with surviving member (CPU and memory), conflicting ownership, deduplication, missing-row and unrelated-gap tests |
 | REQ-WSLOAD-002 | `WorkScopeLoadService::spawn_sampler`, `tick`, `window`, `prune_history` | CPU deltas, clipped/partial windows, restart-empty state, exited scope and idle pruning tests |
 | REQ-WSLOAD-003 | `summary`, `summaries`, `ResourceMonitor::observe_live_groups` | Concurrent lease reuse and shared across-scope generation tests |
 | REQ-WSLOAD-004 | `load_request_scope`, `contains_scope`, `WorkScopeLoadTool`, coordinator registry | HTTP attached/cross-scope admission, Global-only registration/execution and unknown-scope tests |
 | REQ-WSLOAD-005 | `DesktopLayout`, `FileExplorerPanel`, `WorkScopeLoadIndicator` | Formatting, coverage, idle/null/stale values, response ordering, live/canonical/archived/pinned/inert-fixture tests |
 
-Focused validation and broad-check classification are recorded in task 68002. Rendered browser acceptance remains pending; unit/integration rendering is not a browser-layout pass. No production deployment or acceptance is claimed.
+Focused validation and equivalent base/candidate macOS qualification are recorded in task 68002. Rendered browser acceptance exercised the real ConversationPage → DesktopLayout → FileExplorerPanel → WorkScopeSection route: unmocked idle API, deterministic intercepted active/idle/stale/unavailable/partial responses in dark/light at 1440/1100 widths, keyboard Enter collapse/reopen, no overflow, and a real pinned historical route with zero load requests. Snapshot colors use secondary text for small-value contrast. No archived row existed in the local seed; archived admission remains covered by integration tests, not a separate rendered archived-row pass. No production deployment or acceptance is claimed.
 
 Decision rationale: [ADR-092](../adrs/092_workscope-cpu-history-and-demand-memory.md). No Allium lifecycle model is added: this is a bounded read projection over existing resource lifecycles plus ephemeral measurement history, not a new work lifecycle.

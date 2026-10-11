@@ -8,7 +8,7 @@ Agents and users need to understand how busy a WorkScope is and its attributed m
 
 THE SYSTEM SHALL account for live Phoenix-owned bash process groups under their owning WorkScope, including Coordinator jobs targeting that scope. THE SYSTEM SHALL deduplicate native process identities within a scope. WHEN ownership conflicts across scopes, THE SYSTEM SHALL report affected totals as unavailable rather than count twice or assign by arbitrary ordering.
 
-THE SYSTEM SHALL exclude descendants that detach from the owned process group, terminal/browser/shared-server resources outside those groups, and disk usage. Process identity validation SHALL prevent attribution to a reused native process incarnation. Missing or incomplete observations SHALL NOT become authoritative partial totals.
+THE SYSTEM SHALL exclude descendants that detach from the owned process group, terminal/browser/shared-server resources outside those groups, and disk usage. Process identity validation SHALL require the observed group to contain the exact launch leader PID and start-time incarnation before attributing any of its members. An absent or reused leader SHALL make the affected scope's current CPU and memory totals unavailable even if other group members remain; the system SHALL NOT adopt those members as a replacement launch proof. Missing or incomplete observations SHALL NOT become authoritative partial totals.
 
 ## REQ-WSLOAD-002: CPU collection and history
 

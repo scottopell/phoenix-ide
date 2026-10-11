@@ -8,7 +8,7 @@
 
 The resource monitor supplied request-coalesced instantaneous observations for deployment, WorkScope inventory, and process inspection. The user approved a first-party per-WorkScope/across-scope API, a Global-only tool, and small inline indicators. They explicitly requested always-on recent consumed-CPU tracking, accepted existing owned bash process groups and exclusion of detached descendants, and chose in-memory history and fresh demand memory. Disk and run-queue additions were rejected.
 
-## Options
+## Options considered
 
 1. Retain demand-only collection: cheap idle behavior, but no history before the first query.
 2. Reuse full demand observations periodically: supplies history but unnecessarily reads memory, terminal/API processes, and host metrics.

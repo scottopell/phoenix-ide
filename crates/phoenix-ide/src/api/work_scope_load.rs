@@ -384,12 +384,9 @@ fn scope_cpu_members(
             members_by_scope.entry(scope).or_default();
             continue;
         };
-        if members.is_empty()
-            || members
-                .get(&group.launch_identity.process.pid)
-                .is_some_and(|identity| {
-                    identity.start_time != group.launch_identity.process.start_time
-                })
+        if members
+            .get(&group.launch_identity.process.pid)
+            .is_none_or(|identity| identity.start_time != group.launch_identity.process.start_time)
         {
             *valid = false;
             members_by_scope.entry(scope).or_default();
@@ -771,6 +768,26 @@ mod tests {
         assert!(complete["work:a"]);
         assert!(!complete["work:b"]);
         assert!(members["work:b"].is_empty());
+    }
+
+    #[test]
+    fn missing_launch_leader_does_not_adopt_other_cpu_group_members() {
+        let scope =
+            ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse("a").unwrap());
+        let groups = vec![group(scope, "b-1")]; // launch pid 10, start 1
+        let identities = BTreeMap::from([(
+            10,
+            BTreeMap::from([(
+                11,
+                ProcessIdentity {
+                    pid: 11,
+                    start_time: 2,
+                },
+            )]),
+        )]);
+        let (members, complete) = scope_cpu_members(&groups, Some(&identities));
+        assert!(members["work:a"].is_empty());
+        assert!(!complete["work:a"]);
     }
 
     #[test]
