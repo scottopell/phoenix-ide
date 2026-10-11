@@ -14,6 +14,7 @@ import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { getProductConversationScenario } from '../fixtures/productConversation/scenarios';
 import { api, type Conversation, type Message, type ProductConversationSnapshotView } from '../api';
 import type { RenderUnit } from '../conversation/renderUnits';
+import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { VirtualTranscriptHandle, VirtualTranscriptProps } from '../components/VirtualTranscript';
 import { notifyProductConversationSnapshotChanged } from '../notifications';
 
@@ -72,6 +73,8 @@ vi.mock('./ConversationPage', () => ({
     return <div>composer owner</div>;
   },
 }));
+vi.mock('../hooks/useConnection', () => ({ useConnection: vi.fn() }));
+
 vi.mock('../components/MessageComponents', () => ({
   UserMessage: ({ message }: { message: Message }) => <div>{(message.content as { text: string }).text}</div>,
   QueuedUserMessage: ({ message }: { message: PendingUserMessage }) => <div>{message.text}</div>,
@@ -266,6 +269,51 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     expect(document.querySelector('[data-owned-unit="next-request"]')).toBeNull();
     expect(screen.queryByText('NEXT_REQUEST_MARKER')).not.toBeInTheDocument();
     expect(screen.getByText('Live question')).toBeInTheDocument();
+  });
+
+  it('retires the warm atom owner on close_incomplete and keeps refreshed same-message snapshot content', async () => {
+    await open();
+    expect(screen.getByText('composer owner')).toBeInTheDocument();
+    const staleMessage = store.getSnapshot(latestRow).messages[0]!;
+    expect(staleMessage.content).toEqual({ text: 'Live question' });
+    const snapshotMessage: EnrichedMessage = { ...staleMessage,
+      origin: staleMessage.origin ?? { kind: 'unknown_historical' },
+      display_data: staleMessage.display_data ?? null, usage_data: staleMessage.usage_data ?? null };
+
+    snapshot = { ...snapshot, ordinary_lifecycle: 'open', writable_transcript_row_id: null,
+      close: { attempt_id: 'incomplete-close', phase: 'completed', outcome: 'close_incomplete',
+        run_ordinal: '1', run_status: 'stopped', confirmation_snapshot: null,
+        inspections: [], losses: [], residuals: [], failure: null },
+      segments: snapshot.segments.map((segment) => segment.transcript_row_id === latestRow
+        ? { ...segment, messages: [{ ...snapshotMessage, content: { text: 'FRESH_SNAPSHOT_MARKER' } }] }
+        : segment) };
+    act(() => notifyProductConversationSnapshotChanged('pc-product-alpha'));
+
+    await screen.findByTestId('product-conversation-close-incomplete');
+    expect(screen.queryByText('composer owner')).not.toBeInTheDocument();
+    expect(screen.getByTestId('product-conversation-close-live-update-owner')).toBeInTheDocument();
+    expect(screen.getByText('FRESH_SNAPSHOT_MARKER')).toBeInTheDocument();
+    expect(screen.queryByText('Live question')).not.toBeInTheDocument();
+    expect(store.getSnapshot(latestRow).messages[0]).toBe(staleMessage);
+
+    const renders = probe.structuralRenders;
+    commits.length = 0;
+    act(() => store.dispatch(latestRow, {
+      type: 'sse_message', sequenceId: store.getSnapshot(latestRow).lastAppliedEventSeq + 1,
+      message: { ...staleMessage, message_id: 'retired-atom-arrival', content: { text: 'RETIRED_ATOM_MARKER' } },
+    }));
+    expect(store.getSnapshot(latestRow).messages.at(-1)!.content).toEqual({ text: 'RETIRED_ATOM_MARKER' });
+    expect(probe.structuralRenders).toBe(renders);
+    expect(commits).toHaveLength(0);
+    expect(screen.queryByText('RETIRED_ATOM_MARKER')).not.toBeInTheDocument();
+
+    snapshot = { ...snapshot, segments: snapshot.segments.map((segment) => segment.transcript_row_id === latestRow
+      ? { ...segment, messages: [{ ...snapshotMessage, content: { text: 'REFRESHED_SNAPSHOT_MARKER' } }] }
+      : segment) };
+    act(() => notifyProductConversationSnapshotChanged('pc-product-alpha'));
+    await screen.findByText('REFRESHED_SNAPSHOT_MARKER');
+    expect(screen.queryByText('RETIRED_ATOM_MARKER')).not.toBeInTheDocument();
+    expect(screen.queryByText('FRESH_SNAPSHOT_MARKER')).not.toBeInTheDocument();
   });
 
   it('switches the atom subscription with the latest member and ignores the previous member', async () => {
