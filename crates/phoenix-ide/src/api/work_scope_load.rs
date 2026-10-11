@@ -523,7 +523,7 @@ mod tests {
         {
             let mut state = load.cpu.lock().await;
             state.intervals.push_back(CpuInterval {
-                end: Instant::now() - HISTORY,
+                end: Instant::now().checked_sub(HISTORY).unwrap(),
                 elapsed: CADENCE,
                 cores: BTreeMap::from([("work:a".into(), Some(1.0))]),
             });
@@ -615,7 +615,7 @@ mod tests {
         let now = Instant::now();
         let mut history = VecDeque::new();
         history.push_back(CpuInterval {
-            end: now - Duration::from_secs(30),
+            end: now.checked_sub(Duration::from_secs(30)).unwrap(),
             elapsed: Duration::from_secs(10),
             cores: BTreeMap::from([("work:a".into(), Some(2.0))]),
         });
@@ -626,7 +626,7 @@ mod tests {
         });
         let result = window(&history, "work:a", now, 60);
         assert_eq!(result.average_cores, Some(2.0));
-        assert_eq!(result.coverage_seconds, 10.0);
+        assert!((result.coverage_seconds - 10.0).abs() < f64::EPSILON);
         assert_eq!(window(&history, "work:b", now, 60).average_cores, None);
     }
     fn point(now: Instant, seconds: f64) -> CpuPoint {
@@ -712,18 +712,18 @@ mod tests {
         let now = Instant::now();
         let mut history = VecDeque::from([
             CpuInterval {
-                end: now - Duration::from_secs(55),
+                end: now.checked_sub(Duration::from_secs(55)).unwrap(),
                 elapsed: Duration::from_secs(10),
                 cores: BTreeMap::from([("work:a".into(), Some(2.0))]),
             },
             CpuInterval {
-                end: now - Duration::from_secs(20),
+                end: now.checked_sub(Duration::from_secs(20)).unwrap(),
                 elapsed: Duration::from_secs(10),
                 cores: BTreeMap::from([("work:a".into(), Some(1.0))]),
             },
         ]);
         let result = window(&history, "work:a", now, 60);
-        assert_eq!(result.coverage_seconds, 15.0);
+        assert!((result.coverage_seconds - 15.0).abs() < f64::EPSILON);
         assert_eq!(result.average_cores, Some(20.0 / 15.0));
         prune_history(&mut history, now + HISTORY);
         assert!(history.is_empty());
@@ -760,16 +760,16 @@ mod tests {
         let (members, complete) = scope_cpu_members(&groups, Some(&identities));
         assert_eq!(members["work:a"].len(), 1);
         assert_eq!(members["work:b"].len(), 1);
-        assert_eq!(complete["work:a"], false);
-        assert_eq!(complete["work:b"], false);
+        assert!(!complete["work:a"]);
+        assert!(!complete["work:b"]);
         let reversed = groups.into_iter().rev().collect::<Vec<_>>();
         assert_eq!(scope_cpu_members(&reversed, Some(&identities)).1, complete);
 
         let mut changed = group(b, "b-2");
         changed.launch_identity.process.start_time = 99;
         let (members, complete) = scope_cpu_members(&[group(a, "b-1"), changed], Some(&identities));
-        assert_eq!(complete["work:a"], true);
-        assert_eq!(complete["work:b"], false);
+        assert!(complete["work:a"]);
+        assert!(!complete["work:b"]);
         assert!(members["work:b"].is_empty());
     }
 
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(result.cpu_cores_latest, Some(0.0));
         assert_eq!(result.cpu_sampled_at, None);
         assert_eq!(result.cpu_one_minute.average_cores, Some(1.0));
-        assert_eq!(result.cpu_one_minute.coverage_seconds, 5.0);
+        assert!((result.cpu_one_minute.coverage_seconds - 5.0).abs() < f64::EPSILON);
         assert_eq!(result.memory_bytes, Some(0));
     }
 
@@ -799,17 +799,19 @@ mod tests {
             ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse("a").unwrap());
         let groups = vec![group(scope.clone(), "b-1")];
         let cpu_at = Utc::now() - chrono::Duration::seconds(3);
-        let mut state = CpuState::default();
-        state.previous = Some(CpuPoint {
-            at: now - Duration::from_secs(3),
-            sampled_at: cpu_at,
-            readings: BTreeMap::new(),
-            complete: BTreeMap::new(),
-            launches: BTreeMap::from([(
-                scope.stable_key(),
-                BTreeSet::from([groups[0].stable_resource_identity()]),
-            )]),
-        });
+        let mut state = CpuState {
+            previous: Some(CpuPoint {
+                at: now.checked_sub(Duration::from_secs(3)).unwrap(),
+                sampled_at: cpu_at,
+                readings: BTreeMap::new(),
+                complete: BTreeMap::new(),
+                launches: BTreeMap::from([(
+                    scope.stable_key(),
+                    BTreeSet::from([groups[0].stable_resource_identity()]),
+                )]),
+            }),
+            ..CpuState::default()
+        };
         state.latest.insert(scope.stable_key(), Some(0.5));
         let memory_at = Utc::now();
         let result = summarize(&scope, &groups, None, &state, now, memory_at);

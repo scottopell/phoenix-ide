@@ -12671,7 +12671,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .unwrap();
         assert_eq!(empty.memory_bytes, Some(0));
-        assert_eq!(empty.cpu_one_minute.coverage_seconds, 0.0);
+        assert!(empty.cpu_one_minute.coverage_seconds.abs() < f64::EPSILON);
         let Json(all) = super::get_all_work_scope_load(
             State(state),
             Query(super::WorkScopeActorQuery {

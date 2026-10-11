@@ -191,9 +191,9 @@ fn valid_group_members(
     identities: &BTreeMap<u32, ProcessIdentity>,
 ) -> bool {
     !identities.is_empty()
-        && !identities
+        && identities
             .get(&group.launch_identity.process.pid)
-            .is_some_and(|identity| identity.start_time != group.launch_identity.process.start_time)
+            .is_none_or(|identity| identity.start_time == group.launch_identity.process.start_time)
 }
 
 async fn sample_generation(

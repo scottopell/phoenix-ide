@@ -41,3 +41,5 @@ Validation:
 Remaining qualification: exact-head hosted CI/review, broad Rust baseline failure disposition, and rendered browser acceptance (unit DOM tests are not visual acceptance). Keep task in-progress until those gates are satisfied. No production profiling, process termination, cleanup, host configuration, or deployment occurred.
 
 Coordination: attempted handoff status to the supplied Global conversation reference was rejected as target_not_found; no delivery claim. Concrete UI edits are bounded to WorkScopePanel, its FileExplorer/DesktopLayout wiring, and tests; no transcript rendering/links/details or replay/startup reducer rewrite.
+
+Published draft PR [#888](https://github.com/scottopell/phoenix-ide/pull/888) in separate backend/spec and inline-UI commits. Final all-target `./dev.py check --lanes clippy` passed after correcting new fixture assertions/checked-time arithmetic and a boolean simplification. Hosted CI remains authoritative for exact published-head qualification. Roadmap worker status posted at comment 6114516361 (projection acknowledgement pending at posting).
