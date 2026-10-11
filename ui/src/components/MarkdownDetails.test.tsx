@@ -64,6 +64,55 @@ describe('safe basic Markdown disclosures', () => {
     expect(container).toHaveTextContent('Body');
   });
 
+  it.each(['`</summary>`', '``literal ` </summary>``', '`literal\ncode </summary>`'])('ignores a summary closing tag inside inline code: %s', (code) => {
+    const source = `<details><summary>Literal ${code} text</summary>\nBody\n</details>`;
+    const { container } = markdown(source);
+    expect(container.querySelectorAll('details')).toHaveLength(1);
+    expect(container.querySelector('summary code')).toHaveTextContent('</summary>');
+    expect(container.querySelector('summary')).toHaveTextContent('text');
+    expect(container.querySelector('details p')).toHaveTextContent('Body');
+    expect(markdownDetailsRanges(source)).toEqual([{ start: 0, end: source.length }]);
+    const processor = unified().use(remarkParse).use(remarkDetails);
+    const tree = processor.runSync(processor.parse(source), { value: source });
+    const details = tree.children[0]!;
+    if (!('children' in details)) throw new Error('Missing disclosure body');
+    const summary = details.children[0]!;
+    if (!('children' in summary)) throw new Error('Missing summary');
+    const literal = summary.children.find((node) => node.type === 'inlineCode')!;
+    expect(literal.position?.start.offset).toBe(source.indexOf(code));
+    expect(literal.position?.end.offset).toBe(source.indexOf(code) + code.length);
+    expect(details.children[1]?.position?.start.offset).toBe(source.indexOf('Body'));
+  });
+
+  it.each([
+    '<details><summary>Unclosed</summary>\n**Visible prefix**',
+    '<details><summary>Unclosed summary\n**Visible prefix**',
+    '<details>\n**Visible prefix**',
+  ])('recognizes a valid adjacent disclosure after malformed input: %s', (prefix) => {
+    const valid = '<details><summary>Valid</summary>\n**Valid body**\n</details>';
+    const source = `${prefix}\n${valid}\nTrailing`;
+    const { container } = markdown(source);
+    expect(container.querySelectorAll('details')).toHaveLength(1);
+    expect(container.querySelector('summary')).toHaveTextContent('Valid');
+    expect(screen.getByText('Valid body').closest('details')).not.toBeNull();
+    expect(screen.getByText('Visible prefix').closest('details')).toBeNull();
+    expect(screen.getByText('Trailing').closest('details')).toBeNull();
+    const start = prefix.length + 1;
+    expect(markdownDetailsRanges(source)).toEqual([{ start, end: start + valid.length }]);
+  });
+
+  it('keeps nested syntax in fallback while recognizing a following adjacent disclosure', () => {
+    const nested = '<details><summary>Outer</summary>\n<details><summary>Inner</summary>\nNested body\n</details>\n</details>';
+    const valid = '<details><summary>Valid</summary>\nValid body\n</details>';
+    const source = `${nested}\n${valid}`;
+    const { container } = markdown(source);
+    expect(container.querySelectorAll('details')).toHaveLength(1);
+    expect(container.querySelector('summary')).toHaveTextContent('Valid');
+    expect(container).toHaveTextContent('Outer');
+    expect(container).toHaveTextContent('Inner');
+    expect(markdownDetailsRanges(source)).toEqual([{ start: nested.length + 1, end: source.length }]);
+  });
+
   it('accepts a wrapper tag as an inline-code literal in the summary', () => {
     const source = '<details><summary>Literal `<details>`</summary>\n\nBody\n</details>';
     const { container } = markdown(source);

@@ -13,7 +13,7 @@ type Node = {
 
 // Quoted attribute values may contain >; no attribute is copied into the tree.
 const ATTRIBUTES = String.raw`((?:"[^"]*"|'[^']*'|[^'">])*)`;
-const HEADER = new RegExp(String.raw`^<details(?=\s|>)${ATTRIBUTES}>\s*<summary(?=\s|>)${ATTRIBUTES}>([\s\S]*?)<\/summary\s*>`, 'i');
+const HEADER = new RegExp(String.raw`^<details(?=\s|>)${ATTRIBUTES}>\s*<summary(?=\s|>)${ATTRIBUTES}>`, 'i');
 const OPENING = /^<details(?:\s|>)/i;
 const CLOSING = /^<\/details\s*>/i;
 const SUPPORTED_TAGS = /<\/?(?:details|summary)\b[^>]*>/gi;
@@ -71,10 +71,24 @@ function disclosureCodeRegions(source: string, parse: (text: string) => Markdown
   };
 }
 
-function disclosureStarts(source: string, isCode: (offset: number) => boolean): number[] {
-  return Array.from(source.matchAll(new RegExp(String.raw`<details(?=\s|>)${ATTRIBUTES}>`, 'gi')))
-    .filter((match) => !isCode(match.index))
-    .map((match) => match.index);
+function disclosureBoundaries(source: string, isCode: (offset: number) => boolean) {
+  const starts: number[] = [];
+  const nestedEnds = new Map<number, number>();
+  const stack: { start: number; nested: boolean }[] = [];
+  const tags = source.matchAll(new RegExp(String.raw`<details(?=\s|>)${ATTRIBUTES}>|<\/details\s*>`, 'gi'));
+  for (const tag of tags) {
+    if (isCode(tag.index)) continue;
+    if (OPENING.test(tag[0])) {
+      starts.push(tag.index);
+      const outer = stack.at(-1);
+      if (outer) outer.nested = true;
+      stack.push({ start: tag.index, nested: false });
+    } else {
+      const outer = stack.pop();
+      if (outer?.nested) nestedEnds.set(outer.start, tag.index + tag[0].length);
+    }
+  }
+  return { starts, nestedEnds };
 }
 
 function relocate(node: Node, pointAt: ReturnType<typeof sourcePoints>, offset: number, insertedEscapes: number[] = []): void {
@@ -143,7 +157,7 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
     const source = String(file);
     const pointAt = sourcePoints(source);
     const isCode = disclosureCodeRegions(source, parse);
-    const starts = disclosureStarts(source, isCode);
+    const { starts, nestedEnds } = disclosureBoundaries(source, isCode);
     const withReferences = referenceContext(source, tree);
     const parseContent = (content: string) => {
       const parsed = parse(withReferences(content));
@@ -179,11 +193,15 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
       const regionEnd = starts[upperBound(starts, start)] ?? source.length;
       const remaining = source.slice(start, regionEnd);
       const header = HEADER.exec(remaining);
+      const summaryStart = start + (header?.[0].length ?? 0);
+      const closingSummary = header ? Array.from(remaining.slice(header[0].length).matchAll(/<\/summary\s*>/gi))
+        .find((match) => !isCode(summaryStart + match.index)) : undefined;
+      const summarySource = closingSummary ? source.slice(summaryStart, summaryStart + closingSummary.index) : undefined;
       let end: number | undefined;
       let bodyEnd: number | undefined;
-      const summaryTree = header ? parseContent(header[3]!) : undefined;
-      if (header && summaryTree && !Array.from(htmlNodes(summaryTree)).some((html) => /<\/?(?:details|summary)\b/i.test(html.value ?? ''))) {
-        const bodyStart = start + header[0].length;
+      const summaryTree = summarySource !== undefined ? parseContent(summarySource) : undefined;
+      if (header && closingSummary && summarySource !== undefined && summaryTree && !Array.from(htmlNodes(summaryTree)).some((html) => /<\/?(?:details|summary)\b/i.test(html.value ?? ''))) {
+        const bodyStart = summaryStart + closingSummary.index + closingSummary[0].length;
         const bodyTree = parse(source.slice(bodyStart, regionEnd));
         for (const html of htmlNodes(bodyTree)) {
           if (OPENING.test(html.value ?? '')) break; // Nested disclosures are outside the basic syntax.
@@ -195,8 +213,6 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
           }
         }
         if (end !== undefined && bodyEnd !== undefined) {
-          const summarySource = header[3]!;
-          const summaryStart = bodyStart - /<\/summary\s*>$/i.exec(header[0])![0].length - summarySource.length;
           const paragraph = summaryTree.children[0];
           // A summary is phrasing content, not a second block document.
           const summary: Extract<MarkdownNode, { type: 'paragraph' }> = {
@@ -228,7 +244,14 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
       }
       // Recover Markdown that CommonMark bundled into an unclosed HTML block.
       const insertedEscapes: number[] = [];
-      const original = source.slice(start, node.position?.end.offset);
+      const recoveryEnd = nestedEnds.get(start) ?? Math.min(regionEnd, node.position?.end.offset ?? regionEnd);
+      let tailEnd = node.position?.end.offset ?? recoveryEnd;
+      while (tailEnd < recoveryEnd && pending.length) {
+        const consumed = pending.pop()!;
+        tailEnd = 'node' in consumed ? consumed.node.position?.end.offset ?? recoveryEnd : consumed.end;
+      }
+      if (tailEnd > recoveryEnd) pending.push({ start: recoveryEnd, end: tailEnd });
+      const original = source.slice(start, recoveryEnd);
       const escaped = original.replace(SUPPORTED_TAGS, (tag, offset: number) => {
         if (isCode(start + offset)) return tag;
         insertedEscapes.push(offset + insertedEscapes.length);
