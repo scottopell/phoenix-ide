@@ -3,6 +3,8 @@ import { useTheme } from '../hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { markdownDetailsRanges, markdownReferenceContext, remarkDetails } from './remarkDetails';
+import { MarkdownDetails, MarkdownSummary } from './MarkdownDetails';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { StreamingBuffer } from '../conversation/atom';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
@@ -15,14 +17,15 @@ import { MermaidDiagram } from './MermaidDiagram';
 import { formatMessageTime } from './MessageComponents';
 
 // Stable markdown configuration — avoids creating new references on every render
-const REMARK_PLUGINS = [remarkGfm];
+const REMARK_PLUGINS = [remarkGfm, remarkDetails];
 
 type StreamingMarkdownComponentsContext = {
+  syntaxStyle: Record<string, React.CSSProperties>;
   rootDir?: string | undefined;
   onFileClick?: ((filePath: string) => void) | undefined;
 };
 
-function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMarkdownComponentsContext) {
+function createStreamingMarkdownComponents({ rootDir, onFileClick, syntaxStyle }: StreamingMarkdownComponentsContext) {
   return {
     a: (props: React.ComponentPropsWithoutRef<'a'> & { node?: unknown }) => (
       <ConversationMarkdownAnchor
@@ -31,10 +34,19 @@ function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMa
         filePathCopyContext={rootDir ? { rootDir } : undefined}
       />
     ),
+    pre: ({ children }) => <>{children}</>,
     code: ({ children, node, ...props }: React.ComponentPropsWithoutRef<'code'> & { node?: unknown }) => {
       void node;
+      const code = String(children ?? '');
+      const language = /language-(\S+)/.exec(props.className ?? '')?.[1];
+      if (language || code.endsWith('\n')) {
+        if (language?.toLowerCase() === 'mermaid') return <MermaidDiagram code={code} />;
+        return <SyntaxHighlighter style={syntaxStyle} language={language || 'text'} PreTag="div">{code.replace(/\n$/, '')}</SyntaxHighlighter>;
+      }
       return <code {...props} data-token-kind={inlineCodeTokenKind(children)}>{children}</code>;
     },
+    details: MarkdownDetails,
+    summary: MarkdownSummary,
     table: ConversationMarkdownTable,
     img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
       <ConversationMarkdownImage
@@ -44,8 +56,6 @@ function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMa
     ),
   } satisfies Components;
 }
-
-const MARKDOWN_COMPONENTS = createStreamingMarkdownComponents({});
 
 /**
  * Subscribes to the streaming buffer for the given slug and renders it.
@@ -167,12 +177,24 @@ export function StreamingBlocks({
   }, []);
 
   // Parse once per text change, not on theme-only re-renders.
-  const blocks = useMemo(() => parseStreamingBlocks(displayText), [displayText]);
+  const blocks = useMemo<StreamingBlock[]>(() => {
+    const ranges = markdownDetailsRanges(displayText);
+    const result: StreamingBlock[] = [];
+    let cursor = 0;
+    for (const range of ranges) {
+      result.push(...parseStreamingBlocks(displayText.slice(cursor, range.start)));
+      result.push({ type: 'markdown', content: displayText.slice(range.start, range.end) });
+      cursor = range.end;
+    }
+    result.push(...parseStreamingBlocks(displayText.slice(cursor)));
+    const withReferences = markdownReferenceContext(displayText);
+    return result.map((block) => block.type === 'markdown'
+      ? { ...block, content: withReferences(block.content) }
+      : block);
+  }, [displayText]);
   const markdownComponents = useMemo(
-    () => (rootDir || onOpenFile
-      ? createStreamingMarkdownComponents({ rootDir, onFileClick: onOpenFile })
-      : MARKDOWN_COMPONENTS),
-    [rootDir, onOpenFile],
+    () => createStreamingMarkdownComponents({ rootDir, onFileClick: onOpenFile, syntaxStyle }),
+    [rootDir, onOpenFile, syntaxStyle],
   );
 
   return (

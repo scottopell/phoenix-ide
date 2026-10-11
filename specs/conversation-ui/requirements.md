@@ -88,6 +88,17 @@ THEN THE SYSTEM SHALL present a transcript-local action to retry the acquisition
 WHEN agent message contains markdown
 THE SYSTEM SHALL render basic markdown (code blocks, bold, italic, paragraphs)
 
+WHEN agent Markdown contains a complete top-level, non-nested details block with a leading summary
+THE SYSTEM SHALL render a native keyboard-operable disclosure with Markdown content in its body
+AND SHALL collapse it unless its opening tag supplies the HTML boolean open attribute
+AND SHALL provide a visible disclosure cue and keyboard focus indication
+AND SHALL discard other wrapper attributes without enabling arbitrary raw HTML
+
+WHEN disclosure markup is incomplete, malformed, nested, or otherwise unsupported
+THE SYSTEM SHALL retain it as visible text without hiding the remaining reply
+
+Disclosure recognition SHALL preserve code-fence and inline-code literals, existing safe URL handling, and ordinary Markdown links.
+
 WHEN agent prose contains a recognized local file path as raw text
 OR a Markdown link has that same recognized local file path as its destination
 THE SYSTEM SHALL present the reference as an in-application file action
@@ -96,6 +107,10 @@ AND SHALL preserve the Markdown label as the visible link text when one is prese
 
 WHEN a Markdown link destination is not a recognized local file path
 THE SYSTEM SHALL preserve ordinary safe browser-link behavior
+AND SHALL make inline prose links recognizable without hover through persistent underlining
+AND SHALL provide visible keyboard focus and readable contrast in light and dark themes
+
+Inline prose link affordances SHALL NOT change unrelated button-like link styling.
 
 The local-path shapes recognized in raw text and Markdown destinations SHALL be identical. Path-shape recognition only identifies a file candidate; the server-side viewer-openability classification defined by `specs/file-explorer/requirements.md` remains authoritative for the resolved content.
 
