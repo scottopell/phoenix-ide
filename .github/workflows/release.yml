@@ -455,8 +455,8 @@ jobs:
           retention-days: 14
 
   publish:
-    needs: [gate, build-linux, build-macos]
-    if: needs.gate.outputs.release == 'true'
+    needs: [gate, tag-release, build-linux, build-macos]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.gate.outputs.release == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && (needs.tag-release.result == 'success' || (needs.tag-release.result == 'skipped' && needs.gate.outputs.create_tag == 'false')) }}
     environment: macos-release-signing
     permissions:
       contents: write
