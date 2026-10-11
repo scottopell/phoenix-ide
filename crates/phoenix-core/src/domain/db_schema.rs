@@ -2,7 +2,9 @@
 
 use crate::domain::llm_types::ContentBlock;
 use crate::domain::product_conversation::ProductConversationId;
-use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
+use crate::domain::retry_policy::{
+    AutoRetryPolicy, UserResumePolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
+};
 pub use crate::domain::sm_state::ConvState;
 use crate::work_scope::{RuntimeRole, WorkScopeId};
 use chrono::{DateTime, Utc};
@@ -750,7 +752,7 @@ pub enum ErrorKind {
     InvalidResponse,
     /// Server error (5xx) - retryable
     ServerError,
-    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) - not retryable
+    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) - capacity-policy retry
     ServerOverloaded,
     /// Request timed out - retryable
     TimedOut,
@@ -775,10 +777,14 @@ impl ErrorKind {
             | Self::RateLimit
             | Self::ServerError
             | Self::InvalidResponse
-            | Self::TimedOut => AutoRetryPolicy::AutoRetryable,
+            | Self::TimedOut => AutoRetryPolicy::Generic {
+                max_attempts: GENERIC_MAX_ATTEMPTS,
+            },
+            Self::ServerOverloaded => AutoRetryPolicy::ServerOverloaded {
+                max_attempts: OVERLOAD_MAX_ATTEMPTS,
+            },
             Self::Auth
             | Self::UsageLimitReached
-            | Self::ServerOverloaded
             | Self::InvalidRequest
             | Self::PromptRejected
             | Self::Cancelled
@@ -794,14 +800,22 @@ impl ErrorKind {
         self.auto_retry_policy().allows_auto_retry()
     }
 
+    /// Whether this error participates in the generic short retry loop exposed
+    /// by the wire-level `can_auto_retry` capability. Capacity overload has its
+    /// own bounded policy and is intentionally excluded.
+    #[must_use]
+    pub fn is_generic_auto_retryable(&self) -> bool {
+        matches!(self.auto_retry_policy(), AutoRetryPolicy::Generic { .. })
+    }
+
     /// Policy for a persisted error state accepting a user-triggered `continue`.
     #[must_use]
     pub fn user_resume_policy(&self) -> UserResumePolicy {
         match self {
             // A usage-limit window resets on a clock boundary ("try again at
-            // 1:01 AM"). Like `ServerOverloaded`, the user can resume once the
-            // window clears, so it is user-resumable even though it is never
-            // *auto*-retried (no point hammering a reset-on-clock quota).
+            // 1:01 AM"). It remains user-resumable even though it is never
+            // auto-retried; overload is also resumable after its bounded
+            // automatic policy is exhausted.
             Self::Auth
             | Self::RateLimit
             | Self::Network
@@ -2068,8 +2082,22 @@ mod error_kind_tests {
     use super::*;
 
     #[test]
+    fn overload_is_not_exposed_as_generic_auto_retryable() {
+        assert!(ErrorKind::Network.is_generic_auto_retryable());
+        assert!(ErrorKind::ServerOverloaded.is_auto_retryable());
+        assert!(!ErrorKind::ServerOverloaded.is_generic_auto_retryable());
+    }
+
+    #[test]
     fn all_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
         use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
+
+        const GENERIC: AutoRetryPolicy = AutoRetryPolicy::Generic {
+            max_attempts: GENERIC_MAX_ATTEMPTS,
+        };
+        const OVERLOAD: AutoRetryPolicy = AutoRetryPolicy::ServerOverloaded {
+            max_attempts: OVERLOAD_MAX_ATTEMPTS,
+        };
         use ErrorKind::{
             Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, InvalidResponse,
             Network, PromptRejected, RateLimit, ServerError, ServerOverloaded, SubAgentError,
@@ -2077,41 +2105,17 @@ mod error_kind_tests {
         };
 
         let cases = [
-            (
-                Network,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
-            (
-                RateLimit,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
+            (Network, GENERIC, UserResumePolicy::Resumable),
+            (RateLimit, GENERIC, UserResumePolicy::Resumable),
             (
                 UsageLimitReached,
                 AutoRetryPolicy::NoAutoRetry,
                 UserResumePolicy::Resumable,
             ),
-            (
-                ServerError,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
-            (
-                InvalidResponse,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
-            (
-                ServerOverloaded,
-                AutoRetryPolicy::NoAutoRetry,
-                UserResumePolicy::Resumable,
-            ),
-            (
-                TimedOut,
-                AutoRetryPolicy::AutoRetryable,
-                UserResumePolicy::Resumable,
-            ),
+            (ServerError, GENERIC, UserResumePolicy::Resumable),
+            (InvalidResponse, GENERIC, UserResumePolicy::Resumable),
+            (ServerOverloaded, OVERLOAD, UserResumePolicy::Resumable),
+            (TimedOut, GENERIC, UserResumePolicy::Resumable),
             (
                 Auth,
                 AutoRetryPolicy::NoAutoRetry,

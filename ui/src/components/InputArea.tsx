@@ -106,6 +106,8 @@ function canAcceptChatMessage(state: ConversationState): boolean {
     case 'tool_executing':
     case 'awaiting_sub_agents':
       return true;
+    case 'server_overload_retrying':
+      return state.target === 'ordinary';
     case 'cancelling_tool':
     case 'cancelling_sub_agents':
       return true;
@@ -155,6 +157,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const canCancel = !readOnly && canCancelConversationState(convState);
   const isCancelling = isCancellingState(convState);
   const acceptsChatMessage = !readOnly && canAcceptChatMessage(convState);
+  const continuationOverloadReadOnly = convState.type === 'server_overload_retrying'
+    && convState.target === 'continuation';
   const setDraft = onDraftChange;
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -725,6 +729,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             placeholder={placeholder}
             rows={1}
             enterKeyHint="send"
+            disabled={continuationOverloadReadOnly}
             value={voiceBase !== null
               ? (voiceBase.trim()
                   ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')

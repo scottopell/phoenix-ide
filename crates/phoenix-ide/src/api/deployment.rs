@@ -1241,6 +1241,9 @@ fn conv_state_name(state: &phoenix_core::domain::sm_state::ConvState) -> &'stati
     match state {
         phoenix_core::domain::sm_state::ConvState::Idle => "Idle",
         phoenix_core::domain::sm_state::ConvState::LlmRequesting { .. } => "LlmRequesting",
+        phoenix_core::domain::sm_state::ConvState::ServerOverloadRetrying { .. } => {
+            "ServerOverloadRetrying"
+        }
         phoenix_core::domain::sm_state::ConvState::SeededLlmRequesting { .. } => {
             "SeededLlmRequesting"
         }

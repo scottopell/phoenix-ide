@@ -43,6 +43,20 @@
     },
     {
       "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ContinuationOverloadCannotContinue",
+      "listening_rules": [
+        "ContinuationOverloadStopsRecoverably"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ContinuationServerOverloadObserved",
+      "listening_rules": [
+        "ContinuationServerOverload"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
       "trigger": "ContinuationSuccessorAttemptLosesRace",
       "listening_rules": [
         "ConcurrentContinuationAttemptResolvesToSingleWinner",
@@ -64,7 +78,9 @@
       "trigger": "CredentialBecameAvailable",
       "listening_rules": [
         "ContinuationRecoverySucceeded",
-        "ConversationTurnRecoverySucceeded"
+        "ConversationTurnRecoverySucceeded",
+        "OverloadRecoveryStopsAtAttemptCap",
+        "OverloadRecoverySucceededWithinBudget"
       ]
     },
     {
@@ -90,6 +106,7 @@
         "BackendRejectsContextExhausted",
         "ContinuationNonRecoverableError",
         "ContinuationRetryableError",
+        "OverloadRetryAuthErrorWithActiveRecovery",
         "ParentLlmErrorNonRecoverable",
         "RetryableLlmError",
         "SubAgentLlmError"
@@ -119,6 +136,20 @@
       "trigger": "ModeTransitioned",
       "listening_rules": [
         "ModeChangeNotification"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "OverloadRetryDeadlineExpires",
+      "listening_rules": [
+        "OverloadRecoveryDeadlineExpires"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "OverloadRetryTimeoutExpires",
+      "listening_rules": [
+        "OverloadRetryTimerDispatchesPersistedAttempt"
       ]
     },
     {
@@ -201,8 +232,28 @@
       "spec": "specs/bedrock/bedrock.allium",
       "trigger": "RuntimeStarts",
       "listening_rules": [
+        "ExpireOverloadRecoveryOnRestart",
+        "ExpireOverloadRetryOnRestart",
+        "RestoreOverloadRecoveryDeadline",
+        "RestoreOverloadRetryBeforeDeadline",
         "ResumeInterruptedContinuation",
         "RuntimeRecreatesUserResumableError"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "RuntimeStartsWithContinuationOverload",
+      "listening_rules": [
+        "ExpireContinuationOverloadRetryOnRestart",
+        "RestoreContinuationOverloadRetry"
+      ]
+    },
+    {
+      "spec": "specs/bedrock/bedrock.allium",
+      "trigger": "ServerOverloadObserved",
+      "listening_rules": [
+        "FirstConversationTurnOverloadStartsIncident",
+        "RepeatedOverloadPreservesIncidentWindow"
       ]
     },
     {

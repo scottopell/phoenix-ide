@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
+import itertools
+import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 workflow = Path('.github/workflows/release.yml').read_text()
@@ -49,7 +53,7 @@ required_fragments = [
     '[[ ! -e "$RUNNER_TEMP/phoenix-notary-api-key.p8" ]]',
     'rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/phoenix-notary-api-key.p8"',
     'macos/Phoenix/scripts/package-desktop-release.sh',
-    'needs: [gate, build-linux, build-macos]',
+    'needs: [gate, tag-release, build-linux, build-macos]',
     'Phoenix-macos-x86_64-apple-darwin-${{ needs.gate.outputs.tag }}.zip',
     'Phoenix-macos-aarch64-apple-darwin-${{ needs.gate.outputs.tag }}.zip',
     'phoenix_ide-x86_64-unknown-linux-musl-debug',
@@ -97,8 +101,31 @@ build_macos_job = workflow.split('\n  build-macos:\n', 1)[1].split('\n  publish:
 publish_job = workflow.split('\n  publish:\n', 1)[1]
 if not build_macos_job.startswith('    environment: macos-release-signing\n'):
     raise SystemExit('macOS signing must use the protected macos-release-signing environment')
-if not publish_job.startswith("    needs: [gate, build-linux, build-macos]\n    if: needs.gate.outputs.release == 'true'\n    environment: macos-release-signing\n"):
-    raise SystemExit('release-only publication must use the protected macos-release-signing environment')
+if not publish_job.startswith('    needs: [gate, tag-release, build-linux, build-macos]\n') or '\n    environment: macos-release-signing\n' not in publish_job:
+    raise SystemExit('publication must explicitly observe all gate/tag/build results in the protected environment')
+publish_condition = re.search(r'^    if: \$\{\{ (.+) \}\}$', publish_job, re.MULTILINE).group(1)
+if '!cancelled()' not in publish_condition:
+    raise SystemExit('publication needs an explicit status function to avoid implicit skipped-ancestor success gating')
+
+# Execute the actual job condition, not a separately reimplemented predicate.
+# Compare all 2,048 result/output/cancellation combinations to the intended gate.
+expression = publish_condition.replace('cancelled()', 'cancelled')
+expression = expression.replace('&&', ' and ').replace('||', ' or ').replace('!', 'not ')
+fields = ['needs.gate.result', 'needs.tag-release.result', 'needs.build-linux.result',
+          'needs.build-macos.result', 'needs.gate.outputs.release', 'needs.gate.outputs.create_tag']
+for index, field in enumerate(fields):
+    expression = expression.replace(field, f'values[{index}]')
+assert re.fullmatch(r"[a-z0-9_\[\]() .'=]+", expression), expression
+results = ['success', 'failure', 'cancelled', 'skipped']
+for gate, tag, linux, macos, release, create_tag, cancelled in itertools.product(
+        results, results, results, results, ['true', 'false'], ['true', 'false'], [True, False]):
+    values = [gate, tag, linux, macos, release, create_tag]
+    actual = eval(expression, {'__builtins__': {}}, {'values': values, 'cancelled': cancelled})
+    expected = (not cancelled and gate == 'success' and release == 'true'
+                and linux == 'success' and macos == 'success'
+                and (tag == 'success' or (tag == 'skipped' and create_tag == 'false')))
+    assert actual == expected, values + [cancelled]
+
 workflow_header = workflow.split('\njobs:\n', 1)[0]
 if "inputs.operation == 'prepare-main' && 'preparation' || 'release'" not in workflow_header or 'cancel-in-progress: false' not in workflow_header:
     raise SystemExit('preparation must not replace a pending release workflow')
@@ -108,7 +135,7 @@ if 'Wait for earlier release workflows' in workflow or 'actions/workflows/releas
     raise SystemExit('release serialization must not claim an application-managed lossless queue')
 if 'ref: ${{ needs.gate.outputs.commit }}' not in build_macos_job:
     raise SystemExit('macOS artifacts must be built from the exact gated commit')
-if "if: needs.gate.outputs.release == 'true'" not in publish_job:
+if "needs.gate.outputs.release == 'true'" not in publish_condition:
     raise SystemExit('preparation must not reach release publication')
 if 'needs.gate.outputs.preparation' in publish_job:
     raise SystemExit('preparation authority must not enter the publication job')
@@ -124,7 +151,7 @@ if write_jobs != {'tag-release', 'publish'}:
     raise SystemExit(f'unexpected repository write-capable jobs: {sorted(write_jobs)}')
 if "if: needs.gate.outputs.create_tag == 'true'" not in job_sections['tag-release']:
     raise SystemExit('tag writer must be release-only')
-if "if: needs.gate.outputs.release == 'true'" not in job_sections['publish']:
+if "needs.gate.outputs.release == 'true'" not in publish_condition:
     raise SystemExit('publisher must be release-only')
 for forbidden in ['prod deploy', '/api/files/reveal', 'gh release', 'gh api --method POST']:
     if forbidden in build_macos_job:
@@ -208,6 +235,11 @@ for fragment in [
         raise SystemExit(f'missing stable/RC publication contract: {fragment}')
 if 'gh release create' in publish_script:
     raise SystemExit('release creation must use explicit channel and latest metadata')
+if 'notes_args=()' in publish_script or '"${publication_args[@]}"' not in publish_script:
+    raise SystemExit('publication arguments must be nonempty under macOS Bash 3.2 nounset')
+publisher_tests = Path('scripts/test-publish-release-assets.sh').read_text()
+if 'PUBLISH_BASH=${PUBLISH_BASH:-/bin/bash}' not in publisher_tests or '"$PUBLISH_BASH" "$root/scripts/publish-release-assets.sh"' not in publisher_tests:
+    raise SystemExit('publisher regressions must default to the actual macOS system Bash')
 
 verify_script = Path('scripts/verify-published-release.sh').read_text()
 for fragment in [
@@ -230,6 +262,229 @@ for fragment in [
 for forbidden in ['MINOR + 1', '^[0-9]+\\.[0-9]+\\.[0-9]+$']:
     if forbidden in tag_script:
         raise SystemExit(f'tag release script bypasses shared version contract: {forbidden}')
+
+acceptance = workflow[workflow.index('      - name: Check isolated signed-helper startup'):
+                      workflow.index('      - name: Retain successful headless acceptance receipt')]
+for fragment in [
+    'if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then',
+    'require("./scripts/check-signed-helper.cjs")',
+    '"${{ needs.gate.outputs.commit }}"',
+    '"${{ needs.gate.outputs.version }}"',
+    '"${{ matrix.target }}"',
+    '"$archive" \\',
+    '"$standalone" \\',
+    'HEADLESS-ACCEPTANCE-${{ matrix.target }}.json',
+]:
+    if fragment not in acceptance:
+        raise SystemExit(f'missing unchanged-artifact acceptance: {fragment}')
+if not (workflow.index('      - name: Remove protected material') <
+        workflow.index('      - name: Check isolated signed-helper startup') <
+        workflow.index('          name: desktop-preparation-${{ matrix.target }}-${{ needs.gate.outputs.commit }}')):
+    raise SystemExit('runtime acceptance must follow signing cleanup and gate successful retention')
+for fragment in [
+    'if: failure()',
+    'path: qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}/runtime/acceptance-receipt.json',
+]:
+    if fragment not in workflow:
+        raise SystemExit('failure upload must contain only a sanitized receipt, not private runtime data')
+
+receipt_names = {}
+for outcome, step_name in [('success', 'Retain successful headless acceptance receipt'),
+                           ('failure', 'Retain failed headless acceptance receipt')]:
+    section = build_macos_job.split(f'      - name: {step_name}\n', 1)[1].split('      - ', 1)[0]
+    name = re.search(r'^          name: (.+)$', section, re.MULTILINE).group(1)
+    if '${{ github.run_id }}' not in name or '${{ github.run_attempt }}' not in name:
+        raise SystemExit('receipt names must preserve evidence across runs and rerun attempts')
+    if not name.endswith('-' + outcome):
+        raise SystemExit('success and failure receipt uploads must not collide within one attempt')
+    receipt_names[outcome] = name
+seen_names = set()
+for target in ['aarch64-apple-darwin', 'x86_64-apple-darwin']:
+    for run in ['100', '101']:
+        for attempt in ['1', '2']:
+            for outcome, template in receipt_names.items():
+                name = template
+                for key, value in {'matrix.target': target, 'needs.gate.outputs.commit': 'a' * 40,
+                                   'github.run_id': run, 'github.run_attempt': attempt}.items():
+                    name = name.replace('${{ ' + key + ' }}', value)
+                if name in seen_names:
+                    raise SystemExit('receipt uploads must be distinct for every arch/run/attempt/outcome')
+                seen_names.add(name)
+
+allium = Path('specs/desktop-release/desktop-release.allium').read_text()
+for rule, variable in [('CompleteInaccessiblePublicationBecomesVerified', 'release'),
+                       ('VerifiedInaccessiblePublicationBecomesPublic', 'publication'),
+                       ('ExactPublicRetryIsIdempotent', 'publication')]:
+    section = allium.split('rule ' + rule + ' {', 1)[1].split('\n}', 1)[0]
+    if f'requires: required_native_pairs_passed({variable})' not in section:
+        raise SystemExit(f'{rule} must require both native acceptance passes')
+for fragment in [
+    'native_acceptance: NativeAcceptanceState',
+    'rule NativeAcceptanceRequiresUnchangedVerifiedPair {',
+    'requires: protected_signing_material_removed(pair)',
+    'requires: native_isolated_artifact_checks_pass(pair)',
+    'ensures: sanitized_native_receipt_retained(pair)',
+    'rule NativeAcceptanceFailureBlocksPair {',
+    'ensures: pair.native_acceptance = failed',
+    'invariant PassedNativeAcceptanceHasVerifiedUnchangedPair {',
+    'invariant VerifiedPreparationHasNativeAcceptance {',
+    'preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))',
+    'required_native_pairs_passed(ReleasePublication) and',
+]:
+    if fragment not in allium:
+        raise SystemExit(f'missing native acceptance model contract: {fragment}')
+
+for helper, next_helper in [
+    ('required_architecture_pairs_validated(publication)', 'public_release_is_exact(publication)'),
+    ('preparation_uses_release_security_path(preparation)', 'preparation_has_no_release_authority(preparation)'),
+]:
+    contract = allium.split('-- ' + helper + ' -> Boolean\n', 1)[1].split('-- ' + next_helper, 1)[0]
+    if 'native_acceptance state, read through' not in contract or 'required_native_pairs_passed' not in contract:
+        raise SystemExit(f'{helper} must defer native acceptance to its typed authority')
+    for duplicate in ['native isolated artifact checks', 'sanitized receipts retained', 'native_acceptance = passed']:
+        if duplicate in contract:
+            raise SystemExit(f'{helper} must not duplicate native acceptance checks or results')
+notes_helper = 'reviewed_notes_attached_atomically_when_supplied(publication)'
+notes_contract = allium.split('-- ' + notes_helper + ' -> Boolean\n', 1)[1].split('-- preparation_identity_is_current_main', 1)[0]
+for fragment in ['immutable tagged source', 'nonempty notes', 'visibility/channel fields',
+                 'no reviewed notes', 'true without', 'existing generated notes remain',
+                 'No subsequent public']:
+    if fragment not in notes_contract:
+        raise SystemExit(f'atomic optional notes contract missing: {fragment}')
+public_transition = allium.split('rule VerifiedInaccessiblePublicationBecomesPublic {', 1)[1].split('\n}', 1)[0]
+if 'requires: ' + notes_helper not in public_transition:
+    raise SystemExit('private-to-public transition must carry supplied notes in its publication request')
+public_retry = allium.split('rule ExactPublicRetryIsIdempotent {', 1)[1].split('\n}', 1)[0]
+if notes_helper in public_retry:
+    raise SystemExit('already-public retries must not require a notes mutation')
+
+if '        if:' in acceptance:
+    raise SystemExit('native headless acceptance must gate preparation and release on default success')
+release_upload = build_macos_job.split('          name: macos-${{ matrix.target }}', 1)[1].split('      - uses:', 1)[0]
+if 'release-assets/*' in release_upload or 'HEADLESS-ACCEPTANCE' in release_upload:
+    raise SystemExit('release payload artifact must not include headless receipts')
+for fragment in [
+    '${{ runner.temp }}/release-assets/${{ matrix.asset }}',
+    '${{ runner.temp }}/release-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip',
+]:
+    if fragment not in release_upload:
+        raise SystemExit('release upload must contain the exact architecture pair')
+if workflow.index('      - name: Retain successful headless acceptance receipt') > workflow.index('          name: macos-${{ matrix.target }}'):
+    raise SystemExit('release payload retention must depend on successful receipt retention')
+if 'notes_source="${{ needs.gate.outputs.commit }}:docs/releases/${{ needs.gate.outputs.tag }}.md"' not in publish_job:
+    raise SystemExit('reviewed notes must come from immutable gated source, not current retry tooling')
+if 'git show "$notes_source" > "$RELEASE_NOTES_FILE"' not in publish_job or 'fetch-depth: 0' not in publish_job:
+    raise SystemExit('publisher must retain immutable tagged notes for historical retries')
+notes = Path('docs/releases/v0.13.0-rc.2.md').read_text()
+for fragment in ['macOS GUI/clean-host desktop pass', 'physical iPhone Safari', 'Known acceptance gaps', 'not new RC2-byte acceptance']:
+    if fragment not in notes:
+        raise SystemExit(f'missing RC2 disclosure: {fragment}')
+
+qa_root = '$GITHUB_WORKSPACE/qa-artifacts/release-qa/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.target }}'
+if f'qa="{qa_root}"' not in acceptance or '/target/signed-helper-acceptance/' in acceptance:
+    raise SystemExit('runtime QA must be run/attempt-qualified outside the Cargo target cache')
+if any(part.startswith('.') for part in qa_root.split('/')[1:]):
+    raise SystemExit('receipt parent directories must not depend on hidden-file uploader behavior')
+if 'rm -' in acceptance:
+    raise SystemExit('stale runtime directories must not be deleted or reused to satisfy freshness')
+wrapper = acceptance.split("          node --eval '\n", 1)[1].split("          ' \\\n", 1)[0]
+for fragment in ['const { checkSignedHelper } = require("./scripts/check-signed-helper.cjs")',
+                 'checkSignedHelper({ archive, standalone, sha, version, target, output })',
+                 'preflightCodes.has(error.message)', 'acceptance-failed-see-sanitized-receipt',
+                 'process.exitCode = 1']:
+    if fragment not in wrapper:
+        raise SystemExit(f'workflow must retain the tagged checker and safe failure behavior: {fragment}')
+if 'error.stack' in wrapper or 'JSON.stringify(error)' in wrapper:
+    raise SystemExit('workflow must not expose private raw checker diagnostics')
+
+# Execute the real workflow shell with a node double: prove each mode selects its
+# own bytes and a failed native check cannot retain a successful payload receipt.
+acceptance_shell = acceptance.split('        run: |\n', 1)[1]
+acceptance_shell = '\n'.join(line[10:] for line in acceptance_shell.splitlines())
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    bin_dir = base / 'bin'
+    bin_dir.mkdir()
+    node = bin_dir / 'node'
+    node.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+Path(os.environ['CALLS']).write_text(json.dumps(sys.argv[1:]))
+if os.environ.get('FAIL_CHECK') == '1':
+    raise SystemExit(1)
+runtime = Path(sys.argv[-1])
+runtime.mkdir(parents=True, exist_ok=True)
+(runtime / 'acceptance-receipt.json').write_text('{}')
+''')
+    node.chmod(0o755)
+    # Invoke the actual inline wrapper with the unchanged checker on a rejected
+    # preflight. It must fail closed and expose only an allowlisted static code.
+    result = subprocess.run(['node', '--eval', wrapper, str(base / 'private-archive'),
+                             str(base / 'private-standalone'), 'short', '0.13.0-rc.2',
+                             'aarch64-apple-darwin', str(base / 'private-output')],
+                            capture_output=True, text=True)
+    assert result.returncode == 1
+    assert result.stderr.strip() in {
+        'Signed-helper acceptance failed: requires-macos-host; private details withheld.',
+        'Signed-helper acceptance failed: expected-full-sha-required; private details withheld.',
+    }, result.stderr
+    assert str(base) not in result.stderr and not (base / 'private-output').exists()
+    private_error = 'private diagnostic path=' + str(base) + ' cookie=DO-NOT-LOG'
+    rejection_double = ('require.cache[require.resolve("./scripts/check-signed-helper.cjs")] = '
+                        '{exports: {checkSignedHelper: () => Promise.reject(new Error('
+                        + json.dumps(private_error) + '))}};\n')
+    result = subprocess.run(['node', '--eval', rejection_double + wrapper,
+                             'archive', 'standalone', 'a' * 40, '0.13.0-rc.2',
+                             'aarch64-apple-darwin', str(base / 'private-output')],
+                            capture_output=True, text=True)
+    assert result.returncode == 1
+    assert result.stderr.strip() == 'Signed-helper acceptance failed: acceptance-failed-see-sanitized-receipt; private details withheld.'
+    assert private_error not in result.stderr and not result.stdout
+    for target in ['aarch64-apple-darwin', 'x86_64-apple-darwin']:
+        for preparation in ['true', 'false']:
+            for fail in ['0', '1']:
+                case = base / f'{target}-{preparation}-{fail}'
+                assets_dir = case / 'release-assets'
+                assets_dir.mkdir(parents=True)
+                old_runtime = case / f'target/signed-helper-acceptance/{target}/runtime'
+                old_runtime.mkdir(parents=True)
+                marker = old_runtime / 'prior-proof'
+                marker.write_text('preserve old cache evidence')
+                prior_attempt = case / f'qa-artifacts/release-qa/100/1/{target}/runtime'
+                prior_attempt.mkdir(parents=True)
+                (prior_attempt / 'prior-proof').write_text('preserve prior attempt evidence')
+                substitutions = {
+                    'needs.gate.outputs.commit': 'a' * 40,
+                    'needs.gate.outputs.version': '0.13.0-rc.2',
+                    'needs.gate.outputs.tag': 'v0.13.0-rc.2',
+                    'needs.gate.outputs.preparation': preparation,
+                    'matrix.target': target,
+                    'matrix.asset': f'phoenix_ide-{target}',
+                    'github.run_id': '100',
+                    'github.run_attempt': '2',
+                }
+                shell = acceptance_shell
+                for key, value in substitutions.items():
+                    shell = shell.replace('${{ ' + key + ' }}', value)
+                env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                           GITHUB_WORKSPACE=str(case), RUNNER_TEMP=str(case),
+                           CALLS=str(case / 'calls.json'), FAIL_CHECK=fail)
+                result = subprocess.run(['bash', '-euo', 'pipefail', '-c', shell], env=env, capture_output=True, text=True)
+                assert result.returncode == (1 if fail == '1' else 0), result.stderr
+                calls = json.loads((case / 'calls.json').read_text())
+                suffix = '-prepared-' + 'a' * 12 if preparation == 'true' else ''
+                archive_suffix = suffix if preparation == 'true' else '-v0.13.0-rc.2'
+                assert calls[0] == '--eval'
+                assert calls[2] == str(assets_dir / f'Phoenix-macos-{target}{archive_suffix}.zip')
+                assert calls[3] == str(assets_dir / f'phoenix_ide-{target}{suffix}')
+                assert calls[4:7] == ['a' * 40, '0.13.0-rc.2', target]
+                runtime = case / f'qa-artifacts/release-qa/100/2/{target}/runtime'
+                assert calls[7] == str(runtime)
+                assert (runtime / 'acceptance-receipt.json').exists() == (fail == '0')
+                assert marker.read_text() == 'preserve old cache evidence'
+                assert (prior_attempt / 'prior-proof').read_text() == 'preserve prior attempt evidence'
+                receipt = assets_dir / f'HEADLESS-ACCEPTANCE-{target}.json'
+                assert receipt.exists() == (preparation == 'true' and fail == '0')
 
 package_script = Path('macos/Phoenix/scripts/package-desktop-release.sh').read_text()
 for fragment in [
@@ -271,6 +526,9 @@ for fragment in [
     'scripts/test-publish-release-assets.sh',
     'scripts/test-verify-published-release.sh',
     'scripts/test-desktop-release-workflow.py',
+    'node --test scripts/test-check-signed-helper.cjs',
+    '"scripts/check-signed-helper.cjs"',
+    '"scripts/test-check-signed-helper.cjs"',
 ]:
     if fragment not in macos_workflow:
         raise SystemExit(f'missing macOS workflow regression check: {fragment}')

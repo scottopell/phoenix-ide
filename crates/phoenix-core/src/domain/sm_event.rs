@@ -519,8 +519,8 @@ impl From<PreparedDirectTurnPayload> for SteerEntry {
 
 use crate::domain::llm_types::{ContentBlock, Usage};
 use crate::domain::sm_state::{
-    PendingSubAgent, QuestionAnnotation, QuestionRequestId, SubAgentOutcome, TaskApprovalOutcome,
-    ToolCall,
+    OverloadRetryGuidance, PendingSubAgent, QuestionAnnotation, QuestionRequestId, SubAgentOutcome,
+    TaskApprovalOutcome, ToolCall,
 };
 use std::collections::HashMap;
 
@@ -591,6 +591,7 @@ pub enum Event {
         /// running and may resolve this error. The transition function uses this
         /// to choose `AwaitingRecovery` vs `Error` (REQ-BED-030).
         recovery_in_progress: bool,
+        observed_at: DateTime<Utc>,
         /// Upstream quota window reset time, when known. Populated only for
         /// rate-limit errors whose `LlmError.quota` carried a `resets_at`
         /// value (see `llm/rate_limit.rs::QuotaDetails`). Threaded onto
@@ -601,6 +602,22 @@ pub enum Event {
         /// upstream response didn't include the reset timestamp.
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
+    ServerOverloaded {
+        message: String,
+        detected_at: DateTime<Utc>,
+        guidance: Option<OverloadRetryGuidance>,
+        logical_request_id: String,
+        model_id: String,
+    },
+    ContinuationServerOverloaded {
+        operation_id: String,
+        message: String,
+        detected_at: DateTime<Utc>,
+        guidance: Option<OverloadRetryGuidance>,
+        logical_request_id: String,
+        model_id: String,
+    },
+    OverloadRetryDeadlineExpired,
     RetryTimeout {
         attempt: u32,
     },
@@ -647,6 +664,7 @@ pub enum Event {
         operation_id: String,
         message: String,
         error_kind: ErrorKind,
+        observed_at: DateTime<Utc>,
         resets_at: Option<DateTime<Utc>>,
     },
     /// User manually triggered continuation (REQ-BED-023)
@@ -703,7 +721,9 @@ pub enum Event {
     /// Credential helper succeeded — conversations in `AwaitingRecovery` should retry.
     #[allow(dead_code)]
     // Constructed by executor in Phase 2 (credential helper settlement wiring)
-    CredentialBecameAvailable,
+    CredentialBecameAvailable {
+        observed_at: DateTime<Utc>,
+    },
     /// Credential helper failed — conversations in `AwaitingRecovery` transition to `Error`.
     #[allow(dead_code)]
     // Constructed by executor in Phase 2 (credential helper settlement wiring)
@@ -787,6 +807,9 @@ impl Event {
             Event::UserCancel { .. } => "UserCancel",
             Event::LlmResponse { .. } => "LlmResponse",
             Event::LlmError { .. } => "LlmError",
+            Event::ServerOverloaded { .. } => "ServerOverloaded",
+            Event::ContinuationServerOverloaded { .. } => "ContinuationServerOverloaded",
+            Event::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             Event::RetryTimeout { .. } => "RetryTimeout",
             Event::ToolComplete { .. } => "ToolComplete",
             Event::ToolAborted { .. } => "ToolAborted",
@@ -802,7 +825,7 @@ impl Event {
             Event::UserQuestionDismissed { .. } => "UserQuestionDismissed",
             Event::DismissError => "DismissError",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
-            Event::CredentialBecameAvailable => "CredentialBecameAvailable",
+            Event::CredentialBecameAvailable { .. } => "CredentialBecameAvailable",
             Event::CredentialHelperFailed { .. } => "CredentialHelperFailed",
             Event::TaskResolved { .. } => "TaskResolved",
             Event::SteerMessage { .. } => "SteerMessage",
@@ -864,9 +887,26 @@ pub enum CoreEvent {
         error_kind: ErrorKind,
         attempt: u32,
         recovery_in_progress: bool,
+        observed_at: DateTime<Utc>,
         /// Quota reset timestamp; see `Event::LlmError::resets_at`.
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
+    ServerOverloaded {
+        message: String,
+        detected_at: DateTime<Utc>,
+        guidance: Option<OverloadRetryGuidance>,
+        logical_request_id: String,
+        model_id: String,
+    },
+    ContinuationServerOverloaded {
+        operation_id: String,
+        message: String,
+        detected_at: DateTime<Utc>,
+        guidance: Option<OverloadRetryGuidance>,
+        logical_request_id: String,
+        model_id: String,
+    },
+    OverloadRetryDeadlineExpired,
     RetryTimeout {
         attempt: u32,
     },
@@ -899,6 +939,7 @@ pub enum CoreEvent {
         operation_id: String,
         message: String,
         error_kind: ErrorKind,
+        observed_at: DateTime<Utc>,
         resets_at: Option<DateTime<Utc>>,
     },
     UserTriggerContinuation {
@@ -933,7 +974,9 @@ pub enum ParentOnlyEvent {
         request_id: Option<QuestionRequestId>,
     },
     DismissError,
-    CredentialBecameAvailable,
+    CredentialBecameAvailable {
+        observed_at: DateTime<Utc>,
+    },
     CredentialHelperFailed {
         message: String,
     },
@@ -1059,14 +1102,47 @@ impl TryFrom<Event> for ParentEvent {
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at,
             } => Ok(ParentEvent::Core(CoreEvent::LlmError {
                 message,
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at,
             })),
+            Event::ServerOverloaded {
+                message,
+                detected_at,
+                guidance,
+                logical_request_id,
+                model_id,
+            } => Ok(ParentEvent::Core(CoreEvent::ServerOverloaded {
+                message,
+                detected_at,
+                guidance,
+                logical_request_id,
+                model_id,
+            })),
+            Event::ContinuationServerOverloaded {
+                operation_id,
+                message,
+                detected_at,
+                guidance,
+                logical_request_id,
+                model_id,
+            } => Ok(ParentEvent::Core(CoreEvent::ContinuationServerOverloaded {
+                operation_id,
+                message,
+                detected_at,
+                guidance,
+                logical_request_id,
+                model_id,
+            })),
+            Event::OverloadRetryDeadlineExpired => {
+                Ok(ParentEvent::Core(CoreEvent::OverloadRetryDeadlineExpired))
+            }
             Event::RetryTimeout { attempt } => {
                 Ok(ParentEvent::Core(CoreEvent::RetryTimeout { attempt }))
             }
@@ -1115,11 +1191,13 @@ impl TryFrom<Event> for ParentEvent {
                 operation_id,
                 message,
                 error_kind,
+                observed_at,
                 resets_at,
             } => Ok(ParentEvent::Core(CoreEvent::ContinuationError {
                 operation_id,
                 message,
                 error_kind,
+                observed_at,
                 resets_at,
             })),
             Event::UserTriggerContinuation { operation_id } => {
@@ -1156,8 +1234,8 @@ impl TryFrom<Event> for ParentEvent {
                 ParentOnlyEvent::UserQuestionDismissed { request_id },
             )),
             Event::DismissError => Ok(ParentEvent::Parent(ParentOnlyEvent::DismissError)),
-            Event::CredentialBecameAvailable => Ok(ParentEvent::Parent(
-                ParentOnlyEvent::CredentialBecameAvailable,
+            Event::CredentialBecameAvailable { observed_at } => Ok(ParentEvent::Parent(
+                ParentOnlyEvent::CredentialBecameAvailable { observed_at },
             )),
             Event::CredentialHelperFailed { message } => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialHelperFailed { message },
@@ -1244,14 +1322,49 @@ impl TryFrom<Event> for SubAgentEvent {
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at,
             } => Ok(SubAgentEvent::Core(CoreEvent::LlmError {
                 message,
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at,
             })),
+            Event::ServerOverloaded {
+                message,
+                detected_at,
+                guidance,
+                logical_request_id,
+                model_id,
+            } => Ok(SubAgentEvent::Core(CoreEvent::ServerOverloaded {
+                message,
+                detected_at,
+                guidance,
+                logical_request_id,
+                model_id,
+            })),
+            Event::ContinuationServerOverloaded {
+                operation_id,
+                message,
+                detected_at,
+                guidance,
+                logical_request_id,
+                model_id,
+            } => Ok(SubAgentEvent::Core(
+                CoreEvent::ContinuationServerOverloaded {
+                    operation_id,
+                    message,
+                    detected_at,
+                    guidance,
+                    logical_request_id,
+                    model_id,
+                },
+            )),
+            Event::OverloadRetryDeadlineExpired => {
+                Ok(SubAgentEvent::Core(CoreEvent::OverloadRetryDeadlineExpired))
+            }
             Event::RetryTimeout { attempt } => {
                 Ok(SubAgentEvent::Core(CoreEvent::RetryTimeout { attempt }))
             }
@@ -1300,11 +1413,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 operation_id,
                 message,
                 error_kind,
+                observed_at,
                 resets_at,
             } => Ok(SubAgentEvent::Core(CoreEvent::ContinuationError {
                 operation_id,
                 message,
                 error_kind,
+                observed_at,
                 resets_at,
             })),
             Event::UserTriggerContinuation { operation_id } => {
@@ -1334,7 +1449,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::UserQuestionResponse { .. }
             | Event::UserQuestionDismissed { .. }
             | Event::DismissError
-            | Event::CredentialBecameAvailable
+            | Event::CredentialBecameAvailable { .. }
             | Event::CredentialHelperFailed { .. }
             | Event::TaskResolved { .. }
             | Event::SteerMessage { .. }
@@ -1361,6 +1476,9 @@ impl CoreEvent {
             CoreEvent::LlmResponse { .. } => "LlmResponse",
             CoreEvent::LlmError { .. } => "LlmError",
             CoreEvent::RetryTimeout { .. } => "RetryTimeout",
+            CoreEvent::ServerOverloaded { .. } => "ServerOverloaded",
+            CoreEvent::ContinuationServerOverloaded { .. } => "ContinuationServerOverloaded",
+            CoreEvent::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             CoreEvent::ToolComplete { .. } => "ToolComplete",
             CoreEvent::ToolAborted { .. } => "ToolAborted",
             CoreEvent::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
@@ -1386,7 +1504,7 @@ impl ParentEvent {
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::UserQuestionDismissed { .. } => "UserQuestionDismissed",
                 ParentOnlyEvent::DismissError => "DismissError",
-                ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
+                ParentOnlyEvent::CredentialBecameAvailable { .. } => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",
                 ParentOnlyEvent::TaskResolved { .. } => "TaskResolved",
             },

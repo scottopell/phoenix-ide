@@ -672,6 +672,7 @@ impl Database {
                 ConvState::Idle
                 | ConvState::LlmRequesting { .. }
                 | ConvState::SeededLlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying { .. }
                 | ConvState::Provisioning { .. }
                 | ConvState::CreationCancelled { .. }
                 | ConvState::CancellingTool { .. }

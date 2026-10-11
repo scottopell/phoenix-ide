@@ -385,7 +385,7 @@ function InputSender({ origin }: { origin: InputOrigin | undefined }) {
   }
   return (
     <span className="message-sender">
-      From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}${origin.source_call ? `?source_transcript=${encodeURIComponent(origin.transcript_id)}&source_tool=${encodeURIComponent(origin.source_call.tool_use_id)}#message-${encodeURIComponent(origin.source_call.message_id)}` : ''}`} title={origin.source_call ? "Open originating send call" : "Original send call unavailable (not recorded)"}>{origin.source_call ? `transcript ID ${origin.transcript_id} · source call` : `transcript ID ${origin.transcript_id} · source call unavailable`}</ConversationMarkdownAnchor>
+      From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}${origin.source_call ? `?source_transcript=${encodeURIComponent(origin.transcript_id)}&source_tool=${encodeURIComponent(origin.source_call.tool_use_id)}#message-${encodeURIComponent(origin.source_call.message_id)}` : `?source_transcript=${encodeURIComponent(origin.transcript_id)}`}`} title={origin.source_call ? "Open originating send call" : "Original send call unavailable (not recorded)"}>{origin.source_call ? `transcript ID ${origin.transcript_id} · source call` : `transcript ID ${origin.transcript_id} · source call unavailable`}</ConversationMarkdownAnchor>
     </span>
   );
 }
@@ -1734,10 +1734,10 @@ type WatchSnapshot = {
 function canonicalTargetLink(target: string | undefined, conversationId: string | undefined) {
   if (!conversationId) return null;
   if (target?.startsWith('@conv:')) {
-    return `/product-conversations/${encodeURIComponent(target.slice('@conv:'.length))}`;
+    return `/c/${encodeURIComponent(target.slice('@conv:'.length))}`;
   }
   const transcript = target?.startsWith('@transcript:') ? target.slice('@transcript:'.length) : conversationId;
-  return transcript ? `/c/${encodeURIComponent(transcript)}` : null;
+  return transcript ? `/c/${encodeURIComponent(transcript)}?source_transcript=${encodeURIComponent(transcript)}` : null;
 }
 
 export function SendConversationMessageView({ response }: { response: SendConversationOutcome }) {
@@ -1754,7 +1754,7 @@ export function SendConversationMessageView({ response }: { response: SendConver
         <span>Recipient</span>
         {link ? <Link to={link}>{response.display_name ?? 'Open conversation'}</Link> : <code>{response.target ?? 'Unresolved'}</code>}
       </div>
-      {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/c/${encodeURIComponent(response.transcript_slug ?? response.conversation_id)}`}>{response.outcome === 'rejected' ? 'Open target transcript' : 'Open receiving transcript'}</Link></div>}
+      {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/c/${encodeURIComponent(response.conversation_id)}?source_transcript=${encodeURIComponent(response.conversation_id)}`}>{response.outcome === 'rejected' ? 'Open target transcript' : 'Open receiving transcript'}</Link></div>}
       <details><summary>IDs</summary><code>{response.target ?? 'Unresolved'}</code>{response.conversation_id && <code>{response.conversation_id}</code>}<code>{response.message_id}</code>{response.reason_code && <code>{response.reason_code}</code>}</details>
       {response.outcome !== 'rejected' && <p className="coordinator-result-note">Accepted by Phoenix; recipient understanding or completion is not implied.</p>}
       {response.outcome === 'rejected' && <p className="coordinator-result-error">{response.message ?? response.reason_code ?? 'Message rejected'}</p>}
@@ -1765,8 +1765,8 @@ export function SendConversationMessageView({ response }: { response: SendConver
 function WatchLink({ watch }: { watch: WatchSnapshot }) {
   return (
     <li className="coordinator-watch-row">
-      <Link to={`/product-conversations/${encodeURIComponent(watch.product_conversation_id)}`}>{watch.display_name ?? 'Open conversation'}</Link>
-      <Link to={`/c/${encodeURIComponent(watch.transcript_slug ?? watch.current_transcript_id)}`}>current transcript</Link>
+      <Link to={`/c/${encodeURIComponent(watch.product_conversation_id)}`}>{watch.display_name ?? 'Open conversation'}</Link>
+      <Link to={`/c/${encodeURIComponent(watch.current_transcript_id)}?source_transcript=${encodeURIComponent(watch.current_transcript_id)}`}>current transcript</Link>
       <span>{watch.current_state?.type ?? 'active'}</span>
       {watch.project_path && <code>{watch.project_path}</code>}
       <details><summary>IDs</summary><code>{watch.product_conversation_id}</code><code>{watch.current_transcript_id}</code></details>
@@ -1780,7 +1780,7 @@ export function UnwatchResultView({ response }: { response: UnwatchOutcome }) {
   return (
     <div className="coordinator-result-card">
       <strong>{response.ended ? 'Watch ended' : 'Watch not found'}</strong>
-      <Link to={`/product-conversations/${encodeURIComponent(response.product_conversation_id)}`}>@conv:{response.product_conversation_id}</Link>
+      <Link to={`/c/${encodeURIComponent(response.product_conversation_id)}`}>@conv:{response.product_conversation_id}</Link>
     </div>
   );
 }
@@ -1807,7 +1807,7 @@ function CoordinatorEnvironment({ displayData }: { displayData: Record<string, u
   const projectPath = typeof value['project_path'] === 'string' ? value['project_path'] : null;
   if (!scope && !cwd) return null;
   const ownerIdentity = ownerName && ownerProductConversationId
-    ? <Link to={`/product-conversations/${encodeURIComponent(ownerProductConversationId)}`} title={`Owning conversation: ${ownerName}`}>{ownerName}</Link>
+    ? <Link to={`/c/${encodeURIComponent(ownerProductConversationId)}`} title={`Owning conversation: ${ownerName}`}>{ownerName}</Link>
     : ownerName ? <span title="Historical environment owner; stable conversation unavailable">{ownerName}</span> : null;
   return <div className="coordinator-environment"><strong>Environment</strong>{ownerIdentity}{projectPath && <code title={projectPath}>{projectPath}</code>}{cwd && <code title={cwd}>{cwd}</code>}{(scope || ownerProductConversationId) && <details><summary>IDs</summary>{scope && <code>{scope}</code>}{ownerProductConversationId && <code>{ownerProductConversationId}</code>}</details>}</div>;
 }

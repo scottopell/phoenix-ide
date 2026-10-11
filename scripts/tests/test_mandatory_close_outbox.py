@@ -135,6 +135,16 @@ BEGIN SELECT RAISE(ABORT, 'Close failure is immutable'); END;
 """
 
 
+BASE += """
+ALTER TABLE close_cleanup_failures ADD COLUMN authority_kind TEXT NOT NULL DEFAULT 'captured_scopes';
+CREATE TABLE close_cleanup_failure_resources (
+    failure_occurrence_id TEXT, ordinal INTEGER, scope TEXT, resource_kind TEXT,
+    identity_kind TEXT, identity_codec TEXT, identity_value TEXT, disposition TEXT
+);
+CREATE TABLE close_run_retry_effects (attempt_id TEXT, run_ordinal INTEGER, ordinal INTEGER);
+CREATE TABLE close_run_retry_successes (attempt_id TEXT, run_ordinal INTEGER, ordinal INTEGER);
+"""
+
 BASE += re.findall(
     r"CREATE TRIGGER close_obligations_require_member_cleanup_before_delete\b.*?END;",
     MIGRATIONS, re.S,

@@ -4,6 +4,16 @@ import Foundation
 // (snake_case) so no key-mapping strategy is needed. Fields the app doesn't
 // consume are omitted — unknown keys are ignored by JSONDecoder.
 
+enum ServerTimestamp {
+    static func parse(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+
+        return ISO8601DateFormatter().date(from: value)
+    }
+}
+
 struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     /// Transcript-row identity. This remains the owner for `ConversationSession`,
     /// SSE routes, message snapshots, and outboxes.
@@ -73,16 +83,7 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     var displaySlug: String { slug.flatMap { $0.isEmpty ? nil : $0 } ?? id }
 
     var updatedAtDate: Date? {
-        updated_at.flatMap { Self.parseDate($0) }
-    }
-
-    static func parseDate(_ s: String) -> Date? {
-        // Server timestamps are RFC3339, sometimes with fractional seconds.
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFraction.date(from: s) { return d }
-        let plain = ISO8601DateFormatter()
-        return plain.date(from: s)
+        updated_at.flatMap { ServerTimestamp.parse($0) }
     }
 }
 
@@ -553,7 +554,7 @@ struct Message: Codable, Identifiable, Equatable, Sendable {
     var inputOrigin: InputOrigin { origin ?? .unknownHistorical }
 
     var createdAtDate: Date? {
-        created_at.flatMap { Conversation.parseDate($0) }
+        created_at.flatMap { ServerTimestamp.parse($0) }
     }
 }
 

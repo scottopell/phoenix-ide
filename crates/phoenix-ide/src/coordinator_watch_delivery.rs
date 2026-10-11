@@ -12,7 +12,7 @@ use crate::send_chat_service::{
 
 fn notification(event: &PendingWatchEvent) -> String {
     let label = match &event.route {
-        WatchEventRoute::Subscription => "Watched conversation terminal event",
+        WatchEventRoute::Subscription => "Watched conversation event",
         WatchEventRoute::MandatoryCloseFailure { .. } => "Mandatory Close cleanup failure",
     };
     let mut text = format!(
@@ -23,10 +23,10 @@ fn notification(event: &PendingWatchEvent) -> String {
         event.source_occurrence_kind,
         event.source_occurrence_id,
         event.source_generation,
-        event.terminal_kind,
+        event.outcome.label(),
         event.occurred_at_us,
     );
-    if let Some(reason) = &event.terminal_reason {
+    if let Some(reason) = event.outcome.reason() {
         text.push_str(" Reason: ");
         text.push_str(reason);
     }
@@ -151,6 +151,185 @@ mod tests {
     use super::*;
     use phoenix_core::domain::product_conversation::ProductConversationId;
 
+    #[tokio::test]
+    async fn persisted_wait_pass_admits_once_through_real_send_service() {
+        use crate::platform::PlatformCapability;
+        use crate::tools::mcp::McpClientManager;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_llm::ModelRegistry;
+
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        let global = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let source = db
+            .create_conversation("delivery-wait", "delivery-wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        deliver_pass(&runtime).await;
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns WHERE origin_subscription_event_id IS NOT NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(before, 0);
+        let waiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--example.md".into(),
+            title: "Example".into(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Review".into(),
+        };
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        deliver_pass(&runtime).await;
+        deliver_pass(&runtime).await;
+        let recipients: Vec<String> = sqlx::query_scalar(
+            "SELECT conversation_id FROM durable_turns WHERE origin_subscription_event_id = ?1",
+        )
+        .bind(&events[0].event_id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(recipients, vec![global.id]);
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        db.update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &waiting)
+            .await
+            .unwrap();
+        db.unwatch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        deliver_pass(&runtime).await;
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns WHERE origin_subscription_event_id IS NOT NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(after, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_global_target_cannot_accept_wait_and_next_pass_targets_successor() {
+        use crate::platform::PlatformCapability;
+        use crate::tools::mcp::McpClientManager;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_llm::ModelRegistry;
+
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        let old = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let source = db
+            .create_conversation("race-wait", "Race wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::AwaitingTaskApproval {
+                task_file: "tasks/12345-p1-ready--example.md".into(),
+                title: "Example".into(),
+                priority: phoenix_core::task_source::Priority::P1,
+                plan: "Review".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let event = db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .remove(0);
+        let stale_target = db.coordinator_watch_target().await.unwrap().unwrap();
+        db.update_conversation_state(
+            &old.id,
+            &ConvState::ContextExhausted {
+                summary: "Continue".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let successor = match db.continue_conversation(&old.id).await.unwrap() {
+            phoenix_db::ContinueOutcome::Created(next) => next,
+            other @ (phoenix_db::ContinueOutcome::AlreadyContinued(_)
+            | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        let outcome = SendChatApplicationService::new(db.clone(), runtime.clone())
+            .send(SendChatRequest {
+                conversation_id: stale_target,
+                origin: InputOrigin::SubscriptionEvent {
+                    event_id: event.event_id.clone(),
+                },
+                text: notification(&event),
+                message_id: event.event_id.clone(),
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            })
+            .await;
+        assert!(!matches!(
+            outcome,
+            Ok(SendChatOutcome::Delivered
+                | SendChatOutcome::AlreadyPersisted
+                | SendChatOutcome::QueuedAsSteering)
+        ));
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+        deliver_pass(&runtime).await;
+        let accepted: String = sqlx::query_scalar(
+            "SELECT accepted_transcript_id FROM coordinator_watch_events WHERE event_id = ?1",
+        )
+        .bind(&event.event_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(accepted, successor.id);
+        let stale_inputs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1 AND origin_subscription_event_id = ?2")
+            .bind(&old.id).bind(&event.event_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(stale_inputs, 0);
+    }
+
     fn failure(stop: CloseFailureStop) -> PendingWatchEvent {
         PendingWatchEvent {
             route: WatchEventRoute::MandatoryCloseFailure {
@@ -172,8 +351,9 @@ mod tests {
             source_occurrence_kind: "close_cleanup_failure".into(),
             source_occurrence_id: "failure-1".into(),
             source_generation: 0,
-            terminal_kind: "cleanup_failed".into(),
-            terminal_reason: Some("remove failed".into()),
+            outcome: phoenix_db::WatchOutcome::CleanupFailed {
+                reason: "remove failed".into(),
+            },
             occurred_at_us: 20,
         }
     }
@@ -298,13 +478,33 @@ mod tests {
 
     #[test]
     fn subscription_message_has_no_cleanup_evidence() {
-        let mut event = failure(CloseFailureStop::ShutdownUncertain);
-        event.route = WatchEventRoute::Subscription;
-        let text = notification(&event);
-        assert!(text.starts_with("Watched conversation terminal event."));
-        assert!(!text.contains("Cleanup run ordinal"));
-        assert!(!text.contains("Remaining resources"));
-        assert!(!text.contains("Shutdown uncertain"));
+        for (outcome, kind, reason) in [
+            (phoenix_db::WatchOutcome::Completed, "direct_turn", None),
+            (
+                phoenix_db::WatchOutcome::AwaitingUserResponse,
+                "question_request",
+                Some("question_request"),
+            ),
+            (
+                phoenix_db::WatchOutcome::AwaitingTaskApproval,
+                "task_approval_wait",
+                Some("task_approval_wait"),
+            ),
+        ] {
+            let mut event = failure(CloseFailureStop::ShutdownUncertain);
+            event.route = WatchEventRoute::Subscription;
+            event.outcome = outcome;
+            event.source_occurrence_kind = kind.into();
+            let text = notification(&event);
+            assert!(text.starts_with("Watched conversation event."));
+            assert!(text.contains(&format!("Outcome: {}.", event.outcome.label())));
+            assert_eq!(event.outcome.reason(), reason);
+            assert!(!text.contains("terminal event"));
+            assert!(!text.contains("Cleanup run ordinal"));
+            assert!(!text.contains("Remaining resources"));
+            assert!(!text.contains("Shutdown uncertain"));
+            assert!(!text.contains("cleanup_failed"));
+        }
     }
 
     #[test]

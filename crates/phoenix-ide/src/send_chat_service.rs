@@ -1333,12 +1333,12 @@ fn transition_code(err: &TransitionError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_turn_fences_direct_acceptance, close_admission_fenced_outcome, expand_message,
-        lookup_durable_replay, lookup_durable_steering_replay, map_conversation_load_error,
-        map_direct_turn_accept_error, pending_queue_fences_direct_acceptance,
-        persisted_skill_matches, queued_retry_matches, should_enqueue_steering,
-        submitted_identity_from_request, DurableReplayOutcome, MessageExpansionPolicy,
-        SendChatOutcome, SendChatRequest, SendChatServiceError,
+        accepts_user_message_direct_or_steering, active_turn_fences_direct_acceptance,
+        close_admission_fenced_outcome, expand_message, lookup_durable_replay,
+        lookup_durable_steering_replay, map_conversation_load_error, map_direct_turn_accept_error,
+        pending_queue_fences_direct_acceptance, persisted_skill_matches, queued_retry_matches,
+        should_enqueue_steering, submitted_identity_from_request, DurableReplayOutcome,
+        MessageExpansionPolicy, SendChatOutcome, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use crate::db::SteeringAcceptanceFingerprint;
@@ -1377,6 +1377,34 @@ mod tests {
                 code: "close_admission_fenced",
             }
         );
+    }
+
+    #[test]
+    fn overload_steering_admission_distinguishes_ordinary_and_continuation_targets() {
+        use phoenix_core::domain::sm_state::{
+            ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+        };
+        let now = chrono::Utc::now();
+        let state = |target| crate::db::ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target,
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 2,
+                started_at: now,
+                deadline_at: now + chrono::Duration::seconds(120),
+                logical_request_id: "send-chat-admission".into(),
+                model_id: "test-model".into(),
+            },
+        };
+        assert!(accepts_user_message_direct_or_steering(&state(
+            ServerOverloadTarget::Ordinary
+        )));
+        assert!(!accepts_user_message_direct_or_steering(&state(
+            ServerOverloadTarget::Continuation {
+                operation_id: "summary-op".into(),
+                rejected_tool_calls: vec![],
+            }
+        )));
     }
 
     #[test]
