@@ -322,3 +322,20 @@ AND SHALL reject subordinate conversations, sub-agents, legacy row-only routes, 
 AND SHALL treat the setting as prospective configuration only: changing it SHALL NOT admit, wake, revoke, or cancel successor work for a row that is already context exhausted
 
 **Rationale:** Automatic continuation configuration is aggregate-scoped so a continuation cannot silently replace the configured identity, and its write response does not claim that existing exhausted work was scheduled.
+
+### REQ-API-030: Observation and Execution Authority
+
+**WHEN** Phoenix serves an observation-only application composition,
+**THE SYSTEM SHALL** use the shared production observation implementations for supported reads
+**AND SHALL** select that composition before constructing execution services or admitting startup recovery, provider discovery, worktree reconciliation, or execution workers
+**AND SHALL** keep observation authority structurally separate from execution authority
+**AND SHALL** reject requests requiring unavailable execution authority before extracting effectful request bodies or upgrading execution transports
+**AND SHALL** represent expected capability absence explicitly rather than report a successful command whose effect did not occur
+**AND SHALL** preserve normal-composition command and authentication behavior.
+
+**WHILE** an observation host uses unauthenticated loopback-only access,
+**THE SYSTEM SHALL** require a loopback connection peer
+**AND SHALL** reject missing or non-loopback peers and requests carrying forwarding headers
+**AND SHALL NOT** create persistent authentication sessions for that observation host.
+
+**Rationale:** Inspecting persisted history must not confer execution authority. The normal binary, route registrations and observation contracts are reused without constructing fake live services. Caller behavior is based on the specific capability required, and server admission remains independent of UI affordances. Loopback-only access is not a guarantee against a local proxy that strips all forwarding evidence; remote observation hosting requires its own explicit access contract.

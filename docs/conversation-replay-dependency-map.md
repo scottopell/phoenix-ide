@@ -54,12 +54,12 @@ flowchart TD
 
 An enum around only RuntimeManager is insufficient: AppState also owns providers, MCP, terminals, chains, credentials and writable DB. Making all those fields optional is rejected. The proposed next seam is an application envelope with shared observation services and a typed live dependency bundle, with fallible request extraction that rejects unavailable execution before body/upload/WebSocket handling. Keep a single route table. No Deref fallback that silently grants live authority in replay.
 
-This seam is not implemented yet. Shared observations must expose bounded methods, not writable pool/DB accessors. Existing live handlers should retain their behavior after adapting their authority extractor. Auth/shutdown and unsafe GET routes require explicit coverage; GET alone is not an observation classification.
+The request-composition seam is implemented: `ApplicationState` owns either the unchanged live `AppState` bundle or bounded observation services; `LiveState` rejects unavailable live authority before request bodies/upgrades. The normal route table is shared. Shared observations expose bounded methods, not writable pool/DB accessors. Auth middleware preserves the live path and admits observation only for direct loopback peers with no forwarding headers; no observation session store exists. Startup selection, shutdown and transcript service extraction remain pending; GET alone is not an observation classification.
 
 ## Implementation status
 
-1. Route observations extracted from production handlers; immutable fixture tests plus normal HTTP route tests establish initial read seam. No composition change yet.
-2. Next: common-state/live-authority composition boundary; enforce absent execution before startup and handler effects.
+1. Route observations extracted from production handlers; immutable fixture tests plus normal HTTP route tests establish the initial read seam.
+2. Request composition/admission implemented and tested without replay startup: immutable same-router reads, pre-body/multipart/unsafe-GET/WebSocket denial, peer/forwarding policy, unchanged fixture, plus normal password/cookie/bearer-lockout regressions. Next: early normal-binary startup selection and shared transcript services; do not construct the live bundle in replay.
 3. Then: shared transcript initialization and persisted enrichment, preserving normal ring/cursor/subscribe-before-read semantics.
 4. Coordinate UI capability callers with the current ProductConversationPage streaming-render owner before changing its interfaces.
 5. Delete separate fake benchmark server and auxiliary responses only when replacement works through real application.
@@ -76,3 +76,11 @@ This seam is not implemented yet. Shared observations must expose bounded method
 ## Coordination
 
 Global handed off shepherding with UI owner overlap at ProductConversationPage. Reply tools rejected both provided Global addresses (stable target not found; exact transcript prohibited as Coordinator chain). Report milestones in this conversation until a permitted routing target exists; this delivery failure is not a reason to stop approved work. Durable-wake removal belongs to separate user-driven work.
+
+## Validation milestone: composition foundation
+
+- Route observation commit: `76023ec169b42ee1e1568f694d4124a2601a3968`; two immutable observation tests and nine normal route tests passed, focused fmt/clippy passed, independent source review found no blocker.
+- Asset containment correction: `7116d7a73`; eight asset tests passed, including raw traversal and symlink escapes. This inherited issue was a blocker for treating public assets as bounded observation reads. Canonical containment assumes a trusted owned UI directory, not hostile concurrent filesystem replacement.
+- Request composition: six full-router tests passed (three immutable observation/admission tests and three live-auth regressions); fmt/clippy passed. The broader API run passed 676 tests and failed only the new test's incorrect share URL; corrected admission suite then passed. Run normal live fixture tests with `PHOENIX_DISCOVERY_ENABLED=false` to avoid unrelated host service probes. AppState workers in those live regressions operate on disposable in-memory state and isolated runtime directories.
+- Both ast-grep rules accept current source and reject deliberately injected authority bypasses. They remain syntactic guardrails, not isolation proofs.
+- Replay startup/browser hydration has NOT been delivered by this milestone. No new fixture capture, production mutation or optimization occurred. Old fixture-server removal is pending replacement.
