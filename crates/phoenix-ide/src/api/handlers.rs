@@ -25,6 +25,9 @@ use super::lifecycle_handlers::{
     list_fork_proposals, mark_merged, reject_task, request_changes_on_fork_proposal,
     retry_close_retirement, task_feedback,
 };
+use super::member_observation::{
+    conversation_resource_scope, MemberObservations, MemberProcessObservations,
+};
 use super::observation::CoordinatorRouteResponse;
 use super::product_conversations::{
     close_product_conversation, get_product_conversation, list_product_conversation_creations,
@@ -785,65 +788,6 @@ pub(crate) fn enrich_message_for_api(msg: &crate::db::Message) -> Value {
     serde_json::to_value(&enriched).unwrap_or(Value::Null)
 }
 
-/// Build an `EnrichedConversation` with derived display fields.
-///
-/// Note: `seed_parent_slug` is left as `None` here. Call sites that need to
-/// render the seed breadcrumb (single-conversation fetch, SSE init) should
-/// use [`enrich_conversation_with_seed`] instead to resolve the parent slug.
-fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::EnrichedConversation {
-    crate::runtime::EnrichedConversation {
-        conv_mode_label: conv.conv_mode.label().to_string(),
-        branch_name: conv.conv_mode.branch_name().map(String::from),
-        worktree_path: conv
-            .conv_mode
-            .worktree_path()
-            .filter(|s| !s.is_empty() && !s.starts_with("__LEGACY"))
-            .map(String::from),
-        base_branch: conv
-            .conv_mode
-            .base_branch()
-            .filter(|s| !s.is_empty() && !s.starts_with("__LEGACY"))
-            .map(String::from),
-        task_title: conv.conv_mode.task_title().map(String::from),
-        // REQ-TERM-002 / REQ-TERM-017: surface the server-user's $SHELL so
-        // the frontend can tailor the OSC 133 enablement snippet. The PTY
-        // spawn path reads `$SHELL` from the same env, so this matches what
-        // the user's shell will actually be.
-        shell: std::env::var("SHELL").ok(),
-        // REQ-SEED-*: surface the home directory so the UI can spawn a seeded
-        // conversation scoped to it (e.g. for shell integration setup).
-        home_dir: Some(
-            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
-                .home()
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        seed_parent_slug: None,
-        parent_conversation_slug: None,
-        // Default to `false`; callers that have access to `AppState` set
-        // this from the manager's `HashMap` via
-        // `enrich_conversation_with_seed`.
-        browser_session_active: false,
-        // Stateless default. Both SSE init *and* the list-endpoint
-        // serializer route through `enrich_conversation_with_runtime`,
-        // which overwrites this with `TmuxRegistry::binary_available()`
-        // — so consumers of `EnrichedConversation` never observe the
-        // `false` default for a real conversation. The list path is
-        // required because the 5s `listConversations` poll's
-        // `upsertSnapshot` would otherwise regress an SSE-set `true`
-        // back to `false` whenever a newer row landed.
-        terminal_uses_tmux: false,
-        // Resolved from the same inputs as `browser_session_active`'s
-        // lookup (conversation id + worktree path). Computable without
-        // AppState, so every enrich path emits the correct key.
-        work_scope_key: conversation_resource_scope(conv).stable_key(),
-        creation_prompt: None,
-        creation_error: None,
-        cached_pr: None,
-        inner: crate::runtime::PresentationConversation(conv.clone()),
-    }
-}
-
 /// Build an `EnrichedConversation` and resolve `seed_parent_slug` (REQ-SEED-003).
 ///
 /// If the conversation has a seed parent and the parent still exists, the
@@ -855,60 +799,49 @@ async fn enrich_conversation_with_seed(
     conv: &crate::db::Conversation,
     include_cached_pr: bool,
 ) -> Result<crate::runtime::EnrichedConversation, AppError> {
-    let mut enriched = enrich_conversation_with_runtime(state, conv);
-    if include_cached_pr {
-        enriched.cached_pr = cached_pr_summary_for_conversation(state, conv).await?;
-    }
-    if let Some(parent_id) = conv.seed_parent_id.as_deref() {
-        if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
-            enriched.seed_parent_slug = parent.slug;
-        }
-    }
-    // Resolve the sub-agent parent slug for the breadcrumb, same as the seed
-    // parent above. Sub-agents set `parent_conversation_id` (not
-    // `seed_parent_id`), so the two breadcrumbs are mutually exclusive.
-    if let Some(parent_id) = conv.parent_conversation_id.as_deref() {
-        if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
-            enriched.parent_conversation_slug = parent.slug;
-        }
-    }
-    // Reflect current `BrowserSessionManager` state at hydration. The single
-    // source of truth is the manager's `HashMap`; the SSE
-    // `BrowserSessionState` event keeps the client in sync after this point.
-    // Sessions are keyed by `ResourceScopeKey` (REQ-BROWSER-WS-001), so a
-    // continuation of a worktree-backed conversation sees `true` here as
-    // soon as its predecessor's session is live.
+    let shell = std::env::var("SHELL").ok();
+    let home_dir = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+        .home()
+        .to_string_lossy()
+        .into_owned();
+    let terminal_uses_tmux = state.runtime.tmux_registry().binary_available();
+    let persisted = MemberObservations::new(state.runtime.db().clone())
+        .read(conv, include_cached_pr)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     let resolved = crate::resource_authority::resolve_resource_authority(state.runtime.db(), conv)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    enriched.browser_session_active = state
+    let browser_session_active = state
         .runtime
         .browser_sessions()
         .is_active_for_actor(&resolved.scope, &resolved.actor)
         .await;
-    Ok(enriched)
+    Ok(persisted.project(
+        conv,
+        MemberProcessObservations {
+            shell,
+            home_dir,
+            terminal_uses_tmux,
+            browser_session_active,
+        },
+    ))
 }
 
-/// Build an `EnrichedConversation` and apply runtime-derived fields that are
-/// process-wide and synchronously readable. Used by both the AppState-aware
-/// `enrich_conversation_with_seed` and the list-endpoint serializer
-/// `conversation_to_json` so the same fields land in every wire payload.
-///
-/// Without this routing, list endpoints (which used to call the stateless
-/// `enrich_conversation` directly) would emit `terminal_uses_tmux: false`
-/// for every row. The 5s `listConversations` poll then upserted those rows
-/// into the conversation atom's `Conversation` slot via
-/// `RoutedStore.upsertSnapshot`, clobbering the `true` value previously set
-/// by `sse_init` — and the terminal-selection composer label silently
-/// regressed from `From tmux pane main:1.0` to `From terminal` for ~5s
-/// windows. Codex review on PR #92.
+/// List projection with synchronously observed server process fields.
 fn enrich_conversation_with_runtime(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> crate::runtime::EnrichedConversation {
-    let mut enriched = enrich_conversation(conv);
-    enriched.terminal_uses_tmux = state.runtime.tmux_registry().binary_available();
-    enriched
+    super::member_observation::project_list_member(
+        conv,
+        std::env::var("SHELL").ok(),
+        phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+            .home()
+            .to_string_lossy()
+            .into_owned(),
+        state.runtime.tmux_registry().binary_available(),
+    )
 }
 
 /// Compute the full `presentation_mode` for a conversation, including the
@@ -930,69 +863,24 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
     conv.state.presentation_mode()
 }
 
-fn conversation_resource_scope(
-    conv: &crate::db::Conversation,
-) -> crate::work_scope::ResourceScopeKey {
-    match conv.attached_work_scope_id.clone() {
-        Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
-        None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
-            crate::work_scope::ResourceScopeKey::Coordinator
-        }
-        None if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent => {
-            crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone())
-        }
-        None => panic!("ordinary persisted conversation is missing its work scope"),
-    }
-}
-
-fn sidebar_cached_pr_summary(
-    pr: &crate::db::WorkScopePrAssociation,
-) -> crate::runtime::CachedPrSummary {
-    crate::runtime::CachedPrSummary {
-        number: pr.pr_number,
-        title: pr.title.clone(),
-        url: pr.url.clone(),
-        display_state: pr.display_state.clone(),
-        base: pr.base.clone(),
-        head: pr.head.clone(),
-        feedback_status: pr.feedback_status,
-    }
-}
-
 async fn cached_pr_summary_for_conversation(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> Result<Option<crate::runtime::CachedPrSummary>, AppError> {
-    let Some(scope) = conv.attached_work_scope_id.as_ref() else {
-        return Ok(None);
-    };
-    Ok(state
-        .runtime
-        .db()
-        .primary_work_scope_pr_association(scope)
+    MemberObservations::new(state.runtime.db().clone())
+        .cached_pr_summary(conv)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .map(|pr| sidebar_cached_pr_summary(&pr)))
+        .map_err(|error| AppError::Internal(error.to_string()))
 }
 
 async fn cached_pr_summaries_for_conversations(
     state: &AppState,
     conversations: &[crate::db::Conversation],
 ) -> Result<HashMap<String, crate::runtime::CachedPrSummary>, AppError> {
-    let scopes: Vec<_> = conversations
-        .iter()
-        .filter_map(|conv| conv.attached_work_scope_id.clone())
-        .collect();
-    let associations = state
-        .runtime
-        .db()
-        .primary_work_scope_pr_associations(&scopes)
+    MemberObservations::new(state.runtime.db().clone())
+        .cached_pr_summaries(conversations)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(associations
-        .into_iter()
-        .map(|(key, pr)| (key, sidebar_cached_pr_summary(&pr)))
-        .collect())
+        .map_err(|error| AppError::Internal(error.to_string()))
 }
 
 async fn get_existing_coordinator(

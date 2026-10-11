@@ -8,6 +8,7 @@ message: |
 files:
   - "**/phoenix-ide/src/api/observation.rs"
   - "**/phoenix-ide/src/api/transcript_observation.rs"
+  - "**/phoenix-ide/src/api/member_observation.rs"
 rule:
   any:
     - kind: type_identifier
