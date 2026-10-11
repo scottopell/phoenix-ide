@@ -56,7 +56,7 @@ import { restoreReactionRange } from './reactionRange';
 import { useReactionSourceReturn } from './useReactionSourceReturn';
 import { MessageReviewEnabledContext } from './MessageReviewAction';
 import { FilePathContextMenu } from './FilePathContextMenu';
-import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
+import { useStreamingBuffer } from '../conversation/useConversationAtom';
 import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
@@ -175,6 +175,7 @@ const MessageSquareIcon = () => (
 interface MessageListProps {
   sourceCallTarget?: { messageId: string; toolUseId: string } | null;
   messages: Message[];
+  streamingRequestId: string | null;
   pendingMessages: PendingUserMessage[];
   convState: ConversationState;
   onRetry: (localId: string) => void;
@@ -435,6 +436,7 @@ function renderTailUnit(
         <RenderProfiler id="StreamingMessage">
           <StreamingMessage
             slug={slug}
+            requestId={unit.key}
             isFirstInTurn={unit.isFirstInTurn}
             rootDir={filePathRootDir}
             onOpenFile={onOpenFile ? (filePath) => onOpenFile(filePath, new Set(), 0) : undefined}
@@ -554,6 +556,7 @@ function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (
 function MessageListImpl({
   sourceCallTarget,
   messages,
+  streamingRequestId,
   pendingMessages,
   convState,
   onRetry,
@@ -612,14 +615,6 @@ function MessageListImpl({
   }
   previousFirstMessageIdRef.current = firstMessageId;
 
-  // The streaming buffer's `requestId` IS the eventual agent message_id
-  // (server uses the same uuid for both — see `AssistantMessage::new` in
-  // crates/phoenix-ide/src/state_machine/state.rs). Keying the streaming
-  // unit by this value means the finalized `agent_turn` HistoricalUnit
-  // arrives under the same render-unit key, and the transition is an
-  // in-place keyed update — the virtual transcript doesn't observe a key swap, the
-  // viewport doesn't drift. Symmetric to pending_user → user.
-  const streamingRequestId = useStreamingRequestId(slug);
   const streamingHandle = useMemo(
     () => (streamingRequestId !== null ? { key: streamingRequestId } : null),
     [streamingRequestId],

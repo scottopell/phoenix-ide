@@ -55,7 +55,7 @@ WHEN the message list renders historical (incl. pending user), sub-agent-
 status, and streaming content
 THE SYSTEM SHALL derive a single ordered pair of typed lists
 `(historicalUnits: HistoricalUnit[], tailUnits: TailUnit[])` from
-`messages`, `pendingMessages`, `convState`, and the streaming-active flag
+`messages`, `pendingMessages`, `convState`, and the active streaming request identity
 AND render exactly the bounded slice
 `historicalUnits.slice(firstRenderedUnitIndex, lastRenderedUnitIndex)`
 followed by all `tailUnits`, with no filtering inside the render loop
@@ -203,13 +203,11 @@ slice
 AND ensure they are always present in the rendered DOM, never represented
 by spacer height
 
-**Rationale:** Sub-agent status and streaming-agent are ephemeral
-display-only views with no acknowledgement lifecycle — they appear,
-update, and disappear in response to phase changes rather than message
-arrival. Keeping them as `TailUnit` reflects that. Pending user
-messages, by contrast, are ackable and must share render-unit identity
-with their acknowledged form; they live in `HistoricalUnit` per
-REQ-MLRU-001.
+**Rationale:** Sub-agent status and streaming-agent are live views that
+must remain outside the collapsed history. The streaming-agent shares
+its request key with its finalized historical form per REQ-MLRU-010.
+Pending user messages live in `HistoricalUnit` per REQ-MLRU-001 and
+share identity with their acknowledged form.
 
 ---
 
@@ -264,15 +262,30 @@ correctly by construction through the REQ-MLRU-001 single-key invariant.
 
 ### REQ-MLRU-010: Streaming Subscription Isolation
 
-WHEN the conversation is in a streaming phase
+WHEN an active streaming request exists
 THE SYSTEM SHALL emit a `{ kind: 'streaming_agent'; key: string }`
-`TailUnit` from `buildRenderUnits`
+`TailUnit` from `buildRenderUnits`, keyed by the request identity
 (the tag only — no buffer in the unit)
+
+WHEN deriving the live transcript's structural inputs
+THE SYSTEM SHALL select `messages`, `convState`, and the active streaming
+request identity (or null) from the same conversation-atom revision
+AND SHALL pass them together to the message-list rendering pipeline,
+including the live member of an aggregate ProductConversation transcript
+AND SHALL NOT combine messages from an effect-published child projection
+with an independently subscribed streaming-lifecycle value
+
+WHEN token content changes without changing the active request identity
+THE SYSTEM SHALL preserve the structural projection's reference
+SO THAT token accumulation does not re-render the transcript owner or
+historical list; streaming start, restart, and end remain structural changes
 
 WHEN rendering a `streaming_agent` tail unit
 THE SYSTEM SHALL render a `<StreamingMessage />` component that
 subscribes to the streaming-buffer atom internally via `useAtomValue`
 (or `useSyncExternalStore` on the underlying store)
+AND SHALL display only the buffer matching the tail unit's request key
+SO THAT a retained leaf cannot display another request's token content
 
 THE SYSTEM SHALL NOT pass the streaming buffer as a prop into
 `MessageList` or any of its parents on the path from the router atom
@@ -281,10 +294,13 @@ SO THAT per-token updates do not cause `MessageList` or
 `MessageListBody` to re-render
 
 WHEN streaming completes (the `sse_message` reducer rule fires)
-THE SYSTEM SHALL transition atomically: `streaming_agent` tail unit
-disappears, a new `agent_turn` historical unit appears at the tail,
-in a single render commit
-(this is the existing REQ-CONV-019 atomic-swap behavior, preserved)
+THE SYSTEM SHALL transition atomically: the `streaming_agent` tail unit
+is replaced by the finalized `agent_turn` historical unit under the same
+request/message key in a single render commit
+AND SHALL NOT commit an intermediate transcript in which that row is
+missing or empty because its buffer was cleared before the finalized
+message reached the structural projection
+(per REQ-CONV-019 atomic-swap behavior)
 
 **Rationale:** The unified-list invariant ("the unit list is everything
 that renders") holds without sacrificing render isolation. The unit struct
