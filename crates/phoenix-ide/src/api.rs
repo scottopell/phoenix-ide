@@ -30,6 +30,7 @@ mod spa_routes;
 mod sse;
 mod svg_artifacts;
 mod terminal_ws;
+pub(crate) mod transcript_observation;
 mod types;
 pub(crate) mod usage;
 pub(crate) mod wire;

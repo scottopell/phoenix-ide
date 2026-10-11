@@ -7,6 +7,7 @@ message: |
   and keep execution authority at application composition/admission boundaries.
 files:
   - "**/phoenix-ide/src/api/observation.rs"
+  - "**/phoenix-ide/src/api/transcript_observation.rs"
 rule:
   any:
     - kind: type_identifier
