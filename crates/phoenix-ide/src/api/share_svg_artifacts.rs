@@ -1,6 +1,7 @@
+use super::application_state::LiveState;
 use super::handlers::AppError;
 use super::AppState;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::response::Response;
 
 async fn shared_owner(state: &AppState, token: &str) -> Result<String, AppError> {
@@ -17,27 +18,27 @@ async fn shared_owner(state: &AppState, token: &str) -> Result<String, AppError>
 }
 
 pub(super) async fn image(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((token, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     let owner = shared_owner(&state, &token).await?;
-    super::svg_artifacts::image(State(state), Path((owner, artifact_id))).await
+    super::svg_artifacts::image(LiveState(state), Path((owner, artifact_id))).await
 }
 
 pub(super) async fn source(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((token, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     let owner = shared_owner(&state, &token).await?;
-    super::svg_artifacts::source(State(state), Path((owner, artifact_id))).await
+    super::svg_artifacts::source(LiveState(state), Path((owner, artifact_id))).await
 }
 
 pub(super) async fn download(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((token, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     let owner = shared_owner(&state, &token).await?;
-    super::svg_artifacts::download(State(state), Path((owner, artifact_id))).await
+    super::svg_artifacts::download(LiveState(state), Path((owner, artifact_id))).await
 }
 
 #[cfg(test)]

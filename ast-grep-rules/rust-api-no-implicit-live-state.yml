@@ -1,0 +1,12 @@
+id: api-no-implicit-live-state
+language: Rust
+severity: error
+message: |
+  API handlers must not extract the full live AppState through infallible State.
+  Use rejecting LiveState admission or a bounded shared observation extractor;
+  otherwise the application composition boundary can be bypassed.
+files:
+  - "**/phoenix-ide/src/api/**/*.rs"
+rule:
+  kind: generic_type
+  regex: '^State\s*<\s*AppState\s*>$'

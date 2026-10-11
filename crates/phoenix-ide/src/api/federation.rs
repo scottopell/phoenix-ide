@@ -1,5 +1,6 @@
+use super::application_state::LiveState;
 use axum::{
-    extract::{Path, State},
+    extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -10,7 +11,6 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use super::auth::OwnerAuthenticated;
-use super::AppState;
 
 #[derive(Deserialize)]
 pub struct IssueEnrollmentRequest {
@@ -40,8 +40,8 @@ fn random_peer_token() -> String {
 }
 
 pub async fn issue_enrollment(
+    LiveState(state): LiveState,
     _owner: OwnerAuthenticated,
-    State(state): State<AppState>,
     Json(request): Json<IssueEnrollmentRequest>,
 ) -> Response {
     let local_id = match state.db.instance_id().await {
@@ -82,8 +82,8 @@ pub async fn issue_enrollment(
 }
 
 pub async fn revoke_enrollment(
+    LiveState(state): LiveState,
     _owner: OwnerAuthenticated,
-    State(state): State<AppState>,
     Path(caller_instance_id): Path<InstanceId>,
 ) -> Response {
     match state

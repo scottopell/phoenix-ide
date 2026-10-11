@@ -7,6 +7,7 @@ use super::types::{ConversationRouteResponse, ProductConversationRouteResponse};
 use crate::db::{Database, DbError};
 use serde::Serialize;
 
+#[derive(Clone)]
 pub(crate) struct ConversationRouteObservations {
     db: Database,
 }

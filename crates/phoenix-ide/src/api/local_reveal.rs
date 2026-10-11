@@ -14,6 +14,7 @@
 //! — at worst it opens a folder the local caller already has filesystem access
 //! to. That property, not a path allowlist, is what makes the endpoint safe.
 
+use super::application_state::LiveState;
 use super::handlers::AppError;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, StatusCode};
@@ -94,6 +95,7 @@ fn host_addresses() -> Vec<IpAddr> {
 /// `POST /api/files/reveal` — open a path's containing folder in the server
 /// host's file manager. Refuses non-local callers (403).
 pub async fn reveal_path(
+    _live: LiveState,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<RevealRequest>,

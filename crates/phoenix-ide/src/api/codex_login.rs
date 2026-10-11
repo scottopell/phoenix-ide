@@ -26,11 +26,8 @@
 //! atomically, so the next `OpenAI` request after login uses the new credential
 //! without a Phoenix restart (task 13005).
 
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    Json,
-};
+use super::application_state::LiveState;
+use axum::{extract::Path, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -58,8 +55,6 @@ use phoenix_llm::codex_login::{
     request_device_code, validate_state, CallbackPayload, DeviceCode, LoginError, LoginResult,
     LoopbackServer, CALLBACK_PORT, CLIENT_ID, ISSUER_BASE,
 };
-
-use super::AppState;
 
 // ---------------------------------------------------------------------------
 // Public status — what GET /status returns.
@@ -304,7 +299,7 @@ async fn bind_loopback_with_retry(
 }
 
 pub async fn pkce_start(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<PkceStartResponse>, (StatusCode, Json<serde_json::Value>)> {
     let _lifecycle = state.codex_login.lifecycle.lock().await;
     let mgr = state.codex_login.clone();
@@ -612,7 +607,7 @@ fn url_decode(s: &str) -> String {
 }
 
 pub async fn pkce_manual(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(session_id): Path<String>,
     Json(body): Json<ManualCodeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -664,7 +659,7 @@ pub async fn pkce_manual(
 }
 
 pub async fn pkce_status(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(session_id): Path<String>,
 ) -> Result<Json<LoginStatusJson>, StatusCode> {
     let mgr = state.codex_login.clone();
@@ -692,7 +687,7 @@ pub async fn pkce_status(
 }
 
 pub async fn pkce_cancel(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(session_id): Path<String>,
 ) -> Json<serde_json::Value> {
     let mgr = state.codex_login.clone();
@@ -729,7 +724,7 @@ pub struct DeviceStartResponse {
 }
 
 pub async fn device_start(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<DeviceStartResponse>, (StatusCode, Json<serde_json::Value>)> {
     let _lifecycle = state.codex_login.lifecycle.lock().await;
     let mgr = state.codex_login.clone();
@@ -871,7 +866,7 @@ fn schedule_device_sweep(mgr: Arc<CodexLoginManager>, session_id: String) {
 }
 
 pub async fn device_status(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(session_id): Path<String>,
 ) -> Result<Json<LoginStatusJson>, StatusCode> {
     let mgr = state.codex_login.clone();
@@ -895,7 +890,7 @@ pub async fn device_status(
 }
 
 pub async fn device_cancel(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(session_id): Path<String>,
 ) -> Json<serde_json::Value> {
     let mgr = state.codex_login.clone();
@@ -994,7 +989,7 @@ async fn fetch_codex_quota(
         .map(|quota| (account_id, quota))
 }
 
-pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_llm::QuotaDetails>> {
+pub async fn codex_quota(LiveState(state): LiveState) -> Json<Option<phoenix_llm::QuotaDetails>> {
     let _publication = state.codex_login.lock_publication().await;
     let quota = match state.llm_registry.current_codex_credential() {
         Some(credential) => fetch_codex_quota(credential.as_ref())
@@ -1005,7 +1000,7 @@ pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_l
     Json(quota)
 }
 
-pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
+pub async fn login_preflight(LiveState(state): LiveState) -> Json<LoginPreflight> {
     let auth_path = state.runtime_env.codex_auth_path();
     let active_path = state.llm_registry.current_codex_loaded_path();
     let already_signed_in = state.llm_registry.current_codex_credential().is_some();
@@ -1042,7 +1037,7 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
 /// and hot-reload the registry to deregister `OpenAI`/Codex bridge models.
 ///
 /// Idempotent — missing file is treated as success.
-pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn signout(LiveState(state): LiveState) -> Json<serde_json::Value> {
     let _lifecycle = state.codex_login.lifecycle.lock().await;
     let auth_path = state.runtime_env.codex_auth_path();
     // Sweep half-open sign-in flows so an in-progress PKCE driver can't race

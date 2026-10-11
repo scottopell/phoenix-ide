@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod alloc_guard;
+pub mod application_state;
 mod assets;
 pub mod auth;
 mod browser_view;

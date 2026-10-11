@@ -14,13 +14,9 @@
 // so the i64/usize -> f64 casts here are exact, not lossy.
 #![allow(clippy::cast_precision_loss)]
 
+use super::application_state::LiveState;
 use super::AppState;
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -723,7 +719,7 @@ struct ConvAcc {
 
 /// `GET /api/usage` — assemble the aggregate usage dashboard.
 #[allow(clippy::too_many_lines)] // one linear assembly of the dashboard payload
-pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn usage_overview(LiveState(state): LiveState) -> impl IntoResponse {
     let daily_rows = match state.db.usage_daily_by_model().await {
         Ok(r) => r,
         Err(e) => {
@@ -922,7 +918,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
 /// `GET /api/usage/conversation/:id` — per-conversation drill-down. `:id` is the
 /// root conversation id; sub-agent turns are included.
 pub async fn usage_conversation_detail(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let turns_projection =

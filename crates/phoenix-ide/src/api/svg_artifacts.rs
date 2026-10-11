@@ -1,6 +1,6 @@
+use super::application_state::LiveState;
 use super::handlers::AppError;
-use super::AppState;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::{header, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use phoenix_db::{Database, SvgArtifact};
@@ -67,7 +67,7 @@ fn artifact_response(artifact: SvgArtifact, representation: Representation) -> R
 }
 
 pub(super) async fn image(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((conversation_id, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     Ok(artifact_response(
@@ -77,7 +77,7 @@ pub(super) async fn image(
 }
 
 pub(super) async fn source(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((conversation_id, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     Ok(artifact_response(
@@ -87,7 +87,7 @@ pub(super) async fn source(
 }
 
 pub(super) async fn download(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((conversation_id, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     Ok(artifact_response(
@@ -99,6 +99,7 @@ pub(super) async fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::AppState;
     use crate::tools::present_svg::validation::{self, SvgInvocationId};
 
     const SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#;

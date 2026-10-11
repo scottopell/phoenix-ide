@@ -4,13 +4,14 @@
 //! This module resolves an immutable release preview and launches the selected
 //! release's deployment controller; it never replaces or restarts Phoenix.
 
+use super::application_state::LiveState;
 use super::{
     installation_ownership::{self, InstallationOwnership},
     local_reveal::client_is_local,
     AppState,
 };
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -646,13 +647,13 @@ fn authority(
     ReleaseUpdateAuthority::Allowed
 }
 
-pub async fn transaction_status(State(state): State<AppState>) -> Json<ReleaseTransactionStatus> {
+pub async fn transaction_status(LiveState(state): LiveState) -> Json<ReleaseTransactionStatus> {
     let ownership = installation_ownership::detect(&state.runtime_env).await;
     Json(read_status(&state, transaction_backend(&ownership)))
 }
 
 pub async fn snapshot(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<SnapshotQuery>,
@@ -727,7 +728,7 @@ async fn materialize_controller(commit: &str, destination: &Path) -> Result<(), 
 
 #[allow(clippy::too_many_lines)]
 pub async fn approve(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<ApproveReleaseUpdateRequest>,

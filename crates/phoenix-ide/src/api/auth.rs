@@ -24,8 +24,8 @@ use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use super::application_state::{ApplicationState, LiveState, ObservationAccessDenied};
 use super::assets::public_root_asset;
-use super::AppState;
 #[derive(Debug, Clone, Copy)]
 pub struct OwnerAuthenticated;
 
@@ -422,10 +422,19 @@ fn is_exempt_path(path: &str) -> bool {
 
 /// Axum middleware that enforces password auth when `PHOENIX_PASSWORD` is set.
 pub async fn auth_middleware(
-    State(state): State<AppState>,
+    State(application): State<ApplicationState>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    let state = match &application {
+        ApplicationState::Live(state) => state,
+        ApplicationState::Observation(application) => {
+            if let Err(error) = application.admit_peer(peer_from_extensions(&req), req.headers()) {
+                return error.into_response();
+            }
+            return next.run(req).await;
+        }
+    };
     // No password configured — pass through as the owner channel.
     let Some(password) = &state.password else {
         req.extensions_mut().insert(OwnerAuthenticated);
@@ -483,10 +492,20 @@ pub struct LoginRequest {
 /// `GET /api/auth/status` — report whether auth is required and whether the
 /// caller is currently authenticated.
 pub async fn auth_status(
-    State(state): State<AppState>,
+    State(application): State<ApplicationState>,
     req: Request<Body>,
-) -> Json<AuthStatusResponse> {
-    match &state.password {
+) -> Result<Json<AuthStatusResponse>, ObservationAccessDenied> {
+    let state = match &application {
+        ApplicationState::Live(state) => state,
+        ApplicationState::Observation(application) => {
+            application.admit_peer(peer_from_extensions(&req), req.headers())?;
+            return Ok(Json(AuthStatusResponse {
+                auth_required: false,
+                authenticated: true,
+            }));
+        }
+    };
+    Ok(match &state.password {
         None => Json(AuthStatusResponse {
             auth_required: false,
             authenticated: true,
@@ -511,14 +530,14 @@ pub async fn auth_status(
                 authenticated,
             })
         }
-    }
+    })
 }
 
 /// `POST /api/auth/login` — validate the password, mint a session token, and
 /// set it in an auth cookie on success. Rate-limited per client (see
 /// [`LoginThrottle`]).
 pub async fn auth_login(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req_headers: header::HeaderMap,
     Json(body): Json<LoginRequest>,

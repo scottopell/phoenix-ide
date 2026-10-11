@@ -1,5 +1,6 @@
+use super::application_state::LiveState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query},
     routing::get,
     Json, Router,
 };
@@ -67,7 +68,7 @@ fn should_retry_aggregate_close(attempt: usize, error_type: &str) -> bool {
 }
 
 pub async fn close_product_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
 ) -> Result<Json<super::types::SuccessResponse>, AppError> {
     for attempt in 0..2 {
@@ -93,7 +94,7 @@ pub async fn close_product_conversation(
 }
 
 pub async fn rename_product_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
     Json(req): Json<RenameProductConversationRequest>,
 ) -> Result<Json<ProductConversationListRow>, AppError> {
@@ -154,7 +155,7 @@ struct AggregateSegmentCeiling {
     tail_message_id: Option<String>,
 }
 
-pub fn automatic_continuation_routes() -> Router<AppState> {
+pub fn automatic_continuation_routes() -> Router<super::application_state::ApplicationState> {
     Router::new()
         .route(
             "/api/product-conversations/:reference/automatic-continuation",
@@ -168,7 +169,7 @@ pub fn automatic_continuation_routes() -> Router<AppState> {
 }
 
 pub async fn get_product_conversation_automatic_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
     let product_conversation_id = reference
@@ -185,7 +186,7 @@ pub async fn get_product_conversation_automatic_continuation(
 }
 
 pub async fn put_product_conversation_automatic_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
     Json(request): Json<UpdateAutomaticContinuationRequest>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
@@ -211,7 +212,7 @@ pub async fn put_product_conversation_automatic_continuation(
 }
 
 pub async fn get_coordinator_automatic_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
     coordinator_automatic_continuation_view(&state)
         .await
@@ -219,7 +220,7 @@ pub async fn get_coordinator_automatic_continuation(
 }
 
 pub async fn put_coordinator_automatic_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(request): Json<UpdateAutomaticContinuationRequest>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
     let coordinator_id = coordinator_conversation_id(&state).await?;
@@ -371,7 +372,7 @@ fn admission_phase_view(
 }
 
 pub async fn list_product_conversations(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<ProductConversationListResponse>, AppError> {
     read_product_conversation_list(&state.db)
         .await
@@ -385,7 +386,7 @@ pub struct ProductCreationRecoveryQuery {
 }
 
 pub async fn list_product_conversation_creations(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<ProductCreationRecoveryQuery>,
 ) -> Result<Json<ProductConversationCreationRecoveryResponse>, AppError> {
     let cursor = query
@@ -428,7 +429,7 @@ pub async fn list_product_conversation_creations(
 }
 
 pub async fn get_product_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<ProductConversationSnapshotView>, AppError> {

@@ -1,6 +1,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
 
+use super::application_state::LiveState;
 use super::handlers::AppError;
 use super::types::{
     CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest,
@@ -17,10 +18,7 @@ use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 use phoenix_core::domain::close::TranscriptConversationId;
 
-use axum::{
-    extract::{Path, State},
-    Json,
-};
+use axum::{extract::Path, Json};
 
 // ============================================================
 // Terminal-action gate (REQ-BED-031)
@@ -130,7 +128,7 @@ async fn require_task_lifecycle_admission(
 }
 
 pub(crate) async fn approve_task(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     body: Option<Json<TaskApprovalRequest>>,
 ) -> Result<Json<TaskApprovalResponse>, AppError> {
@@ -177,7 +175,7 @@ pub(crate) async fn approve_task(
 }
 
 pub(crate) async fn reject_task(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state
@@ -217,7 +215,7 @@ pub(crate) async fn reject_task(
 }
 
 pub(crate) async fn task_feedback(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(req): Json<TaskFeedbackRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -301,7 +299,7 @@ async fn require_proposal_for_conversation(
 /// `POST /api/conversations/:id/proposals/:proposal_id/approve` — spawn a Work
 /// fork (REQ-PROJ-034).
 pub(crate) async fn approve_fork_proposal(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((id, proposal_id)): Path<(String, String)>,
 ) -> Result<Json<ForkSpawnResponse>, AppError> {
     require_proposal_for_conversation(&state, &id, &proposal_id).await?;
@@ -318,7 +316,7 @@ pub(crate) async fn approve_fork_proposal(
 /// `POST /api/conversations/:id/proposals/:proposal_id/dismiss` — record the
 /// proposal as dismissed (REQ-PROJ-034). Idempotent.
 pub(crate) async fn dismiss_fork_proposal(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((id, proposal_id)): Path<(String, String)>,
 ) -> Result<Json<ForkDismissResponse>, AppError> {
     require_proposal_for_conversation(&state, &id, &proposal_id).await?;
@@ -336,7 +334,7 @@ pub(crate) async fn dismiss_fork_proposal(
 /// `POST /api/conversations/:id/proposals/:proposal_id/request-changes` —
 /// promote the proposal to an Explore refinement (REQ-PROJ-037).
 pub(crate) async fn request_changes_on_fork_proposal(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((id, proposal_id)): Path<(String, String)>,
     Json(req): Json<RequestChangesRequest>,
 ) -> Result<Json<ForkPromoteResponse>, AppError> {
@@ -354,7 +352,7 @@ pub(crate) async fn request_changes_on_fork_proposal(
 /// `GET /api/conversations/:id/proposals` — list this conversation's fork
 /// proposals so the UI can render / withdraw the Review affordance.
 pub(crate) async fn list_fork_proposals(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<ForkProposalListResponse>, AppError> {
     let rows = state
@@ -389,7 +387,7 @@ pub(crate) async fn list_fork_proposals(
 /// Confirms destructive loss retirement against one exact persisted server
 /// inspection. This contract deliberately accepts no client path or inventory.
 pub(crate) async fn confirm_close_loss_retirement(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(request): Json<ConfirmCloseLossRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -486,7 +484,7 @@ pub(crate) async fn confirm_close_loss_retirement(
 }
 
 pub(crate) async fn confirm_close_stop_work(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(request): Json<ConfirmCloseStopWorkRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -579,7 +577,7 @@ pub(crate) async fn confirm_close_stop_work(
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn cancel_close_before_retirement(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(request): Json<CancelCloseBeforeRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -642,7 +640,7 @@ pub(crate) async fn cancel_close_before_retirement(
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn retry_close_retirement(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(request): Json<RetryCloseRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -1036,7 +1034,7 @@ pub(crate) async fn close_product_conversation_with_active_work(
 }
 
 pub(crate) async fn abandon_task(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state
@@ -1057,7 +1055,7 @@ pub(crate) async fn abandon_task(
 /// transition to Terminal. The user has already merged/PR'd the branch externally.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn mark_merged(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state

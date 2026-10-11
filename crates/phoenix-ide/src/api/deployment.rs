@@ -9,12 +9,13 @@
 //! (resource usage, sizes, `sampled_at`) are measured per request so a refresh
 //! yields current values.
 
+use super::application_state::LiveState;
 use super::AppState;
 use crate::api::installation_ownership::{self, InstallationOwnership};
 use crate::api::process_sample::ProcessObservation;
 use crate::db::approximate_percentiles_from_histogram;
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -486,7 +487,7 @@ pub struct LogInfo {
 
 /// `GET /api/deployment` — assemble and return a [`DeploymentInfo`] snapshot.
 pub async fn deployment_info(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -516,23 +517,23 @@ pub async fn deployment_info(
     })
 }
 
-pub async fn deployment_disk(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn deployment_disk(LiveState(state): LiveState) -> impl IntoResponse {
     Json(build_disk_info(&state).await)
 }
 
-pub async fn about_resources(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn about_resources(LiveState(state): LiveState) -> impl IntoResponse {
     Json(sample_about_resources(&state).await)
 }
 
 pub async fn sqlite_workload_report(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<SqliteWorkloadReportQuery>,
 ) -> impl IntoResponse {
     Json(sample_sqlite_workload_report(&state, query.window))
 }
 
 pub async fn cleanup_managed_worktree(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(request): Json<ManagedWorktreeCleanupRequest>,
 ) -> impl IntoResponse {
     match cleanup_managed_worktree_inner(&state, &request.path).await {

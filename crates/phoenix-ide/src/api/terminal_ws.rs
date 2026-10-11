@@ -8,11 +8,11 @@
 //! `run_relay`.  This module handles only the axum/WebSocket wiring: auth, 409
 //! guard, PTY spawn, frame type filtering, and process lifecycle.
 
-use crate::api::AppState;
+use super::application_state::LiveState;
 use crate::runtime::{RuntimeManager, SseEvent};
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{Path, WebSocketUpgrade},
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
@@ -40,9 +40,9 @@ const ATTACH_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Auth is handled by the surrounding middleware before this function is called.
 pub async fn terminal_ws_handler(
+    LiveState(state): LiveState,
     ws: WebSocketUpgrade,
     Path(conversation_id): Path<String>,
-    State(state): State<AppState>,
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let db = state.db.clone();
@@ -107,8 +107,8 @@ pub async fn terminal_ws_handler(
 /// lifetime of the Phoenix process. Used by `/new` (and any other surface
 /// that wants a terminal unbound from a single transcript).
 pub async fn terminal_ws_global_handler(
+    LiveState(state): LiveState,
     ws: WebSocketUpgrade,
-    State(state): State<AppState>,
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let runtime = Arc::clone(&state.runtime);
