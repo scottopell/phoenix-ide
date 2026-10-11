@@ -188,6 +188,7 @@ export function SharePage() {
       <main className="share-main">
         <SvgArtifactAccessContext.Provider value={{ kind: 'share', token }}>
           <MessageList
+            streamingRequestId={null}
             messages={messages}
             pendingMessages={[]}
             convState={convState}

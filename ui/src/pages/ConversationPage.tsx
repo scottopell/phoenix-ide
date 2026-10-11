@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -183,9 +183,7 @@ export interface EmbeddedConversationProjection {
   slug: string;
   conversationId?: string;
   conversation: Conversation | null;
-  messages: Message[];
   pendingMessages: PendingUserMessage[];
-  convState: ReturnType<typeof parseConversationState>;
   isArchived: boolean;
   serverArchived: boolean;
   onRetryPending: (localId: string) => void;
@@ -1796,9 +1794,7 @@ function ConversationPageContent({
       slug,
       ...(conversationId ? { conversationId } : {}),
       conversation: conversation ?? null,
-      messages: atom.messages,
       pendingMessages,
-      convState: convStateForChildren,
       isArchived,
       serverArchived,
       onRetryPending: handleRetry,
@@ -1819,9 +1815,7 @@ function ConversationPageContent({
     slug,
     conversationId,
     conversation,
-    atom.messages,
     pendingMessages,
-    convStateForChildren,
     isArchived,
     handleRetry,
     serverArchived,
@@ -2245,6 +2239,7 @@ function ConversationPageContent({
         <RenderProfiler id="MessageList">
           <ConversationNavStack
             messages={atom.messages}
+            streamingRequestId={atom.streamingRequestId}
             pendingMessages={pendingMessages}
             convState={convStateForChildren}
             onRetry={handleRetry}

@@ -7,7 +7,7 @@ vi.mock('./ConversationNav', () => ({ ConversationNav: () => null }));
 vi.mock('../hooks/useFloatingNavStack', () => ({ useFloatingNavStack: () => {} }));
 describe('source locator decoding', () => {
   it('rejects malformed external percent escapes without crashing the transcript', () => {
-    render(<MemoryRouter initialEntries={['/c/source?source_tool=tool#message-%ZZ']}><ConversationNavStack transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source', generation: 1, transcriptGeneration: 1 } }} messages={[]} pendingMessages={[]} convState={{ type: 'idle' }} onRetry={vi.fn()} onOpenFile={undefined} /></MemoryRouter>);
+    render(<MemoryRouter initialEntries={['/c/source?source_tool=tool#message-%ZZ']}><ConversationNavStack streamingRequestId={null} transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source', generation: 1, transcriptGeneration: 1 } }} messages={[]} pendingMessages={[]} convState={{ type: 'idle' }} onRetry={vi.fn()} onOpenFile={undefined} /></MemoryRouter>);
     expect(screen.getByTestId('target')).toHaveTextContent('null');
   });
 });
