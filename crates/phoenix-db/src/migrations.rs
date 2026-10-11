@@ -626,7 +626,14 @@ const MIGRATIONS: &[Migration] = &[
         name: "index_coordinator_event_child_foreign_keys",
         sql: MIGRATION_122,
     },
+    Migration {
+        version: 123,
+        name: "allow_interrupted_active_close_snapshot_failure",
+        sql: MIGRATION_123,
+    },
 ];
+
+const MIGRATION_123: &str = include_str!("migrations/close_startup_interruption.sql");
 
 const MIGRATION_122: &str = r"
 CREATE INDEX IF NOT EXISTS idx_messages_origin_subscription_event_id
@@ -12993,6 +13000,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (123, "allow_interrupted_active_close_snapshot_failure"),
             (122, "index_coordinator_event_child_foreign_keys"),
             (121, "admit_server_overload_retrying_state"),
             (120, "coordinator_question_wait_events"),
@@ -13570,7 +13578,7 @@ mod tests {
         .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version <= 121)
+            .filter(|migration| migration.version <= 121 || migration.version == 123)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -13589,6 +13597,50 @@ mod tests {
                 .unwrap();
         assert_eq!(recorded, "index_coordinator_event_child_foreign_keys");
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_123_replaces_strict_close_interruption_triggers_after_122() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        sqlx::raw_sql(
+            "DELETE FROM _migrations WHERE version = 123;
+             DROP TRIGGER close_cleanup_failures_require_initial_authority;
+             DROP TRIGGER close_cleanup_failure_completion_requires_disposition;
+             CREATE TRIGGER close_cleanup_failures_require_initial_authority
+             BEFORE INSERT ON close_cleanup_failures BEGIN
+                 SELECT RAISE(ABORT, 'strict old authority');
+             END;
+             CREATE TRIGGER close_cleanup_failure_completion_requires_disposition
+             BEFORE UPDATE OF phase, close_outcome ON close_obligations BEGIN
+                 SELECT RAISE(ABORT, 'strict old completion');
+             END;",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        let triggers: Vec<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name IN (
+                 'close_cleanup_failures_require_initial_authority',
+                 'close_cleanup_failure_completion_requires_disposition'
+             ) ORDER BY name",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(triggers.len(), 2);
+        assert!(triggers
+            .iter()
+            .all(|sql| sql.contains("awaiting_retirement_inspection")));
+        let recorded: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 123")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(recorded, "allow_interrupted_active_close_snapshot_failure");
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -18247,7 +18299,8 @@ mod tests {
                     (113, 'temporarily_skip_historical_continuation_settlement'),
                     (119, 'temporarily_skip_close_cleanup_failures'),
                     (120, 'temporarily_skip_coordinator_question_wait_events'),
-                    (122, 'temporarily_skip_coordinator_event_child_indexes')",
+                    (122, 'temporarily_skip_coordinator_event_child_indexes'),
+                    (123, 'temporarily_skip_close_startup_interruption')",
         )
         .execute(&pool)
         .await
@@ -19149,7 +19202,8 @@ mod tests {
                     (113, 'temporarily_skip_historical_continuation_settlement'),
                     (119, 'temporarily_skip_close_cleanup_failures'),
                     (120, 'temporarily_skip_coordinator_question_wait_events'),
-                    (122, 'temporarily_skip_coordinator_event_child_indexes')",
+                    (122, 'temporarily_skip_coordinator_event_child_indexes'),
+                    (123, 'temporarily_skip_close_startup_interruption')",
         )
         .execute(pool)
         .await
