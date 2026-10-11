@@ -37,14 +37,14 @@ use super::sse::{sse_stream, SseInitTrace};
 #[cfg(test)]
 use super::transcript_observation::{
     db_message_selection_for_stream, preserved_stream_transcript_coverage,
-    stable_render_unit_start_index, stream_last_sequence_read_failed,
+    stable_render_unit_start_index, stream_last_sequence_read_failed, StreamDbMessageSelection,
     DEFAULT_MESSAGE_HISTORY_LIMIT, MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES,
     STABLE_TRANSCRIPT_READ_TEST_HOOK, STREAM_LAST_SEQUENCE_READ_FAILED,
 };
 use super::transcript_observation::{
     get_server_message_tail, get_stream_last_sequence_id, latest_stream_transcript_coverage,
     read_stream_init_messages_with_tail, stable_transcript_read, validate_message_history_limit,
-    StreamDbMessageSelection, TranscriptObservations,
+    TranscriptObservations,
 };
 use super::types::{
     AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
@@ -850,7 +850,7 @@ fn enrich_conversation_with_runtime(
 /// - `ContextExhausted` with a continuation → `"done"` (read-only, continued elsewhere)
 /// - `ContextExhausted` without a continuation → `"needs_action"` (user must act)
 /// - All other states → delegate to `ConvState::presentation_mode()`
-fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
+pub(super) fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
     if matches!(
         conv.state,
         crate::state_machine::ConvState::ContextExhausted { .. }
@@ -3811,25 +3811,13 @@ async fn get_system_prompt(
 // SSE Streaming (REQ-API-005)
 // ============================================================
 
+#[cfg(test)]
 fn snapshot_pending_for_stream(
     broadcast_tx: &crate::runtime::SseBroadcaster,
     query: &StreamConversationQuery,
 ) -> (i64, bool, i64, Vec<SseEvent>, bool) {
-    if let Some(after_event_sequence) = query.after_event_sequence {
-        if let Some((anchor, truncated, highest, events)) =
-            broadcast_tx.snapshot_pending_after(after_event_sequence)
-        {
-            (anchor, truncated, highest, events, true)
-        } else {
-            let server_tip = broadcast_tx.current_seq();
-            broadcast_tx.observe_seq(after_event_sequence.min(server_tip));
-            let (anchor, truncated, highest, events) = broadcast_tx.snapshot_pending();
-            (anchor, truncated, highest, events, false)
-        }
-    } else {
-        let (anchor, truncated, highest, events) = broadcast_tx.snapshot_pending();
-        (anchor, truncated, highest, events, false)
-    }
+    super::member_initialization::StreamEvidence::capture(broadcast_tx, query.after_event_sequence)
+        .into_snapshot_parts()
 }
 
 fn stream_state_starts_runtime(state: &ConvState) -> bool {
@@ -3928,13 +3916,11 @@ async fn stream_conversation(
     // Snapshot the ReplayRing before the DB message read. The later DB read is
     // the durable catch-up for any persisted Message that commits before init is
     // constructed; live SSE covers events that commit after that read.
-    let (
-        pending_anchor_sequence_id,
-        pending_truncated,
-        highest_pending_seq,
-        pending_events,
-        cursor_replay_served,
-    ) = snapshot_pending_for_stream(&broadcast_tx, &query);
+    let stream = super::member_initialization::StreamEvidence::capture(
+        &broadcast_tx,
+        query.after_event_sequence,
+    );
+    let cursor_replay_served = stream.cursor_replay_served();
 
     let transcript_started = std::time::Instant::now();
     let db = state.runtime.db();
@@ -3954,29 +3940,15 @@ async fn stream_conversation(
         })
     })
     .await?;
-    let conversation = stable.conversation;
-    let (
-        last_sequence_id,
-        db_message_selection,
-        messages,
-        _server_message_tail,
-        transcript_coverage,
-    ) = stable.value;
+    let persisted =
+        super::member_initialization::PersistedTranscriptEvidence::from_stable_read(stable);
+    let conversation = persisted.conversation();
     init_trace.record_ms("stream.transcript_read_ms", transcript_started.elapsed());
-    init_trace.record_message_count(messages.len());
-    let highest_message_seq = match db_message_selection {
-        StreamDbMessageSelection::None => last_sequence_id,
-        StreamDbMessageSelection::Latest => {
-            messages.iter().map(|m| m.sequence_id).max().unwrap_or(0)
-        }
-    };
-    let init_seq = std::cmp::max(
-        std::cmp::max(last_sequence_id, highest_pending_seq),
-        highest_message_seq,
-    );
-    broadcast_tx.observe_seq(init_seq);
+    init_trace.record_message_count(persisted.messages().len());
+    broadcast_tx.observe_seq(persisted.sequence_floor(&stream));
 
-    let snapshot_context_window_size = messages
+    let snapshot_context_window_size = persisted
+        .messages()
         .iter()
         .filter_map(|m| m.usage_data.as_ref())
         .next_back()
@@ -4006,9 +3978,9 @@ async fn stream_conversation(
         None
     };
 
-    let mut init_conversation = enrich_conversation_with_seed(&state, &conversation, false).await?;
+    let mut init_conversation = enrich_conversation_with_seed(&state, conversation, false).await?;
     let pr_cache_started = std::time::Instant::now();
-    init_conversation.cached_pr = cached_pr_summary_for_conversation(&state, &conversation).await?;
+    init_conversation.cached_pr = cached_pr_summary_for_conversation(&state, conversation).await?;
     init_trace.record_ms("stream.pr_cache_lookup_ms", pr_cache_started.elapsed());
     // The persisted PR association remains the offline/failure seed while the
     // live PR-status hook refreshes after init.
@@ -4053,30 +4025,16 @@ async fn stream_conversation(
         .get_steering_queue(&id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    // Create init event with typed data -- serialization deferred to SSE layer
-    let transcript = match transcript_coverage {
-        crate::runtime::TranscriptCoverage::Complete => {
-            crate::runtime::InitTranscript::Complete(messages)
-        }
-        crate::runtime::TranscriptCoverage::Tail => crate::runtime::InitTranscript::Tail(messages),
-        crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
-    };
-    let init_event = SseEvent::Init {
-        sequence_id: init_seq,
-        conversation: Box::new(init_conversation),
-        transcript_generation: conversation.transcript_generation,
-        transcript,
-        steering_messages,
-        agent_working: conversation.is_agent_working(),
-        presentation_mode: conv_presentation_mode(&conversation).to_string(),
-        last_sequence_id: init_seq,
-        stream_incarnation: broadcast_tx.stream_incarnation().to_string(),
-        context_window_size,
-        project_name,
-        pending_anchor_sequence_id,
-        pending_events,
-        pending_truncated,
-    };
+    let init_event = super::member_initialization::assemble_member_init(
+        persisted,
+        stream,
+        super::member_initialization::MemberInitializationMetadata {
+            conversation: init_conversation,
+            steering_messages,
+            context_window_size,
+            project_name,
+        },
+    );
 
     Ok(sse_stream(
         id,
