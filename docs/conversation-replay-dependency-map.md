@@ -84,3 +84,21 @@ Global handed off shepherding with UI owner overlap at ProductConversationPage. 
 - Request composition: six full-router tests passed (three immutable observation/admission tests and three live-auth regressions); fmt/clippy passed. The broader API run passed 676 tests and failed only the new test's incorrect share URL; corrected admission suite then passed. Run normal live fixture tests with `PHOENIX_DISCOVERY_ENABLED=false` to avoid unrelated host service probes. AppState workers in those live regressions operate on disposable in-memory state and isolated runtime directories.
 - Both ast-grep rules accept current source and reject deliberately injected authority bypasses. They remain syntactic guardrails, not isolation proofs.
 - Replay startup/browser hydration has NOT been delivered by this milestone. No new fixture capture, production mutation or optimization occurred. Old fixture-server removal is pending replacement.
+
+## Resumable next slice at HEAD 364b86986
+
+Approved implementation continues; no new design approval is required. Startup review identifies an additional early boundary: `main::parse_invocation` currently rejects unknown server flags, and `main` installs a fatal diagnostic hook before `run_server`. Replay selection must happen before inherited fatal-log configuration can write on startup errors, not merely before AppState. Prefer one explicit CLI form (`--observe-fixture ABSOLUTE_DB --target REFERENCE [--port PORT]`), no parallel environment authority and no fallback to Live on incomplete arguments.
+
+Next bounded implementation:
+
+1. Typed invocation selection; preserve existing live/migrate/suggest/sandbox/build-identity dispatch.
+2. Move the existing standalone fixture validator out of load_benchmark via clipboard into a shared owner (do not duplicate). Read-only/regular/absolute/no-hardlink/no-sidecar checks remain. No new fixture capture.
+3. Add validated typed target scope to bounded observations, using the actual ordinary product resolver and aggregate topology; do not cache a duplicate member set. Preserve ID versus slug namespaces; reject off-target/child/disconnected rows.
+4. Normal-binary observation branch before logging/provider config/probes/recovery, using the SAME create_router. Supply ConnectInfo from a real loopback listener. No normal AppState construction, no dummy live dependencies.
+5. Validate schema/read compatibility by the needed shared reads; fixture builder omits migration ledger rows, so MAX(version) is not a valid compatibility test. Do not migrate or promise historical compatibility.
+6. Observation shutdown owns only listener/read services, not live runtime retirement or bash kill-tree; bounded SIGINT/SIGTERM drain, close DB after transport release.
+7. Actual executable tests with marker-writing credential-helper and local network sentinel configurations verify that live initialization is never invoked; unchanged fixture/hash/sidecars, scope matrix and real ConnectInfo are required.
+
+This intermediate server will still reject product snapshots, lists and streams until their shared observation service extraction lands. Do NOT claim browser hydration, delete the prior scaffold prematurely, or collect a benchmark from this intermediate milestone. Follow with shared transcript initialization/persisted enrichment, then coordinated UI capability callers, replacement/scaffold deletion and calibration check-in.
+
+Review provenance: final corrected composition review approved tracked diff SHA-256 `7a0633bf43f8ca2cb2e5e09aa04d284ede1adfb60554f38ba2706355624b1454` against asset-fix HEAD `7116d7a73`; code committed as `4af6894f1`, contract/status committed as `364b86986`. The review explicitly excludes startup/SSE/UI/calibration claims.
