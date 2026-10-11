@@ -15,6 +15,7 @@ mod discovery;
 pub mod drive_turn;
 pub(crate) mod git_ops;
 pub(crate) mod git_start;
+pub mod load_benchmark;
 mod mcp_oauth_store;
 mod message_expander;
 mod phx_cli;

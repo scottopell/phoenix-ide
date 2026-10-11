@@ -373,17 +373,9 @@ fn admission_phase_view(
 pub async fn list_product_conversations(
     State(state): State<AppState>,
 ) -> Result<Json<ProductConversationListResponse>, AppError> {
-    let rows = state
-        .db
-        .list_ordinary_product_conversation_projections()
+    read_product_conversation_list(&state.db)
         .await
-        .map_err(db_to_app)?
-        .iter()
-        .map(list_row)
-        .collect();
-    Ok(Json(ProductConversationListResponse {
-        product_conversations: rows,
-    }))
+        .map(|(view, _timing)| Json(view))
 }
 
 #[derive(Deserialize)]
@@ -440,6 +432,38 @@ pub async fn get_product_conversation(
     Path(reference): Path<String>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<ProductConversationSnapshotView>, AppError> {
+    read_product_conversation_snapshot(&state.db, reference, query)
+        .await
+        .map(|(view, _timing)| Json(view))
+}
+
+pub(crate) async fn read_product_conversation_list(
+    db: &crate::db::Database,
+) -> Result<(ProductConversationListResponse, ReadTiming), AppError> {
+    let started = std::time::Instant::now();
+    let projections = db
+        .list_ordinary_product_conversation_projections()
+        .await
+        .map_err(db_to_app)?;
+    let db_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let started = std::time::Instant::now();
+    let rows = projections.iter().map(list_row).collect();
+    Ok((
+        ProductConversationListResponse {
+            product_conversations: rows,
+        },
+        ReadTiming {
+            db_ms,
+            projection_ms: started.elapsed().as_secs_f64() * 1000.0,
+        },
+    ))
+}
+
+pub(crate) async fn read_product_conversation_snapshot(
+    db: &crate::db::Database,
+    reference: String,
+    query: SnapshotQuery,
+) -> Result<(ProductConversationSnapshotView, ReadTiming), AppError> {
     let open_id = query.open_id;
     async move {
         let message_limit = message_limit(query.message_limit)?;
@@ -455,8 +479,8 @@ pub async fn get_product_conversation(
                 })
                 .collect::<Vec<_>>()
         });
-        let snapshot = state
-            .db
+        let started = std::time::Instant::now();
+        let snapshot = db
             .read_ordinary_product_conversation_snapshot(
                 &reference,
                 cursor.as_ref().map(|cursor| {
@@ -471,24 +495,31 @@ pub async fn get_product_conversation(
             )
             .await
             .map_err(db_to_app)?;
+        let db_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
         if let Some(cursor) = &cursor {
             validate_cursor(&snapshot.aggregate, cursor)?;
         }
-        Ok(Json(
-            snapshot_view(
-                &state,
-                snapshot.aggregate,
-                snapshot.close,
-                snapshot.requested_transcript_row_id,
-                cursor,
-                message_limit,
-                snapshot.messages,
-            )
-            .instrument(tracing::info_span!(
-                target: "phoenix_ide::otel",
-                "product_conversation.post_snapshot_projection"
-            ))
-            .await?,
+        let view = snapshot_view(
+            db,
+            snapshot.aggregate,
+            snapshot.close,
+            snapshot.requested_transcript_row_id,
+            cursor,
+            message_limit,
+            snapshot.messages,
+        )
+        .instrument(tracing::info_span!(
+            target: "phoenix_ide::otel",
+            "product_conversation.post_snapshot_projection"
+        ))
+        .await?;
+        Ok((
+            view,
+            ReadTiming {
+                db_ms,
+                projection_ms: started.elapsed().as_secs_f64() * 1000.0,
+            },
         ))
     }
     .instrument(tracing::info_span!(
@@ -497,6 +528,12 @@ pub async fn get_product_conversation(
         "open.id" = open_id.map(|id| id.to_string()).as_deref(),
     ))
     .await
+}
+
+#[derive(Default)]
+pub(crate) struct ReadTiming {
+    pub db_ms: f64,
+    pub projection_ms: f64,
 }
 
 fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
@@ -624,7 +661,7 @@ fn close_action_view(
 
 #[allow(clippy::too_many_lines)]
 async fn snapshot_view(
-    state: &AppState,
+    db: &crate::db::Database,
     mut aggregate: ProductConversationAggregate,
     close: Option<CloseProjection>,
     requested_transcript_row_id: String,
@@ -647,9 +684,7 @@ async fn snapshot_view(
                         | CloseCompletionOutcome::CloseIncomplete
                 )
             ) {
-                state
-                    .db
-                    .list_close_cleanup_failures(projection.obligation.attempt_id().as_str())
+                db.list_close_cleanup_failures(projection.obligation.attempt_id().as_str())
                     .await
                     .map_err(db_to_app)?
             } else {
@@ -668,8 +703,7 @@ async fn snapshot_view(
         aggregate_messages(&aggregate, page, message_limit);
     let source = match aggregate.source.as_mut() {
         Some(source) => {
-            source.deleted = state
-                .db
+            source.deleted = db
                 .source_conversation_is_deleted(source)
                 .await
                 .map_err(db_to_app)?;

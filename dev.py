@@ -11478,6 +11478,42 @@ def cmd_prod_override_unset(_name: str):
     _reject_prod_override_command()
 
 
+def cmd_conversation_load(args):
+    """Run the isolated read-only load fixture without normal server startup."""
+    if args.load_action == "scenario":
+        subprocess.run(["uv", "run", str(ROOT / "scripts/conversation_load_scenario.py"),
+                        "--fixture", str(Path(args.fixture).resolve()), "--url", args.url],
+                       cwd=ROOT, check=True)
+        return
+    if args.load_action == "capture":
+        subprocess.run([
+            "uv", "run", str(ROOT / "scripts/conversation_load_fixture.py"),
+            "--source", str(Path(args.source).expanduser().resolve()),
+            "--output-dir", str(Path(args.fixture).resolve()),
+            "--target", args.target,
+        ], cwd=ROOT, check=True)
+        return
+    fixture = Path(args.fixture).resolve()
+    if not args.no_build:
+        ensure_ui_deps()
+        subprocess.run(["pnpm", "exec", "vite", "build"], cwd=UI_DIR, check=True, env=node_env())
+        _, build_env = _compiler_cache_subprocess_env(cargo_cwd=ROOT)
+        command = ["cargo", "build", "-p", "phoenix_ide", "--bin", "load_benchmark"]
+        if args.release:
+            command.append("--release")
+        _run_cargo_build(command, ROOT, "release" if args.release else "debug", env=build_env)
+    binary = ROOT / "target" / ("release" if args.release else "debug") / "load_benchmark"
+    home = fixture / "isolated-home"
+    home.mkdir(mode=0o700, exist_ok=True)
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "TMPDIR": str(home)}
+    print(f"Read-only load fixture: http://127.0.0.1:{args.port}", flush=True)
+    subprocess.run([
+        str(binary), "--db", str(fixture / "fixture.db"),
+        "--fixtures", str(fixture / "aux.json"), "--port", str(args.port),
+        "--ui-dir", str(UI_DIR / "dist"),
+    ], cwd=ROOT, env=env, check=True)
+
+
 def cmd_conversation_search(args: list[str]) -> None:
     """Run the private, opt-in production conversation-search benchmark helper."""
     helper = ROOT / "scripts" / "conversation_search_benchmark.py"
@@ -11661,6 +11697,21 @@ def main():
     # seed (offline)
     sub.add_parser("seed", help="Populate dev DB with representative conversations (offline; refuses if Phoenix is running)")
 
+    load_parser = sub.add_parser("conversation-load", help="Isolated read-only conversation-load development fixture")
+    load_sub = load_parser.add_subparsers(dest="load_action", required=True)
+    capture = load_sub.add_parser("capture", help="Create a new sanitized relational fixture from a read-only source")
+    capture.add_argument("--source", required=True)
+    capture.add_argument("--fixture", required=True)
+    capture.add_argument("--target", default="7c2d9446-46a1-42b4-bbad-c8ddfbfddf7f")
+    serve = load_sub.add_parser("serve", help="Build UI/backend and serve without normal runtime startup")
+    serve.add_argument("--fixture", required=True)
+    serve.add_argument("--port", type=int, default=8043)
+    serve.add_argument("--release", action="store_true")
+    serve.add_argument("--no-build", action="store_true")
+    scenario_parser = load_sub.add_parser("scenario", help="Emit existing browser_profile.run_scenario arguments")
+    scenario_parser.add_argument("--fixture", required=True)
+    scenario_parser.add_argument("--url", default="http://127.0.0.1:8043/")
+
     # Private production conversation-search benchmark. Arguments are passed to
     # the focused helper so the helper remains directly testable.
     conversation_search_parser = sub.add_parser(
@@ -11843,6 +11894,8 @@ def main():
         )
     elif args.command == "seed":
         cmd_seed()
+    elif args.command == "conversation-load":
+        cmd_conversation_load(args)
     elif args.command == "conversation-search":
         cmd_conversation_search(args.benchmark_args)
     elif args.command == "qa":
