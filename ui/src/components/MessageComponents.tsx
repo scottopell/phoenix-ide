@@ -21,6 +21,8 @@ import { MessageReviewAction } from './MessageReviewAction';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { remarkDetails } from './remarkDetails';
+import { MarkdownDetails, MarkdownSummary } from './MarkdownDetails';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { api } from '../api';
 import type { Message, InputOrigin, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
@@ -127,8 +129,8 @@ function DeferredSyntaxHighlighter({ language, syntaxStyle, children, ...props }
 }
 
 // Stable plugin array -- avoids creating a new array reference on every render
-const REMARK_PLUGINS = [remarkGfm];
-const NO_REMARK_PLUGINS: typeof REMARK_PLUGINS = [];
+const REMARK_PLUGINS = [remarkGfm, remarkDetails];
+const BASIC_REMARK_PLUGINS = [remarkDetails];
 
 // Inline-code / prose file-path links open the file with no modified-line
 // selection. Share one empty Set rather than allocating a new one per markdown
@@ -1216,6 +1218,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           filePathCopyContext={filePathCopyContext}
         />
       ),
+      details: MarkdownDetails,
+      summary: MarkdownSummary,
       table: ConversationMarkdownTable,
       img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
         <ConversationMarkdownImage
@@ -1253,7 +1257,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   }, []);
 
   const renderTextFragment = useCallback((fragment: ConversationTextFragment) => {
-    const remarkPlugins = usesGfmSyntax(fragment.display.sourceText) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
+    const remarkPlugins = usesGfmSyntax(fragment.display.sourceText) ? REMARK_PLUGINS : BASIC_REMARK_PLUGINS;
     const expanded = forceExpandedText || fragment.display.mode === 'full' || expandedFragmentIds.has(fragment.fragmentId);
     const highlight = activeHighlight?.owner === 'agent-text' && activeHighlight.fragmentId === fragment.fragmentId
       ? activeHighlight

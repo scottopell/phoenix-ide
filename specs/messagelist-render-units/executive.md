@@ -8,7 +8,8 @@ The render-unit construction layer (REQ-MLRU-001 through 004) is unchanged by ph
 
 **In scope:**
 
-- Render-unit construction from `messages`, `pendingMessages`, and `convState` (pure transform)
+- Render-unit construction from `messages`, `pendingMessages`, `convState`, and active streaming request identity (pure transform)
+- Coherent live transcript inputs from one conversation-atom revision, including the latest member of an aggregate ProductConversation transcript
 - Pending user messages typed as `HistoricalUnit` sharing the eventual `user` unit's key, so pending → sent is an in-place keyed update
 - VirtualTranscript-owned virtualization (windowing, scroll-anchor compensation, item-height measurement, programmatic positioning)
 - Streaming view as a `TailUnit` kind with leaf-level buffer subscription
@@ -25,7 +26,7 @@ The render-unit construction layer (REQ-MLRU-001 through 004) is unchanged by ph
 **Owned by other specs (cross-references, not duplication):**
 
 - `specs/virtual-transcript/` — owns the platform-neutral physical layout, measurement, positioning, and conformance contract that MessageList adapts
-- `specs/conversation_atom/` — owns the reducer that produces `messages`, `pendingMessages`, `convState`, and the streaming buffer this spec consumes
+- `specs/conversation_atom/` — owns the reducer producing messages, phase, and streaming buffer, and the coherent structural projections that expose messages, phase, and request identity together; the local pending-message queue is owned by `specs/user_message_queue/`
 - `specs/conversation-ui/` — owns REQ-CONV-019 (streaming text display) at the requirements level; this spec is the structural implementation for the message list
 - `specs/user_message_queue/` — owns the local queue that produces `pendingMessages`; this spec consumes them as `pending_user` `HistoricalUnit` instances
 
@@ -40,7 +41,7 @@ A correct-by-construction rewrite of the message-list virtualization so the virt
 - `ui/src/conversation/renderUnits.ts` — pure `buildRenderUnits({ messages, pendingMessages, convState, streamingHandle })` returns `{ historicalUnits: HistoricalUnit[]; tailUnits: TailUnit[] }`. Two discriminated unions; `agent_turn` carries `toolResultsByUseId: ReadonlyMap<string, Message>` and `isFirstInTurn: boolean` as fields, both computed at construction. `tool_only_agent_turn_group` carries ordered segments of one to eight non-`think` tool-only members as one virtual row, retaining the group variant for singleton segments so live appends preserve renderer state; history acquisition preserves a boundary before the prior loaded prefix so existing row identity remains stable. Pending user messages append to `historicalUnits` keyed by `localId`. `streamingHandle` is a tag (`{ key } | null`) — the buffer itself is subscribed inside the leaf.
 - `ui/src/conversation/scrollMachine.ts` — pure reducer for `scroll_policy.allium`, using discriminated `unmeasured`, `mount-rescue`, and `live` sessions; durable `following`, `reading`, `navigating`, and `returning-to-tail` modes; explicit touch gesture variants; reducer-owned unread truth; and bounded mount recovery. Live ownership has no release timeout.
 - `ui/src/components/VirtualTranscript.tsx` — Phoenix-owned web physical layout authority that satisfies `specs/virtual-transcript/`: it consumes ordered render units, owns measured extents and spacers, emits visible-range/pinned/total-extent observations, and exposes imperative tail/index positioning plus visible-anchor capture.
-- `ui/src/components/MessageList.tsx` — derives units, concatenates `[...historicalUnits, ...tailUnits]`, hands them to a single `<VirtualTranscript>` instance configured with `initialTail={allUnits.length > 0}`, `estimatedExtent={120}`, `overscan={600}`, and `key={conversationId}` to force a fresh instance per conversation. System prompt renders via the `header` slot. The component adapts VirtualTranscript, DOM, gesture, and timer events into scroll-policy events and interprets policy effects as VirtualTranscript or DOM scroll operations. Jump-to-newest is an absolute overlay outside VirtualTranscript, driven by pinned/unread state, dispatching a policy event that calls `transcriptRef.current.scrollToTail()`. The `<StreamingMessage slug={slug} />` leaf subscribes to the buffer directly via `useStreamingBuffer(slug)`.
+- `ui/src/components/MessageList.tsx` — derives units, concatenates `[...historicalUnits, ...tailUnits]`, hands them to a single `<VirtualTranscript>` instance configured with `initialTail={allUnits.length > 0}`, `estimatedExtent={120}`, `overscan={600}`, and `key={conversationId}` to force a fresh instance per conversation. System prompt renders via the `header` slot. The component adapts VirtualTranscript, DOM, gesture, and timer events into scroll-policy events and interprets policy effects as VirtualTranscript or DOM scroll operations. Jump-to-newest is an absolute overlay outside VirtualTranscript, driven by pinned/unread state, dispatching a policy event that calls `transcriptRef.current.scrollToTail()`. Messages, phase, and `streamingRequestId` arrive together from `useConversationView` for the member page or `useConversationTranscriptView` for the aggregate ProductConversation page; MessageList does not independently subscribe to streaming request identity. The `<StreamingMessage slug={slug} requestId={unit.key} />` leaf subscribes to the buffer directly via `useStreamingBuffer(slug)` and displays only a matching request. Finalization replaces the streaming tail with the finalized message under the same key without an intermediate missing or empty row.
 
 ## Status Summary
 
@@ -55,7 +56,7 @@ A correct-by-construction rewrite of the message-list virtualization so the virt
 | **REQ-MLRU-007:** Exact Scroll Compensation | **Deprecated** | Replaced by REQ-MLRU-015; VirtualTranscript owns the scroll-anchor contract |
 | **REQ-MLRU-008:** Measured Spacer with Kind Fallback | **Deprecated** | Replaced by REQ-MLRU-015; VirtualTranscript owns measurement |
 | **REQ-MLRU-009:** Unit-Anchor Saved-Scroll Restore | **Deprecated** | Removed alongside REQ-CONV-013; mount always lands pinned to bottom |
-| **REQ-MLRU-010:** Streaming Subscription Isolation | Complete | `TailUnit` tag + `useStreamingBuffer` in leaf; commit-count regression test |
+| **REQ-MLRU-010:** Streaming Subscription Isolation | Implemented; validation pending | Same-revision messages/phase/request identity via page and transcript projections; matching-request buffer subscription at leaf. Coverage: `MessageList.perf-isolation.test.tsx`, `useConversationView.perf-isolation.test.tsx`, and `ProductConversationPage.finalization.test.tsx` (commit-level finalization/isolation, not browser geometry conformance) |
 | **REQ-MLRU-011:** Capability-Gap Logging | Complete | `console.debug` on every skip path; no warn-or-higher |
 | **REQ-MLRU-012:** Tool-Result-Heavy Tail Regression | Complete | Test exists in `MessageList.test.tsx` |
 | **REQ-MLRU-013:** SessionStorage Height Cache | **Deprecated** | In-memory only; persistence served only the removed saved-scroll restore |

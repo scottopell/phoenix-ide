@@ -3,6 +3,8 @@ import { useTheme } from '../hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { markdownDetailsRanges, markdownReferenceContext, remarkDetails } from './remarkDetails';
+import { MarkdownDetails, MarkdownSummary } from './MarkdownDetails';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { StreamingBuffer } from '../conversation/atom';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
@@ -15,14 +17,15 @@ import { MermaidDiagram } from './MermaidDiagram';
 import { formatMessageTime } from './MessageComponents';
 
 // Stable markdown configuration — avoids creating new references on every render
-const REMARK_PLUGINS = [remarkGfm];
+const REMARK_PLUGINS = [remarkGfm, remarkDetails];
 
 type StreamingMarkdownComponentsContext = {
+  syntaxStyle: Record<string, React.CSSProperties>;
   rootDir?: string | undefined;
   onFileClick?: ((filePath: string) => void) | undefined;
 };
 
-function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMarkdownComponentsContext) {
+function createStreamingMarkdownComponents({ rootDir, onFileClick, syntaxStyle }: StreamingMarkdownComponentsContext) {
   return {
     a: (props: React.ComponentPropsWithoutRef<'a'> & { node?: unknown }) => (
       <ConversationMarkdownAnchor
@@ -31,10 +34,19 @@ function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMa
         filePathCopyContext={rootDir ? { rootDir } : undefined}
       />
     ),
+    pre: ({ children }) => <>{children}</>,
     code: ({ children, node, ...props }: React.ComponentPropsWithoutRef<'code'> & { node?: unknown }) => {
       void node;
+      const code = String(children ?? '');
+      const language = /language-(\S+)/.exec(props.className ?? '')?.[1];
+      if (language || code.endsWith('\n')) {
+        if (language?.toLowerCase() === 'mermaid') return <MermaidDiagram code={code} />;
+        return <SyntaxHighlighter style={syntaxStyle} language={language || 'text'} PreTag="div">{code.replace(/\n$/, '')}</SyntaxHighlighter>;
+      }
       return <code {...props} data-token-kind={inlineCodeTokenKind(children)}>{children}</code>;
     },
+    details: MarkdownDetails,
+    summary: MarkdownSummary,
     table: ConversationMarkdownTable,
     img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
       <ConversationMarkdownImage
@@ -45,8 +57,6 @@ function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMa
   } satisfies Components;
 }
 
-const MARKDOWN_COMPONENTS = createStreamingMarkdownComponents({});
-
 /**
  * Subscribes to the streaming buffer for the given slug and renders it.
  * The subscription happens at this leaf so per-token atom mutations
@@ -55,17 +65,19 @@ const MARKDOWN_COMPONENTS = createStreamingMarkdownComponents({});
  */
 export function StreamingMessage({
   slug,
+  requestId,
   isFirstInTurn,
   rootDir,
   onOpenFile,
 }: {
   slug: string;
+  requestId: string;
   isFirstInTurn: boolean;
   rootDir?: string | undefined;
   onOpenFile?: ((filePath: string) => void) | undefined;
 }) {
   const buffer = useStreamingBuffer(slug);
-  return <StreamingMessageView buffer={buffer} isFirstInTurn={isFirstInTurn} rootDir={rootDir} onOpenFile={onOpenFile} />;
+  return <StreamingMessageView buffer={buffer?.requestId === requestId ? buffer : null} isFirstInTurn={isFirstInTurn} rootDir={rootDir} onOpenFile={onOpenFile} />;
 }
 
 interface StreamingMessageViewProps {
@@ -83,10 +95,6 @@ interface StreamingMessageViewProps {
  * `<StreamingMessage slug={...} />` for the subscribing wrapper;
  * `<StreamingMessageView />` is exported for tests that exercise the
  * rendering pipeline directly.
- *
- * Renders while the LLM is generating. When the final `sse_message` event arrives,
- * the reducer clears this buffer and appends the finalized message atomically — one
- * React render, no flicker, no duplication.
  *
  * Uses rAF gating (not debouncing) to coalesce tokens that arrive within a single
  * 16ms frame, capping renders at ~60fps without introducing artificial latency.
@@ -169,12 +177,24 @@ export function StreamingBlocks({
   }, []);
 
   // Parse once per text change, not on theme-only re-renders.
-  const blocks = useMemo(() => parseStreamingBlocks(displayText), [displayText]);
+  const blocks = useMemo<StreamingBlock[]>(() => {
+    const ranges = markdownDetailsRanges(displayText);
+    const result: StreamingBlock[] = [];
+    let cursor = 0;
+    for (const range of ranges) {
+      result.push(...parseStreamingBlocks(displayText.slice(cursor, range.start)));
+      result.push({ type: 'markdown', content: displayText.slice(range.start, range.end) });
+      cursor = range.end;
+    }
+    result.push(...parseStreamingBlocks(displayText.slice(cursor)));
+    const withReferences = markdownReferenceContext(displayText);
+    return result.map((block) => block.type === 'markdown'
+      ? { ...block, content: withReferences(block.content) }
+      : block);
+  }, [displayText]);
   const markdownComponents = useMemo(
-    () => (rootDir || onOpenFile
-      ? createStreamingMarkdownComponents({ rootDir, onFileClick: onOpenFile })
-      : MARKDOWN_COMPONENTS),
-    [rootDir, onOpenFile],
+    () => createStreamingMarkdownComponents({ rootDir, onFileClick: onOpenFile, syntaxStyle }),
+    [rootDir, onOpenFile, syntaxStyle],
   );
 
   return (

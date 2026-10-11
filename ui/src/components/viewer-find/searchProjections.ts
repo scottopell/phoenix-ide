@@ -1,6 +1,7 @@
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
 import { unified } from 'unified';
+import { remarkDetails } from '../remarkDetails';
 
 import type { ContentBlock, Message, ToolResultContent } from '../../api';
 import type { BashToolProgress } from '../../generated/sse';
@@ -370,8 +371,8 @@ function renderedMarkdownText(node: MarkdownNode): string {
 }
 
 export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownDisplayBlock[] {
-  const processor = unified().use(remarkParse).use(remarkGfm);
-  const tree = processor.runSync(processor.parse(markdown)) as MarkdownNode;
+  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkDetails);
+  const tree = processor.runSync(processor.parse(markdown), { value: markdown }) as MarkdownNode;
   const blocks: MarkdownDisplayBlock[] = [];
   const visit = (node: MarkdownNode, path: readonly number[]) => {
     if (node.type !== 'root' && node.position?.start?.line && node.position.start.offset !== undefined && node.position.end?.offset !== undefined) {

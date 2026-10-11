@@ -151,8 +151,7 @@ describe('useConversationView perf isolation (Finding B)', () => {
     expect(viewRenders.current).toBe(viewBaseline);
     expect(clockRenders.current).toBeGreaterThan(clockBaseline);
 
-    // A streaming token. Changes only streamingBuffer — neither subscriber
-    // that excludes it should re-render the page view.
+    // Starting a request changes transcript structure once; subsequent tokens do not.
     const viewAfterClock = viewRenders.current;
     act(() => {
       store!.dispatch(SLUG, {
@@ -170,7 +169,12 @@ describe('useConversationView perf isolation (Finding B)', () => {
         requestId: 'req-1',
       });
     });
-    expect(viewRenders.current).toBe(viewAfterClock);
+    expect(viewRenders.current).toBe(viewAfterClock + 1);
+    const viewAfterStart = viewRenders.current;
+    act(() => {
+      store!.dispatch(SLUG, { type: 'sse_token', epoch: 1, sequenceId: 3, delta: '!', requestId: 'req-1' });
+    });
+    expect(viewRenders.current).toBe(viewAfterStart);
 
     // Sanity: a real page-relevant change (a new message) DOES re-render the
     // view — the isolation is selective, not a dead subscription.
@@ -178,7 +182,7 @@ describe('useConversationView perf isolation (Finding B)', () => {
       store!.dispatch(SLUG, {
         type: 'sse_message',
         epoch: 1,
-        sequenceId: 3,
+        sequenceId: 4,
         message: {
           message_id: 'm1',
           message_type: 'assistant',

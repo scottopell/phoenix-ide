@@ -3,6 +3,9 @@ import { Link, useLocation } from 'react-router-dom';
 import { FilePathLink } from '../utils/FilePathLink';
 import { isConversationFilePath, type FilePathCopyContext } from '../utils/linkify';
 import { coordinatorConversationLinkState } from './conversationReturnOrigin';
+import './conversationMarkdown.css';
+
+const INLINE_LINK_CLASS = 'conversation-markdown-link';
 
 export type MarkdownAnchorProps = React.ComponentPropsWithoutRef<'a'> & {
   node?: unknown;
@@ -47,6 +50,7 @@ export function ConversationMarkdownAnchor({
       <Link
         {...props}
         to={appDestination}
+        className={[props.className, INLINE_LINK_CLASS].filter(Boolean).join(' ')}
         state={coordinatorConversationLinkState(
           `${location.pathname}${location.search}${location.hash}`,
           appDestination,
@@ -68,7 +72,13 @@ export function ConversationMarkdownAnchor({
     );
   }
   return (
-    <a {...props} href={href} target="_blank" rel="noopener noreferrer">
+    <a
+      {...props}
+      className={[props.className, INLINE_LINK_CLASS].filter(Boolean).join(' ')}
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
       {children}
     </a>
   );

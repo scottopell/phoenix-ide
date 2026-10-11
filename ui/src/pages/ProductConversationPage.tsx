@@ -27,6 +27,7 @@ import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { useConnection } from '../hooks/useConnection';
 import type { SSEAction } from '../conversation/atom';
+import { useConversationTranscriptView } from '../conversation/useConversationAtom';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import {
   getProductConversationSnapshotChangeSequence,
@@ -237,10 +238,10 @@ function reconcileLatestTranscriptRowMessages(
 
 function makeAggregateMessages(
   snapshot: ProductConversationSnapshotView,
-  latestProjection: EmbeddedConversationProjection | null,
+  liveMessages: Message[] | null,
 ): Message[] {
   const historical = flattenHistoricalMessages(snapshot);
-  if (!latestProjection) {
+  if (!liveMessages) {
     const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
     const latestMessages = latestSegment
       ? [
@@ -259,9 +260,7 @@ function makeAggregateMessages(
     ...historical,
     ...reconcileLatestTranscriptRowMessages(
       latestSnapshotMessages,
-      latestProjection.conversationId === snapshot.latest_transcript_row_id
-        ? latestProjection.messages
-        : [],
+      liveMessages,
       snapshot.latest_transcript_row_id,
     ),
     ...(latestHandoff ? [latestHandoff] : []),
@@ -808,10 +807,25 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     && latestProjection?.conversationId === snapshot.latest_transcript_row_id
     ? latestProjection
     : null;
+  const isOpen = snapshot?.ordinary_lifecycle === 'open';
+  const closeIncomplete = snapshot?.close?.outcome === 'close_incomplete';
+  const liveTranscriptRowId = isOpen && !closeIncomplete ? snapshot.latest_transcript_row_id : null;
+  const memberTranscript = useConversationTranscriptView(liveTranscriptRowId);
+  const currentMemberTranscript = liveTranscriptRowId && memberTranscript?.conversationId === liveTranscriptRowId
+    ? memberTranscript
+    : null;
+  const liveMessages = currentMemberTranscript?.messages ?? null;
   const aggregateMessages = useMemo(
-    () => snapshot ? makeAggregateMessages(snapshot, currentLatestProjection) : [],
-    [currentLatestProjection, snapshot],
+    () => snapshot ? makeAggregateMessages(snapshot, liveMessages) : [],
+    [liveMessages, snapshot],
   );
+  const aggregatePendingMessages = useMemo(() => {
+    const acknowledgedIds = new Set(aggregateMessages.map((message) => message.message_id));
+    return (currentLatestProjection?.pendingMessages ?? []).filter((message) => (
+      !acknowledgedIds.has(message.localId)
+      && !acknowledgedIds.has(`${currentLatestProjection?.conversationId}:${message.localId}`)
+    ));
+  }, [aggregateMessages, currentLatestProjection?.conversationId, currentLatestProjection?.pendingMessages]);
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   const isWideDesktop = useIsWideDesktop();
   const showSplitPaneViewer = isWideDesktop && aggregateMessageSlot?.presentation === 'pane';
@@ -1020,8 +1034,8 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
       setApprovalContextWindowUsed(null);
       return;
     }
-    const phase = projection.convState;
-    if (phase.type !== 'awaiting_task_approval') {
+    const phase = currentMemberTranscript?.phase;
+    if (phase?.type !== 'awaiting_task_approval') {
       setTaskApprovalOverlay(null);
       setApprovalContextWindowUsed(null);
       return;
@@ -1044,7 +1058,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     return () => {
       cancelled = true;
     };
-  }, [currentLatestProjection, snapshot?.ordinary_lifecycle]);
+  }, [currentLatestProjection, currentMemberTranscript?.phase, snapshot?.ordinary_lifecycle]);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -1110,17 +1124,16 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
   }, [currentLatestProjection?.conversationId, historyGeneration, loadingOlder, productConversationId, snapshot]);
 
   const messages = aggregateMessages;
-  const closeIncomplete = snapshot?.close?.outcome === 'close_incomplete';
   const cleanupAttention = snapshot?.close?.outcome === 'archived_cleanup_attention';
   const closeNeedsLiveUpdateOwner = closeIncomplete || cleanupAttention;
   const closeInProgress = snapshot?.close != null && (snapshot.close.phase !== 'completed' || closeIncomplete);
   const convState = useMemo(
     () => snapshot?.ordinary_lifecycle === 'history' || closeInProgress
       ? ({ type: 'idle' } satisfies ConversationState)
-      : currentLatestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
-    [closeInProgress, currentLatestProjection, loadingOlder, olderError, snapshot],
+      : currentMemberTranscript?.phase ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
+    [closeInProgress, currentMemberTranscript?.phase, loadingOlder, olderError, snapshot],
   );
-  const latestSlug = currentLatestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
+  const latestSlug = snapshot?.latest_transcript_row_id ?? null;
   const latestConversationId = currentLatestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
   const latestWorkScopeKey = snapshot?.ordinary_lifecycle === 'open'
     ? currentLatestProjection?.conversation?.work_scope_key
@@ -1144,7 +1157,6 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
       },
     }
     : { kind: 'idle' as const, view: transcriptView });
-  const isOpen = snapshot?.ordinary_lifecycle === 'open';
   const liveControlsEnabled = isOpen && !closeInProgress;
   const initialSnapshotReady = snapshot !== null;
 
@@ -1255,7 +1267,8 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
       <section className="view active product-conversation-page__transcript" data-testid="product-conversation-transcript">
         <ConversationNavStack
           messages={messages}
-          pendingMessages={currentLatestProjection?.pendingMessages ?? []}
+          streamingRequestId={closeInProgress ? null : currentMemberTranscript?.streamingRequestId ?? null}
+          pendingMessages={aggregatePendingMessages}
           convState={convState}
           onRetry={liveControlsEnabled ? currentLatestProjection?.onRetryPending ?? (() => {}) : () => {}}
           onCancelSteering={liveControlsEnabled ? currentLatestProjection?.onCancelSteering : undefined}
@@ -1283,13 +1296,13 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
-      {isOpen && !closeIncomplete && snapshot.latest_transcript_row_id && (
+      {liveTranscriptRowId && (
         <div
           className="product-conversation-page__composer"
           data-testid="product-conversation-composer"
         >
           <EmbeddedConversationPage
-            slug={snapshot.latest_transcript_row_id}
+            slug={liveTranscriptRowId}
             showTranscript={false}
             embeddedShell
             suppressCanonicalization={true}
