@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import itertools
 import json
 import os
 import re
@@ -52,7 +53,7 @@ required_fragments = [
     '[[ ! -e "$RUNNER_TEMP/phoenix-notary-api-key.p8" ]]',
     'rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/phoenix-notary-api-key.p8"',
     'macos/Phoenix/scripts/package-desktop-release.sh',
-    'needs: [gate, build-linux, build-macos]',
+    'needs: [gate, tag-release, build-linux, build-macos]',
     'Phoenix-macos-x86_64-apple-darwin-${{ needs.gate.outputs.tag }}.zip',
     'Phoenix-macos-aarch64-apple-darwin-${{ needs.gate.outputs.tag }}.zip',
     'phoenix_ide-x86_64-unknown-linux-musl-debug',
@@ -100,8 +101,31 @@ build_macos_job = workflow.split('\n  build-macos:\n', 1)[1].split('\n  publish:
 publish_job = workflow.split('\n  publish:\n', 1)[1]
 if not build_macos_job.startswith('    environment: macos-release-signing\n'):
     raise SystemExit('macOS signing must use the protected macos-release-signing environment')
-if not publish_job.startswith("    needs: [gate, build-linux, build-macos]\n    if: needs.gate.outputs.release == 'true'\n    environment: macos-release-signing\n"):
-    raise SystemExit('release-only publication must use the protected macos-release-signing environment')
+if not publish_job.startswith('    needs: [gate, tag-release, build-linux, build-macos]\n') or '\n    environment: macos-release-signing\n' not in publish_job:
+    raise SystemExit('publication must explicitly observe all gate/tag/build results in the protected environment')
+publish_condition = re.search(r'^    if: \$\{\{ (.+) \}\}$', publish_job, re.MULTILINE).group(1)
+if '!cancelled()' not in publish_condition:
+    raise SystemExit('publication needs an explicit status function to avoid implicit skipped-ancestor success gating')
+
+# Execute the actual job condition, not a separately reimplemented predicate.
+# Compare all 2,048 result/output/cancellation combinations to the intended gate.
+expression = publish_condition.replace('cancelled()', 'cancelled')
+expression = expression.replace('&&', ' and ').replace('||', ' or ').replace('!', 'not ')
+fields = ['needs.gate.result', 'needs.tag-release.result', 'needs.build-linux.result',
+          'needs.build-macos.result', 'needs.gate.outputs.release', 'needs.gate.outputs.create_tag']
+for index, field in enumerate(fields):
+    expression = expression.replace(field, f'values[{index}]')
+assert re.fullmatch(r"[a-z0-9_\[\]() .'=]+", expression), expression
+results = ['success', 'failure', 'cancelled', 'skipped']
+for gate, tag, linux, macos, release, create_tag, cancelled in itertools.product(
+        results, results, results, results, ['true', 'false'], ['true', 'false'], [True, False]):
+    values = [gate, tag, linux, macos, release, create_tag]
+    actual = eval(expression, {'__builtins__': {}}, {'values': values, 'cancelled': cancelled})
+    expected = (not cancelled and gate == 'success' and release == 'true'
+                and linux == 'success' and macos == 'success'
+                and (tag == 'success' or (tag == 'skipped' and create_tag == 'false')))
+    assert actual == expected, values + [cancelled]
+
 workflow_header = workflow.split('\njobs:\n', 1)[0]
 if "inputs.operation == 'prepare-main' && 'preparation' || 'release'" not in workflow_header or 'cancel-in-progress: false' not in workflow_header:
     raise SystemExit('preparation must not replace a pending release workflow')
@@ -111,7 +135,7 @@ if 'Wait for earlier release workflows' in workflow or 'actions/workflows/releas
     raise SystemExit('release serialization must not claim an application-managed lossless queue')
 if 'ref: ${{ needs.gate.outputs.commit }}' not in build_macos_job:
     raise SystemExit('macOS artifacts must be built from the exact gated commit')
-if "if: needs.gate.outputs.release == 'true'" not in publish_job:
+if "needs.gate.outputs.release == 'true'" not in publish_condition:
     raise SystemExit('preparation must not reach release publication')
 if 'needs.gate.outputs.preparation' in publish_job:
     raise SystemExit('preparation authority must not enter the publication job')
@@ -127,7 +151,7 @@ if write_jobs != {'tag-release', 'publish'}:
     raise SystemExit(f'unexpected repository write-capable jobs: {sorted(write_jobs)}')
 if "if: needs.gate.outputs.create_tag == 'true'" not in job_sections['tag-release']:
     raise SystemExit('tag writer must be release-only')
-if "if: needs.gate.outputs.release == 'true'" not in job_sections['publish']:
+if "needs.gate.outputs.release == 'true'" not in publish_condition:
     raise SystemExit('publisher must be release-only')
 for forbidden in ['prod deploy', '/api/files/reveal', 'gh release', 'gh api --method POST']:
     if forbidden in build_macos_job:
