@@ -52,7 +52,7 @@ function sourcePoints(source: string) {
 }
 
 /** Mask disclosure wrappers so CommonMark can identify code inside their bodies. */
-function disclosureStarts(source: string, parse: (text: string) => MarkdownRoot): number[] {
+function disclosureCodeRegions(source: string, parse: (text: string) => MarkdownRoot): (offset: number) => boolean {
   const masked = source.replace(/<\/?(?:details|summary)\b(?:"[^"]*"|'[^']*'|[^'">])*>/gi,
     (tag) => tag.replace(/[^\r\n]/g, 'x'));
   const excluded: { start: number; end: number }[] = [];
@@ -64,25 +64,26 @@ function disclosureStarts(source: string, parse: (text: string) => MarkdownRoot)
     } else node.children?.forEach(visit);
   };
   visit(parse(masked));
-  let range = 0;
-  const starts: number[] = [];
-  for (const match of source.matchAll(new RegExp(String.raw`<details(?=\s|>)${ATTRIBUTES}>`, 'gi'))) {
-    const offset = match.index;
-    while (excluded[range] && excluded[range]!.end <= offset) range++;
-    if (!excluded[range] || excluded[range]!.start > offset) starts.push(offset);
-  }
-  return starts;
+  const starts = excluded.map((range) => range.start);
+  return (offset) => {
+    const range = excluded[upperBound(starts, offset) - 1];
+    return range !== undefined && offset < range.end;
+  };
 }
 
-function relocate(node: Node, pointAt: ReturnType<typeof sourcePoints>, offset: number): void {
-  const base = pointAt(offset);
+function disclosureStarts(source: string, isCode: (offset: number) => boolean): number[] {
+  return Array.from(source.matchAll(new RegExp(String.raw`<details(?=\s|>)${ATTRIBUTES}>`, 'gi')))
+    .filter((match) => !isCode(match.index))
+    .map((match) => match.index);
+}
+
+function relocate(node: Node, pointAt: ReturnType<typeof sourcePoints>, offset: number, insertedEscapes: number[] = []): void {
   const visit = (current: Node) => {
     if (current.position) {
       for (const point of [current.position.start, current.position.end]) {
         if (point.offset === undefined) continue;
-        point.offset += offset;
-        if (point.line === 1) point.column += base.column - 1;
-        point.line += base.line - 1;
+        const originalOffset = point.offset - upperBound(insertedEscapes, point.offset - 1);
+        Object.assign(point, pointAt(offset + originalOffset));
       }
     }
     current.children?.forEach(visit);
@@ -141,7 +142,8 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
   return (tree, file) => {
     const source = String(file);
     const pointAt = sourcePoints(source);
-    const starts = disclosureStarts(source, parse);
+    const isCode = disclosureCodeRegions(source, parse);
+    const starts = disclosureStarts(source, isCode);
     const withReferences = referenceContext(source, tree);
     const parseContent = (content: string) => {
       const parsed = parse(withReferences(content));
@@ -179,7 +181,8 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
       const header = HEADER.exec(remaining);
       let end: number | undefined;
       let bodyEnd: number | undefined;
-      if (header && !/<\/?(?:details|summary)\b/i.test(header[3]!)) {
+      const summaryTree = header ? parseContent(header[3]!) : undefined;
+      if (header && summaryTree && !Array.from(htmlNodes(summaryTree)).some((html) => /<\/?(?:details|summary)\b/i.test(html.value ?? ''))) {
         const bodyStart = start + header[0].length;
         const bodyTree = parse(source.slice(bodyStart, regionEnd));
         for (const html of htmlNodes(bodyTree)) {
@@ -194,7 +197,6 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
         if (end !== undefined && bodyEnd !== undefined) {
           const summarySource = header[3]!;
           const summaryStart = bodyStart - /<\/summary\s*>$/i.exec(header[0])![0].length - summarySource.length;
-          const summaryTree = parseContent(summarySource);
           const paragraph = summaryTree.children[0];
           // A summary is phrasing content, not a second block document.
           const summary: Extract<MarkdownNode, { type: 'paragraph' }> = {
@@ -225,7 +227,15 @@ export const remarkDetails: Plugin<[], MarkdownRoot> = function remarkDetails() 
         }
       }
       // Recover Markdown that CommonMark bundled into an unclosed HTML block.
-      const recovered = parse(node.value.replace(SUPPORTED_TAGS, (tag) => `\\${tag}`));
+      const insertedEscapes: number[] = [];
+      const original = source.slice(start, node.position?.end.offset);
+      const escaped = original.replace(SUPPORTED_TAGS, (tag, offset: number) => {
+        if (isCode(start + offset)) return tag;
+        insertedEscapes.push(offset + insertedEscapes.length);
+        return `\\${tag}`;
+      });
+      const recovered = parse(escaped);
+      recovered.children.forEach((child) => relocate(child, pointAt, start, insertedEscapes));
       children.push(...recovered.children);
     }
     tree.children = children;

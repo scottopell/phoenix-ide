@@ -64,6 +64,52 @@ describe('safe basic Markdown disclosures', () => {
     expect(container).toHaveTextContent('Body');
   });
 
+  it('accepts a wrapper tag as an inline-code literal in the summary', () => {
+    const source = '<details><summary>Literal `<details>`</summary>\n\nBody\n</details>';
+    const { container } = markdown(source);
+    expect(container.querySelectorAll('details')).toHaveLength(1);
+    expect(container.querySelector('summary code')?.textContent).toBe('<details>');
+    expect(container.querySelector('details')).toHaveTextContent('Body');
+    expect(markdownDetailsRanges(source)).toEqual([{ start: 0, end: source.length }]);
+  });
+
+  it.each([
+    '```html\n<details>\n<summary>Literal</summary>\n</details>\n```',
+    '```html\n<details>\n<summary>Literal</summary>\n</details>',
+    '`<details><summary>Literal</summary></details>`',
+  ])('preserves supported-tag code literals when the outer block is unclosed: %s', (code) => {
+    const source = `<details><summary>Unclosed</summary>\n${code}`;
+    const { container } = markdown(source);
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.querySelector('code')?.textContent?.trimEnd()).toBe(
+      code.startsWith('```') ? '<details>\n<summary>Literal</summary>\n</details>' : code.slice(1, -1),
+    );
+    expect(container).toHaveTextContent('<details><summary>Unclosed</summary>');
+    expect(markdownDetailsRanges(source)).toEqual([]);
+  });
+
+  it.each(['\n', '\r\n'])('maps prefixed fallback nodes and inserted escapes to original positions (%j)', (newline) => {
+    const source = ['Before', '', '<details><summary>Literal `<details>`</summary>', '**Body** and `<summary>`', '```html', '<details>', '</summary>', '```'].join(newline);
+    const processor = unified().use(remarkParse).use(remarkDetails);
+    const tree = processor.runSync(processor.parse(source), { value: source });
+    const recovered = tree.children[1]!;
+    expect(recovered.position?.start).toEqual({ offset: source.indexOf('<details>'), line: 3, column: 1 });
+    if (!('children' in recovered)) throw new Error('Missing recovered Markdown');
+    const strong = recovered.children.find((node) => node.type === 'strong')!;
+    expect(strong.position?.start).toEqual({ offset: source.indexOf('**Body**'), line: 4, column: 1 });
+    expect(strong.position?.end).toEqual({ offset: source.indexOf('**Body**') + '**Body**'.length, line: 4, column: 9 });
+    const summaryCode = recovered.children.find((node) => node.type === 'inlineCode')!;
+    expect(summaryCode.position?.start.offset).toBe(source.indexOf('`<details>`'));
+    expect(summaryCode.position?.end.offset).toBe(source.indexOf('`<details>`') + '`<details>`'.length);
+    const code = tree.children.at(-1)!;
+    expect(code.type).toBe('code');
+    expect(code.position?.start).toEqual({ offset: source.indexOf('```html'), line: 5, column: 1 });
+    expect(code.position?.end).toEqual({ offset: source.length, line: 8, column: 4 });
+    const wrapperText = recovered.children[0]!;
+    expect(wrapperText.position?.start.offset).toBe(source.indexOf('<details>'));
+    expect(wrapperText.position?.end.offset).toBe(source.indexOf('`<details>`'));
+  });
+
   it('ignores disclosure syntax in fenced and inline code', () => {
     const { container } = markdown('```html\n' + basic + '\n```\n\n`<details><summary>literal</summary></details>`');
     expect(container.querySelector('details')).toBeNull();
