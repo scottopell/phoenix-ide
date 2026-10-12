@@ -19167,7 +19167,8 @@ mod tests {
                     (119, 'temporarily_skip_close_cleanup_failures'),
                     (120, 'temporarily_skip_coordinator_question_wait_events'),
                     (122, 'temporarily_skip_coordinator_event_child_indexes'),
-                    (123, 'temporarily_skip_close_startup_interruption')",
+                    (123, 'temporarily_skip_close_startup_interruption'),
+                    (126, 'temporarily_skip_wake_feature_retirement')",
         )
         .execute(&pool)
         .await
@@ -20028,7 +20029,8 @@ mod tests {
                     (119, 'temporarily_skip_close_cleanup_failures'),
                     (120, 'temporarily_skip_coordinator_question_wait_events'),
                     (122, 'temporarily_skip_coordinator_event_child_indexes'),
-                    (123, 'temporarily_skip_close_startup_interruption')",
+                    (123, 'temporarily_skip_close_startup_interruption'),
+                    (126, 'temporarily_skip_wake_feature_retirement')",
         )
         .execute(pool)
         .await
