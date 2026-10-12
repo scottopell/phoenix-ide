@@ -2,7 +2,7 @@
 
 ## Decision and Scope
 
-The user explicitly approved removing the durable wake feature. ADR-097 records
+The user explicitly approved removing the durable wake feature. ADR-098 records
 that decision; ADR-006, ADR-011, and ADR-012 remain historical context, not current
 execution authority. The wake registration/router/profile contract and its Allium
 models are retired, without a replacement framework or promise of redesign.
@@ -67,7 +67,9 @@ formatting validate. The shared
 ADR chain is reconciled against actual federation merge
 `1839a37f67c27d13f479068717d59a5aa413c450` and resource merge
 `eec3fae65f113705733cbd8c5f98b97a03fdcf81`. The candidate preserves resource
-ADRs 095–096 and ledger 124–125, then adds wake ADR-097 and migration 126.
+ADRs 095–096 and ledger 124–125, then adds wake ADR-098 and migration 126. P1 retrieval merge
+`be1fbc52c394e299e48268c4a5079dc22851f5ac` is the actual cumulative base;
+its bounded-retrieval ADR-097 and implementation are preserved.
 ADR/spec shape validation passes on that cumulative source. Earlier qualification
 receipts retain their exact predecessor heads; final cumulative test and review
 receipts are reported on the pull request rather than silently relabelled.
@@ -95,4 +97,4 @@ new rollback subsystem is introduced by wake removal.
 - `requirements.md`: retirement and historical-data contract.
 - `../durable-workflows/requirements.md`: retained foundation, direct-turn, and creation behavior.
 - `../compatibility/requirements.md`: forward migration and paired rollback policy.
-- `../adrs/097_retire-wake-execution-and-preserve-history.md`: explicit removal decision.
+- `../adrs/098_retire-wake-execution-and-preserve-history.md`: explicit removal decision.

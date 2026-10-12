@@ -12,7 +12,7 @@ profile requires it.
 Direct-chat and conversation creation are the retained normative profiles.
 Creation exercises a richer dependency graph, resource reconciliation, and
 compensation. Wake is retired under `../wake-contracts/requirements.md` and
-ADR-097, without a replacement profile or redesign commitment.
+ADR-098, without a replacement profile or redesign commitment.
 
 ## Current Reality
 
@@ -42,7 +42,7 @@ The current normative package comprises:
 - `durable-workflows.allium`
 - `direct-chat-profile.allium`
 - `creation-profile.allium`
-- ADR-013 through ADR-016, ADR-019, ADR-024, ADR-036, and ADR-097 in `specs/adrs/`
+- ADR-013 through ADR-016, ADR-019, ADR-024, ADR-036, and ADR-098 in `specs/adrs/`
 
 These artifacts now state:
 
@@ -83,7 +83,7 @@ These artifacts now state:
 ADR-013 through ADR-016 remain historical records of the earlier durable-
 workflow direction. ADR-019 supersedes their permanent-selector,
 shadow-authority, exact-drain, and universal-lease conclusions for current
-normative work without rewriting those historical records. ADR-097 supersedes
+normative work without rewriting those historical records. ADR-098 supersedes
 wake-specific execution obligations while retaining shared foundation, direct-turn,
 and creation authority.
 
@@ -120,6 +120,6 @@ Remaining profile work is:
 - ADR-036 selects process fail-stop when local SQLite authority cannot be established and makes process-local runtime and observer continuity disposable.
 - ADR-074 selects the active materialized direct turn as the sole post-tool restart baton and rejects transcript-only execution authority.
 - ADR-007 remains creation context; ADR-006, ADR-011, and ADR-012 remain
-  historical wake context superseded for execution by ADR-097.
-- ADR-097 removes operational wake authority, preserves history via additive
+  historical wake context superseded for execution by ADR-098.
+- ADR-098 removes operational wake authority, preserves history via additive
   retirement metadata, and retains ordinary already-admitted DirectTurn settlement.

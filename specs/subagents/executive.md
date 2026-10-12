@@ -66,7 +66,7 @@ only the architectural seams.
 - **Path defaults** treat blank cwd overrides as absent and resolve relative cwd
   values from the parent conversation.
 - **Wake retirement** removes REQ-SA-009's wake binding and delivery obligations
-  under ADR-097. Ordinary durable terminal evidence and parent fan-in remain;
+  under ADR-098. Ordinary durable terminal evidence and parent fan-in remain;
   candidate retirement implementation and verification are ongoing.
 - **Named workers** supply persona and execution preferences, never mode or tools.
   The XDG config and candidate catalog are owned by

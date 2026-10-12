@@ -1,4 +1,4 @@
-# ADR-097: Retire wake execution and preserve history
+# ADR-098: Retire wake execution and preserve history
 
 - **Status:** Accepted
 - **Date:** 2026-10-12
