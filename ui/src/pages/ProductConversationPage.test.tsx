@@ -351,6 +351,7 @@ function HistoryRouteControls() {
   return <><div data-testid="history-location">{location.pathname}{location.search}{location.hash}</div>
     <button onClick={() => navigate({ ...location, hash: '#message-m-3' })}>jump latest message</button>
     <button onClick={() => navigate({ ...location, hash: '' })}>clear message hash</button>
+    <button onClick={() => navigate({ pathname: location.pathname, search: '', hash: '' }, { state: { chapterSelection: 'pending' } })}>select pending chapter</button>
     <button onClick={() => navigate(-1)}>history back</button>
     <button onClick={() => navigate(1)}>history forward</button>
   </>;
@@ -575,6 +576,20 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('history-location')).not.toHaveTextContent('#');
   });
 
+  it('retires an implicit historical Global route anchor when selecting a local pending chapter', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })));
+    renderPage('/global/row-1?source_transcript=row-1&source_tool=old-call#message-m-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'select pending chapter' }));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-1');
+    expect(screen.getByTestId('history-location')).not.toHaveTextContent('source_transcript');
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+  });
+
   it('keeps a hashless newest Global reader unpinned when its route member continues', async () => {
     const { api } = await import('../api');
     const initial = { ...coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })), requested_transcript_row_id: 'row-2' };
@@ -615,6 +630,27 @@ describe('ProductConversationPage', () => {
     expect((props?.messages as Message[]).map(message => message.message_id)).toEqual([...live.map(message => message.message_id), 'newest-message']);
     expect(props?.transcriptPositioning).toMatchObject({ kind: 'idle' });
     expect(screen.getByTestId('history-location')).toHaveTextContent('#message-acquired-125');
+  });
+
+  it.each([false, true])('orders a paged predecessor gap between retained prefix and refreshed tail (Global=%s)', async (global) => {
+    const { api } = await import('../api');
+    const rows = Array.from({ length: 250 }, (_, index) => makeMessage(`gap-${index + 1}`, index + 1, 'row-2'));
+    const segment = { segment_ordinal: 0, transcript_row_id: 'row-2', slug: 'row-2', title: 'Predecessor', messages: rows.slice(0, 100) };
+    const initial = makeSnapshot({ before: null, has_older: false, segments: [segment] });
+    const continued = makeSnapshot({ latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', before: 'gap-cursor', has_older: true, segments: [
+      { ...segment, messages: rows.slice(151) },
+      { segment_ordinal: 1, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')] },
+    ] });
+    const gap = { ...continued, before: null, has_older: false, segments: [{ ...segment, messages: rows.slice(51, 151) }] };
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce({ ...coordinatorSnapshot(initial), requested_transcript_row_id: 'row-2' }).mockResolvedValueOnce({ ...coordinatorSnapshot(continued), requested_transcript_row_id: 'row-2' }).mockResolvedValueOnce({ ...coordinatorSnapshot(gap), requested_transcript_row_id: 'row-2' });
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockResolvedValueOnce(continued).mockResolvedValueOnce(gap);
+    renderPage(global ? '/global/row-2' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual([...rows.map(message => message.message_id), 'newest-message']);
   });
 
   it('preserves the aggregate reader anchor and newest composer when continuation races an older page', async () => {

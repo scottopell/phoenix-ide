@@ -316,13 +316,15 @@ function mergeOlderSegments(
       continue;
     }
 
-    const seenMessageIds = new Set(currentSegment.messages.map((message) => message.message_id));
-    const prependedOlderMessages = olderSegment.messages.filter((message) => !seenMessageIds.has(message.message_id));
     mergedByRowId.set(olderSegment.transcript_row_id, {
       ...currentSegment,
       ...olderSegment,
-      messages: [...prependedOlderMessages, ...currentSegment.messages],
-          });
+      messages: reconcileTranscriptRowMessages(
+        olderSegment.messages.map(message => toSegmentMessage(olderSegment, message, current.boundaries)),
+        currentSegment.messages.map(message => toSegmentMessage(currentSegment, message, current.boundaries)),
+        currentSegment.transcript_row_id,
+      ),
+    });
   }
 
   return {
@@ -1239,7 +1241,11 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
         ? snapshot.requested_transcript_row_id : null,
     };
   }
-  const readerSelection = snapshot ? transcriptReaderSelection(snapshot, location.search, routeReaderSelectionRef.current?.transcriptPin ?? null) : { kind: 'latest' as const };
+  const pendingChapterSelected = (location.state as { chapterSelection?: unknown } | null)?.chapterSelection === 'pending'
+    && !hashTargetMessageId && !new URLSearchParams(location.search).has('source_transcript');
+  const readerSelection = snapshot && !pendingChapterSelected
+    ? transcriptReaderSelection(snapshot, location.search, routeReaderSelectionRef.current?.transcriptPin ?? null)
+    : { kind: 'latest' as const };
   const transcriptTargetMessage = !hashTargetMessageId && readerSelection.kind === 'transcript'
     ? messages.find((message) => message.conversation_id === readerSelection.segment.transcript_row_id)
     : undefined;
