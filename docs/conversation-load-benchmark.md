@@ -41,6 +41,12 @@ After an admitted run, retain raw tool samples/methodology warnings and `window.
 
 Do not subtract guessed admission overhead. Admission pre-reads themselves warm SQLite/OS caches; subtracting measured wall time does not establish cold/live equivalence. Keep end-to-end timing and comparable stage boundaries. Separate real scroll interaction from readiness proxy measurement.
 
+## Owner bootstrap latency boundary
+
+Normal owner application startup now requests `/api/auth/status`, then `/api/capabilities` after successful authentication. `ApplicationBootstrap` blocks mounting the owner providers/pages until a capability response is decoded. HTTP/network/schema failure presents an explicit error and mounts no owner page; there is no assumed-live fallback. This is a new normal-startup request and failure gate. Public token-share routes bypass owner auth/capability fetching; transition from share to owner re-enters the authentication/bootstrap boundary.
+
+A **direct opening / fresh document** includes asset loading and App mount, authentication, capability round trip/decode, owner mounting, routing, data hydration and rendering. If investigating the original perceived conversation-opening latency from that entry condition, measure the complete navigation-to-ready span and retain the bootstrap request intervals. An already-mounted list-click pilot starts only after the list and owner capabilities are ready: its setup explicitly excludes auth/capabilities and initial mount costs. It cannot measure or explain direct-opening/bootstrap latency, and those costs must not disappear from the original opening-latency question. Browser-cold and database/OS-cold are separate conditions; neither is established by a new navigation alone. Do not manufacture equivalence with subtraction.
+
 ## Privacy and fidelity
 
 Capture remains a separately authorized operation. The sanitizer opens the source read-only/query-only in one transaction and reconstructs allowlisted rows rather than copying a raw production database. It excludes credentials, jobs, subscriptions, runtime obligations and migration descriptions. Known heterogeneous content is reconstructed; prose, titles, paths, model identities and arbitrary tool data are synthetic. Unknown fields/columns fail closed. It writes only private `fixture.db` (0400) and `manifest.json` (0600) in a new ignored directory (0700), with FK/count checks.
