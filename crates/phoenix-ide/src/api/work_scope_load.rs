@@ -1,4 +1,4 @@
-use super::process_sample::{ProcessIdentity, cpu_time_for_identity, group_identities_by_pgid};
+use super::process_sample::{cpu_time_for_identity, group_identities_by_pgid, ProcessIdentity};
 use super::resource_monitor::{ResourceMonitor, ResourceObservationGeneration};
 use chrono::{DateTime, Utc};
 use phoenix_core::work_scope::ResourceScopeKey;
