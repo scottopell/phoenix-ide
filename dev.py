@@ -5065,6 +5065,7 @@ def _kache_daemon_identity(binary: str, *, cargo_cwd: Path | None) -> str:
         "CI_COMMIT_REF_PROTECTED",
         "CI_COMMIT_TAG",
         "CI_MERGE_REQUEST_ID",
+        "CI_MERGE_REQUEST_IID",
         "CI_PIPELINE_SOURCE",
     }
     daemon_environment = {
@@ -5109,13 +5110,19 @@ def _safe_kache_startup_diagnostic(
             or any(marker in key for marker in ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"))
         ):
             rendered = rendered.replace(value, "[redacted]")
-    rendered = re.sub(
-        r"(?is)((?:secret|token|password|credential|access[_-]?key)\s*[:=]\s*)(?:\"\"\".*?\"\"\"|'''.*?'''|\"[^\"]*\"|'[^']*'|\S+)",
-        r"\1[redacted]",
+    if re.search(
+        r'''(?im)^\s*["']?(?:secret|token|password|credential|access[_-]?key)["']?\s*[:=]''',
         rendered,
-    )
+    ):
+        rendered = "[redacted credential diagnostic]"
     rendered = re.sub(r"(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[redacted]@", rendered)
-    return rendered.strip()[:limit]
+    rendered = rendered.strip()
+    if len(rendered) <= limit:
+        return rendered
+    separator = "\n...[truncated]...\n"
+    head = (limit - len(separator)) // 2
+    tail = limit - len(separator) - head
+    return rendered[:head] + separator + rendered[-tail:]
 
 
 def _kache_daemon_receipt_path(socket: Path) -> Path:
@@ -5157,7 +5164,7 @@ def _kache_daemon_receipt_matches(socket: Path, identity: str) -> bool:
     try:
         receipt = json.loads(_kache_daemon_receipt_path(socket).read_text())
         socket_info = socket.stat()
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     if not isinstance(receipt, dict):
         return False
@@ -5172,7 +5179,7 @@ def _kache_daemon_receipt_matches(socket: Path, identity: str) -> bool:
 def _kache_daemon_serving_pid(socket: Path) -> int | None:
     try:
         state = json.loads(socket.with_suffix(".state.json").read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(state, dict) or state.get("phase") != "ready":
         return None
@@ -5221,7 +5228,13 @@ def _start_kache_daemon_locked(
         args=(child.stderr, diagnostic),
         daemon=True,
     )
-    diagnostic_thread.start()
+    try:
+        diagnostic_thread.start()
+    except Exception as error:
+        return (
+            f"cannot capture Kache startup diagnostics: {error}; spawned Kache child "
+            f"pid {child.pid} may still be live on {socket} without a Phoenix ownership receipt"
+        )
     readiness_error = _wait_for_kache_daemon(
         binary, cargo_cwd=cargo_cwd, expected_socket=socket
     )

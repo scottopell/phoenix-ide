@@ -335,6 +335,7 @@ class CompilerCacheTests(unittest.TestCase):
             "CI",
             "CI_COMMIT_REF_PROTECTED",
             "CI_MERGE_REQUEST_ID",
+            "CI_MERGE_REQUEST_IID",
             "CI_PIPELINE_SOURCE",
         )
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -705,7 +706,7 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertNotIn("unregistered-secret", rendered)
         self.assertNotIn("user:pass", rendered)
         self.assertLessEqual(len(rendered), 2048)
-        self.assertIn("[redacted]", rendered)
+        self.assertIn("[redacted", rendered)
 
     def test_startup_diagnostic_redacts_kache_access_key_and_quoted_values(self):
         access_key = "fixture-access-key"
@@ -717,7 +718,14 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertNotIn(access_key, rendered)
         self.assertNotIn("two word secret", rendered)
         self.assertNotIn("multiline", rendered)
-        self.assertGreaterEqual(rendered.count("[redacted]"), 3)
+        self.assertEqual("[redacted credential diagnostic]", rendered)
+
+    def test_startup_diagnostic_redacts_quoted_key_and_escaped_value(self):
+        rendered = self.dev._safe_kache_startup_diagnostic(
+            '"token" = "first\\\" fixture-escaped-suffix"',
+            environment={},
+        )
+        self.assertEqual("[redacted credential diagnostic]", rendered)
 
     def test_daemon_start_receipts_only_the_spawned_serving_process(self):
         child = mock.Mock(pid=1234)
@@ -763,6 +771,46 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIn("pid 2468 may still be live", error or "")
         self.assertIn("without a Phoenix ownership receipt", error or "")
 
+    def test_long_readiness_failure_retains_live_child_obligation(self):
+        child = mock.Mock(pid=2468)
+        child.poll.return_value = None
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", return_value=child
+        ), mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", return_value="x" * 2500
+        ):
+            error = self.dev._start_kache_daemon_locked(
+                "/bin/kache",
+                cargo_cwd=Path("/repo"),
+                socket=Path("/tmp/kache.sock"),
+                identity="identity",
+            )
+        rendered = self.dev._safe_kache_startup_diagnostic(error or "", environment={})
+        self.assertLessEqual(len(rendered), 2048)
+        self.assertIn("pid 2468 may still be live", rendered)
+        self.assertIn("without a Phoenix ownership receipt", rendered)
+
+    def test_diagnostic_thread_failure_reports_live_child(self):
+        child = mock.Mock(pid=2468)
+        child.poll.return_value = None
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", return_value=child
+        ), mock.patch.object(
+            self.dev.threading.Thread, "start", side_effect=RuntimeError("thread unavailable")
+        ):
+            error = self.dev._start_kache_daemon_locked(
+                "/bin/kache",
+                cargo_cwd=Path("/repo"),
+                socket=Path("/tmp/kache.sock"),
+                identity="identity",
+            )
+        self.assertIn("thread unavailable", error or "")
+        self.assertIn("pid 2468 may still be live", error or "")
+
     def test_live_child_after_receipt_failure_is_reported_unclaimed(self):
         child = mock.Mock(pid=2468)
         child.poll.return_value = None
@@ -786,6 +834,21 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIn("receipt write failed", error or "")
         self.assertIn("pid 2468 is live", error or "")
         self.assertIn("without a Phoenix ownership receipt", error or "")
+
+    def test_malformed_utf8_proof_files_are_unverifiable(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            socket = root / "kache.sock"
+            socket.write_text("")
+            socket.with_suffix(".state.json").write_bytes(b"\xff")
+            with mock.patch.object(
+                self.dev, "_private_kache_socket_dir", return_value=root
+            ):
+                self.dev._kache_daemon_receipt_path(socket).write_bytes(b"\xff")
+                self.assertFalse(
+                    self.dev._kache_daemon_receipt_matches(socket, "identity")
+                )
+                self.assertIsNone(self.dev._kache_daemon_serving_pid(socket))
 
     def test_operator_socket_reuses_only_matching_phoenix_started_daemon(self):
         socket = Path("/tmp/operator.sock")
