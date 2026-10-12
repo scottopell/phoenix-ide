@@ -23,7 +23,7 @@ type StackProps = Omit<
  * active index. Renders the nav as a fixed-height strip above the list.
  */
 export const ConversationNavStack = memo(function ConversationNavStack(props: StackProps) {
-  const { onLoadOlderMessages, historyBoundaries, ...listProps } = props;
+  const { onLoadOlderMessages, onUpdateOlderMessagesRestore, historyBoundaries, ...listProps } = props;
   const location = useLocation();
   const navigate = useNavigate();
   const sourceToolId = new URLSearchParams(location.search).get('source_tool');
@@ -49,8 +49,9 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
   }, []);
 
   const handleJump = useCallback((unitIndex: number) => {
+    onUpdateOlderMessagesRestore?.({ kind: 'reader_viewport' });
     listRef.current?.scrollToUnitIndex(unitIndex);
-  }, []);
+  }, [onUpdateOlderMessagesRestore]);
 
   const handleLoadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!onLoadOlderMessages) return;
@@ -70,6 +71,8 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
         onJumpBoundary={(messageId) => {
           const query = new URLSearchParams(location.search);
           query.delete('source_tool');
+          const boundary = historyBoundaries?.find((candidate) => candidate.message_id === messageId);
+          if (boundary && query.has('source_transcript')) query.set('source_transcript', boundary.predecessor_transcript_row_id);
           navigate({ pathname: location.pathname, search: query.toString(), hash: `#message-${encodeURIComponent(messageId)}` });
         }}
       />
@@ -78,6 +81,7 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
         {...listProps}
         sourceCallTarget={sourceCallTarget}
         onLoadOlderMessages={onLoadOlderMessages ? handleLoadOlderMessages : undefined}
+        onUpdateOlderMessagesRestore={onUpdateOlderMessagesRestore}
         onChaptersChange={handleChaptersChange}
         onVisibleRangeChange={handleVisibleRangeChange}
       />

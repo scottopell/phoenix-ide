@@ -14,7 +14,7 @@ import {
   type ChainView,
   type ConversationState,
   type Message,
-  type ProductConversationSnapshotView,
+  type ProductConversationHistorySnapshotView as ProductConversationSnapshotView,
 } from '../api';
 import { useChainAtom, type InflightQa } from '../chain';
 import { parseConversationState } from '../utils';
@@ -41,7 +41,8 @@ import {
   subscribeProductConversationsReconciled,
 } from '../notifications';
 import { generateUUID } from '../utils/uuid';
-import type { ProductConversationSegmentView } from '../generated/ProductConversationSegmentView';
+import type { ConversationHistorySegmentView as ProductConversationSegmentView } from '../generated/ConversationHistorySegmentView';
+import type { ConversationHistoryBoundaryView } from '../generated/ConversationHistoryBoundaryView';
 import type { CoordinatorConversationSnapshotView } from '../generated/CoordinatorConversationSnapshotView';
 import type { ComponentProps } from 'react';
 import './ProductConversationPage.css';
@@ -49,9 +50,9 @@ import './ProductConversationPage.css';
 type HistorySnapshot =
   | (ProductConversationSnapshotView & { kind: 'ordinary' })
   | (CoordinatorConversationSnapshotView & { kind: 'coordinator' });
-type HistoryOptions = Parameters<typeof api.getProductConversationSnapshot>[1];
+type HistoryOptions = Parameters<typeof api.getProductConversationHistorySnapshot>[1];
 async function fetchOrdinarySnapshot(reference: string, options: HistoryOptions): Promise<HistorySnapshot> {
-  return { kind: 'ordinary', ...await api.getProductConversationSnapshot(reference, options) };
+  return { kind: 'ordinary', ...await api.getProductConversationHistorySnapshot(reference, options) };
 }
 async function fetchCoordinatorSnapshot(reference: string, options: HistoryOptions): Promise<HistorySnapshot> {
   return { kind: 'coordinator', ...await api.getCoordinatorHistory(reference, options) };
@@ -116,6 +117,26 @@ async function fetchOlderSnapshotWithFreshCursor(
       }),
     };
   }
+}
+
+type TranscriptReaderSelection =
+  | { kind: 'latest' }
+  | { kind: 'transcript'; segment: ProductConversationSegmentView }
+  | { kind: 'unavailable' };
+
+function transcriptReaderSelection(snapshot: HistorySnapshot, search: string): TranscriptReaderSelection {
+  const pins = new URLSearchParams(search).getAll('source_transcript');
+  if (pins.length > 0) {
+    const pin = pins[0];
+    if (pins.length !== 1 || !pin || pin.trim() !== pin) return { kind: 'unavailable' };
+    const segment = snapshot.segments.find((candidate) => candidate.transcript_row_id === pin);
+    return segment ? { kind: 'transcript', segment } : { kind: 'unavailable' };
+  }
+  if (snapshot.kind === 'coordinator' && snapshot.requested_transcript_row_id !== snapshot.latest_transcript_row_id) {
+    const segment = snapshot.segments.find((candidate) => candidate.transcript_row_id === snapshot.requested_transcript_row_id);
+    return segment ? { kind: 'transcript', segment } : { kind: 'unavailable' };
+  }
+  return { kind: 'latest' };
 }
 
 type OwnedSnapshot = {
@@ -192,14 +213,15 @@ function sortSegments(snapshot: HistorySnapshot) {
     .sort((a, b) => a.segment_ordinal - b.segment_ordinal);
 }
 
-function toSegmentMessage(segment: ProductConversationSegmentView, enriched: EnrichedMessage): Message {
+function toSegmentMessage(segment: ProductConversationSegmentView, enriched: EnrichedMessage, boundaries: ConversationHistoryBoundaryView[]): Message {
   const message = toMessage(enriched, productOccurrenceToken(segment.transcript_row_id, enriched.message_id));
-  if (segment.handoff?.continuation_message_id !== message.message_id) return message;
+  const boundary = boundaries.find((candidate) => candidate.message_id === message.message_id);
+  if (!boundary) return message;
   return { ...message, display_data: { ...message.display_data, productHistoricalHandoff: {
-    predecessor_transcript_row_id: segment.handoff.predecessor_transcript_row_id,
-    successor_transcript_row_id: segment.handoff.successor_transcript_row_id,
+    predecessor_transcript_row_id: boundary.predecessor_transcript_row_id,
+    successor_transcript_row_id: boundary.successor_transcript_row_id,
     continuation_message_id: message.message_id,
-    segment_ordinal: segment.segment_ordinal,
+    segment_ordinal: boundary.segment_ordinal,
   } } };
 }
 
@@ -211,7 +233,7 @@ function flattenHistoricalMessages(snapshot: HistorySnapshot): Message[] {
   return sortSegments(snapshot)
     .flatMap((segment) => {
       if (isLatestSegment(snapshot, segment.transcript_row_id)) return [];
-      return segment.messages.map((message) => toSegmentMessage(segment, message));
+      return segment.messages.map((message) => toSegmentMessage(segment, message, snapshot.boundaries));
     });
 }
 
@@ -261,12 +283,12 @@ function makeAggregateMessages(
   if (!liveMessages) {
     const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
     const latestMessages = latestSegment
-      ? latestSegment.messages.map((message) => toSegmentMessage(latestSegment, message))
+      ? latestSegment.messages.map((message) => toSegmentMessage(latestSegment, message, snapshot.boundaries))
       : [];
     return [...historical, ...latestMessages];
   }
   const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
-  const latestSnapshotMessages = latestSegment?.messages.map((message) => toSegmentMessage(latestSegment, message)) ?? [];
+  const latestSnapshotMessages = latestSegment?.messages.map((message) => toSegmentMessage(latestSegment, message, snapshot.boundaries)) ?? [];
   return [
     ...historical,
     ...reconcileLatestTranscriptRowMessages(
@@ -296,8 +318,7 @@ function mergeOlderSegments(
       ...currentSegment,
       ...olderSegment,
       messages: [...prependedOlderMessages, ...currentSegment.messages],
-      handoff: olderSegment.handoff ?? currentSegment.handoff,
-    });
+          });
   }
 
   return {
@@ -339,7 +360,6 @@ function mergeRefreshedTail(
         ),
         ...refreshedSegment.messages,
       ],
-      handoff: refreshedSegment.handoff ?? retainedSegment.handoff,
     });
   }
   const retainedPrefix = earliestRefreshedOrdinal != null
@@ -782,7 +802,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   if (hashNavigationRef.current.key !== location.key) {
     hashNavigationRef.current = { key: location.key, token: ++scrollCommandTokenRef.current };
   }
-  const [handledHashKey, setHandledHashKey] = useState<string | null>(null);
+  const [handledPositioningToken, setHandledPositioningToken] = useState<number | null>(null);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
   const ownedSnapshotRef = useRef<OwnedSnapshot | null>(null);
   const snapshotChangeSequenceRef = useRef(0);
@@ -810,7 +830,8 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   const [approvalContextWindowUsed, setApprovalContextWindowUsed] = useState<number | null>(null);
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
   const [historyGeneration, setHistoryGeneration] = useState(0);
-  const [restoreCommand, setRestoreCommand] = useState<TranscriptPositioningInput | null>(null);
+  const [restoreCommand, setRestoreCommand] = useState<{ navigationToken: number; positioning: TranscriptPositioningInput } | null>(null);
+  const pendingOlderRestoreRef = useRef<{ requestGeneration: number; basis: RestoreBasis | undefined } | null>(null);
   const routeGenerationRef = useRef(0);
   const aggregateDeletedRef = useRef(false);
   const pendingAuthoritativeIdentitiesRef = useRef<ReadonlySet<string> | null>(null);
@@ -1043,6 +1064,15 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   }, [ordinarySnapshot?.close, productConversationId, snapshot]);
 
+  const observedContinuationId = currentLatestProjection?.conversation?.continued_in_conv_id ?? null;
+  const observedOpeningMessageId = snapshot?.latest_opening_pending
+    ? liveMessages?.find((message) => message.message_type === 'user')?.message_id ?? null
+    : null;
+  useEffect(() => {
+    if (currentLatestProjection?.conversationId !== snapshot?.latest_transcript_row_id) return;
+    if (observedContinuationId || observedOpeningMessageId) setSnapshotRetry((value) => value + 1);
+  }, [currentLatestProjection?.conversationId, observedContinuationId, observedOpeningMessageId, snapshot?.latest_transcript_row_id]);
+
   useEffect(() => {
     if (!currentLatestProjection?.conversationId || !ordinarySnapshot) return;
     const previous = observedMemberProjectionRef.current;
@@ -1099,11 +1129,19 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     return () => window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
   }, [viewerSlot]);
 
+  const updateOlderMessagesRestore = useCallback((basis: RestoreBasis) => {
+    const pending = pendingOlderRestoreRef.current;
+    if (pending?.requestGeneration === paginationRequestRef.current) pending.basis = basis;
+  }, []);
+
   const loadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!productConversationId || !snapshot?.has_older || !snapshot.before || loadingOlder) return;
     const ownerId = productConversationId;
     const routeGeneration = routeGenerationRef.current;
     const requestGeneration = ++paginationRequestRef.current;
+    const pendingRestore = { requestGeneration, basis: restoreBasis };
+    pendingOlderRestoreRef.current = pendingRestore;
+    const requestNavigationToken = hashNavigationRef.current.token;
     const requestView = {
       conversationId: snapshot.product_conversation_id,
       generation: historyGeneration,
@@ -1128,8 +1166,11 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
         return { productConversationId: ownerId, value: mergeOlderSegments(authoritativeTail, older) };
       });
       setHistoryGeneration((generation) => generation + 1);
-      if (restoreBasis?.kind === 'reader_anchor') {
+      const currentBasis = pendingRestore.basis;
+      if (currentBasis?.kind === 'reader_anchor') {
         setRestoreCommand({
+          navigationToken: requestNavigationToken,
+          positioning: {
           kind: 'positioning',
           command: {
             kind: 'restore_after_prefix_expansion',
@@ -1140,8 +1181,9 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
               generation: requestView.generation + 1,
               transcriptGeneration: requestView.transcriptGeneration + 1,
             },
-            messageId: restoreBasis.messageId,
-            viewportStartOffset: restoreBasis.viewportStartOffset,
+            messageId: currentBasis.messageId,
+            viewportStartOffset: currentBasis.viewportStartOffset,
+          },
           },
         });
       }
@@ -1151,6 +1193,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
       }
     } finally {
       if (routeGenerationRef.current === routeGeneration && paginationRequestRef.current === requestGeneration) {
+        if (pendingOlderRestoreRef.current === pendingRestore) pendingOlderRestoreRef.current = null;
         setLoadingOlder(false);
       }
     }
@@ -1176,9 +1219,17 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     generation: historyGeneration,
     transcriptGeneration: historyGeneration,
   };
+  const readerSelection = snapshot ? transcriptReaderSelection(snapshot, location.search) : { kind: 'latest' as const };
+  const transcriptTargetMessage = !hashTargetMessageId && readerSelection.kind === 'transcript'
+    ? messages.find((message) => message.conversation_id === readerSelection.segment.transcript_row_id)
+    : undefined;
+  const transcriptTargetExhausted = !hashTargetMessageId && readerSelection.kind === 'transcript' && !transcriptTargetMessage && (
+    snapshot?.has_older === false || snapshot?.segments.some((segment) => segment.segment_ordinal < readerSelection.segment.segment_ordinal && segment.messages.length > 0)
+  );
   const hashTargetLoaded = !!hashTargetMessageId && messages.some((message) => message.message_id === hashTargetMessageId);
   const hashTargetExhausted = !!hashTargetMessageId && !hashTargetLoaded && snapshot?.has_older === false;
-  const transcriptPositioning = restoreCommand ?? (hashTargetLoaded && handledHashKey !== location.key
+  const positioningTargetMessageId = readerSelection.kind === 'unavailable' ? undefined : hashTargetLoaded ? hashTargetMessageId : transcriptTargetMessage?.message_id;
+  const transcriptPositioning = (restoreCommand?.navigationToken === hashNavigationRef.current.token ? restoreCommand.positioning : null) ?? (positioningTargetMessageId && handledPositioningToken !== hashNavigationRef.current.token
     ? {
       kind: 'positioning' as const,
       command: {
@@ -1186,11 +1237,11 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
         token: hashNavigationRef.current.token,
         requestToken: 0,
         view: transcriptView,
-        targetMessageId: hashTargetMessageId,
+        targetMessageId: positioningTargetMessageId,
       },
     }
     : { kind: 'idle' as const, view: transcriptView });
-  const liveControlsEnabled = isOpen && !closeInProgress;
+  const liveControlsEnabled = isOpen && !closeInProgress && !snapshot?.latest_opening_pending;
   const initialSnapshotReady = snapshot !== null;
 
   useEffect(() => {
@@ -1221,9 +1272,11 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   }, [initialSnapshotReady, openSnapshotGeneration, productConversationId]);
 
   useEffect(() => {
-    if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder || olderError) return;
+    const needsMessage = !!hashTargetMessageId && !hashTargetLoaded;
+    const needsTranscript = !hashTargetMessageId && readerSelection.kind === 'transcript' && !transcriptTargetMessage && !transcriptTargetExhausted;
+    if ((!needsMessage && !needsTranscript) || !snapshot?.has_older || loadingOlder || olderError || readerSelection.kind === 'unavailable') return;
     void loadOlderMessages();
-  }, [hashTargetLoaded, hashTargetMessageId, loadOlderMessages, loadingOlder, olderError, snapshot?.has_older]);
+  }, [hashTargetLoaded, hashTargetMessageId, loadOlderMessages, loadingOlder, olderError, readerSelection.kind, snapshot?.has_older, transcriptTargetExhausted, transcriptTargetMessage]);
 
   if (loading) {
     return (
@@ -1292,6 +1345,9 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
           )}
         </section>
       )}
+      {(readerSelection.kind === 'unavailable' || transcriptTargetExhausted) && (
+        <div className="error-message" role="alert">Original source transcript unavailable.</div>
+      )}
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">
           {olderError ?? error ?? 'The linked message is not available in this conversation history.'}
@@ -1319,13 +1375,14 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
           slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
           hasOlderMessages={snapshot.has_older}
           onLoadOlderMessages={snapshot.has_older ? loadOlderMessages : undefined}
+          onUpdateOlderMessagesRestore={updateOlderMessagesRestore}
           loadingOlderMessages={loadingOlder}
           olderHistoryError={olderError}
           transcriptPositioning={transcriptPositioning}
           onHistoryScrollCommandHandled={(token) => {
-            if (token === hashNavigationRef.current.token) setHandledHashKey(hashNavigationRef.current.key);
+            if (token === hashNavigationRef.current.token) setHandledPositioningToken(token);
             setRestoreCommand((current) => (
-              current?.kind === 'positioning' && current.command.token === token ? null : current
+              current?.positioning.kind === 'positioning' && current.positioning.command.token === token ? null : current
             ));
           }}
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}

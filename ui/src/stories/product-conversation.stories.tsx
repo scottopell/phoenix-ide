@@ -51,3 +51,8 @@ export const SourceCallGlobal = storyFor('source-call-global');
 SourceCallGlobal.storyName = 'source-call-global';
 export const SourceCallOrdinary = storyFor('source-call-ordinary');
 SourceCallOrdinary.storyName = 'source-call-ordinary';
+
+export const OrdinaryLazyHistory = storyFor('ordinary-lazy-history');
+OrdinaryLazyHistory.storyName = 'ordinary-lazy-history';
+export const GlobalLazyHistory = storyFor('global-lazy-history');
+GlobalLazyHistory.storyName = 'global-lazy-history';

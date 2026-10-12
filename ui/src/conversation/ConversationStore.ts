@@ -67,7 +67,9 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     return this.transcriptAuthorityById.get(conversationId) ?? LIVE_TRANSCRIPT;
   }
 
-  observeProductConversationSnapshot(snapshot: ProductConversationSnapshotView): void {
+  observeProductConversationSnapshot(snapshot: Pick<ProductConversationSnapshotView, 'latest_transcript_row_id' | 'ordinary_lifecycle'> & {
+    close: Pick<NonNullable<ProductConversationSnapshotView['close']>, 'outcome'> | null;
+  }): void {
     const id = snapshot.latest_transcript_row_id;
     const current = this.getTranscriptAuthority(id);
     if (snapshot.ordinary_lifecycle !== 'open' || snapshot.close?.outcome === 'close_incomplete') {

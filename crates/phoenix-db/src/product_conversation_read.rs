@@ -70,6 +70,7 @@ pub struct OrdinaryProductConversationCitation {
 #[derive(Debug, Clone)]
 pub struct ProductConversationSnapshotRead {
     pub aggregate: ProductConversationAggregate,
+    pub latest_opening_pending: bool,
     pub close: Option<CloseProjection>,
     pub messages: Vec<(i64, crate::Message)>,
     pub requested_transcript_row_id: String,
@@ -78,6 +79,7 @@ pub struct ProductConversationSnapshotRead {
 #[derive(Debug, Clone)]
 pub struct CoordinatorConversationSnapshotRead {
     pub aggregate: ProductConversationAggregate,
+    pub latest_opening_pending: bool,
     pub messages: Vec<(i64, crate::Message)>,
     pub requested_transcript_row_id: String,
 }
@@ -872,6 +874,11 @@ impl Database {
             )
             .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
+            let latest_opening_pending: i64 =
+                sqlx::query_scalar(Self::PENDING_CONTINUATION_OPENING_SQL)
+                    .bind(&aggregate.latest_transcript_row_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             let close = Self::get_active_close_projection_for_product_on(
                 &mut tx,
                 aggregate.product_conversation.id(),
@@ -889,6 +896,7 @@ impl Database {
             .await?;
             Ok(ProductConversationSnapshotRead {
                 aggregate,
+                latest_opening_pending: latest_opening_pending != 0,
                 close,
                 messages,
                 requested_transcript_row_id: resolved.requested_transcript_row_id,
@@ -931,6 +939,11 @@ impl Database {
                 ProductConversationKind::Coordinator,
             )
             .await?;
+            let latest_opening_pending: i64 =
+                sqlx::query_scalar(Self::PENDING_CONTINUATION_OPENING_SQL)
+                    .bind(&aggregate.latest_transcript_row_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             let messages = Self::get_product_conversation_messages_page_on(
                 &mut tx,
                 aggregate.product_conversation.id(),
@@ -941,6 +954,7 @@ impl Database {
             .await?;
             Ok(CoordinatorConversationSnapshotRead {
                 aggregate,
+                latest_opening_pending: latest_opening_pending != 0,
                 messages,
                 requested_transcript_row_id: resolved.requested_transcript_row_id,
             })
@@ -1890,7 +1904,12 @@ mod tests {
                 .unwrap();
                 member = match db.continue_conversation(&member.id).await.unwrap() {
                     ContinueOutcome::Created(next) => next,
-                    other => panic!("expected continuation, got {other:?}"),
+                    ContinueOutcome::AlreadyContinued(_) => {
+                        panic!("unexpected existing continuation")
+                    }
+                    ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                        panic!("unexpected parent state {state_variant}")
+                    }
                 };
             }
         }

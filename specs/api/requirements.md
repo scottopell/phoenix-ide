@@ -338,4 +338,19 @@ AND SHALL NOT create a Coordinator, admit a turn, or expose ordinary lifecycle, 
 WHEN an ordinary aggregate, sub-agent, or nonmember reference is supplied to this endpoint
 THE SYSTEM SHALL reject it rather than substituting the current Coordinator.
 
-Ordinary aggregate reads SHALL retain their ordinary lifecycle and mutation boundaries while using the same chronological boundary-message representation. Web consumption is specified by `specs/conversation-ui` REQ-CONV-023 and REQ-CONV-025.
+Ordinary aggregate reads SHALL retain their ordinary lifecycle and mutation boundaries.
+
+WHEN an ordinary aggregate read selects `boundary_representation=original_messages`
+THE SYSTEM SHALL return original continuation messages and content-free boundary navigation metadata using the same history representation as the Global read
+AND SHALL omit handoff-summary metadata from those history segments.
+
+WHEN an ordinary aggregate read omits `boundary_representation` or selects `handoff_metadata`
+THE SYSTEM SHALL return handoff-summary metadata and exclude the represented continuation messages from segment message arrays
+AND SHALL omit the boundary navigation roster.
+
+THE SYSTEM SHALL reject unknown boundary representations.
+
+THE SYSTEM SHALL keep the newest transcript identity distinct from write readiness
+AND SHALL NOT advertise a reserved successor as writable before its continuation opening is accepted.
+
+Web consumption is specified by `specs/conversation-ui` REQ-CONV-023 and REQ-CONV-025.

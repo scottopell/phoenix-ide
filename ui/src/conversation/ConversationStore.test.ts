@@ -11,7 +11,7 @@ function lifecycleSnapshot(
   return {
     product_conversation_id: 'product-alpha',
     close: null,
-    boundaries: [],
+    latest_opening_pending: false,
     canonical_route: '/c/product-alpha',
     requested_transcript_row_id: 'row-root',
     canonical_root: { transcript_row_id: 'row-root', slug: 'root-slug', title: null },

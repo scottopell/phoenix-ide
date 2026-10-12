@@ -111,6 +111,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [095](095_workscope-cpu-history-and-demand-memory.md) | WorkScope CPU history with demand-driven memory | Accepted | REQ-WSLOAD-001–005, REQ-DEPLOY-007a |
 | [096](096_sampled-live-job-resource-visibility.md) | Sampled live-job visibility, not exhaustive accounting | Accepted | REQ-WSLOAD-001/002/005 |
 | [097](097_bounded-retrieval-reconciliation.md) | Bounded orphan pruning and terminal retrieval readiness | Accepted | REQ-RET-003 |
+| [100](100_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/025, REQ-COMP-001 |
 
 ## For agents: which decisions bind your task
 

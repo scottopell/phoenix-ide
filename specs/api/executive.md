@@ -35,6 +35,6 @@ Reconciled against `crates/phoenix-ide/src/api/handlers.rs`, `crates/phoenix-ide
 
 ## Continuous History API Qualification
 
-REQ-API-030 is implemented in the dedicated Coordinator history read and shared aggregate paging projection. Its wire type intentionally has no ordinary lifecycle, Close, or work-action fields. Ordinary reads retain their existing domain gate. Navigation metadata covers all persisted boundaries, while message pages carry the original continuation records rather than synthetic system prose.
+REQ-API-030 is implemented in the dedicated Coordinator history read and shared aggregate paging projection. Its wire type intentionally has no ordinary lifecycle, Close, or work-action fields. Ordinary reads retain their existing domain gate. The web selects `boundary_representation=original_messages`: navigation metadata covers all persisted boundaries, message pages carry original continuation records, and history segments contain no parallel handoff summary. The default `handoff_metadata` representation remains available to existing consumers, including Swift, without changing their implementation. Pending successor openings do not advertise write readiness.
 
 The guarded cold `./dev.py codegen` run completed and generated the Coordinator/boundary TypeScript types. Three-member Coordinator database/router regressions are present; their focused execution, final-head CI, and independent review remain qualification gates. This source is not a production deployment record.
