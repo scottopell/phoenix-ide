@@ -836,7 +836,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Read optional auth password (REQ-AUTH-001)
     let password = std::env::var("PHOENIX_PASSWORD")
         .ok()
-        .filter(|p| !p.is_empty());
+        .filter(|password| !password.is_empty())
+        .map(phoenix_core::domain::instance_identity::OwnerPassword::parse)
+        .transpose()?;
     if password.is_some() {
         tracing::info!("Password authentication enabled (PHOENIX_PASSWORD is set)");
     }
@@ -955,7 +957,13 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // PTY PATH plus the env (API URL + capability token) it needs to call back.
     // The token persists across restarts (bound to the password fingerprint) so
     // terminals opened before a restart stay authorized.
-    let suggest_token = resolve_suggest_token(&db, password.as_deref()).await;
+    let suggest_token = resolve_suggest_token(
+        &db,
+        password
+            .as_ref()
+            .map(phoenix_core::domain::instance_identity::OwnerPassword::expose),
+    )
+    .await;
     setup_phx_companion(
         &runtime_env,
         bind_address,

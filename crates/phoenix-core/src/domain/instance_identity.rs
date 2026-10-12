@@ -197,6 +197,44 @@ impl PeerBaseUrl {
     }
 }
 
+const PEER_BEARER_PREFIX: &str = "phx_peer_";
+const PEER_BEARER_ENCODED_LEN: usize = 43;
+
+fn is_peer_bearer_credential(value: &str) -> bool {
+    let Some(encoded) = value.strip_prefix(PEER_BEARER_PREFIX) else {
+        return false;
+    };
+    encoded.len() == PEER_BEARER_ENCODED_LEN
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnerPassword(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("PHOENIX_PASSWORD must not use the reserved peer bearer credential shape")]
+pub struct OwnerPasswordError;
+
+impl OwnerPassword {
+    /// Parse an owner password outside the peer bearer credential domain.
+    ///
+    /// # Errors
+    /// Returns an error when the password is empty or has the complete reserved peer bearer shape.
+    pub fn parse(value: String) -> Result<Self, OwnerPasswordError> {
+        if value.is_empty() || is_peer_bearer_credential(&value) {
+            return Err(OwnerPasswordError);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PeerBearerCredential(String);
 
@@ -210,14 +248,7 @@ impl PeerBearerCredential {
     /// # Errors
     /// Returns an error when the credential is outside the reserved token namespace or shape.
     pub fn parse(value: String) -> Result<Self, PeerBearerCredentialError> {
-        let encoded = value
-            .strip_prefix("phx_peer_")
-            .ok_or(PeerBearerCredentialError)?;
-        if encoded.len() != 43
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !is_peer_bearer_credential(&value) {
             return Err(PeerBearerCredentialError);
         }
         Ok(Self(value))
@@ -501,6 +532,22 @@ mod tests {
         ] {
             assert!(PeerBaseUrl::from_str(value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn owner_password_domain_excludes_only_complete_peer_bearers() {
+        for value in [
+            "owner-password",
+            "phx_peer_owner-password",
+            "phx_peer_short",
+        ] {
+            assert_eq!(
+                OwnerPassword::parse(value.to_string()).unwrap().expose(),
+                value
+            );
+        }
+        assert!(OwnerPassword::parse(format!("phx_peer_{}", "a".repeat(43))).is_err());
+        assert!(OwnerPassword::parse(String::new()).is_err());
     }
 
     #[test]

@@ -476,7 +476,7 @@ pub async fn auth_middleware(
     // Bearer-password validation is throttled per peer IP, sharing the single
     // login budget, so this 200/401 oracle cannot be used for unlimited guesses.
     let key = throttle_key(req.headers(), peer_from_extensions(&req));
-    match check_bearer_password(&req, password, &state.login_throttle, &key) {
+    match check_bearer_password(&req, password.expose(), &state.login_throttle, &key) {
         BearerCheck::Valid => {
             req.extensions_mut().insert(OwnerAuthenticated);
             next.run(req).await
@@ -565,7 +565,7 @@ pub async fn auth_status(
                 // report `authenticated: false` without comparing.
                 let key = throttle_key(req.headers(), peer_from_extensions(&req));
                 matches!(
-                    check_bearer_password(&req, password, &state.login_throttle, &key),
+                    check_bearer_password(&req, password.expose(), &state.login_throttle, &key,),
                     BearerCheck::Valid
                 )
             };
@@ -602,7 +602,7 @@ pub async fn auth_login(
             .into_response();
     }
 
-    if !owner_password_matches(&body.password, password) {
+    if !owner_password_matches(&body.password, password.expose()) {
         state.login_throttle.record_failure(&key);
         return (
             StatusCode::UNAUTHORIZED,

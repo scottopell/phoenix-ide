@@ -18087,7 +18087,12 @@ mod wake_handler_tests {
     async fn peer_import_requires_owner_authentication() {
         use phoenix_core::domain::instance_identity::InstanceId;
         let mut state = hard_delete_cascade_tests::make_test_state().await;
-        state.password = Some("owner-password".to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
         let local = state.db.instance_id().await.unwrap();
         let body = serde_json::json!({
             "peer_display_name": "peer",
@@ -18137,7 +18142,12 @@ mod wake_handler_tests {
         use tower::ServiceExt as _;
 
         let mut state = hard_delete_cascade_tests::make_test_state().await;
-        state.password = Some("owner-password".to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
         let local = state.db.instance_id().await.unwrap();
         for content in [
             vec![0x30, 0x03, 0x21, 0x01, 0xff],
@@ -18203,7 +18213,12 @@ mod wake_handler_tests {
 
         let mut state = make_test_state().await;
         let owner_password = "phx_peer_owner-password";
-        state.password = Some(owner_password.to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                owner_password.to_string(),
+            )
+            .unwrap(),
+        );
         let destination = state.db.instance_id().await.unwrap();
         let caller = phoenix_core::domain::instance_identity::InstanceId::new();
         let token = format!("phx_peer_{}", "a".repeat(43));
@@ -18300,7 +18315,12 @@ mod wake_handler_tests {
         use tower::ServiceExt as _;
 
         let mut state = make_test_state().await;
-        state.password = Some("owner-password".to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
         let caller = phoenix_core::domain::instance_identity::InstanceId::new();
         let token = format!("phx_peer_{}", "a".repeat(43));
         state
@@ -18339,7 +18359,12 @@ mod wake_handler_tests {
 
         let mut state = make_test_state().await;
         let owner_password = "phx_peer_same-secret";
-        state.password = Some(owner_password.to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                owner_password.to_string(),
+            )
+            .unwrap(),
+        );
         let response = create_router(state)
             .oneshot(
                 Request::builder()
@@ -18369,7 +18394,12 @@ mod wake_handler_tests {
         use tower::ServiceExt as _;
 
         let mut state = make_test_state().await;
-        state.password = Some("phx_peer_same-secret".to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "phx_peer_same-secret".to_string(),
+            )
+            .unwrap(),
+        );
         let response = create_router(state)
             .oneshot(
                 Request::builder()
@@ -18398,7 +18428,12 @@ mod wake_handler_tests {
         use tower::ServiceExt as _;
 
         let mut state = make_test_state().await;
-        state.password = Some("owner-password".to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
         let caller = phoenix_core::domain::instance_identity::InstanceId::new();
         let request_body = serde_json::json!({
             "caller_instance_id": caller,

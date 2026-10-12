@@ -49,6 +49,7 @@ use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
 use crate::terminal::ActiveTerminals;
 use crate::tools::mcp::McpClientManager;
+use phoenix_core::domain::instance_identity::OwnerPassword;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_llm::ModelRegistry;
 use std::sync::Arc;
@@ -64,7 +65,7 @@ pub struct AppState {
     pub mcp_manager: Arc<McpClientManager>,
     pub credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// When set, all non-exempt API endpoints require this password (REQ-AUTH-001).
-    pub password: Option<String>,
+    pub password: Option<OwnerPassword>,
     /// Server-side store of valid browser session tokens. Login mints a random
     /// token into this set; the password itself never travels in a cookie.
     pub sessions: auth::SessionStore,
@@ -210,7 +211,7 @@ impl AppState {
         platform: PlatformCapability,
         mcp_manager: Arc<McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
-        password: Option<String>,
+        password: Option<OwnerPassword>,
         deployment: Arc<DeploymentConfig>,
         runtime_env: Arc<PhoenixRuntimeEnvironment>,
         suggest_token: String,
@@ -347,7 +348,8 @@ impl AppState {
         // them. Empty when auth is disabled (password None) — never consulted,
         // since the auth middleware short-circuits in that mode.
         let session_password_fingerprint = password
-            .as_deref()
+            .as_ref()
+            .map(OwnerPassword::expose)
             .map(auth::password_fingerprint)
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
