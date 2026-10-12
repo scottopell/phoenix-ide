@@ -179,7 +179,8 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             return;
           }
           if (!locationRef.current.pathname.startsWith('/product-conversations/') &&
-              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
+              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id
+              && (locationRef.current.state as { chapterSelection?: unknown } | null)?.chapterSelection !== 'pending') {
             setResolvedProduct({ reference, id: snapshot.product_conversation_id });
             const query = new URLSearchParams(locationRef.current.search);
             query.set('source_transcript', reference);

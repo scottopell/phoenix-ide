@@ -33,7 +33,8 @@ function Location() {
   const location = useLocation();
   const navigate = useNavigate();
   return <><div data-testid="location">{location.pathname}{location.search}{location.hash}</div>
-    <button type="button" onClick={() => navigate({ pathname: location.pathname, search: '?viewer=file', hash: '#message-m-1' })}>Open viewer</button></>;
+    <button type="button" onClick={() => navigate({ pathname: location.pathname, search: '?viewer=file', hash: '#message-m-1' })}>Open viewer</button>
+    <button type="button" onClick={() => navigate(location.pathname, { state: { chapterSelection: 'pending' } })}>Select pending prompt</button></>;
 }
 
 function RoutedAlias() {
@@ -133,7 +134,7 @@ describe('ProductConversationAliasRedirect', () => {
     first.unmount();
     renderAlias('product-1', entry);
     await screen.findByTestId('product-page');
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('old-member');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('old-member', { message_limit: 1 });
     expect(embeddedSpy).not.toHaveBeenCalled();
     expect(screen.getByTestId('location')).toHaveTextContent(entry);
   });
@@ -168,6 +169,19 @@ describe('ProductConversationAliasRedirect', () => {
     await screen.findByTestId('product-page');
     expect(embeddedSpy).not.toHaveBeenCalled();
     expect(screen.getByTestId('location')).toHaveTextContent('/c/historical?source_transcript=historical&source_tool=send#message-source');
+  });
+
+  it('does not restore an exact historical alias pin after explicit pending prompt selection', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async reference => ({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      latest_transcript_row_id: 'successor', writable_transcript_row_id: 'successor', requested_transcript_row_id: reference,
+    } as never));
+    renderAlias('historical', '/c/historical?source_transcript=historical#message-old');
+    const owner = await screen.findByTestId('product-page');
+    fireEvent.click(screen.getByRole('button', { name: 'Select pending prompt' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/c/product-1'));
+    expect(screen.getByTestId('location')).not.toHaveTextContent('source_transcript');
+    expect(screen.getByTestId('product-page')).toBe(owner);
   });
 
   it('keeps an open current member live while direct messages are temporarily blocked', async () => {
