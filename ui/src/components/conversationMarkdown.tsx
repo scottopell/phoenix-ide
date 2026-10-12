@@ -22,7 +22,7 @@ function appLocalDestination(href: string | undefined): string | undefined {
   try {
     const destination = new URL(href, window.location.origin);
     return destination.origin === window.location.origin && isPhoenixConversationDestination(destination.pathname)
-      ? `${destination.pathname}${destination.search}${destination.hash}`
+      ? `${destination.pathname.replace(/\/$/, '')}${destination.search}${destination.hash}`
       : undefined;
   } catch {
     return undefined;

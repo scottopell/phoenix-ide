@@ -43,10 +43,11 @@ describe('ConversationMarkdownAnchor', () => {
       const onFileClick = vi.fn();
       const view = renderAnchor(href, onFileClick);
       const link = screen.getByRole('link', { name: 'Citation' });
-      expect(link).toHaveAttribute('href', path);
+      const destination = path.replace(/\/$/, '');
+      expect(link).toHaveAttribute('href', destination);
       expect(link).not.toHaveAttribute('target');
       fireEvent.click(link);
-      expect(screen.getByTestId('location').textContent).toBe(path);
+      expect(screen.getByTestId('location').textContent).toBe(destination);
       expect(onFileClick).not.toHaveBeenCalled();
       expect(screen.getByTestId('location-state').textContent).toBe(
         /^\/(?:c|product-conversations)\//.test(path)
@@ -111,6 +112,25 @@ describe('ConversationMarkdownAnchor', () => {
     expect(screen.getByTestId('location').textContent).toBe('/global/coordinator');
     expect(onFileClick).not.toHaveBeenCalled();
   });
+
+  it.each(['/c/source', '/product-conversations/source', '/chains/root', '/global', '/global/source'])(
+    'emits a directly loadable slashless href for modified clicks and copying %s/', (path) => {
+      const destination = `${path}?viewer=inspect&reference=old%3Amember#message-old%3Amsg`;
+      for (const href of [`${path}/?viewer=inspect&reference=old%3Amember#message-old%3Amsg`, `${window.location.origin}${path}/?viewer=inspect&reference=old%3Amember#message-old%3Amsg`]) {
+        const onFileClick = vi.fn();
+        const view = renderAnchor(href, onFileClick);
+        const link = screen.getByRole<HTMLAnchorElement>('link', { name: 'Citation' });
+        expect(link).toHaveAttribute('href', destination);
+        expect(link.href).toBe(`${window.location.origin}${destination}`);
+        for (const clickOptions of [{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 }]) {
+          expect(fireEvent.click(link, clickOptions)).toBe(true);
+          expect(screen.getByTestId('location').textContent).toBe('/global/coordinator');
+        }
+        expect(onFileClick).not.toHaveBeenCalled();
+        view.unmount();
+      }
+    },
+  );
 
   it('supports keyboard-style activation through a native anchor without a file action', () => {
     const onFileClick = vi.fn();
