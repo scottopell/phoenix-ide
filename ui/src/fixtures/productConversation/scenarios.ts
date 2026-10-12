@@ -327,7 +327,11 @@ function lazyHistoryScenario(kind: 'ordinary' | 'coordinator'): ProductConversat
     work_identity: null, source: null, chain_qa_compatibility: null,
     segments: [1, 2, 3].map(n => segment(n - 1, `history-${n}`, `Member ${n}`, [
       textMessage(`history-prompt-${n}`, 1, 'user', `Member ${n} request`),
-      textMessage(`history-answer-${n}`, 2, 'agent', `Member ${n} answer`),
+      textMessage(`history-answer-${n}`, 2, 'agent', n === 1
+        ? 'Member 1 answer\n\n<details><summary>Historical investigation</summary>\n\nHistorical **outer evidence**. This retained member records the investigation before continuation; opening its disclosure must not reacquire history or change the newest composer.\n\n<details><summary>Nested historical evidence</summary>\n\nPreserved **nested prose marker**.\n\n</details>\n\n</details>'
+        : n === 2
+          ? 'Member 2 answer\n\n<details><summary>Historical nonnested investigation</summary>\n\nHistorical **outer evidence**. This retained member records the investigation before continuation; opening its disclosure must not reacquire history or change the newest composer. The persisted source and its completed boundary remain independently addressable.\n\nPreserved **historical prose marker**.\n\n- Compare the acquired prefix.\n- Keep newest-member authority.\n\n</details>'
+          : `Member ${n} answer`),
     ], n < 3 ? `Preserved summary from member ${n}` : null)),
   });
   const page = (member: number): ProductConversationSnapshotView => ({ ...full,
