@@ -19,7 +19,7 @@ corpus, and so that every recall surface in Phoenix is built on one
 substrate rather than each re-deriving its own context-assembly
 strategy.
 
-## Startup availability correction — validation pending
+## Startup availability correction — local qualification
 
 The candidate replaces deferred read-to-write orphan pruning with read-only
 keyset discovery and at most 128 revalidated candidates per `BEGIN IMMEDIATE`
@@ -32,10 +32,14 @@ attempt guard records interruption on cancellation or panic; no retry is added.
 without database work, raw errors, or content. Global and palette search retain
 readiness gating and distinguish terminal failure from warming.
 
-Authored tests cover the WAL snapshot race, source revalidation, page bounds,
-rollback, successful readiness and retrieval, duplicate attempts, cancellation,
-panic, and API failure reporting. Compilation and execution are pending host
-capacity admission; source review is not runtime qualification.
+Local qualification passed all 45 retrieval tests, including the WAL snapshot
+race, source revalidation, page bounds, rollback, duplicate attempts,
+cancellation, panic, and successful readiness/retrieval. Both API status tests
+passed: failed startup is not called warming, and authenticated successful
+search follows ready status while unauthenticated status access is denied.
+Independent full-range source review found no remaining behavioral blocker.
+Owning-crate lint and final publication qualification remain separate; none of
+these local results establishes production recovery.
 
 ## Technical Summary
 

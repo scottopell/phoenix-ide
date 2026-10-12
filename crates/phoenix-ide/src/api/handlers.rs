@@ -1322,6 +1322,26 @@ async fn retrieval_status(
     Json(state.message_retriever.reconciliation_status())
 }
 
+fn require_retrieval_ready(
+    status: phoenix_db::retrieval::ReconciliationStatus,
+) -> Result<(), AppError> {
+    if let Some(message) = status.unavailable_message() {
+        let error_type = if matches!(
+            status,
+            phoenix_db::retrieval::ReconciliationStatus::Failed { .. }
+        ) {
+            "conversation_search_failed"
+        } else {
+            "conversation_search_warming"
+        };
+        return Err(AppError::TypedBadRequest {
+            message: message.to_string(),
+            error_type: error_type.to_string(),
+        });
+    }
+    Ok(())
+}
+
 async fn search_conversations(
     State(state): State<AppState>,
     Query(query): Query<ConversationSearchQuery>,
@@ -1330,21 +1350,7 @@ async fn search_conversations(
     if q.is_empty() {
         return Ok(Json(ConversationSearchResponse { hits: Vec::new() }));
     }
-    let status = state.message_retriever.reconciliation_status();
-    if let Some(message) = status.unavailable_message() {
-        return Err(AppError::TypedBadRequest {
-            message: message.to_string(),
-            error_type: if matches!(
-                status,
-                phoenix_db::retrieval::ReconciliationStatus::Failed { .. }
-            ) {
-                "conversation_search_failed"
-            } else {
-                "conversation_search_warming"
-            }
-            .to_string(),
-        });
-    }
+    require_retrieval_ready(state.message_retriever.reconciliation_status())?;
     let limit = clamp_conversation_search_limit(query.limit);
     let hits = state
         .message_retriever
