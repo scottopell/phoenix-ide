@@ -14,6 +14,7 @@ use super::types::{
 use crate::db::{Database, DbError};
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use serde::Serialize;
+use tracing::Instrument;
 
 #[derive(Clone)]
 enum RouteScope {
@@ -38,6 +39,7 @@ impl ConversationRouteObservations {
         Ok(routes)
     }
 
+    #[tracing::instrument(name = "replay.admission", skip_all)]
     async fn resolve_reference(
         &self,
         reference: &str,
@@ -109,17 +111,20 @@ impl ConversationRouteObservations {
             validate_message_history_limit, TranscriptObservations,
         };
         self.require_member(id)
+            .instrument(tracing::info_span!("replay.member.admission"))
             .await
             .map_err(product_route_db_to_app)?;
         let limit = validate_message_history_limit("limit", query.limit, 50)?;
         let stable = TranscriptObservations::new(&self.db)
             .latest(id, limit)
+            .instrument(tracing::info_span!("replay.member.stable_read", limit))
             .await?;
         let (messages, has_older_messages, server_message_tail) = stable.value;
         let conv = stable.conversation;
         let persisted_agent_working = conv.is_agent_working();
         let conversation = super::member_observation::MemberObservations::new(self.db.clone())
             .read(&conv, true)
+            .instrument(tracing::info_span!("replay.member.metadata"))
             .await
             .map_err(product_route_db_to_app)?
             .project_persisted(&conv);

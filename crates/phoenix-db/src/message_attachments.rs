@@ -2,6 +2,7 @@ use crate::{DbError, DbResult, FileAttachment, ImageData, Message, MessageConten
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection};
 use std::collections::HashMap;
+use tracing::Instrument;
 
 struct HydratedAttachments {
     files: Vec<FileAttachment>,
@@ -44,6 +45,7 @@ pub(crate) async fn hydrate(
     )
     .bind(&file_message_ids)
     .fetch_all(&mut *connection)
+    .instrument(tracing::info_span!("replay.attachments.files"))
     .await?;
     let image_rows = sqlx::query(
         "SELECT attachment.message_id, attachment.media_type, attachment.data
@@ -53,7 +55,9 @@ pub(crate) async fn hydrate(
     )
     .bind(&image_message_ids)
     .fetch_all(&mut *connection)
+    .instrument(tracing::info_span!("replay.attachments.images"))
     .await?;
+    let _stage = tracing::info_span!("replay.attachments.hydrate").entered();
 
     let mut by_message = HashMap::<String, HydratedAttachments>::new();
     for row in file_rows {

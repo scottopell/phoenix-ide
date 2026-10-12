@@ -1182,25 +1182,36 @@ impl Database {
         segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
         limit: usize,
     ) -> DbResult<Vec<(i64, crate::Message)>> {
-        let segment_ceilings = segment_ceilings
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let mut rows =
+        let query = {
+            let _stage = tracing::info_span!("replay.page.prepare", limit).entered();
+            let segment_ceilings = segment_ceilings
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
             Self::message_page_query(product_conversation_id, before, segment_ceilings, limit)
-                .try_map(|row| {
-                    let ordinal: i64 = row.try_get("ordinal")?;
-                    super::parse_message_row(row).map(|message| (ordinal, message))
-                })
-                .fetch_all(&mut *connection)
-                .await?;
-        let mut messages = rows
-            .iter()
-            .map(|(_, message)| message.clone())
-            .collect::<Vec<_>>();
-        super::hydrate_attachments_conn(connection, &mut messages).await?;
-        for ((_, message), hydrated) in rows.iter_mut().zip(messages) {
-            *message = hydrated;
+        };
+        let mut rows = query
+            .try_map(|row| {
+                let ordinal: i64 = row.try_get("ordinal")?;
+                super::parse_message_row(row).map(|message| (ordinal, message))
+            })
+            .fetch_all(&mut *connection)
+            .instrument(tracing::info_span!("replay.page.fetch_decode", limit))
+            .await?;
+        let mut messages = {
+            let _stage = tracing::info_span!("replay.page.clone", limit).entered();
+            rows.iter()
+                .map(|(_, message)| message.clone())
+                .collect::<Vec<_>>()
+        };
+        super::hydrate_attachments_conn(connection, &mut messages)
+            .instrument(tracing::info_span!("replay.page.attachments", limit))
+            .await?;
+        {
+            let _stage = tracing::info_span!("replay.page.replace", limit).entered();
+            for ((_, message), hydrated) in rows.iter_mut().zip(messages) {
+                *message = hydrated;
+            }
         }
         Ok(rows)
     }
