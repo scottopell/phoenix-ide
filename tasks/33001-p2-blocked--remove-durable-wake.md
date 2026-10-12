@@ -29,7 +29,7 @@ Read-only inspection at c5c33a53c found no non-test registration caller; api.rs 
 
 ## Non-goals and authorization limits
 
-No Promise-handle redesign, replacement workflow framework, multi-user draining/upgrade refusal, production DB copies/repairs/mutation, production process changes, merge, release or deployment. Git history preserves retired code; it does not justify purging persisted history. Separate performance/replay design work must not be blocked or steered by this removal.
+No Promise-handle redesign, replacement workflow framework, multi-user draining/upgrade refusal, production DB copies/repairs/mutation, or dedicated urgent release/restart. The user subsequently authorized: “Qualify and merge, it will deploy out organically in next batch, deployment is authorized but not urgent for this work item”. Global remains the sole merger; deployment routes through the sole host in a normal qualified batch without bypassing the production search hold. This supersedes the opening merge/deployment restriction, not qualification gates. Git history preserves retired code; it does not justify purging persisted history. Separate performance/replay design work must not be blocked or steered by this removal.
 
 ## Local implementation evidence and integration boundary
 

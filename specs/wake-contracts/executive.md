@@ -61,6 +61,22 @@ blocking defect but those receipts are not relabelled as post-rebase results. No
 is implied by local tests.
 Old wake feature tests are historical evidence, not acceptance of retirement.
 
+## Migration-aware rollback boundary
+
+Retirement is a forward migration, not a reversible switch. Replacing only the
+binary neither undoes migration 126 nor establishes authority to resume retired
+wake obligations. Older code does not interpret the new retirement metadata;
+using it against the migrated database is unsupported and may reinterpret
+preserved historical status as active work. A binary-only rollback therefore
+cannot promise continued retirement or safe wake restoration.
+
+A supported version rollback follows the existing compatibility policy: offline
+restoration of a matching pre-upgrade database and binary, or a separately
+specified qualified paired deployment transaction. Such a restore returns the
+older database state rather than reversing retirement in place, and may contain
+its older obligations. No automatic reexecution, down migration, data purge, or
+new rollback subsystem is introduced by wake removal.
+
 ## Authorities
 
 - `requirements.md`: retirement and historical-data contract.
