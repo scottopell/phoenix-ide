@@ -770,10 +770,9 @@ mod tests {
         registry: Arc<TmuxRegistry>,
         worktree_path: Option<PathBuf>,
     ) -> ToolContext {
-        let ctx = ctx(conv, working_dir, registry, worktree_path)
+        ctx(conv, working_dir, registry, worktree_path)
             .with_root_conversation_id("root-tmux".to_string())
-            .with_tool_use_id("tool-tmux");
-        ctx
+            .with_tool_use_id("tool-tmux")
     }
 
     struct FakeTmux {
