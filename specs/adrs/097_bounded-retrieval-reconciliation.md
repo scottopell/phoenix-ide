@@ -1,8 +1,8 @@
 # ADR-097: Bounded orphan pruning and terminal retrieval readiness
 
-Date: 2026-10-12
-
-Status: Accepted
+- **Status:** Accepted
+- **Date:** 2026-10-12
+- **Affects:** REQ-RET-003; startup retrieval reconciliation and availability
 
 ## Context
 
@@ -38,7 +38,7 @@ Expose status and sanitized numeric database error codes at the authenticated
 `GET /api/deployment/retrieval` diagnostic without issuing database queries.
 Search remains gated on readiness, but reports terminal failure truthfully.
 
-## Alternatives
+## Options considered
 
 - Increasing busy timeout or sleeping inside the stale transaction cannot make
   its snapshot eligible for a write upgrade.
