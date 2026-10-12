@@ -23,6 +23,10 @@ def load_devpy():
 
 class CheckPlanTests(unittest.TestCase):
     def setUp(self):
+        env_patch = mock.patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        os.environ.pop("PHOENIX_CHECK_WORKERS", None)
         self.dev = load_devpy()
 
     def test_git_config_key_validation_preserves_url_subsections(self):
