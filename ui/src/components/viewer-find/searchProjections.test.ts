@@ -95,7 +95,7 @@ describe('buildAgentTextFragments', () => {
   });
 
   it('excludes image alt text that is not rendered as visible Markdown text', () => {
-    const blocks = buildMarkdownDisplayBlocks('Visible ![hidden alt](image.png) text');
+    const blocks = buildMarkdownDisplayBlocks('Visible ![hidden alt](image.png) text', 'standard');
     expect(blocks[0]?.searchableText).toBe('Visible  text');
   });
 });
@@ -238,7 +238,7 @@ describe('buildDiffSearchProjection', () => {
 
 describe('typed semantic display projections', () => {
   it('parses Markdown into stable visible-text blocks without source punctuation', () => {
-    const blocks = buildMarkdownDisplayBlocks('# **Plan**\n\nUse `alpha` and ![diagram text](diagram.png).\n\n```ts\nconst beta = 1;\n```');
+    const blocks = buildMarkdownDisplayBlocks('# **Plan**\n\nUse `alpha` and ![diagram text](diagram.png).\n\n```ts\nconst beta = 1;\n```', 'standard');
     expect(blocks.map((block) => block.searchableText)).toEqual(expect.arrayContaining([
       'Plan',
       'Use alpha and .',
@@ -1120,5 +1120,19 @@ describe('buildConversationSearchProjection', () => {
       'sub_agent_status',
     ]);
     expect(unitTargets.every((target) => target.unitKind !== 'streaming_agent')).toBe(true);
+  });
+});
+
+describe('explicit disclosure projection modes', () => {
+  const source = '<details><summary>**Summary**</summary>\n\nBody **target**\n\n</details>';
+  it('indexes conversation summary and body but not wrapper syntax', () => {
+    const blocks = buildMarkdownDisplayBlocks(source, 'conversation');
+    expect(blocks.map(block => block.searchableText)).toEqual(['Summary', 'Body target']);
+    expect(blocks[0]?.kind).toBe('disclosureSummary');
+  });
+  it('does not promise conversation summaries in standard file projections', () => {
+    const blocks = buildMarkdownDisplayBlocks(source, 'standard');
+    expect(blocks.map(block => block.searchableText)).toEqual(['Body target']);
+    expect(buildMarkdownFileSearchProjection(source, 'Summary').matches).toHaveLength(0);
   });
 });

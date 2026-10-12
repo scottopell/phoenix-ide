@@ -20,7 +20,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { MessageReviewAction } from './MessageReviewAction';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { MarkdownRenderer } from './MarkdownRenderer';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { api } from '../api';
 import type { Message, InputOrigin, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
@@ -125,26 +125,10 @@ function DeferredSyntaxHighlighter({ language, syntaxStyle, children, ...props }
   );
 }
 
-// Stable plugin array -- avoids creating a new array reference on every render
-const REMARK_PLUGINS = [remarkGfm];
-const NO_REMARK_PLUGINS: typeof REMARK_PLUGINS = [];
-
 // Inline-code / prose file-path links open the file with no modified-line
 // selection. Share one empty Set rather than allocating a new one per markdown
 // node on every render. Never mutated.
 const EMPTY_LINE_SET = new Set<number>();
-
-function usesGfmSyntax(text: string): boolean {
-  return /(^|\n)\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s/.test(text)
-    || /(^|\n)\s*\|.*\|/.test(text)
-    || /(^|\n)\s*[-:| ]{3,}\|[-:| ]{3,}/.test(text)
-    || /(?:^|[^~])~[^\s~][^\n~]*[^\s~]~(?:[^~]|$)/.test(text)
-    || /~~[^\n]+~~/.test(text)
-    || /https?:\/\/\S+/.test(text)
-    || /www\.\S+/.test(text)
-    || /(^|[^\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/.test(text)
-    || /\[\^[^\]]+\]/.test(text);
-}
 
 /** Format a tool execution duration for display in the tool block header.
  *  < 1s    -> "743ms" (integer milliseconds)
@@ -521,7 +505,7 @@ type HastNode = {
 
 function markdownHighlightForRange(markdown: string, start: number, end: number): MarkdownHighlight | null {
   let blockStart = 0;
-  for (const block of buildMarkdownDisplayBlocks(markdown).filter((block) => block.kind !== 'code' || block.language === 'mermaid')) {
+  for (const block of buildMarkdownDisplayBlocks(markdown, 'conversation').filter((block) => block.kind !== 'code' || block.language === 'mermaid')) {
     const blockEnd = blockStart + block.searchableText.length;
     if (start >= blockStart && end <= blockEnd) {
       return {
@@ -539,8 +523,12 @@ function markdownHighlightForRange(markdown: string, start: number, end: number)
 function markdownHighlightPlugin(highlight: MarkdownHighlight) {
   return () => (tree: HastNode) => {
     const target = findMarkdownHighlightTarget(tree, highlight);
-    if (target?.tagName === 'code') return;
-    if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end);
+    const targetId = `${highlight.sourceStart}:${highlight.sourceEnd}:${highlight.start}:${highlight.end}`;
+    if (target?.tagName === 'pre') {
+      target.properties = { ...target.properties, 'data-viewer-find-active-target': targetId };
+      return;
+    }
+    if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end, targetId);
   };
 }
 
@@ -555,12 +543,12 @@ function findMarkdownHighlightTarget(node: HastNode, highlight: MarkdownHighligh
   for (const child of node.children ?? []) {
     if (!child.children) continue;
     const target = findMarkdownHighlightTarget(child, highlight);
-    if (target) return target;
+    if (target) return target.tagName === 'code' && node.tagName === 'pre' ? node : target;
   }
   return node.children ? node : null;
 }
 
-function decorateMarkdownTextNodes(node: HastNode, start: number, end: number): void {
+function decorateMarkdownTextNodes(node: HastNode, start: number, end: number, targetId: string): void {
   let cursor = 0;
   const visit = (parent: HastNode) => {
     const nextChildren: HastNode[] = [];
@@ -581,7 +569,7 @@ function decorateMarkdownTextNodes(node: HastNode, start: number, end: number): 
         nextChildren.push({
           type: 'element',
           tagName: 'mark',
-          properties: { className: ['viewer-find-inline-match', 'viewer-find-inline-match--active'] },
+          properties: { className: ['viewer-find-inline-match', 'viewer-find-inline-match--active'], 'data-viewer-find-active-target': targetId },
           children: [{ type: 'text', value: child.value.slice(localStart, localEnd) }],
         });
         if (localEnd < child.value.length) nextChildren.push({ type: 'text', value: child.value.slice(localEnd) });
@@ -1238,7 +1226,6 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   }, []);
 
   const renderTextFragment = useCallback((fragment: ConversationTextFragment) => {
-    const remarkPlugins = usesGfmSyntax(fragment.display.sourceText) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
     const expanded = forceExpandedText || fragment.display.mode === 'full' || expandedFragmentIds.has(fragment.fragmentId);
     const highlight = activeHighlight?.owner === 'agent-text' && activeHighlight.fragmentId === fragment.fragmentId
       ? activeHighlight
@@ -1261,14 +1248,13 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
     return (
       <div key={fragment.fragmentId} className="agent-text-fragment" data-fragment-id={fragment.fragmentId}>
         <div className="agent-text-block" {...(highlight ? { 'data-active-fragment-highlight': true } : {})}>
-          <ReactMarkdown
-            remarkPlugins={remarkPlugins}
+          <MarkdownRenderer mode="conversation"
             rehypePlugins={markdownHighlight ? [markdownHighlightPlugin(markdownHighlight)] : []}
             components={markdownComponents}
             urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}
           >
             {fragment.display.sourceText}
-          </ReactMarkdown>
+          </MarkdownRenderer>
         </div>
       </div>
     );
@@ -3275,7 +3261,7 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
           if (!text) return null;
           return (
             <div key={`${message.message_id}-text-${idx}`} className="subagent-activity-event agent-text">
-              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
+              <MarkdownRenderer mode="conversation" components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</MarkdownRenderer>
             </div>
           );
         }
@@ -3351,7 +3337,7 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
       {finalResult?.text && (
         <div className={`subagent-final-result ${finalResult.statusClass}`}>
           <div className="subagent-final-result-label">final outcome</div>
-          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{finalResult.text}</ReactMarkdown>
+          <MarkdownRenderer mode="conversation" components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{finalResult.text}</MarkdownRenderer>
         </div>
       )}
     </div>

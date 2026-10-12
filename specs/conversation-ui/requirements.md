@@ -674,3 +674,43 @@ AND SHALL NOT imply that the failure disables later automatic continuations for 
 AND SHALL NOT silently loop, fabricate progress, or introduce a separate automatic-retry action
 
 **Rationale:** Automatic continuation configuration belongs to the durable conversation users recognize, not to a replaceable transcript segment. Prospective semantics prevent a toggle from misrepresenting already-exhausted or already-admitted work, while the shared continuation operation remains the single recovery path.
+
+---
+
+### REQ-CONV-025: Bounded Markdown Disclosures
+
+WHEN conversation Markdown contains a complete top-level, non-nested `<details>` envelope with one leading `<summary>` element
+THE SYSTEM SHALL render a native disclosure whose summary contains Markdown phrasing content and whose body contains Markdown block content
+AND SHALL preserve native summary focus and keyboard activation
+AND SHALL default to collapsed unless the details opening contains the `open` attribute
+AND SHALL retain only boolean `open` from source wrapper attributes, with presence meaning true regardless of its value
+AND SHALL NOT enable raw HTML execution or raw HTML reparsing to provide this feature.
+
+Whitespace MAY precede the leading summary. Same-line and multiline summary/body boundaries SHALL use the same recognition rules. Summary content SHALL be parsed as phrasing, not as a block document, and SHALL NOT introduce reference definitions. Source attributes other than boolean `open`, including event handlers, styles, and identifiers, SHALL NOT become disclosure DOM properties. Existing Markdown URL safety policy SHALL remain in force.
+
+WHEN a candidate is malformed, incomplete, nested, lacks a leading summary, or occurs inside a native Markdown container rather than at document root
+THE SYSTEM SHALL NOT promote that candidate to a disclosure
+AND SHALL keep rejected wrapper syntax and ordinary following content visible under the surrounding Markdown interpretation, without swallowing the remainder of the message or manufacturing a closing delimiter.
+
+A completed outer wrapper SHALL suppress promotion of nested descendants even when the outer wrapper is malformed. An unclosed prefix MAY expose a subsequent complete envelope only when its summary has already ended and native document-root ownership was established before that envelope began. Candidates found under an unfinished summary or a missing-summary prefix SHALL NOT be retroactively promoted.
+
+Native code, escaped literals, link/image resources and titles, definitions, and opaque HTML contexts SHALL retain ownership of their contents; tag-shaped text in those contexts SHALL NOT become disclosure boundaries or definitions. This ownership SHALL NOT enable rendering of otherwise suppressed raw HTML. Rejected wrapper syntax outside such native-owned contexts SHALL remain literal text in its surrounding paragraph rather than forcing artificial block breaks.
+
+WHEN a native-complete reference-label construct contains disclosure-shaped text
+THE SYSTEM SHALL shield that text from disclosure recognition based on syntactic completeness, independently of whether a matching definition exists before or after it
+AND SHALL retain native literal rendering for undefined references
+AND SHALL NOT treat malformed or incomplete reference syntax as a blanket shield.
+
+This syntax-first shielding is explicit Phoenix extension precedence, not a CommonMark requirement that undefined references resolve. Recognition membership SHALL remain separate from actual reference definitions.
+
+WHEN rendering, streaming, selecting source ranges, or finding text in conversation Markdown
+THE SYSTEM SHALL derive disclosure boundaries, rendered nodes, and searchable text from one canonical interpretation of the same source and Markdown configuration
+AND SHALL retain original UTF-16 source offsets and line/column coordinates, including BOM and CRLF input
+AND SHALL keep accepted disclosure envelopes intact when selecting rendered chunks
+AND SHALL NOT rediscover definitions or boundaries through an independent chunk interpretation or by appending definition source to rendered chunks. A canonical interpretation MAY compile disjoint, native-owned source regions once with a shared real-definition context.
+
+Ordinary Markdown SHALL preserve native semantic behavior for the selected basic or GFM configuration; GFM SHALL NOT be enabled implicitly. Real document and body reference definitions SHALL be decoded by the native parser, collected in source order with first definition winning, and shared globally across summaries, bodies, and surrounding content, including forward references. Original-source coordinates SHALL take precedence over native BOM-stripped offsets. Standard Markdown file and plan viewers SHALL retain their own renderer configuration; their find projections SHALL NOT promise conversation-only disclosure transformations that those renderers cannot display or mark.
+
+For each source interpretation, let N be source length, E the native event count, and R any actual reference-context bytes copied. The extension SHALL bound character traversal by cN and event traversal by dE for fixed constants independent of candidate count, with O(N+E) auxiliary storage and O(N+E+R) extension overhead, or O(N+E log N+R) when indexed position relocation uses binary search. Native submissions over disjoint source regions SHALL have a documented fixed total source-volume bound. The extension SHALL NOT use input-dependent fixed-point rounds, overlapping ancestor/child reparsing, or per-candidate suffix parsing. These bounds govern extension work, not native speculative tokenization or downstream rendering internals; they SHALL NOT be represented as a whole-parser linear-time guarantee. Each streaming update is a separate interpretation, not a promise of incremental parsing across updates.
+
+**Rationale:** Authors can make long explanations skimmable without losing inspectable content. A single native-context interpretation prevents rendering, source selection, and find from disagreeing, while fixed extension work avoids candidate-dependent reparse amplification.

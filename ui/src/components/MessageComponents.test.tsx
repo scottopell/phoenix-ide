@@ -13,7 +13,7 @@ import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposa
 import { ForkProposalReview } from './ForkProposalReview';
 import { createInitialAtom } from '../conversation/atom';
 import { buildRenderUnits } from '../conversation/renderUnits';
-import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
 describe('Global coordinator tool results', () => {
   it('renders queued delivery truthfully with recipient navigation', () => {
@@ -3887,6 +3887,102 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
   });
 });
 
+
+describe('conversation disclosure integration', () => {
+  const source = '<details><summary>**Title**</summary>\n\nHidden target\n\n</details>\n\nOutside';
+
+  it('renders a native summary and opens only for a body find match', () => {
+    const message = agentMessage('details-find', [{ type: 'text', text: source }]);
+    const renderMessage = (start: number, end: number) => <MemoryRouter><AgentMessage message={message} toolResults={new Map()} activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start, end }} /></MemoryRouter>;
+    const { container, rerender } = render(renderMessage(0, 5));
+    const details = container.querySelector('details')!;
+    expect(details.open).toBe(false);
+    expect(details.firstElementChild?.tagName).toBe('SUMMARY');
+    const summary = details.querySelector('summary')!;
+    summary.focus();
+    expect(document.activeElement).toBe(summary);
+    expect(summary).not.toHaveAttribute('role');
+    expect(summary).not.toHaveAttribute('tabindex');
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(true);
+    expect(details.querySelector('mark')?.textContent).toBe('target');
+    details.open = false;
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(false);
+    rerender(renderMessage(0, 5));
+    expect(details.open).toBe(false);
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(true);
+    rerender(renderMessage(20, 27));
+    expect(details.open).toBe(true);
+  });
+
+  it('reveals only the active Mermaid disclosure and preserves a manual close on updates', async () => {
+    const disclosure = (title: string, language: string) => `<details><summary>${title}</summary>\n\n\`\`\`${language}\ngraph TD; A[target] --> B[target]\n\`\`\`\n\n</details>`;
+    const text = [disclosure('First target', 'mermaid'), disclosure('Second', 'mermaid'), disclosure('Ordinary', 'ts')].join('\n\n');
+    const blocks: ContentBlock[] = [{ type: 'text', text }, { type: 'text', text }];
+    const message = agentMessage('details-mermaid-find', blocks);
+    const projection = buildAgentTextFragments(blocks, 'full', { forSearch: true })[0]!.semanticText;
+    const start = projection.indexOf('target', projection.indexOf('graph'));
+    const view = (offset?: number, fragmentId = 'agent-text-0') => <MemoryRouter><AgentMessage message={message} toolResults={new Map()} activeHighlight={offset === undefined ? null : { owner: 'agent-text', fragmentId, start: offset, end: offset + 6 }} /></MemoryRouter>;
+    const { container, rerender } = render(view());
+    const details = [...container.querySelectorAll('details')];
+    expect(details).toHaveLength(6);
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(projection.indexOf('target')));
+    expect(details[0]!.querySelector('summary mark')).toHaveTextContent('target');
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(start));
+    expect(details.map(node => node.open)).toEqual([true, false, false, false, false, false]);
+    const wrapper = details[0]!.querySelector('[data-viewer-find-active-target]')!;
+    expect(wrapper).not.toBeNull();
+    expect(wrapper.closest('details')).toHaveAttribute('open');
+    expect(wrapper).toBeVisible();
+    await waitFor(() => expect(wrapper.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull());
+    expect(wrapper.textContent).not.toContain('[object Object]');
+    details[0]!.open = false;
+    rerender(view(start));
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(projection.indexOf('target', start + 6)));
+    expect(details[0]!.open).toBe(true);
+    details[0]!.open = false;
+    rerender(view(start, 'agent-text-1'));
+    expect(details.map(node => node.open)).toEqual([false, false, false, true, false, false]);
+    expect(details[2]!.querySelector('[data-viewer-find-active-target]')).toBeNull();
+    expect(details[2]).toHaveTextContent('graph TD; A[target] --> B[target]');
+    details[3]!.open = false;
+    rerender(view());
+    expect(details.every(node => !node.open)).toBe(true);
+    expect(container.querySelector('[data-viewer-find-active-target]')).toBeNull();
+    rerender(view(start, 'agent-text-1'));
+    expect(details[3]!.open).toBe(true);
+  });
+
+  it('promotes the complete streaming envelope once and preserves it across tail tokens', async () => {
+    const view = (text: string) => <MemoryRouter><StreamingMessageView buffer={{ text, lastSequence: 1, startedAt: 0, requestId: 'disclosure' }} /></MemoryRouter>;
+    const partial = '<details><summary>Title</summary>\n\nBody\n';
+    const { container, rerender } = render(view(partial));
+    await waitFor(() => expect(container.textContent).toContain('Body'));
+    expect(container.querySelector('details')).toBeNull();
+    const complete = partial + '\n```ts\nconst answer = 42;\n```\n\n</details>\n\n```js\n1\n```\n\nTail';
+    rerender(view(complete));
+    await waitFor(() => expect(container.querySelectorAll('details')).toHaveLength(1));
+    const details = container.querySelector('details')!;
+    expect(details.textContent).toContain('const answer = 42;');
+    details.open = true;
+    rerender(view(complete + ' grows'));
+    await waitFor(() => expect(container.textContent).toContain('Tail grows'));
+    expect(container.querySelector('details')).toBe(details);
+    expect(details.open).toBe(true);
+  });
+
+  it('resolves ordinary forward references globally across streaming code chunks', async () => {
+    const text = '[first][ref]\n\n```js\n1\n```\n\n[second][ref]\n\n[ref]: https://example.com';
+    render(<MemoryRouter><StreamingMessageView buffer={{ text, lastSequence: 1, startedAt: 0, requestId: 'refs' }} /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByRole('link', { name: 'first' })).toHaveAttribute('href', 'https://example.com'));
+    expect(screen.getByRole('link', { name: 'second' })).toHaveAttribute('href', 'https://example.com');
+  });
+});
 
 describe('AgentMessage compact find reveal', () => {
   it('marks the exact occurrence in fully visible compact commentary', async () => {
