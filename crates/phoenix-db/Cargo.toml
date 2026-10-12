@@ -68,6 +68,7 @@ phoenix-state-machine = { path = "../phoenix-state-machine" }
 # `#[tokio::test]` runtime for the async persistence tests.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3"
+phoenix-tls = { path = "../phoenix-tls" }
 tracing-subscriber = "0.3"
 
 [lints]

@@ -51,6 +51,12 @@ THE SYSTEM SHALL compare it against `PHOENIX_PASSWORD` using constant-time
 string comparison
 AND grant access if the values match
 
+WHERE `PHOENIX_PASSWORD` begins with `phx_peer_` but does not have the complete receiver-issued peer bearer shape
+THE SYSTEM SHALL admit it as an owner password and SHALL apply the same exact-match login and Bearer behavior
+
+WHEN `PHOENIX_PASSWORD` has the complete receiver-issued peer bearer shape
+THE SYSTEM SHALL reject the configuration before serving requests
+
 THE SYSTEM SHALL rate-limit password comparisons per client peer address,
 locking out a peer after repeated failures within a window; session-token
 validation SHALL NOT be rate-limited
@@ -174,5 +180,8 @@ THE SYSTEM SHALL prevent that credential from authorizing subsequent peer operat
 
 WHILE a peer credential is presented to an owner-management route
 THE SYSTEM SHALL reject it without treating peer authentication as owner authentication
+
+THE SYSTEM SHALL keep valid owner passwords structurally disjoint from receiver-issued peer bearer credentials
+SO THAT one raw bearer cannot inhabit both owner and peer authority domains
 
 THE SYSTEM SHALL persist only a nonrecoverable verifier of the peer credential and SHALL deny that verifier through bounded agent SQL reads

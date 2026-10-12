@@ -105,6 +105,9 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [089](089_canonical-short-product-navigation.md) | Canonical short ProductConversation navigation with exact evidence selectors | Accepted | REQ-GR-009 |
 | [090](090_bounded-selected-model-overload-retry.md) | Selected-model overload uses a durable bounded retry window | Accepted | REQ-LLM-006/006b, REQ-LRV-002/005/008, REQ-BED-006/007 |
 | [091](091_touch-reactions-dock-away-from-native-selection.md) | Touch reactions dock away from native selection | Accepted | REQ-PF-018, REQ-PF-020 |
+| [092](092_federation-pins-imported-private-ca-trust-per-peer.md) | Federation pins imported private-CA trust per peer | Accepted | REQ-RQD-003, REQ-RQD-004; federation enrollment transfer and caller-side peer persistence |
+| [093](093_federation-validates-ca-capability-and-types-ipv6-persistence.md) | Federation validates CA capability and types IPv6 persistence | Accepted | REQ-RQD-003, REQ-RQD-004; peer origin and private-CA admission |
+| [094](094_owner-and-peer-credential-domains-are-disjoint.md) | Owner and peer credential domains are structurally disjoint | Accepted | REQ-AUTH-002, REQ-AUTH-009; `OwnerPassword`, `PeerBearerCredential` |
 
 ## For agents: which decisions bind your task
 
@@ -118,6 +121,8 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing pending-question identity compatibility or legacy tokenless settlement | 082, then 034 |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
+| Implementing federation peer TLS trust, enrollment transfer, or peer origins | 093, then 092, 083, and 034 |
+| Changing owner-password or federation peer-credential domains | 094, then 083 and 034 |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Specifying Close failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 088 supersedes the Close recovery/finalization consequences of 026/040/041/042/080; retain their identity and ownership safeguards |
@@ -179,6 +184,9 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-007 (Conversation creation uses fenced reconciliation)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
+      ├── ADR-083 (Federation establishes stable instance identity and excludes known credentials from agent SQL)
+      │   └── ADR-092 (Federation pins imported private-CA trust per peer)
+      │       └── ADR-093 (Federation validates CA capability and types IPv6 persistence)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
       │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)

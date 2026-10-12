@@ -182,6 +182,7 @@ opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 # tmux backend (`phoenix_tools::tmux::fake_backend`).
 phoenix-tools = { path = "../phoenix-tools", features = ["test-support"] }
 proptest = "1"
+rcgen = "0.14"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the
 # bounded-shutdown drain tests to exercise the SHUTDOWN_GRACE timeout
 # without waiting the full real-time deadline. `full` does not include it.
