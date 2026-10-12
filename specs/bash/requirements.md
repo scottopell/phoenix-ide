@@ -791,11 +791,11 @@ AND SHALL reject the call without spawning a process when the `WorkScope` ID is 
 AND SHALL NOT assign the Coordinator a default cwd
 AND SHALL store the process solely under the selected `WorkScope`
 AND SHALL retain Coordinator continuation control as handle authorization metadata
-AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
+AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill`
 AND SHALL keep Coordinator-controlled terminal events from triggering branch-observation reconciliation
 AND SHALL include the process in the owning WorkScope's inventory, lifecycle broadcasts, inspection, health attribution, and teardown
 AND SHALL preserve the same command, wait, label, output, process-count, handle-control, cancellation, teardown, and audit bounds as other Bash execution
-AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
+AND SHALL use one globally unique opaque handle ID for tool operations, events, APIs, UI, logs, and inspection
 
 WHEN conversation bash, including Work-subagent bash, is authorized with write capability
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash

@@ -46,8 +46,6 @@ vi.mock('../api', async () => {
       getConversationGitStatus: vi.fn(() => Promise.resolve({ kind: 'unavailable', reason: 'No git status in test' })),
       getLlmLanguageSetting: vi.fn(() => Promise.resolve({ language: 'en' })),
       getVersion: vi.fn(() => Promise.resolve({ version: 'test' })),
-      getWakeStatus: vi.fn(() => Promise.resolve({ pending_count: 0, soonest_expires_at: null, contracts: [] })),
-      cancelWake: vi.fn(() => Promise.resolve({ success: true })),
     },
   };
 });

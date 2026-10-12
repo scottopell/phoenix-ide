@@ -43,7 +43,6 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalListConversations = api.listConversations;
   const originalListArchivedConversations = api.listArchivedConversations;
   const originalListModels = api.listModels;
-  const originalGetWakeStatus = api.getWakeStatus;
   const originalGetSystemPrompt = api.getSystemPrompt;
   const originalGetWorkScopeInventory = api.getWorkScopeInventory;
   const originalListForkProposals = api.listForkProposals;
@@ -182,7 +181,6 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     llm_configured: false,
     credential_status: 'not_configured',
   });
-  api.getWakeStatus = async () => ({ pending_count: 0, soonest_expires_at: null, contracts: [] });
   api.getSystemPrompt = async () => '';
   api.getWorkScopeInventory = async () => ({
     scope_key: conversation.work_scope_key ?? 'fixture:latest-member',
@@ -354,7 +352,6 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.listConversations = originalListConversations;
     api.listArchivedConversations = originalListArchivedConversations;
     api.listModels = originalListModels;
-    api.getWakeStatus = originalGetWakeStatus;
     api.getSystemPrompt = originalGetSystemPrompt;
     api.getWorkScopeInventory = originalGetWorkScopeInventory;
     api.listForkProposals = originalListForkProposals;

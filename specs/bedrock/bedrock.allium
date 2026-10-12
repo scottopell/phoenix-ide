@@ -2263,7 +2263,7 @@ rule CloseObligationWaitsForOtherSettlementAuthority {
     @guidance
         -- Settlement stays owed until every close-owned authority for the latest
         -- row has released: ordinary bedrock busy ownership plus any typed direct-
-        -- turn, wake, tool, sub-agent, or background authorities rooted in that
+        -- turn, tool, sub-agent, or background authorities rooted in that
         -- same product conversation.
 }
 
@@ -2661,8 +2661,7 @@ rule SubAgentTurnLimitGraceTurn {
         -- Work guidance says submit_result is useful only for completed work and
         -- routes unfinished required edits through submit_error. Text-only
         -- implicit completion remains a bedrock terminal path when admitted by the
-        -- reducer; wake delivery preserves that cause separately from explicit
-        -- submit_result. Other tool calls are not modeled as forbidden by the
+        -- reducer. Other tool calls are not modeled as forbidden by the
         -- runtime; they simply do not produce the terminal outcome needed to avoid
         -- GraceTurnExhausted.
 }
@@ -2926,7 +2925,7 @@ rule ModeChangeNotification {
 --       nonterminal, generation-current, and still owns this conversation.
 --
 --   durable_execution_occurrence_owns_first_response(conversation: Conversation) -> Boolean
---       True exactly when an accepted wake, seeded fork, or interaction response
+--       True exactly when an accepted seeded fork or interaction response
 --       occurrence still owns its first model response.
 --
 --   newer_queued_steering_awaits_dispatch(conversation: Conversation) -> Boolean
@@ -3092,7 +3091,7 @@ rule ModeChangeNotification {
 --
 --   conversation_and_owned_process_shutdown_confirmed(run: CloseRun) -> Boolean
 --       True only with positive evidence that the original aggregate's execution
---       admission is sealed, accepted turns and child/tool/wake work are settled,
+--       admission is sealed, accepted turns and child/tool work are settled,
 --       and all owned processes including persistent tmux are stopped. PID reuse,
 --       missing runtime/permit/path, inaccessible probes, and unknown ownership do
 --       not prove shutdown. Retained valid shutdown proof is not invalidated solely

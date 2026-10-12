@@ -5305,7 +5305,50 @@ _CHECK_CPU_BUDGET = 4
 
 
 def _check_cpu_budget() -> int:
-    return max(1, min(_CHECK_CPU_BUDGET, os.cpu_count() or 1))
+    raw = os.environ.get("PHOENIX_CHECK_WORKERS")
+    requested = _CHECK_CPU_BUDGET
+    if raw is not None:
+        if re.fullmatch(r"[0-9]+", raw) is None:
+            raise SystemExit("PHOENIX_CHECK_WORKERS must be a positive ASCII integer")
+        try:
+            requested = int(raw)
+        except ValueError:
+            raise SystemExit("PHOENIX_CHECK_WORKERS must be a positive ASCII integer") from None
+        if requested < 1:
+            raise SystemExit("PHOENIX_CHECK_WORKERS must be a positive ASCII integer")
+    return max(1, min(requested, os.cpu_count() or 1))
+
+
+def _check_worker_env(budget: int) -> dict[str, str]:
+    return {name: str(budget) for name in (
+        "CARGO_BUILD_JOBS", "RAYON_NUM_THREADS", "RUST_TEST_THREADS",
+    )}
+
+
+def _rust_check_commands(
+    has_nextest: bool,
+    compile_p: list[str],
+    test_p: list[str],
+    codegen_p: list[str],
+    test_threads: int,
+    nextest_profile_args: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    if has_nextest:
+        compile_cmd = ["cargo", "nextest", "run", *compile_p, "--no-run"]
+        test_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *test_p,
+                    "-E", "not test(/export_bindings/)",
+                    "--test-threads", str(test_threads)]
+        codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
+                       "-E", "test(/export_bindings/)",
+                       "--test-threads", str(test_threads)]
+    else:
+        compile_cmd = ["cargo", "test", *compile_p, "--no-run"]
+        test_cmd = ["cargo", "test", *test_p, "--",
+                    "--test-threads", str(test_threads), "--skip", "export_bindings"]
+        codegen_cmd = ["cargo", "test", *codegen_p, "export_bindings", "--",
+                       "--test-threads", str(test_threads)]
+    return compile_cmd, test_cmd, codegen_cmd
+
 
 def _clippy_check_env(root: Path = ROOT) -> dict[str, str]:
     return {
@@ -5320,10 +5363,10 @@ def _prepare_clippy_check_target(root: Path = ROOT) -> None:
 
 
 
-def _vitest_check_command() -> list[str]:
+def _vitest_check_command(budget: int | None = None) -> list[str]:
     return [
         "pnpm", "exec", "vitest", "run",
-        "--maxWorkers", str(_check_cpu_budget()),
+        "--maxWorkers", str(_check_cpu_budget() if budget is None else budget),
     ]
 
 
@@ -5422,6 +5465,7 @@ def cmd_check(
     gate=False. `pretty` renders a live lane table instead of line-per-event
     output.
     """
+    worker_budget = _check_cpu_budget()
     failed_lanes: set[str] = set()
 
     class _CheckResults(list):
@@ -5458,7 +5502,7 @@ def cmd_check(
     if lanes is not None:
         reporter.info(f"lane filter: [{', '.join(sorted(active | set(skipped)))}]")
     reporter.info(
-        f"check execution: one lane at a time; child worker budget: {_check_cpu_budget()}"
+        f"check execution: one lane at a time; child worker budget: {worker_budget}"
     )
     if cargo_test_timeout_source is not None:
         reporter.info(
@@ -5531,9 +5575,7 @@ def cmd_check(
             env.update(compiler_cache_env)
         env["CARGO_TERM_COLOR"] = "never"
         env["NO_COLOR"] = "1"
-        budget = str(_check_cpu_budget())
-        env["CARGO_BUILD_JOBS"] = budget
-        env["RAYON_NUM_THREADS"] = budget
+        env.update(_check_worker_env(worker_budget))
         env.pop("FORCE_COLOR", None)
         env.pop("CLICOLOR_FORCE", None)
         if env_extra:
@@ -6310,7 +6352,7 @@ def cmd_check(
             mem_cap = max(1, int(mem_gib // 1.5))
         except (ValueError, OSError, AttributeError):
             mem_cap = cpus
-        test_threads = min(_check_cpu_budget(), max(1, min(cpus - 1, mem_cap)))
+        test_threads = min(worker_budget, max(1, min(cpus - 1, mem_cap)))
         if test_threads < cpus:
             try:
                 load1, load5, load15 = os.getloadavg()
@@ -6348,24 +6390,16 @@ def cmd_check(
             codegen_p = [f for c in sorted(codegen_scope) for f in ("-p", c)]
         else:
             compile_p, codegen_p = [], []
-        if has_nextest:
-            compile_cmd = ["cargo", "nextest", "run", *compile_p, "--no-run"]
-            nextest_profile_args = []
-            if profile_work and _CHECK_PROFILE is not None:
-                nextest_config = _write_nextest_profile_config(_CHECK_PROFILE)
-                nextest_profile_args = [
-                    "--config-file", str(nextest_config), "--profile", "phoenix-cpu",
-                ]
-            test_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *_pflags(),
-                        "-E", "not test(/export_bindings/)",
-                        "--test-threads", str(test_threads)]
-            codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
-                           "-E", "test(/export_bindings/)"]
-        else:
-            compile_cmd = ["cargo", "test", *compile_p, "--no-run"]
-            test_cmd = ["cargo", "test", *_pflags(), "--",
-                        "--test-threads", str(test_threads), "--skip", "export_bindings"]
-            codegen_cmd = ["cargo", "test", *codegen_p, "export_bindings"]
+        nextest_profile_args = []
+        if has_nextest and profile_work and _CHECK_PROFILE is not None:
+            nextest_config = _write_nextest_profile_config(_CHECK_PROFILE)
+            nextest_profile_args = [
+                "--config-file", str(nextest_config), "--profile", "phoenix-cpu",
+            ]
+        compile_cmd, test_cmd, codegen_cmd = _rust_check_commands(
+            has_nextest, compile_p, _pflags(), codegen_p, test_threads,
+            nextest_profile_args,
+        )
 
         # Scratch base for the ts-rs export. Every `#[ts(export_to)]` in the
         # workspace uses a `../../../ui/src/generated/` path relative to the
@@ -6497,7 +6531,7 @@ def cmd_check(
         ("ui-lint", lane_ui_lint),
         ("vitest", lambda: run_step(
             "vitest",
-            _vitest_check_command(),
+            _vitest_check_command(worker_budget),
             UI_DIR,
         )),
         ("cargo-fmt", lane_cargo_fmt),
@@ -6556,7 +6590,7 @@ def cmd_check(
             "compiler_cache": selected_compiler_cache,
             "rust_test_threads": test_threads if "rust" in active else None,
             "check_execution": "serialized",
-            "check_worker_budget": _check_cpu_budget(),
+            "check_worker_budget": worker_budget,
         })
     for message in profile_messages:
         print(f"  i  {message}")
@@ -11786,6 +11820,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.command == "check":
+        _check_cpu_budget()  # Reject invalid input before optional dependency bootstrap.
 
     # --pretty composes from the global flag and the per-subcommand flag.
     pretty = args.pretty_global or getattr(args, "pretty", False)

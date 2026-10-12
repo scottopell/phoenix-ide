@@ -261,23 +261,19 @@ function emitInit(
 }
 
 describe('user message provenance rendering', () => {
-  it('renders wake meta messages as background task observations instead of authored user bubbles', () => {
+  it('renders meta messages as observations instead of authored user bubbles', () => {
     render(
       <MemoryRouter>
         <UserMessage
-          message={userMessage('wake-meta', 'Wake completed while you were away.', {
+          message={userMessage('meta', 'Background task completed while you were away.', {
             isMeta: true,
-            displayData: { type: 'wake_result' },
           })}
         />
       </MemoryRouter>,
     );
 
-    const observation = screen.getByLabelText('Background task observation');
-    expect(observation).toHaveClass('message', 'meta', 'user-meta-observation');
-    expect(screen.getByText('Background task observation')).toBeInTheDocument();
+    expect(screen.getByText('Background task completed while you were away.').closest('.message')).toHaveClass('meta');
     expect(screen.queryByText('You')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Copy system observation' })).toBeInTheDocument();
   });
 
   it('does not attribute historical or unattributed input to the user', () => {

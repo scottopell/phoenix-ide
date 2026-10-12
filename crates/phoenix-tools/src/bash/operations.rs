@@ -1944,7 +1944,6 @@ mod tests {
     use crate::bash::handle::{Handle, HandleId};
     use crate::bash::registry::BashLifecyclePhase;
     use crate::bash::ring::{RingBuffer, PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
-    use crate::{RegisterWakeInput, RegisteredWake, WakeRegistrar};
     use phoenix_core::work_scope::ResourceScopeKey;
     use std::pin::Pin;
     use std::sync::Mutex;
@@ -1963,25 +1962,10 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct MockWakeRegistrar {
-        register_calls: Mutex<usize>,
-    }
-
-    impl MockWakeRegistrar {
-        fn new() -> Arc<Self> {
-            Arc::new(Self::default())
-        }
-
-        fn register_calls(&self) -> usize {
-            *self.register_calls.lock().expect("register_calls lock")
-        }
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_child_injects_launch_uuid_and_captures_exact_identity() {
-        let ctx = ctx_with_registrar(&scope("spawn-launch-identity"), None);
+        let ctx = test_context(&scope("spawn-launch-identity"));
         let spawn_context = spawn_context_for(&ctx);
         let (handle, spawned) = spawn_child(
             "printf '%s' \"$PHOENIX_BASH_LAUNCH_UUID\"",
@@ -2038,7 +2022,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_unregistered_spawn_kills_the_process_group() {
-        let ctx = ctx_with_registrar(&scope("drop-process-group"), None);
+        let ctx = test_context(&scope("drop-process-group"));
         let spawn_context = spawn_context_for(&ctx);
         let (_, mut spawned) = spawn_child(
             "(echo ready; exec sleep 30) & wait",
@@ -2083,24 +2067,7 @@ mod tests {
         assert!(!scratch.exists(), "sandbox scratch survived guard drop");
     }
 
-    #[async_trait::async_trait]
-    impl WakeRegistrar for MockWakeRegistrar {
-        async fn register(&self, _input: RegisterWakeInput) -> Result<RegisteredWake, String> {
-            *self.register_calls.lock().expect("register_calls lock") += 1;
-            Ok(RegisteredWake::Registered {
-                workflow_id: phoenix_workflow::WorkflowId(1),
-            })
-        }
-
-        async fn cancel(&self, _input: crate::CancelWakeInput) -> Result<RegisteredWake, String> {
-            Ok(RegisteredWake::CancelStale)
-        }
-    }
-
-    fn ctx_with_registrar(
-        work_scope: &ResourceScopeKey,
-        registrar: Option<Arc<dyn WakeRegistrar>>,
-    ) -> ToolContext {
+    fn test_context(work_scope: &ResourceScopeKey) -> ToolContext {
         let worktree_path = None;
         let conversation_id = match work_scope {
             ResourceScopeKey::Work(id) => id.as_str().to_string(),
@@ -2120,11 +2087,8 @@ mod tests {
             worktree_path,
             phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
-        .with_root_conversation_id("root-wake".to_string())
-        .with_tool_use_id("tool-wake");
-        if let Some(registrar) = registrar {
-            ctx = ctx.with_wake_registrar(Some(registrar));
-        }
+        .with_root_conversation_id("root-process".to_string())
+        .with_tool_use_id("tool-process");
         if matches!(
             work_scope,
             ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal
@@ -2160,8 +2124,6 @@ mod tests {
 
     #[test]
     fn progress_projection_reports_byte_budget_truncation() {
-        use std::sync::Mutex;
-
         let emitted = Arc::new(Mutex::new(Vec::new()));
         let captured = emitted.clone();
         let sink: Arc<dyn crate::BashProgressSink> = Arc::new(move |progress| {
@@ -2189,8 +2151,6 @@ mod tests {
 
     #[test]
     fn progress_projection_reports_line_limit_truncation() {
-        use std::sync::Mutex;
-
         let emitted = Arc::new(Mutex::new(Vec::new()));
         let captured = emitted.clone();
         let sink: Arc<dyn crate::BashProgressSink> = Arc::new(move |progress| {
@@ -2360,9 +2320,8 @@ mod tests {
         task.abort();
     }
     #[tokio::test]
-    async fn background_run_does_not_register_or_acknowledge_wake() {
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
+    async fn background_run_returns_live_handle() {
+        let ctx = test_context(&scope("conv-process"));
         let output = run_run(
             "sleep 10",
             None,
@@ -2376,16 +2335,16 @@ mod tests {
         assert!(output.is_success(), "{}", output.output());
         let value = output.display_data().cloned().expect("display data");
         assert_eq!(value["status"], "still_running");
-        assert!(value.get("wake_registration").is_none());
+        let handle_id = value["handle"].as_str().expect("background handle");
         let provider_value: Value = serde_json::from_str(output.output()).expect("provider JSON");
-        assert!(provider_value.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
+        assert_eq!(provider_value["handle"], handle_id);
+        let peek = run_peek(handle_id, ReadArgs::default(), &ctx).await;
+        assert!(peek.is_success(), "{}", peek.output());
     }
 
     #[tokio::test]
-    async fn synchronous_run_does_not_register_wake() {
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
+    async fn synchronous_run_returns_terminal_output() {
+        let ctx = test_context(&scope("conv-process"));
         let output = run_run(
             "printf hi",
             None,
@@ -2399,7 +2358,6 @@ mod tests {
         assert!(output.is_success(), "{}", output.output());
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "exited");
-        assert_eq!(registrar.register_calls(), 0);
     }
 
     #[test]
@@ -2425,9 +2383,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_background_run_preserves_handle_without_durable_wake() {
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(&ResourceScopeKey::Coordinator, Some(registrar.clone()));
+    async fn coordinator_background_run_preserves_handle() {
+        let ctx = test_context(&ResourceScopeKey::Coordinator);
         let output = run_run(
             "sleep 10",
             None,
@@ -2449,14 +2406,11 @@ mod tests {
         let value: Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "still_running");
         assert!(value["handle"].as_str().is_some());
-        assert!(value["wake_registration"].is_null(), "got: {value}");
-        assert_eq!(registrar.register_calls(), 0);
     }
 
     #[tokio::test]
     async fn global_scope_is_rejected() {
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(&ResourceScopeKey::GlobalTerminal, Some(registrar.clone()));
+        let ctx = test_context(&ResourceScopeKey::GlobalTerminal);
         let output = run_run(
             "sleep 10",
             None,
@@ -2471,12 +2425,11 @@ mod tests {
         assert!(output
             .output()
             .contains("bash processes require a conversation-scoped owner"));
-        assert_eq!(registrar.register_calls(), 0);
     }
 
     #[tokio::test]
-    async fn missing_registrar_preserves_background_behavior() {
-        let ctx = ctx_with_registrar(&scope("conv-wake"), None);
+    async fn background_run_preserves_handle() {
+        let ctx = test_context(&scope("conv-process"));
         let output = run_run(
             "sleep 10",
             None,
@@ -2490,15 +2443,13 @@ mod tests {
         assert!(output.is_success(), "{}", output.output());
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "still_running");
-        assert!(value.get("wake_registration").is_none());
     }
 
     #[tokio::test]
-    async fn run_cancellation_does_not_register_durable_wake() {
-        let registrar = MockWakeRegistrar::new();
+    async fn run_cancellation_preserves_background_handle() {
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        let mut ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
+        let mut ctx = test_context(&scope("conv-process"));
         ctx.cancel = cancel;
         let output = run_run(
             "sleep 10",
@@ -2513,8 +2464,6 @@ mod tests {
         assert!(output.is_success(), "{}", output.output());
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "still_running");
-        assert!(value.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
     }
 
     #[tokio::test]

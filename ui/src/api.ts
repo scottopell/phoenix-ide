@@ -1313,18 +1313,6 @@ export interface DiscoveryServicesResponse {
 
 export type TaskApprovalHandoff = 'continue_in_current_conversation' | 'start_fresh_work_conversation';
 
-export interface WakeContractStatus {
-  workflow_id: number;
-  contract_id: string;
-  expires_at: number;
-}
-
-export interface WakeStatus {
-  pending_count: number;
-  soonest_expires_at: number | null;
-  contracts: WakeContractStatus[];
-}
-
 export const streamApi = {
   subscribeToChainStream,
 };
@@ -2190,21 +2178,6 @@ export const api = {
   async listDirectory(path: string, signal?: AbortSignal): Promise<{ entries: { name: string; is_dir: boolean }[] }> {
     const resp = await fetch(`/api/list-directory?path=${encodeURIComponent(path)}`, signal ? { signal } : {});
     if (!resp.ok) throw new Error('Failed to list directory');
-    return resp.json();
-  },
-
-  async getWakeStatus(convId: string): Promise<WakeStatus> {
-    const resp = await fetch(`/api/conversations/${convId}/wake`);
-    if (!resp.ok) throw new Error(await resp.text());
-    return resp.json();
-  },
-
-  async cancelWake(convId: string, contractId: string): Promise<{ success: boolean }> {
-    const resp = await fetch(
-      `/api/conversations/${convId}/wake/${encodeURIComponent(contractId)}/cancel`,
-      { method: 'POST' },
-    );
-    if (!resp.ok) throw new Error(await resp.text());
     return resp.json();
   },
 

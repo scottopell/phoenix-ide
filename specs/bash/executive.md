@@ -5,7 +5,8 @@
 The bash tool owns a normative branch-observation contract used by sibling multi-PR specs: the
 terminal lifecycle edge of a Work-owned bash handle is a supported WorkScope reconciliation
 boundary for authoritative local Git observation. Coordinator-owned handle lifecycle is consumed
-without WorkScope wake registration or inventory reconciliation.
+without inventory reconciliation. Wake registration is retired separately under
+`../wake-contracts/requirements.md`; ordinary Bash waits and process control remain unchanged.
 
 The bash tool executes shell commands as pipe-backed children of the Phoenix
 process. Commands run via `bash -c` with combined stdout/stderr captured into

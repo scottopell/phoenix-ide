@@ -3126,7 +3126,6 @@ dependencies = [
  "phoenix-skills",
  "phoenix-svg",
  "phoenix-terminal",
- "phoenix-workflow",
  "proptest",
  "regex",
  "serde",

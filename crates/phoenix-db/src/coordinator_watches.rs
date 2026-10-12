@@ -229,6 +229,8 @@ impl Database {
              LEFT JOIN product_conversations p ON p.id = w.source_product_conversation_id
              LEFT JOIN close_cleanup_failures f ON f.failure_occurrence_id = e.mandatory_failure_occurrence_id
              WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none'
+               AND NOT EXISTS (SELECT 1 FROM coordinator_event_feature_retirements retired
+                               WHERE retired.event_id = e.event_id)
                AND (e.route_kind = 'mandatory_close_failure' OR
                     (e.route_kind = 'subscription' AND w.ended_at_us IS NULL
                      AND p.ordinary_lifecycle = 'open'
@@ -310,7 +312,6 @@ pub(crate) async fn record_terminal_event_tx(
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MessageExecutionSource {
     Steering,
-    Wake,
     SeededFork,
     InteractionResponse,
 }
@@ -319,7 +320,6 @@ impl MessageExecutionSource {
     pub(crate) fn from_db(value: &str) -> DbResult<Self> {
         match value {
             "steering" => Ok(Self::Steering),
-            "wake" => Ok(Self::Wake),
             "seeded_fork" => Ok(Self::SeededFork),
             "interaction_response" => Ok(Self::InteractionResponse),
             _ => Err(DbError::Serialization(format!(
@@ -331,7 +331,6 @@ impl MessageExecutionSource {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Steering => "steering",
-            Self::Wake => "wake",
             Self::SeededFork => "seeded_fork",
             Self::InteractionResponse => "interaction_response",
         }

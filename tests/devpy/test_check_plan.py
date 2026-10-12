@@ -1,3 +1,4 @@
+import io
 import importlib.util
 import os
 import tempfile
@@ -22,6 +23,10 @@ def load_devpy():
 
 class CheckPlanTests(unittest.TestCase):
     def setUp(self):
+        env_patch = mock.patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        os.environ.pop("PHOENIX_CHECK_WORKERS", None)
         self.dev = load_devpy()
 
     def test_git_config_key_validation_preserves_url_subsections(self):
@@ -104,6 +109,89 @@ class CheckPlanTests(unittest.TestCase):
             self.assertEqual(2, self.dev._check_cpu_budget())
         with mock.patch.object(self.dev.os, "cpu_count", return_value=None):
             self.assertEqual(1, self.dev._check_cpu_budget())
+
+    def test_check_worker_override_one(self):
+        with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1"}), \
+             mock.patch.object(self.dev.os, "cpu_count", return_value=10):
+            self.assertEqual(1, self.dev._check_cpu_budget())
+            self.assertEqual("1", self.dev._vitest_check_command()[-1])
+
+    def test_invalid_check_worker_override_fails_before_lane_resolution(self):
+        for raw in ("", " ", "0", "-1", "1.5", "abc", "+1", "1_0", "١"):
+            with self.subTest(raw=raw), \
+                 mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": raw}), \
+                 mock.patch.object(self.dev, "_resolve_check_lanes") as resolve:
+                with self.assertRaisesRegex(SystemExit, "PHOENIX_CHECK_WORKERS"):
+                    self.dev.cmd_check(gate=False, lanes="task")
+                resolve.assert_not_called()
+
+    def test_check_worker_budget_clamps_override_to_available_cpus(self):
+        for raw, cpus, expected in (("2", 10, 2), ("8", 10, 8), ("8", 2, 2), ("1", None, 1)):
+            with self.subTest(raw=raw, cpus=cpus), \
+                 mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": raw}), \
+                 mock.patch.object(self.dev.os, "cpu_count", return_value=cpus):
+                self.assertEqual(expected, self.dev._check_cpu_budget())
+
+    def test_all_check_worker_consumers_use_requested_one(self):
+        with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1"}), \
+             mock.patch.object(self.dev.os, "cpu_count", return_value=10):
+            budget = self.dev._check_cpu_budget()
+            self.assertEqual({
+                "CARGO_BUILD_JOBS": "1", "RAYON_NUM_THREADS": "1", "RUST_TEST_THREADS": "1",
+            }, self.dev._check_worker_env(budget))
+            self.assertEqual("1", self.dev._vitest_check_command(budget)[-1])
+            for nextest in (True, False):
+                with self.subTest(nextest=nextest):
+                    compile_cmd, test_cmd, codegen_cmd = self.dev._rust_check_commands(
+                        nextest, ["-p", "compile"], ["-p", "tests"], ["-p", "exports"],
+                        budget, ["--config-file", "profile.toml", "--profile", "phoenix-cpu"],
+                    )
+                    self.assertIn("--no-run", compile_cmd)
+                    self.assertIn("compile", compile_cmd)
+                    self.assertIn("tests", test_cmd)
+                    self.assertIn("exports", codegen_cmd)
+                    for cmd in (test_cmd, codegen_cmd):
+                        self.assertEqual("1", cmd[cmd.index("--test-threads") + 1])
+                        if not nextest:
+                            self.assertLess(cmd.index("--"), cmd.index("--test-threads"))
+                    if nextest:
+                        self.assertIn("profile.toml", test_cmd)
+                        self.assertIn("not test(/export_bindings/)", test_cmd)
+                        self.assertIn("test(/export_bindings/)", codegen_cmd)
+                    else:
+                        self.assertEqual("export_bindings", test_cmd[-1])
+                        self.assertIn("export_bindings", codegen_cmd)
+
+    def test_vitest_lane_launch_enforces_budget_over_inherited_limits(self):
+        inherited = {name: "99" for name in (
+            "CARGO_BUILD_JOBS", "RAYON_NUM_THREADS", "RUST_TEST_THREADS",
+        )}
+        proc = mock.Mock(stdout=io.StringIO(""))
+        proc.wait.return_value = 0
+        with mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "1"}), \
+             mock.patch.object(self.dev, "_resolve_check_lanes", return_value=({"vitest"}, {})), \
+             mock.patch.object(self.dev, "_make_reporter"), \
+             mock.patch.object(self.dev, "ensure_ui_deps"), \
+             mock.patch.object(self.dev, "node_env", return_value=inherited), \
+             mock.patch.object(self.dev.subprocess, "Popen", return_value=proc) as launch, \
+             mock.patch.object(self.dev.subprocess, "run", side_effect=AssertionError("unexpected subprocess")):
+            self.dev.cmd_check(gate=False, lanes="vitest")
+        launch.assert_called_once()
+        self.assertEqual(["pnpm", "exec", "vitest", "run", "--maxWorkers", "1"],
+                         launch.call_args.args[0])
+        for name in inherited:
+            self.assertEqual("1", launch.call_args.kwargs["env"][name])
+        self.assertTrue(all(value == "99" for value in inherited.values()))
+
+    def test_cli_rejects_invalid_workers_before_optional_bootstrap(self):
+        with mock.patch.object(self.dev.sys, "argv", ["dev.py", "check", "--pretty"]), \
+             mock.patch.dict(os.environ, {"PHOENIX_CHECK_WORKERS": "0"}), \
+             mock.patch.object(self.dev, "_bootstrap_rich") as rich, \
+             mock.patch.object(self.dev, "_bootstrap_dev_tracing") as tracing:
+            with self.assertRaisesRegex(SystemExit, "PHOENIX_CHECK_WORKERS"):
+                self.dev.main()
+            rich.assert_not_called()
+            tracing.assert_not_called()
 
     def test_clippy_check_disables_incremental_artifacts(self):
         root = Path("/tmp/phoenix-check")
