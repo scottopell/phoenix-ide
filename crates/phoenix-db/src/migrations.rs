@@ -12513,6 +12513,7 @@ mod tests {
             seed_fixture(pre_retirement_in_memory().await).await
         }
 
+        #[allow(clippy::too_many_lines)]
         async fn seed_fixture(db: crate::Database) -> crate::Database {
             for id in [
                 "wake-history",
