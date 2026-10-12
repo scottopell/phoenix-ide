@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import io
 import multiprocessing
 import os
 import platform
@@ -27,6 +28,7 @@ class CompilerCacheTests(unittest.TestCase):
         self.environment = mock.patch.dict(
             os.environ,
             {"KACHE_CACHE_DIR": str(Path(self.store_root.name) / "cache")},
+            clear=True,
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -39,6 +41,37 @@ class CompilerCacheTests(unittest.TestCase):
         )
         self.private_socket.start()
         self.addCleanup(self.private_socket.stop)
+
+        file_identity = self.dev._file_identity
+        host_identity = mock.patch.object(
+            self.dev,
+            "_file_identity",
+            side_effect=lambda path: {"state": "absent"}
+            if path == Path("/etc/kache/config.toml").resolve() else file_identity(path),
+        )
+        host_identity.start()
+        self.addCleanup(host_identity.stop)
+
+        def daemon_status(*_args, **_kwargs):
+            return mock.Mock(
+                returncode=0,
+                stdout=self.dev.json.dumps({
+                    "daemon_running": False,
+                    "socket": os.environ.get("KACHE_SOCKET_PATH"),
+                }),
+                stderr="",
+            )
+
+        status_command = mock.patch.object(
+            self.dev.subprocess, "run", side_effect=daemon_status
+        )
+        status_command.start()
+        self.addCleanup(status_command.stop)
+        no_daemon = mock.patch.object(
+            self.dev.subprocess, "Popen", side_effect=AssertionError("unexpected daemon launch")
+        )
+        no_daemon.start()
+        self.addCleanup(no_daemon.stop)
 
     def configure(self, requested=None, *, env=None, installed=(), **options):
         env = {} if env is None else env
@@ -403,6 +436,16 @@ class CompilerCacheTests(unittest.TestCase):
                 set(parsed),
             )
 
+    def test_daemon_receipt_rejects_missing_socket_missing_receipt_or_wrong_identity(self):
+        socket = Path(self.store_root.name) / "operator.sock"
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64))
+        socket.write_text("mock socket")
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64))
+        self.assertIsNone(self.dev._record_kache_daemon_receipt(socket, "a" * 64))
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "b" * 64))
+        socket.unlink()
+        self.assertFalse(self.dev._kache_daemon_receipt_matches(socket, "a" * 64))
+
     def test_daemon_receipt_rejects_socket_incarnation_change(self):
         with self.dev.tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -424,111 +467,191 @@ class CompilerCacheTests(unittest.TestCase):
                     self.dev._kache_daemon_receipt_matches(socket, "a" * 64)
                 )
 
-    def test_store_admission_preserves_remote_a_intent_and_rejects_remote_b(self):
-        with self.dev.tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            store = root / "store"
-            spool = store / "upload-queue"
-            spool.mkdir(parents=True)
-            intent = spool / "artifact-key.json"
-            intent.write_text('{"remote":"A"}')
-            socket_a = root / "a.sock"
-            socket_a.write_text("")
-            state_a = socket_a.with_suffix(".state.json")
-            state_a.write_text('{"phase":"ready","pid":1234}')
-            config = root / "remote-a.toml"
-            config.write_text(
-                f'[cache]\nlocal_store = "{store}"\n[cache.remote]\nbackend = "file"\n[cache.remote.file]\nroot = "{root / "remote-a"}"\n'
-            )
-            with mock.patch.dict(
-                os.environ, {"KACHE_CONFIG": str(config)}, clear=True
-            ), mock.patch.object(
-                self.dev, "_private_kache_socket_dir", return_value=root
-            ):
-                self.assertIsNone(
-                    self.dev._record_kache_store_owner(
-                        store, socket_a, "remote-a-upload-identity"
+    def test_trust_domain_and_exact_socket_are_consistent_on_start_and_reuse(self):
+        cases = ("generated", "operator", "config", "pr-scoped")
+        for case in cases:
+            with self.subTest(case=case), self.dev.tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                base_socket = root / "base.sock"
+                effective_socket = root / "effective.sock"
+                environment = {"KACHE_TRUST_DOMAIN": "operator-domain"}
+                if case in {"operator", "pr-scoped"}:
+                    environment["KACHE_SOCKET_PATH"] = str(base_socket)
+                if case in {"config", "pr-scoped"}:
+                    config = root / "kache.toml"
+                    config.write_text(
+                        '[cache]\nignore_env = true\n'
+                        f'socket_path = "{effective_socket}"\n'
+                        '[cache.remote]\npull_request_prefix = "prs"\n'
                     )
-                )
-                with mock.patch.object(
-                    self.dev,
-                    "_kache_daemon_receipt_matches",
-                    return_value=True,
-                ):
-                    error = self.dev._admit_kache_store_owner(
-                        store, Path(root / "b.sock"), "remote-b-upload-identity"
+                    environment["KACHE_CONFIG"] = str(config)
+                if case == "pr-scoped":
+                    environment["GITHUB_EVENT_NAME"] = "pull_request"
+
+                observations = []
+                started = False
+                selected_socket = None
+                child = mock.Mock(pid=1234, stderr=io.BytesIO())
+
+                def status(command, **kwargs):
+                    nonlocal selected_socket
+                    self.assertEqual(["/bin/kache", "--json", "daemon"], command)
+                    self.assertEqual(root, kwargs["cwd"])
+                    observations.append(("status", kwargs["env"]["KACHE_TRUST_DOMAIN"]))
+                    selected_socket = (
+                        effective_socket if case in {"config", "pr-scoped"}
+                        else Path(kwargs["env"]["KACHE_SOCKET_PATH"])
+                    ).resolve()
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=self.dev.json.dumps({
+                            "daemon_running": started,
+                            "socket": str(selected_socket),
+                        }),
+                        stderr="",
                     )
 
-            self.assertIn("different Kache identity owns this local store", error or "")
-            self.assertEqual('{"remote":"A"}', intent.read_text())
-            self.assertFalse((root / "b.sock").exists())
+                def launch(command, **kwargs):
+                    nonlocal started
+                    self.assertEqual(["/bin/kache", "daemon", "run"], command)
+                    observations.append(("start", kwargs["env"]["KACHE_TRUST_DOMAIN"]))
+                    selected_socket.write_text("mock socket")
+                    selected_socket.with_suffix(".state.json").write_text(
+                        '{"phase":"ready","pid":1234}'
+                    )
+                    started = True
+                    return child
 
-    def test_environment_only_s3_remote_requires_store_serialization(self):
+                with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                    self.dev.subprocess, "run", side_effect=status
+                ), mock.patch.object(
+                    self.dev.subprocess, "Popen", side_effect=launch
+                ) as spawn:
+                    identity = self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=root)
+                    expected_domain = f"phoenix-{identity[:32]}"
+                    self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache", cargo_cwd=root))
+                    first_socket = os.environ["KACHE_SOCKET_PATH"]
+                    self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache", cargo_cwd=root))
+                    self.assertEqual(first_socket, os.environ["KACHE_SOCKET_PATH"])
+                    self.assertEqual(expected_domain, os.environ["KACHE_TRUST_DOMAIN"])
+                    self.assertEqual(
+                        identity, self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=root)
+                    )
+                    self.assertTrue(self.dev._kache_daemon_receipt_matches(selected_socket, identity))
+
+                spawn.assert_called_once()
+                self.assertEqual(["status", "status", "start", "status", "status", "status"],
+                                 [event for event, _domain in observations])
+                self.assertTrue(all(domain == expected_domain for _event, domain in observations))
+                self.assertRegex(expected_domain, r"^phoenix-[0-9a-f]{32}$")
+                self.assertLessEqual(len(expected_domain), 64)
+                self.assertTrue(selected_socket.with_name(f"{selected_socket.name}.lock").exists())
+                if case in {"config", "pr-scoped"}:
+                    self.assertFalse(base_socket.with_name(f"{base_socket.name}.lock").exists())
+                    self.assertNotEqual(str(selected_socket), first_socket)
+
+    def test_different_identities_get_different_trust_domains_and_generated_sockets(self):
+        domains = []
+        sockets = []
+        identities = []
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev, "_start_kache_daemon_locked", return_value=None
+        ) as start:
+            for cache in ("shared-a", "shared-a", "shared-b"):
+                os.environ["KACHE_CACHE_DIR"] = str(Path(self.store_root.name) / cache)
+                os.environ.pop("KACHE_SOCKET_PATH", None)
+                self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
+                domains.append(os.environ["KACHE_TRUST_DOMAIN"])
+                sockets.append(os.environ["KACHE_SOCKET_PATH"])
+                identities.append(start.call_args.kwargs["identity"])
+        self.assertEqual(domains[0], domains[1])
+        self.assertEqual(sockets[0], sockets[1])
+        self.assertEqual(identities[0], identities[1])
+        self.assertNotEqual(domains[1], domains[2])
+        self.assertNotEqual(sockets[1], sockets[2])
+        self.assertNotEqual(identities[1], identities[2])
+
+    def test_operator_socket_rejects_changed_identity_without_launch_or_new_receipt(self):
+        socket = Path(self.store_root.name) / "operator.sock"
+        socket.write_text("mock socket")
         with mock.patch.dict(
-            os.environ, {"KACHE_S3_BUCKET": "bucket-a"}, clear=True
+            os.environ, {"KACHE_SOCKET_PATH": str(socket), "KACHE_S3_BUCKET": "remote-a"}, clear=True
+        ), mock.patch.object(
+            self.dev.subprocess, "run",
+            return_value=mock.Mock(returncode=0, stdout=self.dev.json.dumps({
+                "daemon_running": True, "socket": str(socket),
+            }), stderr=""),
+        ), mock.patch.object(self.dev.subprocess, "Popen") as spawn:
+            identity = self.dev._kache_daemon_identity("/bin/kache", cargo_cwd=None)
+            self.assertIsNone(self.dev._record_kache_daemon_receipt(socket, identity))
+            receipt_path = self.dev._kache_daemon_receipt_path(socket)
+            receipt = receipt_path.read_bytes()
+            self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
+            first_domain = os.environ["KACHE_TRUST_DOMAIN"]
+            os.environ["KACHE_S3_BUCKET"] = "remote-b"
+            error = self.dev._ensure_kache_daemon("/bin/kache")
+            self.assertNotEqual(first_domain, os.environ["KACHE_TRUST_DOMAIN"])
+            self.assertEqual(receipt, receipt_path.read_bytes())
+        self.assertIn("environment or process identity cannot be verified", error or "")
+        spawn.assert_not_called()
+
+    def test_effective_socket_omission_or_status_failure_never_starts_daemon(self):
+        for status in (
+            mock.Mock(returncode=0, stdout='{"daemon_running":false}', stderr=""),
+            mock.Mock(returncode=2, stdout="", stderr="config denied"),
         ):
-            self.assertTrue(self.dev._kache_remote_enabled(cargo_cwd=Path("/repo")))
-
-    def test_ignore_env_uses_file_store_and_ignores_decoy_cache_dir(self):
-        with self.dev.tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            configured = root / "configured-store"
-            config = root / "kache.toml"
-            config.write_text(
-                f'[cache]\nignore_env = true\nlocal_store = "{configured}"\n'
-            )
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "KACHE_CONFIG": str(config),
-                    "KACHE_CACHE_DIR": str(root / "decoy-store"),
-                },
+            with self.subTest(status=status.stdout), mock.patch.dict(
+                os.environ, {"KACHE_SOCKET_PATH": str(self.socket_directory / "operator.sock")},
                 clear=True,
-            ):
-                actual = self.dev._resolved_kache_store(cargo_cwd=root)
-
-        self.assertEqual(configured.resolve(), actual)
-
-    def test_unowned_nonempty_upload_queue_fails_closed(self):
-        with self.dev.tempfile.TemporaryDirectory() as temporary:
-            store = Path(temporary) / "store"
-            spool = store / "upload-queue"
-            spool.mkdir(parents=True)
-            intent = spool / "intent.json"
-            intent.write_text('{"remote":"A"}')
-            error = self.dev._admit_kache_store_owner(
-                store, Path(temporary) / "remote-b.sock", "remote-b"
+            ), mock.patch.object(
+                self.dev.subprocess, "run", return_value=status
+            ), mock.patch.object(self.dev.subprocess, "Popen") as spawn, mock.patch.object(
+                self.dev, "_kache_socket_lock"
+            ) as lock:
+                error = self.dev._ensure_kache_daemon("/bin/kache")
+            self.assertEqual(
+                "config denied" if status.returncode else "daemon status omitted effective socket",
+                error,
             )
-            preserved = intent.read_text()
+            spawn.assert_not_called()
+            lock.assert_not_called()
 
-        self.assertIn("unowned durable upload intents", error or "")
-        self.assertEqual('{"remote":"A"}', preserved)
-
-    def test_upload_identity_ignores_daemon_only_settings(self):
-        with self.dev.tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            config = root / "kache.toml"
-            config.write_text(
-                '[cache]\nlocal_max_size = "1 GiB"\n[cache.remote]\nbackend = "s3"\nbucket = "same"\n'
-            )
-            with mock.patch.dict(
+    def test_socket_status_failure_is_secret_safe_and_preserves_selection_policy(self):
+        secret = "mock-aws-secret"
+        for requested in ("auto", "kache"):
+            with self.subTest(requested=requested), mock.patch.dict(
                 os.environ,
-                {"KACHE_CONFIG": str(config), "KACHE_LOG_FILE": "one"},
+                {"AWS_SECRET_ACCESS_KEY": secret, "KACHE_TRUST_DOMAIN": "original-domain"},
                 clear=True,
-            ):
-                first = self.dev._kache_upload_identity(cargo_cwd=root)
-                os.environ["KACHE_LOG_FILE"] = "two"
-                second = self.dev._kache_upload_identity(cargo_cwd=root)
-                config.write_text(
-                    '[cache]\nlocal_max_size = "2 GiB"\n[cache.remote]\nbackend = "s3"\nbucket = "same"\n'
-                )
-                third = self.dev._kache_upload_identity(cargo_cwd=root)
-
-        self.assertEqual(first, second)
-        self.assertEqual(second, third)
+            ), mock.patch.object(
+                self.dev, "_kache_host_error", return_value=None
+            ), mock.patch.object(
+                self.dev, "_kache_binary", return_value="/bin/kache"
+            ), mock.patch.object(
+                self.dev, "_kache_version", return_value=("1.0.0", None)
+            ), mock.patch.object(
+                self.dev.shutil, "which", return_value="/bin/sccache"
+            ), mock.patch.object(
+                self.dev, "_usable_sccache", return_value=("sccache 0.18.0", None)
+            ), mock.patch.object(
+                self.dev.subprocess, "run",
+                return_value=mock.Mock(returncode=2, stdout="", stderr=f"config denied: {secret}"),
+            ), mock.patch("builtins.print") as output:
+                if requested == "auto":
+                    self.assertEqual("sccache", self.dev._configure_compiler_cache(requested))
+                    self.assertEqual("original-domain", os.environ["KACHE_TRUST_DOMAIN"])
+                    self.assertNotIn("KACHE_SOCKET_PATH", os.environ)
+                    detail = str(output.call_args_list)
+                else:
+                    with self.assertRaises(SystemExit) as failure:
+                        self.dev._configure_compiler_cache(requested)
+                    detail = str(failure.exception)
+                    self.assertIn("kache daemon failed to start", detail)
+                    self.assertNotIn("RUSTC_WRAPPER", os.environ)
+                self.assertNotIn(secret, detail)
+                self.assertIn("[redacted]", detail)
 
     def test_effective_pr_scoped_socket_drives_ownership(self):
-        configured = Path("/tmp/kache.sock")
         scoped = Path("/tmp/kache-pr-deadbeef.sock")
         with mock.patch.dict(
             os.environ,
@@ -540,7 +663,7 @@ class CompilerCacheTests(unittest.TestCase):
             return_value=(self.dev.KacheDaemonStatus.ABSENT, str(scoped), None),
         ):
             actual, error = self.dev._effective_kache_socket(
-                "/bin/kache", cargo_cwd=Path("/repo"), configured=configured
+                "/bin/kache", cargo_cwd=Path("/repo")
             )
 
         self.assertIsNone(error)
@@ -610,12 +733,11 @@ class CompilerCacheTests(unittest.TestCase):
         ), mock.patch.object(
             self.dev, "_record_kache_daemon_receipt", return_value=None
         ) as record, mock.patch.object(
-            self.dev, "_record_kache_store_owner", return_value=None
+            self.dev, "_read_kache_daemon_status",
+            return_value=(self.dev.KacheDaemonStatus.ABSENT, str(socket), None)
         ), mock.patch.object(
             self.dev, "_kache_daemon_receipt_matches", return_value=True
-        ) as matches, mock.patch.object(
-            self.dev, "_admit_kache_store_owner", return_value=None
-        ):
+        ) as matches:
             self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
             self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
 
@@ -632,7 +754,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev, "_kache_daemon_is_running", return_value=(True, None)
         ), mock.patch.object(
             self.dev, "_kache_daemon_receipt_matches", return_value=False
-        ), mock.patch.object(self.dev.subprocess, "run") as run:
+        ), mock.patch.object(self.dev.subprocess, "Popen") as run:
             error = self.dev._ensure_kache_daemon("/bin/kache")
 
         self.assertIn("environment or process identity cannot be verified", error or "")
@@ -803,6 +925,11 @@ class CompilerCacheTests(unittest.TestCase):
                     },
                     clear=True,
                 ), mock.patch.object(
+                    dev, "_implicit_kache_files", return_value={}
+                ), mock.patch.object(
+                    dev, "_read_kache_daemon_status",
+                    return_value=(dev.KacheDaemonStatus.ABSENT, str(socket), None)
+                ), mock.patch.object(
                     dev, "_kache_daemon_is_running", side_effect=status
                 ), mock.patch.object(
                     dev.subprocess, "Popen", side_effect=launch
@@ -844,7 +971,7 @@ class CompilerCacheTests(unittest.TestCase):
             os.environ, {"KACHE_SOCKET_PATH": "/tmp/kache.sock"}, clear=True
         ), mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(True, None)
-        ), mock.patch.object(self.dev.subprocess, "run") as run:
+        ), mock.patch.object(self.dev.subprocess, "Popen") as run:
             error = self.dev._ensure_kache_daemon("/bin/kache")
         self.assertIn("environment or process identity cannot be verified", error or "")
         run.assert_not_called()
@@ -856,7 +983,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev,
             "_kache_daemon_is_running",
             return_value=(False, "daemon readiness response had an invalid shape"),
-        ), mock.patch.object(self.dev.subprocess, "run") as run:
+        ), mock.patch.object(self.dev.subprocess, "Popen") as run:
             error = self.dev._ensure_kache_daemon("/bin/kache")
         self.assertIn("cannot verify existing daemon environment", error or "")
         run.assert_not_called()
@@ -1135,15 +1262,25 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual("replace", run.call_args.kwargs["errors"])
 
-    def test_kache_version_accepts_qualified_release(self):
+    def test_kache_version_rejects_unpublished_local_candidate_version(self):
         with mock.patch.object(
             self.dev, "_command_version", return_value=("kache 1.0.0", None)
         ):
-            self.assertEqual(("1.0.0", None), self.dev._kache_version("/bin/kache"))
+            version, error = self.dev._kache_version("/bin/kache")
+        self.assertIsNone(version)
+        self.assertIn("no published Kache release", error or "")
+
+    def test_kache_version_accepts_deliberately_qualified_release(self):
+        with mock.patch.object(
+            self.dev, "_SUPPORTED_KACHE_VERSION", "1.0.1"
+        ), mock.patch.object(
+            self.dev, "_command_version", return_value=("kache 1.0.1", None)
+        ):
+            self.assertEqual(("1.0.1", None), self.dev._kache_version("/bin/kache"))
 
     def test_kache_version_rejects_unqualified_patch_and_prerelease(self):
         for output, expected in (
-            ("kache 1.0.1", "unsupported"),
+            ("kache 1.0.1", "no published Kache release"),
             ("kache 1.0.0-rc1", "unrecognized"),
         ):
             with self.subTest(output=output), mock.patch.object(

@@ -10,7 +10,7 @@ Database restore or replacement is an offline operator procedure. Phoenix does n
 
 Internal SQLite timestamps use mixed representations. New or changed internal timestamp columns must converge on explicitly unit-named integer Unix microseconds unless a more specific normative requirement identifies an external reader and requires another representation.
 
-Compiler caching supports exact Kache 1.0.0 on macOS arm64. Automatic selection prefers qualified Kache, then falls through to usable sccache and no cache while reporting the actual backend. Representative cross-root restoration preserves Phoenix application and dependency file/line lookup from an UUID-matched dSYM without restored application object files. Cache selection is scoped to Cargo subprocesses and does not establish a general cross-version, remote-cache, performance, or broader-platform compatibility guarantee.
+Compiler caching falls through to usable sccache or no cache while reporting the actual backend. Kache 1.0.0 passed representative macOS arm64 debug-fidelity qualification, but its released trust-domain implementation fails open and leaves configured volume shards unscoped. A corrected local fork candidate passes focused regression tests and independent review, but still reports the same `1.0.0` version as the vulnerable official artifact. Phoenix therefore has no distinctly identifiable published Kache release to select. Cache selection remains scoped to Cargo subprocesses and does not establish a general cross-version, remote-cache, performance, or broader-platform compatibility guarantee.
 
 ## Requirement coverage
 
@@ -23,7 +23,7 @@ Compiler caching supports exact Kache 1.0.0 on macOS arm64. Automatic selection 
 | REQ-COMP-005 | Policy applies to newly introduced or structurally changed internal timestamp columns. Unchanged historical timestamp columns are outside this initial convergence rule. |
 | REQ-COMP-006 | Legacy Direct WorkScopes are repaired forward to Direct authority without adding rollback guarantees. |
 | REQ-COMP-007 | Historical accepted source-locator payloads retain their original fingerprint and encoding authority. |
-| REQ-COMP-008 | `dev.py` prefers exact Kache 1.0.0 on macOS arm64, verifies daemon readiness/socket identity, falls through honestly to usable sccache/no cache, preserves explicit selections, and scopes generated cache variables to build subprocesses. Representative restored Phoenix application and dependency file/line probes pass. |
+| REQ-COMP-008 | `dev.py` rejects Kache while no distinctly identifiable corrected release exists, falls through honestly to usable sccache/no cache, preserves explicit selections, and scopes generated cache variables to build subprocesses. The retained Kache integration derives a secret-safe trust domain, uses Kache's effective socket, and verifies daemon process/socket ownership for a future qualified release. Representative restored Phoenix application and dependency file/line probes pass for v1.0.0, while local fork regressions close its trust-domain isolation defects. |
 
 ## Next work
 

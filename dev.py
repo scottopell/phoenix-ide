@@ -29,7 +29,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import tomllib
 import time
 import traceback
 from collections.abc import Mapping
@@ -4846,7 +4845,10 @@ def _append_git_config_override(key, value, environ=None):
 _COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
 
 
-_SUPPORTED_KACHE_VERSION = "1.0.0"
+_SUPPORTED_KACHE_VERSION: str | None = None
+_KACHE_QUALIFICATION_BLOCKER = (
+    "no published Kache release has the required fail-closed trust-domain isolation"
+)
 
 
 def _command_version(binary: str) -> tuple[str | None, str | None]:
@@ -4875,6 +4877,8 @@ def _kache_version(binary: str) -> tuple[str | None, str | None]:
     if match is None:
         return None, f"unrecognized version output: {detail}"
     version = match.group(1)
+    if _SUPPORTED_KACHE_VERSION is None:
+        return None, _KACHE_QUALIFICATION_BLOCKER
     if version != _SUPPORTED_KACHE_VERSION:
         return None, f"unsupported kache {version}; Phoenix supports released kache {_SUPPORTED_KACHE_VERSION}"
     return version, None
@@ -5055,7 +5059,7 @@ def _kache_daemon_identity(binary: str, *, cargo_cwd: Path | None) -> str:
     daemon_environment = {
         key: hashlib.sha256(os.fsencode(value)).hexdigest()
         for key, value in os.environ.items()
-        if (key.startswith("KACHE_") and key != "KACHE_SOCKET_PATH")
+        if (key.startswith("KACHE_") and key not in {"KACHE_SOCKET_PATH", "KACHE_TRUST_DOMAIN"})
         or key.startswith("AWS_")
         or key in implicit_names
     }
@@ -5071,172 +5075,15 @@ def _kache_daemon_identity(binary: str, *, cargo_cwd: Path | None) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _kache_file_config(*, cargo_cwd: Path | None) -> dict[str, object]:
-    base = Path(cargo_cwd or ROOT).resolve()
-    config = _identity_path(os.environ.get("KACHE_CONFIG"), base=base)
-    if config is None:
-        return {}
-    try:
-        document = tomllib.loads(config.read_text())
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-    cache = document.get("cache")
-    return cache if isinstance(cache, dict) else {}
-
-
-def _kache_upload_identity(*, cargo_cwd: Path | None) -> str:
-    cache = _kache_file_config(cargo_cwd=cargo_cwd)
-    ignore_env = cache.get("ignore_env") is True
-    environment = {
-        key: hashlib.sha256(os.fsencode(value)).hexdigest()
-        for key, value in os.environ.items()
-        if not ignore_env
-        and (
-            key.startswith("AWS_")
-            or key.startswith("GOOGLE_")
-            or key.startswith("KACHE_S3_")
-            or key in {"KACHE_REMOTE_READONLY"}
-        )
-    }
-    payload = json.dumps(
-        {
-            "remote": cache.get("remote"),
-            "remote_readonly": cache.get("remote_readonly"),
-            "environment": environment,
-            "credential_files": {
-                name: value
-                for name, value in _implicit_kache_files(cargo_cwd=cargo_cwd).items()
-                if name.startswith("aws_") or name == "google_adc"
-            },
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def _resolved_kache_store(*, cargo_cwd: Path | None) -> Path:
-    base = Path(cargo_cwd or ROOT).resolve()
-    cache = _kache_file_config(cargo_cwd=cargo_cwd)
-    ignore_env = cache.get("ignore_env") is True
-    explicit = None if ignore_env else os.environ.get("KACHE_CACHE_DIR")
-    if explicit:
-        store = _identity_path(explicit, base=base)
-        assert store is not None
-    else:
-        configured = cache.get("local_store")
-        store = _identity_path(configured, base=base) if isinstance(configured, str) else None
-        if store is None:
-            cache_home = os.environ.get("XDG_CACHE_HOME")
-            home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-            root = _identity_path(cache_home, base=base)
-            if root is None and home:
-                home_path = _identity_path(home, base=base)
-                root = home_path / ".cache" if home_path else None
-            store = (root or Path(tempfile.gettempdir())) / "kache"
-    trust_domain = os.environ.get("KACHE_TRUST_DOMAIN")
-    if trust_domain and re.fullmatch(r"[A-Za-z0-9._-]+", trust_domain) and trust_domain not in {".", ".."}:
-        store = store / trust_domain
-    return store.resolve()
-
-
-def _kache_store_owner_path(store: Path) -> Path:
-    return store.resolve() / ".phoenix-daemon-owner.json"
-
-
-def _record_kache_store_owner(
-    store: Path, socket: Path, upload_identity: str
-) -> str | None:
-    try:
-        owner = _kache_store_owner_path(store)
-        owner.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = owner.with_suffix(f".tmp.{os.getpid()}")
-        payload = json.dumps(
-            {
-                "version": 1,
-                "upload_identity": upload_identity,
-                "socket": str(socket.resolve()),
-            },
-            sort_keys=True,
-        )
-        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.write(descriptor, payload.encode())
-        finally:
-            os.close(descriptor)
-        os.replace(temporary, owner)
-        owner.chmod(0o600)
-        return None
-    except OSError as error:
-        try:
-            temporary.unlink(missing_ok=True)
-        except (OSError, UnboundLocalError):
-            pass
-        return f"cannot record Kache store ownership: {error}"
-
-
-def _read_kache_store_owner(store: Path) -> dict[str, object] | None:
-    try:
-        owner = json.loads(_kache_store_owner_path(store).read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    return owner if isinstance(owner, dict) else None
-
-
-def _admit_kache_store_owner(
-    store: Path, socket: Path, upload_identity: str
-) -> str | None:
-    owner = _read_kache_store_owner(store)
-    if owner is None:
-        spool = store / "upload-queue"
-        try:
-            if spool.is_dir() and any(spool.iterdir()):
-                return "Kache local store has unowned durable upload intents; refusing remote replay"
-        except OSError as error:
-            return f"cannot inspect Kache upload queue ownership: {error}"
-        return None
-    if owner.get("upload_identity") == upload_identity:
-        return None
-    return "a different Kache identity owns this local store; refusing cross-remote upload-queue replay"
-
-
-def _kache_remote_enabled(*, cargo_cwd: Path | None) -> bool:
-    cache = _kache_file_config(cargo_cwd=cargo_cwd)
-    remote = cache.get("remote")
-    if isinstance(remote, dict) and bool(remote):
-        return True
-    if cache.get("ignore_env") is True:
-        return False
-    return bool(os.environ.get("KACHE_S3_BUCKET"))
-
-
-def _kache_pr_scopes_socket(*, cargo_cwd: Path | None) -> bool:
-    event = os.environ.get("GITHUB_EVENT_NAME", "")
-    if event not in {"pull_request", "pull_request_target"}:
-        return False
-    if os.environ.get("KACHE_PULL_REQUEST_PREFIX"):
-        return True
-    config = _identity_path(os.environ.get("KACHE_CONFIG"), base=Path(cargo_cwd or ROOT).resolve())
-    if config is None:
-        return False
-    try:
-        document = tomllib.loads(config.read_text())
-        return bool(document.get("cache", {}).get("remote", {}).get("pull_request_prefix"))
-    except (OSError, tomllib.TOMLDecodeError, AttributeError):
-        return False
-
-
 def _effective_kache_socket(
-    binary: str, *, cargo_cwd: Path | None, configured: Path
+    binary: str, *, cargo_cwd: Path | None
 ) -> tuple[Path | None, str | None]:
-    if not _kache_pr_scopes_socket(cargo_cwd=cargo_cwd):
-        return configured.resolve(), None
     status, actual, error = _read_kache_daemon_status(binary, cargo_cwd=cargo_cwd)
     if status is KacheDaemonStatus.ERROR:
         return None, error
     if actual:
         return Path(actual).resolve(), None
-    return configured.resolve(), None
+    return None, "daemon status omitted effective socket"
 
 
 def _safe_kache_startup_diagnostic(
@@ -5387,6 +5234,8 @@ def _generated_kache_socket(binary: str, *, cargo_cwd: Path | None) -> Path:
 
 
 def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str | None:
+    identity = _kache_daemon_identity(binary, cargo_cwd=cargo_cwd)
+    os.environ["KACHE_TRUST_DOMAIN"] = f"phoenix-{identity[:32]}"
     generated_socket = os.name != "nt" and "KACHE_SOCKET_PATH" not in os.environ
     if generated_socket:
         try:
@@ -5400,40 +5249,25 @@ def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str |
     if not socket:
         return "KACHE_SOCKET_PATH is required to serialize daemon startup"
 
-    configured_socket = Path(socket)
     socket_path, endpoint_error = _effective_kache_socket(
-        binary, cargo_cwd=cargo_cwd, configured=configured_socket
+        binary, cargo_cwd=cargo_cwd
     )
     if endpoint_error or socket_path is None:
-        return endpoint_error or "cannot resolve Kache daemon socket"
-    identity = _kache_daemon_identity(binary, cargo_cwd=cargo_cwd)
-    upload_identity = _kache_upload_identity(cargo_cwd=cargo_cwd)
-    remote_enabled = _kache_remote_enabled(cargo_cwd=cargo_cwd)
-    store = _resolved_kache_store(cargo_cwd=cargo_cwd)
-    store_lock = _kache_store_owner_path(store).with_suffix(".lock")
+        return _safe_kache_startup_diagnostic(
+            endpoint_error or "cannot resolve Kache daemon socket", environment=os.environ
+        )
     try:
-        lock = store_lock if remote_enabled else socket_path
-        with _kache_socket_lock(lock):
-            if remote_enabled:
-                admission_error = _admit_kache_store_owner(
-                    store, socket_path, upload_identity
-                )
-                if admission_error:
-                    return admission_error
-            with _kache_socket_lock(socket_path) if remote_enabled else contextlib.nullcontext():
-                daemon_error = _start_kache_daemon_locked(
-                    binary,
-                    cargo_cwd=cargo_cwd,
-                    socket=socket_path,
-                    identity=identity,
-                )
-                if daemon_error:
-                    return daemon_error
-                if remote_enabled:
-                    return _record_kache_store_owner(
-                        store, socket_path, upload_identity
-                    )
-                return None
+        with _kache_socket_lock(socket_path):
+            daemon_error = _start_kache_daemon_locked(
+                binary,
+                cargo_cwd=cargo_cwd,
+                socket=socket_path,
+                identity=identity,
+            )
+            return (
+                _safe_kache_startup_diagnostic(daemon_error, environment=os.environ)
+                if daemon_error else None
+            )
     except OSError as error:
         return f"cannot lock Kache socket setup: {error}"
 

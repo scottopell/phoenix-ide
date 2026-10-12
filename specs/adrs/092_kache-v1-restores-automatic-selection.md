@@ -1,6 +1,6 @@
 # ADR-092: Qualified Kache v1 restores automatic compiler-cache selection
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-093
 - **Date:** 2026-10-07
 - **Supersedes:** ADR-079
 - **Affects:** development methodology; REQ-COMP-001, REQ-COMP-008

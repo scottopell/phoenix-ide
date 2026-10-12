@@ -132,7 +132,7 @@ THE SYSTEM SHALL reject any payload whose fingerprint matches neither its curren
 ### REQ-COMP-008 — Qualified Compiler-Cache Compatibility
 
 WHEN Phoenix automatically selects a compiler cache on macOS arm64
-THE SYSTEM SHALL prefer Kache when its executable reports exactly version `1.0.0` and a Phoenix-started local daemon has a matching private identity and reports readiness on the effective configured socket
+THE SYSTEM SHALL prefer Kache only when a deliberately qualified published release has a distinct verifiable version identity and a Phoenix-started local daemon has a matching private identity and reports readiness on the effective configured socket
 AND SHALL otherwise fall through to an sccache executable that passes its version probe or no compiler cache
 AND SHALL report each fallback reason and the backend actually selected
 
@@ -142,7 +142,7 @@ AND SHALL report the fallback reason and backend actually selected
 
 WHEN an operator explicitly selects Kache
 THE SYSTEM SHALL require a macOS arm64 host
-AND SHALL require the executable to report exactly version `1.0.0`
+AND SHALL require the executable to report the distinct version identity of a deliberately qualified published release
 AND SHALL require a Phoenix-started local daemon with matching private identity to report readiness on the effective configured socket
 
 WHEN an operator explicitly selects Kache or sccache
