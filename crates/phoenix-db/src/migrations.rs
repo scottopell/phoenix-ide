@@ -12915,10 +12915,11 @@ mod tests {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
-            let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_feature_retirements")
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
+            let retired: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_feature_retirements")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
             assert_eq!(retired, 9);
             let error = sqlx::query(
                 "INSERT INTO workflow_feature_retirements (workflow_id, reason)
@@ -12972,7 +12973,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn wake_feature_retirement_metadata_requires_retirement_reason_and_exact_message_owner() {
+        async fn wake_feature_retirement_metadata_requires_retirement_reason_and_exact_message_owner(
+        ) {
             let db = fixture().await;
             let mut tx = db.pool().begin().await.unwrap();
             sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
