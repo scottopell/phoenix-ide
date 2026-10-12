@@ -379,11 +379,11 @@ describe('live work-scope load admission in DesktopLayout', () => {
         throw new Error(`Unexpected request: ${url}`);
       }
       return Promise.resolve({ ok: true, json: async () => ({
-        scope_key: scopeKey, sampled_at: new Date().toISOString(), live_jobs: 0,
+        scope_key: scopeKey, measurement_basis: 'live_tracked_bash_groups', sampled_at: new Date().toISOString(), live_jobs: 0,
         cpu_cores_latest: null, cpu_sampled_at: null,
-        cpu_one_minute: { average_cores: null, coverage_seconds: 0 },
-        cpu_five_minutes: { average_cores: null, coverage_seconds: 0 },
-        cpu_fifteen_minutes: { average_cores: null, coverage_seconds: 0 },
+        cpu_one_minute: { average_cores: null, sampled_seconds: 0 },
+        cpu_five_minutes: { average_cores: null, sampled_seconds: 0 },
+        cpu_fifteen_minutes: { average_cores: null, sampled_seconds: 0 },
         memory_bytes: null, process_count: null,
       }) });
     });

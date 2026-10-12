@@ -18,15 +18,30 @@ const HISTORY: Duration = Duration::from_secs(15 * 60);
 #[derive(Clone, Debug, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct CpuLoadWindow {
+    /// Average observed CPU cores, not exhaustive process-group accounting.
     pub average_cores: Option<f64>,
-    pub coverage_seconds: f64,
+    /// Duration of valid sample intervals; does not imply complete CPU accounting.
+    pub sampled_seconds: f64,
+}
+
+/// CPU and memory are attributed only to live tracked bash process groups.
+/// Native sampling is approximate: children that finish between observations
+/// may be missed, and tracking ends when the handle becomes terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum WorkScopeLoadMeasurementBasis {
+    LiveTrackedBashGroups,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct WorkScopeLoadSummary {
     pub scope_key: String,
+    /// This summary observes surviving process identities in live tracked bash groups.
+    pub measurement_basis: WorkScopeLoadMeasurementBasis,
     pub sampled_at: DateTime<Utc>,
+    /// Zero means no tracked live jobs, not that the host is idle.
     pub live_jobs: u32,
     pub cpu_cores_latest: Option<f64>,
     pub cpu_sampled_at: Option<DateTime<Utc>>,
@@ -406,6 +421,7 @@ fn summarize(
     };
     WorkScopeLoadSummary {
         scope_key: key.clone(),
+        measurement_basis: WorkScopeLoadMeasurementBasis::LiveTrackedBashGroups,
         sampled_at: observation.map_or(sampled_at, |value| value.sampled_at),
         live_jobs: scoped.len().try_into().unwrap_or(u32::MAX),
         cpu_cores_latest: latest,
@@ -573,7 +589,7 @@ fn window(
     }
     CpuLoadWindow {
         average_cores: (coverage > 0.0).then_some(weighted / coverage),
-        coverage_seconds: coverage,
+        sampled_seconds: coverage,
     }
 }
 
@@ -788,7 +804,7 @@ mod tests {
         });
         let result = window(&history, "work:a", now, 60);
         assert_eq!(result.average_cores, Some(2.0));
-        assert!((result.coverage_seconds - 10.0).abs() < f64::EPSILON);
+        assert!((result.sampled_seconds - 10.0).abs() < f64::EPSILON);
         assert_eq!(window(&history, "work:b", now, 60).average_cores, None);
     }
     fn point(now: Instant, seconds: f64) -> CpuPoint {
@@ -956,7 +972,7 @@ mod tests {
         let summary = summarize_live(&state, after.at);
         assert_eq!(summary.cpu_cores_latest, None);
         assert_eq!(summary.cpu_sampled_at, None);
-        assert!(summary.cpu_one_minute.coverage_seconds.abs() < f64::EPSILON);
+        assert!(summary.cpu_one_minute.sampled_seconds.abs() < f64::EPSILON);
 
         let mut stable = point(after.at + CADENCE, 20.0);
         stable
@@ -974,7 +990,7 @@ mod tests {
         let summary = summarize_live(&state, stable.at);
         assert_eq!(summary.cpu_cores_latest, Some(1.5));
         assert!(
-            (summary.cpu_one_minute.coverage_seconds - CADENCE.as_secs_f64()).abs() < f64::EPSILON
+            (summary.cpu_one_minute.sampled_seconds - CADENCE.as_secs_f64()).abs() < f64::EPSILON
         );
     }
 
@@ -1053,7 +1069,7 @@ mod tests {
             },
         ]);
         let result = window(&history, "work:a", now, 60);
-        assert!((result.coverage_seconds - 15.0).abs() < f64::EPSILON);
+        assert!((result.sampled_seconds - 15.0).abs() < f64::EPSILON);
         assert_eq!(result.average_cores, Some(20.0 / 15.0));
         prune_history(&mut history, now + HISTORY);
         assert!(history.is_empty());
@@ -1138,7 +1154,7 @@ mod tests {
         assert_eq!(result.cpu_cores_latest, Some(0.0));
         assert_eq!(result.cpu_sampled_at, None);
         assert_eq!(result.cpu_one_minute.average_cores, Some(1.0));
-        assert!((result.cpu_one_minute.coverage_seconds - 5.0).abs() < f64::EPSILON);
+        assert!((result.cpu_one_minute.sampled_seconds - 5.0).abs() < f64::EPSILON);
         assert_eq!(result.memory_bytes, Some(0));
     }
 

@@ -12671,7 +12671,13 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .unwrap();
         assert_eq!(empty.memory_bytes, Some(0));
-        assert!(empty.cpu_one_minute.coverage_seconds.abs() < f64::EPSILON);
+        assert!(empty.cpu_one_minute.sampled_seconds.abs() < f64::EPSILON);
+        assert_eq!(empty.live_jobs, 0);
+        assert_eq!(empty.cpu_cores_latest, Some(0.0));
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["measurement_basis"],
+            "live_tracked_bash_groups"
+        );
         let Json(all) = super::get_all_work_scope_load(
             State(state),
             Query(super::WorkScopeActorQuery {

@@ -115,7 +115,7 @@ function formatCores(value: number | null): string {
 
 function WorkScopeLoadIndicator({ load }: { load: NonNullable<ReturnType<typeof useWorkScopeLoad>> }) {
   const summary = load.summary;
-  if (!summary) return <div className="ws-load" role="status">Load {load.status}</div>;
+  if (!summary) return <div className="ws-load" role="status">Sampled load {load.status}</div>;
   const windows = [
     ['1m', summary.cpu_one_minute],
     ['5m', summary.cpu_five_minutes],
@@ -124,13 +124,13 @@ function WorkScopeLoadIndicator({ load }: { load: NonNullable<ReturnType<typeof 
   const age = Math.max(0, Math.floor(load.age / 1000));
   const cpuAge = summary.cpu_sampled_at === null ? NaN : Math.max(0, Date.parse(summary.sampled_at) - Date.parse(summary.cpu_sampled_at)) + load.age;
   const cpuFresh = Number.isFinite(cpuAge) && cpuAge >= 0 && cpuAge <= LOAD_STALE_AFTER_MS;
-  const coverage = windows.map(([name, window]) => `${name}: ${Math.round(window.coverage_seconds)}s coverage`).join(' · ');
-  const idle = summary.live_jobs === 0 && summary.cpu_cores_latest === 0;
-  const cpuAgeLabel = idle ? 'CPU idle: no owned live bash jobs' : cpuFresh ? `CPU ${Math.floor(cpuAge / 1000)}s ago` : 'CPU latest unavailable';
+  const duration = windows.map(([name, window]) => `${name}: ${Math.round(window.sampled_seconds)}s sampled`).join(' · ');
+  const noTrackedJobs = summary.live_jobs === 0 && summary.cpu_cores_latest === 0;
+  const cpuAgeLabel = noTrackedJobs ? 'No tracked live jobs' : cpuFresh ? `CPU ${Math.floor(cpuAge / 1000)}s ago` : 'CPU latest unavailable';
   return (
-    <div className="ws-load" role="status" title={`Sampled ${age}s ago · Server sampled at ${summary.sampled_at} · ${cpuAgeLabel} · ${coverage}`}>
-      <span className="ws-load-label">Load</span>
-      <span>now {formatCores(idle || cpuFresh ? summary.cpu_cores_latest : null)}</span>
+    <div className="ws-load" role="status" title={`Sampled ${age}s ago · Server sampled at ${summary.sampled_at} · ${cpuAgeLabel} · ${duration} · Duration does not imply complete CPU accounting; short-lived children may be missed; tracking ends with handle`}>
+      <span className="ws-load-label">Sampled load</span>
+      <span>now {formatCores(noTrackedJobs || cpuFresh ? summary.cpu_cores_latest : null)}{noTrackedJobs ? ' · no tracked live jobs' : ''}</span>
       {windows.map(([name, window]) => <span key={name}>{name} {formatCores(window.average_cores)}</span>)}
       <span>mem {summary.memory_bytes == null ? '—' : formatBytes(summary.memory_bytes)}</span>
     </div>

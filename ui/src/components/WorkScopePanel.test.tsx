@@ -116,13 +116,14 @@ describe('WorkScope load indicator', () => {
   const scopeKey = 'work:attached-1';
   const sample = (over: Partial<WorkScopeLoadSummary> = {}): WorkScopeLoadSummary => ({
     scope_key: scopeKey,
+    measurement_basis: 'live_tracked_bash_groups',
     sampled_at: new Date().toISOString(),
     live_jobs: 2,
     cpu_cores_latest: 2.5,
     cpu_sampled_at: new Date().toISOString(),
-    cpu_one_minute: { average_cores: 1.25, coverage_seconds: 40 },
-    cpu_five_minutes: { average_cores: null, coverage_seconds: 40 },
-    cpu_fifteen_minutes: { average_cores: null, coverage_seconds: 40 },
+    cpu_one_minute: { average_cores: 1.25, sampled_seconds: 40 },
+    cpu_five_minutes: { average_cores: null, sampled_seconds: 40 },
+    cpu_fifteen_minutes: { average_cores: null, sampled_seconds: 40 },
     memory_bytes: 128 * 1024 * 1024,
     process_count: 3,
     ...over,
@@ -134,7 +135,7 @@ describe('WorkScope load indicator', () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it('renders latest, windows and memory without fabricating unavailable values; reveals coverage and age on hover', async () => {
+  it('renders latest, windows and memory without fabricating unavailable values; reveals sampled and age on hover', async () => {
     getInv.mockResolvedValue(inv([]));
     const fetchLoad = vi.fn().mockResolvedValue(reply(sample()));
     vi.stubGlobal('fetch', fetchLoad);
@@ -145,7 +146,9 @@ describe('WorkScope load indicator', () => {
     expect(screen.getByRole('status').textContent).toContain('5m —');
     expect(screen.getByRole('status').textContent).toContain('15m —');
     expect(screen.getByRole('status').textContent).toContain('mem 128.0 MB');
-    expect(screen.getByRole('status').getAttribute('title')).toContain('1m: 40s coverage');
+    expect(screen.getByRole('status').textContent).toContain('Sampled load');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('1m: 40s sampled');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('Duration does not imply complete CPU accounting; short-lived children may be missed; tracking ends with handle');
     expect(screen.getByRole('status').getAttribute('title')).toContain('Sampled 0s ago');
     expect(screen.getByRole('status').getAttribute('title')).toContain('CPU 0s ago');
   });
@@ -180,9 +183,10 @@ describe('WorkScope load indicator', () => {
       live_jobs: 0, cpu_cores_latest: 0, cpu_sampled_at: null, memory_bytes: 0,
     }))));
     await act(async () => { render(panel()); });
-    expect(screen.getByRole('status').textContent).toContain('now 0.00 cores');
+    expect(screen.getByRole('status').textContent).toContain('now 0.00 cores · no tracked live jobs');
     expect(screen.getByRole('status').textContent).toContain('1m 1.25 cores');
-    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU idle: no owned live bash jobs');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('No tracked live jobs');
+    expect(screen.getByRole('status').getAttribute('title')).not.toContain('idle');
   });
 
   it('uses the same inline load in the expanded conversation section', async () => {
@@ -196,7 +200,7 @@ describe('WorkScope load indicator', () => {
     getInv.mockResolvedValue(inv([]));
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample({
       cpu_cores_latest: null,
-      cpu_one_minute: { average_cores: 0.5, coverage_seconds: 5 },
+      cpu_one_minute: { average_cores: 0.5, sampled_seconds: 5 },
       memory_bytes: null,
     }))));
     await act(async () => { render(panel()); });
@@ -204,7 +208,7 @@ describe('WorkScope load indicator', () => {
     expect(indicator.textContent).toContain('now —');
     expect(indicator.textContent).toContain('1m 0.50 cores');
     expect(indicator.textContent).toContain('mem —');
-    expect(indicator.getAttribute('title')).toContain('1m: 5s coverage');
+    expect(indicator.getAttribute('title')).toContain('1m: 5s sampled');
     expect(indicator.textContent).not.toContain('0.00 cores');
   });
 
@@ -244,14 +248,14 @@ describe('WorkScope load indicator', () => {
     const fetchLoad = vi.fn().mockResolvedValue(reply(sample({
       cpu_sampled_at: null,
       cpu_cores_latest: 0,
-      cpu_one_minute: { average_cores: 0.5, coverage_seconds: 5 },
+      cpu_one_minute: { average_cores: 0.5, sampled_seconds: 5 },
     })));
     vi.stubGlobal('fetch', fetchLoad);
     const rendered = render(panel());
     await act(async () => { await Promise.resolve(); });
     expect(screen.getByRole('status').textContent).toContain('now —');
     expect(screen.getByRole('status').textContent).toContain('1m 0.50 cores');
-    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU latest unavailable · 1m: 5s coverage');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU latest unavailable · 1m: 5s sampled');
 
     await act(async () => { rendered.rerender(panel()); });
     const serverTime = new Date(Date.now() - 60 * 60_000).toISOString();
@@ -262,7 +266,7 @@ describe('WorkScope load indicator', () => {
     expect(screen.getByRole('status').getAttribute('title')).toContain('CPU latest unavailable');
     fetchLoad.mockImplementation(() => new Promise(() => {}));
     await act(async () => { vi.advanceTimersByTime(20000); });
-    expect(screen.getByRole('status').textContent).toBe('Load stale');
+    expect(screen.getByRole('status').textContent).toBe('Sampled load stale');
   });
 
   it('shows unavailable rather than stale numbers after an error and hides old samples when aged out', async () => {
@@ -272,7 +276,7 @@ describe('WorkScope load indicator', () => {
     vi.stubGlobal('fetch', fetchLoad);
     await act(async () => { render(panel()); });
     await act(async () => { vi.advanceTimersByTime(5000); });
-    expect(screen.getByRole('status').textContent).toBe('Load unavailable');
+    expect(screen.getByRole('status').textContent).toBe('Sampled load unavailable');
     expect(screen.queryByText(/2.50 cores/)).toBeNull();
   });
 
@@ -284,7 +288,7 @@ describe('WorkScope load indicator', () => {
     await act(async () => { render(panel()); });
     await act(async () => { vi.advanceTimersByTime(20000); });
     expect(fetchLoad).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole('status').textContent).toBe('Load stale');
+    expect(screen.getByRole('status').textContent).toBe('Sampled load stale');
   });
 
   it('drops late results after a scope switch and requests only the new attached scope', async () => {

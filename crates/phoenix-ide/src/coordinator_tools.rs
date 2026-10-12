@@ -226,7 +226,7 @@ impl Tool for WorkScopeLoadTool {
     }
 
     fn description(&self) -> String {
-        "Read owned bash process-group CPU cores (latest and 1/5/15-minute available history) and fresh proportional memory for one WorkScope or all WorkScopes. Detached descendants and host resources are excluded.".into()
+        "Read sampled, approximate CPU cores (latest and 1/5/15-minute available history) and fresh proportional memory for live tracked bash process groups in one WorkScope or all WorkScopes. Only surviving observed process identities count: short-lived native children may be missed between five-second samples, and tracking ends when a handle becomes terminal. Sampled duration is not completeness. Detached descendants and host resources are excluded.".into()
     }
 
     fn input_schema(&self) -> Value {
@@ -1649,6 +1649,10 @@ mod tests {
                 phoenix_terminal::ActiveTerminals::new(),
             ),
         };
+        let description = tool.description();
+        assert!(description.contains("short-lived native children may be missed"));
+        assert!(description.contains("tracking ends when a handle becomes terminal"));
+        assert!(description.contains("Sampled duration is not completeness"));
         assert!(!tool
             .run(json!({}), context("ordinary-load"))
             .await
