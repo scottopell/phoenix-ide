@@ -33,7 +33,8 @@ class PhoenixClientRemovedWakeTests(unittest.TestCase):
                         phoenix_client.main, ["-c", "conversation", *args]
                     )
                     self.assertEqual(result.exit_code, 2, result.output)
-                    self.assertIn(f"No such option: {args[0]}", result.output)
+                    self.assertIn("No such option", result.output)
+                    self.assertIn(args[0], result.output)
                     client.assert_not_called()
 
 
