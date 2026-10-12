@@ -18923,6 +18923,72 @@ mod wake_handler_tests {
     }
 
     #[tokio::test]
+    async fn retrieval_status_requires_auth_and_reports_successful_search() {
+        let mut state = make_test_state().await;
+        state.password = Some("retrieval-status-test-password".to_string());
+        state
+            .db
+            .create_conversation("retrieval-ready", "ready", "/tmp/ready", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "retrieval-hit",
+                "retrieval-ready",
+                &crate::db::MessageContent::user("reconciliationcanary"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let retriever = Arc::new(state.db.fts_retriever());
+        retriever.reconcile().await.unwrap();
+        state.message_retriever = retriever;
+        let router = create_router(state);
+        let unauthenticated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/deployment/retrieval")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        for path in [
+            "/api/deployment/retrieval",
+            "/api/conversations/search?q=reconciliationcanary",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            "Bearer retrieval-status-test-password",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            if path == "/api/deployment/retrieval" {
+                assert_eq!(payload["state"], "ready");
+            } else {
+                assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn deployment_sqlite_workload_rejects_invalid_window_values() {
         let state = make_test_state().await;
         let response = create_router(state)

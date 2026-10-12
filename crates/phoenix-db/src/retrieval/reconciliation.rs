@@ -62,8 +62,6 @@ pub(super) type SharedStatus = Arc<Mutex<ReconciliationStatus>>;
 /// including when its future is cancelled before its first poll.
 pub struct ReconciliationRun {
     status: SharedStatus,
-    progress: ReconciliationProgress,
-    finished: bool,
 }
 
 impl ReconciliationRun {
@@ -79,39 +77,39 @@ impl ReconciliationRun {
             }
             *current = ReconciliationStatus::Running { progress };
         }
-        Ok(Self {
-            status,
-            progress,
-            finished: false,
-        })
+        Ok(Self { status })
     }
 
     /// # Panics
     /// Panics if the status mutex was poisoned.
     pub fn phase(&mut self, phase: ReconciliationPhase) {
-        self.progress.phase = phase;
-        self.publish();
+        if let ReconciliationStatus::Running { progress } =
+            &mut *self.status.lock().expect("reconciliation status lock")
+        {
+            progress.phase = phase;
+        }
     }
 
     /// # Panics
     /// Panics if the status mutex was poisoned.
     pub fn message_processed(&mut self) {
-        self.progress.processed_messages += 1;
-        self.publish();
-    }
-
-    fn publish(&self) {
-        *self.status.lock().expect("reconciliation status lock") = ReconciliationStatus::Running {
-            progress: self.progress,
-        };
+        if let ReconciliationStatus::Running { progress } =
+            &mut *self.status.lock().expect("reconciliation status lock")
+        {
+            progress.processed_messages += 1;
+        }
     }
 
     /// Publish the orchestration owner's terminal result.
     ///
     /// # Panics
     /// Panics if the status mutex was poisoned.
-    pub fn complete(mut self, result: &Result<super::ReconcileStats, RetrievalError>) {
-        let status = match result {
+    pub fn complete(self, result: &Result<super::ReconcileStats, RetrievalError>) {
+        let mut current = self.status.lock().expect("reconciliation status lock");
+        let ReconciliationStatus::Running { progress } = *current else {
+            return;
+        };
+        *current = match result {
             Ok(_) => ReconciliationStatus::Ready,
             Err(error) => {
                 let reason = match error {
@@ -120,27 +118,31 @@ impl ReconciliationRun {
                             extended_code: error.code().and_then(|code| code.parse().ok()),
                         }
                     }
-                    _ => ReconciliationFailure::Other,
+                    RetrievalError::Db(_)
+                    | RetrievalError::MessageDecode(_)
+                    | RetrievalError::AlreadyStarted => ReconciliationFailure::Other,
                 };
-                ReconciliationStatus::Failed {
-                    progress: self.progress,
-                    reason,
-                }
+                ReconciliationStatus::Failed { progress, reason }
             }
         };
-        *self.status.lock().expect("reconciliation status lock") = status;
-        self.finished = true;
     }
 }
 
 impl Drop for ReconciliationRun {
     fn drop(&mut self) {
-        if !self.finished {
-            *self.status.lock().expect("reconciliation status lock") =
-                ReconciliationStatus::Failed {
-                    progress: self.progress,
+        let interrupted = {
+            let mut current = self.status.lock().expect("reconciliation status lock");
+            if let ReconciliationStatus::Running { progress } = *current {
+                *current = ReconciliationStatus::Failed {
+                    progress,
                     reason: ReconciliationFailure::Interrupted,
                 };
+                true
+            } else {
+                false
+            }
+        };
+        if interrupted {
             tracing::warn!("conversation retrieval reconciliation interrupted before completion");
         }
     }

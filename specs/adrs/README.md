@@ -110,6 +110,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [094](094_owner-and-peer-credential-domains-are-disjoint.md) | Owner and peer credential domains are structurally disjoint | Accepted | REQ-AUTH-002, REQ-AUTH-009; `OwnerPassword`, `PeerBearerCredential` |
 | [095](095_workscope-cpu-history-and-demand-memory.md) | WorkScope CPU history with demand-driven memory | Accepted | REQ-WSLOAD-001–005, REQ-DEPLOY-007a |
 | [096](096_sampled-live-job-resource-visibility.md) | Sampled live-job visibility, not exhaustive accounting | Accepted | REQ-WSLOAD-001/002/005 |
+| [097](097_bounded-retrieval-reconciliation.md) | Bounded orphan pruning and terminal retrieval readiness | Accepted | REQ-RET-003 |
 
 ## For agents: which decisions bind your task
 
