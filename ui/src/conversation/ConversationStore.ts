@@ -1,6 +1,6 @@
 import { createInitialAtom, conversationReducer } from './atom';
 import type { ConversationAtom, SSEAction } from './atom';
-import type { CachedPrSummary, Conversation } from '../api';
+import type { CachedPrSummary, Conversation, ProductConversationSnapshotView } from '../api';
 import { RoutedStore } from './RoutedStore';
 import { notifyConversationSnapshotChange, notifyProductConversationListMayHaveChanged } from '../notifications';
 import { parseConversationState } from '../utils';
@@ -16,6 +16,14 @@ function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary
     && a.base === b.base
     && a.head === b.head;
 }
+
+export type TranscriptAuthority =
+  | { kind: 'live' }
+  | { kind: 'snapshot' }
+  | { kind: 'awaiting_init'; connectionId: symbol | null };
+
+const LIVE_TRANSCRIPT: TranscriptAuthority = { kind: 'live' };
+const SNAPSHOT_TRANSCRIPT: TranscriptAuthority = { kind: 'snapshot' };
 
 interface SnapshotUpsertOptions {
   allowEqualTimestampSlugMove?: boolean;
@@ -52,13 +60,57 @@ interface SnapshotUpsertOptions {
  */
 export class ConversationStore extends RoutedStore<string, ConversationAtom, SSEAction> {
   private slugByConvId = new Map<string, string>();
+  private transcriptAuthorityById = new Map<string, TranscriptAuthority>();
+  private connectionIdsByKey = new Map<string, symbol>();
+
+  getTranscriptAuthority(conversationId: string): TranscriptAuthority {
+    return this.transcriptAuthorityById.get(conversationId) ?? LIVE_TRANSCRIPT;
+  }
+
+  observeProductConversationSnapshot(snapshot: ProductConversationSnapshotView): void {
+    const id = snapshot.latest_transcript_row_id;
+    const current = this.getTranscriptAuthority(id);
+    if (snapshot.ordinary_lifecycle !== 'open' || snapshot.close?.outcome === 'close_incomplete') {
+      if (current.kind === 'snapshot') return;
+      this.transcriptAuthorityById.set(id, SNAPSHOT_TRANSCRIPT);
+    } else if (current.kind === 'snapshot') {
+      this.transcriptAuthorityById.set(id, { kind: 'awaiting_init', connectionId: null });
+    } else {
+      return;
+    }
+    this.notifyChanged(id);
+  }
+
 
   constructor() {
     super(() => createInitialAtom(), conversationReducer);
   }
 
   override dispatch(slug: string, action: SSEAction): void {
-    super.dispatch(slug, action);
+    if (action.type === 'sse_init' && action.connectionId !== undefined
+      && action.connectionId !== this.connectionIdsByKey.get(slug)) return;
+    const current = this.getSnapshot(slug);
+    const next = conversationReducer(current, action);
+    if (next === current) return;
+    if (action.type === 'connection_reset') this.connectionIdsByKey.delete(slug);
+    if (action.type === 'connection_opened' && action.connectionId !== undefined) {
+      this.connectionIdsByKey.set(slug, action.connectionId);
+      const authority = this.getTranscriptAuthority(slug);
+      if (authority.kind === 'awaiting_init') {
+        this.transcriptAuthorityById.set(slug, { kind: 'awaiting_init', connectionId: action.connectionId });
+      }
+    }
+    if (action.type === 'sse_init') {
+      const authority = this.getTranscriptAuthority(slug);
+      if (authority.kind === 'awaiting_init' && authority.connectionId !== null
+        && action.connectionId === authority.connectionId
+        && action.epoch === current.connectionEpoch
+        && action.payload.conversation.id === slug
+        && action.payload.transcriptCoverage !== 'preserve') {
+        this.transcriptAuthorityById.set(slug, LIVE_TRANSCRIPT);
+      }
+    }
+    this.setAtom(slug, next);
     if (action.type === 'sse_init' || action.type === 'set_initial_data') {
       this.indexDirectHydration(slug);
     }
@@ -301,6 +353,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    * any-listener so list-derivation hooks recompute.
    */
   remove(slug: string): void {
+    this.connectionIdsByKey.delete(slug);
     const existing = this.atomByKey(slug);
     if (existing) {
       const convId = existing.conversation?.id;
@@ -310,6 +363,8 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
   }
 
   removeByConversationId(convId: string): string[] {
+    this.transcriptAuthorityById.delete(convId);
+    this.connectionIdsByKey.delete(convId);
     const removed: string[] = [];
     for (const [slug, atom] of this.entries()) {
       if (atom.conversation?.id !== convId) continue;

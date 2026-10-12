@@ -316,6 +316,7 @@ describe('latest assistant expansion in compact mode', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -340,6 +341,7 @@ describe('MessageList', () => {
   it('claims find only while open, refocuses on repeat, and closes from transcript body', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -375,6 +377,7 @@ describe('MessageList', () => {
   it('falls back to the live transcript when the find focus origin was virtualized away', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -402,6 +405,7 @@ describe('MessageList', () => {
     const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'hidden alpha match' }] } as Message;
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[message]}
         pendingMessages={[]}
         convState={idleState}
@@ -430,6 +434,7 @@ describe('MessageList', () => {
     const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha row match' }] } as Message;
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[message]}
         pendingMessages={[]}
         convState={idleState}
@@ -461,6 +466,7 @@ describe('MessageList', () => {
     ];
     const { rerender } = render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={initialMessages}
         pendingMessages={[]}
         convState={idleState}
@@ -482,6 +488,7 @@ describe('MessageList', () => {
 
     rerender(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={initialMessages.slice(0, 2)}
         pendingMessages={[]}
         convState={idleState}
@@ -503,6 +510,7 @@ describe('MessageList', () => {
   it('searches expanded system prompt text when visible in the transcript header', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -525,6 +533,7 @@ describe('MessageList', () => {
   it('reveals and highlights the expanded system prompt header match instead of scrolling to a row', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -558,6 +567,7 @@ describe('MessageList', () => {
       <ConversationContext.Provider value={store}>
         <FocusScopeProvider>
           <MessageList
+            streamingRequestId={null}
             slug="conv-stream-find"
             messages={messages}
             pendingMessages={[]}
@@ -601,6 +611,7 @@ describe('MessageList', () => {
   it('does not build transcript matches while find is closed or queryless', async () => {
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
@@ -625,6 +636,7 @@ describe('MessageList', () => {
     render(withConvContext(
       <PushScopeOnMount scopeId="overlay-scope">
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1)]}
           pendingMessages={[]}
           convState={idleState}
@@ -654,6 +666,7 @@ describe('MessageList', () => {
 
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[skillMessage]}
         pendingMessages={[]}
         convState={idleState}
@@ -677,6 +690,7 @@ describe('MessageList', () => {
 
     render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[]}
         pendingMessages={[]}
         convState={awaitingState}
@@ -711,6 +725,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[skillMessage]}
           pendingMessages={[]}
           convState={idleState}
@@ -755,6 +770,7 @@ describe('MessageList', () => {
     const { container, rerender } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[pending]}
           convState={idleState}
@@ -778,6 +794,7 @@ describe('MessageList', () => {
     rerender(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[
             ...historical,
             {
@@ -817,6 +834,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -841,6 +859,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -904,6 +923,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -926,6 +946,7 @@ describe('MessageList', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             ref={listRef}
             messages={historical}
             pendingMessages={[]}
@@ -963,7 +984,7 @@ describe('MessageList', () => {
 
   it('positions an admitted source call even when ordinary history positioning is idle', () => {
     const source = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'Sending' }, { type: 'tool_use', id: 'source-tool', name: 'send_conversation_message', input: { message: 'payload' } }] } as Message;
-    render(withConvContext(<MessageList messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="source-member" transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source-member', generation: 1, transcriptGeneration: 1 } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="source-member" transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source-member', generation: 1, transcriptGeneration: 1 } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(0, 'start', 0, '[data-tool-id="source-tool"]');
   });
 
@@ -973,6 +994,7 @@ describe('MessageList', () => {
     const second = { ...makeMessage(2, 'agent'), content: [{ type: 'tool_use', id: 'group-use-2', name: 'search', input: { pattern: 'two' } }] } as Message;
     const { container } = render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         ref={listRef}
         messages={[first, second]}
         pendingMessages={[]}
@@ -1001,6 +1023,7 @@ describe('MessageList', () => {
     virtualTranscriptMock.renderedIndices = new Set([0]);
     const renderList = () => withConvContext(
       <MessageList
+        streamingRequestId={null}
         ref={listRef}
         messages={historical}
         pendingMessages={[]}
@@ -1037,6 +1060,7 @@ describe('MessageList', () => {
     virtualTranscriptMock.renderedIndices = new Set();
     const renderList = (conversationId: string) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         ref={listRef}
         messages={messages}
         pendingMessages={[]}
@@ -1065,6 +1089,7 @@ describe('MessageList', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1104,6 +1129,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1143,6 +1169,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1173,6 +1200,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onVisibleRangeChange = vi.fn();
     const renderList = (historyScrollCommand?: HistoryScrollCommand) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1239,6 +1267,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1274,6 +1303,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1300,6 +1330,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1332,6 +1363,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1364,6 +1396,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1396,6 +1429,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1435,6 +1469,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1464,6 +1499,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1488,6 +1524,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const currentHistoryView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const renderList = (historyScrollCommand: HistoryScrollCommand) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1524,6 +1561,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onHistoryScrollCommandHandled = vi.fn();
     const renderList = (historyScrollCommand: HistoryScrollCommand | null) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -1592,6 +1630,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onHistoryScrollCommandHandled = vi.fn();
     const renderList = (historyScrollCommand: HistoryScrollCommand | null) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -1618,6 +1657,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     const { unmount } = render(withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -1651,6 +1691,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(withConvContext(
       <>
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1677,6 +1718,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     render(withConvContext(
       <StrictMode>
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1702,6 +1744,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const renderList = (command: HistoryScrollCommand) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1731,6 +1774,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onHistoryScrollCommandHandled = vi.fn();
     const renderList = (historyScrollCommand: HistoryScrollCommand | null) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -1757,6 +1801,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1783,6 +1828,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onVisibleRangeChange = vi.fn();
     const renderList = (conversationId: string, token: number) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1816,6 +1862,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const onHistoryScrollCommandHandled = vi.fn();
     const renderList = (conversationId: string, token: number) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={messages}
         pendingMessages={[]}
         convState={idleState}
@@ -1849,6 +1896,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const { container, unmount } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={[]}
           convState={idleState}
@@ -1880,6 +1928,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           ref={listRef}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
           pendingMessages={[]}
@@ -1932,6 +1981,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -1981,6 +2031,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2028,6 +2079,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2063,6 +2115,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2100,6 +2153,7 @@ describe('history expansion feedback', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2143,6 +2197,7 @@ describe('history expansion feedback', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2181,6 +2236,7 @@ describe('history expansion feedback', () => {
     const onLoadOlderMessages = vi.fn();
     const renderList = (conversationId: string) => withConvContext(
       <MessageList
+        streamingRequestId={null}
         messages={[makeMessage(1, 'user')]}
         pendingMessages={[]}
         convState={idleState}
@@ -2206,6 +2262,7 @@ describe('history expansion feedback', () => {
     render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[makeMessage(1, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2245,6 +2302,7 @@ describe('render-unit identity across state ticks', () => {
     const { rerender } = render(
       wrap(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={pending}
           convState={idleState}
@@ -2264,6 +2322,7 @@ describe('render-unit identity across state ticks', () => {
     rerender(
       wrap(
         <MessageList
+          streamingRequestId={null}
           messages={messages}
           pendingMessages={pending}
           convState={{ type: 'awaiting_llm' }}
@@ -2281,6 +2340,7 @@ describe('render-unit identity across state ticks', () => {
     rerender(
       wrap(
         <MessageList
+          streamingRequestId={null}
           messages={[...messages, makeMessage(4, 'agent')]}
           pendingMessages={pending}
           convState={{ type: 'awaiting_llm' }}
@@ -2317,6 +2377,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2351,6 +2412,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2386,6 +2448,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container, rerender } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[]}
           pendingMessages={[]}
           convState={idleState}
@@ -2407,6 +2470,7 @@ describe('handleTotalListHeightChanged', () => {
     rerender(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'))}
           pendingMessages={[]}
           convState={idleState}
@@ -2430,6 +2494,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container, rerender } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historicalA}
           pendingMessages={[]}
           convState={idleState}
@@ -2459,6 +2524,7 @@ describe('handleTotalListHeightChanged', () => {
     rerender(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historicalB}
           pendingMessages={[]}
           convState={idleState}
@@ -2496,6 +2562,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2541,6 +2608,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2588,6 +2656,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2648,6 +2717,7 @@ describe('handleTotalListHeightChanged', () => {
     ['conversation reset', (_scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
       rerender(withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'))}
           pendingMessages={[]}
           convState={idleState}
@@ -2672,6 +2742,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container, rerender } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2691,6 +2762,7 @@ describe('handleTotalListHeightChanged', () => {
 
       rerender(withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={[...historical, makeMessage(6, 'user')]}
           pendingMessages={[]}
           convState={idleState}
@@ -2722,6 +2794,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={subAgentsState}
@@ -2760,6 +2833,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2790,6 +2864,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -2828,6 +2903,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2874,6 +2950,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={idleState}
@@ -2930,6 +3007,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -2975,6 +3053,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -3026,6 +3105,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -3089,6 +3169,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -3137,6 +3218,7 @@ describe('handleTotalListHeightChanged', () => {
       const { container } = render(
         withConvContext(
           <MessageList
+            streamingRequestId={null}
             messages={historical}
             pendingMessages={[]}
             convState={subAgentsState}
@@ -3191,6 +3273,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3225,6 +3308,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3269,6 +3353,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -3303,6 +3388,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3347,6 +3433,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3390,6 +3477,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3442,6 +3530,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3487,6 +3576,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3534,6 +3624,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3584,6 +3675,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -3638,6 +3730,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -3684,6 +3777,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3727,6 +3821,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           ref={listRef}
           messages={historical}
           pendingMessages={[]}
@@ -3764,6 +3859,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3811,6 +3907,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           ref={listRef}
           messages={historical}
           pendingMessages={[]}
@@ -3869,6 +3966,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3912,6 +4010,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -3955,6 +4054,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
@@ -4010,6 +4110,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           ref={listRef}
           messages={historical}
           pendingMessages={[]}
@@ -4050,6 +4151,7 @@ describe('handleTotalListHeightChanged', () => {
     const { container } = render(
       withConvContext(
         <MessageList
+          streamingRequestId={null}
           messages={historical}
           pendingMessages={[]}
           convState={idleState}
@@ -4109,6 +4211,7 @@ it('find navigation searches the canonical patch display diff and carries its ty
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}
@@ -4156,6 +4259,7 @@ it('find navigation carries read_file fragment reveal target for offscreen navig
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}
@@ -4207,6 +4311,7 @@ it('find navigation carries keyword_search fragment reveal target for offscreen 
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}
@@ -4251,6 +4356,7 @@ it('find navigation carries search fragment reveal target for offscreen navigati
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}
@@ -4281,6 +4387,7 @@ it('find navigation requests reveal for compact hidden assistant second-line mat
 
   render(withConvContext(
     <MessageList
+      streamingRequestId={null}
       messages={messages}
       pendingMessages={[]}
       convState={idleState}

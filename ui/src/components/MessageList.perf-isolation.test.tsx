@@ -20,6 +20,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { forwardRef, Profiler, type ProfilerOnRenderCallback } from 'react';
 import { act, render } from '@testing-library/react';
 import { MessageList } from './MessageList';
+import { useConversationView } from '../conversation/useConversationAtom';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 import type { ConversationState, Message } from '../api';
@@ -147,6 +148,11 @@ const idle: ConversationState = { type: 'idle' };
 const EMPTY_PENDING: never[] = [];
 const NOOP_RETRY = () => {};
 
+function OwnedMessageList(props: React.ComponentProps<typeof MessageList> & { slug: string }) {
+  const [view] = useConversationView(props.slug);
+  return <MessageList {...props} streamingRequestId={view.streamingRequestId} />;
+}
+
 describe('MessageList streaming-isolation perf invariant', () => {
   it('per-token streaming commits the leaf but NOT MessageListImpl (REQ-MLRU-010)', () => {
     const slug = 'perf-conv';
@@ -171,7 +177,8 @@ describe('MessageList streaming-isolation perf invariant', () => {
       return (
         <ConversationContext.Provider value={store}>
           <Profiler id="message-list" onRender={messageListCounter.onRender}>
-            <MessageList
+            <OwnedMessageList
+              streamingRequestId={null}
               messages={seedMessages}
               pendingMessages={EMPTY_PENDING}
               convState={llmRequesting}
@@ -197,15 +204,6 @@ describe('MessageList streaming-isolation perf invariant', () => {
     // Log what triggered baseline commits for diagnosis if perf regresses.
     console.info('[perf-isolation] baseline commits:', messageListCounter.count.phases.slice());
 
-    // Dispatch a 100-token burst directly into the store. Each
-    // dispatch triggers useSyncExternalStore notify → React schedules
-    // an update for subscribers whose getSnapshot returned a different
-    // value. useStreamingRequestId returns the same string (the
-    // session's request_id) for every token, so MessageList should NOT
-    // re-commit. useStreamingBuffer returns a fresh buffer ref on
-    // every token, so StreamingMessage SHOULD re-commit (the rAF
-    // coalescing inside the leaf is a separate concern from the
-    // commit count we're measuring here).
     act(() => {
       for (let i = 0; i < 100; i++) {
         store.dispatch(slug, {
@@ -221,16 +219,6 @@ describe('MessageList streaming-isolation perf invariant', () => {
     const messageListDeltaCommits = afterStreamingMessageListCommits - baselineMessageListCommits;
     console.info('[perf-isolation] all commits:', messageListCounter.count.phases.slice());
 
-    // The hard claim: per-token streaming triggers AT MOST ONE
-    // <MessageListImpl> commit — the streaming-start transition where
-    // useStreamingRequestId returns its first non-null value and the
-    // streamingHandle key materialises (adding the streaming_agent
-    // TailUnit). Tokens 2..N keep request_id stable; their dispatches
-    // notify subscribers, but useStreamingRequestId's getSnapshot
-    // returns the same string, so MessageList stays memo'd.
-    //
-    // Without this isolation, the delta would be ~100 (one commit per
-    // token). With it, the delta is 1, regardless of burst size.
     expect(messageListDeltaCommits).toBeLessThanOrEqual(1);
 
     // Surface a one-line summary for human reading when the test runs.
@@ -258,7 +246,8 @@ describe('MessageList streaming-isolation perf invariant', () => {
       return (
         <ConversationContext.Provider value={store}>
           <Profiler id="message-list" onRender={counter.onRender}>
-            <MessageList
+            <OwnedMessageList
+              streamingRequestId={null}
               messages={seed}
               pendingMessages={EMPTY_PENDING}
               convState={convState}
@@ -277,10 +266,6 @@ describe('MessageList streaming-isolation perf invariant', () => {
     const { rerender } = render(<Harness convState={idle} />);
     const baseline = counter.count.total;
 
-    // Transition phase to llm_requesting AND emit a first token —
-    // streamingBuffer goes from null to non-null, useStreamingRequestId
-    // returns a string where it previously returned null. MessageList
-    // memo breaks; one commit expected.
     act(() => {
       store.dispatch(slug, {
         type: 'sse_state_change',
