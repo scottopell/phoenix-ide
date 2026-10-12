@@ -740,4 +740,3 @@ AND SHALL retain exact source-transcript and source-tool evidence selection unti
 AND SHALL preserve unrelated query parameters and browser history when navigating boundaries
 
 Global aggregate history SHALL NOT acquire ordinary Open/History lifecycle, Close actions, work identity, or ordinary mutation authority. Native Swift navigation is outside this web contract.
-
