@@ -279,19 +279,22 @@ impl AppState {
         runtime.require_startup_local_authority()?;
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();
-        // Retrieval works on existing index rows while this sweep runs and
-        // reports `index_reconciled()` when complete.
         {
             let retriever = retriever.clone();
             let runtime = Arc::clone(&runtime);
+            let mut run = retriever
+                .start_reconciliation()
+                .map_err(std::io::Error::other)?;
             tokio::spawn(async move {
                 let result = async {
                     use phoenix_db::retrieval::{
-                        Fts5Retriever, FtsMessageReconcileOutcome, ReconcileStats, RetrievalError,
+                        Fts5Retriever, FtsMessageReconcileOutcome, ReconcileStats,
+                        ReconciliationPhase, RetrievalError,
                     };
                     let plan = retriever.discover_reconcile_plan().await?;
                     let mut stats = ReconcileStats::default();
                     if Fts5Retriever::locator_repair_required(&plan) {
+                        run.phase(ReconciliationPhase::LocatorRepair);
                         let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
                             RetrievalError::Db(sqlx::Error::Protocol(
                                 "fatal local authority closed during retrieval reconciliation"
@@ -300,6 +303,7 @@ impl AppState {
                         })?;
                         retriever.repair_locator_rows().await?;
                     }
+                    run.phase(ReconciliationPhase::Messages);
                     for message in Fts5Retriever::messages(plan) {
                         let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
                             RetrievalError::Db(sqlx::Error::Protocol(
@@ -312,7 +316,9 @@ impl AppState {
                             FtsMessageReconcileOutcome::Indexed => stats.indexed += 1,
                             FtsMessageReconcileOutcome::Reindexed => stats.reindexed += 1,
                         }
+                        run.message_processed();
                     }
+                    run.phase(ReconciliationPhase::Pruning);
                     let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
                         RetrievalError::Db(sqlx::Error::Protocol(
                             "fatal local authority closed during retrieval reconciliation"
@@ -320,10 +326,10 @@ impl AppState {
                         ))
                     })?;
                     stats.pruned = retriever.prune_orphans().await?;
-                    retriever.mark_reconciled();
                     Ok::<_, RetrievalError>(stats)
                 }
                 .await;
+                run.complete(&result);
                 match result {
                     Ok(stats) => tracing::info!(
                         indexed = stats.indexed,
@@ -333,7 +339,7 @@ impl AppState {
                     ),
                     Err(e) => tracing::warn!(
                         error = %e,
-                        "conversation retrieval index reconcile failed; recall may be incomplete until next startup"
+                        "conversation retrieval index reconcile failed; search unavailable until next startup"
                     ),
                 }
             });

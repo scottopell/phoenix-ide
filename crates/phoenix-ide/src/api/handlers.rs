@@ -528,6 +528,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/version", get(get_version_json))
         // About this deployment diagnostics
         .route("/api/deployment", get(super::deployment::deployment_info))
+        .route("/api/deployment/retrieval", get(retrieval_status))
         .route(
             "/api/about/resources",
             get(super::deployment::about_resources),
@@ -1315,6 +1316,12 @@ fn clamp_conversation_search_limit(limit: Option<usize>) -> usize {
         .clamp(1, MAX_CONVERSATION_SEARCH_LIMIT)
 }
 
+async fn retrieval_status(
+    State(state): State<AppState>,
+) -> Json<phoenix_db::retrieval::ReconciliationStatus> {
+    Json(state.message_retriever.reconciliation_status())
+}
+
 async fn search_conversations(
     State(state): State<AppState>,
     Query(query): Query<ConversationSearchQuery>,
@@ -1323,12 +1330,19 @@ async fn search_conversations(
     if q.is_empty() {
         return Ok(Json(ConversationSearchResponse { hits: Vec::new() }));
     }
-    if !state.message_retriever.index_reconciled() {
+    let status = state.message_retriever.reconciliation_status();
+    if let Some(message) = status.unavailable_message() {
         return Err(AppError::TypedBadRequest {
-            message:
-                "the global message index is still warming; try again after startup reconciliation completes"
-                    .to_string(),
-            error_type: "conversation_search_warming".to_string(),
+            message: message.to_string(),
+            error_type: if matches!(
+                status,
+                phoenix_db::retrieval::ReconciliationStatus::Failed { .. }
+            ) {
+                "conversation_search_failed"
+            } else {
+                "conversation_search_warming"
+            }
+            .to_string(),
         });
     }
     let limit = clamp_conversation_search_limit(query.limit);
@@ -18875,6 +18889,37 @@ mod wake_handler_tests {
             .expect("body bytes");
         let payload: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(payload["error_type"], "conversation_search_warming");
+    }
+
+    #[tokio::test]
+    async fn retrieval_status_reports_failed_and_search_does_not_call_it_warming() {
+        let mut state = make_test_state().await;
+        let retriever = Arc::new(state.db.fts_retriever());
+        let run = retriever.start_reconciliation().unwrap();
+        drop(run);
+        state.message_retriever = retriever;
+        let router = create_router(state);
+        for (path, expected) in [
+            ("/api/deployment/retrieval", StatusCode::OK),
+            ("/api/conversations/search?q=test", StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            if expected == StatusCode::OK {
+                assert_eq!(payload["state"], "failed");
+                assert_eq!(payload["reason"]["kind"], "interrupted");
+            } else {
+                assert_eq!(payload["error_type"], "conversation_search_failed");
+            }
+        }
     }
 
     #[tokio::test]

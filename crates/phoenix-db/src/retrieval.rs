@@ -14,8 +14,14 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+mod reconciliation;
+use reconciliation::SharedStatus;
+pub use reconciliation::{
+    ReconciliationFailure, ReconciliationPhase, ReconciliationProgress, ReconciliationRun,
+    ReconciliationStatus,
+};
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -195,6 +201,8 @@ pub struct RetrievedChunk {
 /// Error from a retrieval or index-maintenance operation.
 #[derive(Debug, Error)]
 pub enum RetrievalError {
+    #[error("startup reconciliation has already been started")]
+    AlreadyStarted,
     /// The backing SQLite/FTS5 query failed.
     #[error("retrieval query failed: {0}")]
     Db(#[from] sqlx::Error),
@@ -220,7 +228,11 @@ pub trait MessageRetriever: Send + Sync {
     /// Whether startup reconciliation has completed. Consumers that query broad
     /// scopes use this to avoid treating a warming derived index as
     /// authoritative.
-    fn index_reconciled(&self) -> bool;
+    fn reconciliation_status(&self) -> ReconciliationStatus;
+
+    fn index_reconciled(&self) -> bool {
+        self.reconciliation_status() == ReconciliationStatus::Ready
+    }
 
     /// Whether the index **fully and freshly** covers the given conversations:
     /// every message present AND its indexed `content_hash` matching the
@@ -262,7 +274,7 @@ pub enum FtsMessageReconcileOutcome {
 /// Lexical (FTS5/BM25) retrieval backend.
 pub struct Fts5Retriever {
     pool: SqlitePool,
-    reconciled: Arc<AtomicBool>,
+    reconciliation: SharedStatus,
     sqlite_workload_collector: SqliteWorkloadCollector,
     #[cfg(test)]
     source_snapshot_test_barrier: Option<Arc<SourceSnapshotTestBarrier>>,
@@ -281,7 +293,7 @@ impl Fts5Retriever {
     pub fn new(pool: SqlitePool, sqlite_workload_collector: SqliteWorkloadCollector) -> Self {
         Self {
             pool,
-            reconciled: Arc::new(AtomicBool::new(false)),
+            reconciliation: Arc::new(Mutex::new(ReconciliationStatus::Pending)),
             sqlite_workload_collector,
             #[cfg(test)]
             source_snapshot_test_barrier: None,
@@ -310,7 +322,25 @@ impl Fts5Retriever {
     /// lets a consumer distinguish "no in-scope match" from "index warming").
     #[must_use]
     pub fn index_reconciled(&self) -> bool {
-        self.reconciled.load(Ordering::Acquire)
+        self.reconciliation_status() == ReconciliationStatus::Ready
+    }
+
+    /// # Panics
+    /// Panics if another holder poisoned the status mutex.
+    #[must_use]
+    pub fn reconciliation_status(&self) -> ReconciliationStatus {
+        *self
+            .reconciliation
+            .lock()
+            .expect("reconciliation status lock")
+    }
+
+    /// Admit the single startup attempt for this retriever.
+    ///
+    /// # Errors
+    /// Returns `AlreadyStarted` if an attempt has already been admitted.
+    pub fn start_reconciliation(&self) -> Result<ReconciliationRun, RetrievalError> {
+        ReconciliationRun::start(self.reconciliation.clone())
     }
 
     /// Reconcile the index against `messages`: index absent messages,
@@ -320,10 +350,22 @@ impl Fts5Retriever {
     /// # Errors
     /// Returns [`RetrievalError`] if any underlying query fails.
     pub async fn reconcile(&self) -> Result<ReconcileStats, RetrievalError> {
+        let mut run = self.start_reconciliation()?;
+        let result = self.reconcile_attempt(&mut run).await;
+        run.complete(&result);
+        result
+    }
+
+    async fn reconcile_attempt(
+        &self,
+        run: &mut ReconciliationRun,
+    ) -> Result<ReconcileStats, RetrievalError> {
         let plan = self.discover_reconcile_plan().await?;
         if plan.locator_repair_required {
+            run.phase(ReconciliationPhase::LocatorRepair);
             self.repair_locator_rows().await?;
         }
+        run.phase(ReconciliationPhase::Messages);
         let mut stats = ReconcileStats::default();
         for message in plan.messages {
             match self.reconcile_message(message).await? {
@@ -331,9 +373,10 @@ impl Fts5Retriever {
                 FtsMessageReconcileOutcome::Indexed => stats.indexed += 1,
                 FtsMessageReconcileOutcome::Reindexed => stats.reindexed += 1,
             }
+            run.message_processed();
         }
+        run.phase(ReconciliationPhase::Pruning);
         stats.pruned = self.prune_orphans().await?;
-        self.mark_reconciled();
         Ok(stats)
     }
 
@@ -477,38 +520,73 @@ impl Fts5Retriever {
     /// # Errors
     /// Returns [`RetrievalError`] when the prune transaction fails.
     pub async fn prune_orphans(&self) -> Result<usize, RetrievalError> {
-        // Prune index rows with no live source message, evaluated against the
-        // CURRENT `messages` table — not the (now possibly stale) snapshot
-        // loaded above. This closes a startup race: a hard delete can remove a
-        // conversation (and atomically prune its FTS rows) *after* this sweep
-        // snapshotted `messages`, and the upsert loop above would then
-        // re-insert the deleted message from its stale snapshot. Re-deriving
-        // orphans from the live table removes any such re-inserted row.
-        let mut prune_tx = self.pool.begin().await?;
-        let orphan_rowids: Vec<i64> = sqlx::query_scalar(
-            "SELECT fts_rowid FROM message_fts_rows
-             WHERE message_id NOT IN (SELECT message_id FROM messages)",
-        )
-        .fetch_all(&mut *prune_tx)
-        .await?;
-        for rowid in &orphan_rowids {
-            sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
-                .bind(rowid)
-                .execute(&mut *prune_tx)
-                .await?;
+        let end: Option<i64> = sqlx::query_scalar("SELECT MAX(fts_rowid) FROM message_fts_rows")
+            .fetch_one(&self.pool)
+            .await?;
+        let Some(end) = end else { return Ok(0) };
+        let mut after = None;
+        let mut pruned = 0;
+        loop {
+            let page = self.orphan_candidates(after, end).await?;
+            let Some(last) = page.last() else {
+                return Ok(pruned);
+            };
+            after = Some(last.0);
+            pruned += self.prune_candidate_page(&page).await?;
         }
-        sqlx::query(
-            "DELETE FROM message_fts_rows
-             WHERE message_id NOT IN (SELECT message_id FROM messages)",
-        )
-        .execute(&mut *prune_tx)
-        .await?;
-        prune_tx.commit().await?;
-        Ok(orphan_rowids.len())
     }
 
-    pub fn mark_reconciled(&self) {
-        self.reconciled.store(true, Ordering::Release);
+    async fn orphan_candidates(
+        &self,
+        after: Option<i64>,
+        end: i64,
+    ) -> Result<Vec<(i64, bool)>, sqlx::Error> {
+        let suffix = if after.is_some() {
+            "WHERE r.fts_rowid <= ?1 AND r.fts_rowid > ?2 ORDER BY r.fts_rowid LIMIT 128"
+        } else {
+            "WHERE r.fts_rowid <= ?1 ORDER BY r.fts_rowid LIMIT 128"
+        };
+        let sql = format!(
+            "SELECT r.fts_rowid, m.message_id IS NULL
+             FROM message_fts_rows r LEFT JOIN messages m ON m.message_id = r.message_id {suffix}"
+        );
+        let mut query = sqlx::query_as(&sql).bind(end);
+        if let Some(after) = after {
+            query = query.bind(after);
+        }
+        query.fetch_all(&self.pool).await
+    }
+
+    async fn prune_candidate_page(&self, page: &[(i64, bool)]) -> Result<usize, sqlx::Error> {
+        if !page.iter().any(|(_, orphan)| *orphan) {
+            return Ok(0);
+        }
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let mut pruned = 0;
+        for (rowid, _) in page.iter().filter(|(_, orphan)| *orphan) {
+            let still_orphan: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM message_fts_rows r
+                 WHERE r.fts_rowid = ?1 AND NOT EXISTS
+                 (SELECT 1 FROM messages m WHERE m.message_id = r.message_id))",
+            )
+            .bind(rowid)
+            .fetch_one(&mut *tx)
+            .await?;
+            if still_orphan {
+                sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                    .bind(rowid)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM message_fts_rows WHERE fts_rowid = ?1")
+                    .bind(rowid)
+                    .execute(&mut *tx)
+                    .await?;
+                pruned += 1;
+            }
+        }
+        tx.commit().await?;
+        Ok(pruned)
     }
 }
 
@@ -706,8 +784,8 @@ impl Fts5Retriever {
 
 #[async_trait]
 impl MessageRetriever for Fts5Retriever {
-    fn index_reconciled(&self) -> bool {
-        self.index_reconciled()
+    fn reconciliation_status(&self) -> ReconciliationStatus {
+        self.reconciliation_status()
     }
 
     async fn retrieve(
@@ -1910,6 +1988,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prune_orphans_survives_concurrent_wal_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prune-wal.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        db.create_conversation("c-a", "a", "/tmp/a", true, None, None)
+            .await
+            .unwrap();
+        let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(journal, "wal");
+        let orphan = insert_index_row(db.pool(), "ghost", "gone", 0, "c-a", "hash").await;
+
+        // Control: the deployed deferred read-to-write sequence fails after a writer commits.
+        let mut stale = db.pool().begin().await.unwrap();
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT fts_rowid FROM message_fts_rows
+             WHERE message_id NOT IN (SELECT message_id FROM messages)",
+        )
+        .fetch_all(&mut *stale)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![orphan]);
+        writer
+            .add_message(
+                "writer-one",
+                "c-a",
+                &MessageContent::user("first commit"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let error = sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+            .bind(orphan)
+            .execute(&mut *stale)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("517")
+        );
+        stale.rollback().await.unwrap();
+
+        let retriever = db.fts_retriever();
+        let page = retriever.orphan_candidates(None, i64::MAX).await.unwrap();
+        assert!(page.contains(&(orphan, true)));
+        writer
+            .add_message(
+                "writer-two",
+                "c-a",
+                &MessageContent::user("second commit"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retriever.prune_candidate_page(&page).await.unwrap(), 1);
+        assert_eq!(retriever.prune_orphans().await.unwrap(), 0);
+        let physical: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_fts WHERE rowid = ?1")
+            .bind(orphan)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let locator: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE fts_rowid = ?1")
+                .bind(orphan)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((physical, locator), (0, 0));
+        retriever.reconcile().await.unwrap();
+        assert!(retriever.index_reconciled());
+        let hits = retriever.retrieve(global_request("second")).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "writer-two");
+    }
+
+    #[tokio::test]
+    async fn prune_revalidates_candidates_and_bounds_each_page() {
+        let db = seed().await;
+        let first = insert_index_row(db.pool(), "ghost", "gone", 0, "c-a", "hash").await;
+        for _ in 0..129 {
+            insert_index_row(db.pool(), "ghost", "gone", 0, "c-a", "hash").await;
+        }
+        let retriever = db.fts_retriever();
+        let page = retriever.orphan_candidates(None, i64::MAX).await.unwrap();
+        assert_eq!(page.len(), 128);
+        db.add_message(
+            "live",
+            "c-a",
+            &MessageContent::user("live source"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE message_fts_rows SET message_id = 'live' WHERE fts_rowid = ?1")
+            .bind(first)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(retriever.prune_candidate_page(&page).await.unwrap(), 127);
+        assert_eq!(retriever.prune_orphans().await.unwrap(), 2);
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_fts WHERE rowid = ?1")
+            .bind(first)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(retained, 1);
+    }
+
+    #[tokio::test]
     async fn reconcile_rolls_back_physical_prune_when_locator_prune_fails() {
         let db = seed().await;
         let orphan = insert_index_row(db.pool(), "ghost", "gone", 0, "c-a", "hash").await;
@@ -1939,6 +2135,16 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((physical, locator), (1, 1));
+        assert!(matches!(
+            r.reconciliation_status(),
+            ReconciliationStatus::Failed { .. }
+        ));
+        assert!(!r.index_reconciled());
+        assert!(r
+            .reconciliation_status()
+            .unavailable_message()
+            .unwrap()
+            .contains("failed"));
     }
 
     #[tokio::test]
