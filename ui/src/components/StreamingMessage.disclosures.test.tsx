@@ -166,3 +166,62 @@ it('does not rehighlight completed standalone code while the prose tail grows', 
   view.rerender(stream(prefix + 'Tail grows')); frame();
   expect(renders.code).toHaveBeenCalledExactlyOnceWith('stable');
 });
+
+const nestedFences = [
+  { name: 'blockquote', prefix: '> ', before: '', after: '' },
+  { name: 'list', prefix: '  ', before: '- item\n\n', after: '' },
+  { name: 'footnote', prefix: '    ', before: 'Ref[^n]\n\n[^n]: Note\n\n', after: '' },
+  { name: 'disclosure quote', prefix: '> ', before: '<details><summary>Title</summary>\n\n', after: '\n\n</details>' },
+  { name: 'disclosure list', prefix: '  ', before: '<details><summary>Title</summary>\n\n- item\n\n', after: '\n\n</details>' },
+];
+
+for (const { name, prefix, before, after } of nestedFences) {
+  it.each(['js', 'mermaid', ''])(`defers unfinished %s in ${name}, closes natively and memoizes the result`, (lang) => {
+    const value = lang === 'mermaid' ? 'graph TD; A-->B' : 'let x = 1';
+    const code = `${before}${prefix}\`\`\`${lang}\n${prefix}${value}`;
+    const view = render(stream(code + after)); frame();
+    if (after) expect(view.container.querySelector('details')).not.toBeNull();
+    expect(view.container.querySelector('.streaming-code')?.textContent).toBe(value + (name === 'disclosure list' ? '\n' : ''));
+    expect(renders.code).not.toHaveBeenCalled();
+    expect(renders.mermaid).not.toHaveBeenCalled();
+    view.rerender(stream(code + ' ' + after)); frame();
+    expect(renders.code).not.toHaveBeenCalled();
+    expect(renders.mermaid).not.toHaveBeenCalled();
+    const closed = `${code}\n${prefix}\`\`\`${after}`;
+    view.rerender(stream(closed)); frame();
+    expect(view.container.querySelector('.streaming-code')).toBeNull();
+    const expensive = lang === 'mermaid' ? renders.mermaid : renders.code;
+    expect(expensive).toHaveBeenCalledExactlyOnceWith(value);
+    view.rerender(stream(closed + '\n\nTrailing prose')); frame();
+    view.rerender(stream(closed + '\n\nTrailing prose grows')); frame();
+    expect(expensive).toHaveBeenCalledTimes(1);
+    expect(view.container.querySelector('pre pre')).toBeNull();
+  });
+}
+
+it('distinguishes closed footnote code from a different genuinely open fence', () => {
+  const source = 'Ref[^n]\n\n[^n]: Note\n\n    ```js\n    closed\n    ```\n\n> ```mermaid\n> graph TD; A-->B';
+  const view = render(stream(source)); frame();
+  expect(renders.code).toHaveBeenCalledExactlyOnceWith('closed');
+  expect(renders.mermaid).not.toHaveBeenCalled();
+  expect(view.container.querySelector('.streaming-code')?.textContent).toBe('graph TD; A-->B');
+});
+
+it('does not promote an incomplete disclosure containing real unfinished quote code', () => {
+  const source = '<details><summary>Title</summary>\n\n> ```js\n> open';
+  const view = render(stream(source)); frame();
+  expect(view.container.querySelector('details')).toBeNull();
+  expect(view.container.querySelector('.streaming-code')?.textContent).toBe('open');
+  expect(renders.code).not.toHaveBeenCalled();
+});
+
+it('keeps streaming annotations out of canonical and standard trees', () => {
+  const source = '> ```js\n> x\n> ```';
+  const canonical = prepareMarkdown(source, 'conversation');
+  const standard = prepareMarkdown(source, 'standard');
+  expect(canonical).toEqual(standard);
+  const snapshot = JSON.stringify(canonical);
+  expect(prepareStreamingBlocks(source)[0]?.revision).toContain('data-streaming-complete');
+  expect(JSON.stringify(canonical)).toBe(snapshot);
+  expect(prepareMarkdown(source, 'conversation')).toEqual(standard);
+});

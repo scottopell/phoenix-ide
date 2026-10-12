@@ -1,12 +1,31 @@
 import { parse, preprocess, postprocess } from 'micromark/phoenix';
 import { compiler } from 'mdast-util-from-markdown/phoenix';
+import type { Extension } from 'mdast-util-from-markdown';
 import type { Construct, Event, State, Token, TokenizeContext } from 'micromark-util-types';
-import type { Definition, Root, RootContent } from 'mdast';
+import type { Code, Definition, Root, RootContent } from 'mdast';
 import { recognizeDisclosures } from './recognize';
 import { append, basicOptions, constructList, membership, walk } from './support';
 import type {
   DisclosureDetails, MarkdownConfiguration, MarkdownInterpretation, SourceRange,
 } from './types';
+
+const fencedCodeComplete = new WeakMap<Code, boolean>();
+const codeCompletion: Extension = {
+  exit: {
+    codeFencedFenceSequence() {
+      // The closing sequence sits inside the compiler's temporary value buffer.
+      const node = this.stack.findLast((ancestor): ancestor is Code => ancestor.type === 'code');
+      if (!node) throw new Error('Native fence sequence outside code');
+      // Native sequences occur once for the opener and once for a valid closer.
+      fencedCodeComplete.set(node, fencedCodeComplete.has(node));
+    },
+  },
+};
+
+export function nativeCodeComplete(node: Code): boolean {
+  // Indented code has no fence sequence events.
+  return fencedCodeComplete.get(node) ?? true;
+}
 
 type ContentPart = SourceRange & (
   | { kind: 'markdown' }
@@ -135,7 +154,9 @@ export function interpretMarkdown(
       wrapped.push(['exit', token, last[2]]);
       events = wrapped;
     }
-    const tree = compiler(options)(events);
+    const tree = compiler({
+      ...options, mdastExtensions: [...(options.mdastExtensions ?? []), codeCompletion],
+    })(events);
     pending.delete(part);
     const bom = part.start === 0 && source.charCodeAt(0) === 65279 ? 1 : 0;
     walk(tree, (node) => {
