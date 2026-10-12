@@ -13290,6 +13290,12 @@ mod dispatch_context_budget_tests {
             usage: Usage::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
+        let high_water = storage
+            .get_all_messages(conv_id)
+            .iter()
+            .map(|message| message.sequence_id)
+            .max()
+            .unwrap();
         let (event_tx, event_rx) = mpsc::channel(8);
         let mut runtime = ConversationRuntime::new(
             context,
@@ -13304,7 +13310,7 @@ mod dispatch_context_budget_tests {
             crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx,
-            SseBroadcaster::new(16, 0),
+            SseBroadcaster::new(16, high_water),
         );
         Box::pin(runtime.process_event(Event::UserMessage {
             text: "ordinary new request".into(),
@@ -13317,7 +13323,11 @@ mod dispatch_context_budget_tests {
         }))
         .await
         .unwrap();
-        runtime.llm_task_handle.take().unwrap().await.unwrap();
+        let task = runtime
+            .llm_task_handle
+            .take()
+            .unwrap_or_else(|| panic!("ordinary dispatch did not start: {:?}", runtime.state));
+        task.await.unwrap();
 
         let requests = llm.recorded_requests();
         assert_eq!(requests.len(), 1);
