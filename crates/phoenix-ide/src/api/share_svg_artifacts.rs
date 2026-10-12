@@ -57,7 +57,12 @@ mod tests {
     #[tokio::test]
     async fn shared_svg_artifact_retrieval_is_token_scoped_and_revocable_without_password() {
         let mut state = super::super::handlers::hard_delete_cascade_tests::make_test_state().await;
-        state.password = Some("private-instance".to_owned());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "private-instance".to_owned(),
+            )
+            .unwrap(),
+        );
         let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#;
         let svg = crate::tools::present_svg::validation::validate(bytes).unwrap();
         let invocation =

@@ -113,7 +113,7 @@ fn build_deployment_config(
         (Some(source), Some(loaded)) => {
             let hosts = match source {
                 tls::ConfigSource::Auto { hosts, .. } => hosts.clone(),
-                tls::ConfigSource::Manual(_) => Vec::new(),
+                tls::ConfigSource::Manual { .. } => Vec::new(),
             };
             TlsInfo {
                 enabled: true,
@@ -379,7 +379,7 @@ fn build_disk_locations(
                 mode: MeasureMode::RecurseSmall,
             });
         }
-        (Some(tls::ConfigSource::Manual(_)), Some(loaded)) => {
+        (Some(tls::ConfigSource::Manual { .. }), Some(loaded)) => {
             locations.push(DiskLocation {
                 category: DiskCategory::Tls,
                 label: "TLS certificate".to_string(),
@@ -836,7 +836,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Read optional auth password (REQ-AUTH-001)
     let password = std::env::var("PHOENIX_PASSWORD")
         .ok()
-        .filter(|p| !p.is_empty());
+        .filter(|password| !password.is_empty())
+        .map(phoenix_core::domain::instance_identity::OwnerPassword::parse)
+        .transpose()?;
     if password.is_some() {
         tracing::info!("Password authentication enabled (PHOENIX_PASSWORD is set)");
     }
@@ -846,6 +848,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let loaded_tls = match &tls_source {
         Some(source) => Some(tls::load_config(source)?),
         None => None,
+    };
+    let federation_tls_trust = match loaded_tls.as_ref() {
+        Some(tls) => tls.federation_tls_trust()?,
+        None => phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
     };
 
     // Bind (or adopt the systemd socket-activated) listener now, so the
@@ -951,7 +957,13 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // PTY PATH plus the env (API URL + capability token) it needs to call back.
     // The token persists across restarts (bound to the password fingerprint) so
     // terminals opened before a restart stay authorized.
-    let suggest_token = resolve_suggest_token(&db, password.as_deref()).await;
+    let suggest_token = resolve_suggest_token(
+        &db,
+        password
+            .as_ref()
+            .map(phoenix_core::domain::instance_identity::OwnerPassword::expose),
+    )
+    .await;
     setup_phx_companion(
         &runtime_env,
         bind_address,
@@ -970,6 +982,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         deployment,
         runtime_env,
         suggest_token,
+        federation_tls_trust,
     )
     .await?;
 

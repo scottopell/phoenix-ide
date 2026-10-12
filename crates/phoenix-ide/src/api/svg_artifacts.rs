@@ -135,9 +135,16 @@ mod tests {
             terminals,
             chain_qa,
             message_retriever,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
             sessions,
             credential_helper: None,
-            password: Some("svg-test-password".into()),
+            password: Some(
+                phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                    "svg-test-password".into(),
+                )
+                .unwrap(),
+            ),
             login_throttle: crate::api::auth::LoginThrottle::new(),
             codex_login: crate::api::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(crate::api::deployment::DeploymentConfig::for_tests()),

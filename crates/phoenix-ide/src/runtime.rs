@@ -5942,6 +5942,7 @@ impl RuntimeManager {
                             service,
                             send_chat,
                             self.work_scope_load.clone(),
+                            self.db.clone(),
                         ),
                         coordinator_catalog.clone(),
                     ),

@@ -26,6 +26,32 @@ use serde::{Deserialize, Serialize};
 
 use super::assets::public_root_asset;
 use super::AppState;
+use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAuthenticated {
+    pub caller_instance_id: InstanceId,
+    pub caller_display_name: String,
+}
+
+#[async_trait::async_trait]
+impl<S> FromRequestParts<S> for PeerAuthenticated
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .ok_or(StatusCode::UNAUTHORIZED)
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub struct OwnerAuthenticated;
 
@@ -331,8 +357,7 @@ enum BearerCheck {
 /// `/api/auth/login`. A correct Bearer clears the counter; a wrong one records a
 /// failure; once locked out, further guesses are rejected without comparing.
 fn owner_password_matches(candidate: &str, configured: &str) -> bool {
-    !candidate.starts_with("phx_peer_")
-        && constant_time_eq(candidate.as_bytes(), configured.as_bytes())
+    constant_time_eq(candidate.as_bytes(), configured.as_bytes())
 }
 
 fn check_bearer_password(
@@ -400,6 +425,10 @@ fn is_exempt_path(path: &str) -> bool {
         return true;
     }
 
+    if path.starts_with("/api/federation/peer/") {
+        return true;
+    }
+
     // Command suggestion is gated by its own scoped capability token
     // (PHOENIX_SUGGEST_TOKEN), checked inside the handler — not the master
     // password. Exempt it from the password middleware so the in-terminal
@@ -447,7 +476,7 @@ pub async fn auth_middleware(
     // Bearer-password validation is throttled per peer IP, sharing the single
     // login budget, so this 200/401 oracle cannot be used for unlimited guesses.
     let key = throttle_key(req.headers(), peer_from_extensions(&req));
-    match check_bearer_password(&req, password, &state.login_throttle, &key) {
+    match check_bearer_password(&req, password.expose(), &state.login_throttle, &key) {
         BearerCheck::Valid => {
             req.extensions_mut().insert(OwnerAuthenticated);
             next.run(req).await
@@ -464,6 +493,40 @@ pub async fn auth_middleware(
             Json(serde_json::json!({ "error": "Authentication required" })),
         )
             .into_response(),
+    }
+}
+
+pub async fn peer_auth_middleware(
+    State(state): State<AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let authenticated = bearer_token(&req)
+        .filter(|token| token.starts_with("phx_peer_"))
+        .map(|token| FederationCredentialVerifier::from_bearer(token.as_bytes()));
+    let enrollment = match authenticated {
+        Some(verifier) => match state.db.authenticate_federation_verifier(&verifier).await {
+            Ok(enrollment) => enrollment,
+            Err(error) => {
+                tracing::warn!(%error, "federation credential lookup failed closed");
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(enrollment) = enrollment {
+        req.extensions_mut().insert(PeerAuthenticated {
+            caller_instance_id: enrollment.caller_instance_id,
+            caller_display_name: enrollment.caller_display_name,
+        });
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Peer authentication required" })),
+        )
+            .into_response()
     }
 }
 
@@ -502,7 +565,7 @@ pub async fn auth_status(
                 // report `authenticated: false` without comparing.
                 let key = throttle_key(req.headers(), peer_from_extensions(&req));
                 matches!(
-                    check_bearer_password(&req, password, &state.login_throttle, &key),
+                    check_bearer_password(&req, password.expose(), &state.login_throttle, &key,),
                     BearerCheck::Valid
                 )
             };
@@ -539,7 +602,7 @@ pub async fn auth_login(
             .into_response();
     }
 
-    if !owner_password_matches(&body.password, password) {
+    if !owner_password_matches(&body.password, password.expose()) {
         state.login_throttle.record_failure(&key);
         return (
             StatusCode::UNAUTHORIZED,
@@ -778,9 +841,9 @@ mod tests {
     }
 
     #[test]
-    fn peer_token_namespace_never_authenticates_as_owner_password() {
+    fn configured_password_in_peer_namespace_authenticates_as_owner() {
         let throttle = LoginThrottle::new();
-        assert!(!owner_password_matches(
+        assert!(owner_password_matches(
             "phx_peer_same-secret",
             "phx_peer_same-secret"
         ));
@@ -791,7 +854,7 @@ mod tests {
                 &throttle,
                 "peer",
             ),
-            BearerCheck::Invalid
+            BearerCheck::Valid
         ));
     }
 
