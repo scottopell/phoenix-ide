@@ -11,8 +11,11 @@ models are retired, without a replacement framework or promise of redesign.
 
 The candidate branch removes operational wake admission, worker startup,
 automatic adoption, and wake-only lifecycle coupling. Migration 126 records
-explicit feature retirement additively. Local migration and runtime regressions
-have passed; integration and deployment are separate and are not claimed here.
+explicit feature retirement additively for workflows, occurrence pointers, and
+coordinator wake events. Predecessor local migration and runtime regressions have
+passed; the historical prompt, owned-deletion, and coordinator-event corrections
+have source-only authored regressions awaiting execution. Integration and deployment
+are separate and are not claimed here.
 
 Historical wake workflows, effect payloads and statuses, bindings, receipts,
 messages, deliveries, acceptance records, and links must remain intact. Additive
@@ -28,13 +31,25 @@ Ordinary Bash waits, tmux operations, sub-agent fan-in, and Close are not replac
 
 | Requirement | Status | Verification evidence / boundary |
 | --- | --- | --- |
-| REQ-WAKE-RETIRE-001 no wake execution authority | Implemented in candidate branch; locally verified | Registration, worker, adoption, and wake lifecycle gates removed; `startup_does_not_resume_historical_wake_pointer` passes; independent source review found no actionable defect. |
-| REQ-WAKE-RETIRE-002 additive retirement migration | Implemented in candidate branch; locally verified | Eight `wake_feature_retirement_tests` pass, including byte-preserving upgrade/reopen, all historical workflow statuses, delivery shape, and transactional rollback. The complete post-federation migration module passes 94 tests. |
+| REQ-WAKE-RETIRE-001 no wake execution authority | Candidate corrections awaiting validation | Registration, worker, adoption, and wake lifecycle gates removed; predecessor `startup_does_not_resume_historical_wake_pointer` passed. Coordinator pending discovery now excludes explicitly retired events, and database admission rejects their new direct-turn/steering delivery. |
+| REQ-WAKE-RETIRE-002 additive retirement migration | Candidate corrections awaiting validation | Predecessor migration receipts cover byte-preserving upgrade/reopen, workflow statuses, delivery shape, and rollback. The synthetic fixture now includes pending, accepted, and suppressed coordinator wake events plus all other subscription source kinds; exact-event retirement, unchanged-history, discovery, and admission assertions are authored but unrun. |
 | REQ-WAKE-RETIRE-003 already-admitted DirectTurns | Implemented in candidate branch; locally verified | `historical_wake_pointer_does_not_fence_or_settle_direct_turn` passes; Direct Turn database and runtime ownership/recovery regressions pass. |
 | REQ-WAKE-RETIRE-004 history without replacement feature | Implemented in candidate branch; locally verified | Historical storage and pointers retained. Runtime selection passes 802 tests with one existing ignored test; tool suite passes 533 tests with one macOS registry-test failure separately tracked. |
 | REQ-WAKE-RETIRE-005 forward-only compatibility | Specified | Apply the existing compatibility policy; no downgrade or wake-restoration guarantee. |
 
 ## Verification Boundary
+
+The source-only corrections restore `render_messages`' historical adoption filter
+without a wake runtime type and restore binding-selected workflow deletion in
+`delete_conversation_row_with_dependents` before owner deletion. Authored regressions
+are `ordinary_new_turn_prompt_excludes_unadopted_historical_wake_results`,
+`permanent_delete_removes_only_owned_retired_wake_workflows_and_children`,
+`wake_feature_retirement_excludes_coordinator_wake_events_without_rewriting_history`,
+and `wake_feature_retirement_fences_event_admission_but_keeps_accepted_direct_turns`.
+The deletion fixture checks foreign keys before and after deletion and retains a
+separately-owned wake workflow and unrelated non-wake workflow. These corrections
+have not been compiled, formatted, or tested; predecessor receipts below do not
+qualify them.
 
 Local qualification is not deployment evidence. The initial complete database
 run exposed nine legacy-fixture failures because partial-schema fixtures admitted

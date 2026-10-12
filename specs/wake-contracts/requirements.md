@@ -23,7 +23,8 @@ AND SHALL NOT activate workers, observations, schedules, canonical delivery,
 runtime admission, provider requests, or tool execution from wake state.
 
 WHEN startup, recovery, continuation, or lifecycle processing encounters historical
-wake workflows, bindings, receipts, deliveries, or pointers
+wake workflows, bindings, receipts, deliveries, pointers, or coordinator events whose
+source occurrence kind is `wake`
 THE SYSTEM SHALL treat them as historical data without execution authority
 AND SHALL NOT reconcile, expire, cancel, transfer, deliver, or resume them as live
 wake work.
@@ -35,10 +36,17 @@ admission, and SHALL NOT require wake settlement before ordinary Close can proce
 
 WHEN the wake-retirement migration is applied
 THE SYSTEM SHALL atomically record feature-retirement metadata for every historical
-wake workflow, independently of its execution status
+wake workflow and every coordinator event whose source occurrence kind is `wake`,
+independently of their execution or delivery status
 AND SHALL preserve the existing workflow and effect payloads, statuses, generations,
 attempts, schedules, bindings, terminal evidence, receipts, canonical deliveries,
-messages, acceptance records, and message/delivery links.
+messages, acceptance records, message/delivery links, and coordinator event rows,
+payloads, delivery states, continuation states, and accepted-transcript links.
+
+Coordinator event retirement metadata SHALL reference the exact persisted event
+identity. Retired events SHALL NOT be selected for pending delivery or accepted into
+new direct turns or steering messages. Events with other source occurrence kinds
+SHALL retain their ordinary delivery authority.
 
 The migration SHALL be one-time and additive. It SHALL NOT rewrite a historical
 status to imply cancellation, completion, failure, or settlement, SHALL NOT fabricate
@@ -67,6 +75,16 @@ direct turn.
 THE SYSTEM SHALL preserve historical wake pointers and records as evidence,
 not as a registration API, scheduler, router, polling service, or deferred execution
 framework.
+
+Historical meta messages identified by `display_data.type = wake_result` SHALL be
+omitted from provider prompts unless `display_data.adopted` is explicitly true.
+Accepted historical results SHALL remain ordinary prompt history; this policy
+SHALL NOT adopt an unaccepted result or create a new wake execution capability.
+
+Preservation by the retirement migration SHALL NOT prevent explicit permanent
+Delete from removing solely-owned historical wake workflows and their child rows
+under `specs/bedrock/requirements.md` REQ-BED-031B. Retirement itself SHALL NOT purge
+those rows.
 
 Wake retirement SHALL NOT replace direct-turn, child, tool, shared-`WorkScope`,
 or lifecycle settlement machinery. Ordinary Bash `peek`, `wait`, and `kill`, tmux

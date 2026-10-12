@@ -11164,6 +11164,15 @@ impl Database {
             .await?;
 
         sqlx::query(
+            "DELETE FROM workflows
+             WHERE workflow_id IN (
+                 SELECT workflow_id FROM wake_bindings WHERE conversation_id = ?1
+             )",
+        )
+        .bind(conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
             "INSERT OR IGNORE INTO direct_turn_retirements (turn_id, conversation_id)
              SELECT turn_id, conversation_id FROM durable_turns
              WHERE conversation_id = ?1 AND disposition = 'Runtime'",

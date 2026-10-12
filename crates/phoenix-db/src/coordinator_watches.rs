@@ -229,6 +229,8 @@ impl Database {
              LEFT JOIN product_conversations p ON p.id = w.source_product_conversation_id
              LEFT JOIN close_cleanup_failures f ON f.failure_occurrence_id = e.mandatory_failure_occurrence_id
              WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none'
+               AND NOT EXISTS (SELECT 1 FROM coordinator_event_feature_retirements retired
+                               WHERE retired.event_id = e.event_id)
                AND (e.route_kind = 'mandatory_close_failure' OR
                     (e.route_kind = 'subscription' AND w.ended_at_us IS NULL
                      AND p.ordinary_lifecycle = 'open'

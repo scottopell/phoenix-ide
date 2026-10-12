@@ -1473,6 +1473,22 @@ fn render_messages<'a>(
     for msg in db_messages {
         match &msg.content {
             MessageContent::User(user_content) => {
+                if user_content.is_meta
+                    && msg
+                        .display_data
+                        .as_ref()
+                        .and_then(|data| data.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("wake_result")
+                    && !msg
+                        .display_data
+                        .as_ref()
+                        .and_then(|data| data.get("adopted"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
                 // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
                 // the model sees the fully resolved form while the DB stores the shorthand.
                 let mut text_for_llm = match &msg.origin {
@@ -13225,6 +13241,98 @@ mod dispatch_context_budget_tests {
                 "[Input of unknown historical origin]\nappended"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_new_turn_prompt_excludes_unadopted_historical_wake_results() {
+        let cwd = TempDir::new().expect("cwd");
+        let conv_id = "historical-wake-prompt";
+        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let storage = Arc::new(InMemoryStorage::new());
+        for (id, text, display) in [
+            (
+                "unadopted",
+                "unaccepted background result",
+                serde_json::json!({"type": "wake_result", "adopted": false}),
+            ),
+            (
+                "absent-adoption",
+                "background result without acceptance",
+                serde_json::json!({"type": "wake_result"}),
+            ),
+            (
+                "adopted",
+                "accepted historical result",
+                serde_json::json!({"type": "wake_result", "adopted": true}),
+            ),
+            (
+                "ordinary-meta",
+                "ordinary historical metadata",
+                serde_json::json!({"type": "other", "adopted": false}),
+            ),
+        ] {
+            storage
+                .add_message(
+                    id,
+                    conv_id,
+                    &MessageContent::User(UserContent::meta(text)),
+                    Some(&display),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("ordinary response")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage.clone(),
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+        Box::pin(runtime.process_event(Event::UserMessage {
+            text: "ordinary new request".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "new-user".into(),
+            user_agent: None,
+            skill_invocation: None,
+        }))
+        .await
+        .unwrap();
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+
+        let requests = llm.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        let source_ids: Vec<_> = requests[0]
+            .messages
+            .iter()
+            .filter_map(|message| message.source_message_id.as_deref())
+            .collect();
+        assert_eq!(source_ids, vec!["adopted", "ordinary-meta", "new-user"]);
+        let texts = user_texts(&requests[0]);
+        assert_eq!(texts.len(), 3);
+        assert!(texts[0].ends_with("accepted historical result"));
+        assert!(texts[1].ends_with("ordinary historical metadata"));
+        assert!(texts[2].ends_with("ordinary new request"));
+        assert_eq!(storage.get_all_messages(conv_id).len(), 5);
     }
 
     #[tokio::test]
