@@ -5110,11 +5110,11 @@ def _safe_kache_startup_diagnostic(
             or any(marker in key for marker in ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"))
         ):
             rendered = rendered.replace(value, "[redacted]")
-    if re.search(
-        r'''(?im)^\s*["']?(?:secret|token|password|credential|access[_-]?key)["']?\s*[:=]''',
+    if "=" in rendered or re.search(
+        r"(?i)(?:secret|token|password|credential|access[_-]?key)\s*:",
         rendered,
     ):
-        rendered = "[redacted credential diagnostic]"
+        rendered = "[redacted backend diagnostic]"
     rendered = re.sub(r"(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[redacted]@", rendered)
     rendered = rendered.strip()
     if len(rendered) <= limit:
@@ -5239,16 +5239,19 @@ def _start_kache_daemon_locked(
         binary, cargo_cwd=cargo_cwd, expected_socket=socket
     )
     if readiness_error:
+        safe_readiness = _safe_kache_startup_diagnostic(
+            readiness_error, environment=os.environ, limit=1024
+        )
         if child.poll() is not None:
             diagnostic_thread.join(timeout=0.1)
             detail = _safe_kache_startup_diagnostic(
                 diagnostic.decode(errors="replace"), environment=os.environ
             )
             if detail:
-                return f"{readiness_error}: {detail}"
-            return readiness_error
+                return f"{safe_readiness}: {detail}"
+            return safe_readiness
         return (
-            f"{readiness_error}; spawned Kache child pid {child.pid} may still be live "
+            f"{safe_readiness}; spawned Kache child pid {child.pid} may still be live "
             f"on {socket} without a Phoenix ownership receipt"
         )
     serving_pid = _kache_daemon_serving_pid(socket)

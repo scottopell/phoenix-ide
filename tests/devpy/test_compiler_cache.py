@@ -718,14 +718,27 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertNotIn(access_key, rendered)
         self.assertNotIn("two word secret", rendered)
         self.assertNotIn("multiline", rendered)
-        self.assertEqual("[redacted credential diagnostic]", rendered)
+        self.assertEqual("[redacted backend diagnostic]", rendered)
 
     def test_startup_diagnostic_redacts_quoted_key_and_escaped_value(self):
         rendered = self.dev._safe_kache_startup_diagnostic(
             '"token" = "first\\\" fixture-escaped-suffix"',
             environment={},
         )
-        self.assertEqual("[redacted credential diagnostic]", rendered)
+        self.assertEqual("[redacted backend diagnostic]", rendered)
+
+    def test_startup_diagnostic_redacts_escaped_key_and_numbered_excerpt(self):
+        for diagnostic in (
+            '"to\\u006ben" = "fixture-escaped-key-secret"',
+            '1 | "access\\u005fkey" = "fixture-access-credential"',
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(
+                    "[redacted backend diagnostic]",
+                    self.dev._safe_kache_startup_diagnostic(
+                        diagnostic, environment={}
+                    ),
+                )
 
     def test_daemon_start_receipts_only_the_spawned_serving_process(self):
         child = mock.Mock(pid=1234)
@@ -791,6 +804,28 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 2048)
         self.assertIn("pid 2468 may still be live", rendered)
         self.assertIn("without a Phoenix ownership receipt", rendered)
+
+    def test_credential_readiness_failure_retains_live_child_obligation(self):
+        child = mock.Mock(pid=2468)
+        child.poll.return_value = None
+        diagnostic = '1 | "to\\u006ben" = "fixture-secret"\n' + "x" * 2500
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", return_value=child
+        ), mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", return_value=diagnostic
+        ):
+            error = self.dev._start_kache_daemon_locked(
+                "/bin/kache",
+                cargo_cwd=Path("/repo"),
+                socket=Path("/tmp/kache.sock"),
+                identity="identity",
+            )
+        self.assertNotIn("fixture-secret", error or "")
+        self.assertIn("[redacted backend diagnostic]", error or "")
+        self.assertIn("pid 2468 may still be live", error or "")
+        self.assertIn("without a Phoenix ownership receipt", error or "")
 
     def test_diagnostic_thread_failure_reports_live_child(self):
         child = mock.Mock(pid=2468)
