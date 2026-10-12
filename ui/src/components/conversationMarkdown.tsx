@@ -3,6 +3,9 @@ import { Link, useLocation } from 'react-router-dom';
 import { FilePathLink } from '../utils/FilePathLink';
 import { isConversationFilePath, type FilePathCopyContext } from '../utils/linkify';
 import { coordinatorConversationLinkState } from './conversationReturnOrigin';
+import './conversationMarkdown.css';
+
+const INLINE_LINK_CLASS = 'conversation-markdown-link';
 
 export type MarkdownAnchorProps = React.ComponentPropsWithoutRef<'a'> & {
   node?: unknown;
@@ -12,19 +15,17 @@ export type MarkdownAnchorProps = React.ComponentPropsWithoutRef<'a'> & {
 export type MarkdownImageProps = React.ComponentPropsWithoutRef<'img'> & { node?: unknown };
 
 function isPhoenixConversationDestination(path: string): boolean {
-  return /^\/(?:c|chains|global)(?:\/|$)/.test(path);
+  return /^\/(?:(?:c|product-conversations|chains)\/[^/]+|global(?:\/[^/]+)?)\/?$/.test(path);
 }
 
 function appLocalDestination(href: string | undefined): string | undefined {
   if (!href || typeof window === 'undefined') return undefined;
-  if (href.startsWith('/') && !href.startsWith('//')) {
-    return isPhoenixConversationDestination(href) ? href : undefined;
-  }
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return undefined;
+  if (href.startsWith('//')) return undefined;
+  if (!href.startsWith('/') && !/^[a-z][a-z0-9+.-]*:/i.test(href)) return undefined;
   try {
-    const destination = new URL(href);
+    const destination = new URL(href, window.location.origin);
     return destination.origin === window.location.origin && isPhoenixConversationDestination(destination.pathname)
-      ? `${destination.pathname}${destination.search}${destination.hash}`
+      ? `${destination.pathname.replace(/\/$/, '')}${destination.search}${destination.hash}`
       : undefined;
   } catch {
     return undefined;
@@ -47,6 +48,7 @@ export function ConversationMarkdownAnchor({
       <Link
         {...props}
         to={appDestination}
+        className={[props.className, INLINE_LINK_CLASS].filter(Boolean).join(' ')}
         state={coordinatorConversationLinkState(
           `${location.pathname}${location.search}${location.hash}`,
           appDestination,
@@ -68,7 +70,13 @@ export function ConversationMarkdownAnchor({
     );
   }
   return (
-    <a {...props} href={href} target="_blank" rel="noopener noreferrer">
+    <a
+      {...props}
+      className={[props.className, INLINE_LINK_CLASS].filter(Boolean).join(' ')}
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
       {children}
     </a>
   );

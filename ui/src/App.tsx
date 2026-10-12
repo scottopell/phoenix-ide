@@ -196,7 +196,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
               pathname: snapshot.canonical_route,
               search: locationRef.current.search,
               hash: locationRef.current.hash,
-            }, { replace: true });
+            }, { replace: true, state: locationRef.current.state });
           }
         }
       })
