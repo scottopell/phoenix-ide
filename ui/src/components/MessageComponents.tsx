@@ -523,8 +523,12 @@ function markdownHighlightForRange(markdown: string, start: number, end: number)
 function markdownHighlightPlugin(highlight: MarkdownHighlight) {
   return () => (tree: HastNode) => {
     const target = findMarkdownHighlightTarget(tree, highlight);
-    if (target?.tagName === 'code') return;
-    if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end);
+    const targetId = `${highlight.sourceStart}:${highlight.sourceEnd}:${highlight.start}:${highlight.end}`;
+    if (target?.tagName === 'pre') {
+      target.properties = { ...target.properties, 'data-viewer-find-active-target': targetId };
+      return;
+    }
+    if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end, targetId);
   };
 }
 
@@ -539,12 +543,12 @@ function findMarkdownHighlightTarget(node: HastNode, highlight: MarkdownHighligh
   for (const child of node.children ?? []) {
     if (!child.children) continue;
     const target = findMarkdownHighlightTarget(child, highlight);
-    if (target) return target;
+    if (target) return target.tagName === 'code' && node.tagName === 'pre' ? node : target;
   }
   return node.children ? node : null;
 }
 
-function decorateMarkdownTextNodes(node: HastNode, start: number, end: number): void {
+function decorateMarkdownTextNodes(node: HastNode, start: number, end: number, targetId: string): void {
   let cursor = 0;
   const visit = (parent: HastNode) => {
     const nextChildren: HastNode[] = [];
@@ -565,7 +569,7 @@ function decorateMarkdownTextNodes(node: HastNode, start: number, end: number): 
         nextChildren.push({
           type: 'element',
           tagName: 'mark',
-          properties: { className: ['viewer-find-inline-match', 'viewer-find-inline-match--active'] },
+          properties: { className: ['viewer-find-inline-match', 'viewer-find-inline-match--active'], 'data-viewer-find-active-target': targetId },
           children: [{ type: 'text', value: child.value.slice(localStart, localEnd) }],
         });
         if (localEnd < child.value.length) nextChildren.push({ type: 'text', value: child.value.slice(localEnd) });

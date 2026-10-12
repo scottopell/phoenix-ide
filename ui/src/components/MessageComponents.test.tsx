@@ -13,7 +13,7 @@ import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposa
 import { ForkProposalReview } from './ForkProposalReview';
 import { createInitialAtom } from '../conversation/atom';
 import { buildRenderUnits } from '../conversation/renderUnits';
-import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
 describe('Global coordinator tool results', () => {
   it('renders queued delivery truthfully with recipient navigation', () => {
@@ -3906,8 +3906,56 @@ describe('conversation disclosure integration', () => {
     rerender(renderMessage(13, 19));
     expect(details.open).toBe(true);
     expect(details.querySelector('mark')?.textContent).toBe('target');
+    details.open = false;
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(false);
+    rerender(renderMessage(0, 5));
+    expect(details.open).toBe(false);
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(true);
     rerender(renderMessage(20, 27));
     expect(details.open).toBe(true);
+  });
+
+  it('reveals only the active Mermaid disclosure and preserves a manual close on updates', async () => {
+    const disclosure = (title: string, language: string) => `<details><summary>${title}</summary>\n\n\`\`\`${language}\ngraph TD; A[target] --> B[target]\n\`\`\`\n\n</details>`;
+    const text = [disclosure('First target', 'mermaid'), disclosure('Second', 'mermaid'), disclosure('Ordinary', 'ts')].join('\n\n');
+    const blocks: ContentBlock[] = [{ type: 'text', text }, { type: 'text', text }];
+    const message = agentMessage('details-mermaid-find', blocks);
+    const projection = buildAgentTextFragments(blocks, 'full', { forSearch: true })[0]!.semanticText;
+    const start = projection.indexOf('target', projection.indexOf('graph'));
+    const view = (offset?: number, fragmentId = 'agent-text-0') => <MemoryRouter><AgentMessage message={message} toolResults={new Map()} activeHighlight={offset === undefined ? null : { owner: 'agent-text', fragmentId, start: offset, end: offset + 6 }} /></MemoryRouter>;
+    const { container, rerender } = render(view());
+    const details = [...container.querySelectorAll('details')];
+    expect(details).toHaveLength(6);
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(projection.indexOf('target')));
+    expect(details[0]!.querySelector('summary mark')).toHaveTextContent('target');
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(start));
+    expect(details.map(node => node.open)).toEqual([true, false, false, false, false, false]);
+    const wrapper = details[0]!.querySelector('[data-viewer-find-active-target]')!;
+    expect(wrapper).not.toBeNull();
+    expect(wrapper.closest('details')).toHaveAttribute('open');
+    expect(wrapper).toBeVisible();
+    await waitFor(() => expect(wrapper.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull());
+    expect(wrapper.textContent).not.toContain('[object Object]');
+    details[0]!.open = false;
+    rerender(view(start));
+    expect(details.every(node => !node.open)).toBe(true);
+    rerender(view(projection.indexOf('target', start + 6)));
+    expect(details[0]!.open).toBe(true);
+    details[0]!.open = false;
+    rerender(view(start, 'agent-text-1'));
+    expect(details.map(node => node.open)).toEqual([false, false, false, true, false, false]);
+    expect(details[2]!.querySelector('[data-viewer-find-active-target]')).toBeNull();
+    expect(details[2]).toHaveTextContent('graph TD; A[target] --> B[target]');
+    details[3]!.open = false;
+    rerender(view());
+    expect(details.every(node => !node.open)).toBe(true);
+    expect(container.querySelector('[data-viewer-find-active-target]')).toBeNull();
+    rerender(view(start, 'agent-text-1'));
+    expect(details[3]!.open).toBe(true);
   });
 
   it('promotes the complete streaming envelope once and preserves it across tail tokens', async () => {
