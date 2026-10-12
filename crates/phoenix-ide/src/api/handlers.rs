@@ -3,9 +3,10 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
+use super::AppState;
 use super::assets::{
-    get_index_response, serve_favicon, serve_root_asset, serve_service_worker, serve_static,
-    PUBLIC_ROOT_ASSETS,
+    PUBLIC_ROOT_ASSETS, get_index_response, serve_favicon, serve_root_asset, serve_service_worker,
+    serve_static,
 };
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
@@ -27,7 +28,7 @@ use super::product_conversations::{
     close_product_conversation, get_product_conversation, list_product_conversation_creations,
     list_product_conversations, rename_product_conversation,
 };
-use super::sse::{sse_stream, SseInitTrace};
+use super::sse::{SseInitTrace, sse_stream};
 use super::types::{
     AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
     CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
@@ -47,14 +48,13 @@ use super::types::{
     SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
     TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
-use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
 use crate::db::{
     ConvMode, ConversationUsage, DbError, ImageData, NotificationSettings, RetrievalRequest,
 };
 use crate::git_ops::{
-    check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
-    GitOpError, PhoenixIgnoreStrategy,
+    BranchConflict, GitOpError, PhoenixIgnoreStrategy, check_branch_conflict, create_worktree,
+    materialize_branch, run_git,
 };
 use crate::runtime::SseEvent;
 use crate::state_machine::{ConvState, Event};
@@ -62,12 +62,12 @@ use crate::state_machine::{ConvState, Event};
 use super::browser_view::browser_view_ws_handler;
 
 use axum::{
+    Json, Router,
     extract::{DefaultBodyLimit, MatchedPath, Multipart, Path, Query, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post},
-    Json, Router,
 };
 use chrono::Datelike;
 use chrono::{Local, Timelike};
@@ -3082,9 +3082,11 @@ mod conversation_open_telemetry_tests {
         ] {
             let mut report = valid.clone();
             report[field] = value;
-            assert!(!serde_json::from_value::<ConversationOpenTelemetry>(report)
-                .unwrap()
-                .has_valid_bounds());
+            assert!(
+                !serde_json::from_value::<ConversationOpenTelemetry>(report)
+                    .unwrap()
+                    .has_valid_bounds()
+            );
         }
     }
 }
@@ -4045,10 +4047,11 @@ async fn get_work_scope_inventory(
         let generation = state.resource_monitor.observe(&state).await;
         for handle in &mut inventory.bash {
             if handle.state.is_live() {
-                handle.health = Some(generation.bash_health_for_handles(
-                    &scope_key,
-                    std::slice::from_ref(&handle.handle_id),
-                ));
+                handle.health =
+                    Some(generation.bash_health_for_handles(
+                        &scope_key,
+                        std::slice::from_ref(&handle.handle_id),
+                    ));
             }
         }
         let visible_handle_ids = inventory
@@ -4057,7 +4060,8 @@ async fn get_work_scope_inventory(
             .filter(|handle| handle.state.is_live())
             .map(|handle| handle.handle_id.clone())
             .collect::<Vec<_>>();
-        inventory.health = Some(generation.bash_health_for_handles(&scope_key, &visible_handle_ids));
+        inventory.health =
+            Some(generation.bash_health_for_handles(&scope_key, &visible_handle_ids));
         inventory.health_sampled_at = Some(generation.sampled_at);
     }
 
@@ -5202,12 +5206,10 @@ async fn cancel_conversation_inner(
                     | crate::runtime::SteeringWakeOutcome::NothingToDrain,
                 ) => {}
                 Ok(crate::runtime::SteeringWakeOutcome::Conflict) => {
-                    return Err(AppError::Conflict(Box::new(
-                        ConflictErrorResponse::new(
-                            "Deferred steering could not be reconciled with the current conversation state",
-                            "steering_wake_conflict",
-                        ),
-                    )));
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "Deferred steering could not be reconciled with the current conversation state",
+                        "steering_wake_conflict",
+                    ))));
                 }
                 Ok(crate::runtime::SteeringWakeOutcome::DispatchFailed) => {
                     return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -7291,8 +7293,8 @@ async fn cascade_projects_on_delete(
                     if worktree_dir.exists() {
                         if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
                             return Err(format!(
-                            "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
-                        ));
+                                "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
+                            ));
                         }
                     }
                     let _ = run_git(repo, &["worktree", "prune"]);
@@ -12552,23 +12554,29 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("coordinator");
 
-        assert!(super::run_archive_cascade(&state, &coordinator.id)
-            .await
-            .is_err());
-        assert!(super::run_hard_delete_cascade(&state, &coordinator.id)
-            .await
-            .is_err());
+        assert!(
+            super::run_archive_cascade(&state, &coordinator.id)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::run_hard_delete_cascade(&state, &coordinator.id)
+                .await
+                .is_err()
+        );
         let preserved = state
             .db
             .get_conversation(&coordinator.id)
             .await
             .expect("Coordinator history must remain durable");
         assert!(!preserved.archived);
-        assert!(state
-            .db
-            .is_coordinator_conversation(&coordinator.id)
-            .await
-            .unwrap());
+        assert!(
+            state
+                .db
+                .is_coordinator_conversation(&coordinator.id)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -12681,12 +12689,14 @@ pub(crate) mod hard_delete_cascade_tests {
         )
         .await
         .unwrap();
-        assert!(all
-            .iter()
-            .any(|summary| summary.scope_key == first.stable_key()));
-        assert!(all
-            .iter()
-            .any(|summary| summary.scope_key == second.stable_key()));
+        assert!(
+            all.iter()
+                .any(|summary| summary.scope_key == first.stable_key())
+        );
+        assert!(
+            all.iter()
+                .any(|summary| summary.scope_key == second.stable_key())
+        );
     }
 
     #[tokio::test]
@@ -14117,14 +14127,18 @@ pub(crate) mod hard_delete_cascade_tests {
         .expect("search");
 
         assert_eq!(response.items.len(), 2);
-        assert!(response
-            .items
-            .iter()
-            .all(|item| item.path.starts_with("src/")));
-        assert!(response
-            .items
-            .iter()
-            .all(|item| item.path != "src/blob.bin"));
+        assert!(
+            response
+                .items
+                .iter()
+                .all(|item| item.path.starts_with("src/"))
+        );
+        assert!(
+            response
+                .items
+                .iter()
+                .all(|item| item.path != "src/blob.bin")
+        );
     }
 
     #[tokio::test]
@@ -15554,12 +15568,14 @@ pub(crate) mod hard_delete_cascade_tests {
             other => panic!("expected 409, got {other:?}"),
         }
         let leaf = state.db.get_conversation("cab-b").await.unwrap();
-        assert!(state
-            .db
-            .get_active_close_obligation_for_product(&leaf.product_conversation_id)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            state
+                .db
+                .get_active_close_obligation_for_product(&leaf.product_conversation_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         for id in ["cab-a", "cab-b"] {
             let conv = state.db.get_conversation(id).await.expect("row preserved");
@@ -16347,7 +16363,7 @@ pub(crate) mod hard_delete_cascade_tests {
     #[tokio::test]
     async fn hard_delete_dismisses_pending_fork_proposal_and_cleans_orphan() {
         use crate::db::{ForkProposal, ForkProposalStatus};
-        use crate::runtime::fork_resolve::{derive_conv_id, ResolutionKind};
+        use crate::runtime::fork_resolve::{ResolutionKind, derive_conv_id};
 
         let state = make_test_state().await;
         // Start the single fork-resolution consumer so the cascade's
@@ -16604,10 +16620,12 @@ mod regenerate_conversation_name_tests {
 
         let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
         assert_eq!(response.conversation["slug"], "useful-auth-fix");
-        assert!(response
-            .conversation
-            .get("product_conversation_id")
-            .is_none());
+        assert!(
+            response
+                .conversation
+                .get("product_conversation_id")
+                .is_none()
+        );
         assert!(response.conversation.get("presentation_mode").is_some());
         assert!(response.conversation.get("work_scope_key").is_some());
         let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
@@ -17982,12 +18000,14 @@ mod chat_authority_tests {
         .await
         .expect("cancel");
 
-        assert!(state
-            .db
-            .get_steering_queue("c-cancel")
-            .await
-            .expect("durable queue after cancel")
-            .is_empty());
+        assert!(
+            state
+                .db
+                .get_steering_queue("c-cancel")
+                .await
+                .expect("durable queue after cancel")
+                .is_empty()
+        );
         for receiver in [&mut first, &mut second] {
             assert!(matches!(
                 receiver.recv().await.expect("cancelled event"),
@@ -18464,10 +18484,12 @@ mod wake_handler_tests {
             .expect("response body");
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["error_type"], "question_request_identity_required");
-        assert!(payload["error"]
-            .as_str()
-            .unwrap()
-            .contains("Update Phoenix"));
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("Update Phoenix")
+        );
         assert!(payload["error"].as_str().unwrap().contains("web client"));
         assert!(matches!(
             state
@@ -19203,7 +19225,7 @@ mod continuation_admission_tests {
 #[cfg(test)]
 mod conversation_route_tests {
     use axum::{
-        body::{to_bytes, Body},
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
     use tower::ServiceExt;
