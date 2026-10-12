@@ -29,7 +29,7 @@ Ordinary Bash waits, tmux operations, sub-agent fan-in, and Close are not replac
 | Requirement | Status | Verification evidence / boundary |
 | --- | --- | --- |
 | REQ-WAKE-RETIRE-001 no wake execution authority | Implemented in candidate branch; locally verified | Registration, worker, adoption, and wake lifecycle gates removed; `startup_does_not_resume_historical_wake_pointer` passes; independent source review found no actionable defect. |
-| REQ-WAKE-RETIRE-002 additive retirement migration | Implemented in candidate branch; locally verified | Eight `wake_feature_retirement_tests` pass, including byte-preserving upgrade/reopen, all historical workflow statuses, delivery shape, and transactional rollback. The complete migration module passes 92 tests. |
+| REQ-WAKE-RETIRE-002 additive retirement migration | Implemented in candidate branch; locally verified | Eight `wake_feature_retirement_tests` pass, including byte-preserving upgrade/reopen, all historical workflow statuses, delivery shape, and transactional rollback. The complete post-federation migration module passes 94 tests. |
 | REQ-WAKE-RETIRE-003 already-admitted DirectTurns | Implemented in candidate branch; locally verified | `historical_wake_pointer_does_not_fence_or_settle_direct_turn` passes; Direct Turn database and runtime ownership/recovery regressions pass. |
 | REQ-WAKE-RETIRE-004 history without replacement feature | Implemented in candidate branch; locally verified | Historical storage and pointers retained. Runtime selection passes 802 tests with one existing ignored test; tool suite passes 533 tests with one macOS registry-test failure separately tracked. |
 | REQ-WAKE-RETIRE-005 forward-only compatibility | Specified | Apply the existing compatibility policy; no downgrade or wake-restoration guarantee. |
@@ -54,9 +54,10 @@ ADR chain has an integration gate: federation merge
 migrations 124–125, and this candidate is rebased onto that exact commit.
 Resource PR #888 reserves ADRs 095–096; wake uses ADR-097 and migration 126.
 Spec-shape sequence validation requires the resource predecessors and a
-rebase/recheck before merge. Prior qualification receipts predate the federation
-rebase; semantic seam review found no blocking defect, but post-rebase test
-receipts must be distinguished from the earlier results. No merge or deployment
+rebase/recheck before merge. Post-federation qualification passes all eight retirement tests and all 94
+migration-module tests with clean corrected-guard receipts. Earlier runtime,
+tools, UI, and Clippy receipts predate this rebase; semantic seam review found no
+blocking defect but those receipts are not relabelled as post-rebase results. No merge or deployment
 is implied by local tests.
 Old wake feature tests are historical evidence, not acceptance of retirement.
 
