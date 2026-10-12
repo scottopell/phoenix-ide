@@ -5055,6 +5055,17 @@ def _kache_daemon_identity(binary: str, *, cargo_cwd: Path | None) -> str:
         "XDG_CACHE_HOME",
         "DOCKER_CONFIG",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_REF_TYPE",
+        "GITHUB_REF_PROTECTED",
+        "GITLAB_CI",
+        "CI",
+        "CI_COMMIT_BRANCH",
+        "CI_COMMIT_REF_PROTECTED",
+        "CI_COMMIT_TAG",
+        "CI_MERGE_REQUEST_ID",
+        "CI_PIPELINE_SOURCE",
     }
     daemon_environment = {
         key: hashlib.sha256(os.fsencode(value)).hexdigest()
@@ -5094,11 +5105,12 @@ def _safe_kache_startup_diagnostic(
         if value and (
             key.startswith("AWS_")
             or key.startswith("GOOGLE_")
+            or key == "KACHE_S3_ACCESS_KEY"
             or any(marker in key for marker in ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"))
         ):
             rendered = rendered.replace(value, "[redacted]")
     rendered = re.sub(
-        r"(?i)((?:secret|token|password|credential|access[_-]?key)\s*[:=]\s*)\S+",
+        r"(?is)((?:secret|token|password|credential|access[_-]?key)\s*[:=]\s*)(?:\"\"\".*?\"\"\"|'''.*?'''|\"[^\"]*\"|'[^']*'|\S+)",
         r"\1[redacted]",
         rendered,
     )
@@ -5221,11 +5233,25 @@ def _start_kache_daemon_locked(
             )
             if detail:
                 return f"{readiness_error}: {detail}"
-        return readiness_error
+            return readiness_error
+        return (
+            f"{readiness_error}; spawned Kache child pid {child.pid} may still be live "
+            f"on {socket} without a Phoenix ownership receipt"
+        )
     serving_pid = _kache_daemon_serving_pid(socket)
     if serving_pid != child.pid:
-        return "a different process won the daemon bind race; refusing to claim ownership"
-    return _record_kache_daemon_receipt(socket, identity)
+        child_state = "live" if child.poll() is None else "exited"
+        return (
+            "a different process won the daemon bind race; refusing to claim ownership; "
+            f"spawned child pid {child.pid} is {child_state} and unclaimed for {socket}"
+        )
+    receipt_error = _record_kache_daemon_receipt(socket, identity)
+    if receipt_error and child.poll() is None:
+        return (
+            f"{receipt_error}; spawned Kache child pid {child.pid} is live on {socket} "
+            "without a Phoenix ownership receipt"
+        )
+    return receipt_error
 
 
 def _generated_kache_socket(binary: str, *, cargo_cwd: Path | None) -> Path:

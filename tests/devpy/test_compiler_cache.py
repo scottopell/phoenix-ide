@@ -325,6 +325,31 @@ class CompilerCacheTests(unittest.TestCase):
                     self.assertNotEqual(baseline, changed)
                     os.environ.pop(name)
 
+    def test_daemon_identity_tracks_ci_write_policy_inputs(self):
+        names = (
+            "GITHUB_ACTIONS",
+            "GITHUB_EVENT_NAME",
+            "GITHUB_REF_TYPE",
+            "GITHUB_REF_PROTECTED",
+            "GITLAB_CI",
+            "CI",
+            "CI_COMMIT_REF_PROTECTED",
+            "CI_MERGE_REQUEST_ID",
+            "CI_PIPELINE_SOURCE",
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            baseline = self.dev._kache_daemon_identity(
+                "/bin/kache", cargo_cwd=Path("/repo")
+            )
+            for name in names:
+                with self.subTest(name=name):
+                    os.environ[name] = f"value-for-{name.lower()}"
+                    changed = self.dev._kache_daemon_identity(
+                        "/bin/kache", cargo_cwd=Path("/repo")
+                    )
+                    self.assertNotEqual(baseline, changed)
+                    os.environ.pop(name)
+
     @unittest.skipUnless(hasattr(os, "environb"), "requires byte environment")
     def test_daemon_identity_preserves_surrogate_escaped_environment_bytes(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -682,6 +707,18 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 2048)
         self.assertIn("[redacted]", rendered)
 
+    def test_startup_diagnostic_redacts_kache_access_key_and_quoted_values(self):
+        access_key = "fixture-access-key"
+        rendered = self.dev._safe_kache_startup_diagnostic(
+            f'invalid {access_key}\npassword = "two word secret"\n'
+            "token = '''multiline\nsecret'''\n",
+            environment={"KACHE_S3_ACCESS_KEY": access_key},
+        )
+        self.assertNotIn(access_key, rendered)
+        self.assertNotIn("two word secret", rendered)
+        self.assertNotIn("multiline", rendered)
+        self.assertGreaterEqual(rendered.count("[redacted]"), 3)
+
     def test_daemon_start_receipts_only_the_spawned_serving_process(self):
         child = mock.Mock(pid=1234)
         child.poll.return_value = None
@@ -706,6 +743,49 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIn("different process won the daemon bind race", error or "")
         self.assertEqual(["/bin/kache", "daemon", "run"], spawn.call_args.args[0])
         record.assert_not_called()
+
+    def test_live_child_after_readiness_failure_is_reported_unclaimed(self):
+        child = mock.Mock(pid=2468)
+        child.poll.return_value = None
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", return_value=child
+        ), mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", return_value="readiness timed out"
+        ):
+            error = self.dev._start_kache_daemon_locked(
+                "/bin/kache",
+                cargo_cwd=Path("/repo"),
+                socket=Path("/tmp/kache.sock"),
+                identity="identity",
+            )
+        self.assertIn("pid 2468 may still be live", error or "")
+        self.assertIn("without a Phoenix ownership receipt", error or "")
+
+    def test_live_child_after_receipt_failure_is_reported_unclaimed(self):
+        child = mock.Mock(pid=2468)
+        child.poll.return_value = None
+        with mock.patch.object(
+            self.dev, "_kache_daemon_is_running", return_value=(False, None)
+        ), mock.patch.object(
+            self.dev.subprocess, "Popen", return_value=child
+        ), mock.patch.object(
+            self.dev, "_wait_for_kache_daemon", return_value=None
+        ), mock.patch.object(
+            self.dev, "_kache_daemon_serving_pid", return_value=2468
+        ), mock.patch.object(
+            self.dev, "_record_kache_daemon_receipt", return_value="receipt write failed"
+        ):
+            error = self.dev._start_kache_daemon_locked(
+                "/bin/kache",
+                cargo_cwd=Path("/repo"),
+                socket=Path("/tmp/kache.sock"),
+                identity="identity",
+            )
+        self.assertIn("receipt write failed", error or "")
+        self.assertIn("pid 2468 is live", error or "")
+        self.assertIn("without a Phoenix ownership receipt", error or "")
 
     def test_operator_socket_reuses_only_matching_phoenix_started_daemon(self):
         socket = Path("/tmp/operator.sock")
