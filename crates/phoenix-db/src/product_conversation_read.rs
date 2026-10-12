@@ -323,13 +323,44 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
    AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5))))
  ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "late-hydration-test"))]
+tokio::task_local! {
+    static LATE_HYDRATION_COMPLETED_PAGES: std::cell::Cell<usize>;
+}
+
+#[cfg(any(test, feature = "late-hydration-test"))]
 fn late_hydration_experiment_sql() -> String {
     let (cte, rest) = PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL
         .split_once(" ) SELECT ")
         .unwrap();
     let (_, tail) = rest.split_once("\n FROM transcript").unwrap();
     format!("{cte} ), selected AS MATERIALIZED (SELECT messages.message_id, messages.conversation_id, messages.sequence_id, transcript.ordinal\n FROM transcript{tail}) SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content, m.display_data, m.usage_data, m.created_at, m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id, selected.ordinal FROM selected JOIN messages m ON m.message_id=selected.message_id ORDER BY selected.ordinal DESC, selected.sequence_id DESC, selected.message_id DESC")
+}
+
+#[cfg(any(test, feature = "late-hydration-test"))]
+impl Database {
+    /// Asserts that the awaited read completed a candidate page, full-row comparison,
+    /// and attachment hydration. The receipt is scoped to this future's task;
+    /// independently spawned tasks and concurrent tests cannot satisfy it.
+    ///
+    /// # Panics
+    /// Panics when the read completes without executing the candidate path.
+    pub async fn assert_late_hydration_candidate_executed<T>(
+        read: impl std::future::Future<Output = T>,
+    ) -> T {
+        LATE_HYDRATION_COMPLETED_PAGES
+            .scope(std::cell::Cell::new(0), async {
+                let result = read.await;
+                LATE_HYDRATION_COMPLETED_PAGES.with(|completed| {
+                    assert!(
+                        completed.get() > 0,
+                        "late-hydration candidate did not complete a page"
+                    );
+                });
+                result
+            })
+            .await
+    }
 }
 
 impl Database {
@@ -1191,7 +1222,7 @@ impl Database {
         segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
         limit: usize,
     ) -> DbResult<Vec<(i64, crate::Message)>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "late-hydration-test"))]
         let candidate_before = before.clone();
         let query = {
             let _stage = tracing::info_span!("replay.page.prepare", limit).entered();
@@ -1209,7 +1240,7 @@ impl Database {
             .fetch_all(&mut *connection)
             .instrument(tracing::info_span!("replay.page.fetch_decode", limit))
             .await?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "late-hydration-test"))]
         {
             let candidate_sql = late_hydration_experiment_sql();
             let ceilings = segment_ceilings
@@ -1251,6 +1282,10 @@ impl Database {
                 *message = hydrated;
             }
         }
+        #[cfg(any(test, feature = "late-hydration-test"))]
+        let _ = LATE_HYDRATION_COMPLETED_PAGES.try_with(|completed| {
+            completed.set(completed.get() + 1);
+        });
         Ok(rows)
     }
 
@@ -1415,6 +1450,12 @@ mod tests {
     use phoenix_core::domain::close::TranscriptConversationId;
     use phoenix_workflow::ClientTurnKey;
     use std::time::Instant;
+
+    #[tokio::test]
+    #[should_panic(expected = "late-hydration candidate did not complete a page")]
+    async fn late_hydration_receipt_rejects_unexecuted_candidate() {
+        Database::assert_late_hydration_candidate_executed(async {}).await;
+    }
 
     async fn seed_reset_message(db: &Database, root: &crate::Conversation) {
         use phoenix_core::domain::db_schema::{

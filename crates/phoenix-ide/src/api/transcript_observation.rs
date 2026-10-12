@@ -266,6 +266,8 @@ async fn align_slice_start_to_render_unit(
             .get_messages_before(conversation_id, before_sequence, fetch_limit)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
+        #[cfg(test)]
+        tests::record_alignment_prefix_read(conversation_id, before_sequence, &previous);
         if previous.is_empty() {
             intervening.append(messages);
             let boundary_index =
@@ -339,6 +341,8 @@ async fn get_latest_aligned_messages(
     if messages.len() > requested_count {
         messages.remove(0);
     }
+    #[cfg(test)]
+    tests::reset_before_alignment(db, conversation_id, &messages).await?;
     align_slice_start_to_render_unit(db, conversation_id, &mut messages).await?;
     let has_older_messages = has_messages_before(db, conversation_id, &messages).await?;
     Ok((messages, has_older_messages))
@@ -359,6 +363,8 @@ async fn get_messages_before_aligned(
     if messages.len() > requested_count {
         messages.remove(0);
     }
+    #[cfg(test)]
+    tests::reset_before_alignment(db, conversation_id, &messages).await?;
     align_slice_start_to_render_unit(db, conversation_id, &mut messages).await?;
     let has_older_messages = has_messages_before(db, conversation_id, &messages).await?;
     Ok((messages, has_older_messages))
@@ -505,4 +511,288 @@ pub(super) fn validate_message_history_limit(
         )));
     }
     Ok(value.min(MAX_MESSAGE_HISTORY_LIMIT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, Message, MessageContent};
+    use phoenix_core::domain::llm_types::ContentBlock;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    type AlignmentResetAction = Box<
+        dyn for<'a> FnOnce(
+                &'a Database,
+                &'a str,
+                &'a [Message],
+            ) -> BoxFuture<'a, Result<(), AppError>>
+            + Send,
+    >;
+    type PrefixReads = Arc<Mutex<Vec<(i64, Vec<String>)>>>;
+
+    struct AlignmentResetHook {
+        conversation_id: String,
+        reset: Option<AlignmentResetAction>,
+        prefix_reads: PrefixReads,
+    }
+
+    thread_local! {
+        static ALIGNMENT_RESET_HOOK: std::cell::RefCell<Option<AlignmentResetHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) async fn reset_before_alignment(
+        db: &Database,
+        conversation_id: &str,
+        messages: &[Message],
+    ) -> Result<(), AppError> {
+        let reset = ALIGNMENT_RESET_HOOK.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .filter(|hook| hook.conversation_id == conversation_id)
+                .and_then(|hook| hook.reset.take())
+        });
+        if let Some(reset) = reset {
+            reset(db, conversation_id, messages).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_alignment_prefix_read(
+        conversation_id: &str,
+        before_sequence: i64,
+        messages: &[Message],
+    ) {
+        let prefix_reads = ALIGNMENT_RESET_HOOK.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|hook| hook.conversation_id == conversation_id)
+                .map(|hook| Arc::clone(&hook.prefix_reads))
+        });
+        if let Some(prefix_reads) = prefix_reads {
+            prefix_reads
+                .lock()
+                .expect("prefix oracle lock")
+                .push((before_sequence, message_ids(messages)));
+        }
+    }
+
+    struct AlignmentHookGuard;
+
+    impl Drop for AlignmentHookGuard {
+        fn drop(&mut self) {
+            ALIGNMENT_RESET_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn message_ids(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect()
+    }
+
+    async fn replace_history(
+        db: &Database,
+        conversation_id: &str,
+        label: &str,
+        bump_generation: bool,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = db.pool().begin().await?;
+        sqlx::query("DELETE FROM messages WHERE conversation_id = ?1")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        let contents = [
+            MessageContent::user(format!("{label} older")),
+            MessageContent::user(format!("{label} prompt")),
+            MessageContent::agent(vec![ContentBlock::ToolUse {
+                id: format!("{label}-call"),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": label}),
+            }]),
+            MessageContent::tool(format!("{label}-call"), format!("{label} result 1"), false),
+            MessageContent::tool(format!("{label}-call"), format!("{label} result 2"), false),
+            MessageContent::tool(format!("{label}-call"), format!("{label} tail"), false),
+        ];
+        for (sequence, content) in (1_i64..).zip(contents) {
+            sqlx::query(
+                "INSERT INTO messages (
+                    message_id, conversation_id, sequence_id, message_type,
+                    content, display_data, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(format!("{label}-{sequence}"))
+            .bind(conversation_id)
+            .bind(sequence)
+            .bind(content.message_type().to_string())
+            .bind(content.to_stored_json().to_string())
+            .bind(serde_json::json!({"history": label, "sequence": sequence}).to_string())
+            .bind("2026-10-12T00:00:00Z")
+            .execute(&mut *tx)
+            .await?;
+        }
+        if bump_generation {
+            sqlx::query(
+                "UPDATE conversations SET transcript_generation = transcript_generation + 1
+                 WHERE id = ?1",
+            )
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_causal_alignment_reset(before: Option<i64>) {
+        let db = Database::open_in_memory()
+            .await
+            .expect("disposable database");
+        let conversation_id = if before.is_some() {
+            "alignment-before"
+        } else {
+            "alignment-latest"
+        };
+        let initial = db
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        replace_history(&db, conversation_id, "old", false)
+            .await
+            .expect("old history");
+        let committed = Arc::new(AtomicBool::new(false));
+        let prefix_reads = Arc::new(Mutex::new(Vec::new()));
+        let committed_by_hook = Arc::clone(&committed);
+        let reset: AlignmentResetAction = Box::new(move |db, id, selected| {
+            assert_eq!(
+                message_ids(selected),
+                if before.is_some() {
+                    vec!["old-4", "old-5"]
+                } else {
+                    vec!["old-5", "old-6"]
+                },
+                "hook must run after lookahead trimming and before backfill",
+            );
+            Box::pin(async move {
+                replace_history(db, id, "new", true)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                committed_by_hook.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        ALIGNMENT_RESET_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(AlignmentResetHook {
+                conversation_id: conversation_id.to_string(),
+                reset: Some(reset),
+                prefix_reads: Arc::clone(&prefix_reads),
+            });
+        });
+        let guard = AlignmentHookGuard;
+        reset_before_alignment(&db, "unrelated-conversation", &[])
+            .await
+            .expect("unrelated read must not consume reset");
+        assert!(!committed.load(Ordering::SeqCst));
+
+        let observations = TranscriptObservations::new(&db);
+        let result = match before {
+            Some(cursor) => observations.before(conversation_id, cursor, 2).await,
+            None => observations.latest(conversation_id, 2).await,
+        }
+        .expect("stable read across committed alignment reset");
+        assert!(committed.load(Ordering::SeqCst));
+        ALIGNMENT_RESET_HOOK.with(|slot| {
+            assert!(slot.borrow().as_ref().expect("armed hook").reset.is_none());
+        });
+        assert_eq!(result.attempts, 2);
+        assert_eq!(
+            result.conversation.transcript_generation,
+            initial.transcript_generation + 1
+        );
+        let expected_prefix = if before.is_some() {
+            (
+                4,
+                vec![
+                    "new-1".to_string(),
+                    "new-2".to_string(),
+                    "new-3".to_string(),
+                ],
+            )
+        } else {
+            (
+                5,
+                vec![
+                    "new-1".to_string(),
+                    "new-2".to_string(),
+                    "new-3".to_string(),
+                    "new-4".to_string(),
+                ],
+            )
+        };
+        assert_eq!(
+            *prefix_reads.lock().expect("prefix oracle lock"),
+            vec![expected_prefix.clone(), expected_prefix],
+            "both the discarded attempt and retry must actually backfill from replacement rows",
+        );
+        drop(guard);
+
+        let fresh = match before {
+            Some(cursor) => observations.before(conversation_id, cursor, 2).await,
+            None => observations.latest(conversation_id, 2).await,
+        }
+        .expect("fresh post-reset read");
+        assert_eq!(fresh.attempts, 1);
+        assert_eq!(
+            fresh.conversation.transcript_generation,
+            result.conversation.transcript_generation
+        );
+        assert_eq!(
+            serde_json::to_value(&result.value).unwrap(),
+            serde_json::to_value(&fresh.value).unwrap()
+        );
+        let (messages, has_older, tail) = result.value;
+        assert_eq!(
+            message_ids(&messages),
+            if before.is_some() {
+                vec!["new-3", "new-4", "new-5"]
+            } else {
+                vec!["new-3", "new-4", "new-5", "new-6"]
+            },
+        );
+        assert_eq!(messages.first().map(|message| message.sequence_id), Some(3));
+        assert_eq!(
+            messages.first().map(|message| message.message_type),
+            Some(crate::db::MessageType::Agent)
+        );
+        assert!(has_older);
+        assert_eq!(tail, Some(6));
+        if let Some(cursor) = before {
+            assert!(messages.iter().all(|message| message.sequence_id < cursor));
+        }
+        let replacement = db
+            .get_messages(conversation_id)
+            .await
+            .expect("complete replacement history");
+        let expected_end = if before.is_some() { 5 } else { 6 };
+        assert_eq!(
+            serde_json::to_value(&messages).unwrap(),
+            serde_json::to_value(&replacement[2..expected_end]).unwrap()
+        );
+        db.pool().close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn latest_causal_alignment_reset_retries_committed_history() {
+        assert_causal_alignment_reset(None).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn before_causal_alignment_reset_retries_committed_history() {
+        assert_causal_alignment_reset(Some(6)).await;
+    }
 }

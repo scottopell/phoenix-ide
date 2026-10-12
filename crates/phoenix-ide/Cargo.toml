@@ -176,8 +176,10 @@ phoenix-llm = { path = "../phoenix-llm", features = ["test-support"] }
 # WebSocket relay tests. Dev-only.
 phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
 # Re-declared with test-support so phoenix-db's #[cfg(test)] `create_conversation`
-# explore-mode test wrapper is visible to this crate's tests. Dev-only.
-phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
+# explore-mode test wrapper is visible to this crate's tests. The dedicated
+# late-hydration-test feature runs candidate differential reads in API tests.
+# Both features are dev-only; normal binaries use the production query alone.
+phoenix-db = { path = "../phoenix-db", features = ["test-support", "late-hydration-test"] }
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 # Re-declared with test-support so runtime tests can drive the in-memory
 # tmux backend (`phoenix_tools::tmux::fake_backend`).

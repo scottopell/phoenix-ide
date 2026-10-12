@@ -810,10 +810,11 @@ mod tests {
             .await
             .unwrap()
             .0;
-            let observed = live
-                .get_product_conversation_snapshot(reference.to_owned(), snapshot_query(None))
-                .await
-                .unwrap();
+            let observed = Database::assert_late_hydration_candidate_executed(
+                live.get_product_conversation_snapshot(reference.to_owned(), snapshot_query(None)),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 serde_json::to_value(observed).unwrap(),
                 serde_json::to_value(expected).unwrap()
@@ -836,7 +837,10 @@ mod tests {
         let mut before = None;
         let mut seen = Vec::new();
         for _ in 0..10 {
-            let (status, body) = snapshot_response(app, reference, before.as_deref()).await;
+            let (status, body) = Database::assert_late_hydration_candidate_executed(
+                snapshot_response(app, reference, before.as_deref()),
+            )
+            .await;
             assert_eq!(status, StatusCode::OK, "{target}: {reference}: {body}");
             let expected = read_product_conversation_snapshot(
                 db,

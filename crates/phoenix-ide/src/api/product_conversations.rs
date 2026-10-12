@@ -1708,15 +1708,16 @@ mod tests {
             assert!(listed["lifecycle"].get("close_action").is_none());
         }
 
-        let snapshot = create_router(state.clone())
-            .oneshot(
+        let snapshot = crate::db::Database::assert_late_hydration_candidate_executed(
+            create_router(state.clone()).oneshot(
                 Request::builder()
                     .uri(format!("/api/product-conversations/{reference}"))
                     .body(Body::empty())
                     .unwrap(),
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
         assert_eq!(snapshot.status(), StatusCode::OK);
         let snapshot: serde_json::Value =
             serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
@@ -2732,8 +2733,8 @@ mod tests {
             let suffix = before
                 .as_ref()
                 .map_or_else(String::new, |cursor| format!("&before={cursor}"));
-            let response = create_router(state.clone())
-                .oneshot(
+            let response = crate::db::Database::assert_late_hydration_candidate_executed(
+                create_router(state.clone()).oneshot(
                     Request::builder()
                         .uri(format!(
                             "/api/product-conversations/{}?message_limit=2{suffix}",
@@ -2741,9 +2742,10 @@ mod tests {
                         ))
                         .body(Body::empty())
                         .unwrap(),
-                )
-                .await
-                .unwrap();
+                ),
+            )
+            .await
+            .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let page: serde_json::Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
@@ -2786,8 +2788,8 @@ mod tests {
             .await
             .unwrap();
         let cursor_after_append = emitted_cursor.expect("first page emits a cursor");
-        let appended_response = create_router(state)
-            .oneshot(
+        let appended_response = crate::db::Database::assert_late_hydration_candidate_executed(
+            create_router(state).oneshot(
                 Request::builder()
                     .uri(format!(
                         "/api/product-conversations/{}?before={cursor_after_append}",
@@ -2795,9 +2797,10 @@ mod tests {
                     ))
                     .body(Body::empty())
                     .unwrap(),
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
         assert_eq!(appended_response.status(), StatusCode::OK);
         let appended: serde_json::Value = serde_json::from_slice(
             &to_bytes(appended_response.into_body(), usize::MAX)

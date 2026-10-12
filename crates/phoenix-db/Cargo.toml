@@ -16,6 +16,8 @@ path = "src/lib.rs"
 # conversations in their own tests enable this feature via dev-dependencies.
 # Off in production builds.
 test-support = []
+# Same-transaction candidate differential reads and execution receipts; dev-only.
+late-hydration-test = []
 
 [build-dependencies]
 phoenix-core = { path = "../phoenix-core" }
