@@ -12,7 +12,7 @@ Only sqlite_master DDL and explicitly classified relational fields are copied.
 The source is mode=ro/query_only, held in ONE read transaction including counts,
 schema, and rows (WAL is not ignored). No Phoenix runtime or HTTP is involved.
 The output directory must be new and ignored by git if inside a repository.
-fixture.db is standalone chmod 0400; auxiliary JSON is chmod 0600, directory 0700.
+fixture.db is standalone chmod 0400; manifest is chmod 0600, directory 0700.
 
 This is a timing/scale fixture, not a semantic or rendering-fidelity fixture:
 prose is synthetic, preserving decoded character/UTF-8 lengths and CR/LF offsets;
@@ -322,24 +322,8 @@ def create_schema(source, output):
     return definitions, tables, skipped
 
 
-def aux_fixtures(target, members):
-    bodies = {
-        "/api/conversations": {"conversations": []},
-        "/api/conversations/archived": {"conversations": []},
-        "/api/mcp/status": [],
-        "/api/discovery/services": {"services": []},
-        "/api/env": {"home_dir": "/tmp/phoenix-load-fixture"},
-    }
-    for key in {target, *members}:
-        bodies[f"/api/global/coordinator/route/{key}"] = {"coordinator_id": None, "is_coordinator": False}
-    # Rust loader caps fixtures at 256; target-only route is enough for /c entry.
-    if len(bodies) > 251:
-        bodies = {k: v for k, v in bodies.items() if not k.startswith("/api/global/coordinator/route/") or k.endswith("/" + target)}
-    return {"GET " + key: {"status": 200, "content_type": "application/json", "body": value} for key, value in bodies.items()}
-
-
-def add_current_member_fixtures(db, aux, target):
-    """Static composer carrier from sanitized rows; never a live runtime."""
+def current_member(db, target):
+    """Resolve the recorded continuation tail for the measurement manifest."""
     root = db.execute("SELECT id FROM conversations WHERE product_conversation_id=? AND parent_conversation_id IS NULL AND NOT EXISTS (SELECT 1 FROM conversations p WHERE p.continued_in_conv_id=conversations.id) LIMIT 1", (target,)).fetchone()
     if root is None:
         raise FixtureError("target root missing")
@@ -351,22 +335,6 @@ def add_current_member_fixtures(db, aux, target):
         seen.add(row["id"])
         row = db.execute("SELECT * FROM conversations WHERE id=?", (row["continued_in_conv_id"],)).fetchone()
     member = row["id"]
-    conv = dict(row)
-    conv["state"] = json.loads(conv["state"])
-    conv.update(cwd="/tmp/phoenix-load-fixture", message_count=db.execute("SELECT count(*) FROM messages WHERE conversation_id=?", (member,)).fetchone()[0], conv_mode={"type": "direct"}, conv_mode_label="Direct", model="fixture-model", presentation_mode="idle", accepts_user_message=True, browser_session_active=False, terminal_uses_tmux=False)
-    messages = []
-    for m in db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY sequence_id DESC LIMIT 50", (member,)):
-        item = dict(m)
-        item.update(content=json.loads(item["content"]), origin={"kind": "unknown_historical"})
-        messages.append(item)
-    messages.reverse()
-    last = max((m["sequence_id"] for m in messages), default=0)
-    init = dict(sequence_id=last, conversation=conv, transcript_generation=conv["transcript_generation"], transcript_coverage="tail", messages=messages, steering_messages=[], agent_working=False, last_sequence_id=last, stream_incarnation="read-only-fixture", presentation_mode="idle", context_window_size=0, project_name=None, pending_anchor_sequence_id=last, pending_events=[], pending_truncated=False)
-    aux["GET /api/auth/status"] = {"body": {"auth_required": False, "authenticated": True}}
-    aux["GET /api/models"] = {"body": {"models": [{"id": "fixture-model", "provider": "fixture", "description": "Read-only benchmark (cannot execute)", "context_window": 200000, "recommended": True}], "default": "fixture-model", "llm_configured": True, "credential_status": "valid"}}
-    aux[f"GET /api/conversations/{member}/route"] = {"body": {"id": member, "slug": conv["slug"]}}
-    aux[f"GET /api/conversations/{member}/stream"] = {"content_type": "text/event-stream", "body": "event: init\ndata: " + dumps(init) + "\n\n"}
-    aux["GET /api/product-conversations/events"] = {"content_type": "text/event-stream", "body": ": read-only fixture\n\n"}
     return member
 
 
@@ -446,35 +414,27 @@ def build_fixture(source_path, output_dir, target=DEFAULT_TARGET):
             raise FixtureError("target product has no transcripts")
         target_scale = output.execute("SELECT count(*),coalesce(sum(length(cast(m.content AS BLOB))),0) FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.product_conversation_id=?", (target,)).fetchone()
         output.row_factory = sqlite3.Row
-        aux = aux_fixtures(target, members)
-        latest_member = add_current_member_fixtures(output, aux, target)
+        latest_member = current_member(output, target)
         output.close()
         output = None
         source.rollback()
         source.close()
         db_path.chmod(0o400)
-        aux_path = directory / "aux.json"
         manifest_path = directory / "manifest.json"
-        aux_json = dumps(aux) + "\n"
-        if len(aux) > 256 or len(aux_json.encode()) > 16 * 1024 * 1024:
-            raise FixtureError("completed auxiliary fixture exceeds server capacity")
-        aux_path.write_text(aux_json)
-        aux_path.chmod(0o600)
         manifest = {
             "format": "sanitized-conversation-load-v1", "timing_only": True,
             "target": {"product_id": target, "title": "fixture-" + hashlib.sha256(target.encode()).hexdigest()[:24], "latest_member": latest_member, "members": members, "transcript_count": len(members), "message_count": target_scale[0], "content_bytes": target_scale[1]},
             "counts": counts, "message_types": dict(message_types), "tool_mix": dict(tool_mix),
             "source_content_bytes": source_bytes, "synthetic_content_bytes": synthetic_bytes,
             "db_sha256": file_hash(db_path), "db_bytes": db_path.stat().st_size,
-            "aux_sha256": file_hash(aux_path), "build_seconds": round(time.monotonic() - start, 3),
+            "build_seconds": round(time.monotonic() - start, 3),
             "omissions": dict(sorted(omissions.items())), "skipped_fts_tables": sorted(skipped),
             "limitations": [
                 "Timing/scale only: synthetic prose retains lengths and newlines, not Markdown/code semantics.",
                 "Opaque JSON keys/structure and tool display/usage payloads are not retained; UTF-8 serialized input size is approximated.",
                 "Images/files, credentials, migrations data, jobs, effects, and all non-allowlisted rows are omitted.",
                 "Non-idle/context-exhausted states become idle; runtime is never started.",
-                "Legacy conversation/archived lists, MCP status, and discovery are empty auxiliary fixtures; real product list/snapshot is served from SQL.",
-                "Auxiliary coordinator routes are false/null; over 250 members uses only the target route to honor the server fixture cap.",
+                "The normal binary serves target-scoped persisted reads; live services and command capabilities are unavailable.",
             ],
         }
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")

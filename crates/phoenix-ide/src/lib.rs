@@ -16,7 +16,6 @@ pub mod drive_turn;
 pub(crate) mod git_ops;
 pub(crate) mod git_start;
 mod immutable_fixture;
-pub mod load_benchmark;
 mod mcp_oauth_store;
 mod message_expander;
 pub mod observation_startup;

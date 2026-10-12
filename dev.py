@@ -11479,7 +11479,7 @@ def cmd_prod_override_unset(_name: str):
 
 
 def cmd_conversation_load(args):
-    """Run the isolated read-only load fixture without normal server startup."""
+    """Run the normal binary with observation capabilities, without live startup."""
     if args.load_action == "scenario":
         subprocess.run(["uv", "run", str(ROOT / "scripts/conversation_load_scenario.py"),
                         "--fixture", str(Path(args.fixture).resolve()), "--url", args.url],
@@ -11498,19 +11498,19 @@ def cmd_conversation_load(args):
         ensure_ui_deps()
         subprocess.run(["pnpm", "exec", "vite", "build"], cwd=UI_DIR, check=True, env=node_env())
         _, build_env = _compiler_cache_subprocess_env(cargo_cwd=ROOT)
-        command = ["cargo", "build", "-p", "phoenix_ide", "--bin", "load_benchmark"]
+        command = ["cargo", "build", "-p", "phoenix_ide", "--bin", "phoenix_ide"]
         if args.release:
             command.append("--release")
         _run_cargo_build(command, ROOT, "release" if args.release else "debug", env=build_env)
-    binary = ROOT / "target" / ("release" if args.release else "debug") / "load_benchmark"
+    binary = ROOT / "target" / ("release" if args.release else "debug") / "phoenix_ide"
     home = fixture / "isolated-home"
     home.mkdir(mode=0o700, exist_ok=True)
     env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "TMPDIR": str(home)}
     print(f"Read-only load fixture: http://127.0.0.1:{args.port}", flush=True)
     subprocess.run([
-        str(binary), "--db", str(fixture / "fixture.db"),
-        "--fixtures", str(fixture / "aux.json"), "--port", str(args.port),
-        "--ui-dir", str(UI_DIR / "dist"),
+        str(binary), "--observe-fixture", str(fixture / "fixture.db"),
+        "--target", json.loads((fixture / "manifest.json").read_text())["target"]["product_id"],
+        "--port", str(args.port),
     ], cwd=ROOT, env=env, check=True)
 
 

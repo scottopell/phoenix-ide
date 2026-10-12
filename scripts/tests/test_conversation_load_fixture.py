@@ -187,8 +187,8 @@ class BuilderTests(unittest.TestCase):
         states = dict(db.execute("SELECT id,state_kind FROM conversations"))
         self.assertEqual(states[fixture.identity("parent-private")], "context_exhausted")
         self.assertEqual(states[fixture.identity("child-private")], "idle")
-        aux = json.loads((self.output / "aux.json").read_text())
-        self.assertEqual(aux[f"GET /api/global/coordinator/route/{TARGET}"]["body"], {"coordinator_id": None, "is_coordinator": False})
+        self.assertFalse((self.output / "aux.json").exists())
+        self.assertNotIn("aux_sha256", manifest)
         self.assertEqual(manifest["db_sha256"], fixture.file_hash(db_path))
         self.assertFalse(any(self.output.glob("fixture.db-*")))
 
@@ -263,29 +263,22 @@ class BuilderTests(unittest.TestCase):
             self.assertEqual(args["runs"], 1)
             self.assertEqual(args["reset"]["url"], "http://127.0.0.1:8043/")
             self.assertNotIn(SECRET, json.dumps(args))
+            readiness = args["steps"][1]["expression"]
+            self.assertIn('persisted-conversation-owner', readiness)
+            self.assertIn('User input unavailable', readiness)
+            self.assertIn('transcript.clientHeight <= 0', readiness)
+            self.assertNotIn('input.disabled', readiness)
+            self.assertIn('input_absent', args["steps"][-1]["expression"])
 
-    def test_completed_auxiliary_fixture_cap_and_static_init(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "source.db"
-            make_source(source)
-            output = Path(tmp) / "out"
-            manifest = fixture.build_fixture(source, output, TARGET)
-            db = sqlite3.connect(output / "fixture.db")
-            db.row_factory = sqlite3.Row
-            for size in range(240, 257):
-                aux = fixture.aux_fixtures(TARGET, [f"member-{i}" for i in range(size)])
-                member = fixture.add_current_member_fixtures(db, aux, TARGET)
-                self.assertLessEqual(len(aux), 256)
-                init = json.loads(aux[f"GET /api/conversations/{member}/stream"]["body"].split("data: ", 1)[1])
-                self.assertTrue(all(m["origin"]["kind"] == "unknown_historical" for m in init["messages"]))
-                self.assertNotIn(SECRET, json.dumps(aux))
-                self.assertEqual(manifest["target"]["latest_member"], member)
-            db.close()
-
-    def test_auxiliary_fixture_cap(self):
-        aux = fixture.aux_fixtures(TARGET, [str(i) for i in range(303)])
-        self.assertLessEqual(len(aux), 256)
-        self.assertIn(f"GET /api/global/coordinator/route/{TARGET}", aux)
+    def test_manifest_resolves_recorded_member_without_fake_live_payloads(self):
+        manifest = fixture.build_fixture(self.source, self.output, TARGET)
+        db = sqlite3.connect(self.output / "fixture.db")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        self.assertEqual(manifest["target"]["latest_member"], fixture.current_member(db, TARGET))
+        self.assertFalse((self.output / "aux.json").exists())
+        self.assertEqual({p.name for p in self.output.iterdir()}, {"fixture.db", "manifest.json"})
+        self.assertNotIn(SECRET, json.dumps(manifest))
 
     def test_cli_diagnostics_do_not_print_private_content(self):
         db = sqlite3.connect(self.source)

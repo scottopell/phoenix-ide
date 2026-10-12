@@ -30,13 +30,17 @@ def scenario(fixture, url):
       const ready = () => {
         const transcript = document.querySelector('.message-virtual-transcript');
         const tail = document.getElementById(config.lastId);
-        const input = document.querySelector('textarea[placeholder="Type a message..."]');
-        if (!transcript || !tail || !input || input.disabled || input.readOnly || location.pathname !== config.route) return;
+        const observation = document.querySelector('[data-testid="persisted-conversation-owner"]');
+        const input = document.querySelector('textarea');
+        if (!transcript || transcript.clientHeight <= 0 || !tail || !observation || input || location.pathname !== config.route) return;
+        if (!observation.textContent.includes('live connection unavailable') || !observation.textContent.includes('User input unavailable')) return;
         const r = tail.getBoundingClientRect();
         if (!tail.innerText.trim() || r.height <= 0 || r.bottom <= 0 || r.top >= innerHeight) return;
         if (!p.first) { p.first = performance.now(); requestAnimationFrame(() => requestAnimationFrame(() => {
           const gap = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop;
-          if (Math.abs(gap) <= 2 && document.getElementById(config.lastId)) {
+          const currentTail = document.getElementById(config.lastId);
+          const currentRect = currentTail?.getBoundingClientRect();
+          if (Math.abs(gap) <= 2 && transcript.clientHeight > 0 && currentRect?.height > 0 && currentRect.bottom > 0 && currentRect.top < innerHeight) {
             p.frameProxy = performance.now(); p.bottomGap = gap;
           } else { p.first = null; }
         })); }
@@ -62,7 +66,8 @@ def scenario(fixture, url):
       const t=document.querySelector('.message-virtual-transcript');
       window.__loadBenchmarkResult={first_visible_ms:p.first-p.start,frame_proxy_ms:p.frameProxy-p.start,
         route:location.pathname,last_message_id:p.config.lastId,expected_sequence:p.config.sequence,
-        bottom_gap:p.bottomGap,input_enabled:!!document.querySelector('textarea[placeholder="Type a message..."]:not(:disabled)'),
+        bottom_gap:p.bottomGap,input_absent:!document.querySelector('textarea'),
+        persisted_member_hydrated:!!document.querySelector('[data-testid="persisted-conversation-owner"]'),
         scroll:{top:t.scrollTop,height:t.scrollHeight,client:t.clientHeight},resources:p.resources};
     })()"""
     return {"action":"run_scenario","runs":1,"warmup":0,"throttle_rate":1,"gc_per_run":False,
