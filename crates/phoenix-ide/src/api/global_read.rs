@@ -2410,6 +2410,11 @@ async fn resolve_work(
             "work reference target not found".to_string(),
         ));
     }
+    if root.parent_conversation_id.is_some() {
+        return Err(AppError::BadRequest(
+            "sub-agent work references are not stable ProductConversation targets".to_string(),
+        ));
+    }
     let member_ids = service
         .db
         .chain_members_forward(id)
@@ -4225,6 +4230,32 @@ mod tests {
             let resolved = service.resolve_reference(reference).await.unwrap();
             assert_eq!(resolved.reference, expected, "{reference}");
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_work_alias_rejects_subagent_identity_inheritance() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let parent = db
+            .create_conversation("parent", "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let child = db
+            .create_conversation("child", "child", "/tmp", false, Some(&parent.id), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            child.product_conversation_id,
+            parent.product_conversation_id
+        );
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+
+        let error = service
+            .resolve_reference(&format!("@work:{}", child.id))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::api::handlers::AppError::BadRequest(message) if message.contains("sub-agent work references"))
+        );
     }
 
     #[tokio::test]
