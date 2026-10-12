@@ -18,9 +18,7 @@ interface ConversationNavProps {
   /** `unitIndex` of the chapter currently in view (scroll-spy), or null when
    *  none is resolved. Applies the active pill styling. */
   activeUnitIndex: number | null;
-  /** Jump the message list to the chapter's render unit. Wired to
-   *  `MessageListHandle.scrollToUnitIndex`. */
-  onJump: (unitIndex: number) => void;
+  onJump: (chapter: Chapter) => void;
 }
 
 /**
@@ -49,13 +47,13 @@ export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoun
         const isActive = chapter.unitIndex === activeUnitIndex;
         const origin = chapter.kind === 'prompt' ? inputOriginPresentation(chapter.origin) : null;
         return {
-          key: chapter.messageId ?? `chapter-${chapter.unitIndex}`,
+          key: chapter.kind === 'boundary' ? chapter.messageId : chapter.target.kind === 'persisted' ? chapter.target.messageId : `pending-${chapter.unitIndex}`,
           label: origin && origin.className === 'meta' ? `${origin.label} · ${chapter.label}` : chapter.label,
           active: isActive,
           className: chapter.kind === 'boundary' ? 'boundary' : chapter.kind === 'prose' ? 'assistant' : origin?.className,
           ariaLabel: chapter.kind === 'boundary' ? `Context boundary: ${chapter.transcriptId}` : `${origin?.title ?? PROSE_TITLE}: ${chapter.label}`,
           onClick: () => chapter.kind === 'boundary' && chapter.messageId && onJumpBoundary
-            ? onJumpBoundary(chapter.messageId) : onJump(chapter.unitIndex),
+            ? onJumpBoundary(chapter.messageId) : onJump(chapter),
         };
       }),
     ],

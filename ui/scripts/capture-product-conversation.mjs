@@ -28,10 +28,35 @@ async function assertSourceCall(page, id, viewport, outDir) {
   journeys.push(`${id}/${viewport.name}: receiver click and cold reload reach expanded exact source call`);
 }
 
+async function assertSupersededBoundary(page, id, viewport, outDir) {
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-hold-older')));
+  await page.getByRole('button', { name: 'Load context boundary 2: history-2', exact: true }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureOlderSnapshotRequests === '1');
+  await page.getByRole('button', { name: /Member 3 request$/ }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-history-prompt-3'));
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-release-older')));
+  await page.getByRole('button', { name: 'Context boundary: history-2', exact: true }).waitFor();
+  await page.waitForFunction(() => {
+    const row = [...document.querySelectorAll('.virtual-transcript [data-render-unit-key]')].find(element => element.textContent.includes('Member 3 request'));
+    const viewport = document.querySelector('.product-conversation-page__transcript .chat-main-area');
+    if (!row || !viewport) return false;
+    const rect = row.getBoundingClientRect(); const bounds = viewport.getBoundingClientRect();
+    return document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-history-prompt-3') && rect.bottom > bounds.top && rect.top < bounds.bottom;
+  });
+  if (await fixtureValue(page, 'older-snapshot-requests') !== '1') throw new Error('Superseded boundary caused an unnecessary second page read');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--superseded-boundary.png`, fullPage: true });
+  if (!await page.locator('.product-conversation-page__composer #message-input').isEnabled() || !(await fixtureValue(page, 'event-source-last-url'))?.includes('history-3')) throw new Error('Reader selection changed newest-member composer ownership');
+  journeys.push(`${id}/${viewport.name}: delayed unloaded-boundary read resolves after loaded prompt selection; actual shared reader retains new prompt URL and visible prompt, with newest composer unchanged`);
+  const cleanUrl = new URL(page.url()); cleanUrl.hash = '';
+  cleanUrl.searchParams.set('fixturePass', 'normal-history');
+  await page.goto(cleanUrl.href);
+  await page.waitForSelector(`[data-product-conversation-fixture-ready="${id}"]`);
+}
+
 async function assertLazyHistory(page, id, viewport, outDir) {
   const initialLocation = await page.locator('html').getAttribute('data-source-fixture-location');
   if (await fixtureValue(page, 'older-snapshot-requests') !== null) throw new Error('Older history was acquired before navigation');
-  await page.getByRole('button', { name: 'Load context boundary 2: history-1', exact: true }).click();
+  await page.getByRole('button', { name: 'Load context boundary 1: history-1', exact: true }).click();
   await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureOlderSnapshotRequests === '2');
   await page.getByRole('button', { name: 'Context boundary: history-1', exact: true }).waitFor();
   const boundary = page.locator('[data-render-unit-key="continue-history-1"] .conversation-history-boundary');
@@ -379,6 +404,7 @@ runSurfaceCapture({
   captureStory: async ({ page, id, outDir, viewport }) => {
     const theme = await fixtureValue(page, 'theme') ?? 'dark';
     if (id === 'ordinary-lazy-history' || id === 'global-lazy-history') {
+      await assertSupersededBoundary(page, id, viewport, outDir);
       await assertLazyHistory(page, id, viewport, outDir);
       return false;
     }

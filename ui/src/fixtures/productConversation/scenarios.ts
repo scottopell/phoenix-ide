@@ -325,13 +325,13 @@ function lazyHistoryScenario(kind: 'ordinary' | 'coordinator'): ProductConversat
     requested_transcript_row_id: 'history-3', latest_transcript_row_id: 'history-3', writable_transcript_row_id: 'history-3',
     canonical_root: { transcript_row_id: 'history-1', slug: 'history-1', title: 'First member' },
     work_identity: null, source: null, chain_qa_compatibility: null,
-    segments: [1, 2, 3].map(n => segment(n, `history-${n}`, `Member ${n}`, [
+    segments: [1, 2, 3].map(n => segment(n - 1, `history-${n}`, `Member ${n}`, [
       textMessage(`history-prompt-${n}`, 1, 'user', `Member ${n} request`),
       textMessage(`history-answer-${n}`, 2, 'agent', `Member ${n} answer`),
     ], n < 3 ? `Preserved summary from member ${n}` : null)),
   });
   const page = (member: number): ProductConversationSnapshotView => ({ ...full,
-    segments: full.segments.map(segment => ({ ...segment, messages: segment.segment_ordinal === member ? segment.messages : [] })),
+    segments: full.segments.map(segment => ({ ...segment, messages: segment.segment_ordinal === member - 1 ? segment.messages : [] })),
     before: member > 1 ? `history-before-${member}` : null, has_older: member > 1,
   });
   const common = { ...productConversationScenarioDefinitions.find(def => def.id === `${kind === 'ordinary' ? 'ordinary' : 'global'}-lazy-history`)!, latestConversationState: state('idle') };
@@ -546,7 +546,8 @@ export const productConversationScenarios = [
       content: [{ type: 'text' as const, text: 'Forwarding the requested observation.' }, { type: 'tool_use' as const, id: 'source-send-call', name: 'send_conversation_message', input: { target: '@conv:receiver', message: 'Source jump fixture payload', message_id: 'fixture-send' } }] };
     const history = Array.from({ length: 36 }, (_, i) => textMessage(`source-history-${i}`, i + 5, i % 2 ? 'agent' : 'user', `Historical context ${i}`));
     const source = makeSnapshot({ product_conversation_id: 'source-product', canonical_route: '/product-conversations/source-product', requested_transcript_row_id: 'source-member', latest_transcript_row_id: 'source-successor', writable_transcript_row_id: 'source-successor',
-      segments: [segment(1, 'source-member', 'Original source member', [textMessage('source-request', 1, 'user', 'Send observation'), sourceMessage, ...history], 'Continued after source send'), segment(2, 'source-successor', 'Continued source', [textMessage('successor-request', 60, 'user', 'Continue work')], null)] });
+      canonical_root: { transcript_row_id: 'source-member', slug: 'source-member', title: 'Original source member' }, work_identity: null, source: null, chain_qa_compatibility: null,
+      segments: [segment(0, 'source-member', 'Original source member', [textMessage('source-request', 1, 'user', 'Send observation'), sourceMessage, ...history], 'Continued after source send'), segment(1, 'source-successor', 'Continued source', [textMessage('successor-request', 60, 'user', 'Continue work')], null)] });
     return { ...productConversationScenarioDefinitions.find(def => def.id === id)!, sourceIsGlobal: id === 'source-call-global', sourceSnapshot: source,
       snapshot: makeSnapshot({ segments: [segment(1, ALIGNED_PREFIX_TRANSCRIPT_ROW_ID, 'Receiver', [{ ...textMessage('received-send', 1, 'user', 'Source jump fixture payload'), origin: { kind: 'internal_conversation' as const, product_conversation_id: 'source-product', transcript_id: 'source-member', source_call: { message_id: 'source-assistant', tool_use_id: 'source-send-call' } } }], null)] }) };
   }),

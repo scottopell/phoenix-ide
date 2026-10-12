@@ -23,6 +23,23 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
 describe('ProductConversationFixture', () => {
+  it.each(['ordinary-lazy-history', 'global-lazy-history'] as const)('keeps an explicit loaded prompt selection when the %s unloaded-boundary read resolves', async (id) => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
+    const { container } = render(<ProductConversationFixture scenario={getProductConversationScenario(id)} />);
+    await waitFor(() => expect(container.querySelector(`[data-product-conversation-fixture-ready="${id}"]`)).not.toBeNull());
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-hold-older')));
+    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 2: history-2' }));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('1'));
+    fireEvent.click(await screen.findByRole('button', { name: /Member 3 request$/ }));
+    await waitFor(() => expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('#message-history-prompt-3'));
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-older')));
+    await screen.findByRole('button', { name: 'Context boundary: history-2' });
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('#message-history-prompt-3');
+    expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('1');
+    expect(screen.getByPlaceholderText('Type a message...')).toBeEnabled();
+  });
+
   it.each(['source-call-ordinary', 'source-call-global'] as const)('resolves the real %s alias and expands its exact source call', async (id) => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
@@ -53,7 +70,7 @@ describe('ProductConversationFixture', () => {
     const history = vi.spyOn(api, id === 'global-lazy-history' ? 'getCoordinatorHistory' : 'getProductConversationHistorySnapshot');
     const legacy = vi.spyOn(api, 'getProductConversationSnapshot');
     expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBeUndefined();
-    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 2: history-1' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 1: history-1' }));
     await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('2'));
     expect(history.mock.calls.map(call => call[1]?.before)).toEqual(['history-before-3', 'history-before-2']);
     expect(legacy).not.toHaveBeenCalled();

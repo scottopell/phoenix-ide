@@ -124,8 +124,8 @@ describe('buildConversationChapters', () => {
     const units = [userUnit('u1', 'first question', 5), userUnit('u2', 'second', 7)];
     const chapters = buildConversationChapters(units);
     expect(chapters).toEqual([
-      { unitIndex: 0, kind: 'prompt', label: 'first question', sequenceId: 5, origin: { kind: 'unknown_historical' } },
-      { unitIndex: 1, kind: 'prompt', label: 'second', sequenceId: 7, origin: { kind: 'unknown_historical' } },
+      { unitIndex: 0, kind: 'prompt', target: { kind: 'persisted', messageId: 'u1', transcriptId: 'c1' }, label: 'first question', sequenceId: 5, origin: { kind: 'unknown_historical' } },
+      { unitIndex: 1, kind: 'prompt', target: { kind: 'persisted', messageId: 'u2', transcriptId: 'c1' }, label: 'second', sequenceId: 7, origin: { kind: 'unknown_historical' } },
     ]);
   });
 
@@ -229,7 +229,7 @@ describe('buildConversationChapters', () => {
     const units = [pendingUserUnit('local-1', 'queued prompt')];
     const chapters = buildConversationChapters(units);
     expect(chapters).toEqual([
-      { unitIndex: 0, kind: 'prompt', label: 'queued prompt', sequenceId: undefined, origin: { kind: 'user_api' } },
+      { unitIndex: 0, kind: 'prompt', target: { kind: 'pending' }, label: 'queued prompt', sequenceId: undefined, origin: { kind: 'user_api' } },
     ]);
   });
 });

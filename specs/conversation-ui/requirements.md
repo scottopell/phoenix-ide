@@ -690,6 +690,11 @@ AND SHALL acquire older aggregate pages lazily for scrolling, chapter selection,
 AND SHALL preserve original message identities, ordering, and reader anchors across acquisition and live continuation
 AND SHALL keep boundary selection and browser back/forward navigation under the same message-positioning authority
 
+WHEN a reader explicitly selects a prompt, prose, or context-boundary chapter
+THE SYSTEM SHALL make that selection supersede earlier unresolved chapter-positioning intent
+AND SHALL NOT position the reader at a superseded boundary when its delayed history page arrives
+AND SHALL retain valid acquired pages for the same aggregate independently of the superseded positioning intent
+
 WHILE a reader inspects a historical member
 THE SYSTEM SHALL keep the composer attached to the newest writable member independently of the reader's selected history
 AND SHALL retain exact source-transcript and source-tool evidence selection until the reader explicitly selects a different anchor

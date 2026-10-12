@@ -6,14 +6,14 @@ import { buildConversationChapters } from '../conversation/conversationChapters'
 import type { HistoricalUnit } from '../conversation/renderUnits';
 
 const chapters: Chapter[] = [
-  { unitIndex: 0, kind: 'prompt', label: 'API prompt', sequenceId: 1, origin: { kind: 'user_api' } },
-  { unitIndex: 1, kind: 'prose', label: 'Response', sequenceId: 2 },
-  { unitIndex: 2, kind: 'prompt', label: 'Forwarded prompt', sequenceId: 3, origin: {
+  { unitIndex: 0, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-0', transcriptId: 'fixture' }, label: 'API prompt', sequenceId: 1, origin: { kind: 'user_api' } },
+  { unitIndex: 1, kind: 'prose', target: { kind: 'persisted', messageId: 'chapter-1', transcriptId: 'fixture' }, label: 'Response', sequenceId: 2 },
+  { unitIndex: 2, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-2', transcriptId: 'fixture' }, label: 'Forwarded prompt', sequenceId: 3, origin: {
     kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-product', transcript_id: 'source-row',
   } },
-  { unitIndex: 3, kind: 'prompt', label: 'Event prompt', sequenceId: 4, origin: { kind: 'subscription_event', event_id: 'event-1' } },
-  { unitIndex: 4, kind: 'prompt', label: 'Automatic prompt', sequenceId: 5, origin: { kind: 'system_generated' } },
-  { unitIndex: 5, kind: 'prompt', label: 'Old prompt', sequenceId: 6 },
+  { unitIndex: 3, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-3', transcriptId: 'fixture' }, label: 'Event prompt', sequenceId: 4, origin: { kind: 'subscription_event', event_id: 'event-1' } },
+  { unitIndex: 4, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-4', transcriptId: 'fixture' }, label: 'Automatic prompt', sequenceId: 5, origin: { kind: 'system_generated' } },
+  { unitIndex: 5, kind: 'prompt', target: { kind: 'persisted', messageId: 'chapter-5', transcriptId: 'fixture' }, label: 'Old prompt', sequenceId: 6 },
 ];
 
 describe('ConversationNav input provenance', () => {
@@ -30,7 +30,7 @@ describe('ConversationNav input provenance', () => {
     expect(screen.getAllByRole('button')).toHaveLength(1);
     expect(screen.queryByText('Watch notification')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /User · API: Conversation event/ }));
-    expect(onJump).toHaveBeenCalledWith(0);
+    expect(onJump).toHaveBeenCalledWith(expect.objectContaining({ unitIndex: 0 }));
     rerender(<ConversationNav chapters={buildConversationChapters(JSON.parse(JSON.stringify(units)))} activeUnitIndex={0} onJump={onJump} />);
     expect(screen.getAllByRole('button')).toHaveLength(1);
     expect(units).toHaveLength(3);
@@ -49,7 +49,7 @@ describe('ConversationNav input provenance', () => {
     expect(screen.getByRole('button', { name: 'Unknown input: Old prompt' })).toHaveClass('meta');
     expect(screen.getByRole('button', { name: 'Assistant: Response' })).toHaveClass('assistant');
     fireEvent.keyDown(forwarded, { key: 'Enter' });
-    expect(onJump).toHaveBeenCalledWith(2);
+    expect(onJump).toHaveBeenCalledWith(expect.objectContaining({ unitIndex: 2 }));
   });
 });
 

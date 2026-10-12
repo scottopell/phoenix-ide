@@ -62,6 +62,19 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     document.documentElement.dataset[`productConversationFixture${name}`] = String(value);
   };
 
+  let heldOlderPage: Promise<void> | null = null;
+  let releaseHeldOlderPage: (() => void) | null = null;
+  const holdOlderPage = () => {
+    if (!heldOlderPage) heldOlderPage = new Promise<void>(resolve => { releaseHeldOlderPage = resolve; });
+  };
+  const releaseOlderPage = () => {
+    releaseHeldOlderPage?.();
+    heldOlderPage = null;
+    releaseHeldOlderPage = null;
+  };
+  window.addEventListener('product-conversation-fixture-hold-older', holdOlderPage);
+  window.addEventListener('product-conversation-fixture-release-older', releaseOlderPage);
+
   api.getProductConversationHistorySnapshot = async (_productConversationId, options = {}) => {
     if (scenario.kind === 'coordinator') throw new Error('Global must not request ordinary history');
     if (scenario.sourceSnapshot && _productConversationId !== 'fixture-product-conversation') {
@@ -93,6 +106,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
         });
         record('OlderSnapshotPending', 'false');
       }
+      await heldOlderPage;
       return older;
     }
     return scenario.snapshot;
@@ -130,6 +144,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     const older = scenario.olderPages?.[options.before];
     if (!older) throw new Error(`Unknown Global cursor: ${options.before}`);
     record('OlderSnapshotRequests', Number(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests'] ?? '0') + 1);
+    await heldOlderPage;
     return older;
   };
   api.listActiveCoordinatorWatches = async () => [];
@@ -332,6 +347,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   window.addEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
 
   return () => {
+    window.removeEventListener('product-conversation-fixture-hold-older', holdOlderPage);
+    window.removeEventListener('product-conversation-fixture-release-older', releaseOlderPage);
+    releaseOlderPage();
     window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationHistorySnapshot = originalGetProductConversationSnapshot;

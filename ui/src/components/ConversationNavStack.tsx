@@ -4,7 +4,7 @@ import type { VirtualTranscriptRange } from './VirtualTranscript';
 import { MessageList, type MessageListHandle } from './MessageList';
 import { ConversationNav } from './ConversationNav';
 import { resolveActiveUnitIndex } from './conversationNavSpy';
-import type { Chapter } from '../conversation/conversationChapters';
+import type { Chapter, ChapterTarget } from '../conversation/conversationChapters';
 import type { RestoreBasis } from '../conversation/historyExpansion';
 import type { ConversationHistoryBoundaryView } from '../generated/ConversationHistoryBoundaryView';
 
@@ -48,10 +48,20 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     setActiveUnitIndex((prev) => (prev === next ? prev : next));
   }, []);
 
-  const handleJump = useCallback((unitIndex: number) => {
+  const conversationId = listProps.conversationId;
+  const selectChapterTarget = useCallback((target: ChapterTarget) => {
+    const transcriptId = target.kind === 'persisted' ? target.transcriptId : conversationId;
+    const query = new URLSearchParams(location.search);
+    query.delete('source_tool');
+    if (transcriptId && query.has('source_transcript')) query.set('source_transcript', transcriptId);
+    navigate({ pathname: location.pathname, search: query.toString(), hash: target.kind === 'persisted' ? `#message-${encodeURIComponent(target.messageId)}` : '' });
+  }, [conversationId, location.pathname, location.search, navigate]);
+
+  const handleJump = useCallback((chapter: Chapter) => {
     onUpdateOlderMessagesRestore?.({ kind: 'reader_viewport' });
-    listRef.current?.scrollToUnitIndex(unitIndex);
-  }, [onUpdateOlderMessagesRestore]);
+    selectChapterTarget(chapter.kind === 'boundary' ? { kind: 'persisted', messageId: chapter.messageId, transcriptId: chapter.transcriptId } : chapter.target);
+    listRef.current?.scrollToUnitIndex(chapter.unitIndex);
+  }, [selectChapterTarget, onUpdateOlderMessagesRestore]);
 
   const handleLoadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!onLoadOlderMessages) return;
@@ -69,11 +79,9 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
         onJump={handleJump}
         historyBoundaries={historyBoundaries}
         onJumpBoundary={(messageId) => {
-          const query = new URLSearchParams(location.search);
-          query.delete('source_tool');
-          const boundary = historyBoundaries?.find((candidate) => candidate.message_id === messageId);
-          if (boundary && query.has('source_transcript')) query.set('source_transcript', boundary.predecessor_transcript_row_id);
-          navigate({ pathname: location.pathname, search: query.toString(), hash: `#message-${encodeURIComponent(messageId)}` });
+          const loaded = chapters.find((chapter) => chapter.kind === 'boundary' && chapter.messageId === messageId);
+          const transcriptId = loaded?.kind === 'boundary' ? loaded.transcriptId : historyBoundaries?.find((candidate) => candidate.message_id === messageId)?.predecessor_transcript_row_id;
+          selectChapterTarget({ kind: 'persisted', messageId, transcriptId });
         }}
       />
       <MessageList

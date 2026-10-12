@@ -37,8 +37,17 @@ interface ChapterBase {
   origin?: InputOrigin;
 }
 
+export interface PersistedChapterTarget {
+  kind: 'persisted';
+  messageId: string;
+  transcriptId: string | undefined;
+}
+
+export type ChapterTarget = PersistedChapterTarget | { kind: 'pending' };
+
 export type Chapter = ChapterBase & (
-  | { kind: 'prompt' | 'prose'; messageId?: never; transcriptId?: never }
+  | { kind: 'prompt'; target: ChapterTarget }
+  | { kind: 'prose'; target: PersistedChapterTarget }
   | { kind: 'boundary'; messageId: string; transcriptId: string }
 );
 
@@ -98,6 +107,9 @@ export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Ch
           kind: 'prompt',
           label: truncateLabel(text),
           sequenceId: unit.kind === 'user' ? unit.message.sequence_id : undefined,
+          target: unit.kind === 'user'
+            ? { kind: 'persisted', messageId: unit.message.message_id, transcriptId: unit.message.conversation_id }
+            : { kind: 'pending' },
           // Pending units are local optimistic admissions; server-authored
           // messages carry their own authoritative origin and never use this
           // fallback. Steering status does not change the local API channel.
@@ -124,6 +136,7 @@ export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Ch
           kind: 'prose',
           label: truncateLabel(prose),
           sequenceId: unit.agent.sequence_id,
+          target: { kind: 'persisted', messageId: unit.agent.message_id, transcriptId: unit.agent.conversation_id },
         });
         break;
       }
