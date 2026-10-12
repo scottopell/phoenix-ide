@@ -28,7 +28,7 @@
  * long?"); the bash ring tail / pid detail is one disclosure deeper.
  */
 
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
 import { api } from '../api';
 import type {
   WorkScopeInventory,
@@ -63,11 +63,19 @@ function useWorkScopeLoad(scopeKey: string, conversationId: string, executionCap
     summary: WorkScopeLoadSummary | null;
     receivedAt: number;
     error: boolean;
+    epoch: number;
   } | null>(null);
   const [now, setNow] = useState(() => performance.now());
+  const epochRef = useRef(0);
+  useLayoutEffect(() => {
+    epochRef.current += 1;
+    setResult(null);
+    setNow(performance.now());
+  }, [enabled, scopeKey, conversationId]);
 
   useEffect(() => {
     if (!enabled) return;
+    const requestEpoch = epochRef.current;
     const controller = new AbortController();
     let inFlight = false;
     let cancelled = false;
@@ -79,13 +87,13 @@ function useWorkScopeLoad(scopeKey: string, conversationId: string, executionCap
         const response = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/load?${query}`, { signal: controller.signal });
         if (!response.ok) throw new Error('Work-scope load unavailable');
         const summary = await response.json() as WorkScopeLoadSummary;
-        if (!cancelled) {
+        if (!cancelled && epochRef.current === requestEpoch) {
           const receivedAt = performance.now();
           setNow(receivedAt);
-          setResult({ scopeKey, conversationId, summary: summary.scope_key === scopeKey ? summary : null, receivedAt, error: summary.scope_key !== scopeKey });
+          setResult({ scopeKey, conversationId, summary: summary.scope_key === scopeKey ? summary : null, receivedAt, error: summary.scope_key !== scopeKey, epoch: requestEpoch });
         }
       } catch {
-        if (!cancelled) setResult({ scopeKey, conversationId, summary: null, receivedAt: performance.now(), error: true });
+        if (!cancelled && epochRef.current === requestEpoch) setResult({ scopeKey, conversationId, summary: null, receivedAt: performance.now(), error: true, epoch: requestEpoch });
       } finally {
         inFlight = false;
       }
@@ -102,7 +110,7 @@ function useWorkScopeLoad(scopeKey: string, conversationId: string, executionCap
     };
   }, [enabled, scopeKey, conversationId]);
 
-  const current = enabled && result?.scopeKey === scopeKey && result.conversationId === conversationId ? result : null;
+  const current = enabled && result?.epoch === epochRef.current && result.scopeKey === scopeKey && result.conversationId === conversationId ? result : null;
   const sampled = current?.summary;
   const age = current ? now - current.receivedAt : NaN;
   const fresh = !current?.error && Number.isFinite(age) && age <= LOAD_STALE_AFTER_MS;
@@ -506,6 +514,7 @@ function useWorkScopeInventory(
   visible: boolean,
 ) {
   const [displayed, setDisplayed] = useState<WorkScopeInventory | null>(null);
+  const [confirmedScope, setConfirmedScope] = useState<{ scopeKey: string; conversationId: string } | null>(null);
   const [error, setError] = useState(false);
   // Tick once a second so live elapsed times advance without an SSE push.
   const [now, setNow] = useState(() => Date.now());
@@ -551,9 +560,15 @@ function useWorkScopeInventory(
       const inv = await api.getWorkScopeInventory(requestedKey, requestedConversationId);
       if (
         scopeKeyRef.current !== requestedKey ||
-        conversationIdRef.current !== requestedConversationId ||
-        sseGenRef.current !== requestedGen
+        conversationIdRef.current !== requestedConversationId
       ) return;
+      if (inv.scope_key !== requestedKey) {
+        setConfirmedScope(null);
+        setError(true);
+        return;
+      }
+      setConfirmedScope({ scopeKey: requestedKey, conversationId: requestedConversationId });
+      if (sseGenRef.current !== requestedGen) return;
       setDisplayed(inv);
     } catch {
       if (
@@ -569,6 +584,7 @@ function useWorkScopeInventory(
   // either the scope or actor changes.
   useEffect(() => {
     setDisplayed(null);
+    setConfirmedScope(null);
     void fetchSnapshot();
   }, [scopeKey, conversationId, fetchSnapshot]);
 
@@ -614,7 +630,7 @@ function useWorkScopeInventory(
     return () => clearInterval(id);
   }, [pollRunning, fetchSnapshot]);
 
-  return { inventory: displayed, error, now, retry: fetchSnapshot };
+  return { inventory: displayed, error, now, retry: fetchSnapshot, scopeConfirmed: confirmedScope?.scopeKey === scopeKey && confirmedScope.conversationId === conversationId };
 }
 
 /**
@@ -736,14 +752,14 @@ interface SectionProps {
  * dense resource body is the shared `WorkScopeBody`.
  */
 export function WorkScopeSection({ scopeKey, conversationId, liveInventory, executionCapable = false, expanded, onToggleExpanded }: SectionProps) {
-  const load = useWorkScopeLoad(scopeKey, conversationId, executionCapable);
-  const { inventory, error, now, retry } = useWorkScopeInventory(
+  const { inventory, error, now, retry, scopeConfirmed } = useWorkScopeInventory(
     scopeKey,
     conversationId,
     liveInventory,
     expanded,
     expanded,
   );
+  const load = useWorkScopeLoad(scopeKey, conversationId, executionCapable && scopeConfirmed && (liveInventory == null || liveInventory.scope_key === scopeKey));
   const count = workScopeLiveCount(inventory);
   const freshHealth = healthIsFresh(inventory?.health_sampled_at, now) ? inventory?.health : undefined;
   const healthWarning = useHealthAttention(freshHealth);

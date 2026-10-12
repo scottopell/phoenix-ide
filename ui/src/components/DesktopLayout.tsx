@@ -286,7 +286,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     && confirmedLive
     && activeWorkScopeKey?.startsWith('work:') === true
     && activeWorkScopeKey.length > 5
-    && activeLiveWorkScope?.scope_key === activeWorkScopeKey;
+    && (activeLiveWorkScope == null || activeLiveWorkScope.scope_key === activeWorkScopeKey);
 
   const browserSessionActive = activeConversation?.browser_session_active;
   const browserSessionStateLoaded = activeConversation !== null

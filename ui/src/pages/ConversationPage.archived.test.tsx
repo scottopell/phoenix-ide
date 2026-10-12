@@ -373,6 +373,10 @@ describe('live work-scope load admission in DesktopLayout', () => {
     requested_transcript_row_id: member,
     latest_transcript_row_id: 'latest-transcript',
   }) as ProductConversationSnapshotView;
+  beforeEach(() => {
+    vi.mocked(api.getWorkScopeInventory).mockImplementation(async (key) => inventory(key));
+  });
+
   const mockLoadFetch = () => {
     const fetchMock = vi.fn((url: string) => {
       if (!url.startsWith('/api/work-scope/') || !url.includes('/load?')) {
@@ -391,33 +395,44 @@ describe('live work-scope load admission in DesktopLayout', () => {
     return fetchMock;
   };
 
-  it('does not query load for an unattached key, absent atom inventory, or a mismatched atom scope', async () => {
+  it('loads once after the server-admitted initial inventory while the idle atom remains null', async () => {
     const fetchMock = mockLoadFetch();
-    const { store } = renderPage(makeConversation({ work_scope_key: scopeKey, conv_mode_label: 'Work' }));
-    await screen.findByText('keep this history visible');
-    act(() => { store.dispatch(slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory('work:other') }); });
-    expect(loadRequests(fetchMock)).toHaveLength(0);
-  });
-
-  it('queries only after exact live scope attachment regardless of mode label', async () => {
-    const fetchMock = mockLoadFetch();
-    const { store } = renderPage(makeConversation({ work_scope_key: scopeKey, conv_mode_label: 'Explore' }));
+    const inventoryResponse = deferred<ReturnType<typeof inventory>>();
+    vi.mocked(api.getWorkScopeInventory).mockReturnValue(inventoryResponse.promise);
+    renderPage(makeConversation({ work_scope_key: scopeKey, conv_mode_label: 'Explore' }));
     await screen.findByText('keep this history visible');
     expect(loadRequests(fetchMock)).toHaveLength(0);
-    act(() => { store.dispatch(slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory(scopeKey) }); });
+    await act(async () => { inventoryResponse.resolve(inventory(scopeKey)); });
     await waitFor(() => expect(loadRequests(fetchMock)).toHaveLength(1));
     expect(loadRequests(fetchMock)[0]?.[0]).toBe(`/api/work-scope/work%3Aattached-1/load?conversation_id=${conversationId}`);
   });
 
-  it('queries on the canonical product route when its latest transcript has live readiness and matching inventory', async () => {
+  it('rejects a mismatched initial inventory response without querying load', async () => {
+    const fetchMock = mockLoadFetch();
+    vi.mocked(api.getWorkScopeInventory).mockResolvedValue(inventory('work:other'));
+    renderPage(makeConversation({ work_scope_key: scopeKey }));
+    await screen.findByText('keep this history visible');
+    expect(api.getWorkScopeInventory).toHaveBeenCalledWith(scopeKey, conversationId);
+    expect(loadRequests(fetchMock)).toHaveLength(0);
+  });
+
+  it('rejects an explicitly mismatched atom even when the initial inventory matches', async () => {
+    const fetchMock = mockLoadFetch();
+    const inventoryResponse = deferred<ReturnType<typeof inventory>>();
+    vi.mocked(api.getWorkScopeInventory).mockReturnValue(inventoryResponse.promise);
+    const { store } = renderPage(makeConversation({ work_scope_key: scopeKey }));
+    await screen.findByText('keep this history visible');
+    act(() => { store.dispatch(slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory('work:other') }); });
+    await act(async () => { inventoryResponse.resolve(inventory(scopeKey)); });
+    expect(loadRequests(fetchMock)).toHaveLength(0);
+  });
+
+  it('queries on the canonical product route after its latest transcript receives exact initial inventory', async () => {
     const fetchMock = mockLoadFetch();
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(productSnapshot('latest-transcript'));
     const conversation = makeConversation({ id: 'latest-id', slug: 'latest-transcript', work_scope_key: scopeKey, conv_mode_label: 'Explore' });
-    const { store } = renderProductLayout(conversation, '/product-conversations/product-1');
+    renderProductLayout(conversation, '/product-conversations/product-1');
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('product-1', { message_limit: 1 }));
-    expect(loadRequests(fetchMock)).toHaveLength(0);
-
-    act(() => { store.dispatch(conversation.slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory(scopeKey) }); });
     await waitFor(() => expect(loadRequests(fetchMock)).toHaveLength(1));
     expect(loadRequests(fetchMock)[0]?.[0]).toBe(`/api/work-scope/work%3Aattached-1/load?conversation_id=${conversation.id}`);
   });
@@ -432,13 +447,16 @@ describe('live work-scope load admission in DesktopLayout', () => {
     expect(loadRequests(fetchMock)).toHaveLength(0);
   });
 
-  it('does not query on the canonical product route without a matching attached inventory', async () => {
+  it('does not query on the canonical product route with a mismatched attached atom', async () => {
     const fetchMock = mockLoadFetch();
+    const inventoryResponse = deferred<ReturnType<typeof inventory>>();
+    vi.mocked(api.getWorkScopeInventory).mockReturnValue(inventoryResponse.promise);
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(productSnapshot('latest-transcript'));
     const conversation = makeConversation({ id: 'latest-id', slug: 'latest-transcript', work_scope_key: scopeKey });
     const { store } = renderProductLayout(conversation, '/product-conversations/product-1');
     act(() => { store.dispatch(conversation.slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory('work:other') }); });
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('product-1', { message_limit: 1 }));
+    await act(async () => { inventoryResponse.resolve(inventory(scopeKey)); });
     expect(loadRequests(fetchMock)).toHaveLength(0);
   });
 

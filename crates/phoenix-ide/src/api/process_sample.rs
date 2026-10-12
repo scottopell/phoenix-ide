@@ -163,21 +163,100 @@ pub(crate) fn group_identities_by_pgid(
         return Some(BTreeMap::new());
     }
     let members = group_member_pids(pgids)?;
-    let mut groups = BTreeMap::new();
-    for pid in members {
-        if let (Some(pgid), Some(identity)) = (
-            process_group_for_sampling(pid),
-            current_process_identity(pid),
-        ) {
-            if pgids.contains(&pgid) {
-                groups
-                    .entry(pgid)
-                    .or_insert_with(BTreeMap::new)
-                    .insert(pid, identity);
+    Some(collect_group_identities(
+        pgids,
+        members,
+        process_group_for_sampling,
+        current_process_identity,
+    ))
+}
+
+pub(super) fn collect_group_identities(
+    pgids: &BTreeSet<i32>,
+    members: impl IntoIterator<Item = (u32, i32)>,
+    mut group_for_pid: impl FnMut(u32) -> Option<i32>,
+    mut identity_for_pid: impl FnMut(u32) -> Option<ProcessIdentity>,
+) -> BTreeMap<i32, BTreeMap<u32, ProcessIdentity>> {
+    let mut groups = BTreeMap::<i32, BTreeMap<u32, ProcessIdentity>>::new();
+    let mut unavailable = BTreeSet::new();
+    for (pid, original_pgid) in members {
+        let observed_pgid = group_for_pid(pid);
+        if observed_pgid != Some(original_pgid) {
+            unavailable.insert(original_pgid);
+            if let Some(pgid) = observed_pgid.filter(|pgid| pgids.contains(pgid)) {
+                unavailable.insert(pgid);
             }
+            continue;
+        }
+        if unavailable.contains(&original_pgid) {
+            continue;
+        }
+        if let Some(identity) = identity_for_pid(pid) {
+            groups
+                .entry(original_pgid)
+                .or_default()
+                .insert(pid, identity);
+        } else {
+            unavailable.insert(original_pgid);
         }
     }
-    Some(groups)
+    for pgid in unavailable {
+        groups.remove(&pgid);
+        tracing::debug!(
+            pgid,
+            "process-group observation incomplete; excluding group"
+        );
+    }
+    groups
+}
+
+#[cfg(test)]
+mod group_identity_tests {
+    use super::*;
+
+    #[test]
+    fn listed_child_identity_read_failure_excludes_its_group_only() {
+        let groups = collect_group_identities(
+            &BTreeSet::from([10, 20]),
+            [(10, 10), (11, 10), (20, 20)],
+            |pid| Some(if pid == 20 { 20 } else { 10 }),
+            |pid| (pid != 11).then_some(ProcessIdentity { pid, start_time: 1 }),
+        );
+        assert!(!groups.contains_key(&10));
+        assert_eq!(groups[&20].keys().copied().collect::<Vec<_>>(), vec![20]);
+    }
+
+    #[test]
+    fn listed_child_group_reread_failure_or_move_excludes_affected_groups() {
+        let pgids = BTreeSet::from([10, 20, 30]);
+        let listed = [(10, 10), (11, 10), (20, 20), (30, 30)];
+        let identity = |pid| Some(ProcessIdentity { pid, start_time: 1 });
+        let unreadable = collect_group_identities(
+            &pgids,
+            listed,
+            |pid| (pid != 11).then_some(i32::try_from(pid).unwrap()),
+            identity,
+        );
+        assert!(!unreadable.contains_key(&10));
+        assert!(unreadable.contains_key(&20));
+        assert!(unreadable.contains_key(&30));
+
+        let moved = collect_group_identities(
+            &pgids,
+            listed,
+            |pid| {
+                Some(if pid == 11 {
+                    20
+                } else {
+                    i32::try_from(pid).unwrap()
+                })
+            },
+            identity,
+        );
+        assert!(!moved.contains_key(&10));
+        assert!(!moved.contains_key(&20));
+        assert_eq!(moved[&30].keys().copied().collect::<Vec<_>>(), vec![30]);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -313,7 +392,8 @@ fn process_cpu_time_seconds_impl(_pid: u32) -> Option<f64> {
 /// exited between enumeration and read); the gap is logged at `debug`.
 #[cfg(test)]
 pub async fn sample_process_group(pgid: i32) -> ResourceSample {
-    let members = group_member_pids(&BTreeSet::from([pgid]));
+    let members = group_member_pids(&BTreeSet::from([pgid]))
+        .map(|members| members.into_iter().map(|(pid, _)| pid).collect::<Vec<_>>());
 
     let process_count = match &members {
         Some(pids) => u32::try_from(pids.len()).ok(),
@@ -398,7 +478,7 @@ fn proc_session_id(pid: u32) -> Option<i32> {
 }
 
 #[cfg(target_os = "linux")]
-fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<(u32, i32)>> {
     let entries = match std::fs::read_dir("/proc") {
         Ok(e) => e,
         Err(e) => {
@@ -414,8 +494,8 @@ fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
         let Ok(member_pid) = name.parse::<u32>() else {
             continue;
         };
-        if proc_pgrp(member_pid).is_some_and(|pgid| pgids.contains(&pgid)) {
-            out.push(member_pid);
+        if let Some(pgid) = proc_pgrp(member_pid).filter(|pgid| pgids.contains(pgid)) {
+            out.push((member_pid, pgid));
         }
     }
     Some(out)
@@ -565,14 +645,15 @@ fn all_process_pids() -> Option<Vec<u32>> {
 }
 
 #[cfg(target_os = "macos")]
-fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<(u32, i32)>> {
     all_process_pids().map(|pids| {
         pids.into_iter()
-            .filter(|pid| {
-                i32::try_from(*pid)
+            .filter_map(|pid| {
+                let pgid = i32::try_from(pid)
                     .ok()
                     .and_then(proc_pgid)
-                    .is_some_and(|pgid| pgids.contains(&pgid))
+                    .filter(|pgid| pgids.contains(pgid))?;
+                Some((pid, pgid))
             })
             .collect()
     })
@@ -710,7 +791,7 @@ fn session_member_pids(_session_ids: &BTreeSet<i32>) -> Option<Vec<u32>> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn group_member_pids(_pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+fn group_member_pids(_pgids: &BTreeSet<i32>) -> Option<Vec<(u32, i32)>> {
     tracing::debug!(
         "process-inspector: process-group membership unsupported on this platform \
          — resource trio null"

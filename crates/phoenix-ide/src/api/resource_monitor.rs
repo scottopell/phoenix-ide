@@ -382,6 +382,76 @@ mod tests {
             .contains("work:a"));
     }
 
+    #[test]
+    fn identity_read_failure_excludes_only_affected_group_from_cpu_and_memory() {
+        use phoenix_core::process_identity::ProcessIdentity as BashProcessIdentity;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        use phoenix_tools::bash::handle::{BashLaunchIdentity, HandleId};
+
+        let make_group = |name: &str, pgid: i32| {
+            let scope = ResourceScopeKey::Work(WorkScopeId::parse(name).unwrap());
+            phoenix_tools::bash::registry::LiveHandleProcessGroup {
+                work_scope: scope.clone(),
+                control_scope: scope,
+                handle_id: HandleId::new(format!("b-{name}")),
+                launch_identity: BashLaunchIdentity {
+                    process: BashProcessIdentity {
+                        pid: u32::try_from(pgid).unwrap(),
+                        start_time: 1,
+                    },
+                    launch_uuid: name.into(),
+                },
+                pgid,
+            }
+        };
+        let groups = vec![make_group("a", 10), make_group("b", 20)];
+        let members = super::super::process_sample::collect_group_identities(
+            &BTreeSet::from([10, 20]),
+            [(10, 10), (11, 10), (12, 10), (20, 20)],
+            |pid| Some(if pid == 20 { 20 } else { 10 }),
+            |pid| (pid != 11).then_some(ProcessIdentity { pid, start_time: 1 }),
+        );
+        assert!(!members.contains_key(&10));
+        assert_eq!(members[&20].len(), 1);
+        let (handles, identities, incomplete) = capture_bash_members(&groups, Some(&members));
+        assert_eq!(incomplete, BTreeSet::from(["work:a".into()]));
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].scope_key, "work:b");
+        assert_eq!(identities.keys().copied().collect::<Vec<_>>(), vec![20]);
+        let (_, complete) =
+            super::super::work_scope_load::scope_cpu_members(&groups, Some(&members));
+        assert!(!complete["work:a"]);
+        assert!(complete["work:b"]);
+    }
+
+    #[test]
+    fn moved_group_member_invalidates_source_and_destination_not_unrelated_group() {
+        let members = super::super::process_sample::collect_group_identities(
+            &BTreeSet::from([10, 20, 30]),
+            [(10, 10), (11, 10), (20, 20), (30, 30)],
+            |pid| {
+                Some(if pid == 11 {
+                    20
+                } else {
+                    i32::try_from(pid).unwrap()
+                })
+            },
+            |pid| Some(ProcessIdentity { pid, start_time: 1 }),
+        );
+        assert!(!members.contains_key(&10));
+        assert!(!members.contains_key(&20));
+        assert_eq!(members[&30].keys().copied().collect::<Vec<_>>(), vec![30]);
+
+        let unreadable = super::super::process_sample::collect_group_identities(
+            &BTreeSet::from([10, 20]),
+            [(10, 10), (11, 10), (20, 20)],
+            |pid| (pid != 11).then_some(if pid == 20 { 20 } else { 10 }),
+            |pid| Some(ProcessIdentity { pid, start_time: 1 }),
+        );
+        assert!(!unreadable.contains_key(&10));
+        assert_eq!(unreadable[&20].len(), 1);
+    }
+
     #[tokio::test]
     async fn concurrent_consumers_share_one_generation() {
         let monitor = ResourceMonitor::new();

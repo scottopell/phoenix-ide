@@ -304,6 +304,44 @@ describe('WorkScope load indicator', () => {
     expect(screen.getByRole('status').textContent).not.toContain('2.50 cores');
   });
 
+  it('does not revive an old cached summary when re-enabled after a long disabled interval', async () => {
+    getInv.mockResolvedValue(inv([]));
+    let resolveFresh!: (value: ReturnType<typeof reply>) => void;
+    const fetchLoad = vi.fn().mockResolvedValueOnce(reply(sample()))
+      .mockImplementationOnce(() => new Promise<ReturnType<typeof reply>>((resolve) => { resolveFresh = resolve; }));
+    vi.stubGlobal('fetch', fetchLoad);
+    const rendered = render(panel());
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+
+    await act(async () => { rendered.rerender(panel(scopeKey, false)); });
+    await act(async () => { vi.advanceTimersByTime(60_000); });
+    expect(screen.queryByRole('status')).toBeNull();
+    await act(async () => { rendered.rerender(panel()); });
+    expect(screen.getByRole('status').textContent).toBe('Sampled load loading');
+    expect(screen.queryByText(/2.50 cores/)).toBeNull();
+    await act(async () => { resolveFresh(reply(sample({ cpu_cores_latest: 0.75 }))); });
+    expect(screen.getByRole('status').textContent).toContain('now 0.75 cores');
+  });
+
+  it('ignores a pending old response after disable and keeps re-enabled load unavailable until a fresh reply', async () => {
+    getInv.mockResolvedValue(inv([]));
+    let resolveOld!: (value: ReturnType<typeof reply>) => void;
+    let rejectFresh!: (reason: Error) => void;
+    const fetchLoad = vi.fn().mockImplementationOnce(() => new Promise<ReturnType<typeof reply>>((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise<ReturnType<typeof reply>>((_resolve, reject) => { rejectFresh = reject; }));
+    vi.stubGlobal('fetch', fetchLoad);
+    const rendered = render(panel());
+    await act(async () => { rendered.rerender(panel(scopeKey, false)); });
+    await act(async () => { vi.advanceTimersByTime(60_000); });
+    await act(async () => { rendered.rerender(panel()); });
+    await act(async () => { resolveOld(reply(sample())); });
+    expect(screen.getByRole('status').textContent).toBe('Sampled load loading');
+    await act(async () => { rejectFresh(new Error('unavailable')); });
+    expect(screen.getByRole('status').textContent).toBe('Sampled load unavailable');
+    expect(screen.queryByText(/2.50 cores/)).toBeNull();
+  });
+
   it('never fetches load without explicit execution capability or for an unattached/replay key', async () => {
     getInv.mockResolvedValue(inv([]));
     const fetchLoad = vi.fn();
