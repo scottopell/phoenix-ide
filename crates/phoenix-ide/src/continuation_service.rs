@@ -91,17 +91,15 @@ impl ContinuationApplicationService {
             .has_completed_continuation_handoff(&admission.predecessor_conversation_id)
             .await
             .map_err(|error| error.to_string())?
-        {
-            if self
+            && self
                 .runtime
                 .db()
                 .reconcile_completed_automatic_continuation(admission)
                 .await
                 .map_err(|error| error.to_string())?
                 .is_some()
-            {
-                return Ok(true);
-            }
+        {
+            return Ok(true);
         }
 
         let current = self.current_admission(admission).await?;
@@ -165,14 +163,12 @@ impl ContinuationApplicationService {
             .await
             .map_err(|error| error.to_string())?;
 
-        if plan.transfer_ownership {
-            if automatic_intent {
-                self.advance_current(
-                    &admission.predecessor_conversation_id,
-                    AutomaticContinuationPhase::OwnershipTransferred,
-                )
-                .await?;
-            }
+        if plan.transfer_ownership && automatic_intent {
+            self.advance_current(
+                &admission.predecessor_conversation_id,
+                AutomaticContinuationPhase::OwnershipTransferred,
+            )
+            .await?;
         }
 
         if !automatic_intent {
