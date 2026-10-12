@@ -1,11 +1,11 @@
 //! Demand-driven, request-coalesced process resource observations.
 
+use super::AppState;
 use super::deployment::HostResources;
 use super::process_sample::{
-    group_identities_by_pgid, process_identity_for_sampling, sample_process_observations,
-    session_member_identities_for_sampling, ProcessIdentity, ProcessObservation,
+    ProcessIdentity, ProcessObservation, group_identities_by_pgid, process_identity_for_sampling,
+    sample_process_observations, session_member_identities_for_sampling,
 };
-use super::AppState;
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -83,6 +83,38 @@ impl ResourceObservationGeneration {
             .filter_map(|handle_id| self.handle_pids(scope_key, handle_id))
             .flat_map(|pids| pids.iter().copied())
             .collect()
+    }
+
+    pub fn bash_health_for_handles(
+        &self,
+        scope_key: &str,
+        handle_ids: &[String],
+    ) -> phoenix_core::domain::work_scope_inventory::ResourceHealth {
+        let unavailable = || phoenix_core::domain::work_scope_inventory::ResourceHealth {
+            cpu_percent: None,
+            memory_bytes: None,
+            process_count: None,
+        };
+        if self.incomplete_bash_scopes.contains(scope_key) || handle_ids.is_empty() {
+            return unavailable();
+        }
+        let mut pids = BTreeSet::new();
+        for handle_id in handle_ids {
+            let Some(members) = self.handle_pids(scope_key, handle_id) else {
+                return unavailable();
+            };
+            pids.extend(members);
+        }
+        if pids.is_empty()
+            || pids.iter().any(|pid| !self.observations.contains_key(pid))
+            || self
+                .handles
+                .iter()
+                .any(|target| target.scope_key != scope_key && !target.pids.is_disjoint(&pids))
+        {
+            return unavailable();
+        }
+        health_for_pids(self, &pids)
     }
 }
 
@@ -230,6 +262,13 @@ fn capture_bash_members(
     (handles, identities, incomplete)
 }
 
+fn retain_complete_bash_targets(
+    handles: &mut Vec<HandleObservationTarget>,
+    incomplete_scopes: &BTreeSet<String>,
+) {
+    handles.retain(|target| !incomplete_scopes.contains(&target.scope_key));
+}
+
 fn changed_bash_scopes(
     groups: &[phoenix_tools::bash::registry::LiveHandleProcessGroup],
     before: Option<&GroupIdentities>,
@@ -282,6 +321,8 @@ async fn sample_generation(
         before_members.as_ref(),
         after_members.as_ref(),
     ));
+
+    retain_complete_bash_targets(&mut handles, &incomplete_bash_scopes);
 
     ResourceObservationGeneration {
         sampled_at: Utc::now(),
@@ -377,9 +418,11 @@ mod tests {
             BTreeSet::from(["work:a".to_string(), "work:b".to_string()])
         );
         let missing_leader = BTreeMap::from([(10, BTreeMap::from([(11, identity(11, 2))]))]);
-        assert!(capture_bash_members(&groups, Some(&missing_leader))
-            .2
-            .contains("work:a"));
+        assert!(
+            capture_bash_members(&groups, Some(&missing_leader))
+                .2
+                .contains("work:a")
+        );
     }
 
     #[test]
@@ -481,9 +524,11 @@ mod tests {
         }
         let generations = futures::future::join_all(tasks).await;
         let first = generations[0].as_ref().unwrap();
-        assert!(generations
-            .iter()
-            .all(|result| Arc::ptr_eq(first, result.as_ref().unwrap())));
+        assert!(
+            generations
+                .iter()
+                .all(|result| Arc::ptr_eq(first, result.as_ref().unwrap()))
+        );
         assert_eq!(samples.load(Ordering::SeqCst), 1);
         assert_eq!(monitor.sample_count().await, 1);
     }
@@ -585,6 +630,38 @@ mod tests {
             },
         )]);
         assert!(!valid_group_members(&group, &members));
+    }
+
+    #[test]
+    fn incomplete_scope_targets_are_removed_and_all_bash_consumers_report_unavailable() {
+        let mut generation = empty_generation();
+        generation.handles = vec![
+            HandleObservationTarget {
+                scope_key: "work:a".into(),
+                handle_id: "a-1".into(),
+                pids: BTreeSet::from([10]),
+            },
+            HandleObservationTarget {
+                scope_key: "work:b".into(),
+                handle_id: "b-1".into(),
+                pids: BTreeSet::from([20]),
+            },
+        ];
+        generation.incomplete_bash_scopes.insert("work:a".into());
+        retain_complete_bash_targets(&mut generation.handles, &generation.incomplete_bash_scopes);
+        assert!(generation.handle_pids("work:a", "a-1").is_none());
+        assert!(generation.handle_pids("work:b", "b-1").is_some());
+        let health = generation.bash_health_for_handles("work:a", &["a-1".into()]);
+        assert_eq!(health.cpu_percent, None);
+        assert_eq!(health.memory_bytes, None);
+        assert_eq!(health.process_count, None);
+        // A missing process observation is also unavailable, not a partial total.
+        assert_eq!(
+            generation
+                .bash_health_for_handles("work:b", &["b-1".into()])
+                .process_count,
+            None
+        );
     }
 
     #[test]

@@ -4044,18 +4044,20 @@ async fn get_work_scope_inventory(
     if inventory.bash.iter().any(|handle| handle.state.is_live()) {
         let generation = state.resource_monitor.observe(&state).await;
         for handle in &mut inventory.bash {
-            if let Some(pids) = generation.handle_pids(&scope_key, &handle.handle_id) {
-                handle.health = Some(super::resource_monitor::health_for_pids(&generation, pids));
+            if handle.state.is_live() {
+                handle.health = Some(generation.bash_health_for_handles(
+                    &scope_key,
+                    std::slice::from_ref(&handle.handle_id),
+                ));
             }
         }
         let visible_handle_ids = inventory
             .bash
             .iter()
+            .filter(|handle| handle.state.is_live())
             .map(|handle| handle.handle_id.clone())
             .collect::<Vec<_>>();
-        let visible_pids = generation.visible_handle_pids(&scope_key, &visible_handle_ids);
-        inventory.health = (!visible_pids.is_empty())
-            .then(|| super::resource_monitor::health_for_pids(&generation, &visible_pids));
+        inventory.health = Some(generation.bash_health_for_handles(&scope_key, &visible_handle_ids));
         inventory.health_sampled_at = Some(generation.sampled_at);
     }
 
@@ -4276,14 +4278,7 @@ async fn inspect_bash_handle(
     if assembly.live_pgid.is_some() {
         let generation = state.resource_monitor.observe(&state).await;
         let scope_key = assembly.owner.stable_key();
-        let health = generation.handle_pids(&scope_key, &handle_id).map_or_else(
-            || phoenix_core::domain::work_scope_inventory::ResourceHealth {
-                cpu_percent: None,
-                memory_bytes: None,
-                process_count: None,
-            },
-            |pids| super::resource_monitor::health_for_pids(&generation, pids),
-        );
+        let health = generation.bash_health_for_handles(&scope_key, &[handle_id]);
         assembly.inspection.resources_sampled_at = Some(generation.sampled_at);
         assembly.inspection.resources =
             Some(phoenix_core::domain::process_inspection::ResourceSample {
