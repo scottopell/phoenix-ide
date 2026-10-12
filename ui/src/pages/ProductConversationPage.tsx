@@ -233,11 +233,16 @@ function isLatestSegment(snapshot: HistorySnapshot, transcriptRowId: string): bo
   return transcriptRowId === snapshot.latest_transcript_row_id;
 }
 
+function omitRepresentedOpenings<T extends AcquiredMessage>(messages: T[], boundaries: ConversationHistoryBoundaryView[]): T[] {
+  return messages.filter(message => !boundaries.some(boundary => boundary.successor_transcript_row_id === message.conversation_id
+    && boundary.represented_successor_opening_message_id === message.message_id));
+}
+
 function flattenHistoricalMessages(snapshot: HistorySnapshot): Message[] {
   return sortSegments(snapshot)
     .flatMap((segment) => {
       if (isLatestSegment(snapshot, segment.transcript_row_id)) return [];
-      return segment.messages.map((message) => toSegmentMessage(segment, message, snapshot.boundaries));
+      return omitRepresentedOpenings(segment.messages, snapshot.boundaries).map((message) => toSegmentMessage(segment, message, snapshot.boundaries));
     });
 }
 
@@ -287,17 +292,17 @@ function makeAggregateMessages(
   if (!liveMessages) {
     const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
     const latestMessages = latestSegment
-      ? latestSegment.messages.map((message) => toSegmentMessage(latestSegment, message, snapshot.boundaries))
+      ? omitRepresentedOpenings(latestSegment.messages, snapshot.boundaries).map((message) => toSegmentMessage(latestSegment, message, snapshot.boundaries))
       : [];
     return [...historical, ...latestMessages];
   }
   const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
-  const latestSnapshotMessages = latestSegment?.messages.map((message) => toSegmentMessage(latestSegment, message, snapshot.boundaries)) ?? [];
+  const latestSnapshotMessages = latestSegment ? omitRepresentedOpenings(latestSegment.messages, snapshot.boundaries).map((message) => toSegmentMessage(latestSegment, message, snapshot.boundaries)) : [];
   return [
     ...historical,
     ...reconcileTranscriptRowMessages(
       latestSnapshotMessages,
-      liveMessages,
+      omitRepresentedOpenings(liveMessages, snapshot.boundaries),
       snapshot.latest_transcript_row_id,
     ),
   ];
@@ -954,7 +959,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
           if (current?.productConversationId !== productConversationId) return { productConversationId, value: next };
           const acquired = outgoingId === current.value.latest_transcript_row_id && outgoingMessages.length > 0
             ? { ...current.value, segments: current.value.segments.map(segment => segment.transcript_row_id === outgoingId
-                ? { ...segment, messages: reconcileTranscriptRowMessages(segment.messages.map(message => toSegmentMessage(segment, message, current.value.boundaries)), outgoingMessages, outgoingId) }
+                ? { ...segment, messages: reconcileTranscriptRowMessages(segment.messages.map(message => toSegmentMessage(segment, message, current.value.boundaries)), omitRepresentedOpenings(outgoingMessages, next.boundaries), outgoingId) }
                 : segment) }
             : current.value;
           return { productConversationId, value: mergeRefreshedTail(acquired, next) };

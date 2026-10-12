@@ -95,6 +95,17 @@ async function assertLazyHistory(page, id, viewport, outDir) {
   if (await fixtureValue(page, 'older-snapshot-requests') !== '2') throw new Error('Authored disclosure navigation reacquired loaded history');
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--nested-historical-fallback.png`, fullPage: true });
   journeys.push(`${id}/${viewport.name}: loaded historical prose uses one native nonnested Markdown disclosure; unsupported nested envelope remains visible literal syntax with ordinary Markdown body, independently of the literal persisted handoff summary and history-owned outer disclosure`);
+  if (id.includes('global-lazy-history')) {
+    await page.evaluate(() => { location.hash = '/global/history-3?source_transcript=history-1#message-history-answer-1'; });
+    await page.waitForFunction(() => document.querySelector('.coordinator-conversation')?.hidden === false
+      && document.documentElement.dataset.sourceFixtureLocation?.includes('source_transcript=history-1'));
+    await page.getByRole('button', { name: /Member 2 request/ }).click();
+    await page.waitForFunction(() => document.querySelector('.coordinator-conversation')?.hidden === false
+      && document.documentElement.dataset.sourceFixtureLocation?.includes('source_transcript=history-2'));
+    if (await fixtureValue(page, 'older-snapshot-requests') !== '2') throw new Error('Changing a validated Global source pin discarded acquired history');
+    await page.getByRole('button', { name: /Member 1 request/ }).waitFor({ state: 'visible' });
+    journeys.push(`${id}/${viewport.name}: changing validated Global member pins retains the acquired prefix and aggregate owner`);
+  }
   const input = page.locator('.product-conversation-page__composer #message-input');
   await input.fill('Newest member remains writable after historical navigation');
   await input.press('Enter');

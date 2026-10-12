@@ -106,7 +106,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
     ...overrides,
   };
   snapshot.boundaries = overrides.boundaries ?? snapshot.segments.flatMap((segment, index) => segment.messages.filter(message => message.message_type === 'continuation').map(message => ({
-    message_id: message.message_id, predecessor_transcript_row_id: segment.transcript_row_id,
+    message_id: message.message_id, represented_successor_opening_message_id: null, predecessor_transcript_row_id: segment.transcript_row_id,
     successor_transcript_row_id: snapshot.segments[index + 1]?.transcript_row_id ?? snapshot.latest_transcript_row_id,
     segment_ordinal: segment.segment_ordinal,
   })));

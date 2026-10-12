@@ -561,6 +561,10 @@ fn history_boundaries(
             let handoff = segment.handoff.as_ref()?;
             Some(ConversationHistoryBoundaryView {
                 message_id: handoff.continuation_message_id().to_owned(),
+                represented_successor_opening_message_id: handoff
+                    .accepted_is_duplicate_summary()
+                    .then(|| handoff.accepted_successor_message_id().map(str::to_owned))
+                    .flatten(),
                 predecessor_transcript_row_id: segment.transcript_row.conversation.id.clone(),
                 successor_transcript_row_id: segment
                     .transcript_row
@@ -2389,6 +2393,7 @@ mod tests {
         assert_eq!(boundaries[0]["conversation_id"], root.id);
         assert_eq!(boundaries[0]["sequence_id"], 2);
         assert_eq!(original["boundaries"][0]["message_id"], "original-boundary");
+        assert!(original["boundaries"][0]["represented_successor_opening_message_id"].is_null());
         assert!(original["boundaries"][0].get("summary").is_none());
         let response = create_router(state)
             .oneshot(
@@ -2479,7 +2484,15 @@ mod tests {
             } else {
                 "/api/product-conversations"
             };
-            let uri = format!("{prefix}/{}", root.id);
+            let uri = format!(
+                "{prefix}/{}{}",
+                root.id,
+                if coordinator {
+                    ""
+                } else {
+                    "?boundary_representation=original_messages"
+                }
+            );
             let response = create_router(state.clone())
                 .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
                 .await
@@ -2522,6 +2535,16 @@ mod tests {
                     .unwrap();
             assert_eq!(ready["latest_opening_pending"], false);
             assert_eq!(ready["writable_transcript_row_id"], successor.id);
+            assert_eq!(
+                ready["boundaries"][0]["represented_successor_opening_message_id"],
+                "reserved-opening"
+            );
+            assert!(ready["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|segment| segment["messages"].as_array().unwrap())
+                .all(|message| message["message_id"] != "reserved-opening"));
         }
     }
 

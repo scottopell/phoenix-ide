@@ -332,6 +332,8 @@ AND SHALL read reference resolution, ordered topology, message-page contents, an
 AND SHALL reuse the aggregate cursor's message limits, deterministic ordering, ceiling fencing, and generation validation
 AND SHALL return original continuation message records with their exact identity and transcript-local coordinates
 AND SHALL return content-free boundary navigation metadata for the aggregate, including boundaries outside the acquired page
+AND SHALL identify the exact accepted successor opening already represented by each original boundary, or explicitly report no represented opening, so live hydration cannot restore a duplicate summary
+AND SHALL retain accepted openings with distinct instructions and messages with distinct identities even when their text matches a boundary summary
 AND SHALL identify the newest writable Coordinator member independently of the requested historical member
 AND SHALL NOT create a Coordinator, admit a turn, or expose ordinary lifecycle, Close, or work actions as a side effect of the read
 

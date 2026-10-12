@@ -301,7 +301,7 @@ function makeSnapshot(overrides: Partial<SnapshotFixtureInput> = {}): ProductCon
     has_older: true,
     ...overrides,
   };
-  snapshot.boundaries = snapshot.segments.flatMap((segment) => segment.handoff ? [{ message_id: segment.handoff.continuation_message_id, predecessor_transcript_row_id: segment.transcript_row_id, successor_transcript_row_id: segment.handoff.successor_transcript_row_id, segment_ordinal: segment.segment_ordinal }] : []);
+  snapshot.boundaries = overrides.boundaries ?? snapshot.segments.flatMap((segment) => segment.handoff ? [{ represented_successor_opening_message_id: null, message_id: segment.handoff.continuation_message_id, predecessor_transcript_row_id: segment.transcript_row_id, successor_transcript_row_id: segment.handoff.successor_transcript_row_id, segment_ordinal: segment.segment_ordinal }] : []);
   const segments = snapshot.segments.map(({ handoff, ...segment }) => !handoff || segment.messages.some((message) => message.message_id === handoff.continuation_message_id) ? segment : {
     ...segment, messages: [...segment.messages, { ...makeMessage(handoff.continuation_message_id, Math.max(0, ...segment.messages.map((message) => message.sequence_id)) + 1, segment.transcript_row_id), message_type: 'continuation' as const, content: { summary: handoff.summary } }],
   });
@@ -588,6 +588,32 @@ describe('ProductConversationPage', () => {
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
     fireEvent.click(screen.getByRole('button', { name: 'history back' }));
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+  });
+
+  it.each([false, true])('excludes only the exact represented successor opening from live hydration (Global=%s)', async (global) => {
+    const { api } = await import('../api');
+    const boundary = { ...makeMessage('original-boundary', 2, 'row-1'), message_type: 'continuation', content: { type: 'continuation', summary: 'Persisted summary' } };
+    const opening = { ...makeMessage('represented-opening', 1, 'row-2'), message_type: 'continuation', content: { type: 'continuation', summary: 'Persisted summary' } };
+    const editedOpening = { ...makeMessage('distinct-opening', 2, 'row-2'), content: { type: 'user', text: 'Persisted summary plus explicit instruction' } };
+    const sameTextDifferentIdentity = { ...makeMessage('distinct-repeat', 3, 'row-2'), content: { type: 'user', text: 'Persisted summary' } };
+    const initial = makeSnapshot({ before: null, has_older: false, segments: [
+      { segment_ordinal: 0, transcript_row_id: 'row-1', slug: 'row-1', title: 'Old', messages: [boundary] },
+      { segment_ordinal: 1, transcript_row_id: 'row-2', slug: 'row-2', title: 'Newest', messages: [] },
+    ], boundaries: [{ represented_successor_opening_message_id: 'represented-opening', message_id: 'original-boundary', predecessor_transcript_row_id: 'row-1', successor_transcript_row_id: 'row-2', segment_ordinal: 0 }] });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(initial));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(initial);
+    renderPage(global ? '/global/row-2' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => emitLatestProjection({ messages: [opening, editedOpening, sameTextDifferentIdentity], pendingMessages: [], convState: { type: 'idle' } }));
+    await waitFor(() => expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual(['original-boundary', 'distinct-opening', 'distinct-repeat']));
+    const continued = makeSnapshot({ ...initial, latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', segments: [...initial.segments, {
+      segment_ordinal: 2, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')],
+    }] });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(continued));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(continued);
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual(['original-boundary', 'distinct-opening', 'distinct-repeat', 'newest-message']);
   });
 
   it('keeps a hashless newest Global reader unpinned when its route member continues', async () => {

@@ -417,6 +417,7 @@ pub struct ProductConversationSnapshotView {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ConversationHistoryBoundaryView {
     pub message_id: String,
+    pub represented_successor_opening_message_id: Option<String>,
     pub predecessor_transcript_row_id: String,
     pub successor_transcript_row_id: String,
     pub segment_ordinal: i64,

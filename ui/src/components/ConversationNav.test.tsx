@@ -55,7 +55,7 @@ describe('ConversationNav input provenance', () => {
 
 describe('aggregate boundary navigation', () => {
   it('uses one exact boundary identity before and after its chronological unit loads', () => {
-    const boundary = { message_id: 'exact-continuation', predecessor_transcript_row_id: 'predecessor', successor_transcript_row_id: 'successor', segment_ordinal: 0 };
+    const boundary = { represented_successor_opening_message_id: null, message_id: 'exact-continuation', predecessor_transcript_row_id: 'predecessor', successor_transcript_row_id: 'successor', segment_ordinal: 0 };
     const jump = vi.fn();
     const boundaryJump = vi.fn();
     const { rerender } = render(<ConversationNav chapters={[]} activeUnitIndex={null} onJump={jump} historyBoundaries={[boundary]} onJumpBoundary={boundaryJump} />);
