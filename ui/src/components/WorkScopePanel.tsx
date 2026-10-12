@@ -595,8 +595,13 @@ function useWorkScopeInventory(
     if (liveInventory != null) {
       sseGenRef.current += 1;
       setDisplayed(liveInventory);
+      if (liveInventory.scope_key === scopeKey) {
+        setConfirmedScope({ scopeKey, conversationId });
+      } else {
+        setConfirmedScope(null);
+      }
     }
-  }, [liveInventory]);
+  }, [liveInventory, scopeKey, conversationId]);
 
   // Elapsed-time tick: only while the surface is visible (expanded). The
   // collapsed badge shows just a count, not elapsed times — so an off-screen

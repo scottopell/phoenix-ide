@@ -1,4 +1,4 @@
-use super::process_sample::{cpu_time_for_identity, group_identities_by_pgid, ProcessIdentity};
+use super::process_sample::{ProcessIdentity, cpu_time_for_identity, group_identities_by_pgid};
 use super::resource_monitor::{ResourceMonitor, ResourceObservationGeneration};
 use chrono::{DateTime, Utc};
 use phoenix_core::work_scope::ResourceScopeKey;
@@ -88,6 +88,8 @@ pub struct WorkScopeLoadService {
     cpu: Mutex<CpuState>,
     memory_monitor: Arc<ResourceMonitor>,
     terminals: phoenix_terminal::ActiveTerminals,
+    #[cfg(test)]
+    before_cpu_lock: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 impl WorkScopeLoadService {
@@ -101,6 +103,8 @@ impl WorkScopeLoadService {
             cpu: Mutex::new(CpuState::default()),
             memory_monitor,
             terminals,
+            #[cfg(test)]
+            before_cpu_lock: std::sync::Mutex::new(None),
         });
         Self::spawn_sampler(&service);
         service
@@ -204,6 +208,14 @@ impl WorkScopeLoadService {
         }
     }
 
+    #[cfg(test)]
+    async fn wait_before_cpu_lock(&self) {
+        let barrier = self.before_cpu_lock.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+    }
+
     pub async fn contains_scope(
         &self,
         db: &crate::db::Database,
@@ -239,17 +251,23 @@ impl WorkScopeLoadService {
             .handles
             .snapshot_live_process_groups_with_epochs()
             .await;
-        let stable_epoch = stable_scope_epoch(&snapshot, &latest, scope);
+        #[cfg(test)]
+        self.wait_before_cpu_lock().await;
         let state = self.cpu.lock().await;
+        let current = self
+            .handles
+            .snapshot_live_process_groups_with_epochs()
+            .await;
         summarize(
             scope,
-            &latest.groups,
-            stable_epoch,
+            &current.groups,
+            stable_scope_epoch(&snapshot, &current, scope),
             observation.as_deref(),
             &state,
             Instant::now(),
             Utc::now(),
-            memory_snapshot_stable(&snapshot, &latest, scope),
+            memory_snapshot_stable(&snapshot, &latest, scope)
+                && memory_snapshot_stable(&latest, &current, scope),
         )
     }
 
@@ -286,7 +304,13 @@ impl WorkScopeLoadService {
             .handles
             .snapshot_live_process_groups_with_epochs()
             .await;
+        #[cfg(test)]
+        self.wait_before_cpu_lock().await;
         let state = self.cpu.lock().await;
+        let current = self
+            .handles
+            .snapshot_live_process_groups_with_epochs()
+            .await;
         let now = Instant::now();
         let sampled_at = Utc::now();
         Ok(scopes
@@ -294,13 +318,14 @@ impl WorkScopeLoadService {
             .map(|scope| {
                 summarize(
                     scope,
-                    &latest.groups,
-                    stable_scope_epoch(&snapshot, &latest, scope),
+                    &current.groups,
+                    stable_scope_epoch(&snapshot, &current, scope),
                     observation.as_deref(),
                     &state,
                     now,
                     sampled_at,
-                    memory_snapshot_stable(&snapshot, &latest, scope),
+                    memory_snapshot_stable(&snapshot, &latest, scope)
+                        && memory_snapshot_stable(&latest, &current, scope),
                 )
             })
             .collect())
@@ -453,25 +478,42 @@ fn read_cpu(
     BTreeMap<String, BTreeMap<u32, CpuReading>>,
     BTreeMap<String, bool>,
 ) {
+    read_cpu_with(groups, group_identities_by_pgid, cpu_time_for_identity)
+}
+
+fn read_cpu_with(
+    groups: &[LiveHandleProcessGroup],
+    mut enumerate: impl FnMut(&BTreeSet<i32>) -> Option<BTreeMap<i32, BTreeMap<u32, ProcessIdentity>>>,
+    mut counter: impl FnMut(ProcessIdentity) -> Option<f64>,
+) -> (
+    BTreeMap<String, BTreeMap<u32, CpuReading>>,
+    BTreeMap<String, bool>,
+) {
     let pgids = groups
         .iter()
         .map(|group| group.pgid)
         .collect::<BTreeSet<_>>();
-    let group_members = group_identities_by_pgid(&pgids);
-    let (members, mut complete) = scope_cpu_members(groups, group_members.as_ref());
+    let before = enumerate(&pgids);
+    let (members, mut complete) = scope_cpu_members(groups, before.as_ref());
     let mut readings = BTreeMap::new();
-    for (scope, identities) in members {
+    for (scope, identities) in &members {
         let mut scope_readings = BTreeMap::new();
-        if complete.get(&scope) == Some(&true) {
-            for (&pid, &identity) in &identities {
-                if let Some(seconds) = cpu_time_for_identity(identity) {
+        if complete.get(scope) == Some(&true) {
+            for (&pid, &identity) in identities {
+                if let Some(seconds) = counter(identity) {
                     scope_readings.insert(pid, CpuReading { identity, seconds });
                 } else {
                     complete.insert(scope.clone(), false);
                 }
             }
         }
-        readings.insert(scope, scope_readings);
+        readings.insert(scope.clone(), scope_readings);
+    }
+    let after = enumerate(&pgids);
+    let (after_members, after_complete) = scope_cpu_members(groups, after.as_ref());
+    for (scope, valid) in &mut complete {
+        *valid &= after_complete.get(scope) == Some(&true)
+            && members.get(scope) == after_members.get(scope);
     }
     for (scope, valid) in &complete {
         if !valid {
@@ -760,6 +802,103 @@ mod tests {
             assert_eq!(summary.cpu_sampled_at, None);
             assert_eq!((summary.memory_bytes, summary.process_count), (None, None));
         }
+    }
+
+    #[tokio::test]
+    async fn summary_rechecks_registry_after_waiting_for_cpu_mutex() {
+        use phoenix_tools::bash::handle::{Handle, HandleId};
+        let handles = Arc::new(BashHandleRegistry::new());
+        let load = WorkScopeLoadService::new(
+            &handles,
+            ResourceMonitor::new(),
+            phoenix_terminal::ActiveTerminals::new(),
+        );
+        let scope = ResourceScopeKey::Work(
+            phoenix_core::work_scope::WorkScopeId::parse("waiting").unwrap(),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *load.before_cpu_lock.lock().unwrap() = Some(barrier.clone());
+        let cpu = load.cpu.lock().await;
+        let pending = tokio::spawn({
+            let load = load.clone();
+            let scope = scope.clone();
+            async move { load.summary(&scope).await }
+        });
+        barrier.wait().await;
+        handles
+            .register_existing_handle(
+                &scope,
+                Handle::new_live(
+                    scope.clone(),
+                    HandleId::new("new"),
+                    "test".into(),
+                    None,
+                    "/tmp".into(),
+                    i32::MAX,
+                    10,
+                    1024,
+                ),
+            )
+            .await;
+        drop(cpu);
+        let result = pending.await.unwrap();
+        assert_eq!(result.live_jobs, 1);
+        assert_eq!(result.cpu_cores_latest, None);
+        assert_eq!((result.memory_bytes, result.process_count), (None, None));
+    }
+
+    #[tokio::test]
+    async fn summaries_recheck_registry_after_waiting_for_cpu_mutex() {
+        use phoenix_tools::bash::handle::{Handle, HandleId};
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("waiting-conv", "waiting", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope = ResourceScopeKey::Work(
+            db.get_conversation("waiting-conv")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .unwrap(),
+        );
+        let handles = Arc::new(BashHandleRegistry::new());
+        let load = WorkScopeLoadService::new(
+            &handles,
+            ResourceMonitor::new(),
+            phoenix_terminal::ActiveTerminals::new(),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *load.before_cpu_lock.lock().unwrap() = Some(barrier.clone());
+        let cpu = load.cpu.lock().await;
+        let pending = tokio::spawn({
+            let load = load.clone();
+            async move { load.summaries(&db).await.unwrap() }
+        });
+        barrier.wait().await;
+        handles
+            .register_existing_handle(
+                &scope,
+                Handle::new_live(
+                    scope.clone(),
+                    HandleId::new("new"),
+                    "test".into(),
+                    None,
+                    "/tmp".into(),
+                    i32::MAX,
+                    10,
+                    1024,
+                ),
+            )
+            .await;
+        drop(cpu);
+        let results = pending.await.unwrap();
+        let result = results
+            .iter()
+            .find(|item| item.scope_key == scope.stable_key())
+            .unwrap();
+        assert_eq!(result.live_jobs, 1);
+        assert_eq!(result.cpu_cores_latest, None);
+        assert_eq!((result.memory_bytes, result.process_count), (None, None));
     }
 
     #[tokio::test]
@@ -1185,6 +1324,71 @@ mod tests {
                 launch_uuid: "launch".into(),
             },
             pgid: 10,
+        }
+    }
+
+    #[test]
+    fn cpu_counter_interval_rechecks_native_membership_and_identity() {
+        let scope =
+            ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse("a").unwrap());
+        let groups = vec![group(scope, "b-1")];
+        let leader = ProcessIdentity {
+            pid: 10,
+            start_time: 1,
+        };
+        let child = ProcessIdentity {
+            pid: 11,
+            start_time: 2,
+        };
+        let members = |entries: &[ProcessIdentity]| {
+            Some(BTreeMap::from([(
+                10,
+                entries
+                    .iter()
+                    .map(|identity| (identity.pid, *identity))
+                    .collect(),
+            )]))
+        };
+        let base = members(&[leader, child]);
+        let cases = [
+            ("stable", base.clone(), base.clone(), true),
+            ("join", members(&[leader]), base.clone(), false),
+            ("exit", base.clone(), members(&[leader]), false),
+            (
+                "reuse",
+                base.clone(),
+                members(&[
+                    leader,
+                    ProcessIdentity {
+                        pid: 11,
+                        start_time: 3,
+                    },
+                ]),
+                false,
+            ),
+            ("failed post-read", base.clone(), None, false),
+        ];
+        for (case, before, after, expected) in cases {
+            let mut calls = 0;
+            let (readings, complete) = read_cpu_with(
+                &groups,
+                |_| {
+                    calls += 1;
+                    if calls == 1 {
+                        before.clone()
+                    } else {
+                        after.clone()
+                    }
+                },
+                |_| Some(2.0),
+            );
+            assert_eq!(calls, 2, "{case}");
+            assert_eq!(complete["work:a"], expected, "{case}");
+            assert_eq!(
+                readings["work:a"].len(),
+                before.unwrap()[&10].len(),
+                "{case}"
+            );
         }
     }
 

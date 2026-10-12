@@ -196,6 +196,22 @@ describe('WorkScope load indicator', () => {
     expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
   });
 
+  it('admits a matching SSE inventory even when the superseded initial pull fails', async () => {
+    let rejectInitial!: (reason: Error) => void;
+    getInv.mockReturnValue(new Promise((_resolve, reject) => { rejectInitial = reject; }));
+    const fetchLoad = vi.fn().mockResolvedValue(reply(sample()));
+    vi.stubGlobal('fetch', fetchLoad);
+    const utils = render(sectionTree({ scopeKey, executionCapable: true, liveInventory: null }));
+    expect(fetchLoad).not.toHaveBeenCalled();
+
+    await act(async () => {
+      utils.rerender(sectionTree({ scopeKey, executionCapable: true, liveInventory: inv([], { scope_key: scopeKey }) }));
+    });
+    await act(async () => { rejectInitial(new Error('initial inventory failed')); });
+    expect(fetchLoad).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+  });
+
   it('revokes load admission when a later inventory poll returns a different scope', async () => {
     getInv
       .mockResolvedValue(inv([bash()], { scope_key: 'work:other' }))
