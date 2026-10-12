@@ -5102,14 +5102,25 @@ def _safe_kache_startup_diagnostic(
     output: str, *, environment: Mapping[str, str], limit: int = 2048
 ) -> str:
     rendered = output
-    for key, value in environment.items():
-        if value and (
-            key.startswith("AWS_")
-            or key.startswith("GOOGLE_")
-            or key == "KACHE_S3_ACCESS_KEY"
-            or any(marker in key for marker in ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"))
-        ):
-            rendered = rendered.replace(value, "[redacted]")
+    sensitive_values = sorted(
+        (
+            value
+            for key, value in environment.items()
+            if value
+            and (
+                key in {"AWS_ACCESS_KEY_ID", "KACHE_S3_ACCESS_KEY"}
+                or key.startswith("GOOGLE_APPLICATION_CREDENTIALS")
+                or any(
+                    marker in key
+                    for marker in ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL")
+                )
+            )
+        ),
+        key=len,
+        reverse=True,
+    )
+    for value in sensitive_values:
+        rendered = rendered.replace(value, "[redacted]")
     if "=" in rendered or re.search(
         r"(?i)(?:secret|token|password|credential|access[_-]?key)\s*:",
         rendered,
@@ -5164,7 +5175,7 @@ def _kache_daemon_receipt_matches(socket: Path, identity: str) -> bool:
     try:
         receipt = json.loads(_kache_daemon_receipt_path(socket).read_text())
         socket_info = socket.stat()
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return False
     if not isinstance(receipt, dict):
         return False
@@ -5179,7 +5190,7 @@ def _kache_daemon_receipt_matches(socket: Path, identity: str) -> bool:
 def _kache_daemon_serving_pid(socket: Path) -> int | None:
     try:
         state = json.loads(socket.with_suffix(".state.json").read_text())
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(state, dict) or state.get("phase") != "ready":
         return None
@@ -5306,10 +5317,7 @@ def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str |
                 socket=socket_path,
                 identity=identity,
             )
-            return (
-                _safe_kache_startup_diagnostic(daemon_error, environment=os.environ)
-                if daemon_error else None
-            )
+            return daemon_error
     except OSError as error:
         return f"cannot lock Kache socket setup: {error}"
 

@@ -34,6 +34,7 @@ class CompilerCacheTests(unittest.TestCase):
         self.addCleanup(self.environment.stop)
         self.socket_directory = Path(self.store_root.name) / "sockets"
         self.socket_directory.mkdir()
+        self.real_private_kache_socket_dir = self.dev._private_kache_socket_dir
         self.private_socket = mock.patch.object(
             self.dev,
             "_private_kache_socket_dir",
@@ -740,6 +741,17 @@ class CompilerCacheTests(unittest.TestCase):
                     ),
                 )
 
+    def test_environment_secret_redaction_is_order_independent(self):
+        secret = "fixture-secret-2-suffix"
+        rendered = self.dev._safe_kache_startup_diagnostic(
+            f"config denied: {secret}",
+            environment={
+                "AWS_MAX_ATTEMPTS": "2",
+                "AWS_SECRET_ACCESS_KEY": secret,
+            },
+        )
+        self.assertEqual("config denied: [redacted]", rendered)
+
     def test_daemon_start_receipts_only_the_spawned_serving_process(self):
         child = mock.Mock(pid=1234)
         child.poll.return_value = None
@@ -884,6 +896,43 @@ class CompilerCacheTests(unittest.TestCase):
                     self.dev._kache_daemon_receipt_matches(socket, "identity")
                 )
                 self.assertIsNone(self.dev._kache_daemon_serving_pid(socket))
+
+    def test_pathological_numeric_proof_files_are_unverifiable(self):
+        with self.dev.tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            socket = root / "kache.sock"
+            socket.write_text("")
+            invalid = b'{"phase":"ready","pid":' + b"9" * 4301 + b"}"
+            socket.with_suffix(".state.json").write_bytes(invalid)
+            with mock.patch.object(
+                self.dev, "_private_kache_socket_dir", return_value=root
+            ):
+                self.dev._kache_daemon_receipt_path(socket).write_bytes(invalid)
+                self.assertFalse(
+                    self.dev._kache_daemon_receipt_matches(socket, "identity")
+                )
+                self.assertIsNone(self.dev._kache_daemon_serving_pid(socket))
+
+    def test_full_daemon_boundary_preserves_lifecycle_facts_for_equals_socket(self):
+        socket = Path("/tmp/run=one.sock")
+        with mock.patch.dict(
+            os.environ, {"KACHE_SOCKET_PATH": str(socket)}, clear=True
+        ), mock.patch.object(
+            self.dev, "_effective_kache_socket", return_value=(socket, None)
+        ), mock.patch.object(
+            self.dev, "_kache_socket_lock", return_value=contextlib.nullcontext()
+        ), mock.patch.object(
+            self.dev,
+            "_start_kache_daemon_locked",
+            return_value=(
+                "[redacted backend diagnostic]; spawned Kache child pid 2468 may still be "
+                f"live on {socket} without a Phoenix ownership receipt"
+            ),
+        ):
+            error = self.dev._ensure_kache_daemon("/bin/kache")
+        self.assertIn("pid 2468 may still be live", error or "")
+        self.assertIn(str(socket), error or "")
+        self.assertIn("without a Phoenix ownership receipt", error or "")
 
     def test_operator_socket_reuses_only_matching_phoenix_started_daemon(self):
         socket = Path("/tmp/operator.sock")
@@ -1285,13 +1334,16 @@ class CompilerCacheTests(unittest.TestCase):
             ), mock.patch.object(
                 self.dev,
                 "_private_kache_socket_dir",
-                wraps=self.dev._private_kache_socket_dir,
+                wraps=self.real_private_kache_socket_dir,
             ):
                 self.assertIsNone(self.dev._ensure_kache_daemon("/bin/kache"))
 
                 socket_path = Path(os.environ["KACHE_SOCKET_PATH"])
-                self.assertEqual(socket_path.parent, self.socket_directory)
-                self.assertEqual(socket_path.parent.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(
+                    socket_path.parent,
+                    Path(temporary) / f"phoenix-kache-{os.getuid()}",
+                )
+                self.assertEqual(socket_path.parent.stat().st_mode & 0o777, 0o700)
                 self.assertRegex(socket_path.name, r"^[0-9a-f]{16}\.sock$")
             run.assert_called_once()
 
