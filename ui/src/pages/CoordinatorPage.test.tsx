@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
 import { COORDINATOR_BRIEFING_PROMPT } from './coordinatorBriefing';
 import type { Conversation } from '../api';
@@ -255,6 +255,28 @@ describe('CoordinatorPage', () => {
     await screen.findByText('Shared conversation runtime /global');
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(pin);
     expect(screen.getByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
+  });
+
+  it('retains the same acquired-history owner while a different valid source pin is validated', async () => {
+    function SelectOtherSource() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/global/old-member?source_transcript=conv-coordinator#message-new')}>select other member</button>;
+    }
+    render(<MemoryRouter initialEntries={['/global/old-member?source_transcript=old-member#message-old']}><Routes>
+      <Route path="/global/:slug" element={<><CoordinatorPage /><SelectOtherSource /><CurrentPath /></>} />
+    </Routes></MemoryRouter>);
+    const owner = await screen.findByTestId('history-reference');
+    expect(owner).toHaveTextContent('old-member');
+    let release!: (value: { conversation: { id: string } }) => void;
+    apiMock.getConversation.mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+    fireEvent.click(screen.getByRole('button', { name: 'select other member' }));
+    expect(screen.getByTestId('history-reference')).toBe(owner);
+    await waitFor(() => expect(apiMock.getConversation).toHaveBeenCalledWith('conv-coordinator'));
+    await act(async () => release({ conversation: { id: 'conv-coordinator' } }));
+    await waitFor(() => expect(owner.closest('section')).not.toHaveAttribute('hidden'));
+    expect(screen.getByTestId('history-reference')).toBe(owner);
+    expect(owner).toHaveTextContent('old-member');
+    expect(screen.getByText('/global/old-member?source_transcript=conv-coordinator#message-new')).toBeInTheDocument();
   });
 
   it('rejects a slug pin even when it belongs to the Global domain', async () => {
