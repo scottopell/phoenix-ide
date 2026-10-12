@@ -190,10 +190,28 @@ describe('WorkScope load indicator', () => {
   });
 
   it('uses the same inline load in the expanded conversation section', async () => {
-    getInv.mockResolvedValue(inv([]));
+    getInv.mockResolvedValue(inv([], { scope_key: scopeKey }));
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample())));
     await act(async () => { render(sectionTree({ scopeKey, executionCapable: true })); });
     expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+  });
+
+  it('revokes load admission when a later inventory poll returns a different scope', async () => {
+    getInv
+      .mockResolvedValue(inv([bash()], { scope_key: 'work:other' }))
+      .mockResolvedValueOnce(inv([bash()], { scope_key: scopeKey }));
+    const fetchLoad = vi.fn().mockResolvedValue(reply(sample()));
+    vi.stubGlobal('fetch', fetchLoad);
+
+    await act(async () => { render(sectionTree({ scopeKey, executionCapable: true })); });
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+    expect(fetchLoad).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(getInv).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('status')).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(fetchLoad).toHaveBeenCalledTimes(1);
   });
 
   it('keeps partial coverage and missing memory or latest CPU explicitly unavailable', async () => {
@@ -573,8 +591,8 @@ describe('WorkScopeSection stale-scope guard', () => {
     const oldPending = new Promise<WorkScopeInventory>((r) => {
       resolveOld = r;
     });
-    const oldInv = inv([bash({ cmd: 'OLD-SCOPE-CMD', state: 'tombstoned', duration_ms: 1 })]);
-    const newInv = inv([bash({ cmd: 'NEW-SCOPE-CMD', state: 'tombstoned', duration_ms: 1 })]);
+    const oldInv = inv([bash({ cmd: 'OLD-SCOPE-CMD', state: 'tombstoned', duration_ms: 1 })], { scope_key: 'ws-old' });
+    const newInv = inv([bash({ cmd: 'NEW-SCOPE-CMD', state: 'tombstoned', duration_ms: 1 })], { scope_key: 'ws-new' });
 
     getInv.mockImplementation((key: string) =>
       key === 'ws-old' ? oldPending : Promise.resolve(newInv),
@@ -606,8 +624,8 @@ describe('WorkScopeSection stale-scope guard', () => {
     const oldPending = new Promise<WorkScopeInventory>((resolve) => {
       resolveOld = resolve;
     });
-    const oldInv = inv([bash({ cmd: 'OLD-ACTOR-CMD', state: 'tombstoned', duration_ms: 1 })]);
-    const newInv = inv([bash({ cmd: 'NEW-ACTOR-CMD', state: 'tombstoned', duration_ms: 1 })]);
+    const oldInv = inv([bash({ cmd: 'OLD-ACTOR-CMD', state: 'tombstoned', duration_ms: 1 })], { scope_key: 'ws-shared' });
+    const newInv = inv([bash({ cmd: 'NEW-ACTOR-CMD', state: 'tombstoned', duration_ms: 1 })], { scope_key: 'ws-shared' });
     getInv.mockImplementation((_key: string, conversationId: string) =>
       conversationId === 'conv-old' ? oldPending : Promise.resolve(newInv),
     );

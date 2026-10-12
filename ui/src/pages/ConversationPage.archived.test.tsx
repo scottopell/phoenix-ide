@@ -410,9 +410,9 @@ describe('live work-scope load admission in DesktopLayout', () => {
   it('rejects a mismatched initial inventory response without querying load', async () => {
     const fetchMock = mockLoadFetch();
     vi.mocked(api.getWorkScopeInventory).mockResolvedValue(inventory('work:other'));
-    renderPage(makeConversation({ work_scope_key: scopeKey }));
+    renderPage(makeConversation({ work_scope_key: scopeKey, conv_mode_label: 'Explore' }));
     await screen.findByText('keep this history visible');
-    expect(api.getWorkScopeInventory).toHaveBeenCalledWith(scopeKey, conversationId);
+    await waitFor(() => expect(api.getWorkScopeInventory).toHaveBeenCalledWith(scopeKey, conversationId));
     expect(loadRequests(fetchMock)).toHaveLength(0);
   });
 
