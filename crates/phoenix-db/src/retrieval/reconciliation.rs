@@ -60,7 +60,7 @@ pub(super) type SharedStatus = Arc<Mutex<ReconciliationStatus>>;
 
 /// Owns one startup attempt. Dropping an unfinished attempt records interruption,
 /// including when its future is cancelled before its first poll.
-pub struct ReconciliationRun {
+pub(super) struct ReconciliationRun {
     status: SharedStatus,
 }
 
@@ -113,11 +113,12 @@ impl ReconciliationRun {
             Ok(_) => ReconciliationStatus::Ready,
             Err(error) => {
                 let reason = match error {
-                    RetrievalError::Db(sqlx::Error::Database(error)) => {
-                        ReconciliationFailure::Database {
-                            extended_code: error.code().and_then(|code| code.parse().ok()),
-                        }
-                    }
+                    RetrievalError::Db(sqlx::Error::Database(error))
+                    | RetrievalError::MessageDecode(crate::DbError::Sqlx(sqlx::Error::Database(
+                        error,
+                    ))) => ReconciliationFailure::Database {
+                        extended_code: error.code().and_then(|code| code.parse().ok()),
+                    },
                     RetrievalError::Db(_)
                     | RetrievalError::MessageDecode(_)
                     | RetrievalError::AlreadyStarted => ReconciliationFailure::Other,
@@ -217,6 +218,32 @@ mod tests {
             .contains("failed"));
         assert!(ReconciliationRun::start(panicked).is_err());
         assert!(ReconciliationRun::start(status()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn nested_hydration_database_error_preserves_extended_code() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let error = sqlx::query("SELECT * FROM missing_hydration_fixture")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        let expected: u32 = error
+            .as_database_error()
+            .unwrap()
+            .code()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let status = status();
+        let run = ReconciliationRun::start(status.clone()).unwrap();
+        run.complete(&Err(RetrievalError::MessageDecode(crate::DbError::Sqlx(
+            error,
+        ))));
+        assert!(
+            matches!(*status.lock().unwrap(), ReconciliationStatus::Failed {
+            reason: ReconciliationFailure::Database { extended_code: Some(code) }, ..
+        } if code == expected)
+        );
     }
 
     #[tokio::test]

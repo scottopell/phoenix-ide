@@ -17,10 +17,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 mod reconciliation;
+use reconciliation::ReconciliationRun;
 use reconciliation::SharedStatus;
 pub use reconciliation::{
-    ReconciliationFailure, ReconciliationPhase, ReconciliationProgress, ReconciliationRun,
-    ReconciliationStatus,
+    ReconciliationFailure, ReconciliationPhase, ReconciliationProgress, ReconciliationStatus,
 };
 
 #[cfg(test)]
@@ -339,7 +339,7 @@ impl Fts5Retriever {
     ///
     /// # Errors
     /// Returns `AlreadyStarted` if an attempt has already been admitted.
-    pub fn start_reconciliation(&self) -> Result<ReconciliationRun, RetrievalError> {
+    fn start_reconciliation(&self) -> Result<ReconciliationRun, RetrievalError> {
         ReconciliationRun::start(self.reconciliation.clone())
     }
 
@@ -351,23 +351,55 @@ impl Fts5Retriever {
     /// Returns [`RetrievalError`] if any underlying query fails.
     pub async fn reconcile(&self) -> Result<ReconcileStats, RetrievalError> {
         let mut run = self.start_reconciliation()?;
-        let result = self.reconcile_attempt(&mut run).await;
+        let result = self.reconcile_attempt(&mut run, &mut || Ok(())).await;
         run.complete(&result);
         result
     }
 
-    async fn reconcile_attempt(
+    /// Create one startup future with an attempt guard owned before its first poll.
+    /// Admission guards stay alive through each mutation unit.
+    ///
+    /// # Errors
+    /// Returns `AlreadyStarted` when an attempt already exists.
+    pub fn reconcile_with_admission<F, G>(
+        self: &Arc<Self>,
+        mut admit: F,
+    ) -> Result<
+        impl std::future::Future<Output = Result<ReconcileStats, RetrievalError>> + Send + 'static,
+        RetrievalError,
+    >
+    where
+        F: FnMut() -> Result<G, RetrievalError> + Send + 'static,
+        G: Send,
+    {
+        let retriever = Arc::clone(self);
+        let mut run = self.start_reconciliation()?;
+        Ok(async move {
+            let result = retriever.reconcile_attempt(&mut run, &mut admit).await;
+            run.complete(&result);
+            result
+        })
+    }
+
+    async fn reconcile_attempt<F, G>(
         &self,
         run: &mut ReconciliationRun,
-    ) -> Result<ReconcileStats, RetrievalError> {
+        admit: &mut F,
+    ) -> Result<ReconcileStats, RetrievalError>
+    where
+        F: FnMut() -> Result<G, RetrievalError> + Send,
+        G: Send,
+    {
         let plan = self.discover_reconcile_plan().await?;
         if plan.locator_repair_required {
             run.phase(ReconciliationPhase::LocatorRepair);
+            let _admitted = admit()?;
             self.repair_locator_rows().await?;
         }
         run.phase(ReconciliationPhase::Messages);
         let mut stats = ReconcileStats::default();
         for message in plan.messages {
+            let _admitted = admit()?;
             match self.reconcile_message(message).await? {
                 FtsMessageReconcileOutcome::Unchanged => {}
                 FtsMessageReconcileOutcome::Indexed => stats.indexed += 1,
@@ -376,6 +408,7 @@ impl Fts5Retriever {
             run.message_processed();
         }
         run.phase(ReconciliationPhase::Pruning);
+        let _admitted = admit()?;
         stats.pruned = self.prune_orphans().await?;
         Ok(stats)
     }
@@ -1985,6 +2018,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(indexed, 0);
+    }
+
+    #[tokio::test]
+    async fn owned_orchestration_cannot_be_ready_before_poll_or_after_denied_prune() {
+        let db = seed().await;
+        let retriever = Arc::new(db.fts_retriever());
+        let future = retriever.reconcile_with_admission(|| Ok(())).unwrap();
+        assert!(!retriever.index_reconciled());
+        drop(future);
+        assert!(matches!(
+            retriever.reconciliation_status(),
+            ReconciliationStatus::Failed { .. }
+        ));
+
+        let retriever = Arc::new(db.fts_retriever());
+        let result = retriever
+            .reconcile_with_admission(|| {
+                Err::<(), _>(RetrievalError::Db(sqlx::Error::Protocol(
+                    "admission denied".into(),
+                )))
+            })
+            .unwrap()
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            retriever.reconciliation_status(),
+            ReconciliationStatus::Failed {
+                progress: ReconciliationProgress {
+                    phase: ReconciliationPhase::Pruning,
+                    ..
+                },
+                ..
+            }
+        ));
+        let fresh = Arc::new(db.fts_retriever());
+        fresh
+            .reconcile_with_admission(|| Ok(()))
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(fresh.index_reconciled());
     }
 
     #[tokio::test]

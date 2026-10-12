@@ -18901,7 +18901,7 @@ mod wake_handler_tests {
     async fn retrieval_status_reports_failed_and_search_does_not_call_it_warming() {
         let mut state = make_test_state().await;
         let retriever = Arc::new(state.db.fts_retriever());
-        let run = retriever.start_reconciliation().unwrap();
+        let run = retriever.reconcile_with_admission(|| Ok(())).unwrap();
         drop(run);
         state.message_retriever = retriever;
         let router = create_router(state);

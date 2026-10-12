@@ -1333,9 +1333,9 @@ mod tests {
             let policy_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
             let policy_retriever = Arc::new(policy_db.fts_retriever());
             policy_retriever
-                .start_reconciliation()
-                .unwrap()
-                .complete(&Ok(phoenix_db::retrieval::ReconcileStats::default()));
+                .reconcile()
+                .await
+                .expect("read-only benchmark fixture must already be reconciled");
             let policy_service = GlobalReadService::new(policy_db, policy_retriever.clone());
             if case_id == "broad-common" {
                 let request = policy_service
@@ -1434,9 +1434,9 @@ mod tests {
                     let plan_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
                     let plan_retriever = Arc::new(plan_db.fts_retriever());
                     plan_retriever
-                        .start_reconciliation()
-                        .unwrap()
-                        .complete(&Ok(phoenix_db::retrieval::ReconcileStats::default()));
+                        .reconcile()
+                        .await
+                        .expect("read-only benchmark fixture must already be reconciled");
                     let plan = plan_retriever
                         .explain(policy_request.clone())
                         .await
@@ -1453,9 +1453,9 @@ mod tests {
                 let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
                 let retriever = Arc::new(db.fts_retriever());
                 retriever
-                    .start_reconciliation()
-                    .unwrap()
-                    .complete(&Ok(phoenix_db::retrieval::ReconcileStats::default()));
+                    .reconcile()
+                    .await
+                    .expect("read-only benchmark fixture must already be reconciled");
                 let service = GlobalReadService::new(db.clone(), retriever.clone());
                 let tool = SearchConversations(service.clone());
                 let retrieval_request = (*surface == "retriever").then(|| policy_request.clone());

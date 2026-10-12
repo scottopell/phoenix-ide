@@ -282,54 +282,18 @@ impl AppState {
         {
             let retriever = retriever.clone();
             let runtime = Arc::clone(&runtime);
-            let mut run = retriever
-                .start_reconciliation()
-                .map_err(std::io::Error::other)?;
-            tokio::spawn(async move {
-                let result = async {
-                    use phoenix_db::retrieval::{
-                        Fts5Retriever, FtsMessageReconcileOutcome, ReconcileStats,
-                        ReconciliationPhase, RetrievalError,
-                    };
-                    let plan = retriever.discover_reconcile_plan().await?;
-                    let mut stats = ReconcileStats::default();
-                    if Fts5Retriever::locator_repair_required(&plan) {
-                        run.phase(ReconciliationPhase::LocatorRepair);
-                        let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
-                            RetrievalError::Db(sqlx::Error::Protocol(
-                                "fatal local authority closed during retrieval reconciliation"
-                                    .to_string(),
-                            ))
-                        })?;
-                        retriever.repair_locator_rows().await?;
-                    }
-                    run.phase(ReconciliationPhase::Messages);
-                    for message in Fts5Retriever::messages(plan) {
-                        let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
-                            RetrievalError::Db(sqlx::Error::Protocol(
-                                "fatal local authority closed during retrieval reconciliation"
-                                    .to_string(),
-                            ))
-                        })?;
-                        match retriever.reconcile_message(message).await? {
-                            FtsMessageReconcileOutcome::Unchanged => {}
-                            FtsMessageReconcileOutcome::Indexed => stats.indexed += 1,
-                            FtsMessageReconcileOutcome::Reindexed => stats.reindexed += 1,
-                        }
-                        run.message_processed();
-                    }
-                    run.phase(ReconciliationPhase::Pruning);
-                    let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
-                        RetrievalError::Db(sqlx::Error::Protocol(
+            let reconcile = retriever
+                .reconcile_with_admission(move || {
+                    runtime.acquire_local_authority_pass().map_err(|()| {
+                        phoenix_db::retrieval::RetrievalError::Db(sqlx::Error::Protocol(
                             "fatal local authority closed during retrieval reconciliation"
                                 .to_string(),
                         ))
-                    })?;
-                    stats.pruned = retriever.prune_orphans().await?;
-                    Ok::<_, RetrievalError>(stats)
-                }
-                .await;
-                run.complete(&result);
+                    })
+                })
+                .map_err(std::io::Error::other)?;
+            tokio::spawn(async move {
+                let result = reconcile.await;
                 match result {
                     Ok(stats) => tracing::info!(
                         indexed = stats.indexed,
