@@ -541,16 +541,16 @@ impl Fts5Retriever {
         after: Option<i64>,
         end: i64,
     ) -> Result<Vec<(i64, bool)>, sqlx::Error> {
-        let suffix = if after.is_some() {
-            "WHERE r.fts_rowid <= ?1 AND r.fts_rowid > ?2 ORDER BY r.fts_rowid LIMIT 128"
-        } else {
-            "WHERE r.fts_rowid <= ?1 ORDER BY r.fts_rowid LIMIT 128"
-        };
-        let sql = format!(
+        let sql = if after.is_some() {
             "SELECT r.fts_rowid, m.message_id IS NULL
-             FROM message_fts_rows r LEFT JOIN messages m ON m.message_id = r.message_id {suffix}"
-        );
-        let mut query = sqlx::query_as(&sql).bind(end);
+             FROM message_fts_rows r LEFT JOIN messages m ON m.message_id = r.message_id
+             WHERE r.fts_rowid <= ?1 AND r.fts_rowid > ?2 ORDER BY r.fts_rowid LIMIT 128"
+        } else {
+            "SELECT r.fts_rowid, m.message_id IS NULL
+             FROM message_fts_rows r LEFT JOIN messages m ON m.message_id = r.message_id
+             WHERE r.fts_rowid <= ?1 ORDER BY r.fts_rowid LIMIT 128"
+        };
+        let mut query = sqlx::query_as(sql).bind(end);
         if let Some(after) = after {
             query = query.bind(after);
         }
