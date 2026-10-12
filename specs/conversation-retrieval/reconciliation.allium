@@ -99,6 +99,8 @@ rule AttemptInterrupted {
 }
 
 surface StartupWorker {
+    contracts:
+        fulfils ReconciliationOperations
     context attempt: Reconciliation
     exposes:
         attempt.status
@@ -117,30 +119,51 @@ surface StartupWorker {
         WorkerDropped(attempt)
 }
 
--- Invariant: OneAttemptPerRetriever
-    -- Only pending may start. Ready and failed are terminal for this process's
-    -- retriever; neither search requests nor diagnostics initiate another pass.
+invariant ReadyRequiresCompletedMessagePass {
+    for attempt in Reconciliation where attempt.status = ready:
+        attempt.phase = pruning
+        and attempt.remaining_messages = 0
+}
 
--- Invariant: CancellationBeforeFirstPoll
-    -- The attempt owns its running lifetime before the worker can first poll.
-    -- Cancellation or panic drops that lifetime and records interrupted failure.
+invariant FailureHasTerminalReason {
+    for attempt in Reconciliation where attempt.status = failed:
+        attempt.failure_kind != null
+}
 
--- Invariant: BoundedPruneTransactions
-    -- Discover at most config.prune_page_limit locator rows per read-only keyset
-    -- page, with a fixed upper locator boundary. Discovery holds no writer.
-    -- Pages with candidates obtain write admission before reading current source
-    -- existence. Revalidate each candidate's current locator and source under
-    -- that admission; delete physical index and locator rows atomically per page.
-    -- A failed page rolls back; already committed pages remain committed.
-    -- Normal mutation hooks maintain changes behind the sweep's cursor.
+invariant ProcessedCountsAreNonnegative {
+    for attempt in Reconciliation:
+        attempt.processed_messages >= 0
+        and attempt.remaining_messages >= 0
+}
 
--- Invariant: MutationAuthority
-    -- The orchestration obtains and retains authority through each mutation
-    -- unit: locator repair, one message, or pruning. Denial fails the attempt.
+contract ReconciliationOperations {
+    observe: (attempt: Reconciliation) -> AttemptStatus
 
--- Invariant: TruthfulDiagnostic
-    -- Authenticated diagnostics read only the in-memory status, phase and count.
-    -- Database failures preserve available numeric codes, including wrapped
-    -- hydration errors; raw errors and message content are never exposed.
-    -- Pending/running may be called warming; failed is unavailable, never warming.
-    -- Search is authoritative only after ready. Diagnostics perform no DB work.
+    @invariant OneAttemptPerRetriever
+        -- Only pending may start. Ready and failed are terminal for this process's
+        -- retriever; neither search requests nor diagnostics initiate another pass.
+
+    @invariant CancellationBeforeFirstPoll
+        -- The attempt owns its running lifetime before the worker can first poll.
+        -- Cancellation or panic drops that lifetime and records interrupted failure.
+
+    @invariant BoundedPruneTransactions
+        -- Discover at most config.prune_page_limit locator rows per read-only keyset
+        -- page, with a fixed upper locator boundary. Discovery holds no writer.
+        -- Pages with candidates obtain write admission before reading current source
+        -- existence. Revalidate each candidate's current locator and source under
+        -- that admission; delete physical index and locator rows atomically per page.
+        -- A failed page rolls back; already committed pages remain committed.
+        -- Normal mutation hooks maintain changes behind the sweep's cursor.
+
+    @invariant MutationAuthority
+        -- The orchestration obtains and retains authority through each mutation
+        -- unit: locator repair, one message, or pruning. Denial fails the attempt.
+
+    @invariant TruthfulDiagnostic
+        -- Authenticated diagnostics read only the in-memory status, phase and count.
+        -- Database failures preserve available numeric codes, including wrapped
+        -- hydration errors; raw errors and message content are never exposed.
+        -- Pending/running may be called warming; failed is unavailable, never warming.
+        -- Search is authoritative only after ready. Diagnostics perform no DB work.
+}
