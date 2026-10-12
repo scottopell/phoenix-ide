@@ -139,7 +139,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
 | Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
-| Retiring wake execution and preserving wake history | 092, within 034's compatibility scope; 006/011/012 are historical only |
+| Retiring wake execution and preserving wake history | 097, within 034's compatibility scope; 006/011/012 are historical only |
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
 | Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 043 for the private staging boundary, then 044, 007, and 031 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
@@ -147,7 +147,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying native macOS self-deployment, activation, rollback, or installed-state-preserving restart | 050, then 010 |
 | Specifying protected prepared artifacts or paired launchd ProductConversation database recovery | 076, 077, within 034; then 050 and 017 |
 | Specifying authoritative build identity, candidate verification, legacy predecessor rollback, or bare-supervisor replacement | 064, then 017 and 010 |
-| Reviewing historical wake registration, observation, or resume records | 092 governs retirement; 006, 011, 012 record former behavior without execution authority |
+| Reviewing historical wake registration, observation, or resume records | 097 governs retirement; 006, 011, 012 record former behavior without execution authority |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
 | Specifying Work-subagent trust, sandboxing, or inherited worktree ownership | 068, then 067 |
