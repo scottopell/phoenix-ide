@@ -3892,6 +3892,54 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 });
 
 
+describe('conversation disclosure integration', () => {
+  const source = '<details><summary>**Title**</summary>\n\nHidden target\n\n</details>\n\nOutside';
+
+  it('renders a native summary and opens only for a body find match', () => {
+    const message = agentMessage('details-find', [{ type: 'text', text: source }]);
+    const renderMessage = (start: number, end: number) => <MemoryRouter><AgentMessage message={message} toolResults={new Map()} activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start, end }} /></MemoryRouter>;
+    const { container, rerender } = render(renderMessage(0, 5));
+    const details = container.querySelector('details')!;
+    expect(details.open).toBe(false);
+    expect(details.firstElementChild?.tagName).toBe('SUMMARY');
+    const summary = details.querySelector('summary')!;
+    summary.focus();
+    expect(document.activeElement).toBe(summary);
+    expect(summary).not.toHaveAttribute('role');
+    expect(summary).not.toHaveAttribute('tabindex');
+    rerender(renderMessage(13, 19));
+    expect(details.open).toBe(true);
+    expect(details.querySelector('mark')?.textContent).toBe('target');
+    rerender(renderMessage(20, 27));
+    expect(details.open).toBe(true);
+  });
+
+  it('promotes the complete streaming envelope once and preserves it across tail tokens', async () => {
+    const view = (text: string) => <MemoryRouter><StreamingMessageView buffer={{ text, lastSequence: 1, startedAt: 0, requestId: 'disclosure' }} /></MemoryRouter>;
+    const partial = '<details><summary>Title</summary>\n\nBody\n';
+    const { container, rerender } = render(view(partial));
+    await waitFor(() => expect(container.textContent).toContain('Body'));
+    expect(container.querySelector('details')).toBeNull();
+    const complete = partial + '\n```ts\nconst answer = 42;\n```\n\n</details>\n\n```js\n1\n```\n\nTail';
+    rerender(view(complete));
+    await waitFor(() => expect(container.querySelectorAll('details')).toHaveLength(1));
+    const details = container.querySelector('details')!;
+    expect(details.textContent).toContain('const answer = 42;');
+    details.open = true;
+    rerender(view(complete + ' grows'));
+    await waitFor(() => expect(container.textContent).toContain('Tail grows'));
+    expect(container.querySelector('details')).toBe(details);
+    expect(details.open).toBe(true);
+  });
+
+  it('resolves ordinary forward references globally across streaming code chunks', async () => {
+    const text = '[first][ref]\n\n```js\n1\n```\n\n[second][ref]\n\n[ref]: https://example.com';
+    render(<MemoryRouter><StreamingMessageView buffer={{ text, lastSequence: 1, startedAt: 0, requestId: 'refs' }} /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByRole('link', { name: 'first' })).toHaveAttribute('href', 'https://example.com'));
+    expect(screen.getByRole('link', { name: 'second' })).toHaveAttribute('href', 'https://example.com');
+  });
+});
+
 describe('AgentMessage compact find reveal', () => {
   it('marks the exact occurrence in fully visible compact commentary', async () => {
     mockDensity = 'compact';

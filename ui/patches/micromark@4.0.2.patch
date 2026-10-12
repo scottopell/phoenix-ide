@@ -1,0 +1,394 @@
+diff --git a/dev/lib/create-tokenizer.js b/dev/lib/create-tokenizer.js
+index abd242f..85276ed 100644
+--- a/dev/lib/create-tokenizer.js
++++ b/dev/lib/create-tokenizer.js
+@@ -64,7 +64,7 @@ const debug = createDebug('micromark')
+  * @returns {TokenizeContext}
+  *   Context.
+  */
+-export function createTokenizer(parser, initialize, from) {
++export function createTokenizer(parser, initialize, from, control = {}) {
+   /** @type {Point} */
+   let point = {
+     _bufferIndex: -1,
+@@ -73,14 +73,17 @@ export function createTokenizer(parser, initialize, from) {
+     column: (from && from.column) || 1,
+     offset: (from && from.offset) || 0
+   }
++  if (control.tape) point = {...from}
+   /** @type {Record<string, number>} */
+   const columnStart = {}
+   /** @type {Array<Construct>} */
+   const resolveAllConstructs = []
+   /** @type {Array<Chunk>} */
+-  let chunks = []
++  let chunks = control.tape || []
++  let ended = false
+   /** @type {Array<Token>} */
+   let stack = []
++  let containerDepth = 0
+   /** @type {boolean | undefined} */
+   let consumed = true
+ 
+@@ -105,6 +108,7 @@ export function createTokenizer(parser, initialize, from) {
+    */
+   const context = {
+     code: codes.eof,
++    get containerDepth() { return containerDepth },
+     containerState: {},
+     defineSkip,
+     events: [],
+@@ -113,7 +117,8 @@ export function createTokenizer(parser, initialize, from) {
+     previous: codes.eof,
+     sliceSerialize,
+     sliceStream,
+-    write
++    write,
++    run() { main(); return context.events }
+   }
+ 
+   /**
+@@ -138,6 +143,7 @@ export function createTokenizer(parser, initialize, from) {
+ 
+   /** @type {TokenizeContext['write']} */
+   function write(slice) {
++    if (control.tape) throw new Error('borrowed tape is read only')
+     chunks = push(chunks, slice)
+ 
+     main()
+@@ -202,7 +208,11 @@ export function createTokenizer(parser, initialize, from) {
+     /** @type {number} */
+     let chunkIndex
+ 
+-    while (point._index < chunks.length) {
++    while (!ended && !control.stop && point._index < chunks.length) {
++      if (control.tape && control.end !== undefined && point.offset >= control.end) {
++        go(codes.eof)
++        continue
++      }
+       const chunk = chunks[point._index]
+ 
+       // If we’re in a buffer chunk, loop through it.
+@@ -214,9 +224,11 @@ export function createTokenizer(parser, initialize, from) {
+         }
+ 
+         while (
++          !ended && !control.stop &&
+           point._index === chunkIndex &&
+           point._bufferIndex < chunk.length
+         ) {
++          if (control.tape && control.end !== undefined && point.offset >= control.end) break
+           go(chunk.charCodeAt(point._bufferIndex))
+         }
+       } else {
+@@ -244,6 +256,12 @@ export function createTokenizer(parser, initialize, from) {
+ 
+   /** @type {Effects['consume']} */
+   function consume(code) {
++    if (control.tape && code === codes.eof) {
++      ended = true
++      context.previous = codes.eof
++      consumed = true
++      return
++    }
+     assert(code === expectedCode, 'expected given code to equal expected code')
+ 
+     debug('consume: `%s`', code)
+@@ -311,6 +329,7 @@ export function createTokenizer(parser, initialize, from) {
+     context.events.push(['enter', token, context])
+ 
+     stack.push(token)
++    if (isContainer(type)) containerDepth++
+ 
+     return token
+   }
+@@ -323,6 +342,10 @@ export function createTokenizer(parser, initialize, from) {
+     const token = stack.pop()
+     assert(token, 'cannot close w/o open tokens')
+     token.end = now()
++    if (isContainer(token.type)) {
++      containerDepth--
++      if (!containerDepth) control.onContainerExit?.(token)
++    }
+ 
+     assert(type === token.type, 'expected exit token to match current token')
+ 
+@@ -564,6 +587,8 @@ export function createTokenizer(parser, initialize, from) {
+     const startCurrentConstruct = context.currentConstruct
+     const startEventsIndex = context.events.length
+     const startStack = Array.from(stack)
++    const startContainerDepth = containerDepth
++    const startEnded = ended
+ 
+     return {from: startEventsIndex, restore}
+ 
+@@ -579,6 +604,8 @@ export function createTokenizer(parser, initialize, from) {
+       context.currentConstruct = startCurrentConstruct
+       context.events.length = startEventsIndex
+       stack = startStack
++      containerDepth = startContainerDepth
++      ended = startEnded
+       accountForPotentialSkip()
+       debug('position: restore: `%j`', point)
+     }
+@@ -715,3 +742,8 @@ function serializeChunks(chunks, expandTabs) {
+ 
+   return result.join('')
+ }
++
++function isContainer(type) {
++  return type === 'blockQuote' || type === 'listOrdered' ||
++    type === 'listUnordered' || type === 'gfmFootnoteDefinition'
++}
+diff --git a/dev/lib/initialize/document.js b/dev/lib/initialize/document.js
+index bca159e..0a719da 100644
+--- a/dev/lib/initialize/document.js
++++ b/dev/lib/initialize/document.js
+@@ -229,6 +229,9 @@ function initializeDocument(effects) {
+ 
+   /** @type {State} */
+   function flowStart(code) {
++    if (!stack.length && !childFlow && self.parser.onRootFlow?.(self.now())) {
++      return () => {}
++    }
+     if (code === codes.eof) {
+       if (childFlow) closeFlow()
+       exitContainers(0)
+diff --git a/dev/lib/phoenix.js b/dev/lib/phoenix.js
+new file mode 100644
+index 0000000..45b7636
+--- /dev/null
++++ b/dev/lib/phoenix.js
+@@ -0,0 +1,5 @@
++export {parse} from './parse.js'
++export {preprocess} from './preprocess.js'
++export {postprocess} from './postprocess.js'
++export {document} from './initialize/document.js'
++export {createTokenizer} from './create-tokenizer.js'
+diff --git a/lib/create-tokenizer.js b/lib/create-tokenizer.js
+index 50aded8..b71dfa6 100644
+--- a/lib/create-tokenizer.js
++++ b/lib/create-tokenizer.js
+@@ -58,7 +58,7 @@ import { resolveAll } from 'micromark-util-resolve-all';
+  * @returns {TokenizeContext}
+  *   Context.
+  */
+-export function createTokenizer(parser, initialize, from) {
++export function createTokenizer(parser, initialize, from, control = {}) {
+   /** @type {Point} */
+   let point = {
+     _bufferIndex: -1,
+@@ -67,14 +67,17 @@ export function createTokenizer(parser, initialize, from) {
+     column: from && from.column || 1,
+     offset: from && from.offset || 0
+   };
++  if (control.tape) point = {...from};
+   /** @type {Record<string, number>} */
+   const columnStart = {};
+   /** @type {Array<Construct>} */
+   const resolveAllConstructs = [];
+   /** @type {Array<Chunk>} */
+-  let chunks = [];
++  let chunks = control.tape || [];
++  let ended = false;
+   /** @type {Array<Token>} */
+   let stack = [];
++  let containerDepth = 0;
+   /** @type {boolean | undefined} */
+   let consumed = true;
+ 
+@@ -101,6 +104,7 @@ export function createTokenizer(parser, initialize, from) {
+    */
+   const context = {
+     code: null,
++    get containerDepth() { return containerDepth },
+     containerState: {},
+     defineSkip,
+     events: [],
+@@ -109,7 +113,8 @@ export function createTokenizer(parser, initialize, from) {
+     previous: null,
+     sliceSerialize,
+     sliceStream,
+-    write
++    write,
++    run() { main(); return context.events }
+   };
+ 
+   /**
+@@ -132,6 +137,7 @@ export function createTokenizer(parser, initialize, from) {
+ 
+   /** @type {TokenizeContext['write']} */
+   function write(slice) {
++    if (control.tape) throw new Error('borrowed tape is read only');
+     chunks = push(chunks, slice);
+     main();
+ 
+@@ -203,7 +209,11 @@ export function createTokenizer(parser, initialize, from) {
+   function main() {
+     /** @type {number} */
+     let chunkIndex;
+-    while (point._index < chunks.length) {
++    while (!ended && !control.stop && point._index < chunks.length) {
++      if (control.tape && control.end !== undefined && point.offset >= control.end) {
++        go(null);
++        continue;
++      }
+       const chunk = chunks[point._index];
+ 
+       // If we’re in a buffer chunk, loop through it.
+@@ -212,7 +222,8 @@ export function createTokenizer(parser, initialize, from) {
+         if (point._bufferIndex < 0) {
+           point._bufferIndex = 0;
+         }
+-        while (point._index === chunkIndex && point._bufferIndex < chunk.length) {
++        while (!ended && !control.stop && point._index === chunkIndex && point._bufferIndex < chunk.length) {
++          if (control.tape && control.end !== undefined && point.offset >= control.end) break;
+           go(chunk.charCodeAt(point._bufferIndex));
+         }
+       } else {
+@@ -237,6 +248,12 @@ export function createTokenizer(parser, initialize, from) {
+ 
+   /** @type {Effects['consume']} */
+   function consume(code) {
++    if (control.tape && code === null) {
++      ended = true;
++      context.previous = null;
++      consumed = true;
++      return
++    }
+     if (markdownLineEnding(code)) {
+       point.line++;
+       point.column = 1;
+@@ -280,6 +297,7 @@ export function createTokenizer(parser, initialize, from) {
+     token.start = now();
+     context.events.push(['enter', token, context]);
+     stack.push(token);
++    if (isContainer(type)) containerDepth++;
+     return token;
+   }
+ 
+@@ -287,6 +305,10 @@ export function createTokenizer(parser, initialize, from) {
+   function exit(type) {
+     const token = stack.pop();
+     token.end = now();
++    if (isContainer(token.type)) {
++      containerDepth--;
++      if (!containerDepth) control.onContainerExit?.(token);
++    }
+     context.events.push(['exit', token, context]);
+     return token;
+   }
+@@ -474,6 +496,8 @@ export function createTokenizer(parser, initialize, from) {
+     const startCurrentConstruct = context.currentConstruct;
+     const startEventsIndex = context.events.length;
+     const startStack = Array.from(stack);
++    const startContainerDepth = containerDepth;
++    const startEnded = ended;
+     return {
+       from: startEventsIndex,
+       restore
+@@ -491,6 +515,8 @@ export function createTokenizer(parser, initialize, from) {
+       context.currentConstruct = startCurrentConstruct;
+       context.events.length = startEventsIndex;
+       stack = startStack;
++      containerDepth = startContainerDepth;
++      ended = startEnded;
+       accountForPotentialSkip();
+     }
+   }
+@@ -608,4 +634,8 @@ function serializeChunks(chunks, expandTabs) {
+     result.push(value);
+   }
+   return result.join('');
+-}
+\ No newline at end of file
++}
++function isContainer(type) {
++  return type === 'blockQuote' || type === 'listOrdered' ||
++    type === 'listUnordered' || type === 'gfmFootnoteDefinition';
++}
+diff --git a/lib/initialize/document.js b/lib/initialize/document.js
+index 75e4749..d117610 100644
+--- a/lib/initialize/document.js
++++ b/lib/initialize/document.js
+@@ -185,6 +185,9 @@ function initializeDocument(effects) {
+ 
+   /** @type {State} */
+   function flowStart(code) {
++    if (!stack.length && !childFlow && self.parser.onRootFlow?.(self.now())) {
++      return () => {};
++    }
+     if (code === null) {
+       if (childFlow) closeFlow();
+       exitContainers(0);
+diff --git a/lib/phoenix.d.ts b/lib/phoenix.d.ts
+new file mode 100644
+index 0000000..652900c
+--- /dev/null
++++ b/lib/phoenix.d.ts
+@@ -0,0 +1,38 @@
++import type {Chunk, Event, InitialConstruct, ParseContext, ParseOptions, Point, Token, TokenizeContext} from 'micromark-util-types'
++export {preprocess} from './preprocess.js'
++export {postprocess} from './postprocess.js'
++export {document} from './initialize/document.js'
++
++export interface PhoenixParseContext extends ParseContext {
++  /** Called only before a new root flow, outside containers. True requires
++   * setting the document control's stop flag; it yields without consuming. */
++  onRootFlow?: (point: Point) => boolean
++}
++export function parse(options?: ParseOptions | null): PhoenixParseContext
++
++export interface TokenizerControl {
++  /** Terminal yield for this session; not a resumable pause. */
++  stop?: boolean
++  /** Observes an outer container exit, including speculative exits. */
++  onContainerExit?: (token: Token) => void
++}
++export interface BorrowedControl extends TokenizerControl {
++  readonly tape: readonly Chunk[]
++  /** Exclusive source offset at which to supply EOF without advancing. */
++  readonly end?: number
++}
++export interface WritableControl extends TokenizerControl {
++  tape?: never
++  end?: never
++}
++export interface ControlledContext extends TokenizeContext {
++  readonly containerDepth: number
++  /** Runs the existing tape without final resolution; events are session-owned. */
++  run(): Event[]
++}
++export interface BorrowedContext extends ControlledContext {
++  /** Borrowed tape cannot be appended to (also rejected at runtime). */
++  write: never
++}
++export function createTokenizer(parser: ParseContext, initialize: InitialConstruct, from: Point, control: BorrowedControl): BorrowedContext
++export function createTokenizer(parser: ParseContext, initialize: InitialConstruct, from?: Omit<Point, '_bufferIndex' | '_index'>, control?: WritableControl): ControlledContext
+diff --git a/lib/phoenix.js b/lib/phoenix.js
+new file mode 100644
+index 0000000..45b7636
+--- /dev/null
++++ b/lib/phoenix.js
+@@ -0,0 +1,5 @@
++export {parse} from './parse.js'
++export {preprocess} from './preprocess.js'
++export {postprocess} from './postprocess.js'
++export {document} from './initialize/document.js'
++export {createTokenizer} from './create-tokenizer.js'
+diff --git a/package.json b/package.json
+index c1c00e8..d92669f 100644
+--- a/package.json
++++ b/package.json
+@@ -56,6 +56,11 @@
+       "development": "./dev/index.js",
+       "default": "./index.js"
+     },
++    "./phoenix": {
++      "types": "./lib/phoenix.d.ts",
++      "development": "./dev/lib/phoenix.js",
++      "default": "./lib/phoenix.js"
++    },
+     "./stream": {
+       "development": "./dev/stream.js",
+       "default": "./stream.js"

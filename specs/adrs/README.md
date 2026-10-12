@@ -111,6 +111,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [095](095_workscope-cpu-history-and-demand-memory.md) | WorkScope CPU history with demand-driven memory | Accepted | REQ-WSLOAD-001–005, REQ-DEPLOY-007a |
 | [096](096_sampled-live-job-resource-visibility.md) | Sampled live-job visibility, not exhaustive accounting | Accepted | REQ-WSLOAD-001/002/005 |
 | [097](097_bounded-retrieval-reconciliation.md) | Bounded orphan pruning and terminal retrieval readiness | Accepted | REQ-RET-003 |
+| [099](099_bounded_markdown_disclosures.md) | Recognize bounded Markdown disclosures within native parsing contexts | Accepted | REQ-CONV-025; REQ-CONV-002/019 |
 
 ## For agents: which decisions bind your task
 
@@ -118,6 +119,7 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
 | Selecting or qualifying development compiler-cache defaults | 079, then 078 and 034 |
