@@ -810,9 +810,9 @@ mod tests {
             .await
             .unwrap()
             .0;
-            let observed = Database::assert_late_hydration_candidate_executed(
+            let observed = Box::pin(Database::assert_late_hydration_candidate_executed(
                 live.get_product_conversation_snapshot(reference.to_owned(), snapshot_query(None)),
-            )
+            ))
             .await
             .unwrap();
             assert_eq!(
