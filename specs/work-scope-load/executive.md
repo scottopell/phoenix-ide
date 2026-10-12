@@ -2,7 +2,7 @@
 
 ## Measurement contract
 
-This is sampled visibility for **live tracked jobs**, not exhaustive accounting. CPU snapshots may miss native children that start and exit between ticks. Attribution ends when the tracked handle terminalizes. `sampled_seconds` is represented observation duration, not completeness; zero live jobs means no tracked live jobs, not no surviving host processes. API `measurement_basis`, tool description and inline labels expose this boundary. Concrete detected lifecycle/membership/identity/freshness races still invalidate measurements. See [ADR-093](../adrs/093_sampled-live-job-resource-visibility.md).
+This is sampled visibility for **live tracked jobs**, not exhaustive accounting. CPU snapshots may miss native children that start and exit between ticks. Attribution ends when the tracked handle terminalizes. `sampled_seconds` is represented observation duration, not completeness; zero live jobs means no tracked live jobs, not no surviving host processes. API `measurement_basis`, tool description and inline labels expose this boundary. Concrete detected lifecycle/membership/identity/freshness races still invalidate measurements. See [ADR-096](../adrs/096_sampled-live-job-resource-visibility.md).
 
 ## Scope and architecture
 
@@ -32,4 +32,4 @@ The inline indicator is gated by confirmed live readiness, a nonarchived surface
 
 Focused validation and equivalent base/candidate macOS qualification are recorded in task 68002. Rendered browser acceptance exercised the real ConversationPage → DesktopLayout → FileExplorerPanel → WorkScopeSection route: unmocked idle API, deterministic intercepted active/idle/stale/unavailable/partial responses in dark/light at 1440/1100 widths, keyboard Enter collapse/reopen, no overflow, and a real pinned historical route with zero load requests. Snapshot colors use secondary text for small-value contrast. No archived row existed in the local seed; archived admission remains covered by integration tests, not a separate rendered archived-row pass. No production deployment or acceptance is claimed.
 
-Decision rationale: [ADR-092](../adrs/092_workscope-cpu-history-and-demand-memory.md). No Allium lifecycle model is added: this is a bounded read projection over existing resource lifecycles plus ephemeral measurement history, not a new work lifecycle.
+Decision rationale: [ADR-095](../adrs/095_workscope-cpu-history-and-demand-memory.md). No Allium lifecycle model is added: this is a bounded read projection over existing resource lifecycles plus ephemeral measurement history, not a new work lifecycle.

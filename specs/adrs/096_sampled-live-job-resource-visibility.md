@@ -1,4 +1,4 @@
-# ADR-093: Sampled live-job resource visibility, not exhaustive accounting
+# ADR-096: Sampled live-job resource visibility, not exhaustive accounting
 
 - **Status:** Accepted
 - **Date:** 2026-10-12

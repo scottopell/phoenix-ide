@@ -1,4 +1,4 @@
-# ADR-092: WorkScope CPU history with demand-driven memory
+# ADR-095: WorkScope CPU history with demand-driven memory
 
 - **Status:** Accepted
 - **Date:** 2026-10-11
