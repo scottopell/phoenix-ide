@@ -1180,7 +1180,10 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
             ? mergeRefreshedTail(current.value, refreshedTail)
             : { ...older, segments: current.value.segments })
           : current.value;
-        return { productConversationId: ownerId, value: mergeOlderSegments(authoritativeTail, older) };
+        const acquiredPage = current.value === snapshot ? older : {
+          ...older, before: current.value.before, has_older: current.value.has_older,
+        };
+        return { productConversationId: ownerId, value: mergeOlderSegments(authoritativeTail, acquiredPage) };
       });
       setHistoryGeneration((generation) => generation + 1);
       const currentBasis = pendingRestore.basis;

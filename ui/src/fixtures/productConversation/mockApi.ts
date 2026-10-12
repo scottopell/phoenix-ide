@@ -177,9 +177,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   api.getConversationRoute = async (id) => id === sourceId ? { id, slug: id } : route;
   api.getConversationRouteBySlug = async (id) => id === sourceId ? { id, slug: id } : route;
   api.getConversation = async (id) => ({
-    conversation: id === sourceId ? sourceConversation : scenario.snapshot.segments.some(segment => segment.transcript_row_id === id)
+    conversation: id === sourceId ? sourceConversation : scenario.snapshot?.segments.some(segment => segment.transcript_row_id === id)
       ? { ...conversation, id, slug: id } : conversation,
-    messages: id === sourceId ? sourceMessages : (scenario.snapshot.segments.find(segment => segment.transcript_row_id === id)?.messages as Message[] | undefined) ?? messages,
+    messages: id === sourceId ? sourceMessages : (scenario.snapshot?.segments.find(segment => segment.transcript_row_id === id)?.messages as Message[] | undefined) ?? messages,
     agent_working: false,
     presentation_mode: 'idle',
     context_window_size: 128_000,

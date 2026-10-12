@@ -1446,10 +1446,15 @@ function MessageListImpl({
   useEffect(() => {
     const key = sourceMessageId && sourceToolId ? `${sourceMessageId}:${sourceToolId}` : null;
     if (!key) { revealedSourceRef.current = null; return; }
+    if (transcriptPositioning.kind === 'positioning' && transcriptPositioning.command.kind === 'jump_to_message'
+      && transcriptPositioning.command.targetMessageId === sourceMessageId) {
+      revealedSourceRef.current = key;
+      return;
+    }
     if (revealedSourceRef.current !== key && sourceMessageId && scrollToMessageId(sourceMessageId)) {
       revealedSourceRef.current = key;
     }
-  }, [sourceMessageId, sourceToolId, scrollToMessageId]);
+  }, [sourceMessageId, sourceToolId, scrollToMessageId, transcriptPositioning]);
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
