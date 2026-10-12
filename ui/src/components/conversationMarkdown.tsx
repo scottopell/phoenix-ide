@@ -12,17 +12,15 @@ export type MarkdownAnchorProps = React.ComponentPropsWithoutRef<'a'> & {
 export type MarkdownImageProps = React.ComponentPropsWithoutRef<'img'> & { node?: unknown };
 
 function isPhoenixConversationDestination(path: string): boolean {
-  return /^\/(?:c|chains|global)(?:\/|$)/.test(path);
+  return /^\/(?:(?:c|product-conversations|chains)\/[^/]+|global(?:\/[^/]+)?)\/?$/.test(path);
 }
 
 function appLocalDestination(href: string | undefined): string | undefined {
   if (!href || typeof window === 'undefined') return undefined;
-  if (href.startsWith('/') && !href.startsWith('//')) {
-    return isPhoenixConversationDestination(href) ? href : undefined;
-  }
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return undefined;
+  if (href.startsWith('//')) return undefined;
+  if (!href.startsWith('/') && !/^[a-z][a-z0-9+.-]*:/i.test(href)) return undefined;
   try {
-    const destination = new URL(href);
+    const destination = new URL(href, window.location.origin);
     return destination.origin === window.location.origin && isPhoenixConversationDestination(destination.pathname)
       ? `${destination.pathname}${destination.search}${destination.hash}`
       : undefined;
