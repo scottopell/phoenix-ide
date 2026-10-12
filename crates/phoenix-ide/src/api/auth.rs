@@ -357,8 +357,7 @@ enum BearerCheck {
 /// `/api/auth/login`. A correct Bearer clears the counter; a wrong one records a
 /// failure; once locked out, further guesses are rejected without comparing.
 fn owner_password_matches(candidate: &str, configured: &str) -> bool {
-    !candidate.starts_with("phx_peer_")
-        && constant_time_eq(candidate.as_bytes(), configured.as_bytes())
+    constant_time_eq(candidate.as_bytes(), configured.as_bytes())
 }
 
 fn check_bearer_password(
@@ -842,9 +841,9 @@ mod tests {
     }
 
     #[test]
-    fn peer_token_namespace_never_authenticates_as_owner_password() {
+    fn configured_password_in_peer_namespace_authenticates_as_owner() {
         let throttle = LoginThrottle::new();
-        assert!(!owner_password_matches(
+        assert!(owner_password_matches(
             "phx_peer_same-secret",
             "phx_peer_same-secret"
         ));
@@ -855,7 +854,7 @@ mod tests {
                 &throttle,
                 "peer",
             ),
-            BearerCheck::Invalid
+            BearerCheck::Valid
         ));
     }
 

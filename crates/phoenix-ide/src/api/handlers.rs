@@ -18202,7 +18202,8 @@ mod wake_handler_tests {
         use tower::ServiceExt as _;
 
         let mut state = make_test_state().await;
-        state.password = Some("owner-password".to_string());
+        let owner_password = "phx_peer_owner-password";
+        state.password = Some(owner_password.to_string());
         let destination = state.db.instance_id().await.unwrap();
         let caller = phoenix_core::domain::instance_identity::InstanceId::new();
         let token = format!("phx_peer_{}", "a".repeat(43));
@@ -18235,6 +18236,23 @@ mod wake_handler_tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let owner_credential = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/query-database")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {owner_password}"),
+                    )
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_credential.status(), StatusCode::UNAUTHORIZED);
 
         let mismatch = create_router(state.clone())
             .oneshot(
@@ -18315,7 +18333,39 @@ mod wake_handler_tests {
     }
 
     #[tokio::test]
-    async fn peer_namespace_cannot_login_as_owner_via_json() {
+    async fn configured_password_in_peer_namespace_authenticates_owner_bearer() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        let owner_password = "phx_peer_same-secret";
+        state.password = Some(owner_password.to_string());
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {owner_password}"),
+                    )
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        45123,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["authenticated"], true);
+    }
+
+    #[tokio::test]
+    async fn configured_password_in_peer_namespace_can_login_as_owner() {
         use tower::ServiceExt as _;
 
         let mut state = make_test_state().await;
@@ -18335,7 +18385,10 @@ mod wake_handler_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key(axum::http::header::SET_COOKIE));
     }
 
     #[tokio::test]
