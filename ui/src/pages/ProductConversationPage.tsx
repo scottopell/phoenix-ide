@@ -799,7 +799,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   const fetchSnapshot = coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot;
   const conversationStore = useContext(ConversationContext);
   if (!conversationStore) throw new Error('Product conversation requires ConversationProvider');
-  const params = useParams<{ productConversationId: string }>();
+  const params = useParams<{ productConversationId: string; slug: string }>();
   const productConversationId = productId ?? params.productConversationId;
   const viewerSlot = useViewerSlot();
   const location = useLocation();
@@ -1083,7 +1083,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
 
   const observedContinuationId = currentLatestProjection?.conversation?.continued_in_conv_id ?? null;
   const observedOpeningMessageId = snapshot?.latest_opening_pending
-    ? liveMessages?.find((message) => message.message_type === 'user')?.message_id ?? null
+    ? liveMessages?.find((message) => message.message_type === 'user' || message.message_type === 'continuation')?.message_id ?? null
     : null;
   useEffect(() => {
     if (currentLatestProjection?.conversationId !== snapshot?.latest_transcript_row_id) return;
@@ -1239,11 +1239,14 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   const routeReaderSelectionRef = useRef<{ pathname: string; productConversationId: string | undefined; transcriptPin: string | null } | null>(null);
   if (snapshot && (routeReaderSelectionRef.current?.pathname !== location.pathname
     || routeReaderSelectionRef.current.productConversationId !== productConversationId)) {
+    const routeMemberId = snapshot.kind === 'coordinator'
+      ? snapshot.segments.find(segment => segment.transcript_row_id === params.slug || segment.slug === params.slug)?.transcript_row_id
+        ?? snapshot.requested_transcript_row_id
+      : null;
     routeReaderSelectionRef.current = {
       pathname: location.pathname,
       productConversationId,
-      transcriptPin: snapshot.kind === 'coordinator' && snapshot.requested_transcript_row_id !== snapshot.latest_transcript_row_id
-        ? snapshot.requested_transcript_row_id : null,
+      transcriptPin: routeMemberId !== snapshot.latest_transcript_row_id ? routeMemberId : null,
     };
   }
   const pendingChapterSelected = (location.state as { chapterSelection?: unknown } | null)?.chapterSelection === 'pending'

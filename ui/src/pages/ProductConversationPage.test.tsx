@@ -342,6 +342,7 @@ function ProductRouteSwitch() {
   return <>
     <button onClick={() => navigate('/product-conversations/pc-1')}>open first product</button>
     <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>
+    <button onClick={() => navigate('/global/row-2')}>open second Global member</button>
   </>;
 }
 
@@ -484,11 +485,11 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('history-location')).toHaveTextContent('?source_transcript=row-1#message-cont-1');
   });
 
-  it.each([false, true])('keeps a reserved opening read-only until an accepted-message signal refreshes readiness (Global=%s)', async (global) => {
+  it.each([[false, 'user'], [true, 'user'], [false, 'continuation'], [true, 'continuation']] as const)('keeps a reserved opening read-only until its accepted signal refreshes readiness (Global=%s, opening=%s)', async (global, openingType) => {
     const { api } = await import('../api');
     const pending = makeSnapshot({ latest_opening_pending: true, writable_transcript_row_id: null, before: null, has_older: false });
     pending.segments = pending.segments.map((segment) => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [] } : segment);
-    const opening = makeMessage('accepted-opening', 1, 'row-2');
+    const opening = { ...makeMessage('accepted-opening', 1, 'row-2'), message_type: openingType, content: openingType === 'continuation' ? { type: 'continuation', summary: 'generated opening' } : { type: 'user', text: 'accepted opening' } };
     const ready = { ...pending, latest_opening_pending: false, writable_transcript_row_id: 'row-2', segments: pending.segments.map((segment) => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [opening] } : segment) };
     if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(pending)).mockResolvedValueOnce(coordinatorSnapshot(ready));
     else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(pending).mockResolvedValueOnce(ready);
@@ -614,6 +615,22 @@ describe('ProductConversationPage', () => {
     act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
     await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
     expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual(['original-boundary', 'distinct-opening', 'distinct-repeat', 'newest-message']);
+  });
+
+  it('positions the new hashless Global route member without replacing the acquired aggregate owner', async () => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', before: null, has_older: false });
+    initial.segments.push({ segment_ordinal: 2, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')] });
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(initial));
+    renderPage('/global/row-1', true);
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'open second Global member' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-3' } }));
+    expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(1);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3');
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
   });
 
   it('keeps a hashless newest Global reader unpinned when its route member continues', async () => {
