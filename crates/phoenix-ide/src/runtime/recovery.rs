@@ -128,18 +128,6 @@ pub fn should_auto_continue(
         // Treat it as a settled Idle, never an interrupted tool turn.
         return RecoveryDecision::idle(reason);
     }
-    let adopted_wake_tail = messages
-        .iter()
-        .rev()
-        .filter(|message| !is_restart_marker(message))
-        .take_while(|message| is_adopted_wake_result(message));
-    if adopted_wake_tail
-        .filter_map(wake_terminal_object)
-        .any(|terminal| !terminal.contains_key("Cancelled"))
-    {
-        return RecoveryDecision::auto_continue();
-    }
-
     if !matches!(last_msg.message_type, MessageType::Tool) {
         return RecoveryDecision::idle(RecoveryReason::LastMessageNotTool);
     }
@@ -234,18 +222,6 @@ fn is_restart_marker(message: &Message) -> bool {
     )
 }
 
-fn is_adopted_wake_result(message: &Message) -> bool {
-    message.message_type == MessageType::User
-        && message.display_data.as_ref().is_some_and(|data| {
-            data.get("type").and_then(serde_json::Value::as_str) == Some("wake_result")
-                && data.get("adopted").and_then(serde_json::Value::as_bool) == Some(true)
-        })
-}
-
-fn wake_terminal_object(message: &Message) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    message.display_data.as_ref()?.get("terminal")?.as_object()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,21 +248,6 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         }
-    }
-
-    fn adopted_wake_msg(seq: i64, cancelled: bool) -> Message {
-        let mut message = user_msg(seq, "wake result");
-        let terminal = if cancelled {
-            json!({ "Cancelled": {} })
-        } else {
-            json!({ "Bash": {} })
-        };
-        message.display_data = Some(json!({
-            "type": "wake_result",
-            "adopted": true,
-            "terminal": terminal,
-        }));
-        message
     }
 
     // Helper to create an agent message with only tool_use blocks
@@ -525,44 +486,6 @@ mod tests {
     // =========================================================================
     // Normal completion cases (should NOT auto-continue)
     // =========================================================================
-
-    #[test]
-    fn mixed_adopted_wake_tail_auto_continues_when_any_result_is_resumable() {
-        let messages = vec![
-            user_msg(1, "start"),
-            adopted_wake_msg(2, false),
-            adopted_wake_msg(3, true),
-        ];
-
-        let decision = should_auto_continue(&messages, None);
-
-        assert!(decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
-    }
-
-    #[test]
-    fn restart_marker_is_transparent_to_adopted_wake_tail() {
-        let messages = vec![
-            adopted_wake_msg(1, false),
-            adopted_wake_msg(2, true),
-            system_restart_msg(3),
-        ];
-
-        let decision = should_auto_continue(&messages, None);
-
-        assert!(decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
-    }
-
-    #[test]
-    fn cancellation_only_adopted_wake_tail_stays_idle() {
-        let messages = vec![user_msg(1, "start"), adopted_wake_msg(2, true)];
-
-        let decision = should_auto_continue(&messages, None);
-
-        assert!(!decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
-    }
 
     #[test]
     fn test_completed_tool_cycle() {

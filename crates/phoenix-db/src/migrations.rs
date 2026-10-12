@@ -641,7 +641,14 @@ const MIGRATIONS: &[Migration] = &[
         name: "support_ipv6_federation_peer_hosts",
         sql: MIGRATION_125,
     },
+    Migration {
+        version: 126,
+        name: "retire_wake_feature_preserving_history",
+        sql: WAKE_FEATURE_RETIREMENT_SQL,
+    },
 ];
+
+const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
 
 const MIGRATION_123: &str = include_str!("migrations/close_startup_interruption.sql");
 
@@ -12448,6 +12455,854 @@ mod tests {
     use sqlx::Row;
     use std::str::FromStr;
 
+    mod wake_feature_retirement_tests {
+        use super::*;
+
+        const WAKE_STATUSES: [&str; 9] = [
+            "Active",
+            "Cancelling",
+            "ManualResolution",
+            "Incompatible",
+            "DeletionPending",
+            "Completed",
+            "Failed",
+            "Cancelled",
+            "Deleted",
+        ];
+
+        async fn initialize_pre_retirement(db: crate::Database) -> crate::Database {
+            sqlx::raw_sql(
+                "CREATE TABLE _migrations (
+                     version INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO _migrations (version, name)
+                     VALUES (126, 'fixture_skip_wake_retirement');",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                run_pending_migrations(db.pool()).await.unwrap() as usize,
+                MIGRATIONS.len() - 1
+            );
+            sqlx::query("DELETE FROM _migrations WHERE version = 126")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let retirement_tables: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN (
+                     'workflow_feature_retirements', 'wake_occurrence_feature_retirements',
+                     'coordinator_event_feature_retirements'
+                 )",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(retirement_tables, 0);
+            db
+        }
+
+        async fn pre_retirement_in_memory() -> crate::Database {
+            let db = crate::Database::from_pool_for_tests(test_pool().await, String::new());
+            db.run_migrations().await.unwrap();
+            initialize_pre_retirement(db).await
+        }
+
+        async fn fixture() -> crate::Database {
+            seed_fixture(pre_retirement_in_memory().await).await
+        }
+
+        #[allow(clippy::too_many_lines)]
+        async fn seed_fixture(db: crate::Database) -> crate::Database {
+            for id in [
+                "wake-history",
+                "steering-history",
+                "seed-history",
+                "interaction-history",
+            ] {
+                db.create_conversation(id, id, "/tmp", true, None, None)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
+                         content, created_at)
+                     VALUES (?1, ?2, 1, 'user', '{ \"text\" : \"preserved history\" }', '2026-01-01')",
+                )
+                .bind(format!("{id}:message"))
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            for (index, status) in WAKE_STATUSES.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                         runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                         status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                         created_at, updated_at)
+                     VALUES (?1, 'wake', ?1, 1, 0, 1, 7, ?2, 'wake.snapshot', 1, ?3, 10, 20)",
+                )
+                .bind(i64::try_from(index + 1).unwrap())
+                .bind(*status)
+                .bind(format!("{{ \"historical_status\" : \"{status}\" }}").into_bytes())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            sqlx::raw_sql(
+                "INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                     runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                     status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                     created_at, updated_at) VALUES
+                     (100, 'direct_turn', 1, 0, 1, 1, 7, 'Active', 'direct_turn.snapshot', 1, X'0001FF', 10, 20),
+                     (101, 'nonwake', 1, 1, 0, 1, 7, 'Active', 'wake.snapshot', 1, X'0002FE', 10, 20);
+                 INSERT INTO workflow_supported_codecs (workflow_id, codec_family, codec_version)
+                     SELECT workflow_id, 'historical.codec', 1 FROM workflows;
+                 INSERT INTO workflow_transitions (workflow_id, transition_id, from_version,
+                     to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at)
+                     SELECT workflow_id, 1, 0, 1, 7, 'historical.event', 1, X'0000FEFF', 20 FROM workflows;
+                 INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version,
+                     family, kind, intent_codec_family, intent_codec_version, intent_payload, generation,
+                     role, capability_kind, status)
+                     SELECT workflow_id, 1, 0, 'historical', 'observe', 'historical.intent', 1,
+                         X'0001FF', 7, 'Required', 'ReclaimableObservation', 'Receipted' FROM workflows;
+                 INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version,
+                     family, kind, intent_codec_family, intent_codec_version, intent_payload, generation,
+                     role, capability_kind, status, next_eligible_at, pending_reconciliation)
+                     SELECT workflow_id, 2, 1, 'historical', 'observe', 'historical.intent', 1,
+                         X'FF0002', 7, 'Required', 'ReclaimableObservation',
+                         CASE status WHEN 'Cancelling' THEN 'Executing'
+                             WHEN 'ManualResolution' THEN 'AmbiguityWait'
+                             WHEN 'Incompatible' THEN 'RetryWait'
+                             WHEN 'DeletionPending' THEN 'Blocked'
+                             WHEN 'Completed' THEN 'Invalidated'
+                             WHEN 'Failed' THEN 'Invalidated'
+                             WHEN 'Cancelled' THEN 'Invalidated'
+                             WHEN 'Deleted' THEN 'Invalidated' ELSE 'Eligible' END,
+                         100, 1 FROM workflows;
+                 INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version,
+                     family, kind, intent_codec_family, intent_codec_version, intent_payload, generation,
+                     role, capability_kind, status)
+                     SELECT workflow_id, 3, 0, 'historical', 'observe', 'historical.intent', 1,
+                         X'0003FF', 7, 'Required', 'ReclaimableObservation', 'Receipted' FROM workflows;
+                 INSERT INTO workflow_attempts (workflow_id, effect_id, attempt_id, ordinal,
+                     declared_workflow_version, generation, process_incarnation, status, created_at)
+                     SELECT workflow_id, effect_id, effect_id, 0, 0, 7, 2, 'ReceiptAccepted', 15
+                     FROM workflow_effects WHERE effect_id IN (1, 3);
+                 INSERT INTO workflow_attempts (workflow_id, effect_id, attempt_id, ordinal,
+                     declared_workflow_version, generation, process_incarnation, status, created_at)
+                     VALUES (2, 2, 2, 0, 1, 7, 2, 'Begun', 20);
+                 INSERT INTO workflow_reclaimable_leases (workflow_id, attempt_id, lease_until)
+                     VALUES (2, 2, 200);
+                 INSERT INTO workflow_authoritative_observations (workflow_id, observation_id,
+                     effect_id, attempt_id, declared_workflow_version, generation, process_incarnation,
+                     observation_codec_family, observation_codec_version, observation_payload,
+                     observed_at, recorded_at)
+                     SELECT workflow_id, 1, 1, 1, 0, 7, 2, 'historical.observation', 1, X'00FF01', 16, 17
+                     FROM workflows;
+                 INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation,
+                     declared_workflow_version, process_incarnation, attempt_id, origin,
+                     receipt_codec_family, receipt_codec_version, receipt_payload)
+                     SELECT workflow_id, effect_id, effect_id, 7, 0, 2, effect_id, 'Execution',
+                         'historical.receipt', 1, X'00FF02' FROM workflow_effects WHERE effect_id IN (1, 3);
+                 INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, consumer_kind,
+                     event_codec_family, event_codec_version, payload_kind, payload_blob,
+                     requires_runtime_acceptance, status, runtime_acceptance_status)
+                     SELECT workflow_id, 1, 1, 'conversation', 'historical.delivery', 1, 'Receipt',
+                         X'00FF03', 1, 'Pending', 'Owed' FROM workflows WHERE profile_kind = 'wake';
+                 INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, consumer_kind,
+                     event_codec_family, event_codec_version, payload_kind, payload_blob,
+                     requires_runtime_acceptance, status, runtime_acceptance_status, accepted_by_transition_id)
+                     SELECT workflow_id, 2, 3, 'conversation', 'historical.delivery', 1, 'Receipt',
+                         X'00FF04', 1, 'Accepted', 'Accepted', 1 FROM workflows WHERE profile_kind = 'wake';
+                 INSERT INTO workflow_schedules (workflow_id, schedule_id, policy, schedule_key,
+                     status, next_eligible_at, due_occurrence_id, due_generation, due_at)
+                     VALUES (1, 1, 'CoalesceLatest', 'historical-schedule', 'Due', 100, 5, 7, 90);
+                 INSERT INTO workflow_manual_resolutions (workflow_id, manual_resolution_id,
+                     workflow_version, effect_id, status)
+                     VALUES (3, 1, 1, 2, 'Required');
+                 INSERT INTO wake_bindings (workflow_id, conversation_id, contract_id, profile_kind,
+                     profile_version, work_scope_id, resource_kind, bash_handle_id,
+                     registering_tool_use_id, expires_at, resolved_at, prepared_fingerprint,
+                     observe_effect_id, created_at)
+                     SELECT w.workflow_id, c.id, 'contract-' || w.workflow_id, 'wake', w.profile_version,
+                         c.work_scope_id, 'Bash', 'b-' || w.workflow_id, 'tool-' || w.workflow_id,
+                         100, 18, 'historical-fingerprint', 1, 10
+                     FROM workflows w JOIN conversations c ON c.id = 'wake-history'
+                     WHERE w.profile_kind = 'wake' AND w.status <> 'Deleted';
+                 INSERT INTO wake_terminal_receipts (workflow_id, receipt_id, delivery_id,
+                     conversation_id, contract_id, resource_kind, terminal_kind, resolved_at,
+                     bash_handle_id, bash_status, occurred_at, exit_code, duration_ms)
+                     SELECT workflow_id, 1, 1, conversation_id, contract_id, 'Bash', 'Fired', 18,
+                         bash_handle_id, 'Exited', 16, 0, 2 FROM wake_bindings;
+                 INSERT INTO wake_terminal_receipts (workflow_id, receipt_id, delivery_id,
+                     conversation_id, contract_id, resource_kind, terminal_kind, resolved_at,
+                     bash_handle_id, bash_status, occurred_at, exit_code, duration_ms)
+                     SELECT workflow_id, 3, 2, conversation_id, contract_id, 'Bash', 'Fired', 18,
+                         bash_handle_id, 'Exited', 16, 0, 2 FROM wake_bindings;
+                 INSERT INTO wake_terminal_receipt_tails (workflow_id, receipt_id, ordinal, line)
+                     SELECT workflow_id, receipt_id, 0, 'unchanged historical tail' FROM wake_terminal_receipts;
+                 INSERT INTO wake_delivery_messages (workflow_id, delivery_id, conversation_id,
+                     message_id, registering_tool_use_id, terminal_kind, auto_resume, created_at)
+                     VALUES (6, 2, 'wake-history', 'wake-history:message', 'tool-6', 'Fired', 1, 20);
+                 INSERT INTO durable_turns (turn_id, workflow_id, conversation_id, client_turn_key,
+                     prepared_fingerprint, prepared_payload, disposition, generation, owns_conversation,
+                     canonical_message_id)
+                     VALUES (100, 100, 'wake-history', 'wake:6:2', 'accepted-fingerprint', X'FF000A',
+                         'Runtime', 7, 1, 'wake-history:message');
+                 INSERT INTO workflow_external_acceptance_bindings (profile_kind, profile_version,
+                     target_scope, idempotency_key, intent_fingerprint, workflow_id,
+                     receipt_handle, disposition_handle, created_at)
+                     VALUES ('direct_turn', 1, 'wake-history', 'wake:6:2', 'accepted-fingerprint',
+                         100, X'00FF05', X'00FF06', 20);
+                 INSERT INTO durable_turn_submitted_images (turn_id, ordinal, media_type, data)
+                     VALUES (100, 0, 'image/png', 'historical submitted image');
+                 INSERT INTO durable_turn_delivery_images (turn_id, ordinal, media_type, data)
+                     VALUES (100, 0, 'image/png', 'historical delivery image');
+                 INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES
+                     ('wake-history', 'wake-history:message', 'wake'),
+                     ('steering-history', 'steering-history:message', 'steering'),
+                     ('seed-history', 'seed-history:message', 'seeded_fork'),
+                     ('interaction-history', 'interaction-history:message', 'interaction_response');",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO coordinator_watches (id, source_product_conversation_id, enrolled_at_us)
+                     SELECT 1, product_conversation_id, 20 FROM conversations WHERE id = 'wake-history';
+                 INSERT INTO coordinator_watch_events (event_id, watch_id, source_occurrence_kind,
+                     source_occurrence_id, source_generation, source_transcript_id, terminal_kind,
+                     terminal_reason, occurred_at_us, delivery_state, accepted_transcript_id) VALUES
+                     ('wake-event-pending', 1, 'wake', 'pending-occurrence', 7, 'wake-history',
+                         'failed', 'unchanged historical failure', 30, 'pending', NULL),
+                     ('wake-event-accepted', 1, 'wake', 'accepted-occurrence', 7, 'wake-history',
+                         'completed', NULL, 31, 'accepted', 'wake-history'),
+                     ('wake-event-suppressed', 1, 'wake', 'suppressed-occurrence', 7, 'wake-history',
+                         'cancelled', NULL, 32, 'suppressed', NULL);",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            for kind in [
+                "direct_turn",
+                "creation",
+                "steering",
+                "seeded_fork",
+                "interaction_response",
+                "continuation_summary",
+            ] {
+                sqlx::query(
+                    "INSERT INTO coordinator_watch_events (event_id, watch_id, source_occurrence_kind,
+                         source_occurrence_id, source_generation, source_transcript_id, terminal_kind,
+                         occurred_at_us)
+                     VALUES (?1, 1, ?2, ?1, 7, 'wake-history', 'completed', 33)",
+                )
+                .bind(format!("nonwake-{kind}"))
+                .bind(kind)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            assert_foreign_keys(db.pool()).await;
+            db
+        }
+
+        async fn assert_foreign_keys(pool: &SqlitePool) {
+            let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(enabled, 1);
+            assert!(sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        async fn historical_tables(pool: &SqlitePool) -> Vec<String> {
+            sqlx::query_scalar(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name <> '_migrations' ORDER BY name",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn snapshot_tables(
+            pool: &SqlitePool,
+            tables: &[String],
+        ) -> Vec<(String, Vec<Vec<String>>)> {
+            let mut snapshot = Vec::new();
+            for table in tables {
+                let columns: Vec<String> =
+                    sqlx::query_scalar("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+                        .bind(table)
+                        .fetch_all(pool)
+                        .await
+                        .unwrap();
+                let projection = columns
+                    .iter()
+                    .map(|column| {
+                        let quoted = column.replace('"', "\"\"");
+                        format!("typeof(\"{quoted}\") || ':' || hex(CAST(\"{quoted}\" AS BLOB))")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let quoted_table = table.replace('"', "\"\"");
+                let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT {projection} FROM \"{quoted_table}\""
+                )))
+                .fetch_all(pool)
+                .await
+                .unwrap();
+                let mut cells: Vec<Vec<String>> = rows
+                    .iter()
+                    .map(|row| (0..columns.len()).map(|index| row.get(index)).collect())
+                    .collect();
+                cells.sort();
+                snapshot.push((table.clone(), cells));
+            }
+            snapshot
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_preserves_every_historical_row_and_snapshot_byte() {
+            let db = fixture().await;
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            let snapshots: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+                "SELECT workflow_id, snapshot_payload FROM workflows ORDER BY workflow_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+            let recorded: String =
+                sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 126")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, "retire_wake_feature_preserving_history");
+
+            let retired: Vec<(i64, String, String)> = sqlx::query_as(
+                "SELECT r.workflow_id, w.status, r.reason FROM workflow_feature_retirements r
+                 JOIN workflows w USING (workflow_id) ORDER BY r.workflow_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            let expected: Vec<_> = WAKE_STATUSES
+                .iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    (
+                        i64::try_from(index + 1).unwrap(),
+                        (*status).to_owned(),
+                        "WakeFeatureRetired".to_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(retired, expected);
+            let occurrences: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT conversation_id, message_id, reason FROM wake_occurrence_feature_retirements",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                occurrences,
+                vec![(
+                    "wake-history".into(),
+                    "wake-history:message".into(),
+                    "WakeFeatureRetired".into(),
+                )]
+            );
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            let after_snapshots: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+                "SELECT workflow_id, snapshot_payload FROM workflows ORDER BY workflow_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(after_snapshots, snapshots);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_excludes_coordinator_wake_events_without_rewriting_history(
+        ) {
+            let db = fixture().await;
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+
+            let retired: Vec<(String, String)> = sqlx::query_as(
+                "SELECT event_id, reason FROM coordinator_event_feature_retirements ORDER BY event_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                retired,
+                vec![
+                    ("wake-event-accepted".into(), "WakeFeatureRetired".into()),
+                    ("wake-event-pending".into(), "WakeFeatureRetired".into()),
+                    ("wake-event-suppressed".into(), "WakeFeatureRetired".into()),
+                ]
+            );
+            let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+            assert_eq!(pending.len(), 6);
+            assert!(pending
+                .iter()
+                .all(|event| event.source_occurrence_kind != "wake"));
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        #[allow(clippy::too_many_lines)]
+        async fn wake_feature_retirement_fences_event_admission_but_keeps_accepted_direct_turns() {
+            let db = fixture().await;
+            let coordinator = db
+                .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                     runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                     status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                     created_at, updated_at)
+                 VALUES (102, 'direct_turn', 1, 0, 1, 1, 7, 'Active', 'direct_turn.snapshot', 1,
+                     X'0001FF', 10, 20),
+                     (103, 'direct_turn', 1, 0, 1, 1, 7, 'Active', 'direct_turn.snapshot', 1,
+                     X'0001FF', 10, 20)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let admission = "INSERT INTO durable_turns (turn_id, workflow_id, conversation_id,
+                    client_turn_key, prepared_fingerprint, prepared_payload, disposition,
+                    generation, owns_conversation, origin_kind, origin_subscription_event_id)
+                VALUES (?1, ?1, ?2, 'event-turn-' || ?1, 'event-fingerprint', X'FF000A', 'Runtime',
+                    7, 1, 'subscription_event', ?3)";
+            sqlx::query(admission)
+                .bind(102)
+                .bind(&coordinator.id)
+                .bind("wake-event-pending")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO coordinator_watch_events (event_id, watch_id, source_occurrence_kind,
+                     source_occurrence_id, source_generation, source_transcript_id, terminal_kind,
+                     occurred_at_us)
+                 VALUES ('wake-event-unaccepted', 1, 'wake', 'unaccepted-occurrence', 7,
+                     'wake-history', 'completed', 34)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+
+            let owned: (i64, i64, String) = sqlx::query_as(
+                "SELECT generation, owns_conversation, origin_subscription_event_id
+                 FROM durable_turns WHERE turn_id = 102",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(owned, (7, 1, "wake-event-pending".into()));
+            sqlx::query(
+                "UPDATE durable_turns SET terminal_kind = 'Completed', owns_conversation = 0
+                 WHERE turn_id = 102",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let event: (String, String) = sqlx::query_as(
+                "SELECT delivery_state, accepted_transcript_id FROM coordinator_watch_events
+                 WHERE event_id = 'wake-event-pending'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(event, ("accepted".into(), coordinator.id.clone()));
+
+            let error = sqlx::query(admission)
+                .bind(103)
+                .bind(&coordinator.id)
+                .bind("wake-event-unaccepted")
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("retired wake event has no delivery authority"));
+            for event_id in [
+                "wake-event-unaccepted",
+                "wake-event-accepted",
+                "wake-event-suppressed",
+            ] {
+                let error = sqlx::query(
+                    "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text,
+                         origin_kind, origin_subscription_event_id)
+                     VALUES (?1, ?2, 0, 'historical wake event', 'subscription_event', ?1)",
+                )
+                .bind(event_id)
+                .bind(&coordinator.id)
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+                assert!(error
+                    .as_database_error()
+                    .unwrap()
+                    .message()
+                    .contains("retired wake event has no delivery authority"));
+            }
+            sqlx::query(
+                "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text,
+                     origin_kind, origin_subscription_event_id)
+                 VALUES ('ordinary-event', ?1, 0, 'ordinary event', 'subscription_event',
+                     'nonwake-creation')",
+            )
+            .bind(&coordinator.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn permanent_delete_removes_only_owned_retired_wake_workflows_and_children() {
+            let db = fixture().await;
+            sqlx::raw_sql(
+                "UPDATE wake_bindings SET conversation_id = 'steering-history',
+                     work_scope_id = (SELECT work_scope_id FROM conversations WHERE id = 'steering-history')
+                 WHERE workflow_id = 8;
+                 UPDATE wake_terminal_receipts SET conversation_id = 'steering-history'
+                 WHERE workflow_id = 8;",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_foreign_keys(db.pool()).await;
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+            db.delete_conversation("wake-history").await.unwrap();
+
+            let remaining: Vec<i64> =
+                sqlx::query_scalar("SELECT workflow_id FROM workflows ORDER BY workflow_id")
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(remaining, vec![8, 9, 101]);
+            for table in [
+                "workflow_feature_retirements",
+                "workflow_supported_codecs",
+                "workflow_transitions",
+                "workflow_effects",
+                "workflow_attempts",
+                "workflow_reclaimable_leases",
+                "workflow_authoritative_observations",
+                "workflow_receipts",
+                "workflow_deliveries",
+                "workflow_schedules",
+                "workflow_manual_resolutions",
+                "wake_bindings",
+                "wake_terminal_receipts",
+                "wake_terminal_receipt_tails",
+                "wake_delivery_messages",
+            ] {
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {table} WHERE workflow_id BETWEEN 1 AND 7"
+                )))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(count, 0, "owned child rows remained in {table}");
+            }
+            let survivor: (String, String) = sqlx::query_as(
+                "SELECT binding.conversation_id, workflow.status FROM wake_bindings binding
+                 JOIN workflows workflow USING (workflow_id) WHERE workflow_id = 8",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(survivor, ("steering-history".into(), "Cancelled".into()));
+            assert_eq!(
+                db.get_conversation("steering-history").await.unwrap().id,
+                "steering-history"
+            );
+            assert!(matches!(
+                db.get_conversation("wake-history").await,
+                Err(crate::DbError::ConversationNotFound(_))
+            ));
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_runner_upgrade_is_idempotent_after_reopen() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("wake-retirement.db");
+            let path = path.to_str().unwrap();
+            let db = crate::Database::open(path).await.unwrap();
+            let db = seed_fixture(initialize_pre_retirement(db).await).await;
+            let historical = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &historical).await;
+
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+            assert_eq!(snapshot_tables(db.pool(), &historical).await, before);
+            let tables = historical_tables(db.pool()).await;
+            let upgraded = snapshot_tables(db.pool(), &tables).await;
+            let ledger: Vec<(i64, String)> =
+                sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                ledger,
+                compiled_migration_ledger()
+                    .into_iter()
+                    .map(|(version, name)| (version, name.to_owned()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, upgraded);
+            assert_foreign_keys(db.pool()).await;
+            db.pool().close().await;
+            drop(db);
+
+            let reopened = crate::Database::open(path).await.unwrap();
+            assert_eq!(run_pending_migrations(reopened.pool()).await.unwrap(), 0);
+            assert_eq!(historical_tables(reopened.pool()).await, tables);
+            assert_eq!(snapshot_tables(reopened.pool(), &tables).await, upgraded);
+            let reopened_ledger: Vec<(i64, String)> =
+                sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
+                    .fetch_all(reopened.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(reopened_ledger, ledger);
+            assert_foreign_keys(reopened.pool()).await;
+            reopened.pool().close().await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_runner_failure_does_not_record_version() {
+            let db = fixture().await;
+            sqlx::query(
+                "CREATE TABLE wake_occurrence_feature_retirements (fixture_marker TEXT NOT NULL)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            assert!(run_pending_migrations(db.pool()).await.is_err());
+            let recorded: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 126")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, 0);
+            assert_eq!(historical_tables(db.pool()).await, tables);
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_keeps_accepted_owed_delivery_shape_forbidden() {
+            let db = fixture().await;
+            for after_retirement in [false, true] {
+                if after_retirement {
+                    let mut tx = db.pool().begin().await.unwrap();
+                    sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                }
+                let error = sqlx::query(
+                    "UPDATE workflow_deliveries SET runtime_acceptance_status = 'Owed'
+                     WHERE workflow_id = 6 AND delivery_id = 2",
+                )
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+                assert!(error
+                    .as_database_error()
+                    .unwrap()
+                    .message()
+                    .contains("CHECK constraint failed"));
+                let statuses: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT status, runtime_acceptance_status FROM workflow_deliveries
+                     WHERE workflow_id = 6 ORDER BY delivery_id",
+                )
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(
+                    statuses,
+                    vec![
+                        ("Pending".into(), "Owed".into()),
+                        ("Accepted".into(), "Accepted".into()),
+                    ]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_rolls_back_metadata_and_leaves_history_unchanged() {
+            let db = fixture().await;
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let retired: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_feature_retirements")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(retired, 9);
+            let error = sqlx::query(
+                "INSERT INTO workflow_feature_retirements (workflow_id, reason)
+                 VALUES (99999, 'WakeFeatureRetired')",
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("FOREIGN KEY constraint failed"));
+            tx.rollback().await.unwrap();
+            assert_eq!(historical_tables(db.pool()).await, tables);
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_mid_script_failure_rolls_back_earlier_writes() {
+            let db = fixture().await;
+            sqlx::query(
+                "CREATE TABLE wake_occurrence_feature_retirements (fixture_marker TEXT NOT NULL)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            let mut tx = db.pool().begin().await.unwrap();
+            let error = sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
+                .execute(&mut *tx)
+                .await
+                .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("already exists"));
+            let partial_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_feature_retirements")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(partial_count, 9);
+            tx.rollback().await.unwrap();
+            assert_eq!(historical_tables(db.pool()).await, tables);
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_metadata_requires_retirement_reason_and_exact_message_owner(
+        ) {
+            let db = fixture().await;
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::raw_sql(WAKE_FEATURE_RETIREMENT_SQL)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            for statement in [
+                "UPDATE workflow_feature_retirements SET reason = 'Cancelled' WHERE workflow_id = 1",
+                "UPDATE wake_occurrence_feature_retirements SET reason = 'Completed'
+                 WHERE conversation_id = 'wake-history'",
+                "UPDATE coordinator_event_feature_retirements SET reason = 'Cancelled'
+                 WHERE event_id = 'wake-event-pending'",
+            ] {
+                let error = sqlx::query(statement)
+                    .execute(db.pool())
+                    .await
+                    .unwrap_err();
+                assert!(error
+                    .as_database_error()
+                    .unwrap()
+                    .message()
+                    .contains("CHECK constraint failed"));
+            }
+            let error = sqlx::query(
+                "INSERT INTO wake_occurrence_feature_retirements (conversation_id, message_id, reason)
+                 VALUES ('steering-history', 'wake-history:message', 'WakeFeatureRetired')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("FOREIGN KEY constraint failed"));
+            let error = sqlx::query(
+                "INSERT INTO coordinator_event_feature_retirements (event_id, reason)
+                 VALUES ('missing-event', 'WakeFeatureRetired')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap_err();
+            assert!(error
+                .as_database_error()
+                .unwrap()
+                .message()
+                .contains("FOREIGN KEY constraint failed"));
+            assert_foreign_keys(db.pool()).await;
+        }
+
+        #[tokio::test]
+        async fn wake_feature_retirement_accepts_empty_current_schema_without_inventing_work() {
+            let db = crate::Database::open_in_memory().await.unwrap();
+            let tables = historical_tables(db.pool()).await;
+            let before = snapshot_tables(db.pool(), &tables).await;
+            assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+            let recorded: String =
+                sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 126")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, "retire_wake_feature_preserving_history");
+            let counts: (i64, i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM workflow_feature_retirements),
+                        (SELECT COUNT(*) FROM wake_occurrence_feature_retirements),
+                        (SELECT COUNT(*) FROM coordinator_event_feature_retirements)",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(counts, (0, 0, 0));
+            assert_eq!(snapshot_tables(db.pool(), &tables).await, before);
+            assert_foreign_keys(db.pool()).await;
+        }
+    }
+
     async fn historical_continuation_schema() -> SqlitePool {
         let pool = test_pool().await;
         sqlx::raw_sql(
@@ -13275,6 +14130,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (126, "retire_wake_feature_preserving_history"),
             (125, "support_ipv6_federation_peer_hosts"),
             (124, "persist_federation_peer_tls_trust"),
             (123, "allow_interrupted_active_close_snapshot_failure"),
@@ -18577,7 +19433,10 @@ mod tests {
                     (119, 'temporarily_skip_close_cleanup_failures'),
                     (120, 'temporarily_skip_coordinator_question_wait_events'),
                     (122, 'temporarily_skip_coordinator_event_child_indexes'),
-                    (123, 'temporarily_skip_close_startup_interruption')",
+                    (123, 'temporarily_skip_close_startup_interruption'),
+                    (124, 'temporarily_skip_federation_peer_tls_trust'),
+                    (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
+                    (126, 'temporarily_skip_wake_feature_retirement')",
         )
         .execute(&pool)
         .await
@@ -19321,48 +20180,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(migrated_fingerprint, ("fingerprint".to_string(), 1));
-        let replay_intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
-            contract_id: "contract".to_string(),
-            conversation_id: "branch-root".to_string(),
-            root_conversation_id: "branch-root".to_string(),
-            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                wake_ownership.0.clone(),
-            ),
-            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
-                phoenix_workflow::wake_profile::BashResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                        wake_ownership.0.clone(),
-                    ),
-                    handle_id: "b-52".to_string(),
-                },
-            ),
-            registering_tool_use_id: "tool-52".to_string(),
-            registered_at: phoenix_workflow::Timestamp(3),
-            expires_at: phoenix_workflow::Timestamp(100),
-        };
-        let replay = crate::workflow::wake::WakeRepository::new(pool.clone())
-            .register(
-                &replay_intent,
-                "opaque-fingerprint",
-                phoenix_workflow::Timestamp(3),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            replay,
-            crate::workflow::wake::WakeRegistrationOutcome::Replayed {
-                workflow_id: phoenix_workflow::WorkflowId(52),
-                ..
-            }
-        ));
-        let upgraded_fingerprint: (String, i64) = sqlx::query_as(
-            "SELECT prepared_fingerprint, fingerprint_needs_scope_upgrade
-             FROM wake_bindings WHERE workflow_id = 52",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(upgraded_fingerprint, ("opaque-fingerprint".to_string(), 0));
         let preserved_tail: String = sqlx::query_scalar(
             "SELECT line FROM wake_terminal_receipt_tails WHERE workflow_id = 52 AND receipt_id = 1 AND ordinal = 0",
         )
@@ -19480,7 +20297,10 @@ mod tests {
                     (119, 'temporarily_skip_close_cleanup_failures'),
                     (120, 'temporarily_skip_coordinator_question_wait_events'),
                     (122, 'temporarily_skip_coordinator_event_child_indexes'),
-                    (123, 'temporarily_skip_close_startup_interruption')",
+                    (123, 'temporarily_skip_close_startup_interruption'),
+                    (124, 'temporarily_skip_federation_peer_tls_trust'),
+                    (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
+                    (126, 'temporarily_skip_wake_feature_retirement')",
         )
         .execute(pool)
         .await

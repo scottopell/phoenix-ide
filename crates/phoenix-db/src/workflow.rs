@@ -20,7 +20,6 @@ use sqlx::{error::DatabaseError, Row, SqlitePool};
 use std::collections::BTreeSet;
 
 pub mod direct_turn;
-pub mod wake;
 
 pub use direct_turn::*;
 
@@ -39,7 +38,6 @@ impl<T> LocalAuthorityResult<T> {
         }
     }
 }
-use phoenix_workflow::wake_profile;
 use sqlx::{Sqlite, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,13 +213,6 @@ pub struct LocalAttemptRecord {
     pub authority: LocalAttemptAuthority,
     pub status: AttemptStatus,
     pub lease: Option<LocalReclaimableLease>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkflowSequenceName {
-    Observation,
-    Receipt,
-    Delivery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,32 +688,6 @@ impl<'a> WorkflowTx<'a> {
             },
             snapshot_payload: row.get("snapshot_payload"),
         }))
-    }
-
-    pub(crate) async fn allocate_sequence_value(
-        &mut self,
-        workflow_id: WorkflowId,
-        sequence: WorkflowSequenceName,
-    ) -> DbResult<u64> {
-        let name = workflow_sequence_name_str(sequence);
-        sqlx::query(
-            "INSERT INTO workflow_sequences (workflow_id, sequence_name, next_value)
-             VALUES (?1, ?2, 2)
-             ON CONFLICT(workflow_id, sequence_name)
-             DO UPDATE SET next_value = workflow_sequences.next_value + 1",
-        )
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .bind(name)
-        .execute(&mut *self.tx)
-        .await?;
-        let allocated = sqlx::query_scalar::<_, i64>(
-            "SELECT next_value - 1 FROM workflow_sequences WHERE workflow_id = ?1 AND sequence_name = ?2",
-        )
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .bind(name)
-        .fetch_one(&mut *self.tx)
-        .await?;
-        to_u64(allocated, "allocated_sequence")
     }
 
     pub(crate) async fn begin_attempt(
@@ -2436,14 +2401,6 @@ fn parse_workflow_status(value: &str) -> DbResult<WorkflowStatus> {
         other => Err(DbError::Serialization(format!(
             "unknown workflow status: {other}"
         ))),
-    }
-}
-
-fn workflow_sequence_name_str(sequence: WorkflowSequenceName) -> &'static str {
-    match sequence {
-        WorkflowSequenceName::Observation => "observation",
-        WorkflowSequenceName::Receipt => "receipt",
-        WorkflowSequenceName::Delivery => "delivery",
     }
 }
 

@@ -1309,7 +1309,7 @@ AND preserve its branch in git
 WHEN a context-exhausted conversation has no continuation
 THE SYSTEM SHALL permit user-initiated Close on that latest row of the same ordinary Open ProductConversation
 AND SHALL apply the same close contract and worktree/resource disposition as Close from a non-terminal state
-AND SHALL route any direct-turn-owned runtime work, wake deliveries, tool execution, sub-agent execution, and other child work through the durable workflow profile's typed effects and reconciliation machinery rather than through parent-row callbacks that mutate conversation state directly
+AND SHALL route any direct-turn-owned runtime work, tool execution, sub-agent execution, and other child work through the durable workflow profile's typed effects and reconciliation machinery rather than through parent-row callbacks that mutate conversation state directly
 
 WHEN a context-exhausted conversation has an existing continuation
 THE SYSTEM SHALL NOT permit Close conversation on the predecessor row
@@ -1330,7 +1330,7 @@ stranded continuation record. When a continuation exists, the live
 conversation is the continuation; operating on the parent would be
 ambiguous about which conversation the action affects. Parent lifecycle
 settlement uses typed durable profile boundaries rather than ad hoc callbacks
-that mutate the parent row directly after child completion; wake, child, tool,
+that mutate the parent row directly after child completion; child, tool,
 sub-agent, and other direct-turn-owned effects reconcile through those
 boundaries so restart/replay and Close settlement share one authority.
 

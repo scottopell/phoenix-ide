@@ -1729,14 +1729,6 @@ impl Database {
         )
     }
 
-    #[must_use]
-    pub fn wake_repository(&self) -> workflow::wake::WakeRepository {
-        workflow::wake::WakeRepository::with_sqlite_workload_collector(
-            self.pool.clone(),
-            self.sqlite_workload_collector.clone(),
-        )
-    }
-
     #[cfg(test)]
     #[must_use]
     pub fn sqlite_workload_aggregate_report(
@@ -2377,23 +2369,6 @@ impl Database {
                           WHERE member.attempt_id = ?2
                             AND member.conversation_id = successor.id
                       ))
-                 )",
-            ),
-            (
-                WorkScopeRetirementBlocker::PendingWakeOrWorkflow,
-                "SELECT EXISTS(
-                    SELECT 1 FROM wake_bindings b
-                    JOIN workflows w ON w.workflow_id = b.workflow_id
-                    WHERE b.work_scope_id = ?1
-                      AND (
-                        b.resolved_at IS NULL
-                        OR w.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending')
-                        OR EXISTS (
-                            SELECT 1 FROM workflow_deliveries d
-                            WHERE d.workflow_id = b.workflow_id
-                              AND (d.status IN ('Pending', 'Deferred') OR d.runtime_acceptance_status = 'Owed')
-                        )
-                      )
                  )",
             ),
         ];
@@ -7742,7 +7717,7 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// Report whether an adopted wake, seeded fork, or accepted interaction
+    /// Report whether a seeded fork or accepted interaction
     /// response still owns the conversation's first model response.
     ///
     /// # Errors
@@ -7754,7 +7729,7 @@ impl Database {
                  FROM steering_execution_occurrences occurrence
                  JOIN messages source ON source.message_id = occurrence.message_id
                  WHERE occurrence.conversation_id = ?1
-                   AND occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+                   AND occurrence.source_kind IN ('seeded_fork', 'interaction_response')
              )",
         )
         .bind(conversation_id)
@@ -7823,7 +7798,7 @@ impl Database {
              FROM steering_execution_occurrences occurrence
              JOIN messages source ON source.message_id = occurrence.message_id
              WHERE occurrence.conversation_id = ?1
-               AND occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+               AND occurrence.source_kind IN ('seeded_fork', 'interaction_response')
              ORDER BY source.sequence_id DESC
              LIMIT 1",
         )
@@ -7851,7 +7826,7 @@ impl Database {
                  SELECT 1 FROM steering_execution_occurrences
                  WHERE conversation_id = ?1
                    AND message_id = ?2
-                   AND source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+                   AND source_kind IN ('seeded_fork', 'interaction_response')
              )",
         )
         .bind(conversation_id)
@@ -7895,7 +7870,8 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let source_kind: Option<String> = sqlx::query_scalar(
             "SELECT source_kind FROM steering_execution_occurrences
-             WHERE conversation_id = ?1 AND message_id = ?2",
+             WHERE conversation_id = ?1 AND message_id = ?2
+               AND source_kind IN ('steering', 'seeded_fork', 'interaction_response')",
         )
         .bind(conversation_id)
         .bind(source_message_id)
@@ -8012,7 +7988,7 @@ impl Database {
         Ok(true)
     }
 
-    /// List conversations whose adopted wake, seeded fork, or accepted
+    /// List conversations whose seeded fork or accepted
     /// interaction response still owns the first model response after restart.
     ///
     /// # Errors
@@ -8024,7 +8000,7 @@ impl Database {
              JOIN steering_execution_occurrences occurrence
                ON occurrence.conversation_id = c.id
              JOIN messages source ON source.message_id = occurrence.message_id
-             WHERE occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+             WHERE occurrence.source_kind IN ('seeded_fork', 'interaction_response')
                AND (
                    c.state_kind IN ('idle', 'llm_requesting')
                    OR (
@@ -13426,35 +13402,7 @@ impl Database {
 
         hydrate_attachments(&self.pool, &mut rows).await?;
 
-        // Adopted wake results form a consecutive user-message tail. The newest
-        // user boundary above contains only the last result, but recovery must
-        // inspect the entire tail because any non-cancelled terminal requests
-        // auto-resume. Expand only that semantic tail, stopping at the first
-        // ordinary message rather than hydrating older transcript turns.
-        if rows.last().is_some_and(is_adopted_wake_result_message) {
-            let mut cursor = rows.last().map_or(0, |message| message.sequence_id);
-            let mut wake_tail = Vec::new();
-            'tail: loop {
-                let older = self
-                    .get_messages_before_inner(conversation_id, cursor, 64)
-                    .await?;
-                if older.is_empty() {
-                    break;
-                }
-                cursor = older.first().map_or(cursor, |message| message.sequence_id);
-                for message in older.into_iter().rev() {
-                    if !is_adopted_wake_result_message(&message) {
-                        break 'tail;
-                    }
-                    wake_tail.push(message);
-                }
-            }
-            rows.extend(wake_tail);
-            rows.sort_by_key(|message| message.sequence_id);
-            rows.dedup_by_key(|message| message.sequence_id);
-        }
-
-            Ok(rows)
+        Ok(rows)
         })
         .await
     }
@@ -15688,7 +15636,7 @@ pub(crate) async fn record_initial_execution_outcome_tx(
             .await;
     }
     let steering: Option<(String, String)> = sqlx::query_as(
-        "SELECT message_id, source_kind FROM steering_execution_occurrences WHERE conversation_id = ?1",
+        "SELECT message_id, source_kind FROM steering_execution_occurrences WHERE conversation_id = ?1 AND source_kind IN ('steering', 'seeded_fork', 'interaction_response')",
     )
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
@@ -15925,14 +15873,6 @@ fn parse_project_row(row: SqliteRow) -> Result<Project, sqlx::Error> {
         created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
         conversation_count: row.try_get("conversation_count")?,
     })
-}
-
-fn is_adopted_wake_result_message(message: &Message) -> bool {
-    message.message_type == MessageType::User
-        && message.display_data.as_ref().is_some_and(|data| {
-            data.get("type").and_then(serde_json::Value::as_str) == Some("wake_result")
-                && data.get("adopted").and_then(serde_json::Value::as_bool) == Some(true)
-        })
 }
 
 fn prompt_decode_error(error: impl std::fmt::Display) -> sqlx::Error {
@@ -16352,6 +16292,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_wake_pointer_is_readable_but_has_no_execution_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("historical-wake", "History", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "historical-observation",
+            "historical-wake",
+            &MessageContent::user("Historical background observation"),
+            Some(&serde_json::json!({"type": "wake_result", "adopted": true})),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES ('historical-wake', 'historical-observation', 'wake')")
+            .execute(db.pool()).await.unwrap();
+
+        assert!(!db
+            .has_execution_occurrence("historical-wake")
+            .await
+            .unwrap());
+        assert!(db
+            .latest_execution_occurrence_message_id("historical-wake")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .execution_occurrence_conversation_ids()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!db
+            .project_execution_occurrence_requesting(
+                "historical-wake",
+                "historical-observation",
+                &ConvState::LlmRequesting { attempt: 1 },
+                &Utc::now(),
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .settle_execution_occurrence(
+                "historical-wake",
+                "historical-observation",
+                &ExecutionOccurrenceTerminal::Completed,
+                &ConvState::Idle,
+            )
+            .await
+            .unwrap());
+        db.update_conversation_state("historical-wake", &ConvState::Terminal)
+            .await
+            .unwrap();
+
+        let pointer: String = sqlx::query_scalar("SELECT source_kind FROM steering_execution_occurrences WHERE conversation_id = 'historical-wake'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(pointer, "wake");
+        let messages = db.get_recovery_messages("historical-wake").await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].display_data.as_ref().unwrap()["type"],
+            "wake_result"
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_messages_start_at_newest_user_or_skill_boundary() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("recovery-suffix", "slug", "/tmp", true, None, None)
@@ -16387,60 +16392,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 4]
         );
-    }
-
-    #[tokio::test]
-    async fn recovery_messages_include_the_complete_adopted_wake_tail() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("recovery-wake-tail", "slug", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.add_message(
-            "wake-boundary",
-            "recovery-wake-tail",
-            &MessageContent::user("ordinary"),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        for (index, terminal) in ["Completed", "Cancelled"].iter().enumerate() {
-            db.add_message(
-                &format!("wake-result-{index}"),
-                "recovery-wake-tail",
-                &MessageContent::user("wake"),
-                Some(&serde_json::json!({
-                    "type": "wake_result",
-                    "adopted": true,
-                    "terminal": { (*terminal): {} },
-                })),
-                None,
-            )
-            .await
-            .unwrap();
-        }
-
-        let messages = db
-            .get_recovery_messages("recovery-wake-tail")
-            .await
-            .unwrap();
-        assert_eq!(
-            messages
-                .iter()
-                .map(|message| message.sequence_id)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-        let report = db
-            .sqlite_workload_collector
-            .aggregate_fresh_collector_for_test();
-        let recovery = SqliteReadFamily::RecoveryRangeHistory.index();
-        let bounded = SqliteReadFamily::LatestBoundedHistory.index();
-        assert_eq!(
-            report.read_family_outcomes[recovery][SqliteReadFamilyOutcome::Success.index()],
-            1
-        );
-        assert_eq!(report.read_family_outcomes[bounded].iter().sum::<u64>(), 0);
     }
 
     #[tokio::test]
@@ -28567,169 +28518,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn test_delete_conversation_removes_wake_owned_workflows_and_messages() {
-        let db = Database::open_in_memory().await.unwrap();
-        let conversation = db
-            .create_conversation_with_project(
-                "conv-del",
-                "conv-del",
-                "/tmp",
-                true,
-                None,
-                Some("claude-opus-test"),
-                None,
-                &ConvMode::Direct,
-                None,
-                None,
-                None,
-                phoenix_core::llm_language::LlmLanguage::default(),
-            )
-            .await
-            .unwrap();
-        let work_scope_id = conversation
-            .attached_work_scope_id
-            .expect("ordinary conversation scope");
-        let wake_repo = crate::workflow::wake::WakeRepository::new(db.pool.clone());
-        let workflow_id = phoenix_workflow::WorkflowId(9_101);
-        let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
-            contract_id: "contract-del".into(),
-            conversation_id: "conv-del".into(),
-            root_conversation_id: "conv-del".into(),
-            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                work_scope_id.as_str().into(),
-            ),
-            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
-                phoenix_workflow::wake_profile::BashResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                        work_scope_id.as_str().into(),
-                    ),
-                    handle_id: "b-del".into(),
-                },
-            ),
-            registering_tool_use_id: "tool-del".into(),
-            registered_at: phoenix_workflow::Timestamp(10),
-            expires_at: phoenix_workflow::Timestamp(100),
-        };
-        wake_repo
-            .register_allocated(
-                workflow_id,
-                &intent,
-                "fp-del",
-                phoenix_workflow::Timestamp(10),
-            )
-            .await
-            .unwrap();
-        let started = wake_repo
-            .claim_observation_if_eligible(
-                workflow_id,
-                phoenix_workflow::ProcessIncarnation(1),
-                phoenix_workflow::Timestamp(20),
-                phoenix_workflow::LeaseExpiry(30),
-            )
-            .await
-            .unwrap();
-        let authority = match started {
-            crate::workflow::wake::WakeObservationOutcome::Started { canonical } => {
-                canonical.authority.expect("authority")
-            }
-            other @ (crate::workflow::wake::WakeObservationOutcome::Busy { .. }
-            | crate::workflow::wake::WakeObservationOutcome::Ineligible) => {
-                panic!("expected started, got {other:?}")
-            }
-        };
-        let pending = match wake_repo
-            .record_terminal_evidence(
-                workflow_id,
-                &authority,
-                1,
-                phoenix_workflow::ReceiptId(1),
-                phoenix_workflow::DeliveryId(1),
-                phoenix_workflow::Timestamp(20),
-                &phoenix_workflow::wake_profile::WakeTerminalEvidence::Bash(
-                    phoenix_workflow::wake_profile::BashTerminalEvidence {
-                        identity: phoenix_workflow::wake_profile::BashResourceIdentity {
-                            work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                                work_scope_id.as_str().into(),
-                            ),
-                            handle_id: "b-del".into(),
-                        },
-                        status: phoenix_workflow::wake_profile::BashTerminalStatus::Exited,
-                        occurred_at: phoenix_workflow::Timestamp(19),
-                        exit_code: Some(0),
-                        duration_ms: Some(12),
-                        signal_number: None,
-                        kill_signal_sent: None,
-                        final_tail: vec!["done".into()],
-                    },
-                ),
-            )
-            .await
-            .unwrap()
-        {
-            crate::workflow::wake::WakeTerminalEvidenceOutcome::Recorded { delivery, .. }
-            | crate::workflow::wake::WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => {
-                delivery
-            }
-            other @ (crate::workflow::wake::WakeTerminalEvidenceOutcome::StaleAttempt
-            | crate::workflow::wake::WakeTerminalEvidenceOutcome::WrongResource
-            | crate::workflow::wake::WakeTerminalEvidenceOutcome::EvidenceAfterObservation
-            | crate::workflow::wake::WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
-                panic!("expected pending delivery, got {other:?}")
-            }
-        };
-        let _ = wake_repo
-            .materialize_pending_delivery_message(
-                &crate::workflow::wake::MaterializePendingDeliveryMessageInput {
-                    workflow_id,
-                    delivery_id: pending.canonical_delivery.delivery_id,
-                    conversation_id: pending.conversation_id.clone(),
-                    rendered_content: "wake complete".to_string(),
-                    display_data: None,
-                    auto_resume: true,
-                    created_at: phoenix_workflow::Timestamp(50),
-                    sequence_id: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        db.delete_conversation("conv-del").await.unwrap();
-
-        assert!(db.get_conversation("conv-del").await.is_err());
-        let workflow_exists: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE workflow_id = ?1")
-                .bind(9_101_i64)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        let binding_exists: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM wake_bindings WHERE workflow_id = ?1")
-                .bind(9_101_i64)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        let receipt_exists: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM wake_terminal_receipts WHERE workflow_id = ?1",
-        )
-        .bind(9_101_i64)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        let link_exists: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM wake_delivery_messages WHERE workflow_id = ?1",
-        )
-        .bind(9_101_i64)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(workflow_exists, 0);
-        assert_eq!(binding_exists, 0);
-        assert_eq!(receipt_exists, 0);
-        assert_eq!(link_exists, 0);
-    }
-
-    #[tokio::test]
     async fn product_conversation_members_put_subordinates_first_and_parents_in_topology_order() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
@@ -30986,25 +30774,6 @@ mod tests {
                 .await
                 .unwrap(),
             WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::ActiveSubAgent)
-        );
-    }
-
-    #[tokio::test]
-    async fn retirement_blocks_pending_wake_workflow() {
-        let db = Database::open_in_memory().await.unwrap();
-        let scope =
-            retirement_fixture(&db, "wake-owner", RuntimeRole::User, &ConvState::Terminal).await;
-        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (900, 'wake', 1, 1, 0, 0, 0, 'Active', 'wake', 1, X'00', 1, 1)")
-            .execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version, family, kind, intent_codec_family, intent_codec_version, intent_payload, generation, role, capability_kind, status) VALUES (900, 1, 0, 'wake', 'observe', 'wake', 1, X'00', 0, 'Required', 'ReclaimableObservation', 'Eligible')")
-            .execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO wake_bindings (workflow_id, conversation_id, contract_id, profile_kind, profile_version, work_scope_id, resource_kind, bash_handle_id, registering_tool_use_id, expires_at, prepared_fingerprint, observe_effect_id, created_at) VALUES (900, 'wake-owner', 'contract', 'wake', 1, ?1, 'Bash', 'b-900', 'tool', 100, 'fingerprint', 1, 1)")
-            .bind(scope.as_str()).execute(db.pool()).await.unwrap();
-        assert_eq!(
-            db.retire_work_scope(no_live_resource(scope), "cleanup")
-                .await
-                .unwrap(),
-            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::PendingWakeOrWorkflow)
         );
     }
 

@@ -1919,7 +1919,6 @@ where
     tmux_registry: Arc<crate::tools::TmuxRegistry>,
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
-    wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
@@ -2274,7 +2273,6 @@ where
             bash_handles,
             tmux_registry,
             llm_registry,
-            wake_registrar: None,
             terminals,
             event_rx,
             event_tx,
@@ -2342,15 +2340,6 @@ where
             fork_cmd_tx: None,
             state_watcher: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_wake_registrar(
-        mut self,
-        wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
-    ) -> Self {
-        self.wake_registrar = wake_registrar;
-        self
     }
 
     pub fn with_startup_creation_completion(
@@ -3365,28 +3354,6 @@ where
         Ok(())
     }
 
-    async fn process_adopted_wake_batch(&mut self) -> Result<(), String> {
-        self.parent_tool_cycle_count = 0;
-        if !matches!(self.state, ConvState::Idle) {
-            tracing::debug!(
-                conv_id = %self.context.conversation_id,
-                state = self.state.variant_name(),
-                "Ignoring wake batch notification because runtime is no longer idle"
-            );
-            return Ok(());
-        }
-        self.install_live_state(ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true)?;
-        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-            sequence_id: seq,
-            state: self.state.clone(),
-            state_updated_at: self.state_updated_at,
-            presentation_mode: self.state.presentation_mode().to_string(),
-        });
-        Box::pin(self.execute_effect(Effect::RequestLlm))
-            .await
-            .map(|_| ())
-    }
-
     async fn process_acknowledged_event(
         &mut self,
         event: Event,
@@ -3577,10 +3544,6 @@ where
                 "Steering message cancelled in executor"
             );
             return Ok(());
-        }
-
-        if matches!(event, Event::WakeBatchAdopted) {
-            return self.process_adopted_wake_batch().await;
         }
 
         if matches!(event, Event::RetryBufferedSubAgentResults) {
@@ -8785,7 +8748,6 @@ where
                 self.svg_publication_lifetime.clone(),
             ),
         ))
-        .with_wake_registrar(self.wake_registrar.clone())
         .with_llm_metrics_tx(llm_metrics_tx);
 
         if let ConvState::ToolExecuting {
@@ -13279,6 +13241,108 @@ mod dispatch_context_budget_tests {
                 "[Input of unknown historical origin]\nappended"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_new_turn_prompt_excludes_unadopted_historical_wake_results() {
+        let cwd = TempDir::new().expect("cwd");
+        let conv_id = "historical-wake-prompt";
+        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let storage = Arc::new(InMemoryStorage::new());
+        for (id, text, display) in [
+            (
+                "unadopted",
+                "unaccepted background result",
+                serde_json::json!({"type": "wake_result", "adopted": false}),
+            ),
+            (
+                "absent-adoption",
+                "background result without acceptance",
+                serde_json::json!({"type": "wake_result"}),
+            ),
+            (
+                "adopted",
+                "accepted historical result",
+                serde_json::json!({"type": "wake_result", "adopted": true}),
+            ),
+            (
+                "ordinary-meta",
+                "ordinary historical metadata",
+                serde_json::json!({"type": "other", "adopted": false}),
+            ),
+        ] {
+            storage
+                .add_message(
+                    id,
+                    conv_id,
+                    &MessageContent::User(UserContent::meta(text)),
+                    Some(&display),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("ordinary response")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let high_water = storage
+            .get_all_messages(conv_id)
+            .iter()
+            .map(|message| message.sequence_id)
+            .max()
+            .unwrap();
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage.clone(),
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, high_water),
+        );
+        Box::pin(runtime.process_event(Event::UserMessage {
+            text: "ordinary new request".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "new-user".into(),
+            user_agent: None,
+            skill_invocation: None,
+        }))
+        .await
+        .unwrap();
+        let task = runtime
+            .llm_task_handle
+            .take()
+            .unwrap_or_else(|| panic!("ordinary dispatch did not start: {:?}", runtime.state));
+        task.await.unwrap();
+
+        let requests = llm.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        let source_ids: Vec<_> = requests[0]
+            .messages
+            .iter()
+            .filter_map(|message| message.source_message_id.as_deref())
+            .collect();
+        assert_eq!(source_ids, vec!["adopted", "ordinary-meta", "new-user"]);
+        let texts = user_texts(&requests[0]);
+        assert_eq!(texts.len(), 3);
+        assert!(texts[0].ends_with("accepted historical result"));
+        assert!(texts[1].ends_with("ordinary historical metadata"));
+        assert!(texts[2].ends_with("ordinary new request"));
+        assert_eq!(storage.get_all_messages(conv_id).len(), 5);
     }
 
     #[tokio::test]
@@ -20861,28 +20925,6 @@ mod steer_drain_detector_tests {
             activation_rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         ));
-    }
-
-    #[test]
-    fn render_messages_withholds_unadopted_wake_observation() {
-        let created_at = chrono::Utc::now();
-        let msgs = vec![crate::db::Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-            message_id: "wake-msg".to_string(),
-            conversation_id: "conv".to_string(),
-            sequence_id: 7,
-            message_type: crate::db::MessageType::User,
-            content: MessageContent::User(crate::db::UserContent::meta("bash finished normally")),
-            display_data: Some(serde_json::json!({"type": "wake_result"})),
-            usage_data: None,
-            created_at,
-        }];
-
-        let rendered = render_messages(&msgs, &std::collections::HashSet::new());
-        assert!(
-            rendered.is_empty(),
-            "wake observations become provider-visible only through the adoption event"
-        );
     }
 
     /// Regression (task 61005): a `SubAgentResult` buffered from an earlier
