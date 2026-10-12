@@ -777,9 +777,10 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual(["/bin/kache", "daemon", "run"], spawn.call_args.args[0])
         record.assert_not_called()
 
-    def test_live_child_after_readiness_failure_is_reported_unclaimed(self):
+    def test_live_child_after_readiness_failure_is_settled(self):
         child = mock.Mock(pid=2468)
         child.poll.return_value = None
+        child.wait.return_value = -15
         with mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
         ), mock.patch.object(
@@ -793,12 +794,37 @@ class CompilerCacheTests(unittest.TestCase):
                 socket=Path("/tmp/kache.sock"),
                 identity="identity",
             )
-        self.assertIn("pid 2468 may still be live", error or "")
-        self.assertIn("without a Phoenix ownership receipt", error or "")
+        child.terminate.assert_called_once_with()
+        child.kill.assert_not_called()
+        child.wait.assert_called_once_with(timeout=1.0)
+        self.assertIn("readiness timed out", error or "")
+        self.assertIn("spawned Kache child pid 2468 terminated", error or "")
+        self.assertNotIn("may still be live", error or "")
 
-    def test_long_readiness_failure_retains_live_child_obligation(self):
+    def test_readiness_failure_escalates_only_spawned_child(self):
         child = mock.Mock(pid=2468)
         child.poll.return_value = None
+        child.wait.side_effect = [self.dev.subprocess.TimeoutExpired("kache", 1.0), -9]
+        settlement = self.dev._settle_spawned_kache_child(child)
+        self.assertIsNone(settlement)
+        child.terminate.assert_called_once_with()
+        child.kill.assert_called_once_with()
+        self.assertEqual(
+            [mock.call(timeout=1.0), mock.call(timeout=1.0)],
+            child.wait.call_args_list,
+        )
+
+    def test_readiness_failure_reports_owned_child_settlement_failure(self):
+        child = mock.Mock(pid=2468)
+        child.poll.return_value = None
+        child.wait.side_effect = self.dev.subprocess.TimeoutExpired("kache", 1.0)
+        settlement = self.dev._settle_spawned_kache_child(child)
+        self.assertIn("pid 2468 remained live after SIGKILL", settlement or "")
+
+    def test_long_readiness_failure_retains_child_settlement(self):
+        child = mock.Mock(pid=2468)
+        child.poll.return_value = None
+        child.wait.return_value = -15
         with mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
         ), mock.patch.object(
@@ -814,12 +840,13 @@ class CompilerCacheTests(unittest.TestCase):
             )
         rendered = self.dev._safe_kache_startup_diagnostic(error or "", environment={})
         self.assertLessEqual(len(rendered), 2048)
-        self.assertIn("pid 2468 may still be live", rendered)
-        self.assertIn("without a Phoenix ownership receipt", rendered)
+        self.assertIn("spawned Kache child pid 2468 terminated", rendered)
+        self.assertIn("after readiness failure", rendered)
 
-    def test_credential_readiness_failure_retains_live_child_obligation(self):
+    def test_credential_readiness_failure_retains_child_settlement(self):
         child = mock.Mock(pid=2468)
         child.poll.return_value = None
+        child.wait.return_value = -15
         diagnostic = '1 | "to\\u006ben" = "fixture-secret"\n' + "x" * 2500
         with mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
@@ -836,8 +863,7 @@ class CompilerCacheTests(unittest.TestCase):
             )
         self.assertNotIn("fixture-secret", error or "")
         self.assertIn("[redacted backend diagnostic]", error or "")
-        self.assertIn("pid 2468 may still be live", error or "")
-        self.assertIn("without a Phoenix ownership receipt", error or "")
+        self.assertIn("spawned Kache child pid 2468 terminated", error or "")
 
     def test_diagnostic_thread_failure_reports_live_child(self):
         child = mock.Mock(pid=2468)

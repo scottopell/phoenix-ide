@@ -5208,6 +5208,31 @@ def _drain_bounded(stream, buffer: bytearray, *, limit: int = 8192) -> None:
             del buffer[:-limit]
 
 
+def _settle_spawned_kache_child(child: subprocess.Popen) -> str | None:
+    if child.poll() is not None:
+        return None
+    try:
+        child.terminate()
+        child.wait(timeout=1.0)
+        return None
+    except ProcessLookupError:
+        return None
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError as error:
+        return f"cannot terminate spawned Kache child pid {child.pid}: {error}"
+    try:
+        child.kill()
+        child.wait(timeout=1.0)
+        return None
+    except ProcessLookupError:
+        return None
+    except subprocess.TimeoutExpired:
+        return f"spawned Kache child pid {child.pid} remained live after SIGKILL"
+    except OSError as error:
+        return f"cannot kill spawned Kache child pid {child.pid}: {error}"
+
+
 def _start_kache_daemon_locked(
     binary: str, *, cargo_cwd: Path | None, socket: Path, identity: str
 ) -> str | None:
@@ -5264,9 +5289,13 @@ def _start_kache_daemon_locked(
             if detail:
                 return f"{safe_readiness}: {detail}"
             return safe_readiness
+        settlement_error = _settle_spawned_kache_child(child)
+        diagnostic_thread.join(timeout=0.1)
+        if settlement_error:
+            return f"{safe_readiness}; {settlement_error}"
         return (
-            f"{safe_readiness}; spawned Kache child pid {child.pid} may still be live "
-            f"on {socket} without a Phoenix ownership receipt"
+            f"{safe_readiness}; spawned Kache child pid {child.pid} terminated "
+            "after readiness failure"
         )
     serving_pid = _kache_daemon_serving_pid(socket)
     if serving_pid != child.pid:
