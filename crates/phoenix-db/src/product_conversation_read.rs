@@ -323,6 +323,15 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
    AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5))))
  ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6";
 
+#[cfg(test)]
+fn late_hydration_experiment_sql() -> String {
+    let (cte, rest) = PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL
+        .split_once(" ) SELECT ")
+        .unwrap();
+    let (_, tail) = rest.split_once("\n FROM transcript").unwrap();
+    format!("{cte} ), selected AS MATERIALIZED (SELECT messages.message_id, messages.conversation_id, messages.sequence_id, transcript.ordinal\n FROM transcript{tail}) SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content, m.display_data, m.usage_data, m.created_at, m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id, selected.ordinal FROM selected JOIN messages m ON m.message_id=selected.message_id ORDER BY selected.ordinal DESC, selected.sequence_id DESC, selected.message_id DESC")
+}
+
 impl Database {
     /// Returns the accepted opening message ID for a completed continuation edge.
     ///
@@ -1182,6 +1191,8 @@ impl Database {
         segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
         limit: usize,
     ) -> DbResult<Vec<(i64, crate::Message)>> {
+        #[cfg(test)]
+        let candidate_before = before.clone();
         let query = {
             let _stage = tracing::info_span!("replay.page.prepare", limit).entered();
             let segment_ceilings = segment_ceilings
@@ -1198,6 +1209,33 @@ impl Database {
             .fetch_all(&mut *connection)
             .instrument(tracing::info_span!("replay.page.fetch_decode", limit))
             .await?;
+        #[cfg(test)]
+        {
+            let candidate_sql = late_hydration_experiment_sql();
+            let ceilings = segment_ceilings
+                .map(serde_json::to_string)
+                .transpose()
+                .unwrap();
+            let candidate = sqlx::query(sqlx::AssertSqlSafe(candidate_sql.as_str()))
+                .bind(product_conversation_id.as_str())
+                .bind(ceilings)
+                .bind(candidate_before.as_ref().map(|c| c.0))
+                .bind(candidate_before.as_ref().map(|c| c.1))
+                .bind(candidate_before.as_ref().map(|c| c.2.as_str()))
+                .bind(i64::try_from(limit).unwrap())
+                .try_map(|row| {
+                    let ordinal: i64 = row.try_get("ordinal")?;
+                    super::parse_message_row(row).map(|message| (ordinal, message))
+                })
+                .fetch_all(&mut *connection)
+                .await?;
+            assert_eq!(
+                serde_json::to_value(&rows).unwrap(),
+                serde_json::to_value(&candidate).unwrap(),
+                "isolated late-hydration full-row equivalence"
+            );
+            rows = candidate;
+        }
         let mut messages = {
             let _stage = tracing::info_span!("replay.page.clone", limit).entered();
             rows.iter()
