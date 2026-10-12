@@ -1,3 +1,5 @@
+import { Link } from 'react-router-dom';
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
 import { useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
@@ -82,7 +84,15 @@ function SubAgentViewerDock() {
   );
 }
 
-export function DesktopLayout({ children }: DesktopLayoutProps) {
+export function DesktopLayout(props: DesktopLayoutProps) {
+  const capabilities = useApplicationCapabilities();
+  if (capabilities.host_resource_observations === 'unavailable' || capabilities.live_stream === 'unavailable') {
+    return <div className="layout-main"><nav><Link to="/">Conversations</Link></nav>{props.children}</div>;
+  }
+  return <LiveDesktopLayout {...props} />;
+}
+
+function LiveDesktopLayout({ children }: DesktopLayoutProps) {
   const isDesktop = useIsDesktop();
   const sidebarPane = useResizablePane({
     key: 'sidebar-width',

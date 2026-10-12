@@ -10,7 +10,7 @@
 // the same atom that SSE writes into.
 
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, act, waitFor } from '@testing-library/react';
+import { render, screen, act, waitFor } from '../testing/renderWithCapabilities';
 import {
   ConversationProvider,
   ConversationStore,

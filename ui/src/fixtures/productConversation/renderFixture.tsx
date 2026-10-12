@@ -1,3 +1,4 @@
+import { LiveApplicationCapabilitiesFixture } from '../LiveApplicationCapabilitiesFixture';
 import { ProductConversationAliasRedirect } from '../../App';
 import { CoordinatorPage } from '../../pages/CoordinatorPage';
 import { FocusScopeProvider } from '../../hooks/useFocusScope';
@@ -101,7 +102,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
       <MemoryRouter initialEntries={[new URLSearchParams(window.location.search).get('fixtureEntry') ?? `/product-conversations/fixture-product-conversation${fixtureHash}`]}>
         <FixtureLocation />
         <FocusScopeProvider>
-          <ConversationProvider>
+          <LiveApplicationCapabilitiesFixture><ConversationProvider>
             {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
               <SeedReactionDraft slug={scenario.snapshot.latest_transcript_row_id} text={scenario.initialDraft} />
             )}
@@ -118,7 +119,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
                 </ViewerSlotProvider>
               </ChainProvider>
             </ConversationReadinessProvider>
-          </ConversationProvider>
+          </ConversationProvider></LiveApplicationCapabilitiesFixture>
         </FocusScopeProvider>
       </MemoryRouter>
     </main>

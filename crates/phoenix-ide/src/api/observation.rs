@@ -3,9 +3,13 @@ pub(crate) struct CoordinatorRouteResponse {
     coordinator_id: Option<String>,
 }
 use super::handlers::AppError;
-use super::product_conversations::{read_product_conversation_snapshot, SnapshotQuery};
+use super::product_conversations::{
+    read_product_conversation_list, read_product_conversation_snapshot,
+    read_scoped_product_conversation_list, SnapshotQuery,
+};
 use super::types::{
-    ConversationRouteResponse, ProductConversationRouteResponse, ProductConversationSnapshotView,
+    ConversationRouteResponse, ProductConversationListResponse, ProductConversationRouteResponse,
+    ProductConversationSnapshotView,
 };
 use crate::db::{Database, DbError};
 use phoenix_core::domain::product_conversation::ProductConversationId;
@@ -92,6 +96,70 @@ impl ConversationRouteObservations {
         Err(DbError::ConversationNotFound(id.to_owned()))
     }
 
+    pub(crate) async fn get_persisted_member(
+        &self,
+        id: &str,
+        query: super::persisted_member::PersistedMemberQuery,
+    ) -> Result<super::persisted_member::PersistedMemberResponse, AppError> {
+        use super::persisted_member::{
+            MemberLiveProcessFacts, MemberObservationSource, PersistedMemberResponse,
+            PersistedTranscriptCoverage,
+        };
+        use super::transcript_observation::{
+            validate_message_history_limit, TranscriptObservations,
+        };
+        self.require_member(id)
+            .await
+            .map_err(product_route_db_to_app)?;
+        let limit = validate_message_history_limit("limit", query.limit, 50)?;
+        let stable = TranscriptObservations::new(&self.db)
+            .latest(id, limit)
+            .await?;
+        let (messages, has_older_messages, server_message_tail) = stable.value;
+        let conv = stable.conversation;
+        let persisted_agent_working = conv.is_agent_working();
+        let conversation = super::member_observation::MemberObservations::new(self.db.clone())
+            .read(&conv, true)
+            .await
+            .map_err(product_route_db_to_app)?
+            .project_persisted(&conv);
+        Ok(PersistedMemberResponse {
+            source: MemberObservationSource::Persisted,
+            conversation,
+            messages: messages
+                .into_iter()
+                .map(super::wire::EnrichedMessage::from)
+                .collect(),
+            transcript_coverage: if has_older_messages {
+                PersistedTranscriptCoverage::Tail
+            } else {
+                PersistedTranscriptCoverage::Complete
+            },
+            server_message_tail,
+            persisted_agent_working,
+            live_process: MemberLiveProcessFacts::Unavailable,
+        })
+    }
+
+    pub(crate) async fn list_product_conversations(
+        &self,
+    ) -> Result<ProductConversationListResponse, AppError> {
+        match &self.scope {
+            RouteScope::Live => read_product_conversation_list(&self.db).await,
+            RouteScope::Product(target) => {
+                read_scoped_product_conversation_list(&self.db, Some(target)).await
+            }
+        }
+        .map(|(view, timing)| {
+            tracing::debug!(
+                db_ms = timing.db_ms,
+                projection_ms = timing.projection_ms,
+                "product persisted read timing"
+            );
+            view
+        })
+    }
+
     pub(crate) async fn get_product_conversation_snapshot(
         &self,
         reference: String,
@@ -108,7 +176,14 @@ impl ConversationRouteObservations {
         };
         read_product_conversation_snapshot(&self.db, reference, query)
             .await
-            .map(|(view, _timing)| view)
+            .map(|(view, timing)| {
+                tracing::debug!(
+                    db_ms = timing.db_ms,
+                    projection_ms = timing.projection_ms,
+                    "product persisted read timing"
+                );
+                view
+            })
     }
 
     pub(crate) async fn get_product_conversation_route(
@@ -269,6 +344,67 @@ mod tests {
         for suffix in ["-wal", "-shm", "-journal"] {
             assert!(!PathBuf::from(format!("{}{suffix}", path.display())).exists());
         }
+    }
+
+    #[tokio::test]
+    async fn persisted_member_tail_uses_current_generation_and_persisted_state() {
+        use super::super::persisted_member::{PersistedMemberQuery, PersistedTranscriptCoverage};
+        let db = Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("tail", "tail-slug", "/fixture", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..55 {
+            db.add_message(
+                &format!("message-{index}"),
+                &conv.id,
+                &crate::db::MessageContent::user(format!("text-{index}")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.update_conversation_state(&conv.id, &ConvState::LlmRequesting { attempt: 2 })
+            .await
+            .unwrap();
+        let before = db.get_conversation(&conv.id).await.unwrap();
+        super::super::transcript_observation::STABLE_TRANSCRIPT_READ_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_| true));
+        });
+        let service = ConversationRouteObservations::new(db.clone());
+        let tail = service
+            .get_persisted_member(&conv.id, PersistedMemberQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(tail.messages.len(), 50);
+        assert_eq!(tail.transcript_coverage, PersistedTranscriptCoverage::Tail);
+        assert_eq!(
+            tail.server_message_tail,
+            tail.messages.last().map(|message| message.sequence_id)
+        );
+        assert_eq!(
+            tail.conversation.transcript_generation,
+            before.transcript_generation + 1
+        );
+        assert!(tail.persisted_agent_working);
+        assert_eq!(
+            tail.conversation.state,
+            crate::runtime::public_conversation_state(&before.state)
+        );
+        let complete = service
+            .get_persisted_member(&conv.id, PersistedMemberQuery { limit: Some(500) })
+            .await
+            .unwrap();
+        assert_eq!(complete.messages.len(), 55);
+        assert_eq!(
+            complete.transcript_coverage,
+            PersistedTranscriptCoverage::Complete
+        );
+        assert_eq!(
+            db.get_conversation(&conv.id).await.unwrap().state,
+            before.state
+        );
     }
 
     #[tokio::test]
@@ -536,6 +672,118 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn immutable_target_list_matches_real_live_projection_and_excludes_other_products() {
+        use crate::api::application_state::{ApplicationState, ObservationApplication};
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let (_dir, path, root, successor, live) = scoped_fixture().await;
+        let original = std::fs::read(&path).unwrap();
+        let all = live.list_product_conversations().await.unwrap();
+        assert_eq!(all.product_conversations.len(), 2);
+        let expected = serde_json::to_value(
+            all.product_conversations
+                .iter()
+                .find(|row| row.product_conversation_id == root.product_conversation_id.as_str())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(expected["canonical_root"]["transcript_row_id"], root.id);
+        assert_eq!(expected["latest_transcript_row_id"], successor.id);
+        assert_eq!(expected["lifecycle"]["state"], "open");
+        assert_eq!(expected["presentation"]["display_name"], "Root Alias");
+
+        for target in [
+            root.id.as_str(),
+            "root-alias",
+            root.product_conversation_id.as_str(),
+            successor.id.as_str(),
+            successor.slug.as_deref().unwrap(),
+        ] {
+            let app = crate::api::create_router(ApplicationState::Observation(
+                ObservationApplication::for_target(live.db.clone(), target)
+                    .await
+                    .unwrap(),
+            ));
+            let mut request = Request::builder()
+                .uri("/api/product-conversations")
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{target}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({"product_conversations": [expected.clone()]}),
+                "{target}"
+            );
+            let snapshot = live
+                .get_product_conversation_snapshot(target.into(), snapshot_query(None))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.writable_transcript_row_id,
+                Some(successor.id.clone())
+            );
+            assert_unchanged(&path, &original);
+        }
+        live.db.pool().close().await;
+        assert_unchanged(&path, &original);
+    }
+
+    #[tokio::test]
+    async fn immutable_target_list_preserves_history_lifecycle_and_exhausted_presentation() {
+        let (_dir, path, db) = fixture().await;
+        let row = db
+            .create_conversation("history", "history-alias", "/fixture", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &row.id,
+            &ConvState::ContextExhausted {
+                summary: "exhausted".into(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?")
+            .bind(row.product_conversation_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let live = freeze(db, &path).await;
+        let original = std::fs::read(&path).unwrap();
+        let service = ConversationRouteObservations::for_target(live.db.clone(), &row.id)
+            .await
+            .unwrap();
+        let scoped =
+            serde_json::to_value(service.list_product_conversations().await.unwrap()).unwrap();
+        assert_eq!(
+            scoped,
+            serde_json::to_value(live.list_product_conversations().await.unwrap()).unwrap()
+        );
+        let listed = &scoped["product_conversations"][0];
+        assert_eq!(listed["lifecycle"]["state"], "history");
+        assert_eq!(listed["presentation"]["kind"], "needs_action");
+        assert_eq!(listed["presentation"]["display_name"], "History Alias");
+        let snapshot = service
+            .get_product_conversation_snapshot(row.id, snapshot_query(None))
+            .await
+            .unwrap();
+        assert!(snapshot.writable_transcript_row_id.is_none());
+        live.db.pool().close().await;
+        assert_unchanged(&path, &original);
     }
 
     #[tokio::test]

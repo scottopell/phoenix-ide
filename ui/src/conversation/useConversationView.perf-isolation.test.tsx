@@ -13,7 +13,7 @@
 // the cached-reference contract, the render-count assertions below fail.
 
 import { describe, it, expect, vi } from 'vitest';
-import { render, act } from '@testing-library/react';
+import { render, act } from '../testing/renderWithCapabilities';
 import { useContext, useRef } from 'react';
 import {
   ConversationProvider,

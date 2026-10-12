@@ -127,6 +127,97 @@ async fn response_json(app: &Router, request: Request<Body>) -> (StatusCode, Val
     )
 }
 
+fn expected_capabilities(live: &str) -> Value {
+    json!({
+        "persisted_member_read": "available", "live_stream": live,
+        "conversation_activation": live, "user_input": live, "telemetry": live,
+        "provider_catalog": live, "host_resource_observations": live,
+    })
+}
+
+#[tokio::test]
+async fn persisted_bootstrap_observes_immutable_member_without_live_services() {
+    let fixture = Fixture::new().await;
+    let (status, capabilities) = response_json(
+        &fixture.app,
+        loopback_request("GET", "/api/capabilities", Body::empty()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities, expected_capabilities("unavailable"));
+    let (status, member) = response_json(
+        &fixture.app,
+        loopback_request(
+            "GET",
+            "/api/conversations/ordinary/observation",
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(member["source"], "persisted");
+    assert_eq!(member["conversation"]["id"], "ordinary");
+    assert_eq!(member["conversation"]["state"]["type"], "idle");
+    assert_eq!(member["persisted_agent_working"], false);
+    assert_eq!(member["messages"], json!([]));
+    assert_eq!(member["server_message_tail"], Value::Null);
+    assert_eq!(member["transcript_coverage"], "complete");
+    assert_eq!(
+        member["live_process"],
+        json!({"availability": "unavailable"})
+    );
+    for id in fixture
+        .coordinator_references
+        .iter()
+        .chain(std::iter::once(&"missing".to_owned()))
+    {
+        let (status, _) = response_json(
+            &fixture.app,
+            loopback_request(
+                "GET",
+                &format!("/api/conversations/{id}/observation"),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    for (limit, expected_status) in [
+        ("0", StatusCode::BAD_REQUEST),
+        ("501", StatusCode::OK),
+        ("-1", StatusCode::BAD_REQUEST),
+    ] {
+        let (status, _) = response_json(
+            &fixture.app,
+            loopback_request(
+                "GET",
+                &format!("/api/conversations/ordinary/observation?limit={limit}"),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(status, expected_status, "limit={limit}");
+    }
+    for path in [
+        "/api/capabilities",
+        "/api/conversations/ordinary/observation",
+    ] {
+        let mut request = loopback_request("GET", path, Body::empty());
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        let (status, _) = response_json(&fixture.app, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, _) = response_json(
+        &fixture.app,
+        loopback_request("GET", "/api/conversations/ordinary/stream", Body::empty()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    fixture.finish().await;
+}
+
 #[tokio::test]
 async fn full_router_observes_immutable_id_slug_product_and_coordinator_routes() {
     let fixture = Fixture::new().await;
@@ -532,6 +623,35 @@ async fn live_full_router_password_login_persists_cookie_and_authenticates_statu
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, expected);
     }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn live_bootstrap_reports_specific_capabilities_and_persisted_contract() {
+    let fixture = LiveAuthFixture::new(None).await;
+    let (status, capabilities) = response_json(
+        &fixture.app,
+        loopback_request("GET", "/api/capabilities", Body::empty()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities, expected_capabilities("available"));
+    let (status, member) = response_json(
+        &fixture.app,
+        loopback_request(
+            "GET",
+            "/api/conversations/live-auth-row/observation",
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(member["source"], "persisted");
+    assert_eq!(member["conversation"]["id"], "live-auth-row");
+    assert_eq!(
+        member["live_process"],
+        json!({"availability": "unavailable"})
+    );
     fixture.finish().await;
 }
 

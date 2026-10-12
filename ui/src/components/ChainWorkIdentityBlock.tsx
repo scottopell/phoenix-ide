@@ -8,6 +8,7 @@
 
 import type { ChainWorkIdentity, ProductConversationSnapshotView } from '../api';
 import { useConversationPrStatus } from '../hooks/useConversationPrStatus';
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
 import {
   prBadgeClass,
   prBadgeLabel,
@@ -30,11 +31,9 @@ export function ChainWorkIdentityBlock({
   identity: WorkIdentity | null;
   title?: string | null;
 }) {
-  // Work mode carries a task; Branch mode does not — the PR-status pipeline
-  // only enables for those two modes, which is exactly when `identity` is
-  // present. A null id keeps the hook disabled (no fetch) for the empty state.
+  const capabilities = useApplicationCapabilities();
   const prHandle = useConversationPrStatus({
-    conversationId: workConversationId(identity),
+    conversationId: capabilities.host_resource_observations === 'available' ? workConversationId(identity) : null,
     convModeLabel: identity ? (identity.task_id ? 'Work' : 'Branch') : undefined,
     branchName: identity?.branch_name ?? null,
   });

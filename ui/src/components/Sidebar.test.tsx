@@ -5,7 +5,7 @@ import {
   subscribeProductConversationListRevision,
   subscribeProductConversationSnapshotChanged,
 } from '../notifications';
-import { render, fireEvent, waitFor } from '@testing-library/react';
+import { render, fireEvent, waitFor } from '../testing/renderWithCapabilities';
 import { MemoryRouter } from 'react-router-dom';
 import { ApiResponseError, ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';

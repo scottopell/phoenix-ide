@@ -1,3 +1,5 @@
+import { ApplicationBootstrap } from './contexts/ApplicationBootstrap';
+import { useApplicationCapabilities } from './contexts/ApplicationCapabilitiesContext';
 import { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
@@ -6,6 +8,9 @@ import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
 import { ThemeProvider } from './components/ThemeProvider';
 import { DensityProvider } from './components/DensityProvider';
 import { ConversationProvider } from './conversation';
+import { ConversationContext } from './conversation/ConversationContext';
+import { ConversationStore } from './conversation/ConversationStore';
+import { Link } from 'react-router-dom';
 import { ChainProvider } from './chain';
 import { api, ApiResponseError } from './api';
 import { ConversationReadinessProvider } from './contexts/ConversationReadinessContext';
@@ -67,7 +72,8 @@ function RouteFallback() {
 type AuthState =
   | { status: 'checking' }
   | { status: 'authenticated' }
-  | { status: 'login_required' };
+  | { status: 'login_required' }
+  | { status: 'failed' };
 
 // Wrapper component to use hooks inside router context
 function AppRoutes() {
@@ -90,14 +96,12 @@ function AppRoutes() {
           {MobileConversationListFixturePage && (
             <Route path="/__qa/mobile-conversation-list" element={<MobileConversationListFixturePage />} />
           )}
-          {/* Share view: minimal layout, no sidebar, no auth required */}
-          <Route path="/s/:token" element={<SharePage />} />
           {/* Main app routes: full layout with sidebar */}
           <Route path="*" element={
             <DesktopLayout>
               <Routes>
                 <Route path="/" element={<ConversationListPage />} />
-                <Route path="/new" element={<NewConversationPage />} />
+                <Route path="/new" element={<NewConversationRoute />} />
                 <Route path="/terminal" element={<TerminalPage />} />
                 <Route path="/c/:slug" element={<ConversationRouteRedirect />} />
                 <Route path="/product-conversations/:slug" element={<ConversationRouteRedirect />} />
@@ -118,7 +122,32 @@ function AppRoutes() {
   );
 }
 
+function NewConversationRoute() {
+  const capabilities = useApplicationCapabilities();
+  if (capabilities.conversation_activation === 'unavailable') {
+    return <main role="status">Conversation creation unavailable. <Link to="/">View persisted conversations</Link></main>;
+  }
+  return <NewConversationPage />;
+}
+
+function PublicShareRoutes() {
+  const [store] = useState(() => new ConversationStore());
+  return (
+    <ConversationContext.Provider value={store}>
+      <Suspense fallback={<RouteFallback />}>
+        <Routes><Route path="/s/:token" element={<SharePage />} /></Routes>
+      </Suspense>
+    </ConversationContext.Provider>
+  );
+}
+
+function ApplicationRouteBoundary() {
+  const location = useLocation();
+  return location.pathname.startsWith('/s/') ? <PublicShareRoutes /> : <OwnerApplication />;
+}
+
 export function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
+  const capabilities = useApplicationCapabilities();
   const navigate = useNavigate();
   const location = useLocation();
   const [fallbackSnapshot, setFallbackSnapshot] = useState<{
@@ -151,8 +180,9 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       return;
     }
     let cancelled = false;
-    api.resolveCoordinatorRoute(reference)
-      .then(async ({ coordinator_id }) => {
+    const snapshotRequest = capabilities.conversation_activation === 'unavailable'
+      ? api.getProductConversationSnapshot(reference, { message_limit: 1 })
+      : api.resolveCoordinatorRoute(reference).then(async ({ coordinator_id }) => {
         if (cancelled) return null;
         if (coordinator_id) {
           if (pinned !== undefined) {
@@ -163,8 +193,8 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
           return null;
         }
         return api.getProductConversationSnapshot(reference, { message_limit: 1 });
-      })
-      .then(async (snapshot) => {
+      });
+    snapshotRequest.then(async (snapshot) => {
         if (!snapshot) return;
         if (!cancelled) {
           if (pinned !== undefined) {
@@ -214,7 +244,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
         }
       });
     return () => { cancelled = true; };
-  }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken]);
+  }, [capabilities.conversation_activation, invalidPin, location.pathname, navigate, pinned, reference, retryToken]);
 
   if (pinError) return <main><div role="alert">{pinError}</div></main>;
 
@@ -259,17 +289,10 @@ function ChainRouteRedirect() {
   return <ProductConversationAliasRedirect reference={rootConvId} />;
 }
 
-function App() {
+function OwnerApplication() {
   const [authState, setAuthState] = useState<AuthState>({ status: 'checking' });
 
   useEffect(() => {
-    // Share pages are auth-exempt -- skip the check entirely so we don't
-    // flash a login screen while the /api/auth/status round-trip resolves.
-    if (window.location.pathname.startsWith('/s/')) {
-      setAuthState({ status: 'authenticated' });
-      return;
-    }
-
     let cancelled = false;
     api.authStatus().then((result) => {
       if (cancelled) return;
@@ -279,9 +302,7 @@ function App() {
         setAuthState({ status: 'authenticated' });
       }
     }).catch(() => {
-      // If we can't reach the server, show the app and let normal error
-      // handling surface the connection issue
-      if (!cancelled) setAuthState({ status: 'authenticated' });
+      if (!cancelled) setAuthState({ status: 'failed' });
     });
     return () => { cancelled = true; };
   }, []);
@@ -294,6 +315,8 @@ function App() {
     return <ThemeProvider>{null}</ThemeProvider>;
   }
 
+  if (authState.status === 'failed') return <main role="alert">Unable to verify authentication.</main>;
+
   if (authState.status === 'login_required') {
     return (
       <ThemeProvider>
@@ -305,17 +328,25 @@ function App() {
   }
 
   return (
+    <ApplicationBootstrap>
+      <ConversationProvider>
+        <ChainProvider>
+          <ConversationReadinessProvider>
+            <AppRoutes />
+          </ConversationReadinessProvider>
+        </ChainProvider>
+      </ConversationProvider>
+    </ApplicationBootstrap>
+  );
+}
+
+function App() {
+  return (
     <ThemeProvider>
       <DensityProvider>
         <BrowserRouter>
           <FocusScopeProvider>
-            <ConversationProvider>
-              <ChainProvider>
-                <ConversationReadinessProvider>
-                  <AppRoutes />
-                </ConversationReadinessProvider>
-              </ChainProvider>
-            </ConversationProvider>
+            <ApplicationRouteBoundary />
           </FocusScopeProvider>
         </BrowserRouter>
       </DensityProvider>

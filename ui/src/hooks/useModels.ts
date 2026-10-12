@@ -1,3 +1,4 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
 import { useEffect, useState } from 'react';
 import type { ModelInfo, CredentialStatus, ModelsResponse } from '../api';
 import { subscribeModels } from '../modelsPoller';
@@ -16,11 +17,13 @@ interface UseModelsReturn {
  * `/api/models` response so they stay consistent.
  */
 export function useModels(): UseModelsReturn {
+  const capabilities = useApplicationCapabilities();
   const [state, setState] = useState<ModelsResponse | null>(null);
 
   useEffect(() => {
+    if (capabilities.provider_catalog === 'unavailable') return;
     return subscribeModels(setState);
-  }, []);
+  }, [capabilities.provider_catalog]);
 
   return {
     models: state?.models ?? [],

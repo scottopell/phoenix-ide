@@ -1,3 +1,4 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
 import { useState, useCallback, useEffect, useRef, type Dispatch } from 'react';
 import * as v from 'valibot';
 import type { SseInitData } from '../api';
@@ -138,7 +139,7 @@ function epochStampedDispatch(
 export type { ConnectionState } from './connectionMachine';
 import {
   ConversationOpenMeasurement,
-  reportConversationOpen,
+  reportConversationOpen as sendConversationOpen,
   type ConversationOpenTelemetryPayload,
 } from './conversationOpenTelemetry';
 
@@ -229,6 +230,11 @@ export function useConnection({
   onValidatedInit,
   onValidatedSteeringQueued,
 }: UseConnectionOptions): ConnectionInfo {
+  const capabilities = useApplicationCapabilities();
+  const liveAvailable = capabilities.live_stream !== 'unavailable' && capabilities.conversation_activation !== 'unavailable';
+  const reportConversationOpen = useCallback((payload: ConversationOpenTelemetryPayload) => {
+    if (capabilities.telemetry !== 'unavailable') sendConversationOpen(payload);
+  }, [capabilities.telemetry]);
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
 
@@ -319,7 +325,7 @@ export function useConnection({
       reportConversationOpen(telemetry);
     }, 0);
     pendingCancellationsRef.current.push({ conversationId, timeout, telemetry });
-  }, []);
+  }, [reportConversationOpen]);
 
   useEffect(() => {
     const flushPendingCancellation = () => {
@@ -335,12 +341,13 @@ export function useConnection({
     };
     window.addEventListener('pagehide', flushPendingCancellation);
     return () => window.removeEventListener('pagehide', flushPendingCancellation);
-  }, []);
+  }, [reportConversationOpen]);
 
   const executeEffects = useCallback((effects: ConnectionEffect[]) => {
     for (const effect of effects) {
       switch (effect.type) {
         case 'OPEN_SSE': {
+          if (!liveAvailable) break;
           const convId = conversationIdRef.current;
           if (!convId) break;
 
@@ -887,7 +894,7 @@ export function useConnection({
         }
       }
     }
-  }, [reportCanceledOpen]);
+  }, [liveAvailable, reportCanceledOpen, reportConversationOpen]);
 
   const executeEffectsRef = useRef(executeEffects);
   useEffect(() => {
@@ -895,6 +902,7 @@ export function useConnection({
   }, [executeEffects]);
 
   useEffect(() => {
+    if (!liveAvailable) return;
     const handleOnline = () => dispatchMachineRef.current({ type: 'BROWSER_ONLINE' });
     const handleOffline = () => dispatchMachineRef.current({ type: 'BROWSER_OFFLINE' });
 
@@ -905,9 +913,10 @@ export function useConnection({
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, []);
+  }, [liveAvailable]);
 
   useEffect(() => {
+    if (!liveAvailable) return;
     const handleVisibility = () => {
       if (document.visibilityState === 'visible' && navigator.onLine) {
         dispatchMachineRef.current({ type: 'BROWSER_ONLINE' });
@@ -915,10 +924,10 @@ export function useConnection({
     };
     document.addEventListener('visibilitychange', handleVisibility);
     return () => document.removeEventListener('visibilitychange', handleVisibility);
-  }, []);
+  }, [liveAvailable]);
 
   useEffect(() => {
-    if (conversationId) {
+    if (conversationId && liveAvailable) {
       // Null the atom's retained `connectionEpoch` from a prior visit so
       // the new generation's first `connection_opened` is accepted (the
       // atom's monotonic guard would otherwise reject a lower epoch from
@@ -932,7 +941,7 @@ export function useConnection({
     return () => {
       dispatchMachineRef.current({ type: 'DISCONNECT', deferCloseForReplay: true });
     };
-  }, [conversationId]);
+  }, [conversationId, liveAvailable]);
 
   // Mirror machine state to the atom's `connectionState` so consumers that
   // only have access to the atom (deeply nested components reading via
@@ -940,6 +949,7 @@ export function useConnection({
   // prop-drilling `connectionInfo`. Stamped with the machine epoch so a
   // stale executor cannot override the current generation's value.
   useEffect(() => {
+    if (!liveAvailable) return;
     const mapped: 'connecting' | 'live' | 'reconnecting' | 'failed' =
       machineState.state === 'connected' || machineState.state === 'reconnected'
         ? 'live'
@@ -953,11 +963,11 @@ export function useConnection({
       state: mapped,
       epoch: machineState.epoch,
     });
-  }, [machineState.state, machineState.epoch]);
+  }, [liveAvailable, machineState.state, machineState.epoch]);
 
   const retryNow = useCallback(() => {
-    dispatchMachineRef.current({ type: 'RETRY_NOW' });
-  }, []);
+    if (liveAvailable) dispatchMachineRef.current({ type: 'RETRY_NOW' });
+  }, [liveAvailable]);
 
   return {
     state: machineState.state,

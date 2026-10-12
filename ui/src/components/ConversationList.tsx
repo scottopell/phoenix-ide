@@ -1,3 +1,4 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
 import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -695,6 +696,8 @@ export function ConversationList({
   emptyScopeLabel,
   footer,
 }: ConversationListProps) {
+  const capabilities = useApplicationCapabilities();
+  const canCreate = capabilities.user_input !== 'unavailable' && capabilities.conversation_activation !== 'unavailable';
   const navigate = useNavigate();
   const { hasActiveScope } = useFocusScope();
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -785,7 +788,7 @@ export function ConversationList({
         },
       }
       : {}),
-    onNew: onNewConversation,
+    ...(canCreate ? { onNew: onNewConversation } : {}),
   });
 
   const handleClick = useCallback((conv: Conversation) => {
@@ -906,7 +909,7 @@ export function ConversationList({
             </div>
           </div>
           <div className="conversation-list-command-cluster">
-            <button
+            {capabilities.conversation_activation !== 'unavailable' && <button
               type="button"
               className="conversation-list-icon-btn conversation-list-coordinator-btn"
               onClick={() => navigate('/global')}
@@ -914,8 +917,8 @@ export function ConversationList({
               aria-label="Open Coordinator"
             >
               <span aria-hidden="true">◎</span>
-            </button>
-            <button
+            </button>}
+            {capabilities.host_resource_observations !== 'unavailable' && <button
               type="button"
               className="conversation-list-icon-btn"
               onClick={() => navigate('/terminal')}
@@ -923,16 +926,16 @@ export function ConversationList({
               aria-label="Open terminal"
             >
               <TerminalGlyph />
-            </button>
+            </button>}
             {utilityActions}
-            <button
+            {canCreate && <button
               id="new-conv-btn"
               className="btn-primary"
               onClick={onNewConversation}
               title="Start new conversation"
             >
               + New
-            </button>
+            </button>}
           </div>
         </div>
       )}

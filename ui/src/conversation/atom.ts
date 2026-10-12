@@ -1,3 +1,4 @@
+import type { PersistedMemberResponse } from '../generated/PersistedMemberResponse';
 import * as v from 'valibot';
 import type { ConversationState, Message, Conversation, QueuedSteeringMessage } from '../api';
 import type { ErrorPresentation } from '../errorPresentation';
@@ -75,6 +76,10 @@ export interface PendingMessagePatchState {
 }
 
 export interface ConversationAtom {
+  observation: { source: 'live' } | (Omit<PersistedMemberResponse, 'messages' | 'transcript_coverage' | 'conversation'> & {
+    conversation: Omit<PersistedMemberResponse['conversation'], 'transcript_generation'>;
+  });
+
   conversationId: string | null;
   conversation: Conversation | null;
   phase: ConversationState;
@@ -167,7 +172,7 @@ export interface ConversationAtom {
    *  the UI can render a connecting/live/reconnecting/failed indicator
    *  without inferring from event timing. Always stamped with the connection
    *  epoch (rejected if stale). */
-  connectionState: 'connecting' | 'live' | 'reconnecting' | 'failed';
+  connectionState: 'unavailable' | 'connecting' | 'live' | 'reconnecting' | 'failed';
   /** Full work-scope resource inventory (bash handles, tmux, browser) for the
    *  scope this conversation resolves to (REQ-WSUI-010). `null` until the
    *  initial `GET /api/work-scope/:scope_key/inventory` fetch or the first
@@ -225,6 +230,8 @@ export interface InitPayload {
 // closing the contamination window where a slug-bound dispatch captured by an
 // in-flight `await api.foo(...)` resolves after the user has navigated away.
 export type SSEAction =
+  | { type: 'persisted_hydrated'; payload: PersistedMemberResponse }
+
   | { type: 'sse_init'; payload: InitPayload; epoch?: number }
   | { type: 'sse_message'; message: Message; sequenceId: number; epoch?: number }
   | {
@@ -401,6 +408,7 @@ export type SSEAction =
 
 export function createInitialAtom(): ConversationAtom {
   return {
+    observation: { source: 'live' },
     conversationId: null,
     conversation: null,
     phase: { type: 'idle' },
@@ -1293,6 +1301,25 @@ export function conversationReducer(
   if (isStaleEpoch(atom, action)) return atom;
 
   switch (action.type) {
+    case 'persisted_hydrated': {
+      const { messages, transcript_coverage, conversation, ...observation } = action.payload;
+      const { transcript_generation, ...member } = conversation;
+      return {
+        ...createInitialAtom(),
+        observation: { ...observation, conversation: member },
+        connectionState: 'unavailable',
+        conversationId: member.id,
+        phase: parseConversationState(member.state),
+        phaseStateUpdatedAt: Number.isFinite(Date.parse(member.state_updated_at)) ? Date.parse(member.state_updated_at) : null,
+        messages: messages.map((message) => ({
+          ...message,
+          content: message.content as Message['content'],
+          display_data: message.display_data as Exclude<Message['display_data'], undefined>,
+        })),
+        transcriptGeneration: transcript_generation,
+        transcriptCoverage: transcript_coverage,
+      };
+    }
     case 'sse_init': {
       const p = action.payload;
 
@@ -1372,6 +1399,8 @@ export function conversationReducer(
           : null;
       let next: ConversationAtom = {
         ...atom,
+        observation: { source: 'live' },
+        connectionState: atom.connectionState === 'unavailable' ? 'connecting' : atom.connectionState,
         conversationId: p.conversation.id,
         conversation: p.conversation,
         phase: p.phase,

@@ -22,6 +22,7 @@ mod local_reveal;
 pub(crate) mod member_initialization;
 pub(crate) mod member_observation;
 pub(crate) mod observation;
+pub(crate) mod persisted_member;
 pub(crate) mod pr_monitoring;
 mod process_sample;
 pub(crate) mod product_conversations;

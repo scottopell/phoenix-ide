@@ -1751,7 +1751,8 @@ pub struct ConversationMetadataUpdate {
     pub archived: Option<bool>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct CachedPrSummary {
     pub number: u64,
     pub title: String,

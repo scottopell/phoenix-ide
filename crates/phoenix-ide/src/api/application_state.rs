@@ -23,6 +23,58 @@ impl From<AppState> for ApplicationState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum CapabilityAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ApplicationCapabilities {
+    pub persisted_member_read: CapabilityAvailability,
+    pub live_stream: CapabilityAvailability,
+    pub conversation_activation: CapabilityAvailability,
+    pub user_input: CapabilityAvailability,
+    pub telemetry: CapabilityAvailability,
+    pub provider_catalog: CapabilityAvailability,
+    pub host_resource_observations: CapabilityAvailability,
+}
+
+impl ApplicationState {
+    fn capabilities(&self) -> ApplicationCapabilities {
+        use CapabilityAvailability::{Available, Unavailable};
+        let live = match self {
+            Self::Live(_) => Available,
+            Self::Observation(_) => Unavailable,
+        };
+        ApplicationCapabilities {
+            persisted_member_read: Available,
+            live_stream: live,
+            conversation_activation: live,
+            user_input: live,
+            telemetry: live,
+            provider_catalog: live,
+            host_resource_observations: live,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl FromRequestParts<ApplicationState> for ApplicationCapabilities {
+    type Rejection = ObservationAccessDenied;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ApplicationState,
+    ) -> Result<Self, Self::Rejection> {
+        ConversationRouteObservations::from_request_parts(parts, state).await?;
+        Ok(state.capabilities())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum ObservationAccessPolicy {
     LoopbackUnauthenticated,

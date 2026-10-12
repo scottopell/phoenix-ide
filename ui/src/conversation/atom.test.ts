@@ -1,3 +1,4 @@
+import { persistedObservationFixture } from '../testing/persistedObservationFixture';
 import { describe, it, expect } from 'vitest';
 import {
   conversationReducer,
@@ -3130,4 +3131,44 @@ it('applies replaceable bash progress without advancing the replay sequence floo
   });
   expect(atom.lastAppliedEventSeq).toBe(5);
   expect(atom.eventGap).toBeNull();
+});
+
+
+describe('persisted observation hydration', () => {
+  it('replaces live ephemeral state while preserving recorded phase, coverage and generation', () => {
+    const live = conversationReducer(createInitialAtom(), { type: 'sse_init', payload: makeInitPayload({ messages: [makeMessage(1)] }) });
+    const dirty: ConversationAtom = { ...live, connectionEpoch: 9, connectionState: 'live', uiError: { type: 'BackendError', message: 'old error' }, streamingBuffer: { text: 'old stream', lastSequence: 8, startedAt: 1, requestId: 'old-request' } };
+    const payload = persistedObservationFixture();
+    const next = conversationReducer(dirty, { type: 'persisted_hydrated', payload });
+    expect(next.observation.source).toBe('persisted');
+    expect(next.conversation).toBeNull();
+    expect(next.conversationId).toBe(payload.conversation.id);
+    expect(next.phase.type).toBe('awaiting_sub_agents');
+    expect(next.phaseStateUpdatedAt).toBe(Date.parse(payload.conversation.state_updated_at));
+    expect(next.messages).toEqual(payload.messages);
+    expect(next.transcriptGeneration).toBe(7);
+    expect(next.transcriptCoverage).toBe('tail');
+    expect(next.connectionState).toBe('unavailable');
+    expect(next.connectionEpoch).toBeNull();
+    expect(next.lastAppliedEventSeq).toBe(0);
+    expect(next.streamingBuffer).toBeNull();
+    expect(next.liveBashProgress).toEqual({});
+    expect(next.steeringMessages).toEqual([]);
+    expect(next.uiError).toBeNull();
+    expect(next.workScope).toBeNull();
+    expect(next.observation).not.toHaveProperty('messages');
+    expect(next.observation).not.toHaveProperty('transcript_coverage');
+    expect(next.observation).not.toHaveProperty('conversation.transcript_generation');
+  });
+
+  it('returns to explicit live ownership on live init without retaining persisted-only metadata', () => {
+    const saved = conversationReducer(createInitialAtom(), { type: 'persisted_hydrated', payload: persistedObservationFixture() });
+    const next = conversationReducer(saved, { type: 'sse_init', payload: makeInitPayload({ messages: [makeMessage(1)], transcriptGeneration: 8, transcriptCoverage: 'complete' }) });
+    expect(next.observation).toEqual({ source: 'live' });
+    expect(next.connectionState).toBe('connecting');
+    expect(next.conversation).toEqual(testConversation);
+    expect(next.messages).toEqual([makeMessage(1)]);
+    expect(next.transcriptCoverage).toBe('complete');
+    expect(next.transcriptGeneration).toBe(8);
+  });
 });

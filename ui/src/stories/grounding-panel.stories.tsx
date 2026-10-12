@@ -1,3 +1,4 @@
+import { LiveApplicationCapabilitiesFixture } from '../fixtures/LiveApplicationCapabilitiesFixture';
 import type { Story } from '@ladle/react';
 import { MemoryRouter } from 'react-router-dom';
 import { ConversationProvider } from '../conversation';
@@ -9,9 +10,9 @@ const storyFor = (id: string): Story => {
   return function GroundingPanelStory() {
     return (
       <MemoryRouter initialEntries={['/c/grounding-panel-fixture']}>
-        <ConversationProvider>
+        <LiveApplicationCapabilitiesFixture><ConversationProvider>
         <GroundingPanelFixture scenario={scenario} showToolbar={false} />
-      </ConversationProvider>
+      </ConversationProvider></LiveApplicationCapabilitiesFixture>
       </MemoryRouter>
     );
   };

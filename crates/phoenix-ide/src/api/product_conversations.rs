@@ -372,11 +372,9 @@ fn admission_phase_view(
 }
 
 pub async fn list_product_conversations(
-    LiveState(state): LiveState,
+    observations: ConversationRouteObservations,
 ) -> Result<Json<ProductConversationListResponse>, AppError> {
-    read_product_conversation_list(&state.db)
-        .await
-        .map(|(view, _timing)| Json(view))
+    observations.list_product_conversations().await.map(Json)
 }
 
 #[derive(Deserialize)]
@@ -442,6 +440,13 @@ pub async fn get_product_conversation(
 pub(crate) async fn read_product_conversation_list(
     db: &crate::db::Database,
 ) -> Result<(ProductConversationListResponse, ReadTiming), AppError> {
+    read_scoped_product_conversation_list(db, None).await
+}
+
+pub(crate) async fn read_scoped_product_conversation_list(
+    db: &crate::db::Database,
+    target: Option<&ProductConversationId>,
+) -> Result<(ProductConversationListResponse, ReadTiming), AppError> {
     let started = std::time::Instant::now();
     let projections = db
         .list_ordinary_product_conversation_projections()
@@ -449,7 +454,13 @@ pub(crate) async fn read_product_conversation_list(
         .map_err(db_to_app)?;
     let db_ms = started.elapsed().as_secs_f64() * 1000.0;
     let started = std::time::Instant::now();
-    let rows = projections.iter().map(list_row).collect();
+    let rows = projections
+        .iter()
+        .filter(|projection| {
+            target.is_none_or(|target| &projection.product_conversation_id == target)
+        })
+        .map(list_row)
+        .collect();
     Ok((
         ProductConversationListResponse {
             product_conversations: rows,

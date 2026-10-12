@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { useEffect, useRef } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '../testing/renderWithCapabilities';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { ConversationPage } from './ConversationPage';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';

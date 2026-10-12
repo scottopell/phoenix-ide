@@ -244,6 +244,11 @@ pub fn create_router(state: impl Into<ApplicationState>) -> Router {
         )
         .route("/api/conversations/:id/slug", get(get_conversation_slug))
         .route("/api/conversations/:id/route", get(get_conversation_route))
+        .route("/api/capabilities", get(get_capabilities))
+        .route(
+            "/api/conversations/:id/observation",
+            get(get_persisted_member),
+        )
         .route(
             "/api/conversations/:id/messages/latest",
             get(get_conversation_messages_latest),
@@ -3389,6 +3394,23 @@ async fn get_conversation_route(
     Path(id): Path<String>,
 ) -> Result<Json<ConversationRouteResponse>, AppError> {
     observations.get_conversation_route(&id).await.map(Json)
+}
+
+async fn get_capabilities(
+    capabilities: super::application_state::ApplicationCapabilities,
+) -> Json<super::application_state::ApplicationCapabilities> {
+    Json(capabilities)
+}
+
+async fn get_persisted_member(
+    observations: ConversationRouteObservations,
+    Path(id): Path<String>,
+    Query(query): Query<super::persisted_member::PersistedMemberQuery>,
+) -> Result<Json<super::persisted_member::PersistedMemberResponse>, AppError> {
+    observations
+        .get_persisted_member(&id, query)
+        .await
+        .map(Json)
 }
 
 async fn get_product_conversation_route(

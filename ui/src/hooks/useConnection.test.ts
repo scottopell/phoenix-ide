@@ -12,7 +12,7 @@
 // events synthetically, and assert what landed in the atom.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { renderHook, act } from '@testing-library/react';
+import { renderHook, act } from '../testing/renderWithCapabilities';
 import { StrictMode } from 'react';
 import { useConnection } from './useConnection';
 import type { SSEAction } from '../conversation/atom';

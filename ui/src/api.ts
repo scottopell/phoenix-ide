@@ -1,3 +1,6 @@
+import { ApplicationCapabilitiesSchema, PersistedMemberResponseSchema } from './observationSchemas';
+import type { ApplicationCapabilities } from './generated/ApplicationCapabilities';
+import type { PersistedMemberResponse } from './generated/PersistedMemberResponse';
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
@@ -1344,6 +1347,18 @@ export interface ActiveCoordinatorWatch {
 }
 
 export const api = {
+  async getCapabilities(): Promise<ApplicationCapabilities> {
+    const response = await fetch('/api/capabilities');
+    if (!response.ok) throw new ApiResponseError('Failed to load application capabilities', response.status);
+    return v.parse(ApplicationCapabilitiesSchema, await response.json());
+  },
+
+  async getPersistedMember(reference: string, signal?: AbortSignal): Promise<PersistedMemberResponse> {
+    const response = await fetch(`/api/conversations/${encodeURIComponent(reference)}/observation`, { ...(signal ? { signal } : {}) });
+    if (!response.ok) throw new ApiResponseError('Failed to load persisted conversation', response.status);
+    return v.parse(PersistedMemberResponseSchema, await response.json());
+  },
+
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
     if (!resp.ok) throw new Error('Failed to check auth status');

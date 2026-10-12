@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '../testing/renderWithCapabilities';
 import { MemoryRouter } from 'react-router-dom';
 import { NewConversationPage } from './NewConversationPage';
 import { recoveryDiscoveryDelay } from './recoveryPolling';

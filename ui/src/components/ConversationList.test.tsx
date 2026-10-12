@@ -5,7 +5,7 @@
 // CHN-Sidebar: chain grouping render (REQ-CHN-002, task 02690 Phase 5)
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, fireEvent, within, act, waitFor } from '@testing-library/react';
+import { render, fireEvent, within, act, waitFor } from '../testing/renderWithCapabilities';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { FocusScopeProvider } from '../hooks/useFocusScope';

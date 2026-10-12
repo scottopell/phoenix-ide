@@ -7,7 +7,7 @@ use nix::{
 use phoenix_db::{ContinueOutcome, ConvState, Database};
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -259,11 +259,24 @@ impl Fixture {
                 "untouched"
             );
         }
-        assert_eq!(
-            sentinel.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock,
-            "provider or host discovery connected to sentinel"
-        );
+        match sentinel.accept() {
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+            Ok((mut stream, peer)) => {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                let mut prefix = [0_u8; 512];
+                let request = match stream.read(&mut prefix) {
+                    Ok(length) => String::from_utf8_lossy(&prefix[..length]).into_owned(),
+                    Err(error) => format!("request prefix unavailable: {error}"),
+                };
+                panic!(
+                    "unexpected sentinel connection: local={} peer={peer} fixture={} request={request:?}; host loopback traffic is not child-attributed",
+                    sentinel.local_addr().unwrap(), self.path.display()
+                );
+            }
+        }
     }
 }
 
@@ -330,6 +343,7 @@ impl Server {
                 Instant::now() < deadline,
                 "observation shutdown was not bounded"
             );
+            // test-timing-allow: Child exposes try_wait, not an exit notification; status is the oracle and the deadline only bounds liveness.
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -475,10 +489,77 @@ async fn normal_executable_observation_scopes_reads_and_never_constructs_live_se
             "{reference}"
         );
     }
+    let capabilities = client
+        .get(format!("{url}/api/capabilities"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(capabilities.status(), 200);
+    assert_eq!(
+        capabilities.json::<Value>().await.unwrap(),
+        json!({
+            "persisted_member_read": "available", "live_stream": "unavailable",
+            "conversation_activation": "unavailable", "user_input": "unavailable",
+            "telemetry": "unavailable", "provider_catalog": "unavailable",
+            "host_resource_observations": "unavailable",
+        })
+    );
+    for id in ["a-root", fixture.successor.as_str()] {
+        let response = client
+            .get(format!("{url}/api/conversations/{id}/observation"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.json::<Value>().await.unwrap();
+        assert_eq!(body["source"], "persisted");
+        assert_eq!(body["conversation"]["id"], id);
+        assert_eq!(body["messages"][0]["message_id"], format!("{id}-message"));
+        assert_eq!(body["transcript_coverage"], "complete");
+        assert_eq!(
+            body["server_message_tail"],
+            body["messages"][0]["sequence_id"]
+        );
+        assert_eq!(body["live_process"], json!({"availability": "unavailable"}));
+    }
+    for id in [
+        "other",
+        "child",
+        "0-disconnected",
+        fixture.coordinator.as_str(),
+    ] {
+        assert_eq!(
+            client
+                .get(format!("{url}/api/conversations/{id}/observation"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+    }
+    fixture.assert_isolated(&sentinel);
+    let response = client
+        .get(format!("{url}/api/product-conversations"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let listed = response.json::<Value>().await.unwrap();
+    let rows = listed["product_conversations"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["product_conversation_id"], fixture.product);
+    assert_eq!(
+        rows[0]["canonical_route"],
+        format!("/c/{}", fixture.product)
+    );
+    assert_eq!(rows[0]["canonical_root"]["transcript_row_id"], "a-root");
+    assert_eq!(rows[0]["latest_transcript_row_id"], fixture.successor);
+    assert_eq!(rows[0]["lifecycle"]["state"], "open");
+    fixture.assert_isolated(&sentinel);
     for path in [
         "/api/models",
         "/api/conversations",
-        "/api/product-conversations",
         "/api/conversations/a-root/stream",
     ] {
         let response = client.get(format!("{url}{path}")).send().await.unwrap();
@@ -510,6 +591,7 @@ async fn normal_executable_observation_scopes_reads_and_never_constructs_live_se
         "/assets/index.js",
         "/api/conversations/a-root/route",
         "/api/product-conversations/a-root",
+        "/api/product-conversations",
     ] {
         for header in ["forwarded", "x-forwarded-for"] {
             assert_eq!(
@@ -569,6 +651,7 @@ async fn observation_startup_errors_do_not_log_migrate_or_fall_back_to_live() {
                     break;
                 }
                 assert!(Instant::now() < deadline, "failed startup did not exit");
+                // test-timing-allow: Child exposes try_wait, not an exit notification; status is the oracle and the deadline only bounds liveness.
                 std::thread::sleep(Duration::from_millis(20));
             }
             fixture.assert_isolated(&sentinel);

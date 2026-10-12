@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '../../testing/renderWithCapabilities';
 import { api } from '../../api';
 import { InlineReactionStore } from '../../conversation/InlineReactionStore';
 import { ProductConversationFixture } from './renderFixture';

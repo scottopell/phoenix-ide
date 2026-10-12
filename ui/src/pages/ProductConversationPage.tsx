@@ -1,3 +1,4 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
@@ -28,6 +29,7 @@ import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { useConnection } from '../hooks/useConnection';
 import type { SSEAction } from '../conversation/atom';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
+import { PersistedConversationOwner } from './PersistedConversationOwner';
 import {
   getProductConversationSnapshotChangeSequence,
   getProductConversationDeleteSequence,
@@ -712,6 +714,7 @@ function ProductConversationHeader({
   messages: Message[];
   recallDisabled: boolean;
 }) {
+  const capabilities = useApplicationCapabilities();
   const source = snapshot.source;
   return (
     <header className="product-conversation-page__header">
@@ -741,9 +744,9 @@ function ProductConversationHeader({
             disabled={recallDisabled}
           />
         )}
-        <AutomaticContinuationControl
+        {capabilities.conversation_activation !== 'unavailable' && capabilities.user_input !== 'unavailable' && <AutomaticContinuationControl
           scope={{ kind: 'ordinary', reference: snapshot.product_conversation_id }}
-        />
+        />}
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
             <summary>Work</summary>
@@ -756,13 +759,21 @@ function ProductConversationHeader({
 }
 
 export function ProductConversationPage({ productId }: { productId?: string | undefined } = {}) {
-  return <ProductConversationPageInner productId={productId} />;
+  const capabilities = useApplicationCapabilities();
+  return capabilities.host_resource_observations === 'available' && capabilities.live_stream === 'available'
+    ? <ProductConversationWithViewer productId={productId} />
+    : <ProductConversationPageInner productId={productId} viewerSlot={null} />;
 }
 
-function ProductConversationPageInner({ productId }: { productId?: string | undefined }) {
+function ProductConversationWithViewer({ productId }: { productId?: string | undefined }) {
+  const viewerSlot = useViewerSlot();
+  return <ProductConversationPageInner productId={productId} viewerSlot={viewerSlot} />;
+}
+
+function ProductConversationPageInner({ productId, viewerSlot }: { productId?: string | undefined; viewerSlot: ReturnType<typeof useViewerSlot> | null }) {
+  const capabilities = useApplicationCapabilities();
   const params = useParams<{ productConversationId: string }>();
   const productConversationId = productId ?? params.productConversationId;
-  const viewerSlot = useViewerSlot();
   const location = useLocation();
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
@@ -812,14 +823,14 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     () => snapshot ? makeAggregateMessages(snapshot, currentLatestProjection) : [],
     [currentLatestProjection, snapshot],
   );
-  const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
+  const aggregateMessageSlot = viewerSlot?.slot.kind === 'message' ? viewerSlot.slot : null;
   const isWideDesktop = useIsWideDesktop();
   const showSplitPaneViewer = isWideDesktop && aggregateMessageSlot?.presentation === 'pane';
-  const closeAggregateMessageViewer = viewerSlot.close;
+  const closeAggregateMessageViewer = viewerSlot?.close;
   const appendAggregateReviewNotes = useCallback((formattedNotes: string) => {
     currentLatestProjection?.appendReviewNotesToComposer?.(formattedNotes);
     if (!(isWideDesktop && aggregateMessageSlot?.presentation === 'fullscreen')) {
-      closeAggregateMessageViewer();
+      closeAggregateMessageViewer?.();
     }
   }, [aggregateMessageSlot?.presentation, closeAggregateMessageViewer, currentLatestProjection, isWideDesktop]);
   ownedSnapshotRef.current = ownedSnapshot;
@@ -1047,6 +1058,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
   }, [currentLatestProjection, snapshot?.ordinary_lifecycle]);
 
   useEffect(() => {
+    if (!viewerSlot) return;
     const handler = (event: Event) => {
       const { sequenceId, messageId, occurrenceToken, presentation } = (event as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
       if (!Number.isSafeInteger(sequenceId) || sequenceId <= 0) return;
@@ -1145,13 +1157,14 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     }
     : { kind: 'idle' as const, view: transcriptView });
   const isOpen = snapshot?.ordinary_lifecycle === 'open';
-  const liveControlsEnabled = isOpen && !closeInProgress;
+  const liveControlsEnabled = isOpen && !closeInProgress && capabilities.user_input !== 'unavailable' && capabilities.conversation_activation !== 'unavailable';
   const initialSnapshotReady = snapshot !== null;
 
   useEffect(() => {
     const measurement = openMeasurementRef.current;
     if (
-      !measurement
+      capabilities.telemetry === 'unavailable'
+      || !measurement
       || measurement.reported
       || measurement.snapshotReceivedAt === undefined
       || !initialSnapshotReady
@@ -1173,7 +1186,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
       cancelAnimationFrame(paintFrame);
       cancelAnimationFrame(reportFrame);
     };
-  }, [initialSnapshotReady, openSnapshotGeneration, productConversationId]);
+  }, [capabilities.telemetry, initialSnapshotReady, openSnapshotGeneration, productConversationId]);
 
   useEffect(() => {
     if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder || olderError) return;
@@ -1214,6 +1227,11 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
       className={`product-conversation-page${showSplitPaneViewer ? ' product-conversation-page--split-pane' : ''}`}
       data-testid="product-conversation-page"
     >
+      {(capabilities.live_stream === 'unavailable' || capabilities.conversation_activation === 'unavailable') && (
+        snapshot.latest_transcript_row_id
+          ? <PersistedConversationOwner key={snapshot.latest_transcript_row_id} slug={snapshot.latest_transcript_row_id} showTranscript={false} />
+          : <div role="status">Persisted content · live connection unavailable. No current member is recorded.</div>
+      )}
       <ProductConversationHeader
         snapshot={snapshot}
         productConversationId={snapshot.product_conversation_id}
@@ -1257,13 +1275,14 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
           messages={messages}
           pendingMessages={currentLatestProjection?.pendingMessages ?? []}
           convState={convState}
+          transcriptMode={capabilities.live_stream === 'unavailable' || capabilities.conversation_activation === 'unavailable' ? 'persisted' : 'live'}
           onRetry={liveControlsEnabled ? currentLatestProjection?.onRetryPending ?? (() => {}) : () => {}}
           onCancelSteering={liveControlsEnabled ? currentLatestProjection?.onCancelSteering : undefined}
           onOpenFile={currentLatestProjection?.onOpenFile}
           filePathRootDir={currentLatestProjection?.filePathRootDir}
           systemPrompt={currentLatestProjection?.systemPrompt}
-          enableMessageSidepanel
-          enableMessageFullscreen
+          enableMessageSidepanel={viewerSlot !== null}
+          enableMessageFullscreen={viewerSlot !== null}
           reactionScopeKey={snapshot.product_conversation_id}
           reactionDestination={liveControlsEnabled && currentLatestProjection?.appendInlineReactionToComposer
             ? { append: currentLatestProjection.appendInlineReactionToComposer }
@@ -1283,7 +1302,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
-      {isOpen && !closeIncomplete && snapshot.latest_transcript_row_id && (
+      {capabilities.live_stream === 'available' && capabilities.conversation_activation === 'available' && isOpen && !closeIncomplete && snapshot.latest_transcript_row_id && (
         <div
           className="product-conversation-page__composer"
           data-testid="product-conversation-composer"
@@ -1302,7 +1321,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
           />
         </div>
       )}
-      {closeNeedsLiveUpdateOwner && snapshot.latest_transcript_row_id && (
+      {capabilities.live_stream !== 'unavailable' && capabilities.conversation_activation !== 'unavailable' && closeNeedsLiveUpdateOwner && snapshot.latest_transcript_row_id && (
         <div data-testid="product-conversation-close-live-update-owner" hidden>
           <CloseLiveUpdateOwner conversationId={snapshot.latest_transcript_row_id} />
         </div>
@@ -1322,13 +1341,13 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
                 messageId={aggregateMessageSlot.messageId}
                 occurrenceToken={aggregateMessageSlot.occurrenceToken}
                 messages={aggregateMessages}
-                onClose={closeAggregateMessageViewer}
+                onClose={viewerSlot!.close}
                 onSendNotes={liveControlsEnabled && currentLatestProjection?.appendReviewNotesToComposer
                   ? appendAggregateReviewNotes
                   : undefined}
                 presentation={aggregateMessageSlot.presentation}
                 canTogglePresentation={isWideDesktop}
-                onPresentationChange={viewerSlot.setPresentation}
+                onPresentationChange={viewerSlot!.setPresentation}
                 inline={showSplitPaneViewer}
               />
             </div>

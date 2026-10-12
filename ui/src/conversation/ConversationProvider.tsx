@@ -1,3 +1,4 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
 import { useRef } from 'react';
 import { ConversationStore } from './ConversationStore';
 import { ConversationContext } from './ConversationContext';
@@ -18,6 +19,7 @@ import { useConversationsRefreshDriver } from './useConversationsRefresh';
  * whole-snapshot subscriptions.
  */
 export function ConversationProvider({ children }: { children: React.ReactNode }) {
+  const capabilities = useApplicationCapabilities();
   // Single store instances for the app. Refs are fine here because the stores
   // are mutable externally and subscriptions run through `useSyncExternalStore`.
   const storeRef = useRef<ConversationStore | null>(null);
@@ -35,7 +37,7 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
     <ConversationContext.Provider value={storeRef.current}>
       <DraftContext.Provider value={draftStoreRef.current}>
         <InlineReactionContext.Provider value={reactionStoreRef.current}>
-          <ConversationsRefreshDriver />
+          {capabilities.conversation_activation !== 'unavailable' && <ConversationsRefreshDriver />}
           {children}
         </InlineReactionContext.Provider>
       </DraftContext.Provider>

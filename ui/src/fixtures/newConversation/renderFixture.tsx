@@ -1,3 +1,4 @@
+import { LiveApplicationCapabilitiesFixture } from '../LiveApplicationCapabilitiesFixture';
 import { useEffect, useRef, useState } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { ConversationProvider } from '../../conversation';
@@ -95,9 +96,9 @@ export function NewConversationFixture({ scenario }: Props) {
   if (!installed) return null;
   return (
     <MemoryRouter initialEntries={['/new']}>
-      <ConversationProvider>
+      <LiveApplicationCapabilitiesFixture><ConversationProvider>
         <NewConversationFixtureBody scenario={scenario} />
-      </ConversationProvider>
+      </ConversationProvider></LiveApplicationCapabilitiesFixture>
     </MemoryRouter>
   );
 }

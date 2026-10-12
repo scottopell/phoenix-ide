@@ -7,7 +7,7 @@
 // the wrong conversation.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, act, waitFor } from '@testing-library/react';
+import { render, act, waitFor } from '../testing/renderWithCapabilities';
 import { useContext } from 'react';
 import {
   ConversationProvider,

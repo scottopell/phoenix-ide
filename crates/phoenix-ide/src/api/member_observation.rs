@@ -23,17 +23,50 @@ impl PersistedMemberObservations {
         conv: &crate::db::Conversation,
         process: MemberProcessObservations,
     ) -> crate::runtime::EnrichedConversation {
-        let mut enriched = project_member(
-            conv,
-            process.shell,
-            process.home_dir,
-            process.terminal_uses_tmux,
-            process.browser_session_active,
-        );
-        enriched.seed_parent_slug = self.seed_parent_slug;
-        enriched.parent_conversation_slug = self.parent_conversation_slug;
-        enriched.cached_pr = self.cached_pr;
-        enriched
+        project_live_member(conv, self.metadata(conv), process)
+    }
+}
+
+impl PersistedMemberObservations {
+    fn metadata(
+        self,
+        conv: &crate::db::Conversation,
+    ) -> super::persisted_member::PersistedMemberMetadata {
+        let mut metadata = persisted_member_metadata(conv);
+        metadata.seed_parent_slug = self.seed_parent_slug;
+        metadata.parent_conversation_slug = self.parent_conversation_slug;
+        metadata.cached_pr = self.cached_pr;
+        metadata
+    }
+
+    pub(crate) fn project_persisted(
+        self,
+        conv: &crate::db::Conversation,
+    ) -> super::persisted_member::PersistedMember {
+        super::persisted_member::PersistedMember {
+            id: conv.id.clone(),
+            slug: conv.slug.clone(),
+            title: conv.title.clone(),
+            cwd: conv.cwd.clone(),
+            parent_conversation_id: conv.parent_conversation_id.clone(),
+            user_initiated: conv.user_initiated,
+            state: crate::runtime::public_conversation_state(&conv.state),
+            state_updated_at: conv.state_updated_at,
+            created_at: conv.created_at,
+            updated_at: conv.updated_at,
+            archived: conv.archived,
+            model: conv.model.clone(),
+            effort: conv.effort,
+            service_tier: conv.service_tier,
+            project_id: conv.project_id.clone(),
+            message_count: conv.message_count,
+            transcript_generation: conv.transcript_generation,
+            seed_parent_id: conv.seed_parent_id.clone(),
+            seed_label: conv.seed_label.clone(),
+            continued_in_conv_id: conv.continued_in_conv_id.clone(),
+            chain_name: conv.chain_name.clone(),
+            metadata: self.metadata(conv),
+        }
     }
 }
 
@@ -107,17 +140,22 @@ pub(super) fn project_list_member(
     home_dir: String,
     terminal_uses_tmux: bool,
 ) -> crate::runtime::EnrichedConversation {
-    project_member(conv, shell, home_dir, terminal_uses_tmux, false)
+    project_live_member(
+        conv,
+        persisted_member_metadata(conv),
+        MemberProcessObservations {
+            shell,
+            home_dir,
+            terminal_uses_tmux,
+            browser_session_active: false,
+        },
+    )
 }
 
-fn project_member(
+fn persisted_member_metadata(
     conv: &crate::db::Conversation,
-    shell: Option<String>,
-    home_dir: String,
-    terminal_uses_tmux: bool,
-    browser_session_active: bool,
-) -> crate::runtime::EnrichedConversation {
-    crate::runtime::EnrichedConversation {
+) -> super::persisted_member::PersistedMemberMetadata {
+    super::persisted_member::PersistedMemberMetadata {
         conv_mode_label: conv.conv_mode.label().to_string(),
         branch_name: conv.conv_mode.branch_name().map(String::from),
         worktree_path: conv
@@ -131,19 +169,54 @@ fn project_member(
             .filter(|s| !s.is_empty() && !s.starts_with("__LEGACY"))
             .map(String::from),
         task_title: conv.conv_mode.task_title().map(String::from),
-        shell,
-        home_dir: Some(home_dir),
         seed_parent_slug: None,
         parent_conversation_slug: None,
-        browser_session_active,
-        terminal_uses_tmux,
         work_scope_key: conversation_resource_scope(conv).stable_key(),
+        cached_pr: None,
+    }
+}
+fn project_live_member(
+    conv: &crate::db::Conversation,
+    metadata: super::persisted_member::PersistedMemberMetadata,
+    process: MemberProcessObservations,
+) -> crate::runtime::EnrichedConversation {
+    let super::persisted_member::PersistedMemberMetadata {
+        conv_mode_label,
+        branch_name,
+        worktree_path,
+        base_branch,
+        task_title,
+        work_scope_key,
+        seed_parent_slug,
+        parent_conversation_slug,
+        cached_pr,
+    } = metadata;
+    let MemberProcessObservations {
+        shell,
+        home_dir,
+        terminal_uses_tmux,
+        browser_session_active,
+    } = process;
+    crate::runtime::EnrichedConversation {
+        conv_mode_label,
+        branch_name,
+        worktree_path,
+        base_branch,
+        task_title,
+        work_scope_key,
+        seed_parent_slug,
+        parent_conversation_slug,
+        cached_pr,
+        shell,
+        home_dir: Some(home_dir),
+        terminal_uses_tmux,
+        browser_session_active,
         creation_prompt: None,
         creation_error: None,
-        cached_pr: None,
         inner: crate::runtime::PresentationConversation(conv.clone()),
     }
 }
+
 pub(super) fn conversation_resource_scope(
     conv: &crate::db::Conversation,
 ) -> crate::work_scope::ResourceScopeKey {
@@ -275,6 +348,33 @@ mod tests {
                     .project(&conv, normal_process());
                 let actual = serde_json::to_value(&projected).unwrap();
                 assert_eq!(actual, expected);
+                let persisted = serde_json::to_value(
+                    service
+                        .read(&conv, true)
+                        .await
+                        .unwrap()
+                        .project_persisted(&conv),
+                )
+                .unwrap();
+                for (key, value) in persisted.as_object().unwrap() {
+                    assert_eq!(
+                        actual.get(key).unwrap_or(&serde_json::Value::Null),
+                        value,
+                        "persisted public field {key}"
+                    );
+                }
+                for field in [
+                    "browser_session_active",
+                    "terminal_uses_tmux",
+                    "shell",
+                    "home_dir",
+                    "product_conversation_id",
+                ] {
+                    assert!(
+                        persisted.get(field).is_none(),
+                        "not persisted metadata: {field}"
+                    );
+                }
                 assert_eq!(
                     actual["state"],
                     crate::runtime::public_conversation_state(state)
@@ -443,6 +543,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(included["cached_pr"], expected);
+        let persisted = serde_json::to_value(
+            service
+                .read(&conv, true)
+                .await
+                .unwrap()
+                .project_persisted(&conv),
+        )
+        .unwrap();
+        assert_eq!(persisted["cached_pr"], expected);
         let excluded = serde_json::to_value(
             service
                 .read(&conv, false)

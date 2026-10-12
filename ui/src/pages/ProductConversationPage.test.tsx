@@ -1,5 +1,8 @@
+import { ApplicationCapabilitiesContext } from '../contexts/ApplicationCapabilitiesContext';
+import { persistedCapabilities, persistedObservationFixture } from '../testing/persistedObservationFixture';
+import { ConversationProvider } from '../conversation/ConversationProvider';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '../testing/renderWithCapabilities';
 import { StrictMode, useEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
@@ -428,6 +431,27 @@ describe('ProductConversationPage', () => {
       refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-01-01T00:00:00Z' },
       work_change: { kind: 'clean' },
     });
+  });
+
+  it('renders an observation-only aggregate without mounting a live owner, viewer provider, or composer', async () => {
+    const { api } = await import('../api');
+    const getPersistedMember = vi.spyOn(api, 'getPersistedMember').mockResolvedValue(persistedObservationFixture());
+    render(<ApplicationCapabilitiesContext.Provider value={persistedCapabilities}>
+      <ConversationProvider><MemoryRouter><ProductConversationPage productId="pc-1" /></MemoryRouter></ConversationProvider>
+    </ApplicationCapabilitiesContext.Provider>);
+    await waitForPageReady();
+    expect(await screen.findByTestId('persisted-conversation-owner')).toHaveTextContent('Persisted content · live connection unavailable');
+    expect(getPersistedMember).toHaveBeenCalled();
+    expect(screen.getByTestId('persisted-conversation-owner')).not.toHaveClass('view');
+    expect(api.getPrStatus).not.toHaveBeenCalled();
+    expect(conversationNavStackSpy.mock.lastCall?.[0]).toMatchObject({ transcriptMode: 'persisted', enableMessageSidepanel: false, enableMessageFullscreen: false });
+    expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
+    expect(FakeCloseEventSource.instances).toHaveLength(0);
+    expect(screen.queryByTestId('product-conversation-composer')).toBeNull();
+    expect(screen.queryByTestId('automatic-continuation-control')).toBeNull();
+    expect(api.getProductConversationAutomaticContinuation).not.toHaveBeenCalled();
+    expect(api.reportProductConversationOpen).not.toHaveBeenCalled();
+    expect(chainStream.subscribe).not.toHaveBeenCalled();
   });
 
   it('shows the aggregate automatic-continuation control on an ordinary ProductConversation', async () => {

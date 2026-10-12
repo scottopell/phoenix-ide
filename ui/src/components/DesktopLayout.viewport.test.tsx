@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { render } from '@testing-library/react';
+import { render } from '../testing/renderWithCapabilities';
 import { describe, expect, it } from 'vitest';
 import {
   isViewportOwnedRoute,

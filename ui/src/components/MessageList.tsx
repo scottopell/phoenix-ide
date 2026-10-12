@@ -173,6 +173,7 @@ const MessageSquareIcon = () => (
 );
 
 interface MessageListProps {
+  transcriptMode?: 'live' | 'persisted';
   sourceCallTarget?: { messageId: string; toolUseId: string } | null;
   messages: Message[];
   pendingMessages: PendingUserMessage[];
@@ -552,6 +553,7 @@ function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (
 }
 
 function MessageListImpl({
+  transcriptMode = 'live',
   sourceCallTarget,
   messages,
   pendingMessages,
@@ -641,7 +643,7 @@ function MessageListImpl({
   );
   previousFirstHistoricalKeyRef.current = historicalUnits[0]?.key ?? null;
   const tailUnits = useMemo(
-    () => buildTailUnits({
+    () => transcriptMode === 'persisted' ? [] : buildTailUnits({
       convState,
       streamingHandle,
       endsInAgentRun,
@@ -649,7 +651,7 @@ function MessageListImpl({
         historicalUnits.flatMap((unit) => agentTurnsInHistoricalUnit(unit).map((member) => member.key)),
       ),
     }),
-    [convState, streamingHandle, endsInAgentRun, historicalUnits],
+    [transcriptMode, convState, streamingHandle, endsInAgentRun, historicalUnits],
   );
 
   const allUnits = useMemo<RenderUnit[]>(
@@ -846,7 +848,7 @@ function MessageListImpl({
   }, [chapters]);
 
   const isEmpty = allUnits.length === 0;
-  const activeToolUseId = activeToolUseIdFromState(convState);
+  const activeToolUseId = transcriptMode === 'persisted' ? undefined : activeToolUseIdFromState(convState);
 
   const detachGestureListenersRef = useRef<(() => void) | null>(null);
   const settleSnapRafRef = useRef(0);

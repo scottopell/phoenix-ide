@@ -1,3 +1,5 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
+import { PersistedConversationOwner } from './PersistedConversationOwner';
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
@@ -222,7 +224,15 @@ export function ConversationPage({ routePrefix = '/c', composerQuickAction, stat
     : null;
 }
 
-export function EmbeddedConversationPage({
+export function EmbeddedConversationPage(props: EmbeddedConversationPageProps) {
+  const capabilities = useApplicationCapabilities();
+  if (capabilities.conversation_activation === 'unavailable' || capabilities.live_stream === 'unavailable') {
+    return <PersistedConversationOwner slug={props.slug} showTranscript={props.showTranscript ?? true} />;
+  }
+  return <LiveEmbeddedConversationPage {...props} mutationEnabled={props.mutationEnabled !== false && capabilities.user_input !== 'unavailable'} />;
+}
+
+function LiveEmbeddedConversationPage({
   slug,
   routePrefix = '/c',
   composerQuickAction,

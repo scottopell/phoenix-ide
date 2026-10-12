@@ -1,3 +1,4 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilitiesContext';
 import { useState, useEffect, useCallback, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ApiResponseError, ConflictError, api } from '../api';
@@ -51,6 +52,44 @@ function projectProductConversationHistory(
 }
 
 export function ConversationListPage() {
+  const capabilities = useApplicationCapabilities();
+  return capabilities.conversation_activation === 'unavailable'
+    ? <PersistedConversationListOwner />
+    : <LiveConversationListPage />;
+}
+
+function PersistedConversationListOwner() {
+  const navigate = useNavigate();
+  const isDesktop = useIsDesktop();
+  const [rows, setRows] = useState<ProductConversationListRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+    api.listProductConversations(controller.signal).then((response) => {
+      if (!cancelled) { setRows(response.product_conversations); setError(null); }
+    }).catch((reason: unknown) => {
+      if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
+    });
+    return () => { cancelled = true; controller.abort(); };
+  }, [revision]);
+  return <main>
+    <div role="status">Persisted conversations · live activation unavailable.</div>
+    {error && <div role="alert">{error}<button type="button" onClick={() => setRevision((value) => value + 1)}>Retry</button></div>}
+    {rows ? <ConversationList
+      productConversations={rows.filter((row) => row.lifecycle.state === 'open')}
+      archivedProductConversations={rows.filter((row) => row.lifecycle.state === 'history')}
+      productRowsAuthoritative showArchived={showArchived} onToggleArchived={() => setShowArchived((value) => !value)}
+      onNewConversation={() => navigate('/new')} onArchive={() => {}} onDelete={() => {}}
+      onProductConversationClick={(row) => navigate(row.canonical_route)}
+      listDensity={isDesktop ? 'full' : 'mobile'}
+    /> : !error && <ConversationListSkeleton count={5} />}
+  </main>;
+}
+
+function LiveConversationListPage() {
   const navigate = useNavigate();
   const isDesktop = useIsDesktop();
   const { theme, toggleTheme } = useTheme();

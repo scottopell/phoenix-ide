@@ -6,7 +6,9 @@
 // the "no managed work scope" empty state.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen } from '../testing/renderWithCapabilities';
+import { ApplicationCapabilitiesContext } from '../contexts/ApplicationCapabilitiesContext';
+import { persistedCapabilities } from '../testing/persistedObservationFixture';
 import type { ChainWorkIdentity, PrStatusResponse } from '../api';
 import type { ConversationPrStatusState } from '../hooks/useConversationPrStatus';
 import { ChainWorkIdentityBlock } from './ChainWorkIdentityBlock';
@@ -38,6 +40,14 @@ beforeEach(() => {
 });
 
 describe('ChainWorkIdentityBlock', () => {
+  it('retains persisted work identity without requesting unavailable host PR observations', () => {
+    render(<ApplicationCapabilitiesContext.Provider value={persistedCapabilities}>
+      <ChainWorkIdentityBlock identity={WORK_IDENTITY} />
+    </ApplicationCapabilitiesContext.Provider>);
+    expect(screen.getByText('/wt/auth')).toBeInTheDocument();
+    expect(mockUsePrStatus).toHaveBeenCalledWith({ conversationId: null, convModeLabel: 'Work', branchName: 'feat-auth' });
+  });
+
   it('renders worktree / branch / task for a managed chain', () => {
     render(<ChainWorkIdentityBlock identity={WORK_IDENTITY} />);
 

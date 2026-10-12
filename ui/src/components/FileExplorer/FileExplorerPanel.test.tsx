@@ -3,7 +3,7 @@
 // of remounting both sections from defaults.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '../../testing/renderWithCapabilities';
 import { MemoryRouter } from 'react-router-dom';
 import { FileExplorerPanel } from './FileExplorerPanel';
 import { FileExplorerProvider } from './FileExplorerContext';
