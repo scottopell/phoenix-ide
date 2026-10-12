@@ -23,13 +23,14 @@ vi.mock('../hooks/useFloatingNavStack', () => ({ useFloatingNavStack: () => {} }
 describe('source locator decoding', () => {
   it('retires the pending older-page anchor before jumping to a loaded chapter', () => {
     const update = vi.fn();
-    render(<MemoryRouter initialEntries={['/global/fixture?source_transcript=older&source_tool=old-tool&filter=keep#message-unloaded-boundary']}><ConversationNavStack messages={[]} pendingMessages={[]} conversationId="product-aggregate" slug="fixture" streamingRequestId={null} convState={{ type: 'idle' }} onRetry={vi.fn()} onOpenFile={undefined} transcriptPositioning={{ kind: 'idle', view: { conversationId: 'fixture', generation: 1, transcriptGeneration: 1 } }} onUpdateOlderMessagesRestore={update} /></MemoryRouter>);
+    render(<MemoryRouter initialEntries={['/global/fixture?source_transcript=older&source_tool=old-tool&filter=keep#message-unloaded-boundary']}><ConversationNavStack messages={[]} pendingMessages={[]} historyBoundaries={[]} conversationId="product-aggregate" slug="fixture" streamingRequestId={null} convState={{ type: 'idle' }} onRetry={vi.fn()} onOpenFile={undefined} transcriptPositioning={{ kind: 'idle', view: { conversationId: 'fixture', generation: 1, transcriptGeneration: 1 } }} onUpdateOlderMessagesRestore={update} /></MemoryRouter>);
     fireEvent.click(screen.getByRole('button', { name: 'Loaded chapter' }));
     expect(update).toHaveBeenCalledWith({ kind: 'reader_viewport' });
-    expect(scrollToUnitIndex).toHaveBeenCalledWith(0);
+    expect(scrollToUnitIndex).not.toHaveBeenCalled();
     expect(screen.getByTestId('nav-location')).toHaveTextContent('/global/fixture?source_transcript=fixture&filter=keep#message-loaded-message');
     expect(screen.getByTestId('target')).toHaveTextContent('null');
     fireEvent.click(screen.getByRole('button', { name: 'Pending chapter' }));
+    expect(scrollToUnitIndex).toHaveBeenCalledWith(1);
     expect(screen.getByTestId('nav-location')).toHaveTextContent('/global/fixture?filter=keep');
     expect(screen.getByTestId('nav-location')).not.toHaveTextContent('source_transcript');
     expect(screen.getByTestId('nav-location')).not.toHaveTextContent('#');

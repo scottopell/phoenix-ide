@@ -1054,7 +1054,7 @@ async fn resolve_coordinator_route(
         }
     };
     Ok(Json(CoordinatorRouteResponse {
-        coordinator_id: matched.then_some(coordinator_id),
+        coordinator_id: matched.then_some(root_id),
     }))
 }
 

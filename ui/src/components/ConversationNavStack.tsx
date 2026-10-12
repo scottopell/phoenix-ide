@@ -60,9 +60,10 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
 
   const handleJump = useCallback((chapter: Chapter) => {
     onUpdateOlderMessagesRestore?.({ kind: 'reader_viewport' });
-    selectChapterTarget(chapter.kind === 'boundary' ? { kind: 'persisted', messageId: chapter.messageId, transcriptId: chapter.transcriptId } : chapter.target);
-    listRef.current?.scrollToUnitIndex(chapter.unitIndex);
-  }, [selectChapterTarget, onUpdateOlderMessagesRestore]);
+    const target = chapter.kind === 'boundary' ? { kind: 'persisted' as const, messageId: chapter.messageId, transcriptId: chapter.transcriptId } : chapter.target;
+    selectChapterTarget(target);
+    if (historyBoundaries === undefined || target.kind === 'pending') listRef.current?.scrollToUnitIndex(chapter.unitIndex);
+  }, [selectChapterTarget, onUpdateOlderMessagesRestore, historyBoundaries]);
 
   const handleLoadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!onLoadOlderMessages) return;

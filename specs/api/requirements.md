@@ -352,6 +352,11 @@ AND SHALL omit the boundary navigation roster.
 
 THE SYSTEM SHALL reject unknown boundary representations.
 
+WHEN a caller requests Coordinator route membership for an exact row ID or member slug
+THE SYSTEM SHALL return the immutable Coordinator root identity for a member rather than its changing newest member identity
+AND SHALL return no Coordinator identity for a nonmember
+AND SHALL preserve that membership identity across continuation so independent exact-source validations compare the same aggregate.
+
 THE SYSTEM SHALL keep the newest transcript identity distinct from write readiness
 AND SHALL NOT advertise a reserved successor as writable before its continuation opening is accepted.
 

@@ -2757,6 +2757,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_route_membership_identity_survives_leaf_continuation() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let first =
+            create_completed_continuation(&state, &root, "route-boundary-1", "route-opening-1")
+                .await;
+        let before = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/global/coordinator/route/{}", root.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.status(), StatusCode::OK);
+        let before: serde_json::Value =
+            serde_json::from_slice(&to_bytes(before.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let second =
+            create_completed_continuation(&state, &first, "route-boundary-2", "route-opening-2")
+                .await;
+        for reference in [&root.id, &first.id, &second.id] {
+            let after = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/global/coordinator/route/{reference}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(after.status(), StatusCode::OK);
+            let after: serde_json::Value =
+                serde_json::from_slice(&to_bytes(after.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(after["coordinator_id"], before["coordinator_id"]);
+            assert_eq!(after["coordinator_id"], root.id);
+        }
+    }
+
+    #[tokio::test]
     async fn edited_completed_opening_remains_an_ordinary_message() {
         let state = make_test_state().await;
         let root = state
