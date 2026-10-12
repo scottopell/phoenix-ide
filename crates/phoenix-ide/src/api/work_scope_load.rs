@@ -536,9 +536,12 @@ pub(super) fn scope_cpu_members(
     let mut members_by_scope = BTreeMap::<String, BTreeMap<u32, ProcessIdentity>>::new();
     let mut complete = BTreeMap::<String, bool>::new();
     let mut owners = BTreeMap::<(u32, u128), BTreeSet<String>>::new();
+    let conflicts = super::resource_monitor::conflicting_bash_scopes(groups);
     for group in groups {
         let scope = group.work_scope.stable_key();
-        let valid = complete.entry(scope.clone()).or_insert(true);
+        let valid = complete
+            .entry(scope.clone())
+            .or_insert(!conflicts.contains(&scope));
         let Some(members) = group_members.and_then(|groups| groups.get(&group.pgid)) else {
             *valid = false;
             members_by_scope.entry(scope).or_default();
@@ -1413,7 +1416,7 @@ mod tests {
         let mut changed = group(b, "b-2");
         changed.launch_identity.process.start_time = 99;
         let (members, complete) = scope_cpu_members(&[group(a, "b-1"), changed], Some(&identities));
-        assert!(complete["work:a"]);
+        assert!(!complete["work:a"]);
         assert!(!complete["work:b"]);
         assert!(members["work:b"].is_empty());
     }

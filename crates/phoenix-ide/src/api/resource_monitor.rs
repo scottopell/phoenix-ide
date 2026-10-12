@@ -217,6 +217,23 @@ impl ResourceMonitor {
     }
 }
 
+pub(super) fn conflicting_bash_scopes(
+    groups: &[phoenix_tools::bash::registry::LiveHandleProcessGroup],
+) -> BTreeSet<String> {
+    let mut scopes_by_pgid = BTreeMap::<i32, BTreeSet<String>>::new();
+    for group in groups {
+        scopes_by_pgid
+            .entry(group.pgid)
+            .or_default()
+            .insert(group.work_scope.stable_key());
+    }
+    scopes_by_pgid
+        .into_values()
+        .filter(|scopes| scopes.len() > 1)
+        .flatten()
+        .collect()
+}
+
 fn valid_group_members(
     group: &phoenix_tools::bash::registry::LiveHandleProcessGroup,
     identities: &BTreeMap<u32, ProcessIdentity>,
@@ -238,7 +255,7 @@ fn capture_bash_members(
 ) {
     let mut handles = Vec::with_capacity(groups.len());
     let mut identities = BTreeMap::new();
-    let mut incomplete = BTreeSet::new();
+    let mut incomplete = conflicting_bash_scopes(groups);
     for group in groups {
         let scope_key = group.work_scope.stable_key();
         match members.and_then(|groups| groups.get(&group.pgid)) {
