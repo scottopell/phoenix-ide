@@ -66,7 +66,7 @@ export type ConversationPageView = Pick<
   | 'turnRetryContext'
   | 'transcriptGeneration'
   | 'transcriptCoverage'
->;
+> & { streamingRequestId: string | null };
 
 const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'conversationId',
@@ -84,6 +84,7 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'turnRetryContext',
   'transcriptGeneration',
   'transcriptCoverage',
+  'streamingRequestId',
 ];
 
 function pageViewsEqual(a: ConversationPageView, b: ConversationPageView): boolean {
@@ -134,6 +135,7 @@ export function useConversationView(
       turnRetryContext: a.turnRetryContext,
       transcriptGeneration: a.transcriptGeneration,
       transcriptCoverage: a.transcriptCoverage,
+      streamingRequestId: a.streamingBuffer?.requestId ?? null,
     };
     const prev = lastRef.current;
     if (prev && pageViewsEqual(prev, next)) return prev;
@@ -184,6 +186,46 @@ export function useLastSseEventAt(slug: string): number {
     [store, slug],
   );
 
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+export function useConversationTranscriptAuthority(conversationId: string | null) {
+  const store = useConversationStore();
+  const subscribe = useCallback(
+    (listener: () => void) => conversationId ? store.subscribe(conversationId, listener) : () => {},
+    [store, conversationId],
+  );
+  const getSnapshot = useCallback(
+    () => conversationId ? store.getTranscriptAuthority(conversationId) : null,
+    [store, conversationId],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+export type ConversationTranscriptView = Pick<ConversationPageView, 'conversationId' | 'messages' | 'phase' | 'streamingRequestId'>;
+
+/** Structural transcript fields from one atom revision; token content stays at the leaf. */
+export function useConversationTranscriptView(slug: string | null): ConversationTranscriptView | null {
+  const store = useConversationStore();
+  const lastRef = useRef<ConversationTranscriptView | null>(null);
+  const subscribe = useCallback(
+    (listener: () => void) => slug ? store.subscribe(slug, listener) : () => {},
+    [store, slug],
+  );
+  const getSnapshot = useCallback(() => {
+    if (!slug || store.getTranscriptAuthority(slug).kind !== 'live') return null;
+    const atom = store.getSnapshot(slug);
+    if (!atom.conversationId) return null;
+    const previous = lastRef.current;
+    const streamingRequestId = atom.streamingBuffer?.requestId ?? null;
+    if (previous?.conversationId === atom.conversationId
+      && previous.messages === atom.messages
+      && previous.phase === atom.phase
+      && previous.streamingRequestId === streamingRequestId) return previous;
+    const next = { conversationId: atom.conversationId, messages: atom.messages, phase: atom.phase, streamingRequestId };
+    lastRef.current = next;
+    return next;
+  }, [store, slug]);
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
@@ -418,40 +460,6 @@ export function useStreamingBuffer(slug: string): StreamingBuffer | null {
   );
   const getSnapshot = useCallback(
     () => store.getSnapshot(slug).streamingBuffer ?? null,
-    [store, slug],
-  );
-
-  return useSyncExternalStore(subscribe, getSnapshot);
-}
-
-/**
- * Returns the streaming buffer's `requestId` for `slug`, or null when
- * no buffer is active. Re-renders the consumer on streaming-start,
- * streaming-end, AND streaming-restart (a new buffer with a fresh
- * `requestId`), because `Object.is` comparison on the returned string
- * distinguishes those transitions.
- *
- * `requestId` is the server-generated id stamped on every `Token` SSE
- * event AND on the eventual `AssistantMessage.message_id`. Using it as
- * the streaming render unit's key means the streaming → sent transition
- * preserves key identity — the streaming `TailUnit` and the finalized
- * `agent_turn` `HistoricalUnit` share a key, so VirtualTranscript (and the
- * React reconciler in general) sees an in-place keyed update rather
- * than a cross-region key swap. Symmetric to REQ-MLRU-001's
- * pending_user → user pattern.
- *
- * The boolean "is streaming active right now" is just
- * `useStreamingRequestId(slug) !== null`.
- */
-export function useStreamingRequestId(slug: string | undefined): string | null {
-  const store = useConversationStore();
-
-  const subscribe = useCallback(
-    (listener: () => void) => (slug ? store.subscribe(slug, listener) : () => {}),
-    [store, slug],
-  );
-  const getSnapshot = useCallback(
-    () => (slug ? store.getSnapshot(slug).streamingBuffer?.requestId ?? null : null),
     [store, slug],
   );
 
