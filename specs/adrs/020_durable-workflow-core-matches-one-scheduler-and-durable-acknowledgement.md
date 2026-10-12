@@ -4,7 +4,7 @@
 - **Date:** 2026-07-18
 - **Affects:** REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029 through REQ-DWF-042, REQ-DWF-CHAT-001 through REQ-DWF-CHAT-011, REQ-DWF-WAKE-002 through REQ-DWF-WAKE-005, REQ-DWF-CREATE-001 through REQ-DWF-CREATE-004
 
-- **Retirement cross-reference:** [ADR-092](092_retire-wake-execution-and-preserve-history.md) supersedes wake execution obligations; the decision body below is historical. Shared foundation, direct-turn, and creation obligations are not retired.
+- **Retirement cross-reference:** [ADR-095](095_retire-wake-execution-and-preserve-history.md) supersedes wake execution obligations; the decision body below is historical. Shared foundation, direct-turn, and creation obligations are not retired.
 
 ## Context
 

@@ -30,3 +30,11 @@ Read-only inspection at c5c33a53c found no non-test registration caller; api.rs 
 ## Non-goals and authorization limits
 
 No Promise-handle redesign, replacement workflow framework, multi-user draining/upgrade refusal, production DB copies/repairs/mutation, production process changes, merge, release or deployment. Git history preserves retired code; it does not justify purging persisted history. Separate performance/replay design work must not be blocked or steered by this removal.
+
+## Local implementation evidence and integration boundary
+
+The candidate removes wake registration/injection, startup worker and adoption, API/UI/client commands, and wake lifecycle gates. Additive migration 126 records retirement without rewriting historical payloads/statuses or cancelling admitted Direct Turns. Independent full-range source review found no actionable defect after migration/client fixes.
+
+Qualification: eight retirement tests pass; complete migration module passes 92; runtime selection passes 802 with one existing ignored test; historical pointer/Direct Turn and startup-no-resumption tests pass. The initial DB run passed 892 with nine partial-schema migration-fixture failures; the fixtures were corrected and their entire migration module rerun. Python client passes 14; UI TypeScript/lint/Vitest and changed Allium models pass. Workspace all-target Clippy finishes exit 0 with warnings denied; its guard recorded descendant cleanup at exit, and actual child/group absence was independently verified before slot release. Full dev.py check is not claimed. Tools suite passes 533 with an unchanged macOS registry-test failure captured separately in task 33002.
+
+Integration gate: federation PR #860 reserves migrations 124/125 and ADRs 092–094. Wake reserves migration 126 and ADR-095; shared ADR sequence preflight requires those predecessors and a rebase/recheck before merge. No merge, production mutation or deployment performed. Existing Bash/tmux handles are preserved, not delivery of a unified Promise interface.

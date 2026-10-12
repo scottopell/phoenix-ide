@@ -12,7 +12,7 @@ profile requires it.
 Direct-chat and conversation creation are the retained normative profiles.
 Creation exercises a richer dependency graph, resource reconciliation, and
 compensation. Wake is retired under `../wake-contracts/requirements.md` and
-ADR-092, without a replacement profile or redesign commitment.
+ADR-095, without a replacement profile or redesign commitment.
 
 ## Current Reality
 
@@ -24,7 +24,15 @@ terminal evidence, statuses, payloads, messages, and links are preserved as iner
 history by additive retirement metadata, not rewritten as settled execution.
 Already-admitted DirectTurns remain normal work on their existing authorities.
 
-Direct-chat foundations have landed partially. The aggregate/repository layer contains accepted-turn identity, immutable prepared payload, runtime acceptance, replay, and deterministic transaction-cut foundations. Production direct-turn materialization now returns a closed established/unclassified authority result, keeps proposed conversation state private until SQLite commits the accepted turn, reducer projection, and canonical message, and routes unclassified authority through one process fail-stop boundary that closes runtime admission and semantic publication before draining live runtimes. Production chat submission/reconciliation has not fully cut over to the durable profile, and equivalent authority-loss enforcement for other authoritative SQLite commands remains incomplete. Conversation creation is in a similar state: shell-first and protocol/model work exist, while production worker/orchestration cutover remains incomplete.
+Production Direct Turn admission, claim/reclaim, materialization, rearm, and terminalization actively consume the shared workflow transaction primitives. Materialization returns a closed established/unclassified authority result, keeps proposed conversation state private until SQLite commits the accepted turn, reducer projection, and canonical message, and routes unclassified authority through the process fail-stop boundary. Conversation creation has its own active protocol worker; its scheduling and worker kicks are not wake contracts.
+
+### Consumer classification after wake removal
+
+- **Active production:** shared workflow identity/codec types, Direct Turn model/profile, normalized tables, and transaction primitives used by the Direct Turn repository (`insert_workflow`, `commit_transition_plan`, `begin_attempt`, `accept_receipt_and_delivery`, delivery resolution, terminal fencing, and head CAS).
+- **Verification contract, not a production producer:** generic foundation engine/simulator and generic repository wrappers for observation, lease, schedule, manual-resolution, and row enumeration. Their tests verify the retained foundation requirements; they must not be described as active runtime enrollment or retained for a hypothetical wake replacement.
+- **Historical storage:** wake schemas and historical migration discriminants remain to preserve existing rows and forward upgrades. Operational wake profile, registration, repository, worker, and adoption code are removed.
+
+Wake removal does not establish new authority-loss coverage for other SQLite commands or claim a unified asynchronous-handle API.
 
 ## Normative Shape
 
@@ -34,7 +42,7 @@ The current normative package comprises:
 - `durable-workflows.allium`
 - `direct-chat-profile.allium`
 - `creation-profile.allium`
-- ADR-013 through ADR-016, ADR-019, ADR-024, ADR-036, and ADR-092 in `specs/adrs/`
+- ADR-013 through ADR-016, ADR-019, ADR-024, ADR-036, and ADR-095 in `specs/adrs/`
 
 These artifacts now state:
 
@@ -75,7 +83,7 @@ These artifacts now state:
 ADR-013 through ADR-016 remain historical records of the earlier durable-
 workflow direction. ADR-019 supersedes their permanent-selector,
 shadow-authority, exact-drain, and universal-lease conclusions for current
-normative work without rewriting those historical records. ADR-092 supersedes
+normative work without rewriting those historical records. ADR-095 supersedes
 wake-specific execution obligations while retaining shared foundation, direct-turn,
 and creation authority.
 
@@ -112,6 +120,6 @@ Remaining profile work is:
 - ADR-036 selects process fail-stop when local SQLite authority cannot be established and makes process-local runtime and observer continuity disposable.
 - ADR-074 selects the active materialized direct turn as the sole post-tool restart baton and rejects transcript-only execution authority.
 - ADR-007 remains creation context; ADR-006, ADR-011, and ADR-012 remain
-  historical wake context superseded for execution by ADR-092.
-- ADR-092 removes operational wake authority, preserves history via additive
+  historical wake context superseded for execution by ADR-095.
+- ADR-095 removes operational wake authority, preserves history via additive
   retirement metadata, and retains ordinary already-admitted DirectTurn settlement.

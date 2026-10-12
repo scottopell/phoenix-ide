@@ -1,11 +1,11 @@
 # ADR-011: Wake-plane core uses registration receipts and durable runtime observations
 
-- **Status:** Superseded by ADR-092
+- **Status:** Superseded by ADR-095
 - **Date:** 2026-07-03
 - **Supersedes:** ADR-006 for delayed-result delivery, `is_busy()` derivation, and the assumption that sub-agent wakes ship in the same core implementation slice
 - **Affects:** REQ-WAKE-001, REQ-WAKE-002, REQ-WAKE-003, REQ-WAKE-004, REQ-WAKE-006, REQ-WAKE-008, REQ-WAKE-009, REQ-WAKE-012, REQ-WAKE-013, REQ-WAKE-016, REQ-WAKE-017, REQ-WAKE-018
 
-- **Retirement cross-reference:** [ADR-092](092_retire-wake-execution-and-preserve-history.md) supersedes wake execution obligations; the decision body below is historical. Shared foundation, direct-turn, and creation obligations are not retired.
+- **Retirement cross-reference:** [ADR-095](095_retire-wake-execution-and-preserve-history.md) supersedes wake execution obligations; the decision body below is historical. Shared foundation, direct-turn, and creation obligations are not retired.
 
 ## Context
 

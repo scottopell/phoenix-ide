@@ -2,16 +2,17 @@
 
 ## Decision and Scope
 
-The user explicitly approved removing the durable wake feature. ADR-092 records
+The user explicitly approved removing the durable wake feature. ADR-095 records
 that decision; ADR-006, ADR-011, and ADR-012 remain historical context, not current
 execution authority. The wake registration/router/profile contract and its Allium
 models are retired, without a replacement framework or promise of redesign.
 
 ## Current Reality
 
-This is a candidate retirement implementation. Operational wake removal and the
-one-time additive database migration are being implemented and verified; this
-summary does not claim completed integration, passing final tests, or deployment.
+The candidate branch removes operational wake admission, worker startup,
+automatic adoption, and wake-only lifecycle coupling. Migration 126 records
+explicit feature retirement additively. Local migration and runtime regressions
+have passed; integration and deployment are separate and are not claimed here.
 
 Historical wake workflows, effect payloads and statuses, bindings, receipts,
 messages, deliveries, acceptance records, and links must remain intact. Additive
@@ -25,24 +26,38 @@ Ordinary Bash waits, tmux operations, sub-agent fan-in, and Close are not replac
 
 ## Requirement Status
 
-| Requirement | Status | Verification needed |
+| Requirement | Status | Verification evidence / boundary |
 | --- | --- | --- |
-| REQ-WAKE-RETIRE-001 no wake execution authority | Candidate implementation / verification ongoing | No registration, scheduler or worker selection, startup/recovery/continuation dispatch, runtime admission, or wake lifecycle blocking. |
-| REQ-WAKE-RETIRE-002 additive retirement migration | Candidate implementation / verification ongoing | Migration coverage for all wake statuses; exact preservation of historical payloads, statuses, bindings, receipts, messages, acceptance records, and links; supported runner re-open behavior. |
-| REQ-WAKE-RETIRE-003 already-admitted DirectTurns | Candidate implementation / verification ongoing | Existing accepted-turn ownership and settlement survive retirement; historical unaccepted delivery remains inert. |
-| REQ-WAKE-RETIRE-004 history without replacement feature | Candidate implementation / verification ongoing | Historical pointers retained; ordinary tools, fan-in, direct-turn settlement, and Close retain their owning contracts. |
+| REQ-WAKE-RETIRE-001 no wake execution authority | Implemented in candidate branch; locally verified | Registration, worker, adoption, and wake lifecycle gates removed; `startup_does_not_resume_historical_wake_pointer` passes; independent source review found no actionable defect. |
+| REQ-WAKE-RETIRE-002 additive retirement migration | Implemented in candidate branch; locally verified | Eight `wake_feature_retirement_tests` pass, including byte-preserving upgrade/reopen, all historical workflow statuses, delivery shape, and transactional rollback. The complete migration module passes 92 tests. |
+| REQ-WAKE-RETIRE-003 already-admitted DirectTurns | Implemented in candidate branch; locally verified | `historical_wake_pointer_does_not_fence_or_settle_direct_turn` passes; Direct Turn database and runtime ownership/recovery regressions pass. |
+| REQ-WAKE-RETIRE-004 history without replacement feature | Implemented in candidate branch; locally verified | Historical storage and pointers retained. Runtime selection passes 802 tests with one existing ignored test; tool suite passes 533 tests with one macOS registry-test failure separately tracked. |
 | REQ-WAKE-RETIRE-005 forward-only compatibility | Specified | Apply the existing compatibility policy; no downgrade or wake-restoration guarantee. |
 
 ## Verification Boundary
 
-The implementation owner owns migration and runtime regressions and final project
-validation. Spec-only validation does not establish those behaviors. Old wake
-feature tests and prior coverage are historical evidence, not acceptance of the
-retirement contract.
+Local qualification is not deployment evidence. The initial complete database
+run exposed nine legacy-fixture failures because partial-schema fixtures admitted
+the new migration; those fixture boundaries were corrected and all 92 migration
+tests subsequently passed. Existing Direct Turn, Close, creation, and shared
+foundation tests passed in that database run. Full project-check completion is
+not claimed by these focused receipts.
+
+The Python client suite passes 14 tests, including absent wake commands/methods.
+TypeScript, UI lint, and Vitest qualification passed after the surface removal.
+Workspace all-target Clippy finishes with exit 0 and warnings denied. Its guard
+recorded exit-time descendant cleanup; final process/group absence was verified
+before reservation release. Changed Allium models, task metadata, and Rust
+formatting validate. The shared
+ADR chain has an integration gate: federation PR #860 reserves ADRs 092–094 and
+migrations 124–125; this candidate reserves ADR-095 and migration 126. Spec-shape
+sequence validation must be rerun after the reserved predecessors are integrated
+and the candidate rebased. No merge or deployment is implied by local tests.
+Old wake feature tests are historical evidence, not acceptance of retirement.
 
 ## Authorities
 
 - `requirements.md`: retirement and historical-data contract.
 - `../durable-workflows/requirements.md`: retained foundation, direct-turn, and creation behavior.
 - `../compatibility/requirements.md`: forward migration and paired rollback policy.
-- `../adrs/092_retire-wake-execution-and-preserve-history.md`: explicit removal decision.
+- `../adrs/095_retire-wake-execution-and-preserve-history.md`: explicit removal decision.
