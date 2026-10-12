@@ -156,6 +156,8 @@ entity FederatedTerminalFact {
 -- cursor_is_next(subscription: FederatedSubscription, event_id: String) -> Boolean
 -- explicit_gap_reported(subscription: FederatedSubscription) -> Boolean
 -- current_state_reported(stable_conversation: String) -> Boolean
+-- authenticated_subscription_caller(subscription: FederatedSubscription) -> Boolean
+-- owner_authenticated() -> Boolean
 
 rule AdmitFederatedTerminalFact {
     when: TerminalFactReceived(subscription, fact)
@@ -188,6 +190,7 @@ rule RevokeFederatedSubscriptions {
 rule UnsubscribeFederatedSubscription {
     when: FederatedUnsubscribeRequested(subscription)
     requires: subscription.state = active
+    requires: authenticated_subscription_caller(subscription) or owner_authenticated()
 
     ensures: subscription.state = unsubscribed
 }

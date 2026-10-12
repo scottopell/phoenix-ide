@@ -163,7 +163,7 @@ AND SHALL NOT thereby grant generic filesystem authority or any unrelated write 
 
 THE SYSTEM MAY provide a dedicated cross-conversation message tool to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative input acceptance path
 
-WHEN an authenticated enrolled remote Coordinator sends through the federated message adapter governed by `../federation/requirements.md` REQ-FED-010
+WHEN an authenticated enrolled remote Coordinator sends through the federated message adapter governed by `../federation/requirements.md` REQ-FED-007
 THE destination MAY admit the message to its Coordinator chain through the same authoritative input acceptance path
 AND SHALL preserve the source instance and exact source-call provenance
 AND SHALL continue to reject same-instance Coordinator self-targeting
@@ -308,7 +308,8 @@ THE SYSTEM SHALL report a queued-as-steering result containing the resolved targ
 IF the target cannot accept the message
 THE SYSTEM SHALL report a rejected result with a stable reason code and explanatory message and SHALL NOT report it as delivered or queued
 
-THE SYSTEM SHALL reject the originating conversation, the Coordinator conversation and every member of its continuation chain as message targets
+THE SYSTEM SHALL reject the originating conversation as a message target
+AND SHALL reject the Coordinator conversation and every member of its continuation chain for same-instance callers and remote callers lacking the authenticated enrolled Coordinator exception in REQ-GR-007
 AND SHALL continue to treat sub-agent conversations as separately ineligible targets under the ordinary acceptance rules rather than by conflating them with Coordinator identity
 
 THE SYSTEM SHALL reject archived, deleted, unavailable, terminal, context-exhausted, awaiting-question, and awaiting-approval targets according to authoritative conversation state
