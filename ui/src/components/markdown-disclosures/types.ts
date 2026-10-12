@@ -60,6 +60,7 @@ export interface MarkdownInterpretation {
 }
 
 export interface AcceptedFrame extends SourceRange {
+  admission: 'rootFlow';
   open: boolean;
   summaryOpenStart: number;
   summaryStart: number;
@@ -72,7 +73,9 @@ export type TagGrammar =
   | { valid: false }
   | { valid: true; closing: boolean; kind: 'details' | 'summary'; open: boolean };
 
-export type RecognizedTag = SourceRange & { grammar: TagGrammar };
+export type ParsedTag = SourceRange & { grammar: TagGrammar };
+export type TagAdmission = 'rootFlow' | 'inline';
+export type RecognizedTag = ParsedTag & { admission: TagAdmission };
 export interface Recognition {
   candidates: Map<number, number>;
   tags: RecognizedTag[];

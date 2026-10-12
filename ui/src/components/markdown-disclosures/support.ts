@@ -2,7 +2,7 @@ import { gfm } from 'micromark-extension-gfm';
 import { gfmFromMarkdown } from 'mdast-util-gfm';
 import type { Nodes } from 'mdast';
 import type { Construct } from 'micromark-util-types';
-import type { InterpretationStats, MarkdownConfiguration, RecognizedTag } from './types';
+import type { InterpretationStats, MarkdownConfiguration, ParsedTag } from './types';
 
 export const basicOptions: MarkdownConfiguration = Object.freeze({ extensions: [], mdastExtensions: [] });
 export const gfmOptions: MarkdownConfiguration = Object.freeze({ extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] });
@@ -65,15 +65,15 @@ export function append<T>(target: T[], items: readonly T[]): void {
 
 export function tagGrammar(
   source: string, start: number, prefixEnd: number, quoteEnds: ReadonlyMap<number, number>, horizon: number,
-): RecognizedTag {
+): ParsedTag {
   const closing = source[start + 1] === '/';
   const kind = source[start + (closing ? 2 : 1)]!.toLowerCase() === 'd' ? 'details' : 'summary';
   let i = prefixEnd;
   let open = false;
   const at = () => i < horizon ? source[i] : undefined;
   const space = (c: string | undefined) => c !== undefined && /[\t\n\r\f ]/.test(c);
-  const invalid = (): RecognizedTag => ({ start, end: i, grammar: { valid: false } });
-  const valid = (): RecognizedTag => ({ start, end: i + 1, grammar: { valid: true, closing, kind, open } });
+  const invalid = (): ParsedTag => ({ start, end: i, grammar: { valid: false } });
+  const valid = (): ParsedTag => ({ start, end: i + 1, grammar: { valid: true, closing, kind, open } });
   if (closing) {
     while (space(at())) i++;
     return at() === '>' ? valid() : invalid();

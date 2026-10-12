@@ -12,6 +12,38 @@ function markdown(source: string) {
 }
 
 describe('ReactMarkdown with the actual disclosure parser', () => {
+  it.each([
+    ['prefix <details><summary>T</summary>B</details> suffix', 'prefix <details><summary>T</summary>B</details> suffix'],
+    ['*prefix <details><summary>T</summary>**B**</details> suffix*', 'prefix <details><summary>T</summary>B</details> suffix'],
+    ['[prefix <details><summary>T</summary>**B**</details> suffix](/target)', 'prefix <details><summary>T</summary>B</details> suffix'],
+    ['<details><summary>Unclosed</summary>prefix <details><summary>T</summary>**B**</details>', '<details><summary>Unclosed</summary>prefix <details><summary>T</summary>B</details>'],
+  ])('keeps inline wrappers literal in the same paragraph: %s', (source, text) => {
+    const { container } = markdown(source);
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.querySelectorAll('p')).toHaveLength(1);
+    expect(container.querySelector('p')?.textContent).toBe(text);
+    if (source.includes('**B**')) expect(container.querySelector('strong')?.textContent).toBe('B');
+    if (source.startsWith('*')) expect(container.querySelector('em')?.textContent).toBe(text);
+    if (source.startsWith('[')) expect(container.querySelector('a')).toHaveAttribute('href', '/target');
+  });
+  it.each(['prefix\n', 'prefix\n\n', ''])('renders admitted root and adjacent envelopes after %j', prefix => {
+    const { container } = markdown(prefix + '<details><summary>T</summary>**A**</details><details><summary>U</summary>*B*</details>');
+    expect(container.querySelectorAll('details')).toHaveLength(2);
+    expect(container.querySelector('details strong')?.textContent).toBe('A');
+    expect(container.querySelector('details em')?.textContent).toBe('B');
+  });
+  it('does not admit an indented code envelope', () => {
+    const { container } = markdown('prefix\n\n    <details><summary>T</summary>B</details>');
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.querySelector('pre code')?.textContent).toContain('<details>');
+  });
+  it('rejects inline nesting in a completed root envelope', () => {
+    const source = '<details><summary>Outer</summary>prefix <details><summary>T</summary>B</details> suffix</details>';
+    const { container } = markdown(source);
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.querySelector('p')?.textContent).toBe(source);
+  });
+
   it('renders native details/summary through hName with Markdown and find-ready text', () => {
     const source = 'Before\n\n<details><summary>**Find title** [docs][d]</summary>\n\n## Find body\n\n- [x] done\n\n~~old~~\n\n</details>\n\n[d]: https://example.com/docs\n\nAfter';
     const interpretation = interpretMarkdown(source, gfmOptions);

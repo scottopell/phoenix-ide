@@ -10,7 +10,7 @@ import type { Construct, InitialConstruct, State, Token } from 'micromark-util-t
 import { basicOptions, constructList, createStats, membership, tagGrammar } from './support';
 import { indexSource } from './source-index';
 import { acceptFrames } from './frames';
-import type { MarkdownConfiguration, Recognition, RecognizedTag, SourceRange } from './types';
+import type { MarkdownConfiguration, Recognition, RecognizedTag, SourceRange, TagAdmission } from './types';
 
 type SessionMode = 'entry' | 'classify' | 'documentClassify' | 'horizon';
 type Horizon = SourceRange & { type: 'horizon' };
@@ -29,13 +29,13 @@ export function recognizeDisclosures(source: string, options: MarkdownConfigurat
   const lexicalFrames: ('summaryOpen' | 'summary' | 'body')[] = [];
   let inSummary = false;
 
-  function addTag(start: number, nativeEnd: number): number {
+  function addTag(start: number, nativeEnd: number, admission: TagAdmission): number {
     const horizon = Math.min(nativeEnd, grammarEnds.get(start)!);
     const tag = tagGrammar(source, start, candidates.get(start)!, quoteEnds, horizon);
     stats.validatedUnits += tag.end - tag.start;
     candidates.set(start, tag.end);
     const grammar = tag.grammar;
-    tags.push(tag);
+    tags.push({ ...tag, admission });
     if (grammar.valid) {
       if (grammar.kind === 'details') {
         if (grammar.closing) lexicalFrames.pop();
@@ -239,10 +239,10 @@ export function recognizeDisclosures(source: string, options: MarkdownConfigurat
       cursor = end;
       const tagEnd = candidates.get(cursor);
       if (tagEnd !== undefined) {
-        cursor = addTag(cursor, result.end);
+        cursor = addTag(cursor, result.end, 'inline');
       }
     } else if (result.type === 'marker') {
-      cursor = addTag(result.start, source.length);
+      cursor = addTag(result.start, source.length, 'rootFlow');
     } else if (result.type === 'native') {
       if (result.end <= cursor) throw new Error('No native progress');
       cursor = result.end;

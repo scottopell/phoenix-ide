@@ -198,7 +198,7 @@ describe('positions, source partitions and bounded work counters', () => {
     expect(result.tree.position!.end.offset).toBe(source.length);
   });
   for (const count of [20, 40, 80, 160]) it(`partitions ${count} adjacent envelopes without resubmitting source`, () => {
-    const unit = 'x ' + envelope('<!--x-->\nx ') + '\n';
+    const unit = 'x\n' + envelope('<!--x-->\nx ') + '\n';
     const source = unit.repeat(count);
     const result = interpretMarkdown(source);
     expect(result.ranges).toEqual(Array.from({ length: count }, (_, i) => ({ start: i * unit.length + 2, end: (i + 1) * unit.length - 1 })));
@@ -259,6 +259,48 @@ describe('remark parser integration', () => {
 });
 
 describe('candidate admission and restrictive recovery regressions', () => {
+  it.each([
+    'prefix ' + envelope('B') + ' suffix',
+    '*prefix ' + envelope('**B**') + ' suffix*',
+    '[prefix ' + envelope('**B**') + ' suffix](/target)',
+    '<details><summary>Unclosed</summary>prefix ' + envelope('**B**'),
+  ])('never promotes an inline opening to root authority: %j', source => {
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([]);
+    expect(result.tree.children.map(n => n.type)).toEqual(['paragraph']);
+    expect(nodes(result.tree, 'text').map(n => n.value).join('')).toContain('<details><summary>T</summary>');
+    if (source.includes('**B**')) expect(nodes(result.tree, 'strong')).toHaveLength(1);
+    if (source.startsWith('*')) expect(nodes(result.tree, 'emphasis')).toHaveLength(1);
+    if (source.startsWith('[')) expect(nodes(result.tree, 'link')).toHaveLength(1);
+  });
+  it.each([20, 40, 80, 160])('keeps %i prose-inline envelopes literal with bounded work', count => {
+    const source = ('x ' + envelope('<!--x-->\nx ') + '\n').repeat(count);
+    const result = interpretMarkdown(source);
+    expect(result.ranges).toEqual([]);
+    expect(nodes(result.tree, 'disclosureDetails')).toHaveLength(0);
+    expect(result.stats.submittedUnits).toBe(source.length);
+    expect(result.stats.indexed + result.stats.validatedUnits + result.stats.frameSteps + result.stats.dispatch + result.stats.horizonBytes + result.stats.documentBytes + result.stats.submittedUnits).toBeLessThan(12 * source.length);
+  });
+  it.each(['prefix\n', 'prefix\n\n', 'prefix\r\n', 'prefix\r'])('admits root flow after %j', prefix => {
+    const source = prefix + envelope('**B**');
+    expect(interpretMarkdown(source).ranges).toEqual([{ start: prefix.length, end: source.length }]);
+  });
+  it('keeps indented code outside root admission', () => {
+    const result = interpretMarkdown('prefix\n\n    ' + envelope('B'));
+    expect(result.ranges).toEqual([]);
+    expect(nodes(result.tree, 'code')).toHaveLength(1);
+  });
+  it('admits same-line adjacent completed root envelopes', () => {
+    const first = envelope('**A**');
+    const second = envelope('*B*');
+    expect(interpretMarkdown(first + second).ranges).toEqual([
+      { start: 0, end: first.length }, { start: first.length, end: first.length + second.length },
+    ]);
+  });
+  it('still invalidates an outer frame for inline nested tags', () => {
+    expect(interpretMarkdown(envelope('prefix ' + envelope('B') + ' suffix')).ranges).toEqual([]);
+  });
+
   it.each([
     '<details><summary>T</summary>`<details broken` **B**</details>',
     '`<details broken`\n\n<details><summary>T</summary>B</details>',

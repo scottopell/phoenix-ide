@@ -1,4 +1,4 @@
-import type { AcceptedFrame, InterpretationStats, RecognizedTag, SourceRange } from './types';
+import type { AcceptedFrame, InterpretationStats, RecognizedTag, SourceRange, TagAdmission } from './types';
 
 type Phase =
   | { kind: 'summaryOpen' }
@@ -6,6 +6,7 @@ type Phase =
   | { kind: 'body'; summaryStart: number; summaryOpenStart: number; summaryEnd: number; bodyStart: number };
 
 interface Frame {
+  admission: TagAdmission;
   start: number;
   openEnd: number;
   open: boolean;
@@ -26,6 +27,7 @@ export function acceptFrames(source: string, tags: RecognizedTag[], stats: Inter
     if (!grammar.valid) continue;
     if (grammar.kind === 'details' && !grammar.closing) {
       const frame: Frame = {
+        admission: tag.admission,
         start: tag.start, openEnd: tag.end, open: grammar.open,
         phase: { kind: 'summaryOpen' }, close: null, invalid: false, children: [],
         openingContext: !current || current.phase.kind === 'body' ? 'body' : 'provisional',
@@ -55,9 +57,10 @@ export function acceptFrames(source: string, tags: RecognizedTag[], stats: Inter
     stats.frameSteps++;
     const frame = todo.pop()!;
     if (frame.close) {
-      if (!frame.invalid && frame.phase.kind === 'body' && !frame.children.length) {
+      if (frame.admission === 'rootFlow' && !frame.invalid && frame.phase.kind === 'body' && !frame.children.length) {
         ranges.push({ start: frame.start, end: frame.close.end });
         accepted.push({
+          admission: frame.admission,
           start: frame.start, end: frame.close.end, open: frame.open,
           summaryOpenStart: frame.phase.summaryOpenStart,
           summaryStart: frame.phase.summaryStart, summaryEnd: frame.phase.summaryEnd,
@@ -67,7 +70,7 @@ export function acceptFrames(source: string, tags: RecognizedTag[], stats: Inter
     } else if (frame.phase.kind === 'body') {
       for (let i = frame.children.length - 1; i >= 0; i--) {
         const child = frame.children[i]!;
-        if (child.openingContext === 'body') todo.push(child);
+        if (child.admission === 'rootFlow' && child.openingContext === 'body') todo.push(child);
       }
     }
   }
