@@ -49,7 +49,10 @@ function segment(
     transcript_row_id: transcriptRowId,
     slug: transcriptRowId,
     title,
-    messages,
+    messages: handoffSummary === null ? messages : [...messages, {
+      ...textMessage(`continue-${transcriptRowId}`, Math.max(0, ...messages.map((message) => message.sequence_id)) + 1, 'system', handoffSummary),
+      conversation_id: transcriptRowId, message_type: 'continuation' as const, content: { summary: handoffSummary },
+    }],
     handoff: handoffSummary === null ? null : {
       kind: 'historical' as const,
       predecessor_transcript_row_id: `prev-${transcriptRowId}`,
@@ -64,6 +67,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   return {
     product_conversation_id: 'pc-product-alpha',
     close: null,
+    boundaries: [],
     canonical_route: '/product-conversations/pc-product-alpha',
     requested_transcript_row_id: 'row-work',
     canonical_root: { transcript_row_id: 'row-root', slug: 'product-alpha-root', title: 'Product Alpha root' },

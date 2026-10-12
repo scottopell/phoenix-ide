@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { StrictMode, useEffect } from 'react';
-import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
@@ -108,7 +108,7 @@ vi.mock('../components/ConversationNavStack', () => ({
         <div data-testid="message-count">{messages.length}</div>
         <div data-testid="message-order">{messages.map((m) => m.message_id).join(',')}</div>
         <div data-testid="message-types">{messages.map((m) => m.message_type).join(',')}</div>
-        <div data-testid="message-text-order">{messages.map((m) => typeof m.content === 'object' && m.content !== null && 'text' in m.content ? String((m.content as { text?: string }).text ?? '') : '').join('|')}</div>
+        <div data-testid="message-text-order">{messages.map((m) => typeof m.content === 'object' && m.content !== null && 'text' in m.content ? String((m.content as { text?: string }).text ?? '') : typeof m.content === 'object' && m.content !== null && 'summary' in m.content ? String((m.content as { summary?: string }).summary ?? '') : '').join('|')}</div>
       </div>
     );
   },
@@ -207,6 +207,7 @@ vi.mock('../api', async () => {
     api: {
       ...actual.api,
       getProductConversationSnapshot: vi.fn(),
+      getCoordinatorHistory: vi.fn(),
       getProductConversationAutomaticContinuation: vi.fn(),
       updateProductConversationAutomaticContinuation: vi.fn(),
       reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
@@ -237,9 +238,10 @@ function makeMessage(message_id: string, sequence_id: number, conversation_id = 
 }
 
 function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}): ProductConversationSnapshotView {
-  return {
+  const snapshot: ProductConversationSnapshotView = {
     product_conversation_id: 'pc-1',
     close: null,
+    boundaries: [],
     canonical_route: '/product-conversations/pc-1',
     requested_transcript_row_id: 'row-2',
     canonical_root: { transcript_row_id: 'row-1', slug: 'root-slug', title: 'Root title' },
@@ -273,8 +275,8 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
         messages: [makeMessage('m-1', 1), makeMessage('m-2', 2)],
         handoff: {
           kind: 'historical',
-          predecessor_transcript_row_id: 'row-0',
-          successor_transcript_row_id: 'row-1',
+          predecessor_transcript_row_id: 'row-1',
+          successor_transcript_row_id: 'row-2',
           continuation_message_id: 'cont-1',
           summary: 'First handoff',
         },
@@ -285,19 +287,18 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
         slug: 'row-2',
         title: 'Latest',
         messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
-        handoff: {
-          kind: 'historical',
-          predecessor_transcript_row_id: 'row-1',
-          successor_transcript_row_id: 'row-2',
-          continuation_message_id: 'cont-2',
-          summary: 'Second handoff should not repeat',
-        },
+        handoff: null,
       },
     ],
     before: 'cursor-1',
     has_older: true,
     ...overrides,
   };
+  snapshot.boundaries = snapshot.segments.flatMap((segment) => segment.handoff ? [{ message_id: segment.handoff.continuation_message_id, predecessor_transcript_row_id: segment.transcript_row_id, successor_transcript_row_id: segment.handoff.successor_transcript_row_id, segment_ordinal: segment.segment_ordinal }] : []);
+  snapshot.segments = snapshot.segments.map((segment) => !segment.handoff || segment.messages.some((message) => message.message_id === segment.handoff?.continuation_message_id) ? segment : {
+    ...segment, messages: [...segment.messages, { ...makeMessage(segment.handoff.continuation_message_id, Math.max(0, ...segment.messages.map((message) => message.sequence_id)) + 1, segment.transcript_row_id), message_type: 'continuation', content: { summary: segment.handoff.summary } }],
+  });
+  return snapshot;
 }
 
 function makeChain(overrides: Partial<ChainView> = {}): ChainView {
@@ -337,6 +338,26 @@ function ProductRouteSwitch() {
   </>;
 }
 
+function HistoryRouteControls() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  return <><div data-testid="history-location">{location.pathname}{location.search}{location.hash}</div>
+    <button onClick={() => navigate({ ...location, hash: '#message-m-3' })}>jump latest message</button>
+    <button onClick={() => navigate(-1)}>history back</button>
+    <button onClick={() => navigate(1)}>history forward</button>
+  </>;
+}
+
+function coordinatorSnapshot(snapshot: ProductConversationSnapshotView) {
+  return {
+    product_conversation_id: snapshot.product_conversation_id,
+    canonical_route: '/global/row-2', requested_transcript_row_id: 'row-1',
+    canonical_root: snapshot.canonical_root, latest_transcript_row_id: snapshot.latest_transcript_row_id,
+    writable_transcript_row_id: snapshot.writable_transcript_row_id, updated_at: snapshot.updated_at,
+    segments: snapshot.segments, boundaries: snapshot.boundaries, before: snapshot.before, has_older: snapshot.has_older,
+  };
+}
+
 let conversationStore: ConversationStore;
 
 function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false, strict = false) {
@@ -348,7 +369,9 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
           <ChainProvider>
             <FileExplorerProvider>
             {withRouteSwitch && <ProductRouteSwitch />}
+            <HistoryRouteControls />
             <Routes>
+              <Route path="/global/:slug" element={<ProductConversationPage productId="row-1" globalShell={{ composerQuickAction: undefined, stateBarExtension: undefined }} />} />
               <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
             </Routes>
             </FileExplorerProvider>
@@ -428,6 +451,70 @@ async function waitForPageReady() {
 }
 
 describe('ProductConversationPage', () => {
+  it('uses aggregate Global history without ordinary lifecycle and keeps newest composer separate from pinned evidence', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })));
+    renderPage('/global/row-1?source_transcript=row-1&source_tool=exact-call#message-m-1');
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('m-1,m-2,cont-1,m-3,m-4'));
+    expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
+    expect(screen.queryByText('Open')).not.toBeInTheDocument();
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]).toMatchObject({ slug: 'row-2', routePrefix: '/global' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-1?source_transcript=row-1&source_tool=exact-call#message-m-1');
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } });
+  });
+
+  it('loads an unloaded Global boundary by exact message ID through the same bounded page loader', async () => {
+    const { api } = await import('../api');
+    const complete = coordinatorSnapshot(makeSnapshot({ before: null, has_older: false }));
+    const tail = { ...complete, segments: complete.segments.map((segment) => segment.transcript_row_id === 'row-1' ? { ...segment, messages: [], handoff: null } : segment), before: 'global-before', has_older: true };
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(tail).mockResolvedValueOnce(complete);
+    renderPage('/global/row-1?source_transcript=row-1#message-cont-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'cont-1' } }));
+    expect(api.getCoordinatorHistory).toHaveBeenNthCalledWith(2, 'row-1', { message_limit: 100, before: 'global-before' });
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).filter((message) => message.message_id === 'cont-1')).toHaveLength(1);
+    expect(screen.getByTestId('history-location')).toHaveTextContent('?source_transcript=row-1#message-cont-1');
+  });
+
+  it('preserves the aggregate reader anchor and newest composer when continuation races an older page', async () => {
+    const { api } = await import('../api');
+    const initial = coordinatorSnapshot(makeSnapshot());
+    let resolveOlder!: (page: ReturnType<typeof coordinatorSnapshot>) => void;
+    const pendingOlder = new Promise<ReturnType<typeof coordinatorSnapshot>>((resolve) => { resolveOlder = resolve; });
+    const continued = { ...initial, latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', segments: [...initial.segments, {
+      segment_ordinal: 3, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')], handoff: null,
+    }] };
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(initial).mockReturnValueOnce(pendingOlder).mockResolvedValueOnce(continued);
+    renderPage('/global/row-1?source_transcript=row-1');
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('m-1'));
+    fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    await act(async () => resolveOlder({ ...initial, before: null, has_older: false, segments: [{ segment_ordinal: 0, transcript_row_id: 'older', slug: 'older', title: 'Older', messages: [makeMessage('old-message', 1, 'older')], handoff: null }, ...initial.segments] }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
+    const props = conversationNavStackSpy.mock.lastCall?.[0];
+    expect(props?.conversationId).toBe('pc-1');
+    expect(props?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { kind: 'restore_after_prefix_expansion', messageId: 'm-3', viewportStartOffset: 17, view: { conversationId: 'pc-1' } } });
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3');
+    expect((props?.messages as Message[]).map((message) => message.message_id)).toEqual(['old-message', 'm-1', 'm-2', 'cont-1', 'm-3', 'm-4', 'newest-message']);
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-1?source_transcript=row-1');
+  });
+
+  it('reissues acknowledged exact-message positioning on browser back/forward without refetching history', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })));
+    renderPage('/global/row-1?source_transcript=row-1#message-m-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    const first = (conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning as { command: { token: number } }).command.token;
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'jump latest message' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-3' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning as { command: { token: number } }).command.token).toBeGreaterThan(first);
+    expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(1);
+  });
+
   beforeEach(async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockReset();
@@ -804,7 +891,7 @@ describe('ProductConversationPage', () => {
     expect(messages.at(-1)?.message_id).toBe('aligned-prefix-terminal-assistant');
     expect(props.pendingMessages).toEqual([]);
     expect(props.convState).toEqual({ type: 'idle' });
-    expect(props.conversationId).toBe('row-aligned-prefix-tail');
+    expect(props.conversationId).toBe('pc-aligned-prefix-tail');
   });
 
   it('refetches the authoritative aggregate when SSE changes member archive state', async () => {
@@ -896,15 +983,16 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'm-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4,product-handoff:pc-1:row-2:cont-2,m-5,m-6,product-handoff:pc-1:row-3:cont-3'
+        'm-1,m-2,cont-1,m-3,m-4,cont-2,m-5,m-6,cont-3'
       );
     });
-    expect(screen.getByTestId('message-types').textContent).toBe('user,agent,system,user,agent,system,user,agent,system');
+    expect(screen.getByTestId('message-types').textContent).toBe('user,agent,continuation,user,agent,continuation,user,agent,continuation');
     expect(screen.getByTestId('message-text-order').textContent).toContain('First handoff');
     expect(screen.getByTestId('message-text-order').textContent).toContain('Second handoff');
     expect(screen.getByTestId('message-text-order').textContent).toContain('Third handoff');
-    const messages = conversationNavStackSpy.mock.lastCall?.[0]?.['messages'] as Array<{ message_id: string }>;
-    expect(messages.filter((message) => message.message_id.includes('product-handoff:'))).toHaveLength(3);
+    const messages = conversationNavStackSpy.mock.lastCall?.[0]?.['messages'] as Message[];
+    expect(messages.filter((message) => message.message_type === 'continuation').map((message) => message.message_id)).toEqual(['cont-1', 'cont-2', 'cont-3']);
+    expect(messages.every((message) => message.sequence_id > 0)).toBe(true);
   });
 
   it('renders completed handoffs as the single typed segment boundary', async () => {
@@ -942,7 +1030,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'm-1,m-2,accepted-successor,product-handoff:pc-1:row-2:continuation-request'
+        'm-1,m-2,accepted-successor,continuation-request'
       );
     });
     expect(screen.getByTestId('message-text-order')).toHaveTextContent('Completed handoff');
@@ -1050,10 +1138,10 @@ describe('ProductConversationPage', () => {
     });
     const order = screen.getByTestId('message-order').textContent?.split(',') ?? [];
     expect(order[0]).toBe('m-1');
-    expect(order[35]).toBe('product-handoff:pc-1:row-1:cont-1');
-    expect(order[71]).toBe('product-handoff:pc-1:row-2:cont-2');
+    expect(order[35]).toBe('cont-1');
+    expect(order[71]).toBe('cont-2');
     expect(order[111]).toBe('m-110');
-    expect(order.at(-1)).toBe('product-handoff:pc-1:row-3:cont-3');
+    expect(order.at(-1)).toBe('cont-3');
     expect(new Set(order).size).toBe(order.length);
   });
 
@@ -1361,7 +1449,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'm-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4,live-sent,live-streamed,product-handoff:pc-1:row-2:cont-2'
+        'm-1,m-2,cont-1,m-3,m-4,live-sent,live-streamed'
       );
       expect(conversationNavStackSpy.mock.lastCall?.[0]?.['pendingMessages']).toEqual([
         expect.objectContaining({ localId: 'pending-local', status: 'pending' }),
@@ -1378,7 +1466,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => {
       const props = conversationNavStackSpy.mock.lastCall?.[0] as Record<string, unknown>;
       expect(props['slug']).toBe('row-2');
-      expect(props['conversationId']).toBe('row-2');
+      expect(props['conversationId']).toBe('pc-1');
       expect(props['workScopeKey']).toBe('ws-latest');
     });
   });
@@ -1651,7 +1739,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
-    expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4');
+    expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,cont-1,m-3,m-4');
     expect(screen.getByTestId('message-order').textContent?.split(',').filter((id) => id === 'old-message')).toHaveLength(1);
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({ kind: 'idle' }));
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false);
@@ -1811,7 +1899,7 @@ describe('ProductConversationPage', () => {
 
     expect(screen.getByTestId('product-conversation-history')).toHaveTextContent('History is read-only.');
     expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
-    expect(screen.getByTestId('message-order')).toHaveTextContent('product-handoff:pc-1:row-1:cont-1');
+    expect(screen.getByTestId('message-order')).toHaveTextContent('cont-1');
   });
 
   it('keeps aggregate transcript viewer actions reachable while the aggregate route owns placement', async () => {
@@ -1913,7 +2001,7 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
     fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
 
-    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4'));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,cont-1,m-3,m-4'));
     expect(vi.mocked(api.getProductConversationSnapshot).mock.calls.slice(1, 4)).toEqual([
       ['pc-1', { message_limit: 100, before: 'cursor-1' }],
       ['pc-1', { message_limit: 100 }],
@@ -1964,7 +2052,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(4));
     fireEvent.click(screen.getByRole('button', { name: 'load older' }));
 
-    const expected = 'recovered,older-0,older-1,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4';
+    const expected = 'recovered,older-0,older-1,m-1,m-2,cont-1,m-3,m-4';
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(expected));
     const ids = screen.getByTestId('message-order').textContent?.split(',') ?? [];
     expect(new Set(ids).size).toBe(ids.length);

@@ -41,7 +41,23 @@ import {
   subscribeProductConversationsReconciled,
 } from '../notifications';
 import { generateUUID } from '../utils/uuid';
+import type { ProductConversationSegmentView } from '../generated/ProductConversationSegmentView';
+import type { CoordinatorConversationSnapshotView } from '../generated/CoordinatorConversationSnapshotView';
+import type { ComponentProps } from 'react';
 import './ProductConversationPage.css';
+
+type HistorySnapshot =
+  | (ProductConversationSnapshotView & { kind: 'ordinary' })
+  | (CoordinatorConversationSnapshotView & { kind: 'coordinator' });
+type HistoryOptions = Parameters<typeof api.getProductConversationSnapshot>[1];
+async function fetchOrdinarySnapshot(reference: string, options: HistoryOptions): Promise<HistorySnapshot> {
+  return { kind: 'ordinary', ...await api.getProductConversationSnapshot(reference, options) };
+}
+async function fetchCoordinatorSnapshot(reference: string, options: HistoryOptions): Promise<HistorySnapshot> {
+  return { kind: 'coordinator', ...await api.getCoordinatorHistory(reference, options) };
+}
+type HistoryPageProps = { productId?: string | undefined; globalShell?: { composerQuickAction: ComponentProps<typeof EmbeddedConversationPage>['composerQuickAction']; stateBarExtension: ComponentProps<typeof EmbeddedConversationPage>['stateBarExtension'] } };
+
 
 const PAGE_SIZE = 100;
 const MessageViewer = lazy(() =>
@@ -81,19 +97,20 @@ function RetryTranscriptHydrationOwner({ conversationId }: { conversationId: str
 async function fetchOlderSnapshotWithFreshCursor(
   productConversationId: string,
   before: string,
-): Promise<{ older: ProductConversationSnapshotView; refreshedTail?: ProductConversationSnapshotView }> {
+  coordinator: boolean,
+): Promise<{ older: HistorySnapshot; refreshedTail?: HistorySnapshot }> {
   try {
-    return { older: await api.getProductConversationSnapshot(productConversationId, {
+    return { older: await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, {
       message_limit: PAGE_SIZE,
       before,
     }) };
   } catch (error) {
     if (!(error instanceof ApiResponseError) || error.status !== 400) throw error;
-    const refreshed = await api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
+    const refreshed = await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, { message_limit: PAGE_SIZE });
     if (!refreshed.has_older || !refreshed.before) throw error;
     return {
       refreshedTail: refreshed,
-      older: await api.getProductConversationSnapshot(productConversationId, {
+      older: await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, {
         message_limit: PAGE_SIZE,
         before: refreshed.before,
       }),
@@ -103,13 +120,13 @@ async function fetchOlderSnapshotWithFreshCursor(
 
 type OwnedSnapshot = {
   productConversationId: string;
-  value: ProductConversationSnapshotView;
+  value: HistorySnapshot;
 };
 
 type ProductConversationOpenMeasurement = {
   openId: string;
   routeReference: string;
-  request: Promise<ProductConversationSnapshotView> | undefined;
+  request: Promise<HistorySnapshot> | undefined;
   startedAt: number;
   snapshotReceivedAt?: number;
   storeReadyAt?: number;
@@ -169,44 +186,32 @@ function toMessage(message: EnrichedMessage, occurrenceToken?: string): Message 
   };
 }
 
-function sortSegments(snapshot: ProductConversationSnapshotView) {
+function sortSegments(snapshot: HistorySnapshot) {
   return snapshot.segments
     .slice()
     .sort((a, b) => a.segment_ordinal - b.segment_ordinal);
 }
 
-function makeHandoffMessage(snapshot: ProductConversationSnapshotView, segmentOrdinal: number): Message | null {
-  const segment = sortSegments(snapshot).find((candidate) => candidate.segment_ordinal === segmentOrdinal);
-  if (!segment?.handoff) return null;
-  return {
-    message_id: `product-handoff:${snapshot.product_conversation_id}:${segment.transcript_row_id}:${segment.handoff.continuation_message_id}`,
-    conversation_id: snapshot.product_conversation_id,
-    sequence_id: Number.MIN_SAFE_INTEGER + segment.segment_ordinal,
-    message_type: 'system',
-    content: { text: segment.handoff.summary },
-    display_data: {
-      productHistoricalHandoff: {
-        predecessor_transcript_row_id: segment.handoff.predecessor_transcript_row_id,
-        successor_transcript_row_id: segment.handoff.successor_transcript_row_id,
-        continuation_message_id: segment.handoff.continuation_message_id,
-        segment_ordinal: segment.segment_ordinal,
-      },
-    },
-    created_at: segment.messages[0]?.created_at ?? snapshot.updated_at,
-  };
+function toSegmentMessage(segment: ProductConversationSegmentView, enriched: EnrichedMessage): Message {
+  const message = toMessage(enriched, productOccurrenceToken(segment.transcript_row_id, enriched.message_id));
+  if (segment.handoff?.continuation_message_id !== message.message_id) return message;
+  return { ...message, display_data: { ...message.display_data, productHistoricalHandoff: {
+    predecessor_transcript_row_id: segment.handoff.predecessor_transcript_row_id,
+    successor_transcript_row_id: segment.handoff.successor_transcript_row_id,
+    continuation_message_id: message.message_id,
+    segment_ordinal: segment.segment_ordinal,
+  } } };
 }
 
-function isLatestSegment(snapshot: ProductConversationSnapshotView, transcriptRowId: string): boolean {
+function isLatestSegment(snapshot: HistorySnapshot, transcriptRowId: string): boolean {
   return transcriptRowId === snapshot.latest_transcript_row_id;
 }
 
-function flattenHistoricalMessages(snapshot: ProductConversationSnapshotView): Message[] {
+function flattenHistoricalMessages(snapshot: HistorySnapshot): Message[] {
   return sortSegments(snapshot)
     .flatMap((segment) => {
       if (isLatestSegment(snapshot, segment.transcript_row_id)) return [];
-      const handoffMessage = makeHandoffMessage(snapshot, segment.segment_ordinal);
-      const segmentMessages = segment.messages.map((message) => toMessage(message, productOccurrenceToken(segment.transcript_row_id, message.message_id)));
-      return handoffMessage ? [...segmentMessages, handoffMessage] : segmentMessages;
+      return segment.messages.map((message) => toSegmentMessage(segment, message));
     });
 }
 
@@ -249,25 +254,19 @@ function reconcileLatestTranscriptRowMessages(
 }
 
 function makeAggregateMessages(
-  snapshot: ProductConversationSnapshotView,
+  snapshot: HistorySnapshot,
   liveMessages: Message[] | null,
 ): Message[] {
   const historical = flattenHistoricalMessages(snapshot);
   if (!liveMessages) {
     const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
     const latestMessages = latestSegment
-      ? [
-        ...latestSegment.messages.map((message) => toMessage(message, productOccurrenceToken(latestSegment.transcript_row_id, message.message_id))),
-        ...(latestSegment.handoff
-          ? [makeHandoffMessage(snapshot, latestSegment.segment_ordinal)!]
-          : []),
-      ]
+      ? latestSegment.messages.map((message) => toSegmentMessage(latestSegment, message))
       : [];
     return [...historical, ...latestMessages];
   }
   const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
-  const latestHandoff = latestSegment ? makeHandoffMessage(snapshot, latestSegment.segment_ordinal) : null;
-  const latestSnapshotMessages = latestSegment?.messages.map((message) => toMessage(message, productOccurrenceToken(latestSegment.transcript_row_id, message.message_id))) ?? [];
+  const latestSnapshotMessages = latestSegment?.messages.map((message) => toSegmentMessage(latestSegment, message)) ?? [];
   return [
     ...historical,
     ...reconcileLatestTranscriptRowMessages(
@@ -275,14 +274,13 @@ function makeAggregateMessages(
       liveMessages,
       snapshot.latest_transcript_row_id,
     ),
-    ...(latestHandoff ? [latestHandoff] : []),
   ];
 }
 
 function mergeOlderSegments(
-  current: ProductConversationSnapshotView,
-  older: ProductConversationSnapshotView,
-): ProductConversationSnapshotView {
+  current: HistorySnapshot,
+  older: Pick<HistorySnapshot, 'segments' | 'before' | 'has_older'>,
+): HistorySnapshot {
   const mergedByRowId = new Map(current.segments.map((segment) => [segment.transcript_row_id, segment]));
 
   for (const olderSegment of older.segments) {
@@ -304,7 +302,6 @@ function mergeOlderSegments(
 
   return {
     ...current,
-    ...older,
     segments: Array.from(mergedByRowId.values()).sort((a, b) => a.segment_ordinal - b.segment_ordinal),
     before: older.before,
     has_older: older.has_older,
@@ -312,9 +309,9 @@ function mergeOlderSegments(
 }
 
 function mergeRefreshedTail(
-  current: ProductConversationSnapshotView,
-  refreshed: ProductConversationSnapshotView,
-): ProductConversationSnapshotView {
+  current: HistorySnapshot,
+  refreshed: HistorySnapshot,
+): HistorySnapshot {
   const segmentsByRowId = new Map(
     refreshed.segments.map((segment) => [segment.transcript_row_id, segment]),
   );
@@ -358,7 +355,7 @@ function mergeRefreshedTail(
   };
 }
 
-function aggregateConversationState(snapshot: ProductConversationSnapshotView, loadingOlder: boolean, olderError: string | null): ConversationState {
+function aggregateConversationState(snapshot: HistorySnapshot, loadingOlder: boolean, olderError: string | null): ConversationState {
   if (olderError) {
     return { type: 'error', message: olderError, error_kind: 'server_error' };
   }
@@ -378,7 +375,7 @@ function aggregateConversationState(snapshot: ProductConversationSnapshotView, l
   return parseConversationState(maybeState);
 }
 
-function countSnapshotMessages(snapshot: ProductConversationSnapshotView): number {
+function countSnapshotMessages(snapshot: Pick<ProductConversationSnapshotView, 'segments'>): number {
   return snapshot.segments.reduce((sum, segment) => sum + segment.messages.length, 0);
 }
 
@@ -766,11 +763,13 @@ function ProductConversationHeader({
   );
 }
 
-export function ProductConversationPage({ productId }: { productId?: string | undefined } = {}) {
-  return <ProductConversationPageInner productId={productId} />;
+export function ProductConversationPage(props: HistoryPageProps = {}) {
+  return <ProductConversationPageInner {...props} />;
 }
 
-function ProductConversationPageInner({ productId }: { productId?: string | undefined }) {
+function ProductConversationPageInner({ productId, globalShell }: HistoryPageProps) {
+  const coordinator = globalShell !== undefined;
+  const fetchSnapshot = coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot;
   const conversationStore = useContext(ConversationContext);
   if (!conversationStore) throw new Error('Product conversation requires ConversationProvider');
   const params = useParams<{ productConversationId: string }>();
@@ -778,12 +777,19 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
   const viewerSlot = useViewerSlot();
   const location = useLocation();
   const hashTargetMessageId = decodeMessageHash(location.hash);
+  const scrollCommandTokenRef = useRef(0);
+  const hashNavigationRef = useRef({ key: '', token: 0 });
+  if (hashNavigationRef.current.key !== location.key) {
+    hashNavigationRef.current = { key: location.key, token: ++scrollCommandTokenRef.current };
+  }
+  const [handledHashKey, setHandledHashKey] = useState<string | null>(null);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
   const ownedSnapshotRef = useRef<OwnedSnapshot | null>(null);
   const snapshotChangeSequenceRef = useRef(0);
   const snapshot = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
     ? ownedSnapshot.value
     : null;
+  const ordinarySnapshot = snapshot?.kind === 'ordinary' ? snapshot : null;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [snapshotRetry, setSnapshotRetry] = useState(0);
@@ -792,6 +798,10 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     window.addEventListener('phoenix:automatic-continuation-updated', refresh);
     return () => window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
   }, []);
+  useEffect(() => {
+    setRestoreCommand(null);
+    setOlderError(null);
+  }, [location.key]);
   const [openSnapshotGeneration, setOpenSnapshotGeneration] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
@@ -823,8 +833,8 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     && latestProjection?.conversationId === snapshot.latest_transcript_row_id
     ? latestProjection
     : null;
-  const isOpen = snapshot?.ordinary_lifecycle === 'open';
-  const closeIncomplete = snapshot?.close?.outcome === 'close_incomplete';
+  const isOpen = !!snapshot && (!ordinarySnapshot || ordinarySnapshot.ordinary_lifecycle === 'open');
+  const closeIncomplete = ordinarySnapshot?.close?.outcome === 'close_incomplete';
   const liveTranscriptRowId = isOpen && !closeIncomplete && transcriptAuthority?.kind === 'live'
     ? snapshot.latest_transcript_row_id : null;
   const memberTranscript = useConversationTranscriptView(liveTranscriptRowId);
@@ -888,11 +898,11 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
       ? candidateMeasurement
       : null;
     const request = measurement
-      ? (measurement.request ??= api.getProductConversationSnapshot(productConversationId, {
+      ? (measurement.request ??= fetchSnapshot(productConversationId, {
           message_limit: PAGE_SIZE,
           open_id: measurement.openId,
         }))
-      : api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
+      : fetchSnapshot(productConversationId, { message_limit: PAGE_SIZE });
     request
       .then((next) => {
         if (cancelled || aggregateDeletedRef.current) return;
@@ -909,7 +919,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
         }
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
-        conversationStore.observeProductConversationSnapshot(next);
+        if (next.kind === 'ordinary') conversationStore.observeProductConversationSnapshot(next);
         setOwnedSnapshot((current) => ({
           productConversationId,
           value: current?.productConversationId === productConversationId
@@ -947,7 +957,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     return () => {
       cancelled = true;
     };
-  }, [conversationStore, productConversationId, snapshotRetry]);
+  }, [conversationStore, fetchSnapshot, productConversationId, snapshotRetry]);
 
   useEffect(() => {
     const canonicalId = snapshot?.product_conversation_id;
@@ -1022,32 +1032,32 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     ].filter((id): id is string => Boolean(id)));
     if (notificationIds.size === 0) return;
     const refresh = (source: 'close' | 'stream') => {
-      const closeNeedsLiveRefresh = snapshot?.close != null
-        && (snapshot.close.phase !== 'completed'
-          || snapshot.close.outcome === 'close_incomplete'
-          || snapshot.close.outcome === 'archived_cleanup_attention');
+      const closeNeedsLiveRefresh = ordinarySnapshot?.close != null
+        && (ordinarySnapshot.close.phase !== 'completed'
+          || ordinarySnapshot.close.outcome === 'close_incomplete'
+          || ordinarySnapshot.close.outcome === 'archived_cleanup_attention');
       if (source === 'close' || closeNeedsLiveRefresh) setSnapshotRetry((retry) => retry + 1);
     };
     const unsubscribes = [...notificationIds].map((id) =>
       subscribeCloseSnapshotChanged(id, refresh));
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
-  }, [productConversationId, snapshot]);
+  }, [ordinarySnapshot?.close, productConversationId, snapshot]);
 
   useEffect(() => {
-    if (!currentLatestProjection?.conversationId || !snapshot) return;
+    if (!currentLatestProjection?.conversationId || !ordinarySnapshot) return;
     const previous = observedMemberProjectionRef.current;
     observedMemberProjectionRef.current = currentLatestProjection;
     const lifecycleMismatch = currentLatestProjection.serverArchived
-      !== (snapshot.ordinary_lifecycle === 'history');
+      !== (ordinarySnapshot?.ordinary_lifecycle === 'history');
     const projectionChanged = previous !== currentLatestProjection;
     if (lifecycleMismatch && projectionChanged) {
       setSnapshotRetry((retry) => retry + 1);
     }
-  }, [currentLatestProjection, snapshot]);
+  }, [currentLatestProjection, ordinarySnapshot]);
 
   useEffect(() => {
     const projection = currentLatestProjection;
-    if (!projection?.conversationId || snapshot?.ordinary_lifecycle === 'history') {
+    if (!projection?.conversationId || ordinarySnapshot?.ordinary_lifecycle === 'history') {
       setTaskApprovalOverlay(null);
       setApprovalContextWindowUsed(null);
       return;
@@ -1076,7 +1086,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     return () => {
       cancelled = true;
     };
-  }, [currentLatestProjection, currentMemberTranscript?.phase, snapshot?.ordinary_lifecycle]);
+  }, [currentLatestProjection, currentMemberTranscript?.phase, ordinarySnapshot?.ordinary_lifecycle]);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -1095,7 +1105,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     const routeGeneration = routeGenerationRef.current;
     const requestGeneration = ++paginationRequestRef.current;
     const requestView = {
-      conversationId: currentLatestProjection?.conversationId ?? snapshot.product_conversation_id,
+      conversationId: snapshot.product_conversation_id,
       generation: historyGeneration,
       transcriptGeneration: historyGeneration,
     };
@@ -1103,13 +1113,17 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     setLoadingOlder(true);
     setOlderError(null);
     try {
-      const { older, refreshedTail } = await fetchOlderSnapshotWithFreshCursor(productConversationId, snapshot.before);
+      const { older, refreshedTail } = await fetchOlderSnapshotWithFreshCursor(productConversationId, snapshot.before, coordinator);
       if (routeGenerationRef.current !== routeGeneration || paginationRequestRef.current !== requestGeneration) return;
-      if (refreshedTail) conversationStore.observeProductConversationSnapshot(refreshedTail);
+      if (ownedSnapshotRef.current?.value === snapshot && refreshedTail?.kind === 'ordinary') {
+        conversationStore.observeProductConversationSnapshot(refreshedTail);
+      }
       setOwnedSnapshot((current) => {
         if (!current || current.productConversationId !== ownerId) return current;
-        const authoritativeTail = refreshedTail
-          ? mergeRefreshedTail(current.value, refreshedTail)
+        const authoritativeTail = current.value === snapshot
+          ? (refreshedTail
+            ? mergeRefreshedTail(current.value, refreshedTail)
+            : { ...older, segments: current.value.segments })
           : current.value;
         return { productConversationId: ownerId, value: mergeOlderSegments(authoritativeTail, older) };
       });
@@ -1119,7 +1133,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
           kind: 'positioning',
           command: {
             kind: 'restore_after_prefix_expansion',
-            token: requestGeneration,
+            token: ++scrollCommandTokenRef.current,
             requestToken: requestGeneration,
             view: {
               ...requestView,
@@ -1140,36 +1154,36 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
         setLoadingOlder(false);
       }
     }
-  }, [conversationStore, currentLatestProjection?.conversationId, historyGeneration, loadingOlder, productConversationId, snapshot]);
+  }, [conversationStore, coordinator, historyGeneration, loadingOlder, productConversationId, snapshot]);
 
   const messages = aggregateMessages;
-  const cleanupAttention = snapshot?.close?.outcome === 'archived_cleanup_attention';
+  const cleanupAttention = ordinarySnapshot?.close?.outcome === 'archived_cleanup_attention';
   const closeNeedsLiveUpdateOwner = closeIncomplete || cleanupAttention;
-  const closeInProgress = snapshot?.close != null && (snapshot.close.phase !== 'completed' || closeIncomplete);
+  const closeInProgress = ordinarySnapshot?.close != null && (ordinarySnapshot.close.phase !== 'completed' || closeIncomplete);
   const convState = useMemo(
-    () => snapshot?.ordinary_lifecycle === 'history' || closeInProgress
+    () => ordinarySnapshot?.ordinary_lifecycle === 'history' || closeInProgress
       ? ({ type: 'idle' } satisfies ConversationState)
       : currentMemberTranscript?.phase ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
-    [closeInProgress, currentMemberTranscript?.phase, loadingOlder, olderError, snapshot],
+    [closeInProgress, currentMemberTranscript?.phase, loadingOlder, olderError, ordinarySnapshot?.ordinary_lifecycle, snapshot],
   );
   const latestSlug = snapshot?.latest_transcript_row_id ?? null;
   const latestConversationId = currentLatestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
-  const latestWorkScopeKey = snapshot?.ordinary_lifecycle === 'open'
+  const latestWorkScopeKey = isOpen
     ? currentLatestProjection?.conversation?.work_scope_key
     : undefined;
   const transcriptView = {
-    conversationId: latestConversationId ?? snapshot?.product_conversation_id ?? '',
+    conversationId: snapshot?.product_conversation_id ?? '',
     generation: historyGeneration,
     transcriptGeneration: historyGeneration,
   };
   const hashTargetLoaded = !!hashTargetMessageId && messages.some((message) => message.message_id === hashTargetMessageId);
   const hashTargetExhausted = !!hashTargetMessageId && !hashTargetLoaded && snapshot?.has_older === false;
-  const transcriptPositioning = restoreCommand ?? (hashTargetLoaded
+  const transcriptPositioning = restoreCommand ?? (hashTargetLoaded && handledHashKey !== location.key
     ? {
       kind: 'positioning' as const,
       command: {
         kind: 'jump_to_message' as const,
-        token: 1,
+        token: hashNavigationRef.current.token,
         requestToken: 0,
         view: transcriptView,
         targetMessageId: hashTargetMessageId,
@@ -1230,7 +1244,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
         {fallbackSlug && (
           <EmbeddedConversationPage
             slug={fallbackSlug}
-            routePrefix="/c"
+            routePrefix={coordinator ? "/global" : "/c"}
             suppressCanonicalization
             mutationEnabled={false}
             aggregateLifecycleOpen={false}
@@ -1245,28 +1259,28 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
       className={`product-conversation-page${showSplitPaneViewer ? ' product-conversation-page--split-pane' : ''}`}
       data-testid="product-conversation-page"
     >
-      <ProductConversationHeader
-        snapshot={snapshot}
+      {ordinarySnapshot && <ProductConversationHeader
+        snapshot={ordinarySnapshot}
         productConversationId={snapshot.product_conversation_id}
         messages={messages}
         recallDisabled={!liveControlsEnabled}
-      />
-      {snapshot.close && (snapshot.close.outcome === 'archived_cleanup_attention' || closeIncomplete) && (
+      />}
+      {ordinarySnapshot?.close && (ordinarySnapshot.close.outcome === 'archived_cleanup_attention' || closeIncomplete) && (
         <section className="product-conversation-page__close-status" role="alert" aria-label="Close status">
           <strong>{closeIncomplete
             ? 'Close incomplete — shutdown could not be confirmed'
             : 'Closed — cleanup needs attention'}</strong>
-          <div>Run {snapshot.close.run_ordinal} · {snapshot.close.run_status}. No automatic retry.</div>
-          {snapshot.close.failure && (
+          <div>Run {ordinarySnapshot.close.run_ordinal} · {ordinarySnapshot.close.run_status}. No automatic retry.</div>
+          {ordinarySnapshot.close.failure && (
             <>
-              <div>{snapshot.close.failure.reason.replaceAll('_', ' ')} — {snapshot.close.failure.detail}</div>
-              <div>{snapshot.close.failure.stop_certainty.kind === 'conversation_and_processes_stopped'
+              <div>{ordinarySnapshot.close.failure.reason.replaceAll('_', ' ')} — {ordinarySnapshot.close.failure.detail}</div>
+              <div>{ordinarySnapshot.close.failure.stop_certainty.kind === 'conversation_and_processes_stopped'
                 ? 'Conversation and processes stopped.' : 'Shutdown uncertain.'}</div>
-              <div>Failure <code>{snapshot.close.failure.occurrence_id}</code></div>
+              <div>Failure <code>{ordinarySnapshot.close.failure.occurrence_id}</code></div>
               <details>
-                <summary>Remaining resources ({snapshot.close.failure.remaining_resources.length})</summary>
+                <summary>Remaining resources ({ordinarySnapshot.close.failure.remaining_resources.length})</summary>
                 <ol>
-                  {snapshot.close.failure.remaining_resources.map((resource, ordinal) => (
+                  {ordinarySnapshot.close.failure.remaining_resources.map((resource, ordinal) => (
                     <li key={ordinal}>
                       <code>{resource.scope}: {resource.resource_kind.replaceAll('_', ' ')} · {resource.identity}</code>
                       {' · '}{resource.disposition}
@@ -1286,6 +1300,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
       <section className="view active product-conversation-page__transcript" data-testid="product-conversation-transcript">
         <ConversationNavStack
           messages={messages}
+          historyBoundaries={snapshot.boundaries}
           streamingRequestId={closeInProgress ? null : currentMemberTranscript?.streamingRequestId ?? null}
           pendingMessages={aggregatePendingMessages}
           convState={convState}
@@ -1300,7 +1315,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
           reactionDestination={liveControlsEnabled && currentLatestProjection?.appendInlineReactionToComposer
             ? { append: currentLatestProjection.appendInlineReactionToComposer }
             : undefined}
-          conversationId={latestConversationId ?? snapshot.product_conversation_id}
+          conversationId={snapshot.product_conversation_id}
           slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
           hasOlderMessages={snapshot.has_older}
           onLoadOlderMessages={snapshot.has_older ? loadOlderMessages : undefined}
@@ -1308,6 +1323,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
           olderHistoryError={olderError}
           transcriptPositioning={transcriptPositioning}
           onHistoryScrollCommandHandled={(token) => {
+            if (token === hashNavigationRef.current.token) setHandledHashKey(hashNavigationRef.current.key);
             setRestoreCommand((current) => (
               current?.kind === 'positioning' && current.command.token === token ? null : current
             ));
@@ -1336,6 +1352,9 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
             mutationEnabled={liveControlsEnabled}
             aggregateLifecycleOpen={isOpen}
             onProjectionChange={setLatestProjection}
+            routePrefix={coordinator ? "/global" : "/c"}
+            composerQuickAction={globalShell?.composerQuickAction}
+            stateBarExtension={globalShell?.stateBarExtension}
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
         </div>

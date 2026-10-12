@@ -378,6 +378,32 @@ pub struct ProductConversationSnapshotView {
     pub source: Option<ProductConversationSourceView>,
     pub chain_qa_compatibility: Option<ProductConversationChainQaCompatibilityView>,
     pub segments: Vec<ProductConversationSegmentView>,
+    pub boundaries: Vec<ConversationHistoryBoundaryView>,
+    pub before: Option<String>,
+    pub has_older: bool,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConversationHistoryBoundaryView {
+    pub message_id: String,
+    pub predecessor_transcript_row_id: String,
+    pub successor_transcript_row_id: String,
+    pub segment_ordinal: i64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CoordinatorConversationSnapshotView {
+    pub product_conversation_id: String,
+    pub canonical_route: String,
+    pub requested_transcript_row_id: String,
+    pub canonical_root: ProductConversationTranscriptRowView,
+    pub latest_transcript_row_id: String,
+    pub writable_transcript_row_id: Option<String>,
+    pub updated_at: String,
+    pub segments: Vec<ProductConversationSegmentView>,
+    pub boundaries: Vec<ConversationHistoryBoundaryView>,
     pub before: Option<String>,
     pub has_older: bool,
 }

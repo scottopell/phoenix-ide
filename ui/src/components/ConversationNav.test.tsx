@@ -52,3 +52,26 @@ describe('ConversationNav input provenance', () => {
     expect(onJump).toHaveBeenCalledWith(2);
   });
 });
+
+describe('aggregate boundary navigation', () => {
+  it('uses one exact boundary identity before and after its chronological unit loads', () => {
+    const boundary = { message_id: 'exact-continuation', predecessor_transcript_row_id: 'predecessor', successor_transcript_row_id: 'successor', segment_ordinal: 0 };
+    const jump = vi.fn();
+    const boundaryJump = vi.fn();
+    const { rerender } = render(<ConversationNav chapters={[]} activeUnitIndex={null} onJump={jump} historyBoundaries={[boundary]} onJumpBoundary={boundaryJump} />);
+    fireEvent.keyDown(screen.getByRole('button', { name: /Load context boundary/ }), { key: 'Enter' });
+    expect(boundaryJump).toHaveBeenLastCalledWith('exact-continuation');
+    const loaded = buildConversationChapters([{ kind: 'continuation', key: 'exact-continuation', message: {
+      message_id: 'exact-continuation', conversation_id: 'predecessor', sequence_id: 42,
+      message_type: 'continuation', content: { summary: 'summary stays in the transcript disclosure' }, created_at: '',
+    } }]);
+    rerender(<ConversationNav chapters={loaded} activeUnitIndex={0} onJump={jump} historyBoundaries={[boundary]} onJumpBoundary={boundaryJump} />);
+    expect(screen.getAllByRole('button')).toHaveLength(1);
+    const marker = screen.getByRole('button', { name: /Context boundary: predecessor/ });
+    expect(marker).toHaveClass('boundary', 'active');
+    expect(marker).not.toHaveTextContent('summary stays');
+    fireEvent.click(marker);
+    expect(boundaryJump).toHaveBeenLastCalledWith('exact-continuation');
+    expect(jump).not.toHaveBeenCalled();
+  });
+});

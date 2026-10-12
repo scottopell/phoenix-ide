@@ -20,14 +20,13 @@ import type { InputOrigin } from '../api';
 import type { HistoricalUnit } from './renderUnits';
 import { isSignificantText } from '../hooks/useDensity';
 
-export type ChapterKind = 'prompt' | 'prose';
+export type ChapterKind = 'prompt' | 'prose' | 'boundary';
 
-export interface Chapter {
+interface ChapterBase {
   /** Index of this chapter's unit within the `historicalUnits` array — i.e.
    *  its VirtualTranscript item index (tail units always follow historical units, so
    *  a historical unit's index is identical in both coordinate spaces). */
   unitIndex: number;
-  kind: ChapterKind;
   /** Truncated prompt / first line of prose, for the pill label. */
   label: string;
   /** Sequence id of the underlying message, when present — used for
@@ -37,6 +36,11 @@ export interface Chapter {
   /** Present only on input chapters; retained across render-unit rebuilding. */
   origin?: InputOrigin;
 }
+
+export type Chapter = ChapterBase & (
+  | { kind: 'prompt' | 'prose'; messageId?: never; transcriptId?: never }
+  | { kind: 'boundary'; messageId: string; transcriptId: string }
+);
 
 const LABEL_MAX_CHARS = 40;
 
@@ -98,6 +102,17 @@ export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Ch
           // messages carry their own authoritative origin and never use this
           // fallback. Steering status does not change the local API channel.
           origin: unit.message.origin ?? (unit.kind === 'pending_user' ? { kind: 'user_api' } : { kind: 'unknown_historical' }),
+        });
+        break;
+      }
+      case 'continuation': {
+        chapters.push({
+          unitIndex,
+          kind: 'boundary',
+          label: 'Context boundary',
+          sequenceId: unit.message.sequence_id,
+          messageId: unit.message.message_id,
+          transcriptId: unit.message.conversation_id,
         });
         break;
       }

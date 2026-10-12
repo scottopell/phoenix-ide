@@ -305,3 +305,19 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
     }
   });
 });
+
+describe('continuous history boundaries', () => {
+  it('uses the same continuation unit as scrolling, retaining its exact message identity', () => {
+    const message: Message = {
+      message_id: 'handoff-exact', conversation_id: 'predecessor', sequence_id: 42,
+      message_type: 'continuation', content: { summary: 'handoff summary' }, created_at: '',
+    };
+    const chapters = buildConversationChapters([
+      userUnit('before', 'Earlier prompt'),
+      { kind: 'continuation', key: message.message_id, message },
+      userUnit('after', 'Later prompt'),
+    ]);
+    expect(chapters.map((chapter) => chapter.kind)).toEqual(['prompt', 'boundary', 'prompt']);
+    expect(chapters[1]).toMatchObject({ unitIndex: 1, messageId: 'handoff-exact', transcriptId: 'predecessor' });
+  });
+});

@@ -5,8 +5,8 @@ import { AutomaticContinuationControl } from '../components/AutomaticContinuatio
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
 
-const ConversationPage = lazy(() =>
-  import('./ConversationPage').then((module) => ({ default: module.ConversationPage })),
+const ProductConversationPage = lazy(() =>
+  import('./ProductConversationPage').then((module) => ({ default: module.ProductConversationPage })),
 );
 
 interface CoordinatorPageFixtureData {
@@ -143,6 +143,10 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const locationRef = useRef(location);
   locationRef.current = location;
   const { slug } = useParams<{ slug: string }>();
+  const sourceQuery = new URLSearchParams(location.search);
+  const sourcePins = sourceQuery.getAll('source_transcript');
+  const sourceSelectionKey = JSON.stringify([sourcePins, sourcePins.length === 0 && sourceQuery.has('source_tool')]);
+  const [resolvedSourceSelectionKey, setResolvedSourceSelectionKey] = useState(sourceSelectionKey);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
@@ -151,7 +155,6 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [runningCount, setRunningCount] = useState<ActivityCount>(null);
   const [automaticContinuationStatus, setAutomaticContinuationStatus] = useState('…');
   const [automaticContinuationNeedsAttention, setAutomaticContinuationNeedsAttention] = useState(false);
-  const consumedTopologyRevision = useRef(0);
 
   useEffect(() => {
     const refresh = () => setTopologyRevision((value) => value + 1);
@@ -162,7 +165,6 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   useEffect(() => {
     if (fixtureData) return;
     setLoading(true);
-    setResolvedCoordinatorId(null);
     let cancelled = false;
     setError(null);
     api.ensureGlobalCoordinator()
@@ -171,8 +173,6 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
-        const topologyChanged = topologyRevision > consumedTopologyRevision.current;
-        consumedTopologyRevision.current = topologyRevision;
         const query = new URLSearchParams(locationRef.current.search);
         const pins = query.getAll('source_transcript');
         const pinnedSource = pins.length > 0 || query.has('source_tool');
@@ -192,13 +192,13 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
             setError('Original source conversation unavailable');
             return;
           }
+          setResolvedSourceSelectionKey(sourceSelectionKey);
           setResolvedCoordinatorId(pin);
           if (slug !== pin) navigate(`/global/${pin}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
           return;
         }
-        if (topologyChanged && !pinnedSource && slug !== coordinator.conversation.id) {
-          navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
-        } else if (!slug || slug === coordinator.conversation.id) {
+        if (!slug || slug === coordinator.conversation.id) {
+          setResolvedSourceSelectionKey(sourceSelectionKey);
           setResolvedCoordinatorId(coordinator.conversation.id);
           if (!slug) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
         } else {
@@ -206,6 +206,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
             .then(({ coordinator_id }) => {
               if (cancelled) return;
               if (coordinator_id) {
+                setResolvedSourceSelectionKey(sourceSelectionKey);
                 setResolvedCoordinatorId(slug);
               } else if (pinnedSource) {
                 setError("Original source conversation unavailable");
@@ -227,7 +228,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [fixtureData, navigate, slug, topologyRevision, location.search]);
+  }, [fixtureData, navigate, slug, sourceSelectionKey, topologyRevision, location.search]);
 
   const handleAutomaticContinuationStatus = useCallback((status: string, requiresAttention: boolean) => {
     setAutomaticContinuationStatus(status);
@@ -263,9 +264,9 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
 
 
       <section className="coordinator-conversation" aria-label="Coordinator conversation">
-        {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (
+        {!error && resolvedSourceSelectionKey === sourceSelectionKey && slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
-            <ConversationPage routePrefix="/global" composerQuickAction={COORDINATOR_QUICK_ACTION} stateBarExtension={stateBarExtension} />
+            <ProductConversationPage productId={resolvedCoordinatorId ?? undefined} globalShell={{ composerQuickAction: COORDINATOR_QUICK_ACTION, stateBarExtension }} />
           </Suspense>
         ) : null}
       </section>

@@ -94,9 +94,10 @@ describe('ContextExhaustedHandoff', () => {
   it('presents a completed continuation as a reviewable historical boundary', () => {
     render(<CompletedContinuationBoundary summary={generated} />);
     const boundary = screen.getByRole('region', { name: 'Conversation continuation boundary' });
-    const review = screen.getByText('Review handoff');
+    const review = screen.getByText('Context boundary · Review handoff');
 
-    expect(boundary).toHaveTextContent('Conversation continued in the next segment');
+    expect(boundary).toHaveClass('conversation-history-boundary');
+    expect(boundary).not.toHaveClass('context-exhausted-banner');
     expect(review.closest('details')).not.toHaveAttribute('open');
     fireEvent.click(review);
     expect(review.closest('details')).toHaveAttribute('open');
@@ -113,7 +114,7 @@ describe('ContextExhaustedHandoff', () => {
       />,
     );
 
-    const review = screen.getByText('Review handoff');
+    const review = screen.getByText('Context boundary · Review handoff');
     expect(review.closest('details')).toHaveAttribute('open');
     expect(screen.getByText('operational').tagName).toBe('MARK');
     expect(screen.getByText('operational').closest('[data-fragment-id="message-text"]')).not.toBeNull();

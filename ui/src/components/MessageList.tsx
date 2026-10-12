@@ -377,6 +377,7 @@ function renderHistoricalUnit(
       );
     case 'continuation': {
       const summary = (unit.message.content as { summary?: string })?.summary;
+      const handoff = (unit.message.display_data as ProductHistoricalHandoffDisplayData | null)?.productHistoricalHandoff;
       if (!summary) return null;
       const revealedSummary = activeHighlight?.owner === 'message-text'
         ? renderHighlightedText(summary, activeHighlight.start, activeHighlight.end)
@@ -385,6 +386,7 @@ function renderHistoricalUnit(
         <div id={`message-${unit.message.message_id}`}>
           <CompletedContinuationBoundary
             summary={summary}
+            provenance={{ predecessor: unit.message.conversation_id, messageId: unit.message.message_id, ...(handoff ? { successor: handoff.successor_transcript_row_id } : {}) }}
             revealedSummary={revealedSummary}
             revealSummary={revealedSummary !== undefined}
           />

@@ -31,3 +31,10 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 ## Verification Notes
 
 Reconciled against `crates/phoenix-ide/src/api/handlers.rs`, `crates/phoenix-ide/src/api/lifecycle_handlers.rs`, `crates/phoenix-ide/src/api/chains.rs`, and `crates/phoenix-ide/src/api/sse.rs`.
+
+
+## Continuous History API Qualification
+
+REQ-API-030 is implemented in the dedicated Coordinator history read and shared aggregate paging projection. Its wire type intentionally has no ordinary lifecycle, Close, or work-action fields. Ordinary reads retain their existing domain gate. Navigation metadata covers all persisted boundaries, while message pages carry the original continuation records rather than synthetic system prose.
+
+The guarded cold `./dev.py codegen` run completed and generated the Coordinator/boundary TypeScript types. Three-member Coordinator database/router regressions are present; their focused execution, final-head CI, and independent review remain qualification gates. This source is not a production deployment record.

@@ -23,26 +23,27 @@ vi.mock('../api', async () => {
   return { ...actual, api: apiMock };
 });
 
-vi.mock('./ConversationPage', () => ({
-  ConversationPage: ({
-    routePrefix,
-    composerQuickAction,
-    stateBarExtension,
+vi.mock('./ProductConversationPage', () => ({
+  ProductConversationPage: ({
+    productId,
+    globalShell,
   }: {
-    routePrefix?: string;
-    composerQuickAction?: { label: string; compactLabel: string; prompt: string };
-    stateBarExtension?: { summary: React.ReactNode; details: React.ReactNode };
+    productId?: string;
+    globalShell?: {
+      composerQuickAction?: { label: string; compactLabel: string; prompt: string };
+      stateBarExtension?: { summary: React.ReactNode; details: React.ReactNode };
+    };
   }) => (
     <div>
-      Shared conversation runtime {routePrefix}
+      Shared conversation runtime /global <span data-testid="history-reference">{productId}</span>
       <div data-testid="mock-statebar">
-        {stateBarExtension?.summary}
-        {stateBarExtension?.details}
+        {globalShell?.stateBarExtension?.summary}
+        {globalShell?.stateBarExtension?.details}
       </div>
-      {composerQuickAction && (
-        <button type="button" data-prompt={composerQuickAction.prompt}>
-          {composerQuickAction.compactLabel}
-          <span className="sr-only">{composerQuickAction.label}</span>
+      {globalShell?.composerQuickAction && (
+        <button type="button" data-prompt={globalShell.composerQuickAction.prompt}>
+          {globalShell.composerQuickAction.compactLabel}
+          <span className="sr-only">{globalShell.composerQuickAction.label}</span>
         </button>
       )}
     </div>

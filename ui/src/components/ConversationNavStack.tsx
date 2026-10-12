@@ -1,4 +1,4 @@
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { memo, useCallback, useRef, useState } from 'react';
 import type { VirtualTranscriptRange } from './VirtualTranscript';
 import { MessageList, type MessageListHandle } from './MessageList';
@@ -6,13 +6,14 @@ import { ConversationNav } from './ConversationNav';
 import { resolveActiveUnitIndex } from './conversationNavSpy';
 import type { Chapter } from '../conversation/conversationChapters';
 import type { RestoreBasis } from '../conversation/historyExpansion';
+import type { ConversationHistoryBoundaryView } from '../generated/ConversationHistoryBoundaryView';
 
 /** Everything MessageList accepts, minus the wiring this stack owns
  *  (`onVisibleRangeChange`, `onChaptersChange`, and the imperative ref). */
 type StackProps = Omit<
   React.ComponentProps<typeof MessageList>,
   'onVisibleRangeChange' | 'onChaptersChange' | 'ref'
->;
+> & { historyBoundaries?: ConversationHistoryBoundaryView[] };
 
 /**
  * Coordinates the conversation nav strip with the virtualized message list.
@@ -22,8 +23,9 @@ type StackProps = Omit<
  * active index. Renders the nav as a fixed-height strip above the list.
  */
 export const ConversationNavStack = memo(function ConversationNavStack(props: StackProps) {
-  const { onLoadOlderMessages } = props;
+  const { onLoadOlderMessages, historyBoundaries, ...listProps } = props;
   const location = useLocation();
+  const navigate = useNavigate();
   const sourceToolId = new URLSearchParams(location.search).get('source_tool');
   let sourceCallTarget: { messageId: string; toolUseId: string } | null = null;
   if (sourceToolId && location.hash.startsWith('#message-')) {
@@ -64,10 +66,16 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
         chapters={chapters}
         activeUnitIndex={activeUnitIndex}
         onJump={handleJump}
+        historyBoundaries={historyBoundaries}
+        onJumpBoundary={(messageId) => {
+          const query = new URLSearchParams(location.search);
+          query.delete('source_tool');
+          navigate({ pathname: location.pathname, search: query.toString(), hash: `#message-${encodeURIComponent(messageId)}` });
+        }}
       />
       <MessageList
         ref={listRef}
-        {...props}
+        {...listProps}
         sourceCallTarget={sourceCallTarget}
         onLoadOlderMessages={onLoadOlderMessages ? handleLoadOlderMessages : undefined}
         onChaptersChange={handleChaptersChange}

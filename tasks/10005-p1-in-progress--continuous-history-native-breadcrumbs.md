@@ -20,3 +20,15 @@ Disclosure owner58cff20d owns #889 parser/markdown/disclosure rendering. Do not 
 
 ## Execution
 Isolated branch feat/continuous-conversation-history nested under coordinator evidence; preserve parent dirty tree. Implement through one dedicated owner and focused PR. No production changes. Builds use current host self-service reservations and capacity guards; source/light tests may progress independently. Do not mark done until implemented and qualified; release acceptance remains separately tracked in #780.
+
+
+## Implementation milestone — source and focused regressions
+
+- Global now consumes the same history page adapter as ordinary conversations through a dedicated Coordinator-only snapshot API. The API/DB read has no ordinary Close or lifecycle authority; ordinary mutation gates are unchanged.
+- Continuation records retain their real message IDs, transcript coordinates, timestamps, and chronology. Content-free aggregate boundary metadata supplies unloaded native navigation stops. The existing `ConversationNav`/`PillStrip` is the native web boundary surface; there is no separate `BreadcrumbBar` module in this tree.
+- The transcript viewport is aggregate-owned, while the latest writable member owns the embedded composer. Out-of-order older-page completion does not replace an already-adopted newer continuation projection. Exact pin/hash navigation and browser back/forward use the common positioning path.
+- Completed continuation markers are compact native boundary disclosures with summary and exact provenance on demand. Generic Markdown/disclosure parser and find-owner seams are untouched.
+- First executed regression: continuation chapter test failed with `prompt,prompt` instead of `prompt,boundary,prompt`; after implementation, all 16 chapter tests passed.
+- Focused UI milestone: 131/131 tests across aggregate/Global adapters, chapter selector, navigation stack, and boundary component; bounded no-emit TypeScript and focused ESLint passed.
+- Guarded cold `./dev.py codegen` completed at jobs=1, incremental=0. Its reservation was released only after process-group descendants were absent. Local evidence is protected under `.phoenix/evidence/continuous-history/` (Phoenix/server-local harness pointer, not portable evidence).
+- Still in progress: focused backend regression execution, native desktop/mobile rendered acceptance, independent exact-target review, integrated final-head CI, and reconciliation with the actual-main wake removal. No merge, deployment, or production operation has been performed by this owner.

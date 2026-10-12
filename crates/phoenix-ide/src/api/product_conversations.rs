@@ -18,7 +18,8 @@ use super::handlers::AppError;
 use super::types::{
     AutomaticContinuationAdmissionPhaseView, AutomaticContinuationAdmissionView,
     AutomaticContinuationAggregateView, AutomaticContinuationFailureView,
-    AutomaticContinuationView, OrdinaryProductConversationLifecycleView,
+    AutomaticContinuationView, ConversationHistoryBoundaryView,
+    CoordinatorConversationSnapshotView, OrdinaryProductConversationLifecycleView,
     ProductConversationChainQaCompatibilityView, ProductConversationCloseActionView,
     ProductConversationCloseInspectionView, ProductConversationCloseLossView,
     ProductConversationCloseOutcomeView, ProductConversationClosePhaseView,
@@ -156,6 +157,10 @@ struct AggregateSegmentCeiling {
 
 pub fn automatic_continuation_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/global/coordinator/history/:reference",
+            get(get_coordinator_history),
+        )
         .route(
             "/api/product-conversations/:reference/automatic-continuation",
             get(get_product_conversation_automatic_continuation)
@@ -435,6 +440,106 @@ pub async fn list_product_conversation_creations(
     }))
 }
 
+pub async fn get_coordinator_history(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<CoordinatorConversationSnapshotView>, AppError> {
+    let limit = message_limit(query.message_limit)?;
+    let cursor = query.before.as_deref().map(decode_cursor).transpose()?;
+    let ceilings = cursor.as_ref().map(|cursor| {
+        cursor
+            .segment_ceilings
+            .iter()
+            .map(|ceiling| ProductConversationSegmentCeiling {
+                transcript_row_id: ceiling.transcript_row_id.clone(),
+                tail_sequence_id: ceiling.tail_sequence_id,
+                tail_message_id: ceiling.tail_message_id.clone(),
+            })
+            .collect::<Vec<_>>()
+    });
+    let snapshot = state
+        .db
+        .read_coordinator_product_conversation_snapshot(
+            &reference,
+            cursor.as_ref().map(|cursor| {
+                (
+                    cursor.before_segment_ordinal,
+                    cursor.before_sequence_id,
+                    cursor.before_message_id.clone(),
+                )
+            }),
+            ceilings.as_deref(),
+            limit + 1,
+        )
+        .await
+        .map_err(db_to_app)?;
+    let aggregate = snapshot.aggregate;
+    if let Some(cursor) = &cursor {
+        validate_cursor(&aggregate, cursor)?;
+    }
+    let generation = aggregate_generation(&aggregate);
+    let ceilings = cursor.as_ref().map_or_else(
+        || aggregate_segment_ceilings(&aggregate),
+        |cursor| cursor.segment_ceilings.clone(),
+    );
+    let (messages, has_older, page, boundary_ids) =
+        aggregate_messages(&aggregate, snapshot.messages, limit);
+    let latest = &aggregate
+        .segments
+        .last()
+        .expect("aggregate has segment")
+        .transcript_row
+        .conversation;
+    let writable = (accepts_user_message_direct_or_steering(&latest.state)
+        && latest.continued_in_conv_id.is_none())
+    .then(|| latest.id.clone());
+    Ok(Json(CoordinatorConversationSnapshotView {
+        product_conversation_id: aggregate.product_conversation.id().to_string(),
+        canonical_route: format!("/global/{}", aggregate.latest_transcript_row_id),
+        requested_transcript_row_id: snapshot.requested_transcript_row_id,
+        canonical_root: ProductConversationTranscriptRowView {
+            transcript_row_id: aggregate.root.conversation.id.clone(),
+            slug: aggregate.root.conversation.slug.clone(),
+            title: aggregate.root.conversation.title.clone(),
+        },
+        latest_transcript_row_id: aggregate.latest_transcript_row_id.clone(),
+        writable_transcript_row_id: writable,
+        updated_at: aggregate.updated_at.to_rfc3339(),
+        segments: aggregate
+            .segments
+            .iter()
+            .map(|segment| segment_view(segment, &messages, &boundary_ids))
+            .collect(),
+        boundaries: history_boundaries(&aggregate),
+        before: has_older
+            .then(|| encode_cursor(&next_cursor(&aggregate, &generation, &ceilings, &page))),
+        has_older,
+    }))
+}
+
+fn history_boundaries(
+    aggregate: &ProductConversationAggregate,
+) -> Vec<ConversationHistoryBoundaryView> {
+    aggregate
+        .segments
+        .iter()
+        .filter_map(|segment| {
+            let handoff = segment.handoff.as_ref()?;
+            Some(ConversationHistoryBoundaryView {
+                message_id: handoff.continuation_message_id().to_owned(),
+                predecessor_transcript_row_id: segment.transcript_row.conversation.id.clone(),
+                successor_transcript_row_id: segment
+                    .transcript_row
+                    .conversation
+                    .continued_in_conv_id
+                    .clone()?,
+                segment_ordinal: segment.transcript_row.segment_ordinal,
+            })
+        })
+        .collect()
+}
+
 pub async fn get_product_conversation(
     State(state): State<AppState>,
     Path(reference): Path<String>,
@@ -694,6 +799,7 @@ async fn snapshot_view(
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         canonical_route: canonical_route(&aggregate),
         close,
+        boundaries: history_boundaries(&aggregate),
 
         requested_transcript_row_id,
         canonical_root: ProductConversationTranscriptRowView {
@@ -782,7 +888,15 @@ fn aggregate_messages(
     let mut by_segment = std::collections::HashMap::<String, Vec<_>>::new();
     for (ordinal, message) in &messages {
         let _ = ordinal;
-        if !boundary_message_ids.contains(message.message_id.as_str()) {
+        let duplicate_opening = aggregate
+            .segments
+            .iter()
+            .filter_map(|segment| segment.handoff.as_ref())
+            .any(|handoff| {
+                handoff.accepted_is_duplicate_summary()
+                    && handoff.accepted_successor_message_id() == Some(message.message_id.as_str())
+            });
+        if !duplicate_opening {
             by_segment
                 .entry(message.conversation_id.clone())
                 .or_default()
@@ -2130,6 +2244,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_history_uses_exact_boundaries_and_pages_without_ordinary_authority() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "global-root",
+                &root.id,
+                &MessageContent::user("root"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let middle =
+            create_completed_continuation(&state, &root, "global-boundary-0", "global-opening-1")
+                .await;
+        state
+            .db
+            .add_message(
+                "global-middle",
+                &middle.id,
+                &MessageContent::user("middle"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let latest =
+            create_completed_continuation(&state, &middle, "global-boundary-1", "global-opening-2")
+                .await;
+        state
+            .db
+            .add_message(
+                "global-latest",
+                &latest.id,
+                &MessageContent::user("latest"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut before = None;
+        let mut pages = Vec::new();
+        for _ in 0..10 {
+            let suffix = before
+                .as_ref()
+                .map_or_else(String::new, |cursor| format!("&before={cursor}"));
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/global/coordinator/history/{}?message_limit=2{suffix}",
+                            root.id
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let page: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert!(page.get("ordinary_lifecycle").is_none());
+            assert!(page.get("close").is_none());
+            assert!(page.get("work_identity").is_none());
+            assert_eq!(page["latest_transcript_row_id"], latest.id);
+            assert_eq!(page["boundaries"].as_array().unwrap().len(), 2);
+            assert_eq!(page["boundaries"][0]["message_id"], "global-boundary-0");
+            assert_eq!(page["boundaries"][1]["message_id"], "global-boundary-1");
+            let messages = page["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|segment| segment["messages"].as_array().unwrap())
+                .map(|message| message["message_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert!(messages.len() <= 2);
+            pages.push(messages);
+            before = page["before"].as_str().map(str::to_owned);
+            if before.is_none() {
+                break;
+            }
+        }
+        assert!(before.is_none(), "bounded fixture pagination exhausted");
+        let ids = pages.into_iter().rev().flatten().collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "global-root",
+                "global-boundary-0",
+                "global-opening-1",
+                "global-middle",
+                "global-boundary-1",
+                "global-opening-2",
+                "global-latest"
+            ]
+        );
+        let ordinary = state
+            .db
+            .create_conversation("ordinary", "ordinary", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let rejected = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/global/coordinator/history/{}", ordinary.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn router_lists_one_ordinary_row_and_resolves_member_snapshot() {
         let state = make_test_state().await;
         let root = state
@@ -2203,7 +2438,7 @@ mod tests {
             .unwrap()
             .iter()
             .flat_map(|segment| segment["messages"].as_array().unwrap())
-            .all(|message| message["message_id"] != "handoff"));
+            .any(|message| message["message_id"] == "handoff"));
         assert!(snapshot["segments"]
             .as_array()
             .unwrap()
@@ -2258,7 +2493,7 @@ mod tests {
             .unwrap()
             .iter()
             .flat_map(|segment| segment["messages"].as_array().unwrap())
-            .all(|message| message["message_id"] != "handoff"));
+            .any(|message| message["message_id"] == "handoff"));
     }
 
     #[tokio::test]
@@ -2333,7 +2568,7 @@ mod tests {
             .unwrap()
             .iter()
             .flat_map(|segment| segment["messages"].as_array().unwrap())
-            .all(|message| message["message_id"] != "legacy-handoff"));
+            .any(|message| message["message_id"] == "legacy-handoff"));
         assert!(snapshot["segments"]
             .as_array()
             .unwrap()
@@ -2723,7 +2958,13 @@ mod tests {
         seen.sort();
         assert_eq!(
             seen,
-            vec!["opening", "root-1", "successor-1", "successor-2"]
+            vec![
+                "opening",
+                "root-1",
+                "root-handoff",
+                "successor-1",
+                "successor-2"
+            ]
         );
         assert_eq!(seen_handoffs, vec!["root-handoff"]);
 

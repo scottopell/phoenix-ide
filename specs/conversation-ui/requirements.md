@@ -620,9 +620,15 @@ AND assign the strip a single fixed role that does not change between cold load 
 THE SYSTEM SHALL treat as a chapter every user prompt except inputs whose stored provenance is a subscription event, and every assistant text block at or above the significance threshold (REQ-CONV-022)
 AND SHALL exclude subscription-event inputs from navigation stops without removing them from the chronological transcript or changing message anchors
 AND SHALL determine this exclusion from typed provenance, not from message text, so a user prompt quoting an event label remains navigable
-AND render each chapter as a type-styled pill distinguishing a user prompt from assistant prose
-AND label each pill with human-meaningful conversation text — the truncated prompt or the first line of the prose
+AND render each chapter as a type-styled pill distinguishing a user prompt, assistant prose, and a continuation boundary
+AND label prompt and prose pills with human-meaningful conversation text — the truncated prompt or the first line of the prose
+AND label continuation pills as context boundaries in aggregate chronological order
 AND NOT expose opaque internal display identifiers, render-unit keys, sequence numbers, or placeholder IDs as the chapter label
+
+THE SYSTEM SHALL use the same persisted continuation-message identity for the chronological boundary marker and its navigation stop
+AND SHALL make unloaded boundaries selectable from aggregate topology without eagerly fetching their message history
+AND SHALL resolve such a selection through the bounded earlier-history loader and exact-message positioning authority
+AND SHALL present completed boundaries as compact native web markers with handoff text and provenance disclosed on demand, not as ordinary conversational prose
 
 WHEN a chapter pill is clicked
 THE SYSTEM SHALL issue one virtualizer-owned positioning command to that chapter's message, including when the loaded target is outside the rendered window
@@ -674,3 +680,19 @@ AND SHALL NOT imply that the failure disables later automatic continuations for 
 AND SHALL NOT silently loop, fabricate progress, or introduce a separate automatic-retry action
 
 **Rationale:** Automatic continuation configuration belongs to the durable conversation users recognize, not to a replaceable transcript segment. Prospective semantics prevent a toggle from misrepresenting already-exhausted or already-admitted work, while the shared continuation operation remains the single recovery path.
+
+
+### REQ-CONV-025: Continuous Aggregate History
+
+WHEN viewing an ordinary ProductConversation or Global Coordinator on the web
+THE SYSTEM SHALL present its continuation members as one chronological history
+AND SHALL acquire older aggregate pages lazily for scrolling, chapter selection, and exact-message deep links
+AND SHALL preserve original message identities, ordering, and reader anchors across acquisition and live continuation
+AND SHALL keep boundary selection and browser back/forward navigation under the same message-positioning authority
+
+WHILE a reader inspects a historical member
+THE SYSTEM SHALL keep the composer attached to the newest writable member independently of the reader's selected history
+AND SHALL retain exact source-transcript and source-tool evidence selection until the reader explicitly selects a different anchor
+AND SHALL preserve unrelated query parameters and browser history when navigating boundaries
+
+Global aggregate history SHALL NOT acquire ordinary Open/History lifecycle, Close actions, work identity, or ordinary mutation authority. Native Swift navigation is outside this web contract.
