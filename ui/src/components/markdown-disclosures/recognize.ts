@@ -22,15 +22,16 @@ type SessionResult =
 
 export function recognizeDisclosures(source: string, options: MarkdownConfiguration = basicOptions): Recognition {
   const stats = createStats(source.length);
-  const { tape, candidates, quoteEnds, pointAt } = indexSource(source);
+  const { tape, candidates, quoteEnds, grammarEnds, pointAt } = indexSource(source);
   const tags: RecognizedTag[] = [];
   const defined = membership(stats, 'recognitionDefinitions');
   const footnotes = membership(stats, 'recognitionFootnotes');
   const lexicalFrames: ('summaryOpen' | 'summary' | 'body')[] = [];
   let inSummary = false;
 
-  function addTag(start: number): number {
-    const tag = tagGrammar(source, start, candidates.get(start)!, quoteEnds);
+  function addTag(start: number, nativeEnd: number): number {
+    const horizon = Math.min(nativeEnd, grammarEnds.get(start)!);
+    const tag = tagGrammar(source, start, candidates.get(start)!, quoteEnds, horizon);
     stats.validatedUnits += tag.end - tag.start;
     candidates.set(start, tag.end);
     const grammar = tag.grammar;
@@ -238,10 +239,10 @@ export function recognizeDisclosures(source: string, options: MarkdownConfigurat
       cursor = end;
       const tagEnd = candidates.get(cursor);
       if (tagEnd !== undefined) {
-        cursor = addTag(cursor);
+        cursor = addTag(cursor, result.end);
       }
     } else if (result.type === 'marker') {
-      cursor = addTag(result.start);
+      cursor = addTag(result.start, source.length);
     } else if (result.type === 'native') {
       if (result.end <= cursor) throw new Error('No native progress');
       cursor = result.end;

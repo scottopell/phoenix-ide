@@ -23,10 +23,7 @@ export function acceptFrames(source: string, tags: RecognizedTag[], stats: Inter
     stats.frameSteps++;
     const current = frames.at(-1);
     const grammar = tag.grammar;
-    if (!grammar.valid) {
-      if (current) current.invalid = true;
-      continue;
-    }
+    if (!grammar.valid) continue;
     if (grammar.kind === 'details' && !grammar.closing) {
       const frame: Frame = {
         start: tag.start, openEnd: tag.end, open: grammar.open,

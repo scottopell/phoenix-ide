@@ -64,42 +64,43 @@ export function append<T>(target: T[], items: readonly T[]): void {
 }
 
 export function tagGrammar(
-  source: string, start: number, prefixEnd: number, quoteEnds: ReadonlyMap<number, number>,
+  source: string, start: number, prefixEnd: number, quoteEnds: ReadonlyMap<number, number>, horizon: number,
 ): RecognizedTag {
   const closing = source[start + 1] === '/';
   const kind = source[start + (closing ? 2 : 1)]!.toLowerCase() === 'd' ? 'details' : 'summary';
   let i = prefixEnd;
   let open = false;
+  const at = () => i < horizon ? source[i] : undefined;
   const space = (c: string | undefined) => c !== undefined && /[\t\n\r\f ]/.test(c);
   const invalid = (): RecognizedTag => ({ start, end: i, grammar: { valid: false } });
   const valid = (): RecognizedTag => ({ start, end: i + 1, grammar: { valid: true, closing, kind, open } });
   if (closing) {
-    while (space(source[i])) i++;
-    return source[i] === '>' ? valid() : invalid();
+    while (space(at())) i++;
+    return at() === '>' ? valid() : invalid();
   }
-  while (i < source.length) {
-    if (source[i] === '>') return valid();
-    if (!space(source[i])) return invalid();
-    while (space(source[i])) i++;
-    if (source[i] === '>') continue;
+  while (i < horizon) {
+    if (at() === '>') return valid();
+    if (!space(at())) return invalid();
+    while (space(at())) i++;
+    if (at() === '>') continue;
     const begin = i;
-    if (!/[A-Za-z_:]/.test(source[i] ?? '')) break;
+    if (!/[A-Za-z_:]/.test(at() ?? '')) break;
     i++;
-    while (i < source.length && /[A-Za-z0-9_.:-]/.test(source[i]!)) i++;
+    while (i < horizon && /[A-Za-z0-9_.:-]/.test(source[i]!)) i++;
     const attribute = source.slice(begin, i).toLowerCase();
     const end = i;
-    while (space(source[i])) i++;
-    if (source[i] === '=') {
+    while (space(at())) i++;
+    if (at() === '=') {
       i++;
-      while (space(source[i])) i++;
-      const quote = source[i];
+      while (space(at())) i++;
+      const quote = at();
       if (quote === '"' || quote === "'") {
         const quoteEnd = quoteEnds.get(i);
-        if (quoteEnd === undefined) break;
+        if (quoteEnd === undefined || quoteEnd >= horizon) break;
         i = quoteEnd + 1;
       } else {
         const valueStart = i;
-        while (i < source.length && !space(source[i]) && !/["'`=<>]/.test(source[i]!)) i++;
+        while (i < horizon && !space(at()) && !/["'`=<>]/.test(source[i]!)) i++;
         if (i === valueStart) break;
       }
     } else i = end;

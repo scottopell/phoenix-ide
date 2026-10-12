@@ -43,14 +43,30 @@ export function indexSource(source: string) {
       single = i;
     }
   }
+  const blankStarts: number[] = [];
+  let lineStart = 0;
+  let blank = true;
+  for (let i = 0; i <= source.length; i++) {
+    const c = source[i];
+    if (c === undefined || c === '\r' || c === '\n') {
+      if (blank) blankStarts.push(lineStart);
+      if (c === '\r' && source[i + 1] === '\n') i++;
+      lineStart = i + 1;
+      blank = true;
+    } else if (c !== ' ' && c !== '\t') blank = false;
+  }
+  const grammarEnds = new Map<number, number>();
+  let nextBlank = 0;
   const candidates = new Map<number, number>();
   const pattern = /<\/?(?:details|summary)(?=[\s/>])/ig;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(source))) {
     candidates.set(match.index, match.index + match[0].length);
+    while (nextBlank < blankStarts.length && blankStarts[nextBlank]! <= match.index) nextBlank++;
+    grammarEnds.set(match.index, blankStarts[nextBlank] ?? source.length);
   }
   return {
-    tape, candidates, quoteEnds,
+    tape, candidates, quoteEnds, grammarEnds,
     pointAt(offset: number): Point {
       const result = points.get(offset);
       if (!result) throw new Error(`No tokenizer point at source offset ${offset}`);

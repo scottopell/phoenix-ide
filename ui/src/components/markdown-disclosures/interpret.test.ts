@@ -339,3 +339,99 @@ describe('disjoint validation and recovery provenance', () => {
     expect(result.stats.validatedUnits).toBe(source.length - 6);
   });
 });
+
+describe('candidate grammar stays within native ownership', () => {
+  function rendererTree(source: string): Root {
+    return unified().use(remarkParse).use(remarkGfm).use(remarkDetails).parse(source);
+  }
+
+  for (const newline of ['\n', '\r\n', '\r']) for (const blank of ['', ' \t ']) {
+    it(`does not borrow a quote across a native blank line ${JSON.stringify([newline, blank])}`, () => {
+      const prefix = `<details title="unterminated${newline}${blank}${newline}`;
+      const child = envelope('B');
+      const source = `${prefix}${child}${newline}${newline}" >`;
+      const result = interpretMarkdown(source, gfmOptions);
+      expect(result.ranges).toEqual([{ start: prefix.length, end: prefix.length + child.length }]);
+      expect(nodes(result.tree, 'text').map(n => n.value).join('')).toContain('<details title="unterminated');
+      expect(rendererTree(source)).toEqual(result.tree);
+      expect(nodes(rendererTree(source), 'disclosureDetails')).toHaveLength(1);
+    });
+  }
+
+  it.each(['<details broken!', '<summary broken!', '</details broken!', '</summary broken!'])('keeps invalid body candidates literal: %s', body => {
+    const source = envelope(body + ' **visible**');
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([{ start: 0, end: source.length }]);
+    expect(nodes(result.tree, 'text').map(n => n.value).join('')).toContain(body);
+    expect(nodes(result.tree, 'strong')).toHaveLength(1);
+    expect(rendererTree(source)).toEqual(result.tree);
+  });
+
+  it.each(['\n', '\r\n', '\r'])('retains valid multiline attributes: %j', newline => {
+    const source = `<details title="first${newline}<details>quoted</details>"${newline}open><summary title='first${newline}last'>T</summary>B</details>`;
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([{ start: 0, end: source.length }]);
+    expect(nodes(result.tree, 'disclosureDetails')[0]!.data!.hProperties).toEqual({ open: true });
+    expect(rendererTree(source)).toEqual(result.tree);
+  });
+
+  it('bounds malformed quotes in summary phrasing as well as root flow', () => {
+    const source = envelope('B', '<details title="unterminated\n\nT') + '\n\n" >';
+    const end = source.indexOf('</details>') + '</details>'.length;
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([{ start: 0, end }]);
+    expect(nodes(result.tree, 'text').map(n => n.value).join('')).toContain('<details title="unterminated');
+    expect(rendererTree(source)).toEqual(result.tree);
+  });
+
+  it.each(['<script>\n', '```html\n', '    '])('does not claim native-owned candidates after a broken quote: %s', lead => {
+    const close = lead.startsWith('<') ? '\n</script>' : lead.startsWith('`') ? '\n```' : '';
+    const prefix = '<details title="unterminated\n\n';
+    const source = prefix + lead + envelope('hidden') + close + '\n\n" >';
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([]);
+    expect(rendererTree(source)).toEqual(result.tree);
+    expect(nodes(result.tree, lead.startsWith('<') ? 'html' : 'code')).toHaveLength(1);
+  });
+
+  it.each(['<details open\n\n>', '<details title="ok"\n\n>', '<details title=\n\nvalue>', '</details\n\n>'])('does not complete tag grammar across a blank line: %j', prefix => {
+    const source = prefix + '\n\n' + envelope('B');
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([{ start: prefix.length + 2, end: source.length }]);
+    expect(rendererTree(source)).toEqual(result.tree);
+    expect(nodes(result.tree, 'text').map(n => n.value).join('')).toContain(prefix.slice(0, prefix.indexOf('\n')));
+  });
+
+  it('leaves an inline horizon boundary candidate for native root admission', () => {
+    const prefix = 'paragraph\n';
+    const source = prefix + '<details title="first\nlast"><summary>T</summary>B</details>';
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([{ start: prefix.length, end: source.length }]);
+    expect(rendererTree(source)).toEqual(result.tree);
+  });
+
+  it('does not let inline attribute grammar jump a native fenced block', () => {
+    const source = 'paragraph <details title="unfinished\n```html\n' + envelope('hidden') + '\n```\n" >';
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([]);
+    expect(nodes(result.tree, 'code')).toHaveLength(1);
+    expect(rendererTree(source)).toEqual(result.tree);
+  });
+
+  it('still suppresses valid nested structural tags in the renderer AST', () => {
+    const source = envelope(envelope('nested'));
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([]);
+    expect(nodes(rendererTree(source), 'disclosureDetails')).toHaveLength(0);
+    expect(rendererTree(source)).toEqual(result.tree);
+    expect(nodes(result.tree, 'text').map(n => n.value).join('')).toBe(source);
+  });
+
+  it.each([100, 400])('bounds repeated broken quote validation at %i candidates', count => {
+    const source = ('<details title="unterminated\n\n' + envelope('B') + '\n\n" >\n\n').repeat(count);
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toHaveLength(count);
+    expect(result.stats.validatedUnits).toBeLessThan(source.length);
+    expect(result.stats.submittedUnits).toBeLessThanOrEqual(source.length);
+  });
+});
