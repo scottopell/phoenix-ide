@@ -14,6 +14,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-worker-budget:
+    name: check worker budget (exact source)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PHOENIX_CHECK_ALL: ""
+      PHOENIX_CHECK_BASE: origin/main
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Focused command-construction regressions (no compiler)
+        run: |
+          python -m unittest discover -s tests/devpy -p test_check_plan.py
+          PHOENIX_CHECK_WORKERS=1 python -m unittest discover -s tests/devpy -p test_check_plan.py
+
   plan_check:
     name: plan check lanes
     runs-on: ubuntu-latest
