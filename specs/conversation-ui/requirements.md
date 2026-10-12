@@ -88,13 +88,20 @@ THEN THE SYSTEM SHALL present a transcript-local action to retry the acquisition
 WHEN agent message contains markdown
 THE SYSTEM SHALL render basic markdown (code blocks, bold, italic, paragraphs)
 
+WHEN a Markdown link destination is a root-relative or same-origin absolute URL whose parsed path matches `/c/:slug`, `/product-conversations/:slug`, `/chains/:root`, `/global`, or `/global/:slug`
+THE SYSTEM SHALL recognize it before local-file detection and navigate in the current application context
+AND SHALL preserve its query string and fragment
+AND SHALL retain native anchor keyboard and modified-click behavior
+
+Protocol-relative and document-relative destinations SHALL NOT be promoted to application routes. Links from the Coordinator to `/product-conversations/:slug` SHALL carry the same Coordinator return origin as links to `/c/:slug`; chain and Global destinations SHALL NOT acquire that return origin.
+
 WHEN agent prose contains a recognized local file path as raw text
-OR a Markdown link has that same recognized local file path as its destination
+OR a Markdown link has that same recognized local file path as its destination and is not a supported application route
 THE SYSTEM SHALL present the reference as an in-application file action
 AND SHALL open the path through the conversation's file viewer when activated
 AND SHALL preserve the Markdown label as the visible link text when one is present
 
-WHEN a Markdown link destination is not a recognized local file path
+WHEN a Markdown link destination is neither a supported application route nor a recognized local file path
 THE SYSTEM SHALL preserve ordinary safe browser-link behavior
 
 The local-path shapes recognized in raw text and Markdown destinations SHALL be identical. Path-shape recognition only identifies a file candidate; the server-side viewer-openability classification defined by `specs/file-explorer/requirements.md` remains authoritative for the resolved content.
