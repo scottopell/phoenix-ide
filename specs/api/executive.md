@@ -27,8 +27,14 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 | **REQ-API-009:** Model Information | GET /api/models with default | Implemented |
 | **REQ-API-010:** Static Assets | UI assets served from the binary (embedded), with a filesystem fallback | Implemented |
 | **REQ-API-013:** One-Shot Command Suggestion | POST /api/suggest | Implemented |
-| **REQ-API-030:** Observation and Execution Authority | ApplicationState composition, LiveState admission, bounded route observations | Partial: normal-binary immutable target startup, same-router admission, real product snapshots and shared persisted transcript reads tested; shared member stream initialization and capability-aware UI remain pending |
+| **REQ-API-030:** Observation and Execution Authority | ApplicationState composition, LiveState admission, bounded route observations | Implemented for target persisted-list/member/detail UI: normal-binary immutable startup, same-router admission, shared reads, typed persisted hydration, explicit capability absence and public-share regression tested. Calibration and composed resource/UI integration remain unqualified |
 
 ## Verification Notes
 
 Reconciled against `crates/phoenix-ide/src/api/handlers.rs`, `crates/phoenix-ide/src/api/lifecycle_handlers.rs`, `crates/phoenix-ide/src/api/chains.rs`, and `crates/phoenix-ide/src/api/sse.rs`.
+
+## Target replay qualification
+
+The target journey hydrates the current member through a typed persisted endpoint and displays explicit unavailable live/input capabilities. Owner bootstrap decodes `/api/capabilities`; public shares retain token-authorized hydration without owner capability/auth requests. Observation navigation avoids live connection, provider and PR-status polling. The superseded fixed-response binary/static-SSE/provider payload generator has been retired. This is a bounded functioning replay, not simulation, performance improvement or calibrated production equivalence. Resource collector/UI and standalone UI finalization/link/Close changes remain separate composed integration obligations.
+
+Actual-executable startup tests retain filesystem/helper/provider traps and fixture immutability checks. A historical discovery-range sentinel connection failure is not explained by later passes: a bounded no-child probe independently observed a different live Phoenix process scanning that host-global port, proving a test attribution weakness without identifying the original peer. The assertion remains strict and captures a bounded request prefix on failure; details and exact-source browser evidence are retained in `docs/conversation-replay-dependency-map.md`.

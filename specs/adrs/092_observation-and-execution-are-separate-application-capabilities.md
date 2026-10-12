@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-11
-- **Related requirements:** REQ-API-007, REQ-CONV-006, REQ-BT-019
+- **Affects:** REQ-API-030, REQ-API-007, REQ-CONV-006, REQ-BT-019
 
 ## Context
 
@@ -26,7 +26,7 @@ The initial replay is a private same-host development composition, not a remote 
 
 The mock-provider composition is separate future work: writable isolated persistence, real command admission and explicit execution adapters would be required. Continuation, recovery and tool execution are excluded from this replay scope.
 
-## Alternatives
+## Options considered
 
 - **Expand the fixed-response server:** rejected because it duplicates application behavior and can fabricate readiness or successful service availability.
 - **Global read-only boolean and optional AppState fields:** rejected because authority remains constructed and enforcement scatters across call sites.
