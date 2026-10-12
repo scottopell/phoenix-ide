@@ -41,15 +41,19 @@ import {
   subscribeProductConversationsReconciled,
 } from '../notifications';
 import { generateUUID } from '../utils/uuid';
-import type { ConversationHistorySegmentView as ProductConversationSegmentView } from '../generated/ConversationHistorySegmentView';
+import type { ConversationHistorySegmentView } from '../generated/ConversationHistorySegmentView';
 import type { ConversationHistoryBoundaryView } from '../generated/ConversationHistoryBoundaryView';
 import type { CoordinatorConversationSnapshotView } from '../generated/CoordinatorConversationSnapshotView';
 import type { ComponentProps } from 'react';
 import './ProductConversationPage.css';
 
-type HistorySnapshot =
-  | (ProductConversationSnapshotView & { kind: 'ordinary' })
-  | (CoordinatorConversationSnapshotView & { kind: 'coordinator' });
+type AcquiredMessage = EnrichedMessage | Message;
+type ProductConversationSegmentView = Omit<ConversationHistorySegmentView, 'messages'> & { messages: AcquiredMessage[] };
+type HistorySnapshot = (
+  | (Omit<ProductConversationSnapshotView, 'segments'> & { kind: 'ordinary' })
+  | (Omit<CoordinatorConversationSnapshotView, 'segments'> & { kind: 'coordinator' })
+) & { segments: ProductConversationSegmentView[] };
+type OrdinaryHistorySnapshot = Extract<HistorySnapshot, { kind: 'ordinary' }>;
 type HistoryOptions = Parameters<typeof api.getProductConversationHistorySnapshot>[1];
 async function fetchOrdinarySnapshot(reference: string, options: HistoryOptions): Promise<HistorySnapshot> {
   return { kind: 'ordinary', ...await api.getProductConversationHistorySnapshot(reference, options) };
@@ -124,7 +128,7 @@ type TranscriptReaderSelection =
   | { kind: 'transcript'; segment: ProductConversationSegmentView }
   | { kind: 'unavailable' };
 
-function transcriptReaderSelection(snapshot: HistorySnapshot, search: string): TranscriptReaderSelection {
+function transcriptReaderSelection(snapshot: HistorySnapshot, search: string, routeTranscriptPin: string | null): TranscriptReaderSelection {
   const pins = new URLSearchParams(search).getAll('source_transcript');
   if (pins.length > 0) {
     const pin = pins[0];
@@ -132,8 +136,8 @@ function transcriptReaderSelection(snapshot: HistorySnapshot, search: string): T
     const segment = snapshot.segments.find((candidate) => candidate.transcript_row_id === pin);
     return segment ? { kind: 'transcript', segment } : { kind: 'unavailable' };
   }
-  if (snapshot.kind === 'coordinator' && snapshot.requested_transcript_row_id !== snapshot.latest_transcript_row_id) {
-    const segment = snapshot.segments.find((candidate) => candidate.transcript_row_id === snapshot.requested_transcript_row_id);
+  if (routeTranscriptPin !== null) {
+    const segment = snapshot.segments.find((candidate) => candidate.transcript_row_id === routeTranscriptPin);
     return segment ? { kind: 'transcript', segment } : { kind: 'unavailable' };
   }
   return { kind: 'latest' };
@@ -188,21 +192,21 @@ function decodeMessageHash(hash: string): string | null {
   }
 }
 
-function toMessage(message: EnrichedMessage, occurrenceToken?: string): Message {
+function toMessage(message: AcquiredMessage, occurrenceToken?: string): Message {
   return {
     message_id: message.message_id,
     conversation_id: message.conversation_id,
     sequence_id: message.sequence_id,
     message_type: message.message_type,
     content: message.content as Message['content'],
-    origin: message.origin,
+    ...(message.origin === undefined ? {} : { origin: message.origin }),
     display_data: occurrenceToken
       ? {
         ...(((message.display_data ?? null) as Exclude<Message['display_data'], undefined>) ?? {}),
         productOccurrenceToken: occurrenceToken,
       }
       : (message.display_data ?? null) as Exclude<Message['display_data'], undefined>,
-    usage_data: message.usage_data,
+    usage_data: message.usage_data ?? null,
     created_at: message.created_at,
   };
 }
@@ -213,7 +217,7 @@ function sortSegments(snapshot: HistorySnapshot) {
     .sort((a, b) => a.segment_ordinal - b.segment_ordinal);
 }
 
-function toSegmentMessage(segment: ProductConversationSegmentView, enriched: EnrichedMessage, boundaries: ConversationHistoryBoundaryView[]): Message {
+function toSegmentMessage(segment: ProductConversationSegmentView, enriched: AcquiredMessage, boundaries: ConversationHistoryBoundaryView[]): Message {
   const message = toMessage(enriched, productOccurrenceToken(segment.transcript_row_id, enriched.message_id));
   const boundary = boundaries.find((candidate) => candidate.message_id === message.message_id);
   if (!boundary) return message;
@@ -242,7 +246,7 @@ function compareTranscriptRowMessages(left: Message, right: Message): number {
     || left.message_id.localeCompare(right.message_id);
 }
 
-function reconcileLatestTranscriptRowMessages(
+function reconcileTranscriptRowMessages(
   snapshotMessages: Message[],
   liveMessages: Message[],
   transcriptRowId: string,
@@ -291,7 +295,7 @@ function makeAggregateMessages(
   const latestSnapshotMessages = latestSegment?.messages.map((message) => toSegmentMessage(latestSegment, message, snapshot.boundaries)) ?? [];
   return [
     ...historical,
-    ...reconcileLatestTranscriptRowMessages(
+    ...reconcileTranscriptRowMessages(
       latestSnapshotMessages,
       liveMessages,
       snapshot.latest_transcript_row_id,
@@ -348,18 +352,14 @@ function mergeRefreshedTail(
       }
       continue;
     }
-    const refreshedMessageIds = new Set(
-      refreshedSegment.messages.map((message) => message.message_id),
-    );
     segmentsByRowId.set(retainedSegment.transcript_row_id, {
       ...retainedSegment,
       ...refreshedSegment,
-      messages: [
-        ...retainedSegment.messages.filter(
-          (message) => !refreshedMessageIds.has(message.message_id),
-        ),
-        ...refreshedSegment.messages,
-      ],
+      messages: reconcileTranscriptRowMessages(
+        retainedSegment.messages.map(message => toSegmentMessage(retainedSegment, message, current.boundaries)),
+        refreshedSegment.messages.map(message => toSegmentMessage(refreshedSegment, message, refreshed.boundaries)),
+        retainedSegment.transcript_row_id,
+      ),
     });
   }
   const retainedPrefix = earliestRefreshedOrdinal != null
@@ -395,11 +395,11 @@ function aggregateConversationState(snapshot: HistorySnapshot, loadingOlder: boo
   return parseConversationState(maybeState);
 }
 
-function countSnapshotMessages(snapshot: Pick<ProductConversationSnapshotView, 'segments'>): number {
+function countSnapshotMessages(snapshot: Pick<HistorySnapshot, 'segments'>): number {
   return snapshot.segments.reduce((sum, segment) => sum + segment.messages.length, 0);
 }
 
-function chainFromSnapshot(snapshot: ProductConversationSnapshotView, qaHistory: ChainQaRow[]): ChainView {
+function chainFromSnapshot(snapshot: OrdinaryHistorySnapshot, qaHistory: ChainQaRow[]): ChainView {
   return {
     root_conv_id: snapshot.chain_qa_compatibility?.root_transcript_row_id ?? snapshot.requested_transcript_row_id,
     product_conversation_id: snapshot.product_conversation_id,
@@ -439,7 +439,7 @@ function RecallPanel({
   disabled,
   onClose,
 }: {
-  snapshot: ProductConversationSnapshotView;
+  snapshot: OrdinaryHistorySnapshot;
   productConversationId: string;
   messages: Message[];
   disabled: boolean;
@@ -685,7 +685,7 @@ function RecallDisclosure({
   messages,
   disabled,
 }: {
-  snapshot: ProductConversationSnapshotView;
+  snapshot: OrdinaryHistorySnapshot;
   productConversationId: string;
   messages: Message[];
   disabled: boolean;
@@ -735,7 +735,7 @@ function ProductConversationHeader({
   messages,
   recallDisabled,
 }: {
-  snapshot: ProductConversationSnapshotView;
+  snapshot: OrdinaryHistorySnapshot;
   productConversationId: string;
   messages: Message[];
   recallDisabled: boolean;
@@ -940,13 +940,23 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
         }
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
+        const previous = ownedSnapshotRef.current;
+        const outgoingId = previous?.productConversationId === productConversationId
+          && previous.value.latest_transcript_row_id !== next.latest_transcript_row_id
+          ? previous.value.latest_transcript_row_id : null;
+        const outgoingAtom = outgoingId && conversationStore.getTranscriptAuthority(outgoingId).kind === 'live'
+          ? conversationStore.getSnapshot(outgoingId) : null;
+        const outgoingMessages = outgoingAtom?.conversationId === outgoingId ? outgoingAtom?.messages ?? [] : [];
         if (next.kind === 'ordinary') conversationStore.observeProductConversationSnapshot(next);
-        setOwnedSnapshot((current) => ({
-          productConversationId,
-          value: current?.productConversationId === productConversationId
-            ? mergeRefreshedTail(current.value, next)
-            : next,
-        }));
+        setOwnedSnapshot((current) => {
+          if (current?.productConversationId !== productConversationId) return { productConversationId, value: next };
+          const acquired = outgoingId === current.value.latest_transcript_row_id && outgoingMessages.length > 0
+            ? { ...current.value, segments: current.value.segments.map(segment => segment.transcript_row_id === outgoingId
+                ? { ...segment, messages: reconcileTranscriptRowMessages(segment.messages.map(message => toSegmentMessage(segment, message, current.value.boundaries)), outgoingMessages, outgoingId) }
+                : segment) }
+            : current.value;
+          return { productConversationId, value: mergeRefreshedTail(acquired, next) };
+        });
         if (!isBackgroundRefresh) setHistoryGeneration(0);
         if (next.product_conversation_id !== productConversationId
           && productConversationSnapshotChangedSince(
@@ -1219,7 +1229,17 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     generation: historyGeneration,
     transcriptGeneration: historyGeneration,
   };
-  const readerSelection = snapshot ? transcriptReaderSelection(snapshot, location.search) : { kind: 'latest' as const };
+  const routeReaderSelectionRef = useRef<{ pathname: string; productConversationId: string | undefined; transcriptPin: string | null } | null>(null);
+  if (snapshot && (routeReaderSelectionRef.current?.pathname !== location.pathname
+    || routeReaderSelectionRef.current.productConversationId !== productConversationId)) {
+    routeReaderSelectionRef.current = {
+      pathname: location.pathname,
+      productConversationId,
+      transcriptPin: snapshot.kind === 'coordinator' && snapshot.requested_transcript_row_id !== snapshot.latest_transcript_row_id
+        ? snapshot.requested_transcript_row_id : null,
+    };
+  }
+  const readerSelection = snapshot ? transcriptReaderSelection(snapshot, location.search, routeReaderSelectionRef.current?.transcriptPin ?? null) : { kind: 'latest' as const };
   const transcriptTargetMessage = !hashTargetMessageId && readerSelection.kind === 'transcript'
     ? messages.find((message) => message.conversation_id === readerSelection.segment.transcript_row_id)
     : undefined;

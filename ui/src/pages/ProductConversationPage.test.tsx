@@ -575,6 +575,48 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('history-location')).not.toHaveTextContent('#');
   });
 
+  it('keeps a hashless newest Global reader unpinned when its route member continues', async () => {
+    const { api } = await import('../api');
+    const initial = { ...coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })), requested_transcript_row_id: 'row-2' };
+    const continued = { ...initial, latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', segments: [...initial.segments, {
+      segment_ordinal: 2, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')],
+    }] };
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(initial).mockResolvedValueOnce(continued);
+    renderPage('/global/row-2');
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2'));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-2');
+  });
+
+  it.each([false, true])('retains acquired live predecessor rows across a bounded continuation refresh (Global=%s)', async (global) => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ before: null, has_older: false, segments: [{
+      segment_ordinal: 0, transcript_row_id: 'row-2', slug: 'row-2', title: 'Predecessor',
+      messages: Array.from({ length: 100 }, (_, index) => makeMessage(`acquired-${index + 1}`, index + 1, 'row-2')),
+    }] });
+    const live = Array.from({ length: 250 }, (_, index) => makeMessage(`acquired-${index + 1}`, index + 1, 'row-2'));
+    const continued = makeSnapshot({ latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', before: 'bounded-tail', has_older: true, segments: [
+      { ...initial.segments[0]!, messages: live.slice(151) },
+      { segment_ordinal: 1, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')] },
+    ] });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue({ ...coordinatorSnapshot(continued), requested_transcript_row_id: 'row-2' }).mockResolvedValueOnce({ ...coordinatorSnapshot(initial), requested_transcript_row_id: 'row-2' });
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(continued).mockResolvedValueOnce(initial);
+    renderPage(global ? '/global/row-2#message-acquired-125' : '/product-conversations/pc-1#message-acquired-125');
+    await waitForPageReady();
+    act(() => emitLatestProjection({ messages: live, pendingMessages: [], convState: { type: 'idle' } }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'acquired-125' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    const props = conversationNavStackSpy.mock.lastCall?.[0];
+    expect((props?.messages as Message[]).map(message => message.message_id)).toEqual([...live.map(message => message.message_id), 'newest-message']);
+    expect(props?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('#message-acquired-125');
+  });
+
   it('preserves the aggregate reader anchor and newest composer when continuation races an older page', async () => {
     const { api } = await import('../api');
     const initial = coordinatorSnapshot(makeSnapshot());
