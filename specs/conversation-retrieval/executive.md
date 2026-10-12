@@ -32,14 +32,19 @@ attempt guard records interruption on cancellation or panic; no retry is added.
 without database work, raw errors, or content. Global and palette search retain
 readiness gating and distinguish terminal failure from warming.
 
-Local qualification passed all 45 retrieval tests, including the WAL snapshot
-race, source revalidation, page bounds, rollback, duplicate attempts,
-cancellation, panic, and successful readiness/retrieval. Both API status tests
-passed: failed startup is not called warming, and authenticated successful
-search follows ready status while unauthenticated status access is denied.
-Independent full-range source review found no remaining behavioral blocker.
-Owning-crate lint and final publication qualification remain separate; none of
-these local results establishes production recovery.
+Local qualification at `034fece8d` executed 48 DB tests (47 retrieval-module
+tests plus the message-hiding retrieval regression) and three API/share tests,
+all passing with no ignored tests. This includes the WAL snapshot race,
+revalidation, rollback, cancellation/panic, nested database-code retention,
+orchestration-owned readiness, and authenticated status/search behavior.
+The harness expected 47 DB tests and recorded a false count assertion; the
+original receipt remains unchanged. A separate retained-output validator
+verified all 51 individual test names/results and the 48+3 summaries; an
+independent evidence review accepted this focused qualification.
+
+Hosted review corrections to benchmark setup and behavioral specifications
+require their own final-head checks. Hosted CI and review are tracked on
+PR #896; earlier local passes are not final-head or production-recovery proof.
 
 ## Technical Summary
 

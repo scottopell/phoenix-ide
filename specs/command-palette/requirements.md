@@ -159,8 +159,13 @@ THE SYSTEM SHALL match natural-language content terms using disjunction
 AND SHALL allow the final content-bearing term to match a token prefix
 AND SHALL NOT interpret user input as raw FTS operators
 
-WHEN the retrieval index has not completed startup reconciliation
+WHEN startup retrieval reconciliation is pending or running
 THE SYSTEM SHALL indicate that conversation search is warming
+AND SHALL NOT present an empty result as authoritative
+
+WHEN startup retrieval reconciliation has failed or its worker was interrupted
+THE SYSTEM SHALL indicate that conversation search is unavailable due to reconciliation failure
+AND SHALL NOT describe the terminated attempt as warming
 AND SHALL NOT present an empty result as authoritative
 
 WHEN conversation content retrieval fails
