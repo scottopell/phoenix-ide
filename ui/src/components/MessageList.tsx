@@ -1358,10 +1358,12 @@ function MessageListImpl({
       pending.conversationId !== conversationId ||
       pending.key !== key
     ) return;
+    const toolTarget = pending.toolUseId ? row.querySelector(`[data-tool-id="${CSS.escape(pending.toolUseId)}"]`) : null;
+    if (pending.toolUseId && !toolTarget) return;
     pendingPulseRef.current = null;
     clearHighlight();
     const target = pending.toolUseId
-      ? row.querySelector(`[data-tool-id="${CSS.escape(pending.toolUseId)}"]`) ?? row
+      ? toolTarget!
       : pending.memberMessageId
         ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
         : row.querySelector('.message') ?? row;
@@ -1379,7 +1381,7 @@ function MessageListImpl({
     clearHighlight();
   }, [clearHighlight]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     pendingPulseRef.current = null;
     clearHighlight();
   }, [conversationId, clearHighlight]);
@@ -1390,6 +1392,19 @@ function MessageListImpl({
       .find((candidate) => candidate.dataset['renderUnitKey'] === key);
     if (row) pulseMountedRow(key, row);
   }, [pulseMountedRow]);
+
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!sourceToolId || !scroller) return;
+    const applyPendingPulse = () => {
+      const pending = pendingPulseRef.current;
+      if (pending) pulseIfMounted(pending.key);
+    };
+    const observer = new MutationObserver(applyPendingPulse);
+    observer.observe(scroller, { childList: true, subtree: true });
+    applyPendingPulse();
+    return () => observer.disconnect();
+  }, [sourceToolId, pulseIfMounted]);
 
   const scrollToUnitIndex = useCallback((
     unitIndex: number,
