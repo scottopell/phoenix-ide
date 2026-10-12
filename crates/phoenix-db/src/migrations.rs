@@ -13041,7 +13041,7 @@ mod tests {
             );
             assert!(matches!(
                 db.get_conversation("wake-history").await,
-                Err(crate::DbError::NotFound(_))
+                Err(crate::DbError::ConversationNotFound(_))
             ));
             assert_foreign_keys(db.pool()).await;
         }
