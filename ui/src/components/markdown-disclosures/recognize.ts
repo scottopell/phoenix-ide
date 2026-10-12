@@ -14,7 +14,7 @@ import type { MarkdownConfiguration, Recognition, RecognizedTag, SourceRange, Ta
 
 type SessionMode = 'entry' | 'classify' | 'documentClassify' | 'horizon';
 type Horizon = SourceRange & { type: 'horizon' };
-type NativeOwner = { kind: 'flow'; horizon?: Horizon } | { kind: 'paragraph'; horizon: Horizon };
+type NativeOwner = { kind: 'flow'; horizon?: Horizon | undefined } | { kind: 'paragraph'; horizon: Horizon };
 type LexicalFrame = { admission: TagAdmission; phase: 'summaryOpen' | 'summary' | 'body' };
 type SessionResult =
   | Horizon
@@ -29,7 +29,7 @@ export function recognizeDisclosures(source: string, options: MarkdownConfigurat
   const defined = membership(stats, 'recognitionDefinitions');
   const footnotes = membership(stats, 'recognitionFootnotes');
   const lexicalFrames: LexicalFrame[] = [];
-  let owner: NativeOwner = { kind: 'flow' };
+  const ownerState: { owner: NativeOwner } = { owner: { kind: 'flow' } };
   let inSummary = false;
 
   function addTag(start: number, nativeEnd: number, admission: TagAdmission): number {
@@ -42,7 +42,7 @@ export function recognizeDisclosures(source: string, options: MarkdownConfigurat
     if (grammar.valid) {
       if (grammar.kind === 'details') {
         if (grammar.closing) {
-          if (lexicalFrames.pop()?.admission === 'rootFlow') owner = { kind: 'flow', horizon: owner.horizon };
+          if (lexicalFrames.pop()?.admission === 'rootFlow') ownerState.owner = { kind: 'flow', horizon: ownerState.owner.horizon };
         } else lexicalFrames.push({ admission, phase: 'summaryOpen' });
       } else if (lexicalFrames.length) {
         const frame = lexicalFrames.at(-1)!;
@@ -222,12 +222,12 @@ export function recognizeDisclosures(source: string, options: MarkdownConfigurat
 
   let cursor = source.charCodeAt(0) === 65279 ? 1 : 0;
   while (cursor < source.length) {
-    if (owner.kind === 'paragraph' && cursor >= owner.horizon.end) owner = { kind: 'flow' };
+    if (ownerState.owner.kind === 'paragraph' && cursor >= ownerState.owner.horizon.end) ownerState.owner = { kind: 'flow' };
     const lineStart = cursor === 0 || source[cursor - 1] === '\n' || source[cursor - 1] === '\r';
     let result: Exclude<SessionResult, { type: 'container' }>;
-    if (owner.kind === 'paragraph') {
+    if (ownerState.owner.kind === 'paragraph') {
       stats.reused++;
-      result = { ...owner.horizon, start: cursor };
+      result = { ...ownerState.owner.horizon, start: cursor };
     } else {
       result = inSummary
         ? { type: 'horizon', start: cursor, end: source.length }
@@ -238,12 +238,12 @@ export function recognizeDisclosures(source: string, options: MarkdownConfigurat
       result = nativeSession(result.start, 'documentClassify');
     }
     if (result.type === 'content') {
-      const cached = owner.horizon;
+      const cached: Horizon | undefined = ownerState.owner.horizon;
       if (cached && result.start >= cached.start && result.start < cached.end) {
         stats.reused++;
         result = { ...cached, start: result.start };
       } else result = nativeSession(result.start, 'horizon');
-      if (result.type === 'horizon') owner = { kind: 'paragraph', horizon: result };
+      if (result.type === 'horizon') ownerState.owner = { kind: 'paragraph', horizon: result };
     }
     if (result.type === 'horizon') {
       const end = inline(result.start, result.end);
