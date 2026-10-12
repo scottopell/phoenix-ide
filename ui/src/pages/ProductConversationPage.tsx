@@ -1236,19 +1236,24 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     generation: historyGeneration,
     transcriptGeneration: historyGeneration,
   };
-  const routeReaderSelectionRef = useRef<{ pathname: string; productConversationId: string | undefined; transcriptPin: string | null } | null>(null);
+  const routeReaderSelectionRef = useRef<{ pathname: string; productConversationId: string | undefined; transcriptPin: string | null; awaitingTopology: boolean } | null>(null);
   if (snapshot && (routeReaderSelectionRef.current?.pathname !== location.pathname
-    || routeReaderSelectionRef.current.productConversationId !== productConversationId)) {
+    || routeReaderSelectionRef.current.productConversationId !== productConversationId || routeReaderSelectionRef.current.awaitingTopology)) {
     const routeMemberId = snapshot.kind === 'coordinator'
       ? snapshot.segments.find(segment => segment.transcript_row_id === params.slug || segment.slug === params.slug)?.transcript_row_id
-        ?? snapshot.requested_transcript_row_id
+        ?? params.slug ?? snapshot.requested_transcript_row_id
       : null;
     routeReaderSelectionRef.current = {
       pathname: location.pathname,
       productConversationId,
       transcriptPin: routeMemberId !== snapshot.latest_transcript_row_id ? routeMemberId : null,
+      awaitingTopology: routeMemberId !== null && !snapshot.segments.some(segment => segment.transcript_row_id === routeMemberId),
     };
   }
+  const awaitingRouteTopology = routeReaderSelectionRef.current?.awaitingTopology ?? false;
+  useEffect(() => {
+    if (awaitingRouteTopology) setSnapshotRetry(value => value + 1);
+  }, [awaitingRouteTopology, location.pathname]);
   const pendingChapterSelected = (location.state as { chapterSelection?: unknown } | null)?.chapterSelection === 'pending'
     && !hashTargetMessageId && !new URLSearchParams(location.search).has('source_transcript');
   const readerSelection = snapshot && !pendingChapterSelected

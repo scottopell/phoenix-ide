@@ -54,6 +54,21 @@ describe('ConversationNav input provenance', () => {
 });
 
 describe('aggregate boundary navigation', () => {
+  it('keeps an unloaded middle boundary after acquired prefix chapters and before the loaded tail', () => {
+    const boundaries = [
+      { represented_successor_opening_message_id: null, message_id: 'boundary-a', predecessor_transcript_row_id: 'a', successor_transcript_row_id: 'b', segment_ordinal: 0 },
+      { represented_successor_opening_message_id: null, message_id: 'boundary-b', predecessor_transcript_row_id: 'b', successor_transcript_row_id: 'c', segment_ordinal: 1 },
+    ];
+    const chapters: Chapter[] = [
+      { kind: 'prompt', label: 'Prefix A', unitIndex: 0, sequenceId: 1, target: { kind: 'persisted', messageId: 'prompt-a', transcriptId: 'a' } },
+      { kind: 'boundary', label: 'Boundary A', unitIndex: 1, sequenceId: 2, messageId: 'boundary-a', transcriptId: 'a' },
+      { kind: 'prompt', label: 'Prefix B', unitIndex: 2, sequenceId: 1, target: { kind: 'persisted', messageId: 'prompt-b', transcriptId: 'b' } },
+      { kind: 'prompt', label: 'Tail C', unitIndex: 3, sequenceId: 20, target: { kind: 'persisted', messageId: 'prompt-c', transcriptId: 'c' } },
+    ];
+    render(<ConversationNav chapters={chapters} historyBoundaries={boundaries} activeUnitIndex={null} onJump={vi.fn()} />);
+    expect(screen.getAllByRole('button').map(button => button.textContent)).toEqual(['Unknown input · Prefix A', 'Boundary A', 'Unknown input · Prefix B', 'Context 2 · load', 'Unknown input · Tail C']);
+  });
+
   it('uses one exact boundary identity before and after its chronological unit loads', () => {
     const boundary = { represented_successor_opening_message_id: null, message_id: 'exact-continuation', predecessor_transcript_row_id: 'predecessor', successor_transcript_row_id: 'successor', segment_ordinal: 0 };
     const jump = vi.fn();

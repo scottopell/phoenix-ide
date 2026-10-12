@@ -343,6 +343,7 @@ function ProductRouteSwitch() {
     <button onClick={() => navigate('/product-conversations/pc-1')}>open first product</button>
     <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>
     <button onClick={() => navigate('/global/row-2')}>open second Global member</button>
+    <button onClick={() => navigate('/global/row-4')}>open newly created Global member</button>
   </>;
 }
 
@@ -631,6 +632,26 @@ describe('ProductConversationPage', () => {
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3');
     fireEvent.click(screen.getByRole('button', { name: 'history back' }));
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+  });
+
+  it('refreshes unresolved warm Global route topology without substituting its old requested member', async () => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ before: null, has_older: false });
+    let release!: (snapshot: CoordinatorConversationSnapshotView) => void;
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(initial)).mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+    renderPage('/global/row-1', true);
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'open newly created Global member' }));
+    await waitFor(() => expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(2));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    const continued = { ...initial, latest_transcript_row_id: 'row-5', writable_transcript_row_id: 'row-5', segments: [...initial.segments,
+      { segment_ordinal: 2, transcript_row_id: 'row-4', slug: 'row-4', title: 'Requested', messages: [makeMessage('requested-new-member', 1, 'row-4')] },
+      { segment_ordinal: 3, transcript_row_id: 'row-5', slug: 'row-5', title: 'Newest', messages: [makeMessage('newest-member', 1, 'row-5')] },
+    ] };
+    await act(async () => release(coordinatorSnapshot(continued)));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'requested-new-member' } }));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-5');
   });
 
   it('keeps a hashless newest Global reader unpinned when its route member continues', async () => {

@@ -34,6 +34,21 @@ export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoun
   // token churn, heartbeat) — this avoids rebuilding the pill list and
   // re-running PillStrip's per-`items` effects when neither the chapters nor
   // the active index changed.
+  const orderByKey = useMemo(() => {
+    const ordinals = new Map<string, number>();
+    const order = new Map<string, number>();
+    for (const boundary of historyBoundaries ?? []) {
+      ordinals.set(boundary.predecessor_transcript_row_id, boundary.segment_ordinal);
+      ordinals.set(boundary.successor_transcript_row_id, boundary.segment_ordinal + 1);
+      order.set(boundary.message_id, boundary.segment_ordinal * 2 + 1);
+    }
+    for (const chapter of chapters) {
+      if (chapter.kind === 'boundary' || chapter.target.kind === 'pending') continue;
+      const ordinal = chapter.target.transcriptId ? ordinals.get(chapter.target.transcriptId) : undefined;
+      if (ordinal !== undefined) order.set(chapter.target.messageId, ordinal * 2);
+    }
+    return order;
+  }, [chapters, historyBoundaries]);
   const items: PillItem[] = useMemo(
     () => [
       ...(historyBoundaries ?? []).filter((boundary) => !chapters.some((chapter) => chapter.kind === 'boundary' && chapter.messageId === boundary.message_id)).map((boundary): PillItem => ({
@@ -56,8 +71,8 @@ export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoun
             ? onJumpBoundary(chapter.messageId) : onJump(chapter),
         };
       }),
-    ],
-    [chapters, activeUnitIndex, onJump, historyBoundaries, onJumpBoundary],
+    ].sort((left, right) => (orderByKey.get(left.key) ?? Number.MAX_SAFE_INTEGER) - (orderByKey.get(right.key) ?? Number.MAX_SAFE_INTEGER)),
+    [chapters, activeUnitIndex, onJump, historyBoundaries, onJumpBoundary, orderByKey],
   );
 
   if (items.length === 0) {
