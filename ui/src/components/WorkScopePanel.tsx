@@ -122,7 +122,7 @@ function WorkScopeLoadIndicator({ load }: { load: NonNullable<ReturnType<typeof 
     ['15m', summary.cpu_fifteen_minutes],
   ] as const;
   const age = Math.max(0, Math.floor(load.age / 1000));
-  const cpuAge = summary.cpu_sampled_at === null ? NaN : Date.parse(summary.sampled_at) - Date.parse(summary.cpu_sampled_at) + load.age;
+  const cpuAge = summary.cpu_sampled_at === null ? NaN : Math.max(0, Date.parse(summary.sampled_at) - Date.parse(summary.cpu_sampled_at)) + load.age;
   const cpuFresh = Number.isFinite(cpuAge) && cpuAge >= 0 && cpuAge <= LOAD_STALE_AFTER_MS;
   const coverage = windows.map(([name, window]) => `${name}: ${Math.round(window.coverage_seconds)}s coverage`).join(' · ');
   const idle = summary.live_jobs === 0 && summary.cpu_cores_latest === 0;

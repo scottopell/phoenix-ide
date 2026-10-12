@@ -156,24 +156,12 @@ pub(crate) async fn sample_process_observations(
     rows
 }
 
-pub(crate) fn group_member_identities_for_sampling(
-    pgids: &BTreeSet<i32>,
-) -> Option<BTreeMap<u32, ProcessIdentity>> {
-    if pgids.is_empty() {
-        return Some(BTreeMap::new());
-    }
-    let member_pids = group_member_pids(pgids)?;
-    Some(
-        member_pids
-            .into_iter()
-            .filter_map(|pid| current_process_identity(pid).map(|identity| (pid, identity)))
-            .collect(),
-    )
-}
-
 pub(crate) fn group_identities_by_pgid(
     pgids: &BTreeSet<i32>,
 ) -> Option<BTreeMap<i32, BTreeMap<u32, ProcessIdentity>>> {
+    if pgids.is_empty() {
+        return Some(BTreeMap::new());
+    }
     let members = group_member_pids(pgids)?;
     let mut groups = BTreeMap::new();
     for pid in members {
@@ -765,7 +753,7 @@ mod tests {
     #[test]
     fn empty_process_group_snapshot_returns_no_members() {
         assert_eq!(
-            group_member_identities_for_sampling(&BTreeSet::new()),
+            group_identities_by_pgid(&BTreeSet::new()),
             Some(BTreeMap::new())
         );
     }

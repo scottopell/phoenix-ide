@@ -2,9 +2,8 @@
 
 use super::deployment::HostResources;
 use super::process_sample::{
-    group_member_identities_for_sampling, process_identity_for_sampling,
-    sample_process_observations, session_member_identities_for_sampling, ProcessIdentity,
-    ProcessObservation,
+    group_identities_by_pgid, process_identity_for_sampling, sample_process_observations,
+    session_member_identities_for_sampling, ProcessIdentity, ProcessObservation,
 };
 use super::AppState;
 use chrono::{DateTime, Utc};
@@ -195,6 +194,59 @@ fn valid_group_members(
         .is_some_and(|identity| identity.start_time == group.launch_identity.process.start_time)
 }
 
+type GroupIdentities = BTreeMap<i32, BTreeMap<u32, ProcessIdentity>>;
+
+fn capture_bash_members(
+    groups: &[phoenix_tools::bash::registry::LiveHandleProcessGroup],
+    members: Option<&GroupIdentities>,
+) -> (
+    Vec<HandleObservationTarget>,
+    BTreeMap<u32, ProcessIdentity>,
+    BTreeSet<String>,
+) {
+    let mut handles = Vec::with_capacity(groups.len());
+    let mut identities = BTreeMap::new();
+    let mut incomplete = BTreeSet::new();
+    for group in groups {
+        let scope_key = group.work_scope.stable_key();
+        match members.and_then(|groups| groups.get(&group.pgid)) {
+            Some(group_members) if valid_group_members(group, group_members) => {
+                handles.push(HandleObservationTarget {
+                    scope_key,
+                    handle_id: group.handle_id.to_string(),
+                    pids: group_members.keys().copied().collect(),
+                });
+                identities.extend(
+                    group_members
+                        .iter()
+                        .map(|(pid, identity)| (*pid, *identity)),
+                );
+            }
+            _ => {
+                incomplete.insert(scope_key);
+            }
+        }
+    }
+    (handles, identities, incomplete)
+}
+
+fn changed_bash_scopes(
+    groups: &[phoenix_tools::bash::registry::LiveHandleProcessGroup],
+    before: Option<&GroupIdentities>,
+    after: Option<&GroupIdentities>,
+) -> BTreeSet<String> {
+    groups
+        .iter()
+        .filter(|group| {
+            before.and_then(|members| members.get(&group.pgid))
+                != after.and_then(|members| members.get(&group.pgid))
+                || before.is_none()
+                || after.is_none()
+        })
+        .map(|group| group.work_scope.stable_key())
+        .collect()
+}
+
 async fn sample_generation(
     live_groups: Vec<phoenix_tools::bash::registry::LiveHandleProcessGroup>,
     terminal_sessions: BTreeSet<i32>,
@@ -206,26 +258,10 @@ async fn sample_generation(
         .into_iter()
         .collect::<BTreeMap<_, _>>();
 
-    let mut handles = Vec::with_capacity(live_groups.len());
-    let mut bash_identities = BTreeMap::<u32, ProcessIdentity>::new();
-    let mut incomplete_bash_scopes = BTreeSet::new();
-    for group in live_groups {
-        let identities = group_member_identities_for_sampling(&BTreeSet::from([group.pgid]));
-        match identities {
-            Some(identities) if valid_group_members(&group, &identities) => {
-                let pids = identities.keys().copied().collect();
-                bash_identities.extend(identities);
-                handles.push(HandleObservationTarget {
-                    scope_key: group.work_scope.stable_key(),
-                    handle_id: group.handle_id.to_string(),
-                    pids,
-                });
-            }
-            Some(_) | None => {
-                incomplete_bash_scopes.insert(group.work_scope.stable_key());
-            }
-        }
-    }
+    let pgids = live_groups.iter().map(|group| group.pgid).collect();
+    let before_members = group_identities_by_pgid(&pgids);
+    let (handles, bash_identities, mut incomplete_bash_scopes) =
+        capture_bash_members(&live_groups, before_members.as_ref());
 
     let terminal_identities = session_member_identities_for_sampling(&terminal_sessions);
 
@@ -239,6 +275,13 @@ async fn sample_generation(
         super::deployment::sample_host_resources(),
         sample_process_observations(&all_identities)
     );
+
+    let after_members = group_identities_by_pgid(&pgids);
+    incomplete_bash_scopes.extend(changed_bash_scopes(
+        &live_groups,
+        before_members.as_ref(),
+        after_members.as_ref(),
+    ));
 
     ResourceObservationGeneration {
         sampled_at: Utc::now(),
@@ -277,6 +320,66 @@ mod tests {
             handles: Vec::new(),
             incomplete_bash_scopes: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn post_sample_group_membership_changes_invalidate_only_affected_scopes() {
+        use phoenix_core::process_identity::ProcessIdentity as BashProcessIdentity;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        use phoenix_tools::bash::handle::{BashLaunchIdentity, HandleId};
+
+        let make_group = |scope: &str, pgid: i32| {
+            let work_scope = ResourceScopeKey::Work(WorkScopeId::parse(scope).unwrap());
+            phoenix_tools::bash::registry::LiveHandleProcessGroup {
+                control_scope: work_scope.clone(),
+                work_scope,
+                handle_id: HandleId::new(format!("b-{scope}")),
+                launch_identity: BashLaunchIdentity {
+                    process: BashProcessIdentity {
+                        pid: u32::try_from(pgid).unwrap(),
+                        start_time: 1,
+                    },
+                    launch_uuid: scope.into(),
+                },
+                pgid,
+            }
+        };
+        let groups = vec![make_group("a", 10), make_group("b", 20)];
+        let identity = |pid, start_time| ProcessIdentity { pid, start_time };
+        let before = BTreeMap::from([
+            (
+                10,
+                BTreeMap::from([(10, identity(10, 1)), (11, identity(11, 2))]),
+            ),
+            (20, BTreeMap::from([(20, identity(20, 1))])),
+        ]);
+        let (targets, _, incomplete) = capture_bash_members(&groups, Some(&before));
+        assert!(incomplete.is_empty());
+        assert_eq!(targets[0].pids, BTreeSet::from([10, 11]));
+        for changed in [
+            BTreeMap::from([
+                (10, identity(10, 1)),
+                (11, identity(11, 2)),
+                (12, identity(12, 3)),
+            ]),
+            BTreeMap::from([(10, identity(10, 1))]),
+            BTreeMap::from([(10, identity(10, 1)), (11, identity(11, 3))]),
+        ] {
+            let after = BTreeMap::from([(10, changed), (20, before[&20].clone())]);
+            assert_eq!(
+                changed_bash_scopes(&groups, Some(&before), Some(&after)),
+                BTreeSet::from(["work:a".to_string()])
+            );
+        }
+        assert!(changed_bash_scopes(&groups, Some(&before), Some(&before)).is_empty());
+        assert_eq!(
+            changed_bash_scopes(&groups, Some(&before), None),
+            BTreeSet::from(["work:a".to_string(), "work:b".to_string()])
+        );
+        let missing_leader = BTreeMap::from([(10, BTreeMap::from([(11, identity(11, 2))]))]);
+        assert!(capture_bash_members(&groups, Some(&missing_leader))
+            .2
+            .contains("work:a"));
     }
 
     #[tokio::test]

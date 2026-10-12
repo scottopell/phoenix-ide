@@ -2,7 +2,9 @@ use super::process_sample::{cpu_time_for_identity, group_identities_by_pgid, Pro
 use super::resource_monitor::{ResourceMonitor, ResourceObservationGeneration};
 use chrono::{DateTime, Utc};
 use phoenix_core::work_scope::ResourceScopeKey;
-use phoenix_tools::bash::registry::{BashHandleRegistry, LiveHandleProcessGroup};
+use phoenix_tools::bash::registry::{
+    BashHandleRegistry, LiveHandleProcessGroup, LiveHandleSnapshot,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -218,21 +220,21 @@ impl WorkScopeLoadService {
         } else {
             None
         };
-        let epochs = self.handles.snapshot_lifecycle_epochs().await;
+        let latest = self
+            .handles
+            .snapshot_live_process_groups_with_epochs()
+            .await;
+        let stable_epoch = stable_scope_epoch(&snapshot, &latest, scope);
         let state = self.cpu.lock().await;
         summarize(
             scope,
             groups,
-            snapshot
-                .lifecycle_epochs
-                .get(scope)
-                .copied()
-                .flatten()
-                .filter(|epoch| epochs.get(scope) == Some(&Some(*epoch))),
+            stable_epoch,
             observation.as_deref(),
             &state,
             Instant::now(),
             Utc::now(),
+            memory_snapshot_stable(&snapshot, &latest, scope),
         )
     }
 
@@ -265,7 +267,10 @@ impl WorkScopeLoadService {
         } else {
             None
         };
-        let epochs = self.handles.snapshot_lifecycle_epochs().await;
+        let latest = self
+            .handles
+            .snapshot_live_process_groups_with_epochs()
+            .await;
         let state = self.cpu.lock().await;
         let now = Instant::now();
         let sampled_at = Utc::now();
@@ -275,20 +280,56 @@ impl WorkScopeLoadService {
                 summarize(
                     scope,
                     groups,
-                    snapshot
-                        .lifecycle_epochs
-                        .get(scope)
-                        .copied()
-                        .flatten()
-                        .filter(|epoch| epochs.get(scope) == Some(&Some(*epoch))),
+                    stable_scope_epoch(&snapshot, &latest, scope),
                     observation.as_deref(),
                     &state,
                     now,
                     sampled_at,
+                    memory_snapshot_stable(&snapshot, &latest, scope),
                 )
             })
             .collect())
     }
+}
+
+fn stable_scope_epoch(
+    before: &LiveHandleSnapshot,
+    after: &LiveHandleSnapshot,
+    scope: &ResourceScopeKey,
+) -> Option<u64> {
+    before
+        .lifecycle_epochs
+        .get(scope)
+        .copied()
+        .flatten()
+        .filter(|epoch| after.lifecycle_epochs.get(scope) == Some(&Some(*epoch)))
+}
+
+fn memory_snapshot_stable(
+    before: &LiveHandleSnapshot,
+    after: &LiveHandleSnapshot,
+    scope: &ResourceScopeKey,
+) -> bool {
+    let launches = |snapshot: &LiveHandleSnapshot| {
+        snapshot
+            .groups
+            .iter()
+            .filter(|group| group.work_scope == *scope)
+            .map(|group| {
+                (
+                    group.handle_id.to_string(),
+                    group.stable_resource_identity(),
+                    group.pgid,
+                )
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let before_launches = launches(before);
+    before_launches == launches(after)
+        && (stable_scope_epoch(before, after, scope).is_some()
+            || (before_launches.is_empty()
+                && !before.lifecycle_epochs.contains_key(scope)
+                && !after.lifecycle_epochs.contains_key(scope)))
 }
 
 fn prune_history(history: &mut VecDeque<CpuInterval>, now: Instant) {
@@ -300,6 +341,7 @@ fn prune_history(history: &mut VecDeque<CpuInterval>, now: Instant) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summarize(
     scope: &ResourceScopeKey,
     groups: &[LiveHandleProcessGroup],
@@ -308,6 +350,7 @@ fn summarize(
     state: &CpuState,
     now: Instant,
     sampled_at: DateTime<Utc>,
+    memory_stable: bool,
 ) -> WorkScopeLoadSummary {
     let scoped: Vec<_> = groups
         .iter()
@@ -332,7 +375,9 @@ fn summarize(
     } else {
         Some(0.0)
     };
-    let (memory_bytes, process_count) = if !active {
+    let (memory_bytes, process_count) = if !memory_stable {
+        (None, None)
+    } else if !active {
         (Some(0), Some(0))
     } else if let Some(observation) = observation {
         let ids = scoped
@@ -535,6 +580,77 @@ fn window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memory_snapshot_rejects_after_start_replacement_and_exit() {
+        use std::collections::HashMap;
+        let a = ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse("a").unwrap());
+        let b = ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse("b").unwrap());
+        let before = LiveHandleSnapshot {
+            groups: vec![group(a.clone(), "b-1")],
+            lifecycle_epochs: HashMap::from([(a.clone(), Some(1)), (b.clone(), Some(0))]),
+        };
+        let mut after = before.clone();
+        assert!(memory_snapshot_stable(&before, &after, &a));
+        assert!(memory_snapshot_stable(&before, &after, &b));
+        after.groups.push(group(a.clone(), "b-2"));
+        after.lifecycle_epochs.insert(a.clone(), Some(2));
+        assert!(!memory_snapshot_stable(&before, &after, &a));
+        assert!(memory_snapshot_stable(&before, &after, &b));
+        let summary = summarize(
+            &a,
+            &before.groups,
+            None,
+            None,
+            &CpuState::default(),
+            Instant::now(),
+            Utc::now(),
+            memory_snapshot_stable(&before, &after, &a),
+        );
+        assert_eq!((summary.memory_bytes, summary.process_count), (None, None));
+        after = before.clone();
+        after.groups[0].launch_identity.launch_uuid = "replacement".into();
+        assert!(!memory_snapshot_stable(&before, &after, &a));
+        after = before.clone();
+        after.groups.clear();
+        assert!(!memory_snapshot_stable(&before, &after, &a));
+        let idle = LiveHandleSnapshot {
+            groups: Vec::new(),
+            lifecycle_epochs: HashMap::from([(a.clone(), Some(1))]),
+        };
+        assert!(memory_snapshot_stable(&idle, &idle, &a));
+        assert_eq!(
+            summarize(
+                &a,
+                &[],
+                None,
+                None,
+                &CpuState::default(),
+                Instant::now(),
+                Utc::now(),
+                memory_snapshot_stable(&idle, &idle, &a)
+            )
+            .memory_bytes,
+            Some(0)
+        );
+        assert!(!memory_snapshot_stable(&idle, &before, &a));
+        let started = summarize(
+            &a,
+            &[],
+            None,
+            None,
+            &CpuState::default(),
+            Instant::now(),
+            Utc::now(),
+            memory_snapshot_stable(&idle, &before, &a),
+        );
+        assert_eq!((started.memory_bytes, started.process_count), (None, None));
+        let missing = LiveHandleSnapshot {
+            groups: vec![],
+            lifecycle_epochs: HashMap::new(),
+        };
+        assert!(!memory_snapshot_stable(&missing, &before, &a));
+    }
+
     #[tokio::test]
     async fn empty_scope_does_not_invoke_native_or_demand_monitor() {
         let handles = Arc::new(BashHandleRegistry::new());
@@ -755,6 +871,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn transient_handle_between_samples_invalidates_only_crossed_interval() {
         use phoenix_tools::bash::handle::{FinalCause, Handle, HandleId, TOMBSTONE_TAIL_LINES};
         let registry = BashHandleRegistry::new();
@@ -833,6 +950,7 @@ mod tests {
                 state,
                 at,
                 Utc::now(),
+                true,
             )
         };
         let summary = summarize_live(&state, after.at);
@@ -891,11 +1009,29 @@ mod tests {
                 BTreeSet::from([groups[0].stable_resource_identity()]),
             );
             assert!(state.latest.contains_key(&scope.stable_key()));
-            let summary = summarize(&scope, &groups, Some(1), None, &state, now, Utc::now());
+            let summary = summarize(
+                &scope,
+                &groups,
+                Some(1),
+                None,
+                &state,
+                now,
+                Utc::now(),
+                true,
+            );
             assert_eq!(summary.cpu_cores_latest, None, "{invalid}");
             assert_eq!(summary.cpu_sampled_at, None, "{invalid}");
             state.latest.insert(scope.stable_key(), Some(0.0));
-            let summary = summarize(&scope, &groups, Some(2), None, &state, now, Utc::now());
+            let summary = summarize(
+                &scope,
+                &groups,
+                Some(2),
+                None,
+                &state,
+                now,
+                Utc::now(),
+                true,
+            );
             assert_eq!(summary.cpu_cores_latest, None);
             assert_eq!(summary.cpu_sampled_at, None);
         }
@@ -998,7 +1134,7 @@ mod tests {
             elapsed: Duration::from_secs(5),
             cores: BTreeMap::from([("work:a".into(), Some(1.0))]),
         });
-        let result = summarize(&scope, &[], None, None, &state, now, Utc::now());
+        let result = summarize(&scope, &[], None, None, &state, now, Utc::now(), true);
         assert_eq!(result.cpu_cores_latest, Some(0.0));
         assert_eq!(result.cpu_sampled_at, None);
         assert_eq!(result.cpu_one_minute.average_cores, Some(1.0));
@@ -1029,7 +1165,7 @@ mod tests {
         };
         state.latest.insert(scope.stable_key(), Some(0.5));
         let memory_at = Utc::now();
-        let result = summarize(&scope, &groups, Some(1), None, &state, now, memory_at);
+        let result = summarize(&scope, &groups, Some(1), None, &state, now, memory_at, true);
         assert_eq!(result.sampled_at, memory_at);
         assert_eq!(result.cpu_sampled_at, Some(cpu_at));
         assert_eq!(result.cpu_cores_latest, Some(0.5));
@@ -1041,7 +1177,8 @@ mod tests {
                 None,
                 &state,
                 now + CADENCE * 3,
-                memory_at
+                memory_at,
+                true,
             )
             .cpu_sampled_at,
             None
@@ -1101,6 +1238,7 @@ mod tests {
             &state,
             now,
             Utc::now(),
+            true,
         );
         let b_summary = summarize(
             &b,
@@ -1110,6 +1248,7 @@ mod tests {
             &state,
             now,
             Utc::now(),
+            true,
         );
         assert_eq!(
             (a_summary.memory_bytes, a_summary.process_count),
@@ -1132,7 +1271,8 @@ mod tests {
                 Some(&observation),
                 &state,
                 now,
-                Utc::now()
+                Utc::now(),
+                true,
             )
             .memory_bytes,
             None
@@ -1146,7 +1286,8 @@ mod tests {
                 Some(&observation),
                 &state,
                 now,
-                Utc::now()
+                Utc::now(),
+                true,
             )
             .memory_bytes,
             None
@@ -1161,7 +1302,8 @@ mod tests {
                 Some(&observation),
                 &state,
                 now,
-                Utc::now()
+                Utc::now(),
+                true,
             )
             .process_count,
             None

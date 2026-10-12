@@ -164,6 +164,16 @@ describe('WorkScope load indicator', () => {
     expect(screen.getByRole('status').getAttribute('title')).toContain(`Server sampled at ${timestamp}`);
   });
 
+  it('accepts CPU newer than the shared cached memory snapshot', async () => {
+    getInv.mockResolvedValue(inv([]));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample({
+      cpu_sampled_at: new Date(Date.now() + 1000).toISOString(),
+    }))));
+    await act(async () => { render(panel()); });
+    expect(screen.getByRole('status').textContent).toContain('now 2.50 cores');
+    expect(screen.getByRole('status').getAttribute('title')).toContain('CPU 0s ago');
+  });
+
   it('shows observed idle zero without requiring a native CPU sample and retains recent history', async () => {
     getInv.mockResolvedValue(inv([]));
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(sample({
