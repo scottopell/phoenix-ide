@@ -262,13 +262,6 @@ fn capture_bash_members(
     (handles, identities, incomplete)
 }
 
-fn retain_complete_bash_targets(
-    handles: &mut Vec<HandleObservationTarget>,
-    incomplete_scopes: &BTreeSet<String>,
-) {
-    handles.retain(|target| !incomplete_scopes.contains(&target.scope_key));
-}
-
 fn changed_bash_scopes(
     groups: &[phoenix_tools::bash::registry::LiveHandleProcessGroup],
     before: Option<&GroupIdentities>,
@@ -321,8 +314,6 @@ async fn sample_generation(
         before_members.as_ref(),
         after_members.as_ref(),
     ));
-
-    retain_complete_bash_targets(&mut handles, &incomplete_bash_scopes);
 
     ResourceObservationGeneration {
         sampled_at: Utc::now(),
@@ -633,35 +624,87 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_scope_targets_are_removed_and_all_bash_consumers_report_unavailable() {
-        let mut generation = empty_generation();
-        generation.handles = vec![
-            HandleObservationTarget {
-                scope_key: "work:a".into(),
-                handle_id: "a-1".into(),
-                pids: BTreeSet::from([10]),
-            },
-            HandleObservationTarget {
-                scope_key: "work:b".into(),
-                handle_id: "b-1".into(),
-                pids: BTreeSet::from([20]),
-            },
+    fn incomplete_scope_keeps_shared_group_claim_and_gates_other_scope_health() {
+        use phoenix_core::process_identity::ProcessIdentity as BashProcessIdentity;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        use phoenix_tools::bash::handle::{BashLaunchIdentity, HandleId};
+        use phoenix_tools::bash::registry::LiveHandleProcessGroup;
+
+        let group = |scope: &str, handle: &str, pgid: i32| {
+            let work_scope = ResourceScopeKey::Work(WorkScopeId::parse(scope).unwrap());
+            LiveHandleProcessGroup {
+                control_scope: work_scope.clone(),
+                work_scope,
+                handle_id: HandleId::new(handle),
+                launch_identity: BashLaunchIdentity {
+                    process: BashProcessIdentity {
+                        pid: u32::try_from(pgid).unwrap(),
+                        start_time: 1,
+                    },
+                    launch_uuid: handle.into(),
+                },
+                pgid,
+            }
+        };
+        let groups = [
+            group("a", "a-1", 10),
+            group("b", "b-1", 10),
+            group("a", "a-2", 30),
         ];
-        generation.incomplete_bash_scopes.insert("work:a".into());
-        retain_complete_bash_targets(&mut generation.handles, &generation.incomplete_bash_scopes);
-        assert!(generation.handle_pids("work:a", "a-1").is_none());
-        assert!(generation.handle_pids("work:b", "b-1").is_some());
-        let health = generation.bash_health_for_handles("work:a", &["a-1".into()]);
-        assert_eq!(health.cpu_percent, None);
-        assert_eq!(health.memory_bytes, None);
-        assert_eq!(health.process_count, None);
-        // A missing process observation is also unavailable, not a partial total.
+        let members = BTreeMap::from([
+            (
+                10,
+                BTreeMap::from([(
+                    10,
+                    ProcessIdentity {
+                        pid: 10,
+                        start_time: 1,
+                    },
+                )]),
+            ),
+            (
+                30,
+                BTreeMap::from([(
+                    30,
+                    ProcessIdentity {
+                        pid: 30,
+                        start_time: 2,
+                    },
+                )]),
+            ),
+        ]);
+        let (handles, identities, incomplete) = capture_bash_members(&groups, Some(&members));
+        assert_eq!(incomplete, BTreeSet::from(["work:a".into()]));
         assert_eq!(
-            generation
-                .bash_health_for_handles("work:b", &["b-1".into()])
-                .process_count,
-            None
+            identities.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([10])
         );
+        let mut generation = empty_generation();
+        generation.handles = handles;
+        generation.incomplete_bash_scopes = incomplete;
+        generation.observations.insert(
+            10,
+            ProcessObservation {
+                pid: 10,
+                name: "shared".into(),
+                cpu_percent: Some(1.0),
+                memory_bytes: Some(1024),
+                thread_count: None,
+                cpu_time_seconds: None,
+            },
+        );
+        assert_eq!(
+            generation.handle_pids("work:a", "a-1"),
+            Some(&BTreeSet::from([10]))
+        );
+        assert_eq!(generation.handle_pids("work:a", "a-2"), None);
+        assert_eq!(generation.all_bash_pids(), BTreeSet::from([10]));
+        for (scope, handle) in [("work:a", "a-1"), ("work:b", "b-1")] {
+            let health = generation.bash_health_for_handles(scope, &[handle.into()]);
+            assert_eq!(health.cpu_percent, None);
+            assert_eq!(health.memory_bytes, None);
+            assert_eq!(health.process_count, None);
+        }
     }
 
     #[test]
