@@ -985,7 +985,7 @@ describe('MessageList', () => {
   it('uses only the admitted command to position and reveal an exact source tool', () => {
     const source = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'Sending' }, { type: 'tool_use', id: 'source-tool', name: 'send_conversation_message', input: { message: 'payload' } }] } as Message;
     const view = { conversationId: 'aggregate-owner', generation: 1, transcriptGeneration: 1 };
-    render(withConvContext(<MessageList streamingRequestId={null} messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="aggregate-owner" transcriptPositioning={{ kind: 'positioning', command: { kind: 'jump_to_message', token: 1, view, targetMessageId: source.message_id } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="aggregate-owner" transcriptPositioning={{ kind: 'positioning', command: { kind: 'jump_to_message', token: 1, requestToken: 1, view, targetMessageId: source.message_id } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(0, 'start', undefined, '[data-tool-id="source-tool"]');
   });
