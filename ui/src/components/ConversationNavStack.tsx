@@ -62,8 +62,8 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     onUpdateOlderMessagesRestore?.({ kind: 'reader_viewport' });
     const target = chapter.kind === 'boundary' ? { kind: 'persisted' as const, messageId: chapter.messageId, transcriptId: chapter.transcriptId } : chapter.target;
     selectChapterTarget(target);
-    if (historyBoundaries === undefined || target.kind === 'pending') listRef.current?.scrollToUnitIndex(chapter.unitIndex);
-  }, [selectChapterTarget, onUpdateOlderMessagesRestore, historyBoundaries]);
+    if (target.kind === 'pending') listRef.current?.scrollToUnitIndex(chapter.unitIndex);
+  }, [selectChapterTarget, onUpdateOlderMessagesRestore]);
 
   const handleLoadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!onLoadOlderMessages) return;

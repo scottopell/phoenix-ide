@@ -21,9 +21,10 @@ vi.mock('./ConversationNav', () => ({ ConversationNav: ({ onJump }: { onJump: (c
 } }));
 vi.mock('../hooks/useFloatingNavStack', () => ({ useFloatingNavStack: () => {} }));
 describe('source locator decoding', () => {
-  it('retires the pending older-page anchor before jumping to a loaded chapter', () => {
+  it.each([false, true])('uses one persisted chapter owner and local pending navigation (aggregate=%s)', aggregate => {
     const update = vi.fn();
-    render(<MemoryRouter initialEntries={['/global/fixture?source_transcript=older&source_tool=old-tool&filter=keep#message-unloaded-boundary']}><ConversationNavStack messages={[]} pendingMessages={[]} historyBoundaries={[]} conversationId="product-aggregate" slug="fixture" streamingRequestId={null} convState={{ type: 'idle' }} onRetry={vi.fn()} onOpenFile={undefined} transcriptPositioning={{ kind: 'idle', view: { conversationId: 'fixture', generation: 1, transcriptGeneration: 1 } }} onUpdateOlderMessagesRestore={update} /></MemoryRouter>);
+    scrollToUnitIndex.mockClear();
+    render(<MemoryRouter initialEntries={['/global/fixture?source_transcript=older&source_tool=old-tool&filter=keep#message-unloaded-boundary']}><ConversationNavStack messages={[]} pendingMessages={[]} {...(aggregate ? { historyBoundaries: [] } : {})} conversationId="product-aggregate" slug="fixture" streamingRequestId={null} convState={{ type: 'idle' }} onRetry={vi.fn()} onOpenFile={undefined} transcriptPositioning={{ kind: 'idle', view: { conversationId: 'fixture', generation: 1, transcriptGeneration: 1 } }} onUpdateOlderMessagesRestore={update} /></MemoryRouter>);
     fireEvent.click(screen.getByRole('button', { name: 'Loaded chapter' }));
     expect(update).toHaveBeenCalledWith({ kind: 'reader_viewport' });
     expect(scrollToUnitIndex).not.toHaveBeenCalled();

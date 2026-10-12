@@ -129,11 +129,12 @@ describe('ProductConversationAliasRedirect', () => {
     } as never));
     const entry = '/c/product-1?source_transcript=old-member#message-old%3Amessage';
     const first = renderAlias('product-1', entry);
-    await screen.findByTestId('embedded-fallback');
+    await screen.findByTestId('product-page');
     first.unmount();
     renderAlias('product-1', entry);
-    await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'old-member' }));
+    await screen.findByTestId('product-page');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('old-member');
+    expect(embeddedSpy).not.toHaveBeenCalled();
     expect(screen.getByTestId('location')).toHaveTextContent(entry);
   });
 
@@ -164,9 +165,9 @@ describe('ProductConversationAliasRedirect', () => {
       latest_transcript_row_id: 'successor', writable_transcript_row_id: 'successor', requested_transcript_row_id: 'historical',
     } as never);
     renderAlias('historical', '/c/historical?source_transcript=historical&source_tool=send#message-source');
-    await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'historical', suppressCanonicalization: true, mutationEnabled: false }));
-    expect(screen.queryByTestId('product-page')).toBeNull();
+    await screen.findByTestId('product-page');
+    expect(embeddedSpy).not.toHaveBeenCalled();
+    expect(screen.getByTestId('location')).toHaveTextContent('/c/historical?source_transcript=historical&source_tool=send#message-source');
   });
 
   it('keeps an open current member live while direct messages are temporarily blocked', async () => {
@@ -175,10 +176,8 @@ describe('ProductConversationAliasRedirect', () => {
       latest_transcript_row_id: 'current-member', writable_transcript_row_id: null, requested_transcript_row_id: 'current-member',
     } as never);
     renderAlias('current-member', '/c/current-member?source_transcript=current-member');
-    await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({
-      slug: 'current-member', aggregateLifecycleOpen: true, mutationEnabled: false,
-    }));
+    await screen.findByTestId('product-page');
+    expect(embeddedSpy).not.toHaveBeenCalled();
   });
 
   it.each(['/c/product-1', '/product-conversations/product-1', '/c/legacy-slug'])('honors an encoded predecessor pin on %s', async (path) => {
@@ -187,8 +186,8 @@ describe('ProductConversationAliasRedirect', () => {
       requested_transcript_row_id: reference === 'old:member' ? 'old:member' : 'root', latest_transcript_row_id: 'successor',
     } as never));
     renderAlias(path.split('/').at(-1)!, `${path}?source_transcript=old%3Amember&viewer=inspect#message-old%3Amsg`);
-    await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'old:member' }));
+    await screen.findByTestId('product-page');
+    expect(embeddedSpy).not.toHaveBeenCalled();
     expect(screen.getByTestId('location')).toHaveTextContent('source_transcript=old%3Amember&viewer=inspect#message-old%3Amsg');
   });
 
