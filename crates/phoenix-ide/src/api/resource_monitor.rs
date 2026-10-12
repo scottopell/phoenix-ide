@@ -687,7 +687,7 @@ mod tests {
             ),
         ]);
         let (handles, identities, incomplete) = capture_bash_members(&groups, Some(&members));
-        assert_eq!(incomplete, BTreeSet::from(["work:a".into()]));
+        assert_eq!(incomplete, BTreeSet::from(["work:a".into(), "work:b".into()]));
         assert_eq!(
             identities.keys().copied().collect::<BTreeSet<_>>(),
             BTreeSet::from([10])
