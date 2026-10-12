@@ -18931,7 +18931,12 @@ mod wake_handler_tests {
     #[tokio::test]
     async fn retrieval_status_requires_auth_and_reports_successful_search() {
         let mut state = make_test_state().await;
-        state.password = Some("retrieval-status-test-password".to_string());
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "retrieval-status-test-password".to_string(),
+            )
+            .unwrap(),
+        );
         state
             .db
             .create_conversation("retrieval-ready", "ready", "/tmp/ready", true, None, None)
