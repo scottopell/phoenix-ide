@@ -1152,6 +1152,29 @@ mod tests {
         clippy::too_many_lines
     )]
     async fn production_conversation_search_benchmark() {
+        // This adapter is confined to the ignored immutable-fixture benchmark.
+        struct ValidatedFixtureRetriever(phoenix_db::retrieval::Fts5Retriever);
+        #[async_trait::async_trait]
+        impl MessageRetriever for ValidatedFixtureRetriever {
+            async fn retrieve(
+                &self,
+                request: phoenix_db::retrieval::RetrievalRequest,
+            ) -> Result<
+                Vec<phoenix_db::retrieval::RetrievedChunk>,
+                phoenix_db::retrieval::RetrievalError,
+            > {
+                self.0.retrieve(request).await
+            }
+            fn reconciliation_status(&self) -> phoenix_db::retrieval::ReconciliationStatus {
+                phoenix_db::retrieval::ReconciliationStatus::Ready
+            }
+            async fn is_fresh_for(
+                &self,
+                ids: &[String],
+            ) -> Result<bool, phoenix_db::retrieval::RetrievalError> {
+                self.0.is_fresh_for(ids).await
+            }
+        }
         enum InvocationResult {
             Retriever(Result<Vec<crate::db::RetrievedChunk>, String>),
             Tool {
@@ -1321,30 +1344,6 @@ mod tests {
                 "unlocated_physical_rows": unlocated_physical_rows,
             })
         };
-        // The immutable fixture was validated once above; this test-only adapter
-        // keeps each measured pool fresh without exposing a production Ready setter.
-        struct ValidatedFixtureRetriever(phoenix_db::retrieval::Fts5Retriever);
-        #[async_trait::async_trait]
-        impl MessageRetriever for ValidatedFixtureRetriever {
-            async fn retrieve(
-                &self,
-                request: phoenix_db::retrieval::RetrievalRequest,
-            ) -> Result<
-                Vec<phoenix_db::retrieval::RetrievedChunk>,
-                phoenix_db::retrieval::RetrievalError,
-            > {
-                self.0.retrieve(request).await
-            }
-            fn reconciliation_status(&self) -> phoenix_db::retrieval::ReconciliationStatus {
-                phoenix_db::retrieval::ReconciliationStatus::Ready
-            }
-            async fn is_fresh_for(
-                &self,
-                ids: &[String],
-            ) -> Result<bool, phoenix_db::retrieval::RetrievalError> {
-                self.0.is_fresh_for(ids).await
-            }
-        }
         'scenarios: for scenario in scenarios["scenarios"].as_array().expect("scenarios array") {
             let case_id = scenario["id"].as_str().unwrap();
             let query = scenario["query"].as_str().unwrap();
