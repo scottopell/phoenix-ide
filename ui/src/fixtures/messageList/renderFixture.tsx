@@ -256,6 +256,7 @@ export function MessageListFixture({ scenario }: Props) {
             <div className="fixture-message-list-stage">
               <div className="message-list-fixture-shell">
                 <MessageList
+                  streamingRequestId={null}
                   ref={messageListRef}
                   messages={messages}
                   pendingMessages={data.pendingMessages}

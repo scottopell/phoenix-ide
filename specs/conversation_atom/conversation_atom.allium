@@ -1046,19 +1046,36 @@ invariant LastSseEventAtPositive {
 --                        AND every ping keep-alive (SseEventObserved). The
 --                        higher-frequency of the two.
 --
--- <ConversationPage> must NOT subscribe to either. It selects a stable
--- projection (useConversationView / ConversationPageView) over only the
--- fields it renders — conversationId, conversation, phase, messages,
--- contextWindow, systemPrompt, uiError, toolExecutingStartedAt,
--- phaseStateUpdatedAt, firstByteRequestId, turnRetryContext — compared
--- by a cached-reference equality so an excluded-field bump yields an
--- equal projection and no page re-render.
+-- <ConversationPage> must NOT select the full streamingBuffer or
+-- lastSseEventAt. Its stable projection (useConversationView /
+-- ConversationPageView) includes the page's structural fields plus
+-- streamingRequestId: the buffer's request identity, or null. Cached
+-- field equality preserves the projection reference on token-only and
+-- clock-only updates. Streaming start, restart, and end change the
+-- request identity and therefore do update the structural projection.
+--
+-- A transcript owner must select messages, phase, and streamingRequestId
+-- from one conversation-atom revision. For the live member of an aggregate
+-- ProductConversation transcript, useConversationTranscriptView selects
+-- those fields together with conversationId. Messages must not arrive via
+-- an effect-published embedded-child projection while stream lifecycle
+-- arrives through an independent subscription. The transcript owner passes
+-- the coherent structural inputs to MessageList; MessageList does not
+-- independently subscribe to streaming request identity.
+--
+-- SseMessageAppended's atomic append-and-clear must remain atomic at the
+-- rendered transcript boundary (REQ-MLRU-010 in messagelist-render-units).
+-- The streaming tail and finalized agent row share the request/message key.
+-- No intermediate commit may omit that row or leave it empty because the
+-- buffer cleared before the finalized message reached the structural view.
 --
 -- The two volatile fields are consumed by narrower subscribers BELOW the
 -- page boundary, so their churn re-renders only the leaf that needs it:
 --
---   - streamingBuffer → <MessageList> / <StreamingMessage> via their own
---                        slice selectors (already memo + stable props).
+--   - streamingBuffer → <StreamingMessage> via useStreamingBuffer; the
+--                        leaf renders only a buffer matching its structural
+--                        request key. Token-aware find uses its own narrow
+--                        subscriber while open, not the transcript owner.
 --   - lastSseEventAt  → <ConnectedStateBar> via useLastSseEventAtRef, which
 --                        writes the clock into a ref WITHOUT re-rendering on
 --                        the bump. The StateBar watchdog samples that ref on
@@ -1071,10 +1088,11 @@ invariant LastSseEventAtPositive {
 -- WHY IT MATTERS. Excluding the volatile fields is what keeps the page
 -- and its non-memoized children (StateBar, InputArea, WorkActions)
 -- out of per-token / per-ping render churn. If a future
--- change reads streamingBuffer or lastSseEventAt back into the page-view
--- projection, or drops the cached-reference equality, the render-count
--- assertions in useConversationView.perf-isolation.test.tsx fail — that
--- test is the executable witness for this contract.
+-- change selects the full streamingBuffer or lastSseEventAt in a
+-- structural projection, or drops cached-reference equality, it violates
+-- this contract. useConversationView.perf-isolation.test.tsx witnesses
+-- token/clock isolation; ProductConversationPage.finalization.test.tsx
+-- witnesses coherent finalization commits at the aggregate boundary.
 
 ------------------------------------------------------------
 -- Design Decisions

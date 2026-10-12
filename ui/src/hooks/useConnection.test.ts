@@ -609,6 +609,111 @@ describe('useConnection epoch stamping (task 08683)', () => {
     }
   });
 
+  it('ignores unmounted stream callbacks across a real remount with a reused epoch and stamps the current init identity', () => {
+    vi.useFakeTimers();
+    try {
+      const store = new ConversationStore();
+      const rowId = 'conv-A';
+      const dispatch = vi.fn((action: SSEAction) => store.dispatch(rowId, action));
+      const oldValidatedInit = vi.fn();
+      const oldMount = renderHook(() => useConnection({
+        conversationId: rowId, dispatch, onValidatedInit: oldValidatedInit,
+      }));
+      const oldStream = FakeEventSource.instances[0]!;
+      const oldOpen = dispatch.mock.calls.map(([action]) => action)
+        .find((action) => action.type === 'connection_opened');
+      expect(oldOpen).toMatchObject({ type: 'connection_opened', epoch: 1 });
+      expect(oldOpen?.type === 'connection_opened' && typeof oldOpen.connectionId).toBe('symbol');
+      act(() => oldStream.emit('init', makeInitPayload(rowId, 'slug-A')));
+      expect(oldValidatedInit).toHaveBeenCalledOnce();
+      expect(oldMount.result.current.state).toBe('connected');
+
+      const snapshot = {
+        product_conversation_id: 'product-A', close: null, canonical_route: '/c/product-A',
+        requested_transcript_row_id: rowId,
+        canonical_root: { transcript_row_id: rowId, slug: 'slug-A', title: null },
+        ordinary_lifecycle: 'history' as const, latest_transcript_row_id: rowId,
+        writable_transcript_row_id: null, updated_at: '2024-06-01T00:00:00Z',
+        presentation: { kind: 'state' as const, display_name: 'A', presentation_mode: 'idle' },
+        work_identity: null, source: null, chain_qa_compatibility: null,
+        segments: [], before: null, has_older: false,
+      };
+      store.observeProductConversationSnapshot(snapshot);
+      store.observeProductConversationSnapshot({ ...snapshot, ordinary_lifecycle: 'open' });
+      expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'awaiting_init', connectionId: null });
+
+      oldMount.unmount();
+      act(() => vi.advanceTimersByTime(0));
+      expect(oldStream.closed).toBe(true);
+      dispatch.mockClear();
+      const afterUnmount = store.getSnapshot(rowId);
+      act(() => {
+        oldStream.emit('init', 'invalid JSON from an already unmounted stream');
+        oldStream.emit('message', 'invalid JSON from an already unmounted stream');
+        oldStream.emit('error', '');
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(store.getSnapshot(rowId)).toBe(afterUnmount);
+      expect(oldValidatedInit).toHaveBeenCalledOnce();
+
+      const currentValidatedInit = vi.fn();
+      const currentMount = renderHook(() => useConnection({
+        conversationId: rowId, dispatch, onValidatedInit: currentValidatedInit,
+      }));
+      expect(FakeEventSource.instances).toHaveLength(2);
+      const currentStream = FakeEventSource.instances[1]!;
+      const currentOpen = dispatch.mock.calls.map(([action]) => action)
+        .find((action) => action.type === 'connection_opened');
+      if (currentOpen?.type !== 'connection_opened' || oldOpen?.type !== 'connection_opened') {
+        throw new Error('Both mounts must dispatch connection_opened');
+      }
+      expect(currentOpen.epoch).toBe(oldOpen.epoch);
+      expect(currentOpen.connectionId).not.toBe(oldOpen.connectionId);
+      expect(typeof currentOpen.connectionId).toBe('symbol');
+      expect(store.getTranscriptAuthority(rowId)).toEqual({
+        kind: 'awaiting_init', connectionId: currentOpen.connectionId,
+      });
+      expect(currentMount.result.current.state).toBe('connecting');
+      dispatch.mockClear();
+      const beforeOldCallbacks = store.getSnapshot(rowId);
+      act(() => {
+        oldStream.emit('init', makeInitPayload(rowId, 'slug-A'));
+        oldStream.emit('message', 'invalid JSON from the old stream');
+        oldStream.emit('error', '');
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(store.getSnapshot(rowId)).toBe(beforeOldCallbacks);
+      expect(currentMount.result.current.state).toBe('connecting');
+      expect(currentValidatedInit).not.toHaveBeenCalled();
+      expect(oldValidatedInit).toHaveBeenCalledOnce();
+      expect(store.getTranscriptAuthority(rowId)).toEqual({
+        kind: 'awaiting_init', connectionId: currentOpen.connectionId,
+      });
+
+      act(() => currentStream.emit('init', {
+        ...makeInitPayload(rowId, 'slug-A'), transcript_coverage: 'preserve',
+      }));
+      expect(currentMount.result.current.state).toBe('connected');
+      expect(store.getTranscriptAuthority(rowId)).toEqual({
+        kind: 'awaiting_init', connectionId: currentOpen.connectionId,
+      });
+      act(() => currentStream.emit('init', makeInitPayload(rowId, 'slug-A')));
+      const currentInits = dispatch.mock.calls.map(([action]) => action)
+        .filter((action) => action.type === 'sse_init');
+      expect(currentInits).toHaveLength(2);
+      for (const init of currentInits) {
+        expect(init).toMatchObject({ epoch: currentOpen.epoch, connectionId: currentOpen.connectionId });
+      }
+      expect(currentValidatedInit).toHaveBeenCalledTimes(2);
+      expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'live' });
+      expect(store.getSnapshot(rowId).conversationId).toBe(rowId);
+      currentMount.unmount();
+      act(() => vi.advanceTimersByTime(0));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('mints a strictly increasing epoch on each OPEN_SSE', () => {
     const captured: SSEAction[] = [];
     const dispatch = (a: SSEAction) => {

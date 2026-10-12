@@ -55,17 +55,19 @@ const MARKDOWN_COMPONENTS = createStreamingMarkdownComponents({});
  */
 export function StreamingMessage({
   slug,
+  requestId,
   isFirstInTurn,
   rootDir,
   onOpenFile,
 }: {
   slug: string;
+  requestId: string;
   isFirstInTurn: boolean;
   rootDir?: string | undefined;
   onOpenFile?: ((filePath: string) => void) | undefined;
 }) {
   const buffer = useStreamingBuffer(slug);
-  return <StreamingMessageView buffer={buffer} isFirstInTurn={isFirstInTurn} rootDir={rootDir} onOpenFile={onOpenFile} />;
+  return <StreamingMessageView buffer={buffer?.requestId === requestId ? buffer : null} isFirstInTurn={isFirstInTurn} rootDir={rootDir} onOpenFile={onOpenFile} />;
 }
 
 interface StreamingMessageViewProps {
@@ -83,10 +85,6 @@ interface StreamingMessageViewProps {
  * `<StreamingMessage slug={...} />` for the subscribing wrapper;
  * `<StreamingMessageView />` is exported for tests that exercise the
  * rendering pipeline directly.
- *
- * Renders while the LLM is generating. When the final `sse_message` event arrives,
- * the reducer clears this buffer and appends the finalized message atomically — one
- * React render, no flicker, no duplication.
  *
  * Uses rAF gating (not debouncing) to coalesce tokens that arrive within a single
  * 16ms frame, capping renders at ~60fps without introducing artificial latency.

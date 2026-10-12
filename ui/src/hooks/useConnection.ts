@@ -361,7 +361,8 @@ export function useConnection({
           const epoch = effect.epoch;
           const stampedDispatch = epochStampedDispatch(dispatchRef.current, epoch);
 
-          dispatchRef.current({ type: 'connection_opened', epoch });
+          const connectionId = Symbol('sse-open');
+          dispatchRef.current({ type: 'connection_opened', epoch, connectionId });
 
           const lastAppliedEventSeq = getLastAppliedEventSeqRef.current?.() ?? 0;
           const transcriptGeneration = getTranscriptGenerationRef.current?.() ?? null;
@@ -435,6 +436,7 @@ export function useConnection({
             stampedDispatch({
               type: 'sse_init',
               payload,
+              connectionId,
             });
             onValidatedInitRef.current?.(payload);
             const telemetry = measurement.connected();

@@ -3,6 +3,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { StrictMode, useEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
+import { ConversationContext } from '../conversation/ConversationContext';
+import { ConversationStore } from '../conversation/ConversationStore';
+import type { Conversation, ConversationState } from '../api';
 import { buildHistoricalUnits } from '../conversation/renderUnits';
 import {
   ALIGNED_PREFIX_BOUNDARY_TOOL_ID,
@@ -334,8 +337,11 @@ function ProductRouteSwitch() {
   </>;
 }
 
+let conversationStore: ConversationStore;
+
 function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false, strict = false) {
   const content = (
+    <ConversationContext.Provider value={conversationStore}>
     <ConversationReadinessProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
         <ViewerSlotProvider browserSessionActive={false}>
@@ -350,6 +356,7 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
         </ViewerSlotProvider>
       </MemoryRouter>
     </ConversationReadinessProvider>
+    </ConversationContext.Provider>
   );
   return render(strict ? <StrictMode>{content}</StrictMode> : content);
 }
@@ -358,7 +365,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
   const props = embeddedConversationPageSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
   const onProjectionChange = props?.['onProjectionChange'] as ((projection: Record<string, unknown> | null) => void) | undefined;
   if (!onProjectionChange) throw new Error('missing onProjectionChange');
-  onProjectionChange({
+  const projection = {
     slug: 'row-2',
     conversationId: 'row-2',
     conversation: { work_scope_key: 'ws-live' },
@@ -379,10 +386,25 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     filePathRootDir: '/tmp/latest-root',
     systemPrompt: 'Preserve this system prompt',
     ...overrides,
+  };
+  const id = String(projection.conversationId);
+  conversationStore.dispatch(id, {
+    type: 'set_initial_data',
+    reset: true,
+    conversationId: id,
+    conversation: { id, slug: projection.slug, updated_at: '2026-01-01', ...projection.conversation } as Conversation,
+    messages: projection.messages as Message[],
+    phase: projection.convState as ConversationState,
+    contextWindow: { used: 0 },
   });
+  const { messages: _messages, convState: _phase, ...controls } = projection;
+  void _messages;
+  void _phase;
+  onProjectionChange(controls);
 }
 
 beforeEach(() => {
+  conversationStore = new ConversationStore();
   vi.clearAllMocks();
   localStorage.clear();
   conversationNavStackSpy.mockClear();
@@ -1355,7 +1377,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       const props = conversationNavStackSpy.mock.lastCall?.[0] as Record<string, unknown>;
-      expect(props['slug']).toBe('row-live-2');
+      expect(props['slug']).toBe('row-2');
       expect(props['conversationId']).toBe('row-2');
       expect(props['workScopeKey']).toBe('ws-latest');
     });
