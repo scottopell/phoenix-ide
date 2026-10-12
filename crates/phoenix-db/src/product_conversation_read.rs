@@ -1416,6 +1416,225 @@ mod tests {
     use phoenix_workflow::ClientTurnKey;
     use std::time::Instant;
 
+    async fn seed_reset_message(db: &Database, root: &crate::Conversation) {
+        use phoenix_core::domain::db_schema::{
+            FileAttachment, ImageData, InputOrigin, SourceToolCall,
+        };
+        let content = MessageContent::User(crate::UserContent {
+            text: "old view".into(),
+            images: vec![ImageData {
+                media_type: "image/png".into(),
+                data: "old-image".into(),
+            }],
+            files: vec![FileAttachment {
+                original_name: "old.txt".into(),
+                media_type: "text/plain".into(),
+                size_bytes: 3,
+                stored_path: "/tmp/old.txt".into(),
+            }],
+            llm_text: Some("expanded old view".into()),
+            is_meta: true,
+        });
+        db.add_message_with_seq_and_origin(
+            "old",
+            &root.id,
+            1,
+            &content,
+            Some(&serde_json::json!({"display": "retained"})),
+            Some(&crate::UsageData {
+                input_tokens: 7,
+                output_tokens: 3,
+                reasoning_tokens: Some(1),
+                cache_creation_tokens: 2,
+                cache_read_tokens: 1,
+            }),
+            &InputOrigin::InternalConversation {
+                product_conversation_id: root.product_conversation_id.clone(),
+                transcript_id: root.id.clone(),
+                source_call: Some(Box::new(SourceToolCall {
+                    message_id: "call-message".into(),
+                    tool_use_id: "call".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_hydration_snapshot_survives_committed_reset_and_preserves_hydrated_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("race.db").to_str().unwrap())
+            .await
+            .unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let root = db
+            .create_conversation("race", "race", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        seed_reset_message(&db, &root).await;
+        let expected = db.get_messages(&root.id).await.unwrap();
+        let mut reader = db.pool.acquire().await.unwrap();
+        let mut tx = reader.begin().await.unwrap();
+        let before =
+            Database::get_ordinary_product_conversation_on(&mut tx, &root.product_conversation_id)
+                .await
+                .unwrap();
+        let before_value = serde_json::to_value(&before.root.conversation).unwrap();
+        let mut writer = db.pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM messages WHERE conversation_id=?")
+            .bind(&root.id)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET transcript_generation=transcript_generation+1 WHERE id=?",
+        )
+        .bind(&root.id)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+        writer.commit().await.unwrap();
+        let page = Database::get_product_conversation_messages_page_on(
+            &mut tx,
+            &root.product_conversation_id,
+            None,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(page.iter().map(|(_, m)| m).collect::<Vec<_>>()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let still =
+            Database::get_ordinary_product_conversation_on(&mut tx, &root.product_conversation_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            before.root.conversation.transcript_generation,
+            still.root.conversation.transcript_generation
+        );
+        assert_eq!(before.root.tail_message_id, still.root.tail_message_id);
+        assert_eq!(
+            before_value,
+            serde_json::to_value(&still.root.conversation).unwrap()
+        );
+        tx.rollback().await.unwrap();
+        drop(reader);
+        let fresh = db
+            .read_ordinary_product_conversation_snapshot(
+                root.product_conversation_id.as_str(),
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(fresh.messages.is_empty());
+        assert_eq!(
+            fresh.aggregate.root.conversation.transcript_generation,
+            before.root.conversation.transcript_generation + 1
+        );
+        db.pool.close().await;
+    }
+
+    fn assert_page_ids(snapshot: &ProductConversationSnapshotRead, ids: &[&str]) {
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .map(|(_, m)| m.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[tokio::test]
+    async fn late_hydration_snapshot_cursor_ceiling_and_metadata_share_one_generation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("cursor", "cursor", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for sequence in 1..=4 {
+            db.add_message_with_seq(
+                &format!("m{sequence}"),
+                &root.id,
+                sequence,
+                &MessageContent::user(format!("message{sequence}")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let first = db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, None, 3)
+            .await
+            .unwrap();
+        assert_page_ids(&first, &["m4", "m3", "m2"]);
+        let ceiling = ProductConversationSegmentCeiling {
+            transcript_row_id: root.id.clone(),
+            tail_sequence_id: 4,
+            tail_message_id: Some("m4".into()),
+        };
+        db.add_message_with_seq(
+            "m5",
+            &root.id,
+            5,
+            &MessageContent::user("append"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let bounded = db
+            .read_ordinary_product_conversation_snapshot(
+                &root.id,
+                None,
+                Some(std::slice::from_ref(&ceiling)),
+                3,
+            )
+            .await
+            .unwrap();
+        assert_page_ids(&bounded, &["m4", "m3", "m2"]);
+        let unbounded = db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, None, 3)
+            .await
+            .unwrap();
+        assert_eq!(unbounded.messages[0].1.message_id, "m5");
+        let second = db
+            .read_ordinary_product_conversation_snapshot(
+                &root.id,
+                Some((0, 3, "m3".into())),
+                Some(&[ceiling]),
+                3,
+            )
+            .await
+            .unwrap();
+        assert_page_ids(&second, &["m2", "m1"]);
+        assert_eq!(
+            first.aggregate.product_conversation.id(),
+            second.aggregate.product_conversation.id()
+        );
+        assert_eq!(
+            first.aggregate.root.conversation.transcript_generation,
+            second.aggregate.root.conversation.transcript_generation
+        );
+        assert_eq!(second.aggregate.root.tail_message_id.as_deref(), Some("m5"));
+        assert_eq!(
+            second.requested_transcript_row_id.as_str(),
+            root.id.as_str()
+        );
+        let empty = db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, Some(&[]), 3)
+            .await
+            .unwrap();
+        assert!(empty.messages.is_empty());
+    }
+
     #[tokio::test]
     async fn source_call_survives_real_snapshot_and_message_page() {
         use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
