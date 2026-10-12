@@ -781,7 +781,7 @@ export function ConversationList({
         onSelect: (item: { id: string }) => {
           const row = displayProductList.find((candidate) => candidate.product_conversation_id === item.id);
           if (row) onProductConversationClick?.(row);
-          else navigate(`/product-conversations/${item.id}`);
+          else navigate(`/c/${item.id}`);
         },
       }
       : {}),

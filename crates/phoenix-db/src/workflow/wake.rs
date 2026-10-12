@@ -3304,7 +3304,7 @@ impl WakeRepository {
                    AND NOT EXISTS (
                      SELECT 1 FROM close_obligations obligation
                      WHERE obligation.product_conversation_id = product.id
-                       AND obligation.phase <> 'completed'
+                       AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
                    )",
         )
         .bind(conversation_id)

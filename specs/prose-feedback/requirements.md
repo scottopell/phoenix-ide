@@ -434,9 +434,16 @@ Task approval and fork-proposal review SHALL remain purpose-built decision surfa
 
 WHEN the user selects non-empty rendered text wholly within one finalized assistant message
 AND the conversation has an eligible current message draft
+AND the selection uses a fine pointer or keyboard
 THE SYSTEM SHALL immediately show a single-line reaction pill near the selection
 AND SHALL preserve the selected text and stable source-message identity when the input receives focus
-AND SHALL NOT focus the input or open the software keyboard merely because text was selected.
+AND SHALL NOT focus the input merely because text was selected.
+
+WHEN such an eligible selection is made using touch or a coarse pointer
+THE SYSTEM SHALL instead show the reaction pill as a compact dock above the current composer
+AND SHALL show a short source preview
+AND SHALL preserve the exact selected text, source identity, and native range before input focus clears the native selection
+AND SHALL NOT open the software keyboard merely because text was selected.
 
 THE SYSTEM SHALL leave native selection, selection handles, copying, context menus, and scrolling available
 AND SHALL exclude editable fields, tool interfaces, streaming content, and selections spanning messages from reaction entry.
@@ -452,7 +459,8 @@ THE SYSTEM SHALL navigate using the source occurrence, restore its exact passage
 WHEN the user manually scrolls the source passage back into view
 THE SYSTEM SHALL restore the pill automatically.
 
-THE SYSTEM SHALL keep the pill and dock inside the visible viewport and account for viewport changes caused by the software keyboard.
+THE SYSTEM SHALL keep the pill and dock inside the visible viewport and account for viewport changes caused by the software keyboard
+AND SHALL keep the touch/coarse-pointer dock directly above the current composer as their geometry changes.
 
 **Rationale:** Users compose feedback while reading without leaving the transcript or sacrificing ordinary platform text interactions.
 

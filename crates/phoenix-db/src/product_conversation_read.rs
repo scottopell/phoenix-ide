@@ -610,7 +610,7 @@ impl Database {
                     EXISTS (
                         SELECT 1 FROM close_obligations obligation
                         WHERE obligation.product_conversation_id = product.id
-                          AND obligation.phase <> 'completed'
+                          AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
                     ) AS has_active_close_attempt
              FROM product_conversations product
              JOIN ranked root_ranked ON root_ranked.product_conversation_id = product.id AND root_ranked.root_rank = 1

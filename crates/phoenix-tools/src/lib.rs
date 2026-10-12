@@ -1139,6 +1139,23 @@ impl ToolRegistry {
         Ok(self)
     }
 
+    /// Add one host-bound read-only capability after rejecting name collisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry already contains the tool name.
+    pub fn try_with_host_bound_tool(mut self, tool: Arc<dyn Tool>) -> Result<Self, String> {
+        if self
+            .tools
+            .iter()
+            .any(|existing| existing.name() == tool.name())
+        {
+            return Err(format!("tool registry already contains {}", tool.name()));
+        }
+        self.tools.push(tool);
+        Ok(self)
+    }
+
     /// Create the full-write registry for a Git-backed parent conversation,
     /// including the `propose_task` capability (REQ-PROJ-033/036).
     ///

@@ -340,6 +340,7 @@ fn arb_llm_error_event() -> impl Strategy<Value = Event> {
             error_kind,
             attempt,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
         }
     })
@@ -458,11 +459,22 @@ pub(crate) fn effects_are_valid(effects: &[Effect], new_state: &ConvState) -> bo
         }
     }
 
-    // RequestLlm should only appear when transitioning to LlmRequesting
-    if has_request_llm {
-        if !matches!(new_state, ConvState::LlmRequesting { .. }) {
-            return false;
-        }
+    // RequestLlm appears in ordinary request state or in the typed overload
+    // lifecycle after a persisted backoff becomes in-flight.
+    if has_request_llm
+        && !matches!(
+            new_state,
+            ConvState::LlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                        ..
+                    }
+                }
+        )
+    {
+        return false;
     }
 
     true
@@ -808,6 +820,7 @@ proptest! {
             error_kind,
             attempt,
             recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
         resets_at: None,
         };
 
@@ -839,6 +852,7 @@ proptest! {
             error_kind: error_kind.clone(),
             attempt,
             recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
         resets_at: None,
         };
 
@@ -865,6 +879,7 @@ proptest! {
             error_kind: ErrorKind::Network, // Retryable but exhausted
             attempt: 3,
             recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
         resets_at: None,
         };
 
@@ -1214,6 +1229,7 @@ fn test_retry_cycle() {
             error_kind: ErrorKind::Network,
             attempt: 1,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
         },
     )
@@ -2048,7 +2064,14 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                 },
                 message: msg,
             },
-            8 => LlmOutcome::ServerOverloaded { message: msg },
+            8 => LlmOutcome::ServerOverloaded {
+                message: msg,
+                detected_at: chrono::Utc::now(),
+                guidance: None,
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
+            },
             9 => LlmOutcome::InvalidResponse { message: msg },
             10 => LlmOutcome::PromptRejected { message: msg },
             11 => LlmOutcome::ContentFiltered { message: msg },

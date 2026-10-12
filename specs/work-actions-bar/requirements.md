@@ -265,18 +265,27 @@ the appropriate REVIEW verb.
 ### REQ-WAB-007: Terminal Verb Tooltips
 
 The terminal action `Close conversation` SHALL carry an info-icon (ⓘ) tooltip that conveys
-its intent and its key safety behavior: Phoenix releases the conversation's owned worktree
-resources, preserves transcript history as read-only History, and does not mutate branches or
-pull requests.
+its intent and its key safety behavior: Phoenix ends conversation execution, attempts owned-resource
+cleanup once, preserves transcript history as read-only History only after confirmed conversation
+and owned-process shutdown, and does not mutate branches or pull requests.
+
+WHEN shutdown is confirmed but cleanup fails
+THE SYSTEM SHALL show conspicuous `cleanup_attention` in History with exact residual information
+AND SHALL NOT present the Close as successful resource retirement
+
+WHEN shutdown is uncertain
+THE SYSTEM SHALL show `CloseIncomplete` while the conversation remains Open
+AND SHALL NOT imply that retry or startup automatically resumes cleanup
 
 The tooltip copy SHALL explain that Close may require confirmation when active work must be
 stopped or when removing the worktree would discard local state. Tooltip text:
 
 **Close conversation:** "End active work on this conversation. Phoenix may ask you to confirm
 stopping running work or discarding uncommitted workspace-only changes. Moves the conversation
-to History and leaves branches and pull requests untouched."
+to History after confirmed shutdown; cleanup failures remain visible. Stops at the first failure.
+Leaves branches and pull requests untouched."
 
-**Design:** The action bar no longer distinguishes separate terminal verbs. The meaningful
+**Design:** The action bar exposes one terminal verb. The meaningful
 behavioral split is between push-forward actions (REVIEW / RESOLVE) and the one Close flow,
 whose confirmations depend on runtime state and loss inspection rather than on separate
 verbs with different repository implications.

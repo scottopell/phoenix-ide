@@ -21,7 +21,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-001:** Pure State Transitions | ✅ Complete | Core state machine module in src/state_machine/transition.rs |
 | **REQ-BED-002:** User Message Handling | ✅ Complete | Rejects while busy, accepts from idle/error |
 | **REQ-BED-003:** LLM Response Processing | ✅ Complete | Handles text, tool use, end_turn |
-| **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking |
+| **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking; Bash wait fallback preserves authentic bounded results, aborts only the wait task on healthy expiry, and closes the shared local-authority fence under REQ-BED-033 if authoritative settlement remains indeterminate at its non-renewing persistence cutoff |
 | **REQ-BED-005:** Cancellation Handling | ✅ Complete | Synthetic tool results for cancelled tools |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff and typed user-resume admission by ErrorKind |
 | **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; provider-only interruptions resume from idle, active materialized turns with persisted tool results proactively resume under bounded exact-turn ownership, committed steering retains first-response recovery ownership, and durable continuations retain recovery state |

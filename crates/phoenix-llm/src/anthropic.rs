@@ -2,6 +2,7 @@
 
 use super::headers::apply_source_header;
 use super::models::ModelSpec;
+use super::retry_guidance::retry_after_from_headers;
 use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
 use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, ModelEffort, Usage,
@@ -11,6 +12,8 @@ use phoenix_core::domain::provider_replay::{
     AnthropicPrivateBlock, AnthropicResponseIdentity, AnthropicResponseSet, ContentIndex,
     ProviderReplayUpdate,
 };
+use reqwest::header::HeaderMap;
+
 use phoenix_core::domain::tool_availability::{ToolAvailability, ToolChange};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -472,6 +475,27 @@ fn parse_anthropic_sse_error(v: &serde_json::Value) -> LlmError {
     }
 }
 
+fn anthropic_http_error(status: u16, headers: &HeaderMap, body: &str) -> LlmError {
+    let overloaded = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|error_type| error_type == "overloaded_error");
+
+    if status == 529 || overloaded {
+        LlmError::server_overloaded_with_retry_after(
+            "Anthropic is overloaded for this model. Try a different model or retry later.",
+            retry_after_from_headers(headers),
+        )
+    } else {
+        LlmError::from_http_status(status, body)
+    }
+}
+
 const OFFICIAL_ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// Beta token enabling Anthropic Fast mode (research preview, direct Claude API).
@@ -655,11 +679,12 @@ pub async fn complete_streaming(
 
     let status = response.status();
     if !status.is_success() {
+        let headers = response.headers().clone();
         let body = response
             .text()
             .await
             .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(anthropic_http_error(status.as_u16(), &headers, &body));
     }
 
     let mut acc = StreamAccumulator::new(dispatch_at, request, fast_mode);
@@ -768,13 +793,14 @@ pub async fn complete(
     })?;
 
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response
         .text()
         .await
         .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
     if !status.is_success() {
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(anthropic_http_error(status.as_u16(), &headers, &body));
     }
 
     let response_value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
@@ -2611,6 +2637,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn http_529_is_overload_regardless_of_body_and_preserves_retry_guidance() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+        for body in [
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "",
+            "{malformed",
+            "<html><body>upstream overloaded</body></html>",
+        ] {
+            let overload = anthropic_http_error(529, &headers, body);
+            assert_eq!(overload.kind, crate::LlmErrorKind::ServerOverloaded);
+            assert_eq!(
+                overload.retry_after(),
+                Some(crate::RetryAfter::WithinLimit(Duration::from_secs(7)))
+            );
+        }
+    }
+
+    #[test]
+    fn http_overload_body_does_not_conflate_quota_or_ordinary_server_errors() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+
+        let typed_overload = anthropic_http_error(
+            503,
+            &headers,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        assert_eq!(typed_overload.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(
+            typed_overload.retry_after(),
+            Some(crate::RetryAfter::WithinLimit(Duration::from_secs(7)))
+        );
+
+        let quota = anthropic_http_error(
+            429,
+            &headers,
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Limited"}}"#,
+        );
+        assert_eq!(quota.kind, crate::LlmErrorKind::RateLimit);
+        assert_eq!(quota.retry_after(), None);
+
+        for status in [500, 502, 503] {
+            let ordinary = anthropic_http_error(status, &headers, "<html>proxy failure</html>");
+            assert_eq!(ordinary.kind, crate::LlmErrorKind::ServerError);
+            assert_eq!(ordinary.retry_after(), None);
+        }
+    }
+
     #[tokio::test]
     async fn test_streaming_error_event_overloaded_maps_to_server_overloaded() {
         let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
@@ -2626,9 +2702,10 @@ mod tests {
 
         assert_eq!(err.kind, crate::LlmErrorKind::ServerOverloaded);
         assert!(
-            !err.kind.is_auto_retryable(),
-            "overloaded Anthropic SSE errors should not be retried as empty responses"
+            err.kind.is_auto_retryable(),
+            "overloaded Anthropic SSE errors use the bounded overload policy"
         );
+        assert_eq!(err.retry_after(), None);
         assert!(err.message.contains("overloaded"));
     }
 

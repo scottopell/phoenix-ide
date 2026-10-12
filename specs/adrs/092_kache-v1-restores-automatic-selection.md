@@ -1,4 +1,4 @@
-# ADR-088: Qualified Kache v1 restores automatic compiler-cache selection
+# ADR-092: Qualified Kache v1 restores automatic compiler-cache selection
 
 - **Status:** Accepted
 - **Date:** 2026-10-07

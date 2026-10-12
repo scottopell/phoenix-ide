@@ -7,6 +7,7 @@
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
 enum ArtifactState { pending | built | verified | failed }
+enum NativeAcceptanceState { pending | passed | failed }
 enum NotaryState { pending | submitted | accepted | stapled | validated | failed }
 enum PublicationState { idle | inaccessible | uploading | verified | public | failed }
 enum FailureDomain { none | tag_gate | build | signing | notarization | publication | configuration }
@@ -56,6 +57,14 @@ entity ArchitecturePair {
     standalone: ArtifactState
     desktop: ArtifactState
     notarization: NotaryState
+    native_acceptance: NativeAcceptanceState
+
+    transitions native_acceptance {
+        pending -> passed
+        pending -> failed
+        passed -> failed
+        failed -> failed
+    }
 
     transitions standalone {
         pending -> built
@@ -141,6 +150,8 @@ surface DesktopReleaseWorkflow {
         NotarizationAccepted(pair)
         NotarizationStapled(pair)
         NotarizationValidated(pair)
+        NativeAcceptancePassed(pair)
+        NativeAcceptanceFailed(pair)
         InaccessiblePublicationCreated(gate, publication)
         InaccessiblePublicationResumed(gate, publication)
         InaccessibleUploadStarted(publication)
@@ -194,25 +205,52 @@ surface DesktopReleaseWorkflow {
 --   Apple returned terminal notary status Accepted for pair before stapling.
 -- notarization_ticket_and_gatekeeper_valid(pair) -> Boolean
 --   the stapled ticket validates and Gatekeeper accepts the app.
+-- protected_signing_material_removed(pair) -> Boolean
+--   runtime acceptance starts only after protected signing/notarization material
+--   is removed from the native host's verification environment.
+-- native_isolated_artifact_checks_pass(pair) -> Boolean
+--   an unchanged extracted embedded helper, byte-identical to pair's standalone,
+--   executes on the matching native architecture with isolated home/state/database/temp,
+--   private authentication, and a fresh loopback port; exact source/version/target
+--   and instance identity, normal authentication, graceful stop/listener closure,
+--   database integrity/foreign keys, and unchanged artifact digests all verify.
+-- sanitized_native_receipt_retained(pair) -> Boolean
+--   a receipt records the observed pass or failure without runtime logs, database,
+--   cookies, or protected material; success/failure uploads have distinct names
+--   qualified by workflow run and attempt, preserving prior attempt evidence.
+--   Receipts remain separate workflow artifacts, not public release payloads.
+-- required_native_pairs_passed(candidate) -> Boolean
+--   candidate.apple_silicon_pair.native_acceptance = passed and
+--   candidate.intel_pair.native_acceptance = passed.
 -- exact_inaccessible_assets_and_digests(publication) -> Boolean
 --   consumer-inaccessible publication work contains exactly the eight required
 --   non-manifest assets and SHA256SUMS, whose entries and reported digests match.
 -- required_architecture_pairs_validated(publication) -> Boolean
 --   publication.apple_silicon_pair and publication.intel_pair have distinct
 --   targets, matching release identities, verified helper/app artifacts, and
---   validated notarization.
+--   validated notarization. Native acceptance is owned only by each pair's
+--   native_acceptance state, read through required_native_pairs_passed.
 -- public_release_is_exact(publication) -> Boolean
 --   the public release contains exactly the required names and matching digests.
 -- publication_channel_is_exact(publication) -> Boolean
 --   stable publication metadata is prerelease=false and make_latest=true unless a
 --   newer stable is already latest, in which case publication is refused; RC
 --   metadata is prerelease=true and make_latest=false.
+-- reviewed_notes_attached_atomically_when_supplied(publication) -> Boolean
+--   if publication's immutable tagged source supplies reviewed notes, the request
+--   that changes its verified private release to public includes those exact
+--   nonempty notes as the release body alongside the visibility/channel fields.
+--   If the tagged source has no reviewed notes, this predicate is true without
+--   a body override: the existing generated notes remain. No subsequent public
+--   edit is used to satisfy the supplied-notes obligation.
 -- preparation_identity_is_current_main(preparation) -> Boolean
 --   preparation identity is the exact current main commit and its source version.
 -- preparation_uses_release_security_path(preparation) -> Boolean
 --   preparation.apple_silicon_pair and preparation.intel_pair have their matching
 --   targets and satisfy the signing, notarization, stapling, Gatekeeper,
---   helper-byte, complete identity, and checksum checks.
+--   helper-byte, complete identity, and checksum checks. Native acceptance is
+--   owned only by each pair's native_acceptance state, read through
+--   required_native_pairs_passed.
 -- preparation_has_no_release_authority(preparation) -> Boolean
 --   preparation creates or moves no tag, creates or mutates no GitHub release,
 --   performs no deployment or installation, and grants no stable/RC decision.
@@ -306,6 +344,25 @@ rule GatekeeperValidationRequiresStapledTicket {
     ensures: pair.notarization = validated
 }
 
+rule NativeAcceptanceRequiresUnchangedVerifiedPair {
+    when: NativeAcceptancePassed(pair)
+    requires: pair.native_acceptance = pending
+    requires: pair.standalone = verified
+    requires: pair.desktop = verified
+    requires: pair.notarization = validated
+    requires: protected_signing_material_removed(pair)
+    requires: native_isolated_artifact_checks_pass(pair)
+    ensures: pair.native_acceptance = passed
+    ensures: sanitized_native_receipt_retained(pair)
+}
+
+rule NativeAcceptanceFailureBlocksPair {
+    when: NativeAcceptanceFailed(pair)
+    requires: pair.native_acceptance = pending or pair.native_acceptance = passed or pair.native_acceptance = failed
+    ensures: pair.native_acceptance = failed
+    ensures: sanitized_native_receipt_retained(pair)
+}
+
 rule PublicationCreatesInaccessiblePreparationOnlyWhenReleaseIsAbsent {
     when: InaccessiblePublicationCreated(gate, publication)
     requires: gate.state = new_tag_created or gate.state = exact_tag_match
@@ -344,6 +401,7 @@ rule CompleteInaccessiblePublicationBecomesVerified {
     requires: release.state = uploading
     requires: exact_inaccessible_assets_and_digests(release)
     requires: required_architecture_pairs_validated(release)
+    requires: required_native_pairs_passed(release)
     ensures: release.state = verified
     ensures: release.failure_domain = none
 }
@@ -356,8 +414,10 @@ rule VerifiedInaccessiblePublicationBecomesPublic {
     requires: tag_points_at_exact_commit(gate)
     requires: exact_inaccessible_assets_and_digests(publication)
     requires: required_architecture_pairs_validated(publication)
+    requires: required_native_pairs_passed(publication)
     requires: publication_channel_is_exact(publication)
     requires: publication_has_workflow_sole_writer(publication)
+    requires: reviewed_notes_attached_atomically_when_supplied(publication)
     ensures: publication.state = public
     ensures: publication.failure_domain = none
 }
@@ -370,6 +430,7 @@ rule ExactPublicRetryIsIdempotent {
     requires: public_release_is_exact(publication)
     requires: publication_channel_is_exact(publication)
     requires: required_architecture_pairs_validated(publication)
+    requires: required_native_pairs_passed(publication)
     ensures: publication.state = public
     ensures: publication.failure_domain = none
 }
@@ -391,18 +452,33 @@ invariant CompletedArchitecturePairHasOneIdentity {
     )
 }
 
+invariant PassedNativeAcceptanceHasVerifiedUnchangedPair {
+    ArchitecturePair.native_acceptance = passed implies (
+        ArchitecturePair.standalone = verified and
+        ArchitecturePair.desktop = verified and
+        ArchitecturePair.notarization = validated and
+        native_isolated_artifact_checks_pass(ArchitecturePair) and
+        sanitized_native_receipt_retained(ArchitecturePair)
+    )
+}
+
+invariant VerifiedPreparationHasNativeAcceptance {
+    DesktopPreparation.verified implies required_native_pairs_passed(DesktopPreparation)
+}
+
 rule ProtectedMainPreparationProducesActionsEvidence {
     when: ProtectedPreparationRequested(preparation)
     requires: preparation_identity_is_current_main(preparation)
     ensures: preparation_has_no_release_authority(preparation)
     ensures: preparation_uses_release_security_path(preparation) implies sanitized_preparation_receipts_exist(preparation)
-    ensures: preparation.verified = preparation_uses_release_security_path(preparation)
+    ensures: preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))
 }
 
 invariant PublicReleaseIsExact {
     ReleasePublication.state = public implies (
         public_release_is_exact(ReleasePublication) and
         required_architecture_pairs_validated(ReleasePublication) and
+        required_native_pairs_passed(ReleasePublication) and
         publication_channel_is_exact(ReleasePublication)
     )
 }

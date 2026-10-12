@@ -6263,6 +6263,11 @@ mod tests {
             panic!("expected created turn")
         };
         let operation_id = "continuation-start-contention-operation";
+        sqlx::query("INSERT INTO coordinator_watches(source_product_conversation_id,enrolled_at_us) SELECT product_conversation_id,0 FROM conversations WHERE id = 'conv-a'")
+            .execute(&setup_repo.pool)
+            .await
+            .unwrap();
+
         let requesting = ConvState::LlmRequesting { attempt: 1 };
         sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'conv-a'")
             .bind(serde_json::to_string(&requesting).unwrap())
@@ -6384,6 +6389,15 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ConvState>(&persisted_state).unwrap(),
             settlement.completed_state
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM coordinator_watch_events WHERE source_transcript_id = 'conv-a' AND terminal_kind = 'failed'"
+            )
+            .fetch_one(&contending_repo.pool)
+            .await
+            .unwrap(),
+            1
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")

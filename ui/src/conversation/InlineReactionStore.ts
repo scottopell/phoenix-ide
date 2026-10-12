@@ -9,13 +9,16 @@ export interface ReactionSource {
   textAnchor?: { start: { fragmentId: string; offset: number }; end: { fragmentId: string; offset: number } };
 }
 
+export type ReactionPresentation = 'floating' | 'touch-docked';
+
 export interface InlineReaction {
   source: ReactionSource;
   body: string;
+  presentation: ReactionPresentation;
 }
 
 type Action =
-  | { type: 'select'; source: ReactionSource }
+  | { type: 'select'; source: ReactionSource; presentation: ReactionPresentation }
   | { type: 'edit'; body: string }
   | { type: 'clear' };
 
@@ -24,7 +27,7 @@ export class InlineReactionStore extends RoutedStore<string, InlineReaction | nu
     super(() => null, (current, action) => {
       switch (action.type) {
         case 'select':
-          return current?.body ? current : { source: action.source, body: '' };
+          return current?.body ? current : { source: action.source, body: '', presentation: action.presentation };
         case 'edit':
           return current ? { ...current, body: action.body } : null;
         case 'clear':
@@ -36,7 +39,7 @@ export class InlineReactionStore extends RoutedStore<string, InlineReaction | nu
 
 export const InlineReactionContext = createContext<InlineReactionStore | null>(null);
 
-export function formatInlineReaction({ source, body }: InlineReaction): string {
+export function formatInlineReaction({ source, body }: Pick<InlineReaction, 'source' | 'body'>): string {
   const identity = source.occurrenceToken ?? source.messageId;
   const longest = Array.from(source.quote.matchAll(/`+/g)).reduce((length, match) => Math.max(length, match[0].length), 2);
   const fence = '`'.repeat(longest + 1);

@@ -1109,7 +1109,7 @@ impl Database {
                AND NOT EXISTS (
                  SELECT 1 FROM close_obligations obligation
                  WHERE obligation.product_conversation_id = product_creation_jobs.published_product_id
-                   AND obligation.phase <> 'completed'
+                   AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
                )",
         )
         .bind(now)
@@ -1134,7 +1134,7 @@ impl Database {
                     ) AND NOT EXISTS (
                       SELECT 1 FROM close_obligations obligation
                       WHERE obligation.product_conversation_id = j.published_product_id
-                        AND obligation.phase <> 'completed'
+                        AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
                     ) THEN 1 ELSE 0 END AS delivery_retryable,
                     COALESCE((SELECT json_group_array(json_object('media_type', ordered.media_type, 'data', ordered.data))
                               FROM (SELECT media_type, data FROM product_creation_job_images
@@ -1212,8 +1212,8 @@ impl Database {
         }
         let now = unix_micros_now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let published_ids: Option<(String, String)> = sqlx::query_as(
-            "SELECT published_conversation_id, published_product_id
+        let published_conversation_id: Option<String> = sqlx::query_scalar(
+            "SELECT published_conversation_id
              FROM product_creation_jobs
              WHERE request_id = ?1 AND status = 'delivery_pending'
                AND claim_generation = ?2 AND claim_worker_id = ?3 AND claim_token = ?4
@@ -1226,23 +1226,17 @@ impl Database {
         .bind(now)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((published_conversation_id, published_product_id)) = published_ids else {
+        let Some(published_conversation_id) = published_conversation_id else {
             tx.rollback().await?;
             return Ok(false);
         };
-        let reopened = sqlx::query(
-            "UPDATE product_conversations SET ordinary_lifecycle = 'open'
-             WHERE id = ?1 AND kind = 'ordinary'
-               AND NOT EXISTS (
-                 SELECT 1 FROM close_obligations close
-                 WHERE close.product_conversation_id = product_conversations.id
-                   AND (close.phase <> 'completed' OR close.close_outcome = 'archived')
-               )",
+        if !crate::close_foundation::admit_product_conversation_operation_tx(
+            &mut tx,
+            &published_conversation_id,
         )
-        .bind(&published_product_id)
-        .execute(&mut *tx)
-        .await?;
-        if reopened.rows_affected() != 1 {
+        .await?
+        .is_accepted()
+        {
             tx.rollback().await?;
             return Ok(false);
         }
@@ -3152,9 +3146,28 @@ mod product_creation_tests {
         assert!(second.is_none());
     }
 
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn delivery_completion_requires_current_claim_and_exact_acceptance() {
+        assert_delivery_completion_admission(None).await;
+    }
+
+    #[tokio::test]
+    async fn delivery_completion_preserves_archived_history() {
+        assert_delivery_completion_admission(Some("archived")).await;
+    }
+
+    #[tokio::test]
+    async fn delivery_completion_preserves_archived_cleanup_attention_history() {
+        assert_delivery_completion_admission(Some("archived_cleanup_attention")).await;
+    }
+
+    #[tokio::test]
+    async fn delivery_completion_respects_open_close_incomplete_fence() {
+        assert_delivery_completion_admission(Some("close_incomplete")).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_delivery_completion_admission(close_outcome: Option<&str>) {
         let db = Database::open_in_memory().await.unwrap();
         db.accept_product_creation("req-delivery-complete", &intent("/repo/a", "delivery"))
             .await
@@ -3253,13 +3266,6 @@ mod product_creation_tests {
         )
         .await
         .unwrap();
-        sqlx::query(
-            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
-        )
-        .bind(accepted.product_conversation_id.as_str())
-        .execute(db.pool())
-        .await
-        .unwrap();
         let stale_claim = ProductCreationClaim {
             worker_id: delivery.claim.worker_id.clone(),
             token: "stale-token".to_string(),
@@ -3277,52 +3283,82 @@ mod product_creation_tests {
             )
             .await
             .unwrap());
-        sqlx::query("DROP TRIGGER close_obligations_require_admission_phase_on_insert")
+        if let Some(outcome) = close_outcome {
+            let archived = outcome != "close_incomplete";
+            let lifecycle = if archived { "history" } else { "open" };
+            sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = ?2 WHERE id = ?1")
+                .bind(accepted.product_conversation_id.as_str())
+                .bind(lifecycle)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE conversations SET archived = ?1 WHERE id = 'conv-delivery-complete'",
+            )
+            .bind(archived)
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO close_obligations (
-                 attempt_id, product_conversation_id, phase, created_at, updated_at,
-                 completed_at, close_outcome
-             ) VALUES (
-                 'delivery-close-won', ?1, 'completed', '2025-01-01T00:00:02Z',
-                 '2025-01-01T00:00:02Z', '2025-01-01T00:00:02Z', 'archived'
-             )",
-        )
-        .bind(accepted.product_conversation_id.as_str())
-        .execute(db.pool())
-        .await
-        .unwrap();
-        assert!(!db
-            .complete_product_creation_delivery(
-                "req-delivery-complete",
-                &delivery.claim,
-                &SteeringAcceptanceFingerprint::Exact(
-                    "product-create:req-delivery-complete".to_string(),
-                ),
-                &delivery.job.intent,
+            sqlx::query("DROP TRIGGER close_obligations_require_admission_phase_on_insert")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO close_obligations (
+                     attempt_id, product_conversation_id, phase, created_at, updated_at,
+                     completed_at, close_outcome
+                 ) VALUES (
+                     'delivery-close-won', ?1, 'completed', '2025-01-01T00:00:02Z',
+                     '2025-01-01T00:00:02Z', '2025-01-01T00:00:02Z', ?2
+                 )",
             )
+            .bind(accepted.product_conversation_id.as_str())
+            .bind(outcome)
+            .execute(db.pool())
             .await
-            .unwrap());
-        assert!(
-            db.get_conversation("conv-delivery-complete")
+            .unwrap();
+            assert!(!db
+                .complete_product_creation_delivery(
+                    "req-delivery-complete",
+                    &delivery.claim,
+                    &SteeringAcceptanceFingerprint::Exact(
+                        "product-create:req-delivery-complete".to_string(),
+                    ),
+                    &delivery.job.intent,
+                )
+                .await
+                .unwrap());
+            assert_eq!(
+                db.get_conversation("conv-delivery-complete")
+                    .await
+                    .unwrap()
+                    .archived,
+                archived
+            );
+            let actual_lifecycle: String = sqlx::query_scalar(
+                "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
+            )
+            .bind(accepted.product_conversation_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(actual_lifecycle, lifecycle);
+            let job = db
+                .get_product_creation_job("req-delivery-complete")
                 .await
                 .unwrap()
-                .archived
-        );
-        let lifecycle: String = sqlx::query_scalar(
-            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
-        )
-        .bind(accepted.product_conversation_id.as_str())
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(lifecycle, "history");
-        sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'delivery-close-won'")
-            .execute(db.pool())
+                .unwrap();
+            assert_eq!(job.status, "delivery_pending");
+            assert_eq!(job, delivery.job);
+            let actual_outcome: String = sqlx::query_scalar(
+                "SELECT close_outcome FROM close_obligations WHERE attempt_id = 'delivery-close-won'",
+            )
+            .fetch_one(db.pool())
             .await
             .unwrap();
+            assert_eq!(actual_outcome, outcome);
+            return;
+        }
 
         assert!(db
             .complete_product_creation_delivery(
@@ -3349,6 +3385,16 @@ mod product_creation_tests {
         .await
         .unwrap();
         assert_eq!(lifecycle, "open");
+        let completed = db
+            .get_product_creation_job("req-delivery-complete")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "published");
+        assert!(completed.claim_worker_id.is_none());
+        assert!(completed.claim_token.is_none());
+        assert!(completed.claim_lease_until.is_none());
+        assert!(completed.delivery_retry_at.is_none());
     }
 
     #[tokio::test]

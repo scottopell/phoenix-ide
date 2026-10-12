@@ -11,7 +11,10 @@ mod coordinator_query;
 mod coordinator_watches;
 mod federation_enrollment;
 mod federation_peers;
-pub use coordinator_watches::{PendingWatchEvent, WatchSnapshot};
+pub use coordinator_watches::{
+    append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
+    PendingWatchEvent, WatchEventRoute, WatchOutcome, WatchSnapshot,
+};
 mod ddl;
 mod git_repository_reconciliation;
 mod message_attachments;
@@ -53,7 +56,10 @@ use phoenix_core::domain::product_conversation::{
     AutoContinueOnContextExhaustion, AutomaticContinuationPhase, ContinuationOpeningAuthority,
     ProductConversationId,
 };
-use phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID;
+use phoenix_core::domain::retry_policy::OVERLOAD_MAX_ATTEMPTS;
+use phoenix_core::domain::sm_state::{
+    ServerOverloadPhase, ServerOverloadTarget, LEGACY_CONTINUATION_OPERATION_ID,
+};
 use phoenix_core::work_scope::{
     AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeLifecycle,
     WorkScopeRetirementBlocker, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -316,6 +322,16 @@ pub(crate) async fn persist_continuation_start_tx(
         &persisted,
         ConvState::RecoverableContinuationFailure { failure }
             if failure.request.operation_id == operation_id
+    ) || matches!(
+        &persisted,
+        ConvState::ServerOverloadRetrying { retry }
+            if matches!(
+                &retry.target,
+                ServerOverloadTarget::Continuation {
+                    operation_id: persisted_operation_id,
+                    ..
+                } if persisted_operation_id == operation_id
+            )
     );
     if owns_operation {
         let exists = sqlx::query("SELECT 1 FROM messages WHERE message_id = ?1")
@@ -329,10 +345,43 @@ pub(crate) async fn persist_continuation_start_tx(
             ContinuationCommitOutcome::Stale
         });
     }
-    if !matches!(
-        persisted,
+    let accepts_start = matches!(
+        &persisted,
         ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. }
-    ) {
+    ) || matches!(
+        (&persisted, target_state),
+        (
+            ConvState::ServerOverloadRetrying { retry: persisted_retry },
+            ConvState::ServerOverloadRetrying { retry: target_retry },
+        ) if matches!(persisted_retry.target, ServerOverloadTarget::Ordinary)
+            && matches!(persisted_retry.phase, ServerOverloadPhase::InFlight)
+            && matches!(target_retry.phase, ServerOverloadPhase::InFlight)
+            && persisted_retry.attempt < OVERLOAD_MAX_ATTEMPTS
+            && persisted_retry.attempt.checked_add(1) == Some(target_retry.attempt)
+            && persisted_retry.started_at == target_retry.started_at
+            && persisted_retry.deadline_at == target_retry.deadline_at
+            && persisted_retry.logical_request_id == target_retry.logical_request_id
+            && persisted_retry.model_id == target_retry.model_id
+            && matches!(
+                &target_retry.target,
+                ServerOverloadTarget::Continuation {
+                    operation_id: target_operation_id,
+                    ..
+                } if target_operation_id == operation_id
+            )
+    ) || matches!(
+        (&persisted, target_state),
+        (
+            ConvState::ServerOverloadRetrying { retry: persisted_retry },
+            ConvState::RecoverableContinuationFailure { failure },
+        ) if matches!(persisted_retry.target, ServerOverloadTarget::Ordinary)
+            && matches!(persisted_retry.phase, ServerOverloadPhase::InFlight)
+            && persisted_retry.attempt == OVERLOAD_MAX_ATTEMPTS
+            && failure.request.operation_id == operation_id
+            && failure.request.attempt == persisted_retry.attempt
+            && failure.error_kind == ErrorKind::ServerOverloaded
+    );
+    if !accepts_start {
         return Ok(ContinuationCommitOutcome::Stale);
     }
     insert_message_tx(tx, message).await?;
@@ -398,11 +447,23 @@ pub(crate) async fn commit_continuation_tx(
         });
     }
 
-    if !matches!(
+    let owns_in_flight_continuation = matches!(
         &persisted,
         ConvState::AwaitingContinuation { request }
             if request.operation_id == operation_id
-    ) {
+    ) || matches!(
+        &persisted,
+        ConvState::ServerOverloadRetrying { retry }
+            if matches!(retry.phase, ServerOverloadPhase::InFlight)
+                && matches!(
+                    &retry.target,
+                    ServerOverloadTarget::Continuation {
+                        operation_id: persisted_operation_id,
+                        ..
+                    } if persisted_operation_id == operation_id
+                )
+    );
+    if !owns_in_flight_continuation {
         return Ok(ContinuationCommitOutcome::Stale);
     }
 
@@ -471,7 +532,7 @@ async fn admit_automatic_continuation_tx(
            AND NOT EXISTS (
                SELECT 1 FROM close_obligations obligation
                WHERE obligation.product_conversation_id = product.id
-                 AND obligation.phase <> 'completed'
+                 AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
            )
          ON CONFLICT(predecessor_conversation_id) DO NOTHING",
     )
@@ -2197,9 +2258,22 @@ impl Database {
                      JOIN close_attempt_scopes captured
                        ON captured.attempt_id = obligation.attempt_id
                      WHERE obligation.attempt_id = ?1
-                       AND obligation.phase <> 'completed'
                        AND obligation.topology_sealed = 1
                        AND captured.scope = ?2
+                       AND (obligation.phase <> 'completed' OR (
+                           obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
+                           AND EXISTS (SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+                               ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+                               WHERE run.attempt_id = obligation.attempt_id AND run.status = 'running'
+                                 AND run.retry_evidence_kind = 'resource_plan'
+                                 AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                                 AND effect.scope = captured.scope AND effect.resource_kind = 'work_scope'
+                                 AND effect.identity_kind = 'opaque' AND effect.identity_codec = 'opaque_string_v1'
+                                 AND effect.identity_value = captured.scope
+                                 AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                                     WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                                       AND success.ordinal = effect.ordinal))
+                       ))
                  )",
             )
             .bind(attempt_id.as_str())
@@ -2222,17 +2296,24 @@ impl Database {
                      WHERE expected.attempt_id = ?1
                        AND expected.scope = ?2
                        AND expected.resource_kind <> 'work_scope'
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM close_retirement_resources receipt
-                           WHERE receipt.attempt_id = expected.attempt_id
-                             AND receipt.scope = expected.scope
-                             AND receipt.inspection_generation = expected.inspection_generation
-                             AND receipt.inspection_fingerprint = expected.inspection_fingerprint
-                             AND receipt.resource_kind = expected.resource_kind
-                             AND receipt.identity_kind = expected.identity_kind
-                             AND receipt.identity_value = expected.identity_value
-                             AND receipt.proof_kind IN ('retired', 'absence_adopted')
+                       AND NOT (
+                           EXISTS (
+                               SELECT 1 FROM close_run_retry_effects effect
+                               JOIN close_run_retry_successes success ON success.attempt_id = effect.attempt_id
+                                 AND success.run_ordinal = effect.run_ordinal AND success.ordinal = effect.ordinal
+                               WHERE effect.attempt_id = expected.attempt_id
+                                 AND effect.scope = expected.scope AND effect.resource_kind = expected.resource_kind
+                                 AND effect.identity_kind = expected.identity_kind AND effect.identity_codec = expected.identity_codec
+                                 AND effect.identity_value = expected.identity_value
+                           ) OR EXISTS (
+                               SELECT 1 FROM close_retirement_resources receipt
+                               WHERE receipt.attempt_id = expected.attempt_id AND receipt.scope = expected.scope
+                                 AND receipt.inspection_generation = expected.inspection_generation
+                                 AND receipt.inspection_fingerprint = expected.inspection_fingerprint
+                                 AND receipt.resource_kind = expected.resource_kind AND receipt.identity_kind = expected.identity_kind
+                                 AND receipt.identity_codec = expected.identity_codec AND receipt.identity_value = expected.identity_value
+                                 AND receipt.proof_kind IN ('retired', 'absence_adopted')
+                           )
                        )
                  )",
             )
@@ -3109,7 +3190,8 @@ impl Database {
                        JOIN close_obligations obligation
                          ON obligation.attempt_id = captured.attempt_id
                        WHERE captured.scope = work_scopes.id
-                         AND obligation.phase <> 'completed'
+                         AND (obligation.phase <> 'completed'
+                              OR obligation.close_outcome IN ('archived_cleanup_attention', 'close_incomplete'))
                          AND obligation.topology_sealed = 1
                    )",
             )
@@ -3149,7 +3231,8 @@ impl Database {
                        JOIN close_obligations obligation
                          ON obligation.attempt_id = captured.attempt_id
                        WHERE captured.scope = work_scopes.id
-                         AND obligation.phase <> 'completed'
+                         AND (obligation.phase <> 'completed'
+                              OR obligation.close_outcome IN ('archived_cleanup_attention', 'close_incomplete'))
                          AND obligation.topology_sealed = 1
                    )",
             )
@@ -3184,7 +3267,8 @@ impl Database {
                        JOIN close_obligations obligation
                          ON obligation.attempt_id = captured.attempt_id
                        WHERE captured.scope = work_scopes.id
-                         AND obligation.phase <> 'completed'
+                         AND (obligation.phase <> 'completed'
+                              OR obligation.close_outcome IN ('archived_cleanup_attention', 'close_incomplete'))
                          AND obligation.topology_sealed = 1
                    )",
             )
@@ -5677,7 +5761,8 @@ impl Database {
                SELECT 1 FROM conversations conversation
                JOIN close_obligations obligation
                  ON obligation.product_conversation_id = conversation.product_conversation_id
-               WHERE conversation.id = ?1 AND obligation.phase <> 'completed'
+               WHERE conversation.id = ?1
+                 AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
              )",
         )
         .bind(conversation_id)
@@ -6690,6 +6775,7 @@ impl Database {
              WHERE archived = 0
                AND state_kind IN (
                    'awaiting_continuation',
+                   'server_overload_retrying',
                    'recoverable_continuation_failure',
                    'awaiting_recovery'
                )",
@@ -6705,10 +6791,12 @@ impl Database {
             if matches!(
                 state,
                 ConvState::AwaitingContinuation { .. }
+                    | ConvState::ServerOverloadRetrying { .. }
                     | ConvState::RecoverableContinuationFailure { .. }
                     | ConvState::AwaitingRecovery {
                     resume:
-                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. },
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. }
+                        | phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { .. },
                     ..
                 }
             ) {
@@ -7404,6 +7492,8 @@ impl Database {
                 .bind(id)
                 .fetch_one(&mut *tx)
                 .await?;
+
+        coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
 
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -10017,6 +10107,7 @@ impl Database {
         for msg in tool_results {
             insert_message_tx(&mut tx, msg).await?;
         }
+        coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
         let state_json = serde_json::to_string(state).unwrap();
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -11648,7 +11739,8 @@ impl Database {
                 state,
                 ConvState::AwaitingRecovery {
                     resume:
-                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. },
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. }
+                        | phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { .. },
                     ..
                 }
             ) {
@@ -11678,7 +11770,7 @@ impl Database {
     ) -> DbResult<()> {
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
-             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
+             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'server_overload_retrying', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
                AND NOT EXISTS (
                    SELECT 1
                    FROM durable_turns AS obligated_turn
@@ -12462,6 +12554,7 @@ impl Database {
                 )),
                 ConvState::Idle
                 | ConvState::LlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying { .. }
                 | ConvState::SeededLlmRequesting { .. }
                 | ConvState::Provisioning { .. }
                 | ConvState::CreationCancelled { .. }
@@ -15615,6 +15708,7 @@ pub(crate) async fn record_initial_execution_outcome_tx(
             }
             ConvState::LlmRequesting { .. }
             | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ServerOverloadRetrying { .. }
             | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
@@ -15683,6 +15777,7 @@ async fn classify_creation_watch_outcome(
         ConvState::ContextExhausted { .. } => ("Failed", Some("context exhausted")),
         ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
+        | ConvState::ServerOverloadRetrying { .. }
         | ConvState::Provisioning { .. }
         | ConvState::ToolExecuting { .. }
         | ConvState::CancellingTool { .. }
@@ -15957,6 +16052,7 @@ pub(crate) const fn conv_state_kind(state: &ConvState) -> &'static str {
     match state {
         ConvState::Idle => "idle",
         ConvState::LlmRequesting { .. } => "llm_requesting",
+        ConvState::ServerOverloadRetrying { .. } => "server_overload_retrying",
         ConvState::ToolExecuting { .. } => "tool_executing",
         ConvState::CancellingTool { .. } => "cancelling_tool",
         ConvState::AwaitingSubAgents { .. } => "awaiting_sub_agents",
@@ -16638,10 +16734,11 @@ mod tests {
         .unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].terminal_kind, "failed");
         assert_eq!(
-            events[0].terminal_reason.as_deref(),
-            Some("context exhausted")
+            events[0].outcome,
+            WatchOutcome::Failed {
+                reason: "context exhausted".into()
+            }
         );
     }
 
@@ -16708,8 +16805,10 @@ mod tests {
         assert_eq!(summary.source_occurrence_id, "summary-operation");
         assert_eq!(summary.source_generation, 1);
         assert_eq!(
-            summary.terminal_reason.as_deref(),
-            Some("continuation summary failed")
+            summary.outcome,
+            WatchOutcome::Failed {
+                reason: "continuation summary failed".into()
+            }
         );
     }
 
@@ -16742,7 +16841,7 @@ mod tests {
             events[0].source_generation,
             i64::try_from(claim.generation).unwrap()
         );
-        assert_eq!(events[0].terminal_kind, "completed");
+        assert_eq!(events[0].outcome, WatchOutcome::Completed);
 
         assert_eq!(
             db.settle_conversation_creation_runtime(
@@ -20194,6 +20293,247 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn overload_continuation_start_is_atomic_exact_and_idempotent() {
+        use phoenix_core::domain::{
+            llm_types::{ContentBlock, Usage},
+            sm_event::Event,
+            sm_state::{
+                ConvContext, ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+            },
+        };
+        use phoenix_state_machine::transition;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "overload-continuation-start";
+        db.create_conversation(conversation_id, "overload-start", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let persisted_retry = ServerOverloadRetry {
+            target: ServerOverloadTarget::Ordinary,
+            phase: ServerOverloadPhase::InFlight,
+            attempt: 3,
+            started_at: now - chrono::Duration::seconds(30),
+            deadline_at: now + chrono::Duration::seconds(90),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
+        };
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::ServerOverloadRetrying {
+                retry: persisted_retry.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let operation_id = "overload-start-operation";
+        let reducer_result = transition(
+            &ConvState::ServerOverloadRetrying {
+                retry: persisted_retry.clone(),
+            },
+            &ConvContext::new(conversation_id, "/tmp".into(), "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::text("threshold response")],
+                tool_calls: Vec::new(),
+                end_turn: true,
+                usage: Usage {
+                    input_tokens: 190_000,
+                    output_tokens: 1,
+                    reasoning_tokens: None,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+                request_id: operation_id.to_string(),
+            },
+        )
+        .expect("overload response above threshold starts continuation");
+        let target = reducer_result.new_state;
+        assert!(matches!(
+            &target,
+            ConvState::ServerOverloadRetrying { retry }
+                if retry.attempt == persisted_retry.attempt + 1
+                    && matches!(
+                        &retry.target,
+                        ServerOverloadTarget::Continuation {
+                            operation_id: target_operation_id,
+                            ..
+                        } if target_operation_id == operation_id
+                    )
+        ));
+        let content = MessageContent::agent(vec![ContentBlock::text("threshold response")]);
+        let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            message_id: operation_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+
+        assert_eq!(
+            db.begin_continuation(conversation_id, operation_id, &message, &target, now)
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            target
+        );
+        assert_eq!(db.get_messages(conversation_id).await.unwrap().len(), 1);
+        assert_eq!(
+            db.begin_continuation(conversation_id, operation_id, &message, &target, now)
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Duplicate
+        );
+        assert_eq!(db.get_messages(conversation_id).await.unwrap().len(), 1);
+
+        let stale_operation = "mismatched-overload-start";
+        let stale_content =
+            MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "stale threshold response",
+            )]);
+        let stale_message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            message_id: stale_operation.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 2,
+            message_type: stale_content.message_type(),
+            content: stale_content,
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+        assert_eq!(
+            db.begin_continuation(
+                conversation_id,
+                stale_operation,
+                &stale_message,
+                &ConvState::ServerOverloadRetrying {
+                    retry: ServerOverloadRetry {
+                        target: ServerOverloadTarget::Continuation {
+                            operation_id: stale_operation.to_string(),
+                            rejected_tool_calls: Vec::new(),
+                        },
+                        deadline_at: persisted_retry.deadline_at + chrono::Duration::seconds(1),
+                        ..persisted_retry
+                    },
+                },
+                now,
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Stale
+        );
+        assert_eq!(db.get_messages(conversation_id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capped_overload_continuation_start_atomically_persists_response_and_failure() {
+        use phoenix_core::domain::sm_state::{
+            ContinuationSummaryRequest, RecoverableContinuationFailure, ServerOverloadRetry,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "capped-overload-continuation-start";
+        db.create_conversation(conversation_id, "capped-overload", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::ServerOverloadRetrying {
+                retry: ServerOverloadRetry {
+                    target: ServerOverloadTarget::Ordinary,
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: OVERLOAD_MAX_ATTEMPTS,
+                    started_at: now - chrono::Duration::seconds(30),
+                    deadline_at: now + chrono::Duration::seconds(90),
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let operation_id = "capped-overload-operation";
+        let failure = ConvState::RecoverableContinuationFailure {
+            failure: RecoverableContinuationFailure {
+                request: ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: OVERLOAD_MAX_ATTEMPTS,
+                },
+                error_kind: ErrorKind::ServerOverloaded,
+                message: "Automatic overload retry attempts exhausted before continuation"
+                    .to_string(),
+            },
+        };
+        let content =
+            MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "threshold response",
+            )]);
+        let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            message_id: operation_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content: content.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+
+        let uncapped_failure = ConvState::RecoverableContinuationFailure {
+            failure: RecoverableContinuationFailure {
+                request: ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: OVERLOAD_MAX_ATTEMPTS - 1,
+                },
+                error_kind: ErrorKind::ServerOverloaded,
+                message: "not capped".to_string(),
+            },
+        };
+        assert_eq!(
+            db.recover_continuation_start(
+                conversation_id,
+                operation_id,
+                &message,
+                &uncapped_failure,
+                now,
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Stale
+        );
+        assert!(db.get_messages(conversation_id).await.unwrap().is_empty());
+
+        assert_eq!(
+            db.recover_continuation_start(conversation_id, operation_id, &message, &failure, now,)
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            failure
+        );
+        let messages = db.get_messages(conversation_id).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, content);
+    }
+
+    #[tokio::test]
     async fn continuation_start_recovery_retains_threshold_response() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("recover-start", "recover", "/tmp", true, None, None)
@@ -20371,6 +20711,94 @@ mod tests {
             db.get_messages("continuation-commit").await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn overload_continuation_commit_rolls_back_and_retries_idempotently() {
+        use phoenix_core::domain::sm_state::{
+            ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "overload-continuation-commit";
+        let operation_id = "overload-commit-operation";
+        db.create_conversation(conversation_id, "overload-commit", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let in_flight = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Continuation {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                },
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 3,
+                started_at: now - chrono::Duration::seconds(30),
+                deadline_at: now + chrono::Duration::seconds(90),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
+            },
+        };
+        db.update_conversation_state(conversation_id, &in_flight)
+            .await
+            .unwrap();
+        let completed = ConvState::ContextExhausted {
+            summary: "durable overload summary".to_string(),
+        };
+        let content = MessageContent::continuation("durable overload summary");
+        let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            message_id: format!("continuation-{operation_id}"),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+
+        sqlx::query(
+            "CREATE TEMP TRIGGER fail_overload_continuation_commit
+             BEFORE UPDATE OF state ON conversations
+             WHEN OLD.id = 'overload-continuation-commit'
+             BEGIN SELECT RAISE(ABORT, 'injected continuation state failure'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.commit_continuation(conversation_id, operation_id, &message, &completed, now)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            in_flight
+        );
+        assert!(db.get_messages(conversation_id).await.unwrap().is_empty());
+
+        sqlx::query("DROP TRIGGER fail_overload_continuation_commit")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.commit_continuation(conversation_id, operation_id, &message, &completed, now)
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            db.commit_continuation(conversation_id, operation_id, &message, &completed, now)
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Duplicate
+        );
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            completed
+        );
+        assert_eq!(db.get_messages(conversation_id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -25439,6 +25867,73 @@ mod tests {
         }
     }
 
+    fn overload_retry_state(
+        phase: phoenix_core::domain::sm_state::ServerOverloadPhase,
+    ) -> ConvState {
+        let started_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase,
+                attempt: 2,
+                started_at,
+                deadline_at: started_at + chrono::Duration::minutes(10),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn overload_retry_waiting_and_inflight_persist_and_reload() {
+        let db = Database::open_in_memory().await.unwrap();
+        for (id, phase) in [
+            (
+                "waiting",
+                phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: Utc::now() + chrono::Duration::seconds(30),
+                },
+            ),
+            (
+                "inflight",
+                phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+            ),
+        ] {
+            db.create_conversation(id, id, "/tmp", false, None, None)
+                .await
+                .unwrap();
+            let expected = overload_retry_state(phase);
+            db.update_conversation_state(id, &expected).await.unwrap();
+            assert_eq!(db.get_conversation(id).await.unwrap().state, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_all_to_idle_preserves_overload_retry_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("overload", "overload", "/tmp", false, None, None)
+            .await
+            .unwrap();
+        let expected = overload_retry_state(
+            phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                retry_at: Utc::now() + chrono::Duration::seconds(30),
+            },
+        );
+        db.update_conversation_state("overload", &expected)
+            .await
+            .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert_eq!(
+            db.get_conversation("overload").await.unwrap().state,
+            expected
+        );
+    }
+
     #[tokio::test]
     async fn reset_all_to_idle_preserves_completed_and_failed_states() {
         let db = Database::open_in_memory().await.unwrap();
@@ -25481,7 +25976,7 @@ mod tests {
     #[tokio::test]
     async fn reset_preserves_continuation_auth_recovery_but_resets_ordinary_recovery() {
         let db = Database::open_in_memory().await.unwrap();
-        for id in ["continuation-auth", "ordinary-auth"] {
+        for id in ["continuation-auth", "overload-auth", "ordinary-auth"] {
             db.create_conversation(id, id, "/tmp", true, None, None)
                 .await
                 .unwrap();
@@ -25499,6 +25994,30 @@ mod tests {
                 recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
                 resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary {
                     request: request.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let started_at = Utc::now();
+        let overload_retry = phoenix_core::domain::sm_state::ServerOverloadRetry {
+            target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+            phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+            attempt: 3,
+            started_at,
+            deadline_at: started_at + chrono::Duration::seconds(120),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
+        };
+        db.update_conversation_state(
+            "overload-auth",
+            &ConvState::AwaitingRecovery {
+                message: "authenticate".to_string(),
+                error_kind: ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                    retry: overload_retry.clone(),
                 },
             },
         )
@@ -25526,6 +26045,15 @@ mod tests {
                 },
                 ..
             } if persisted == request
+        ));
+        assert!(matches!(
+            db.get_conversation("overload-auth").await.unwrap().state,
+            ConvState::AwaitingRecovery {
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                    retry: persisted,
+                },
+                ..
+            } if persisted == overload_retry
         ));
         assert_eq!(
             db.get_conversation("ordinary-auth").await.unwrap().state,
@@ -28472,6 +29000,129 @@ mod tests {
         assert!(error.to_string().contains("induced member delete failure"));
         assert!(db.get_conversation("atomic-root").await.is_ok());
         assert!(db.get_conversation("atomic-member").await.is_ok());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn hard_delete_mandatory_close_failure_requires_delivery_then_preserves_receipt() {
+        use phoenix_core::domain::close::TranscriptConversationId;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("delete-failure", "delete-failure", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        db.begin_close_foundation(
+            &source.product_conversation_id,
+            &TranscriptConversationId::parse(source.id.clone()).unwrap(),
+            "delete-failure-attempt",
+        )
+        .await
+        .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO close_cleanup_failures (
+                failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
+                scope, authority_kind, resource_kind, identity_kind, identity_codec, identity_value,
+                reason, detail, stop_certainty, occurred_at_us)
+             SELECT 'close-failure:1:delete-failure-attempt', obligation.attempt_id, 1,
+                obligation.product_conversation_id, captured.scope, 'captured_scope', 'work_scope',
+                'opaque', 'opaque_string_v1', captured.scope, 'identity_not_proven',
+                'shutdown uncertain', 'shutdown_uncertain', ?1
+             FROM close_obligations obligation JOIN close_attempt_scopes captured
+               ON captured.attempt_id = obligation.attempt_id
+             WHERE obligation.attempt_id = 'delete-failure-attempt'",
+        )
+        .bind(Utc::now().timestamp_micros())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_cleanup_failure_resources (
+                failure_occurrence_id, ordinal, scope, resource_kind, identity_kind,
+                identity_codec, identity_value, disposition)
+             SELECT failure_occurrence_id, 0, scope, resource_kind, identity_kind,
+                identity_codec, identity_value, 'unknown'
+             FROM close_cleanup_failures
+             WHERE failure_occurrence_id = 'close-failure:1:delete-failure-attempt'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        append_mandatory_close_failure_event_tx(&mut tx, "close-failure:1:delete-failure-attempt")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES ('close-outcome:delete-failure-attempt', ?1, 1, 'system', ?2, ?3)",
+        )
+        .bind(&source.id)
+        .bind(serde_json::to_string(&MessageContent::system("Close incomplete").to_stored_json()).unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE close_obligations SET phase = 'completed', close_outcome = 'close_incomplete',
+                completed_at = ?1, updated_at = ?1 WHERE attempt_id = 'delete-failure-attempt'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let error = db.delete_conversation(&source.id).await.unwrap_err();
+        assert!(error.to_string().contains("FOREIGN KEY"), "{error}");
+        assert!(db.get_conversation(&source.id).await.is_ok());
+        let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].event_id,
+            "close-failure:1:delete-failure-attempt"
+        );
+        assert_eq!(pending[0].source_transcript_id, source.id);
+
+        sqlx::query(
+            "INSERT INTO steering_messages
+                (message_id, conversation_id, ordinal, text, origin_kind, origin_subscription_event_id)
+             VALUES ('delete-failure-receipt', ?1, 0, 'Close failed', 'subscription_event', 'close-failure:1:delete-failure-attempt')",
+        )
+        .bind(&coordinator.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.delete_conversation(&source.id).await.unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        let retained: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM conversations WHERE id = ?1),
+                (SELECT COUNT(*) FROM product_conversations WHERE id = ?2),
+                (SELECT COUNT(*) FROM close_cleanup_failures WHERE failure_occurrence_id = 'close-failure:1:delete-failure-attempt'),
+                (SELECT COUNT(*) FROM steering_messages receipt
+                 JOIN coordinator_watch_events event ON event.event_id = receipt.origin_subscription_event_id
+                 WHERE receipt.message_id = 'delete-failure-receipt' AND event.delivery_state = 'accepted'
+                   AND event.mandatory_source_product_id = ?2 AND event.source_transcript_id = ?1)",
+        )
+        .bind(&source.id)
+        .bind(source.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retained, (0, 0, 0, 1));
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

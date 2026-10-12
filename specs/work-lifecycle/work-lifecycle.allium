@@ -10,7 +10,8 @@
 --   - classification of exact worktree-loss categories for an attached
 --     Git-backed WorkScope;
 --   - generation/fingerprint-bound discard confirmation;
---   - stepwise idempotent retirement of owned worktree and WorkScope resources;
+--   - one stop-on-first-failure retirement run, observation-only startup,
+--     and explicit fresh safe retry under original Close authority;
 --   - PR-state guidance that may encourage Close but never blocks it.
 --
 -- Excludes:
@@ -20,7 +21,7 @@
 --     (pr-association owns those authorities);
 --   - UI layout and copy.
 --
--- Requirement traceability: REQ-WL-001 through REQ-WL-003,
+-- Requirement traceability: REQ-WL-001 through REQ-WL-004,
 -- REQ-PROJ-028a, REQ-PROJ-WS-001
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -118,6 +119,7 @@ external entity CloseRetirementAuthority {
 
 external entity RetirementAttempt {
     attempt_id: String
+    run_ordinal: Integer
     product_conversation: bedrock/ProductConversation
     scope: WorkScope
     inspection: RetirementInspection?
@@ -169,12 +171,14 @@ external entity RestartRepairEvidenceAdoption {
 ------------------------------------------------------------
 
 rule ChatOnlyCloseSkipsWorktreeInspection {
-    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires:
         not exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         attempt_id,
+        run_ordinal,
         inspection_generation: "no-worktree",
         inspection_fingerprint: "no-worktree"
     )
@@ -186,12 +190,13 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
 }
 
 rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
-    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     ensures:
         for scope_binding in attached_worktree_scopes(product_conversation):
             RetirementAttempt.created(
-                attempt_id: attempt_id,
+                attempt_id: attempt_id, run_ordinal: run_ordinal,
                 product_conversation: product_conversation,
                 scope: scope_binding.scope,
                 inspection: RetirementInspection {
@@ -203,7 +208,7 @@ rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
                 for item_identity in current_retirement_loss_item_identities(product_conversation, scope_binding.scope, category):
                     RetirementLossCategoryRow.created(
                         attempt: RetirementAttempt{
-                            attempt_id: attempt_id,
+                            attempt_id: attempt_id, run_ordinal: run_ordinal,
                             product_conversation: product_conversation,
                             scope: scope_binding.scope,
                             inspection: RetirementInspection {
@@ -231,15 +236,13 @@ rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
 }
 
 rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: not exists AttachedWorkScope{product_conversation: product_conversation}
-    ensures: ResourceRetirementCompleted(product_conversation, attempt_id)
+    ensures: ResourceRetirementCompleted(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- A Close on a chat-only or otherwise no-scope aggregate has no owned
@@ -248,21 +251,23 @@ rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
 }
 
 rule GitBackedInspectionWithoutLossRequestsRetirement {
-    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     requires:
         for scope_binding in attached_worktree_scopes(product_conversation):
-            exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
+            exists RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         attempt_id,
-        inspection_generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id)),
-        inspection_fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id))
+        run_ordinal,
+        inspection_generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal)),
+        inspection_fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal))
     )
 
     @guidance
@@ -277,22 +282,24 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
 }
 
 rule GitBackedInspectionWithLossRequiresConfirmation {
-    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    when: RetirementInspectionRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     requires:
         for scope_binding in attached_worktree_scopes(product_conversation):
-            exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
+            exists RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
     requires:
-        exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
+        exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionRequiresConfirmation(
         product_conversation,
         attempt_id,
-        inspection_generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id)),
-        inspection_fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id))
+        run_ordinal,
+        inspection_generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal)),
+        inspection_fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id, run_ordinal))
     )
 
     @guidance
@@ -306,17 +313,18 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
 }
 
 rule LossConfirmationRecomputesInspectionBeforeRetirement {
-    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
-    let fresh_scope_inspections = recompute_all_targeted_scope_inspections(product_conversation, attempt_id)
+    let fresh_scope_inspections = recompute_all_targeted_scope_inspections(product_conversation, attempt_id, run_ordinal)
     let fresh_generation = aggregate_inspection_generation(fresh_scope_inspections)
     let fresh_fingerprint = aggregate_inspection_fingerprint(fresh_scope_inspections)
     requires: fresh_generation = inspection_generation
     requires: fresh_fingerprint = inspection_fingerprint
-    ensures: RetirementInspectionRecomputed(product_conversation, attempt_id, fresh_generation, fresh_fingerprint)
-    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+    ensures: RetirementInspectionRecomputed(product_conversation, attempt_id, run_ordinal, fresh_generation, fresh_fingerprint)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- The only user-facing discard-confirmation control is bound to the exact
@@ -330,14 +338,15 @@ rule LossConfirmationRecomputesInspectionBeforeRetirement {
 }
 
 rule LossConfirmationDetectsChangedInspection {
-    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
     requires:
         bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation != inspection_generation
         or bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint != inspection_fingerprint
-        or aggregate_inspection_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)) != inspection_generation
-        or aggregate_inspection_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)) != inspection_fingerprint
-    ensures: RetirementInspectionChanged(product_conversation, attempt_id)
+        or aggregate_inspection_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id, run_ordinal)) != inspection_generation
+        or aggregate_inspection_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id, run_ordinal)) != inspection_fingerprint
+    ensures: RetirementInspectionChanged(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- If the confirmation payload no longer matches either the active Close
@@ -347,12 +356,10 @@ rule LossConfirmationDetectsChangedInspection {
 }
 
 rule RetirementRequestedRetiresOwnedResources {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires:
@@ -360,7 +367,7 @@ rule RetirementRequestedRetiresOwnedResources {
             exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
             and not blocked_by_distinct_open_product_or_identity_conflict(product_conversation, scope_binding.scope)
             and all_owned_resources_retired(product_conversation, scope_binding.scope)
-    ensures: ResourceRetirementCompleted(product_conversation, attempt_id)
+    ensures: ResourceRetirementCompleted(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Retirement completion is the final aggregate gate only after per-resource
@@ -370,27 +377,26 @@ rule RetirementRequestedRetiresOwnedResources {
 }
 
 rule RetirementRequestedCreatesPerResourceEvidence {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     ensures:
-        for scope_binding in attached_owned_scopes_with_pending_resources(product_conversation):
+        for scope_binding in selected_next_retirement_scope(product_conversation, attempt_id, run_ordinal):
             if exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
                and not blocked_by_distinct_open_product_or_identity_conflict(product_conversation, scope_binding.scope)
-               and retirement_step_succeeds_for_pending_resource(product_conversation, scope_binding.scope):
+               and retirement_step_succeeds_for_pending_resource(product_conversation, scope_binding.scope)
+               and fresh_reconstructible_or_explicit_discard_authority(product_conversation, attempt_id, run_ordinal):
                 RetiredResource.created(
-                    attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+                    attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope},
                     product_conversation: product_conversation,
                     scope: scope_binding.scope,
                     kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope),
                     resource_identity: retired_resource_identity_for_pending_step(product_conversation, scope_binding.scope)
                 )
-                and ResourceRetirementProgressRecorded(product_conversation, attempt_id, scope_binding.scope)
+                and ResourceRetirementProgressRecorded(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Resource retirement is stepwise and idempotent. Each successful step creates
@@ -399,17 +405,15 @@ rule RetirementRequestedCreatesPerResourceEvidence {
 }
 
 rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     requires: blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
-    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Continuation rows and subordinate execution conversations inside the same
@@ -420,11 +424,12 @@ rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
 }
 
 rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
-    requires: phoenix_private_retirement_directory_identity_is_ambiguous(product_conversation, attempt_id)
-    ensures: safe_retirement_leftover_is_preserved(product_conversation, attempt_id)
-    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+    requires: phoenix_private_retirement_directory_identity_is_ambiguous(product_conversation, attempt_id, run_ordinal)
+    ensures: safe_retirement_leftover_is_preserved(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Normal Close authority comes from the sealed WorkScope gate plus a random,
@@ -439,29 +444,27 @@ rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
         -- to exit. The open-descriptor scan after quarantine therefore sees only
         -- processes that are not Git's own filesystem watcher. A worktree with no
         -- running daemon treats the stop as a silent no-op. A stop that misses its
-        -- deadline is abandoned, and any daemon still holding the tree is reported
-        -- by the scan as typed residual state. Phoenix never changes the user's
-        -- fsmonitor configuration or index state in this step.
+        -- deadline ends the run immediately with typed failure; Phoenix does not
+        -- continue into quarantine or the descriptor scan after that failed stop.
+        -- Phoenix never changes the user's fsmonitor configuration or index state.
 }
 
 rule RetirementStepSuccessRecordsTypedEvidence {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists RetiredResource{
-        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
         kind: retired_resource_kind_for_completed_step(product_conversation, scope_binding.scope),
         resource_identity: retired_resource_identity_for_completed_step(product_conversation, scope_binding.scope)
     }
-    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Progress reporting consumes already-created exact-attempt RetiredResource
@@ -469,57 +472,56 @@ rule RetirementStepSuccessRecordsTypedEvidence {
         -- that evidence.
 }
 
-rule RetirementAlreadyRetiredIsIdempotentNoOp {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
-    }
+rule FreshRunAdoptsCompletedResourceWithoutRepeatingEffect {
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists RetiredResource{
-        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+    let prior = exact_prior_completed_resource(product_conversation, attempt_id, run_ordinal, scope_binding.scope)
+    requires: exists prior
+    requires: prior.attempt.run_ordinal < run_ordinal
+    requires: fresh_run_adopts_completed_resource(product_conversation, scope_binding.scope, prior.resource_identity)
+    ensures: RetiredResource.created(
+        attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
-        kind: retired_resource_kind_for_retried_step(product_conversation, scope_binding.scope),
-        resource_identity: retired_resource_identity_for_retried_step(product_conversation, scope_binding.scope)
-    }
-    requires: exact_attempt_retries_same_resource(product_conversation, scope_binding.scope, retired_resource_identity_for_retried_step(product_conversation, scope_binding.scope))
-    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+        kind: prior.kind,
+        resource_identity: prior.resource_identity
+    )
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id, run_ordinal)
+    ensures: not CompletedRetirementEffectRepeated(prior)
 
     @guidance
-        -- A retry that encounters the same exact attempt/resource already retired is
-        -- a no-op adoption of prior evidence, not a second completion and not a failure.
+        -- Fresh exact identity observations adopt immutable completion evidence into
+        -- this run; no process signal or filesystem deletion repeats the prior effect.
 }
 
 rule RetirementProgressTriggersNextExactAttemptStep {
-    when: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    when: ResourceRetirementProgressRecorded(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     requires: owned_resource_pending_retirement(product_conversation, AttachedWorkScope.scope)
-    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
 
     @guidance
-        -- Every exact-attempt progress record immediately drives the next retirement
-        -- pass for that same attempt while owned resources remain.
+        -- Progress advances only a still-running run; failure revokes all further
+        -- dispatch even when a delayed success/progress event arrives.
 }
 
 rule RetirementProgressReevaluatesCompletionForExactAttempt {
-    when: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    when: ResourceRetirementProgressRecorded(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     requires: all_owned_resources_retired(product_conversation)
-    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Progress also reissues the exact attempt request when the last owned
@@ -528,17 +530,16 @@ rule RetirementProgressReevaluatesCompletionForExactAttempt {
 }
 
 rule ResourceRetirementFailureProducesResidualRepairState {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
-    let scope_binding = failing_retirement_scope(product_conversation, attempt_id)
+    let scope_binding = failing_retirement_scope(product_conversation, attempt_id, run_ordinal)
     let resource_identity = residual_resource_identity_for_attempt(product_conversation, scope_binding.scope)
+    requires: retirement_step_failed(product_conversation, attempt_id, run_ordinal)
     ensures: RetirementResidualResource.created(
-        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
         residual: RetirementResidual{
@@ -548,7 +549,7 @@ rule ResourceRetirementFailureProducesResidualRepairState {
             detail: residual_repair_detail_for_attempt(product_conversation, scope_binding.scope)
         }
     )
-    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Failure is typed and residual: report the exact remaining resource and
@@ -557,25 +558,26 @@ rule ResourceRetirementFailureProducesResidualRepairState {
         -- so partial completion remains visible across retries.
 }
 
-rule RestartRetirementLeavesProcessEpochResourcesUntouched {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+rule ExplicitRunLeavesUnprovenProcessEpochResourcesUntouched {
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
-    requires: process_epoch_resource_has_no_live_retirement_permit(product_conversation, attempt_id)
-    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    requires: process_epoch_resource_has_no_live_retirement_permit(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Bash, PTY, browser, and equivalent ordinary execution resources are owned
-        -- by the live Phoenix process epoch. A restarted runtime neither discovers
-        -- nor signals a former epoch's resource.
+        -- by the live Phoenix process epoch. A fresh explicit retry neither discovers
+        -- nor signals a former epoch's resource; missing proof is a failure, not progress.
 }
 
-rule RestartRetirementRequiresExactTmuxIdentity {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: pending_tmux_identity_is_ambiguous(product_conversation, attempt_id)
-    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+rule ExplicitRunRequiresExactTmuxIdentity {
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
+    requires: pending_tmux_identity_is_ambiguous(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Tmux is the intentionally persistent runtime resource. Its sealed socket
@@ -584,14 +586,12 @@ rule RestartRetirementRequiresExactTmuxIdentity {
 }
 
 rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
-    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
-    let repair_evidence = exact_restart_repair_evidence(product_conversation, attempt_id, scope_binding.scope)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
+    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id, run_ordinal)
+    let repair_evidence = exact_restart_repair_evidence(product_conversation, attempt_id, run_ordinal, scope_binding.scope)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists scope_binding
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
@@ -599,22 +599,22 @@ rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
     requires: exists repair_evidence
     requires: repair_evidence.observation_kind = missing
     requires: complete_restart_repair_identity_available(repair_evidence, product_conversation, scope_binding.scope)
-    requires: same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, scope_binding.scope)
+    requires: same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, run_ordinal, scope_binding.scope)
     requires: no_replacement_worktree_appeared_since_restart_observation(repair_evidence, scope_binding.scope)
-    requires: exact_active_retirement_attempt(product_conversation, attempt_id, scope_binding.scope)
-    requires: not exists RestartRepairEvidenceAdoption{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}}
+    requires: exact_active_retirement_attempt(product_conversation, attempt_id, run_ordinal, scope_binding.scope)
+    requires: not exists RestartRepairEvidenceAdoption{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope}}
     ensures: RestartRepairEvidenceAdoption.created(
-        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope},
         restart_repair_evidence: repair_evidence
     )
     ensures: RetirementAbsenceEvidence.created(
-        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
         resource_kind: worktree,
         resource_identity: repair_evidence.worktree.id
     )
-    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Adoption is fail-closed and exact-attempt-bound. Phoenix may adopt
@@ -627,14 +627,12 @@ rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
 }
 
 rule RestartRepairConflictRoutesTypedRepair {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
-    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
+    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id, run_ordinal)
     let repair_evidence = latest_restart_repair_evidence(product_conversation, scope_binding.scope)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
     requires: exists scope_binding
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
@@ -643,10 +641,10 @@ rule RestartRepairConflictRoutesTypedRepair {
     requires:
         repair_evidence.observation_kind = inaccessible
         or not complete_restart_repair_identity_available(repair_evidence, product_conversation, scope_binding.scope)
-        or not same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, scope_binding.scope)
+        or not same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, run_ordinal, scope_binding.scope)
         or replacement_worktree_appeared_since_restart_observation(repair_evidence, scope_binding.scope)
-        or not exact_active_retirement_attempt(product_conversation, attempt_id, scope_binding.scope)
-    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+        or not exact_active_retirement_attempt(product_conversation, attempt_id, run_ordinal, scope_binding.scope)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- A later Close attempt may bind fresh retained restart evidence for the
@@ -657,20 +655,18 @@ rule RestartRepairConflictRoutesTypedRepair {
 }
 
 rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
-    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
+    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id, run_ordinal)
     requires: exists scope_binding
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation, scope_binding.scope)
-    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
-    requires: not exists RestartRepairEvidenceAdoption{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}}
-    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
+    requires: not exists RestartRepairEvidenceAdoption{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope}}
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- An already-absent worktree is accepted only when retained identity and
@@ -683,19 +679,17 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
 }
 
 rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
-    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
-        awaiting_retirement_inspection,
-        awaiting_loss_confirmation,
-        retirement_requested,
-        needs_repair
+        retirement_requested
     }
-    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
+    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id, run_ordinal)
     requires: exists scope_binding
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation, scope_binding.scope)
-    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
-    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, run_ordinal: run_ordinal, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id, run_ordinal)
 
     @guidance
         -- Exact-attempt absence evidence lets retirement accept an already-absent
@@ -704,6 +698,31 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
         -- for that same exact attempt.
 }
 
+
+-- REQ-WL-002b / REQ-WL-004: every retirement failure enters the same
+-- run-stopping and mandatory-Global-delivery boundary owned by bedrock.
+rule RetirementFailureStopsBeforeAnyFurtherStep {
+    when: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    let run = bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}
+    requires: run.status = running
+    ensures: CloseRunFailed(product_conversation, attempt_id, run_ordinal,
+        failed_step: failed_retirement_step(run), reason: failed_retirement_reason(run),
+        shutdown: observed_retirement_shutdown(run), residual_evidence: exact_retirement_residuals(run))
+
+    @guidance
+        -- Stop/failure persistence is the step's commit boundary, not a delayed
+        -- background callback. No other scope's step can execute after this failure.
+}
+
+rule UnprovenReconstructibilityPreservesWorktree {
+    when: ResourceRetirementRequested(product_conversation, attempt_id, run_ordinal)
+    requires: bedrock/CloseRun{obligation: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}, ordinal: run_ordinal}.status = running
+    requires: pending_step_deletes_worktree(product_conversation, attempt_id, run_ordinal)
+    requires: not fresh_reconstructible_or_explicit_discard_authority(product_conversation, attempt_id, run_ordinal)
+    ensures: WorktreePreserved(product_conversation, attempt_id, run_ordinal)
+    ensures: CloseRetirementStepFailed(product_conversation, attempt_id, run_ordinal)
+    ensures: ConcreteCloseRepairProposalRequired(product_conversation, attempt_id)
+}
 
 rule PrStatusObservedAsAdvisoryCloseGuidance {
     when: PrStatusQueried(product_conversation)
@@ -722,9 +741,56 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 -- Allium has no formal helper-function declaration; this block defines the
 -- complete semantics of each bare helper used above.
 --
+--   selected_next_retirement_scope(product_conversation, attempt_id, run_ordinal)
+--       -> List<AttachedWorkScope>
+--       Selects at most one exact remaining step across the original-authority
+--       target set, in deterministic order, only while the matching run is running.
+--       The next step cannot dispatch until the prior step's outcome commits.
+--
+--   retirement_step_failed(product_conversation, attempt_id, run_ordinal) -> Boolean
+--       True only for the exact selected step's failed outcome in this running run.
+--
+--   pending_step_deletes_worktree(product_conversation, attempt_id, run_ordinal)
+--       -> Boolean
+--       True when the selected next step would remove a worktree or retained leftover.
+--
+--   fresh_reconstructible_or_explicit_discard_authority(
+--       product_conversation, attempt_id, run_ordinal) -> Boolean
+--       Requires fresh exact ownership and identity for the selected target. For
+--       deletion it requires proof of reconstruction without unique-work loss, or
+--       an exact generation-bound explicit user discard decision. Clean Git status
+--       alone is insufficient; ignored paths may be omitted from the inventory but
+--       not from reconstructibility analysis. A retry additionally requires its fresh
+--       safety proof: changed risk or unique/uncertain discard needs a separately
+--       approved concrete proposal and cannot inherit the failed run's confirmation.
+--       For a nondeleting step, only exact ownership/effect authority is required.
+--
+--   exact_prior_completed_resource(product_conversation, attempt_id, run_ordinal,
+--       scope: WorkScope) -> RetiredResource?
+--       Selects an immutable successful resource record from a lower ordinal of
+--       the same original Close authority and exact scope. Ambiguity returns absent.
+--
+--   fresh_run_adopts_completed_resource(product_conversation, scope, resource_id)
+--       -> Boolean
+--       True only when immutable evidence under the original Close authority proves
+--       that exact resource retired and fresh observations rule out replacement.
+--       Adoption creates fresh run-bound evidence, never repeats a completed effect.
+--
+--   failed_retirement_step(run: bedrock/CloseRun) -> String
+--   failed_retirement_reason(run: bedrock/CloseRun) -> String
+--   exact_retirement_residuals(run: bedrock/CloseRun) -> String
+--       Read the exact selected step's typed failure and residual records, including
+--       scope and resource identities. They never broaden the target/effect set.
+--
+--   observed_retirement_shutdown(run: bedrock/CloseRun) -> confirmed | uncertain
+--       Confirmed only with positive evidence of both conversation-execution and
+--       owned-process shutdown, including intentionally persistent tmux processes.
+--       Missing permits, PID/path absence alone, and inaccessible probes are uncertain.
+--
 --   attempt_bound_scope_inspections(
 --       product_conversation: bedrock/ProductConversation,
---       attempt_id: String
+--       attempt_id: String,
+--       run_ordinal: Integer
 --   ) -> List<(WorkScope, RetirementInspection)>
 --       Returns exactly the persisted inspections bound to the attempt that
 --       produced its RetirementLossCategoryRow set, ordered by the opaque
@@ -733,7 +799,8 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --
 --   recompute_all_targeted_scope_inspections(
 --       product_conversation: bedrock/ProductConversation,
---       attempt_id: String
+--       attempt_id: String,
+--       run_ordinal: Integer
 --   ) -> List<(WorkScope, RetirementInspection)>
 --       Recomputes one exact RetirementInspection for every distinct attached
 --       worktree-owning scope captured by attempt_id, and no other scope. The list
@@ -757,7 +824,8 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --
 --   pending_worktree_retirement_scope(
 --       product_conversation: bedrock/ProductConversation,
---       attempt_id: String
+--       attempt_id: String,
+--       run_ordinal: Integer
 --   ) -> AttachedWorkScope?
 --       The exact attached WorkScope selected for the current worktree-retirement
 --       step of attempt_id. This is step-local: one ProductConversation may have
@@ -788,8 +856,8 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       scope: WorkScope
 --   ) -> gitrep/RestartRepairEvidence?
 --       The latest_restart_repair_evidence row for product_conversation and scope
---       when attempt_id is the sole active Close attempt for that exact scope and
---       that attempt has not already adopted a restart observation; otherwise
+--       when attempt_id/run_ordinal names the sole running Close execution for
+--       that exact scope and that run has not already adopted a restart observation; otherwise
 --       absent. A cancelled attempt never mutates or consumes the source row; a
 --       later attempt creates its own adoption after rechecking every guard.
 --
@@ -836,8 +904,8 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       attempt_id: String,
 --       scope: WorkScope
 --   ) -> Boolean
---       True iff attempt_id is the ProductConversation's sole non-completed Close
---       attempt and its RetirementAttempt is bound to that exact scope.
+--       True iff attempt_id/run_ordinal names the original Close authority
+--       and its sole running execution bound to that exact scope.
 --
 --   worktree_already_absent(
 --       product_conversation: bedrock/ProductConversation,

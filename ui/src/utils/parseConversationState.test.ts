@@ -3,6 +3,102 @@ import { canChangeModelInState } from '../api';
 import { parseConversationState, canCancelConversationState, isAgentWorking } from '../utils';
 
 describe('parseConversationState recovery', () => {
+  it('parses overload retry as busy and cancellable', () => {
+    const state = parseConversationState({
+      type: 'server_overload_retrying',
+      retry: {
+        target: 'ordinary',
+        phase: { type: 'waiting', retry_at: '2026-01-01T00:00:30Z' },
+        attempt: 3,
+      },
+    });
+
+    expect(state).toEqual({
+      type: 'server_overload_retrying',
+      attempt: 3,
+      maxAttempts: 5,
+      retryAt: Date.parse('2026-01-01T00:00:30Z'),
+      target: 'ordinary',
+    });
+    expect(isAgentWorking(state)).toBe(true);
+    expect(canCancelConversationState(state)).toBe(true);
+    expect(canChangeModelInState(state)).toBe(false);
+  });
+
+  it('parses the public continuation overload discriminator without private target payload', () => {
+    expect(parseConversationState({
+      type: 'server_overload_retrying',
+      attempt: 2,
+      max_attempts: 5,
+      retry_at: null,
+      target: 'continuation',
+    })).toEqual({
+      type: 'server_overload_retrying',
+      attempt: 2,
+      maxAttempts: 5,
+      retryAt: null,
+      target: 'continuation',
+    });
+  });
+
+  it('preserves an overload recovery resume target without semantic substitution', () => {
+    const state = parseConversationState({
+      type: 'awaiting_recovery',
+      message: 'refreshing credentials',
+      recovery_kind: 'credential',
+      resume: {
+        type: 'server_overload_retry',
+        retry: {
+          target: {
+            type: 'continuation',
+            operation_id: 'continuation-7',
+            rejected_tool_calls: [],
+          },
+          phase: { type: 'in_flight' },
+          attempt: 3,
+          started_at: '2026-01-01T00:00:00Z',
+          deadline_at: '2026-01-01T00:02:00Z',
+          logical_request_id: 'logical-request-7',
+          model_id: 'resolved-model-7',
+        },
+      },
+    });
+
+    expect(state).toEqual({
+      type: 'awaiting_recovery',
+      message: 'refreshing credentials',
+      recovery_kind: 'credential',
+      resume: {
+        type: 'server_overload_retry',
+        retry: {
+          target: {
+            type: 'continuation',
+            operation_id: 'continuation-7',
+            rejected_tool_calls: [],
+          },
+          phase: { type: 'in_flight' },
+          attempt: 3,
+          started_at: '2026-01-01T00:00:00Z',
+          deadline_at: '2026-01-01T00:02:00Z',
+          logical_request_id: 'logical-request-7',
+          model_id: 'resolved-model-7',
+        },
+      },
+    });
+  });
+
+  it('rejects unknown recovery targets instead of substituting a conversation turn', () => {
+    expect(parseConversationState({
+      type: 'awaiting_recovery',
+      message: 'recovering',
+      recovery_kind: 'credential',
+      resume: { type: 'future_operation' },
+    })).toEqual({
+      type: 'client_decode_error',
+      message: 'Invalid recovery resume target',
+    });
+  });
+
   it.each([
     [{ type: 'awaiting_user_response', questions: [] }],
     [{ type: 'awaiting_user_response', questions: [], request_id: null }],
@@ -26,6 +122,7 @@ describe('parseConversationState recovery', () => {
       request_id: 'request-q2',
     });
   });
+
 
   it('allows manual recovery of a persisted invalid-request error', () => {
     const state = parseConversationState({

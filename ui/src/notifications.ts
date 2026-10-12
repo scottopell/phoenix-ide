@@ -344,6 +344,7 @@ export function notifyArchiveCloseConflict(conversationId: string, error: unknow
     'close_already_history',
     'close_inspection_failed',
     'close_retirement_needs_repair',
+    'close_incomplete',
     'stale_close_inspection',
   ].includes(error.detail.error_type)) return false;
   notifyCloseSnapshotChanged(conversationId);

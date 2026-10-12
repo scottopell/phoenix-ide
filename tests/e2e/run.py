@@ -1161,7 +1161,7 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
         canonical_route = created["canonical_route"]
         root_conv_id = created["transcript_row_id"]
 
-        assert canonical_route == f"/product-conversations/{product_conversation_id}", (
+        assert canonical_route == f"/c/{product_conversation_id}", (
             f"unexpected canonical route: {canonical_route!r}"
         )
 

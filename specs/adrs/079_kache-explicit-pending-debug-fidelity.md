@@ -1,6 +1,6 @@
 # ADR-079: Kache remains explicit pending restored debug fidelity
 
-- **Status:** Superseded by ADR-088
+- **Status:** Superseded by ADR-092
 - **Date:** 2026-10-04
 - **Supersedes:** ADR-078
 - **Affects:** development methodology; REQ-COMP-001, REQ-COMP-008

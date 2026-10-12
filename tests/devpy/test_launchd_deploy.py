@@ -1481,7 +1481,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_positional_version_is_rejected_with_release_guidance(self):
         result = subprocess.run(
-            ["python3", str(ROOT / "dev.py"), "prod", "deploy", "v1.2.3"],
+            [sys.executable, str(ROOT / "dev.py"), "prod", "deploy", "v1.2.3"],
             cwd=ROOT, capture_output=True, text=True,
         )
         self.assertNotEqual(0, result.returncode)

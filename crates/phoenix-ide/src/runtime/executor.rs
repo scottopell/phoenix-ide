@@ -88,6 +88,7 @@ enum AuthoritativeEffect {
     ScheduleRetry {
         delay: Duration,
         attempt: u32,
+        max_attempts: u32,
         reason: phoenix_core::domain::llm_error_kind::LlmAttemptReason,
         resets_at: Option<DateTime<Utc>>,
     },
@@ -264,11 +265,13 @@ impl ClassifiedEffect {
             Effect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             })),
@@ -465,6 +468,9 @@ const CANCELLATION_DEADLINE: Duration = Duration::from_secs(3);
 /// real cancelled result wins the race in the common case, leaving this 6s as a
 /// true last resort for a sub-agent runtime that has genuinely vanished.
 const CANCELLING_SUBAGENTS_DEADLINE: Duration = Duration::from_secs(6);
+const BASH_WAIT_DEFAULT_SECONDS: u64 = 30;
+const BASH_WAIT_EXECUTION_GRACE: Duration = Duration::from_secs(1);
+const BASH_WAIT_SETTLEMENT_GRACE: Duration = Duration::from_secs(5);
 const TERMINAL_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES: u8 = 3;
 
@@ -684,6 +690,7 @@ fn trusted_request_continues(state: &ConvState) -> bool {
     matches!(
         state,
         ConvState::LlmRequesting { .. }
+            | ConvState::ServerOverloadRetrying { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
@@ -1879,6 +1886,10 @@ where
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
+    previous_transcripts: Option<(
+        crate::api::global_read::GlobalReadService,
+        crate::api::global_read::PreviousTranscriptsBinding,
+    )>,
     /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
     /// Static for the conversation's tool set, so it is computed once and only
     /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
@@ -2146,6 +2157,56 @@ enum FollowUpApprovalError {
     AuthorityLost(String),
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+enum OverloadStartupAction {
+    Schedule {
+        delay: std::time::Duration,
+        attempt: u32,
+    },
+    Dispatch,
+    Expire,
+}
+
+fn overload_startup_action(
+    retry: &phoenix_core::domain::sm_state::ServerOverloadRetry,
+    now: chrono::DateTime<chrono::Utc>,
+) -> OverloadStartupAction {
+    use phoenix_core::domain::sm_state::ServerOverloadPhase;
+    if now >= retry.deadline_at {
+        return OverloadStartupAction::Expire;
+    }
+    match retry.phase {
+        ServerOverloadPhase::Waiting { retry_at } if retry_at <= now => {
+            OverloadStartupAction::Dispatch
+        }
+        ServerOverloadPhase::Waiting { retry_at } => OverloadStartupAction::Schedule {
+            delay: (retry_at - now).to_std().unwrap_or_default(),
+            attempt: retry.attempt,
+        },
+        ServerOverloadPhase::InFlight => OverloadStartupAction::Dispatch,
+    }
+}
+
+fn continuation_request_identity(conversation_id: &str, operation_id: &str) -> String {
+    if operation_id == phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID {
+        format!("{operation_id}:{conversation_id}")
+    } else {
+        operation_id.to_string()
+    }
+}
+
+fn overload_recovery_deadline_for(state: &ConvState, now: DateTime<Utc>) -> Option<Duration> {
+    match state {
+        ConvState::AwaitingRecovery {
+            resume:
+                phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { retry },
+            ..
+        } => Some((retry.deadline_at - now).to_std().unwrap_or_default()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskApprovalExecution {
     Initial,
@@ -2200,6 +2261,7 @@ where
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
+            previous_transcripts: None,
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
@@ -2394,6 +2456,15 @@ where
         Ok(())
     }
 
+    pub(crate) fn with_previous_transcripts(
+        mut self,
+        service: crate::api::global_read::GlobalReadService,
+        binding: crate::api::global_read::PreviousTranscriptsBinding,
+    ) -> Self {
+        self.previous_transcripts = Some((service, binding));
+        self
+    }
+
     pub fn with_credential_helper(
         mut self,
         helper: Option<Arc<phoenix_llm::CredentialHelper>>,
@@ -2568,6 +2639,106 @@ where
             }
         };
 
+        if let ConvState::ServerOverloadRetrying { retry } = self.state.clone() {
+            use phoenix_core::domain::sm_state::{ServerOverloadPhase, ServerOverloadTarget};
+            let now = Utc::now();
+            if matches!(
+                overload_startup_action(&retry, now),
+                OverloadStartupAction::Expire
+            ) {
+                if let Err(error) = self
+                    .process_event(Event::OverloadRetryDeadlineExpired)
+                    .await
+                {
+                    tracing::error!(%error, "Failed to expire recovered overload retry");
+                    return RuntimeExitDisposition::Interrupted;
+                }
+            } else {
+                match overload_startup_action(&retry, now) {
+                    OverloadStartupAction::Dispatch
+                        if matches!(retry.phase, ServerOverloadPhase::Waiting { .. }) => {
+                        if let Err(error) = self
+                            .process_event(Event::RetryTimeout {
+                                attempt: retry.attempt,
+                            })
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to dispatch due recovered overload retry");
+                            return RuntimeExitDisposition::Interrupted;
+                        }
+                    }
+                    OverloadStartupAction::Schedule { delay, attempt } => {
+                        if let Err(error) = self
+                            .execute_effect(Effect::ScheduleRetry {
+                                delay,
+                                attempt,
+                                max_attempts: 5,
+                                reason: phoenix_core::domain::llm_error_kind::LlmAttemptReason::ServerOverloaded,
+                                resets_at: None,
+                            })
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to schedule recovered overload retry");
+                            return RuntimeExitDisposition::Interrupted;
+                        }
+                    }
+                    OverloadStartupAction::Expire => unreachable!("handled before startup action match"),
+                    OverloadStartupAction::Dispatch => {
+                        let ordinary_target = matches!(retry.target, ServerOverloadTarget::Ordinary);
+                        let continuation_operation_id = match &retry.target {
+                            ServerOverloadTarget::Continuation { operation_id, .. } => {
+                                Some(operation_id.clone())
+                            }
+                            ServerOverloadTarget::Ordinary => None,
+                        };
+                        let effect = match retry.target {
+                            ServerOverloadTarget::Ordinary => Effect::RequestLlm,
+                            target @ ServerOverloadTarget::Continuation { .. } => {
+                                Effect::RequestContinuation {
+                                    request: target
+                                        .continuation_request(retry.attempt)
+                                        .expect("continuation target reconstructs its request"),
+                                }
+                            }
+                        };
+                        match self.execute_effect(effect).await {
+                            Ok(Some(event)) => {
+                                if let Err(error) = self.process_event(event).await {
+                                    tracing::error!(%error, "Failed to settle resumed overload retry");
+                                    return RuntimeExitDisposition::Interrupted;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let failure = if ordinary_target {
+                                    self.llm_dispatch_failure_event(error)
+                                } else {
+                                    Event::ContinuationFailed {
+                                        operation_id: continuation_operation_id
+                                            .expect("continuation target has operation identity"),
+                                        error,
+                                        error_kind: crate::db::ErrorKind::InvalidRequest,
+                                    }
+                                };
+                                if let Err(settle_error) = self.process_event(failure).await {
+                                    tracing::error!(%settle_error, "Failed to settle resumed overload dispatch failure");
+                                    return RuntimeExitDisposition::Interrupted;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches!(self.state.step_result(), StepResult::Terminal(_)) {
+            self.emit_terminal_lifecycle_event().await;
+            return RuntimeExitDisposition::Terminal;
+        }
+
+        // Check if we need to resume an interrupted operation
+        // This handles crash recovery for in-flight LLM requests
+
         if let ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. } = &self.state
         {
             if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
@@ -2646,25 +2817,38 @@ where
         }
 
         // If the credential helper is still running, the select loop will pick it up.
-        // If it already settled, handle it immediately.
+        // If it already settled, handle it immediately. The deadline is checked
+        // after observing helper status so a result returned after the incident's
+        // absolute deadline cannot supersede overload exhaustion.
         if matches!(self.state, ConvState::AwaitingRecovery { .. }) {
-            if let Some(ref helper) = self.credential_helper {
-                let status = helper.credential_status().await;
-                if !matches!(
+            let credential_status = if let Some(ref helper) = self.credential_helper {
+                Some(helper.credential_status().await)
+            } else {
+                None
+            };
+            if overload_recovery_deadline_for(&self.state, Utc::now()) == Some(Duration::ZERO) {
+                if let Err(error) = self
+                    .process_event(Event::OverloadRetryDeadlineExpired)
+                    .await
+                {
+                    tracing::error!(%error, "Failed to expire recovered overload credential wait");
+                    return RuntimeExitDisposition::Interrupted;
+                }
+            } else if credential_status.is_some_and(|status| {
+                !matches!(
                     status,
                     phoenix_llm::credential_helper::CredentialStatus::Running
-                ) {
-                    self.handle_credential_settlement().await;
-                }
-            } else {
-                // No credential helper available after restart — fall through to error.
-                if let Err(e) = self
+                )
+            }) {
+                self.handle_credential_settlement().await;
+            } else if credential_status.is_none() {
+                if let Err(error) = self
                     .process_event(Event::CredentialHelperFailed {
                         message: "Credential helper not available after restart".to_string(),
                     })
                     .await
                 {
-                    tracing::error!(error = %e, "Error handling post-restart credential recovery");
+                    tracing::error!(%error, "Error handling post-restart credential recovery");
                 }
             }
         }
@@ -2674,8 +2858,18 @@ where
         // so this only matters when a runtime is constructed straight into a
         // waiting state — but arming here (not only on transition) is what makes
         // the backstop structural rather than dependent on the entry path.
-        if let Some(d) = Self::deadline_for(&self.state) {
-            self.deadline = Some(tokio::time::Instant::now() + d);
+        let now = Utc::now();
+        let remaining = overload_recovery_deadline_for(&self.state, now).or_else(|| {
+            Self::scheduler_deadline_for(&self.state).map(|duration| {
+                let elapsed = now
+                    .signed_duration_since(self.state_updated_at)
+                    .to_std()
+                    .unwrap_or_default();
+                duration.saturating_sub(elapsed)
+            })
+        });
+        if let Some(remaining) = remaining {
+            self.deadline = Some(tokio::time::Instant::now() + remaining);
         }
 
         // Process events and outcomes in a loop - no recursion
@@ -2925,18 +3119,23 @@ where
             return;
         };
         let status = helper.credential_status().await;
-        let event = if status == phoenix_llm::credential_helper::CredentialStatus::Valid {
-            tracing::info!("Credential helper succeeded, retrying LLM request");
-            Event::CredentialBecameAvailable
-        } else {
-            tracing::info!(
-                ?status,
-                "Credential helper settled without valid credential"
-            );
-            Event::CredentialHelperFailed {
-                message: "Authentication failed — click Retry to try again".to_string(),
-            }
-        };
+        let event =
+            if overload_recovery_deadline_for(&self.state, Utc::now()) == Some(Duration::ZERO) {
+                Event::OverloadRetryDeadlineExpired
+            } else if status == phoenix_llm::credential_helper::CredentialStatus::Valid {
+                tracing::info!("Credential helper succeeded, retrying LLM request");
+                Event::CredentialBecameAvailable {
+                    observed_at: Utc::now(),
+                }
+            } else {
+                tracing::info!(
+                    ?status,
+                    "Credential helper settled without valid credential"
+                );
+                Event::CredentialHelperFailed {
+                    message: "Authentication failed — click Retry to try again".to_string(),
+                }
+            };
         if let Err(e) = self.process_event(event).await {
             tracing::error!(error = %e, "Error handling credential settlement event");
         }
@@ -3588,6 +3787,58 @@ where
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
+        let remaining = self.bash_wait_transition_remaining(&result.new_state);
+        if let Some(remaining) = remaining {
+            let dispatch_index = result.effects.iter().position(|effect| {
+                matches!(effect, Effect::RequestLlm | Effect::ExecuteTool { .. })
+            });
+            let (settlement, downstream_dispatch) = if let Some(index) = dispatch_index {
+                let mut settlement = result;
+                let downstream = settlement.effects.split_off(index);
+                (settlement, downstream)
+            } else {
+                (result, Vec::new())
+            };
+            let mut generated = if remaining.is_zero() {
+                None
+            } else {
+                let cutoff = tokio::time::sleep(remaining);
+                tokio::pin!(cutoff);
+                tokio::select! {
+                    biased;
+                    () = &mut cutoff => None,
+                    applied = self.apply_transition_result_inner(settlement) => Some(applied?),
+                }
+            };
+            let Some(mut generated) = generated.take() else {
+                self.fatal_local_authority_fence
+                    .close("bash_wait_transition_deadline");
+                return Err("bash wait transition exceeded its absolute settlement deadline; fatal local authority fence closed"
+                    .to_string());
+            };
+            for effect in downstream_dispatch {
+                let is_llm_dispatch = matches!(effect, Effect::RequestLlm);
+                match Box::pin(self.execute_effect(effect)).await {
+                    Ok(Some(event)) => generated.push(event),
+                    Ok(None) => {}
+                    Err(error) if is_llm_dispatch => {
+                        self.pending_trusted_tool_results.clear();
+                        generated.push(self.llm_dispatch_failure_event(error));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(generated);
+        }
+        self.apply_transition_result_inner(result).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::large_futures)]
+    async fn apply_transition_result_inner(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+    ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
         self.proposed_direct_turn_state = None;
@@ -3648,7 +3899,10 @@ where
                     .iter()
                     .any(|effect| matches!(effect, Effect::AbortLlm)))
                 || (matches!(old_state, ConvState::AwaitingRecovery { .. })
-                    && !matches!(result.new_state, ConvState::LlmRequesting { .. }));
+                    && !matches!(
+                        result.new_state,
+                        ConvState::LlmRequesting { .. } | ConvState::ServerOverloadRetrying { .. }
+                    ));
         let mut pending_trusted_cleared = false;
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
@@ -3729,7 +3983,9 @@ where
         // early; correctness does not depend on it.
         if !matches!(
             self.state,
-            ConvState::LlmRequesting { .. } | ConvState::AwaitingContinuation { .. }
+            ConvState::LlmRequesting { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::ServerOverloadRetrying { .. }
         ) {
             if let Some(handle) = self.retry_timer_handle.take() {
                 handle.abort();
@@ -4185,6 +4441,7 @@ where
                             operation_id: request.operation_id.clone(),
                             message: error,
                             error_kind: crate::db::ErrorKind::InvalidRequest,
+                            observed_at: Utc::now(),
                             resets_at: None,
                         });
                         None
@@ -4937,12 +5194,69 @@ where
     /// backstop (2× the 3s sub-agent `CancellingTool` deadline) so real cancelled
     /// results win the drain before the parent presumes a vanished runtime dead.
     fn deadline_for(state: &ConvState) -> Option<Duration> {
+        const MAX_BASH_WAIT_SECONDS: i64 = 900;
         match state {
+            ConvState::ToolExecuting { current_tool, .. } => {
+                let ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    wait_seconds,
+                    ..
+                }) = &current_tool.input
+                else {
+                    return None;
+                };
+                let requested = wait_seconds
+                    .unwrap_or(i64::try_from(BASH_WAIT_DEFAULT_SECONDS).unwrap())
+                    .clamp(0, MAX_BASH_WAIT_SECONDS);
+                let requested = u64::try_from(requested).unwrap();
+                Some(Duration::from_secs(requested) + BASH_WAIT_SETTLEMENT_GRACE)
+            }
             ConvState::AwaitingSubAgents { .. } => Some(DEFAULT_SUBAGENT_TIMEOUT),
             ConvState::CancellingTool { .. } => Some(CANCELLATION_DEADLINE),
             ConvState::CancellingSubAgents { .. } => Some(CANCELLING_SUBAGENTS_DEADLINE),
             _ => None,
         }
+    }
+
+    fn scheduler_deadline_for(state: &ConvState) -> Option<Duration> {
+        match state {
+            ConvState::ToolExecuting { current_tool, .. } => {
+                let ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    wait_seconds,
+                    ..
+                }) = &current_tool.input
+                else {
+                    return None;
+                };
+                let requested = wait_seconds
+                    .unwrap_or(i64::try_from(BASH_WAIT_DEFAULT_SECONDS).unwrap())
+                    .clamp(0, 900);
+                Some(
+                    Duration::from_secs(u64::try_from(requested).unwrap())
+                        + BASH_WAIT_EXECUTION_GRACE,
+                )
+            }
+            _ => Self::deadline_for(state),
+        }
+    }
+
+    fn bash_wait_transition_remaining(&self, next_state: &ConvState) -> Option<Duration> {
+        let current_is_bash_wait = Self::deadline_for(&self.state).is_some()
+            && matches!(self.state, ConvState::ToolExecuting { .. });
+        let (state, entered_at) = if current_is_bash_wait {
+            (&self.state, self.state_updated_at)
+        } else if Self::deadline_for(next_state).is_some()
+            && matches!(next_state, ConvState::ToolExecuting { .. })
+        {
+            (next_state, Utc::now())
+        } else {
+            return None;
+        };
+        let bound = Self::deadline_for(state)?;
+        let elapsed = Utc::now()
+            .signed_duration_since(entered_at)
+            .to_std()
+            .unwrap_or_default();
+        Some(bound.saturating_sub(elapsed))
     }
 
     /// Manage the unified liveness deadline on every transition. Arm a fresh
@@ -4967,10 +5281,26 @@ where
             self.tool_task_handle = None;
         }
 
-        let variant_changed =
-            std::mem::discriminant(old_state) != std::mem::discriminant(&self.state);
-        match Self::deadline_for(&self.state) {
-            Some(duration) if variant_changed => {
+        let entered_waiting_variant = old_state.variant_name() != self.state.variant_name();
+        let entered_distinct_bash_wait = matches!(
+            &self.state,
+            ConvState::ToolExecuting { current_tool, .. }
+                if matches!(current_tool.input, ToolInput::Bash(
+                    phoenix_core::domain::bash_types::BashInvocation::Wait { .. }
+                )) && old_state != &self.state
+        );
+        let now = Utc::now();
+        let remaining = overload_recovery_deadline_for(&self.state, now).or_else(|| {
+            Self::scheduler_deadline_for(&self.state).map(|duration| {
+                let elapsed = now
+                    .signed_duration_since(self.state_updated_at)
+                    .to_std()
+                    .unwrap_or_default();
+                duration.saturating_sub(elapsed)
+            })
+        });
+        match remaining {
+            Some(duration) if entered_waiting_variant || entered_distinct_bash_wait => {
                 self.deadline = Some(tokio::time::Instant::now() + duration);
                 tracing::debug!(
                     state = self.state.variant_name(),
@@ -4979,7 +5309,7 @@ where
                 );
             }
             Some(_) => {
-                // Same waiting variant — keep the in-flight deadline running.
+                // Same waiting execution — keep the in-flight deadline running.
             }
             None => {
                 self.deadline = None;
@@ -4994,10 +5324,30 @@ where
     async fn handle_deadline_expiry(&mut self) {
         self.deadline = None;
         match &self.state {
+            ConvState::ToolExecuting { current_tool, .. }
+                if matches!(
+                    current_tool.input,
+                    ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait { .. })
+                ) =>
+            {
+                self.handle_bash_wait_timeout().await;
+            }
             ConvState::AwaitingSubAgents { .. } => self.handle_sub_agent_timeout().await,
             ConvState::CancellingTool { .. } => self.handle_cancelling_tool_timeout().await,
             ConvState::CancellingSubAgents { .. } => {
                 self.handle_cancelling_sub_agents_timeout().await;
+            }
+            ConvState::AwaitingRecovery {
+                resume:
+                    phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { .. },
+                ..
+            } => {
+                if let Err(error) = self
+                    .process_event(Event::OverloadRetryDeadlineExpired)
+                    .await
+                {
+                    tracing::warn!(%error, "Failed to expire overload retry during credential recovery");
+                }
             }
             other => {
                 tracing::debug!(
@@ -5005,6 +5355,26 @@ where
                     "Liveness deadline fired but state has no backstop — ignoring"
                 );
             }
+        }
+    }
+
+    async fn handle_bash_wait_timeout(&mut self) {
+        let ConvState::ToolExecuting { current_tool, .. } = &self.state else {
+            return;
+        };
+        let tool_use_id = current_tool.id.clone();
+        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
+        if let Some(handle) = self.tool_task_handle.take() {
+            handle.abort();
+        }
+        if let Err(error) = self
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Failed {
+                tool_use_id,
+                error: "bash wait exceeded its bounded settlement deadline".to_string(),
+            }))
+            .await
+        {
+            tracing::error!(%error, "Failed to settle expired bash wait");
         }
     }
 
@@ -5731,6 +6101,11 @@ where
 
     fn abort_external_effects_in_memory(&mut self) {
         self.abort_active_llm_task();
+        self.retry_generation = self.retry_generation.wrapping_add(1);
+        if let Some(handle) = self.retry_timer_handle.take() {
+            handle.abort();
+        }
+        self.handoff_completion_authority = None;
         if let Some(attempt_capture) = self.active_llm_attempt.take() {
             let _ = attempt_capture.finalize_cancelled();
         }
@@ -5745,6 +6120,11 @@ where
 
     async fn abort_external_effects(&mut self) {
         self.abort_active_llm_task();
+        self.retry_generation = self.retry_generation.wrapping_add(1);
+        if let Some(handle) = self.retry_timer_handle.take() {
+            handle.abort();
+        }
+        self.handoff_completion_authority = None;
         if let Some(attempt_capture) = self.active_llm_attempt.take() {
             if let Some(metrics) = attempt_capture.finalize_cancelled() {
                 if let Err(error) = self.storage.upsert_llm_request_metrics(&metrics).await {
@@ -6040,6 +6420,52 @@ where
                     usage_data: Some(usage_data),
                     created_at: Utc::now(),
                 };
+                if matches!(
+                    &self.state,
+                    ConvState::RecoverableContinuationFailure { .. }
+                ) {
+                    let terminal = self
+                        .pending_direct_turn_terminal
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                reason: "Automatic overload retry attempts exhausted before continuation"
+                                    .to_string(),
+                            }
+                        });
+                    let outcome = self
+                        .storage
+                        .recover_continuation_start(
+                            &crate::runtime::traits::ContinuationStartRecoverySettlement {
+                                turn: self.active_direct_turn.as_deref().cloned(),
+                                terminal: self.active_direct_turn.as_ref().map(|_| terminal),
+                                operation_id: request.operation_id.clone(),
+                                message: message.clone(),
+                                state: self.state.clone(),
+                                state_updated_at: self.state_updated_at,
+                            },
+                        )
+                        .await?;
+                    match outcome {
+                        crate::db::ContinuationCommitOutcome::Applied
+                        | crate::db::ContinuationCommitOutcome::Duplicate => {
+                            self.active_direct_turn = None;
+                            self.pending_direct_turn_terminal = None;
+                            self.direct_turn_cancellation_initiated = false;
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .persisted_message(message);
+                        }
+                        crate::db::ContinuationCommitOutcome::Stale => {
+                            self.continuation_effect_disposition =
+                                ContinuationEffectDisposition::AbortRemaining;
+                        }
+                    }
+                    drop(reserved_range);
+                    return Ok(None);
+                }
                 let outcome = match self
                     .storage
                     .begin_continuation(
@@ -6670,6 +7096,7 @@ where
             AuthoritativeEffect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             } => {
@@ -6680,14 +7107,23 @@ where
                 // suffix in lockstep with the state machine. Emitted
                 // BEFORE the tokio sleep so a client subscribing in the
                 // backoff window observes it via the replay ring.
-                let backing_off_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                let remaining_delay = match &self.state {
+                    ConvState::ServerOverloadRetrying { retry } => match retry.phase {
+                        phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                            retry_at,
+                        } => (retry_at - Utc::now()).to_std().unwrap_or_default(),
+                        phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight => delay,
+                    },
+                    _ => delay,
+                };
+                let backing_off_ms = u64::try_from(remaining_delay.as_millis()).unwrap_or(u64::MAX);
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
                     .event(|seq| SseEvent::LlmAttempt {
                         sequence_id: seq,
                         attempt,
-                        max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+                        max_attempts,
                         reason,
                         backing_off_ms,
                         resets_at,
@@ -6713,7 +7149,7 @@ where
                 let timer_admission = admitted.reborrow();
                 let handle = tokio::spawn(async move {
                     let _timer_admission = timer_admission;
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(remaining_delay).await;
                     let _ = retry_outcome_tx.send((timer_generation, attempt)).await;
                 });
                 self.retry_timer_handle = Some(handle.abort_handle());
@@ -6832,6 +7268,17 @@ where
                     &self.state,
                     ConvState::AwaitingContinuation { request: active }
                         if active.operation_id == request.operation_id
+                ) || matches!(
+                    &self.state,
+                    ConvState::ServerOverloadRetrying { retry }
+                        if matches!(
+                            &retry.target,
+                            phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation { operation_id, .. }
+                                if operation_id == &request.operation_id
+                        ) && matches!(
+                            retry.phase,
+                            phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                        )
                 ) {
                     self.request_continuation(request, admitted).await
                 } else {
@@ -7175,8 +7622,9 @@ where
             %error,
             "LLM dispatch failed before starting a provider task"
         );
-        let attempt = match self.state {
-            ConvState::LlmRequesting { attempt } => attempt,
+        let attempt = match &self.state {
+            ConvState::LlmRequesting { attempt } => *attempt,
+            ConvState::ServerOverloadRetrying { retry } => retry.attempt,
             _ => 1,
         };
         Event::LlmError {
@@ -7184,6 +7632,7 @@ where
             error_kind: crate::db::ErrorKind::InvalidRequest,
             attempt,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
         }
     }
@@ -7274,6 +7723,7 @@ where
             error_kind: crate::db::ErrorKind::InvalidRequest,
             attempt,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
         })
         .await
@@ -7393,12 +7843,54 @@ where
             }
         }
 
-        let retry_attempt = match self.state {
+        let retry_attempt = match &self.state {
             ConvState::LlmRequesting { attempt }
-            | ConvState::SeededLlmRequesting { attempt, .. } => attempt,
+            | ConvState::SeededLlmRequesting { attempt, .. } => *attempt,
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(
+                    retry.target,
+                    phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary
+                ) && matches!(
+                    retry.phase,
+                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                ) =>
+            {
+                retry.attempt
+            }
             _ => 1,
         };
+        let overload_incident = match &self.state {
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(
+                    retry.target,
+                    phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary
+                ) && matches!(
+                    retry.phase,
+                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                ) =>
+            {
+                Some((
+                    retry.deadline_at,
+                    retry.logical_request_id.clone(),
+                    retry.model_id.clone(),
+                ))
+            }
+            _ => None,
+        };
+        let overload_deadline = overload_incident.as_ref().map(|(deadline, _, _)| *deadline);
         let mut tool_surface = LlmToolSurface::Full;
+
+        if let Some((deadline, logical_request_id, model_id)) = &overload_incident {
+            if *deadline <= Utc::now() {
+                return Ok(Some(Event::ServerOverloaded {
+                    detected_at: Utc::now(),
+                    message: "Server overload retry deadline elapsed".to_string(),
+                    guidance: None,
+                    logical_request_id: logical_request_id.clone(),
+                    model_id: model_id.clone(),
+                }));
+            }
+        }
 
         // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
         // finite turn budget. Grace turn mechanism gives the model one extra LLM
@@ -7505,6 +7997,17 @@ where
         // Persistence effects have settled before RequestLlm reaches this method.
         // Refresh and render now, before any provider task exists, so scheduling
         // cannot admit later steering into this request.
+        if let Some((deadline, logical_request_id, model_id)) = &overload_incident {
+            if *deadline <= Utc::now() {
+                return Ok(Some(Event::ServerOverloaded {
+                    detected_at: Utc::now(),
+                    message: "Server overload retry deadline elapsed".to_string(),
+                    guidance: None,
+                    logical_request_id: logical_request_id.clone(),
+                    model_id: model_id.clone(),
+                }));
+            }
+        }
         self.refresh_active_prompt_projection().await?;
         let trusted_results = self.pending_trusted_tool_results.clone();
         let trusted_token_reserve = trusted_results
@@ -7626,7 +8129,10 @@ where
         // Message, producing a phantom streaming buffer on the
         // client (the "repeated message" bug).
         let (chunk_tx, chunk_rx) = mpsc::channel::<phoenix_llm::TokenChunk>(256);
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = overload_incident.as_ref().map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |(_, logical_request_id, _)| logical_request_id.clone(),
+        );
 
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
@@ -7696,6 +8202,12 @@ where
             system_prompt.push_str(
                 "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
             );
+        }
+        if let Some((service, binding)) = &self.previous_transcripts {
+            if let Some(orientation) = service.previous_transcripts_orientation(binding).await {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&orientation);
+            }
         }
         let callable_names = request_tool_surface
             .callable_tools(available_tools.clone())
@@ -7847,7 +8359,22 @@ where
             let attempt_capture = task_attempt_capture;
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
-            let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
+            let provider = llm_client.complete_streaming(&request, &chunk_tx);
+            let result = if let Some(deadline) = overload_deadline {
+                let started_at = std::time::Instant::now();
+                let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
+                if let Ok(result) = tokio::time::timeout(remaining, provider).await {
+                    result
+                } else {
+                    let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
+                    Err(phoenix_llm::LlmError::server_overloaded(
+                        "Server overload retry deadline elapsed",
+                    ))
+                }
+            } else {
+                provider.await
+            };
+            let llm_outcome = match result {
                 Ok(response) => {
                     // Extract tool calls from content and convert to typed ToolCall
                     let tool_calls: Vec<ToolCall> = response
@@ -7884,7 +8411,7 @@ where
                         request_id: request_id.clone(),
                     }
                 }
-                Err(e) => llm_error_to_outcome(e),
+                Err(e) => llm_error_to_outcome(e, &request_id, &model_id),
             };
 
             let finalized_metrics = attempt_capture.finalized();
@@ -8921,12 +9448,33 @@ where
         let operation_id = request.operation_id;
         let rejected_tool_calls = request.rejected_tool_calls;
         let retry_attempt = request.attempt;
+        let overload_deadline = match &self.state {
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(
+                    retry.phase,
+                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                ) =>
+            {
+                Some(retry.deadline_at)
+            }
+            _ => None,
+        };
         let llm_client = Arc::clone(&self.llm_client);
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = match &self.state {
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(
+                    retry.phase,
+                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                ) =>
+            {
+                retry.logical_request_id.clone()
+            }
+            _ => continuation_request_identity(&self.context.conversation_id, &operation_id),
+        };
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
         let model_id = self.context.model_id.clone();
@@ -9103,7 +9651,7 @@ where
             telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                 conversation_id: conv_id.clone(),
                 root_conversation_id: root_conv_id,
-                request_id,
+                request_id: request_id.clone(),
                 retry_attempt,
                 attempt_capture: attempt_capture.clone(),
             }),
@@ -9117,7 +9665,21 @@ where
         let continuation_admission = admitted.reborrow();
         let continuation_task = async move {
             let _continuation_admission = continuation_admission;
-            let result = llm_client.complete(&request).await;
+            let provider = llm_client.complete(&request);
+            let result = if let Some(deadline) = overload_deadline {
+                let started_at = std::time::Instant::now();
+                let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
+                if let Ok(result) = tokio::time::timeout(remaining, provider).await {
+                    result
+                } else {
+                    let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
+                    Err(phoenix_llm::LlmError::server_overloaded(
+                        "Server overload retry deadline elapsed",
+                    ))
+                }
+            } else {
+                provider.await
+            };
             let finalized_metrics = attempt_capture.finalized();
 
             match result {
@@ -9167,12 +9729,34 @@ where
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Continuation LLM request failed");
-                    let event = if e.recovery_in_progress {
+                    let event = if e.kind == phoenix_llm::LlmErrorKind::ServerOverloaded {
+                        let guidance = e.retry_after().map(|retry_after| match retry_after {
+                            phoenix_llm::RetryAfter::WithinLimit(duration) => {
+                                phoenix_core::domain::sm_state::OverloadRetryGuidance::WithinLimit(
+                                    duration,
+                                )
+                            }
+                            phoenix_llm::RetryAfter::ExceedsLimit(duration) => {
+                                phoenix_core::domain::sm_state::OverloadRetryGuidance::ExceedsLimit(
+                                    duration,
+                                )
+                            }
+                        });
+                        Event::ContinuationServerOverloaded {
+                            operation_id: operation_id.clone(),
+                            message: e.message.clone(),
+                            detected_at: Utc::now(),
+                            guidance,
+                            logical_request_id: request_id.clone(),
+                            model_id: model_id.clone(),
+                        }
+                    } else if e.recovery_in_progress {
                         Event::LlmError {
                             message: e.message.clone(),
                             error_kind: llm_error_to_db_error(e.kind),
                             attempt: retry_attempt,
                             recovery_in_progress: true,
+                            observed_at: chrono::Utc::now(),
                             resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
                         }
                     } else {
@@ -9180,6 +9764,7 @@ where
                             operation_id,
                             message: e.message.clone(),
                             error_kind: llm_error_to_db_error(e.kind),
+                            observed_at: Utc::now(),
                             resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
                         }
                     };
@@ -12001,7 +12586,11 @@ fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKin
 
 /// Convert an LLM error into a typed `LlmOutcome`.
 /// Explicit match arms — the compiler enforces exhaustiveness.
-fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
+fn llm_error_to_outcome(
+    error: phoenix_llm::LlmError,
+    logical_request_id: &str,
+    model_id: &str,
+) -> LlmOutcome {
     use phoenix_llm::LlmErrorKind;
     match error.kind {
         LlmErrorKind::RateLimit => LlmOutcome::RateLimited {
@@ -12044,9 +12633,23 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
         LlmErrorKind::InvalidResponse => LlmOutcome::InvalidResponse {
             message: error.message,
         },
-        LlmErrorKind::ServerOverloaded => LlmOutcome::ServerOverloaded {
-            message: error.message,
-        },
+        LlmErrorKind::ServerOverloaded => {
+            let guidance = error.retry_after().map(|retry_after| match retry_after {
+                phoenix_llm::RetryAfter::WithinLimit(duration) => {
+                    phoenix_core::domain::sm_state::OverloadRetryGuidance::WithinLimit(duration)
+                }
+                phoenix_llm::RetryAfter::ExceedsLimit(duration) => {
+                    phoenix_core::domain::sm_state::OverloadRetryGuidance::ExceedsLimit(duration)
+                }
+            });
+            LlmOutcome::ServerOverloaded {
+                message: error.message,
+                detected_at: Utc::now(),
+                guidance,
+                logical_request_id: logical_request_id.to_string(),
+                model_id: model_id.to_string(),
+            }
+        }
         LlmErrorKind::Network => LlmOutcome::NetworkError {
             message: error.message,
         },
@@ -12350,8 +12953,8 @@ mod error_mapping_tests {
         );
         let db_kind = llm_error_to_db_error(LlmErrorKind::ServerOverloaded);
         assert!(
-            !db_kind.is_auto_retryable(),
-            "ServerOverloaded must NOT be retryable after mapping"
+            db_kind.is_auto_retryable(),
+            "ServerOverloaded must retain its bounded overload retry policy after mapping"
         );
     }
 
@@ -12386,8 +12989,11 @@ mod error_mapping_tests {
     #[test]
     fn test_invalid_response_outcome_is_not_request_rejected() {
         // InvalidResponse must take the automatically retryable outcome path.
-        let outcome =
-            llm_error_to_outcome(phoenix_llm::LlmError::invalid_response("garbled SSE event"));
+        let outcome = llm_error_to_outcome(
+            phoenix_llm::LlmError::invalid_response("garbled SSE event"),
+            "logical-request",
+            "test-model",
+        );
         assert!(
             matches!(outcome, LlmOutcome::InvalidResponse { .. }),
             "invalid_response must map to LlmOutcome::InvalidResponse, got {outcome:?}"
@@ -12419,10 +13025,11 @@ mod error_mapping_tests {
             let result = handle_outcome(
                 &ConvState::LlmRequesting { attempt: 1 },
                 &context,
-                EffectOutcome::Llm(llm_error_to_outcome(phoenix_llm::LlmError::new(
-                    provider_kind,
-                    "provider rejected request",
-                ))),
+                EffectOutcome::Llm(llm_error_to_outcome(
+                    phoenix_llm::LlmError::new(provider_kind, "provider rejected request"),
+                    "logical-request",
+                    "test-model",
+                )),
             )
             .unwrap();
             let ConvState::Error { error_kind, .. } = &result.new_state else {
@@ -12447,17 +13054,23 @@ mod error_mapping_tests {
         assert!(!db_error.is_auto_retryable());
         assert!(db_error.is_user_resumable());
 
-        let outcome = llm_error_to_outcome(phoenix_llm::LlmError::prompt_rejected(
-            "invalid_prompt: policy rejected the assembled prompt",
-        ));
+        let outcome = llm_error_to_outcome(
+            phoenix_llm::LlmError::prompt_rejected(
+                "invalid_prompt: policy rejected the assembled prompt",
+            ),
+            "logical-request",
+            "test-model",
+        );
         assert!(matches!(outcome, LlmOutcome::PromptRejected { .. }));
     }
 
     #[test]
     fn provider_context_window_error_still_maps_to_token_budget_exceeded() {
-        let outcome = llm_error_to_outcome(phoenix_llm::LlmError::context_window_exceeded(
-            "provider rejected oversized context",
-        ));
+        let outcome = llm_error_to_outcome(
+            phoenix_llm::LlmError::context_window_exceeded("provider rejected oversized context"),
+            "logical-request",
+            "test-model",
+        );
         assert!(
             matches!(outcome, LlmOutcome::TokenBudgetExceeded),
             "provider context-window errors must retain the terminal path, got {outcome:?}"
@@ -14564,6 +15177,7 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn active_direct_turn_terminal_classification_releases_exactly_once() {
         for (event, new_state, expected) in [
             (
@@ -14593,6 +15207,7 @@ mod authoritative_user_message_effect_tests {
                     error_kind: crate::db::ErrorKind::InvalidRequest,
                     attempt: 1,
                     recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
                     resets_at: None,
                 },
                 ConvState::Error {
@@ -14609,6 +15224,7 @@ mod authoritative_user_message_effect_tests {
                     operation_id: "direct-turn-continuation-op".to_string(),
                     message: "continuation capacity".to_string(),
                     error_kind: crate::db::ErrorKind::ServerOverloaded,
+                    observed_at: chrono::Utc::now(),
                     resets_at: None,
                 },
                 ConvState::RecoverableContinuationFailure {
@@ -18290,14 +18906,31 @@ mod explore_prompt_cache_shape_tests {
 mod steer_drain_detector_tests {
     #![allow(clippy::large_futures)]
     use super::*;
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::testing::{
+        GatedDefinitionsToolExecutor, InMemoryStorage, MockLlmClient, MockToolExecutor,
+    };
     use crate::state_machine::event::SteerEntry;
+    struct NoLlm;
+
+    impl phoenix_core::llm_service::LlmSelector for NoLlm {
+        fn get(
+            &self,
+            _model_id: &str,
+        ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+
+        fn default_service(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+    }
+
     use crate::state_machine::state::{
         AssistantMessage, PendingSubAgent, SubAgentMode, ToolCall, ToolInput,
     };
     use crate::state_machine::transition::TransitionResult;
     use crate::state_machine::ConvContext;
-    use crate::tools::BrowserSessionManager;
+    use crate::tools::{BrowserSessionManager, Tool};
     use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -18400,6 +19033,967 @@ mod steer_drain_detector_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn bash_wait_executing_state(
+        tool_use_id: &str,
+        handle: &str,
+        wait_seconds: Option<i64>,
+    ) -> ConvState {
+        let input = serde_json::json!({
+            "op": "wait",
+            "handle": handle,
+            "wait_seconds": wait_seconds,
+        });
+        ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                tool_use_id,
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    handle: handle.to_string(),
+                    wait_seconds,
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage {
+                content: vec![ContentBlock::ToolUse {
+                    id: tool_use_id.to_string(),
+                    name: "bash".to_string(),
+                    input,
+                }],
+                ..AssistantMessage::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_wait_deadline_settles_once_and_allows_next_turn() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-deadline",
+            bash_wait_executing_state("wait-tool", "b-test", Some(600)),
+            vec![],
+        );
+        let independent = tokio::spawn(async { std::future::pending::<()>().await });
+        rt.tool_task_handle = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&rt.state),
+            Some(Duration::from_secs(605))
+        );
+        rt.handle_deadline_expiry().await;
+
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        let settled = storage.get_all_messages("bash-wait-deadline");
+        let tool_results: Vec<_> = settled
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::Tool(tool) if tool.tool_use_id == "wait-tool" => Some(tool),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 1);
+        assert!(tool_results[0].is_error);
+        assert_eq!(
+            tool_results[0].content,
+            "bash wait exceeded its bounded settlement deadline"
+        );
+        assert!(rt.tool_task_handle.is_none());
+        assert!(!independent.is_finished());
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+            provider_replay: None,
+            content: vec![ContentBlock::text("next turn completed")],
+            tool_calls: vec![],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "next-turn-response".to_string(),
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::Idle));
+        let after_next_turn = storage.get_all_messages("bash-wait-deadline");
+        assert_eq!(after_next_turn.len(), settled.len() + 1);
+        assert_eq!(
+            after_next_turn
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::Tool(tool) if tool.tool_use_id == "wait-tool"
+                ))
+                .count(),
+            1
+        );
+        rt.process_event(Event::UserMessage {
+            text: "subsequent admitted turn".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "subsequent-message".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(storage
+            .get_all_messages("bash-wait-deadline")
+            .iter()
+            .any(|message| matches!(
+                &message.content,
+                MessageContent::User(content)
+                    if content.text == "subsequent admitted turn"
+            )));
+        independent.abort();
+    }
+
+    #[tokio::test]
+    async fn real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("started");
+        let registry = Arc::new(crate::tools::BashHandleRegistry::new());
+        let context = ToolContext::new(
+            CancellationToken::new(),
+            "real-bash-wait".to_string(),
+            temp.path().to_path_buf(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::clone(&registry),
+            Arc::new(NoLlm),
+            crate::terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            None,
+            phoenix_core::work_scope::WorkScopeId::parse("real-bash-wait").unwrap(),
+        );
+        let bash = crate::tools::BashTool;
+        let run = bash
+            .run(
+                serde_json::json!({
+                    "op": "run",
+                    "cmd": "printf x >> started; sleep 3",
+                    "wait_seconds": 0
+                }),
+                context.clone(),
+            )
+            .await;
+        let run_value: serde_json::Value = serde_json::from_str(run.output()).unwrap();
+        assert_eq!(run_value["status"], "still_running");
+        let handle = run_value["handle"].as_str().unwrap();
+
+        for wait_seconds in [0, 1] {
+            let waited = bash
+                .run(
+                    serde_json::json!({
+                        "op": "wait",
+                        "handle": handle,
+                        "wait_seconds": wait_seconds
+                    }),
+                    context.clone(),
+                )
+                .await;
+            let waited_value: serde_json::Value = serde_json::from_str(waited.output()).unwrap();
+            assert_eq!(waited_value["status"], "still_running");
+            assert_eq!(waited_value["handle"], handle);
+        }
+
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+        assert_eq!(registry.snapshot_live_pgids().await.len(), 1);
+        let exited = bash
+            .run(
+                serde_json::json!({
+                    "op": "wait",
+                    "handle": handle,
+                    "wait_seconds": 5
+                }),
+                context,
+            )
+            .await;
+        let exited_value: serde_json::Value = serde_json::from_str(exited.output()).unwrap();
+        assert_eq!(exited_value["status"], "tombstoned");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("started")).unwrap(),
+            "x"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn conversation_runtime_dispatches_real_zero_and_normal_bash_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("runtime-started");
+        let release = temp.path().join("release");
+        let registry = Arc::new(crate::tools::BashHandleRegistry::new());
+        let context = ConvContext::new(
+            "runtime-real-bash-wait",
+            temp.path().to_path_buf(),
+            "test-model",
+            200_000,
+        );
+        let setup_context = ToolContext::new_with_resource_scope(
+            CancellationToken::new(),
+            context.conversation_id.clone(),
+            temp.path().to_path_buf(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::clone(&registry),
+            Arc::new(NoLlm),
+            crate::terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            context.work_scope_worktree.clone(),
+            context.resource_scope.clone(),
+            context.resource_authority,
+        );
+        let bash = crate::tools::BashTool;
+        let run = bash
+            .run(
+                serde_json::json!({
+                    "op": "run",
+                    "cmd": "printf x >> runtime-started; while [ ! -f release ]; do sleep 0.05; done",
+                    "wait_seconds": 0
+                }),
+                setup_context.clone(),
+            )
+            .await;
+        let run_value: serde_json::Value = serde_json::from_str(run.output()).unwrap();
+        assert_eq!(run_value["status"], "still_running");
+        let handle = run_value["handle"].as_str().unwrap().to_string();
+
+        let wait_zero = ToolCall::new(
+            "runtime-wait-zero",
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                handle: handle.clone(),
+                wait_seconds: Some(0),
+                lines: None,
+                since: None,
+            }),
+        );
+        let wait_one = ToolCall::new(
+            "runtime-wait-one",
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                handle: handle.clone(),
+                wait_seconds: Some(1),
+                lines: None,
+                since: None,
+            }),
+        );
+        let initial_state = ConvState::ToolExecuting {
+            current_tool: wait_zero.clone(),
+            remaining_tools: vec![wait_one],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "runtime-wait-zero".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"op":"wait","handle":handle,"wait_seconds":0}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "runtime-wait-one".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"op":"wait","handle":handle,"wait_seconds":1}),
+                    },
+                ],
+                ..AssistantMessage::default()
+            },
+        };
+        let registry_tools = crate::tools::ToolRegistry::direct(vec![]);
+        let tool_definitions = registry_tools.definitions();
+        let tools = Arc::new(crate::runtime::traits::ToolRegistryExecutor::builtin_only(
+            registry_tools,
+            Arc::from([]),
+        ));
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.seed_tool_admission_policy(
+            "runtime-real-bash-wait",
+            phoenix_core::domain::tool_availability::ToolAvailability::all(tool_definitions),
+        );
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        for text in ["waits observed", "next turn completed"] {
+            llm.queue_response(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text(text)],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+        }
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let broadcaster = SseBroadcaster::new(128, 0);
+        let mut state_rx = broadcaster.subscribe();
+        let mut rt = ConversationRuntime::new(
+            context,
+            initial_state,
+            Arc::clone(&storage),
+            llm,
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::clone(&registry),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx.clone(),
+            broadcaster,
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.dispatch_tool_execution(wait_zero, &mut admitted)
+            .await
+            .unwrap();
+        drop(admitted);
+        let runtime = tokio::spawn(rt.run_inner());
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(SseEvent::StateChange {
+                        state: ConvState::Idle,
+                        ..
+                    }) = state_rx.recv().await
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("runtime did not reach the expected idle lifecycle boundary");
+            if storage
+                .get_all_messages("runtime-real-bash-wait")
+                .iter()
+                .any(|message| {
+                    matches!(
+                        &message.content,
+                        MessageContent::User(user_message) if user_message.text == "next permitted turn"
+                    )
+                })
+            {
+                break;
+            }
+            event_tx
+                .send(Event::UserMessage {
+                    text: "next permitted turn".to_string(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "runtime-next-turn".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        for expected_id in ["runtime-wait-zero", "runtime-wait-one"] {
+            let results: Vec<_> = storage
+                .get_all_messages("runtime-real-bash-wait")
+                .into_iter()
+                .filter_map(|message| match message.content {
+                    MessageContent::Tool(tool) if tool.tool_use_id == expected_id => Some(tool),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(results.len(), 1);
+            assert!(!results[0].is_error);
+            assert!(results[0].content.contains("still_running"));
+        }
+        assert!(storage
+            .get_all_messages("runtime-real-bash-wait")
+            .iter()
+            .any(|message| matches!(
+                &message.content,
+                MessageContent::User(user_message) if user_message.text == "next permitted turn"
+            )));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+        assert_eq!(registry.snapshot_live_pgids().await.len(), 1);
+
+        std::fs::write(&release, "release").unwrap();
+        let exited = tokio::time::timeout(
+            Duration::from_secs(5),
+            bash.run(
+                serde_json::json!({"op":"wait","handle":handle,"wait_seconds":5}),
+                setup_context,
+            ),
+        )
+        .await
+        .expect("released child did not settle");
+        let exited_value: serde_json::Value = serde_json::from_str(exited.output()).unwrap();
+        assert_eq!(exited_value["status"], "tombstoned");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+        runtime.abort();
+    }
+
+    #[tokio::test]
+    async fn elapsed_bash_wait_timer_retains_settlement_grace() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-elapsed",
+            bash_wait_executing_state("wait-elapsed", "b-elapsed", Some(30)),
+            vec![],
+        );
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(31);
+
+        rt.handle_deadline_expiry().await;
+
+        assert!(!rt.fatal_local_authority_fence.is_closed());
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert_eq!(
+            storage
+                .get_all_messages("bash-wait-elapsed")
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::Tool(tool) if tool.tool_use_id == "wait-elapsed"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn entering_bash_wait_bounds_state_persistence_from_other_tool() {
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("bash-wait-entry", mk_tool_executing(), vec![]);
+        let (write_started, _write_release) = storage.gate_state_update();
+        let transition =
+            TransitionResult::new(bash_wait_executing_state("wait-entry", "b-entry", Some(0)))
+                .with_effect(Effect::PersistState);
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        let applying = tokio::spawn(async move {
+            let result = rt.apply_transition_result(transition).await;
+            (rt, result)
+        });
+
+        write_started.await.unwrap();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+
+        let (rt, result) = applying.await.unwrap();
+        assert!(result
+            .unwrap_err()
+            .contains("absolute settlement deadline; fatal local authority fence closed"));
+        assert!(fence.is_closed());
+        assert!(rt.live_state_owner().is_err());
+        assert_eq!(storage.get_current_state("bash-wait-entry"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_cutoff_wins_when_tool_round_write_releases_at_deadline() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-cutoff-race",
+            bash_wait_executing_state("wait-cutoff-race", "b-cutoff-race", Some(0)),
+            vec![],
+        );
+        let stale_generation = rt.tool_request_generation;
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        let (write_started, write_release) = storage.gate_tool_round_persist();
+        rt.deadline = Some(tokio::time::Instant::now());
+        let late_outcome_tx = rt.tool_outcome_tx.clone();
+        let runtime = tokio::spawn(rt.run_inner());
+
+        write_started.await.unwrap();
+        tokio::time::advance(BASH_WAIT_SETTLEMENT_GRACE).await;
+        write_release.send(()).unwrap();
+        late_outcome_tx
+            .send((
+                stale_generation,
+                ToolExecOutcome::Completed(ToolResult::success(
+                    "wait-cutoff-race".to_string(),
+                    "late completion".to_string(),
+                )),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.await.unwrap(),
+            RuntimeExitDisposition::FatalLocalAuthorityLoss
+        );
+        assert!(fence.is_closed());
+        assert!(storage.get_all_messages("bash-wait-cutoff-race").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sub_agent_drains_preserve_existing_variant_deadlines() {
+        let first = mk_awaiting_sub_agents();
+        let mut second = first.clone();
+        if let ConvState::AwaitingSubAgents {
+            completed_results, ..
+        } = &mut second
+        {
+            completed_results.push(SubAgentResult {
+                agent_id: "completed".to_string(),
+                task: "completed task".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".to_string(),
+                },
+            });
+        }
+        let (mut rt, _) = build_runtime_with_state_and_queue(
+            "awaiting-deadline-preserved",
+            first.clone(),
+            vec![],
+        );
+        let original = tokio::time::Instant::now() + Duration::from_secs(17);
+        rt.deadline = Some(original);
+        rt.state = second;
+        rt.manage_deadline(&first);
+        assert_eq!(rt.deadline, Some(original));
+
+        let cancelling_first = ConvState::CancellingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "sub-1".to_string(),
+                task: "task".to_string(),
+                mode: SubAgentMode::Work,
+            }],
+            completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+            spawn_tool_id: None,
+        };
+        let cancelling_second = ConvState::CancellingSubAgents {
+            pending: vec![],
+            completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+            spawn_tool_id: None,
+        };
+        rt.deadline = Some(original);
+        rt.state = cancelling_second;
+        rt.manage_deadline(&cancelling_first);
+        assert_eq!(rt.deadline, Some(original));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_wait_is_not_fenced_by_slow_downstream_definitions() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let (tools, definitions_started, definitions_release) = GatedDefinitionsToolExecutor::new();
+        let context = ConvContext::new(
+            "wait-slow-definitions",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+        );
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let mut rt = ConversationRuntime::new(
+            context,
+            bash_wait_executing_state("wait-slow-definitions", "b-slow", Some(0)),
+            Arc::clone(&storage),
+            Arc::new(MockLlmClient::new("test-model")),
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(1);
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        let settlement = tokio::spawn(async move {
+            let result = rt
+                .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Failed {
+                    tool_use_id: "wait-slow-definitions".to_string(),
+                    error: "bounded wait elapsed".to_string(),
+                }))
+                .await;
+            (rt, result)
+        });
+
+        definitions_started.await.unwrap();
+        assert_eq!(
+            storage
+                .get_all_messages("wait-slow-definitions")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            1
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!fence.is_closed());
+        definitions_release.send(()).unwrap();
+
+        let (_rt, result) = settlement.await.unwrap();
+        assert!(result.is_ok());
+        assert!(!fence.is_closed());
+        assert_eq!(
+            storage
+                .get_all_messages("wait-slow-definitions")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_shared_fence_closes_only_for_stuck_wait_persistence() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let manager = crate::runtime::RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        );
+        let shared_fence = Arc::clone(&manager.fatal_local_authority_fence);
+        tokio::time::pause();
+
+        let (healthy, healthy_storage) = build_runtime_with_state_and_queue(
+            "manager-healthy-wait",
+            bash_wait_executing_state("manager-healthy", "b-manager-healthy", Some(0)),
+            vec![],
+        );
+        let mut healthy = healthy.with_fatal_local_authority_fence(Arc::clone(&shared_fence));
+        healthy.handle_deadline_expiry().await;
+        assert!(!manager.local_authority_is_closed());
+        assert!(manager.acquire_local_authority_pass().is_ok());
+        assert_eq!(
+            healthy_storage
+                .get_all_messages("manager-healthy-wait")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            1
+        );
+
+        let (stuck, stuck_storage) = build_runtime_with_state_and_queue(
+            "manager-stuck-wait",
+            bash_wait_executing_state("manager-stuck", "b-manager-stuck", Some(0)),
+            vec![],
+        );
+        let mut stuck = stuck.with_fatal_local_authority_fence(Arc::clone(&shared_fence));
+        stuck.state_updated_at = Utc::now() - chrono::Duration::seconds(1);
+        let (write_started, _write_release) = stuck_storage.gate_tool_round_persist();
+        let settlement = tokio::spawn(async move {
+            stuck
+                .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Failed {
+                    tool_use_id: "manager-stuck".to_string(),
+                    error: "bounded wait elapsed".to_string(),
+                }))
+                .await
+        });
+        write_started.await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(settlement.await.unwrap().is_err());
+        assert!(manager.local_authority_is_closed());
+        assert!(manager.acquire_local_authority_pass().is_err());
+        assert!(stuck_storage
+            .get_all_messages("manager-stuck-wait")
+            .is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_scheduler_settles_bash_wait_when_timer_wins() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-scheduled",
+            bash_wait_executing_state("wait-scheduled", "b-scheduled", Some(0)),
+            vec![],
+        );
+        rt.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        rt.tool_task_handle = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+        let independent = tokio::spawn(async { std::future::pending::<()>().await });
+        let runtime = tokio::spawn(rt.run_inner());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let messages = storage.get_all_messages("bash-wait-scheduled");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::Tool(tool) if tool.tool_use_id == "wait-scheduled"
+                ))
+                .count(),
+            1
+        );
+        assert!(!independent.is_finished());
+        runtime.abort();
+        independent.abort();
+    }
+
+    #[tokio::test]
+    async fn bash_wait_completion_wins_before_deadline_without_duplicate_result() {
+        tokio::time::pause();
+        let wait = ToolCall::new(
+            "wait-race",
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                handle: "b-race".to_string(),
+                wait_seconds: Some(600),
+                lines: None,
+                since: None,
+            }),
+        );
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-race",
+            ConvState::ToolExecuting {
+                current_tool: wait,
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message: AssistantMessage {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "wait-race".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"op":"wait","handle":"b-race","wait_seconds":600}),
+                    }],
+                    ..AssistantMessage::default()
+                },
+            },
+            vec![],
+        );
+        rt.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(605));
+        tokio::time::advance(Duration::from_secs(604)).await;
+        rt.process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+            ToolResult::success("wait-race".to_string(), "process exited".to_string()),
+        )))
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.deadline.is_none());
+        rt.handle_deadline_expiry().await;
+        let messages = storage.get_all_messages("bash-wait-race");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::Tool(tool) if tool.tool_use_id == "wait-race"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bash_wait_cancellation_wins_without_later_timeout_result() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-cancel",
+            bash_wait_executing_state("wait-cancel", "b-cancel", Some(600)),
+            vec![],
+        );
+        rt.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(605));
+        rt.process_event(Event::UserCancel {
+            reason: Some("cancel wait".to_string()),
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::CancellingTool { .. }));
+        tokio::time::advance(Duration::from_secs(605)).await;
+        assert_eq!(
+            storage
+                .get_all_messages("bash-wait-cancel")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bash_wait_outcome_is_rejected_after_timeout_generation_fence() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-stale",
+            bash_wait_executing_state("wait-stale", "b-stale", Some(0)),
+            vec![],
+        );
+        let stale_generation = rt.tool_request_generation;
+        rt.handle_deadline_expiry().await;
+        assert!(rt.tool_outcome_is_stale(stale_generation));
+        assert_eq!(
+            storage
+                .get_all_messages("bash-wait-stale")
+                .iter()
+                .filter(|message| matches!(message.content, MessageContent::Tool(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn only_bash_wait_tool_execution_has_a_deadline() {
+        let wait = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "wait",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    handle: "b-test".to_string(),
+                    wait_seconds: None,
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+        let zero = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "zero",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    handle: "b-zero".to_string(),
+                    wait_seconds: Some(0),
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+        let malformed = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "malformed",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Wait {
+                    handle: "b-malformed".to_string(),
+                    wait_seconds: Some(-1),
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+        let command = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "run",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashInvocation::Run {
+                    cmd: "side effect".to_string(),
+                    target: phoenix_core::domain::bash_types::BashSpawnTarget::Context,
+                    label: None,
+                    wait_seconds: Some(30),
+                    lines: None,
+                    since: None,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&wait),
+            Some(Duration::from_secs(35))
+        );
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&zero),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&malformed),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&command),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bash_wait_restart_uses_persisted_absolute_expiry() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "bash-wait-restart",
+            bash_wait_executing_state("wait-restart", "b-restart", Some(600)),
+            vec![],
+        );
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(700);
+        let remaining = rt.bash_wait_transition_remaining(&rt.state).unwrap();
+        assert_eq!(remaining, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sequential_bash_waits_rearm_even_when_provider_reuses_tool_id() {
+        let first = bash_wait_executing_state("reused-id", "b-first", Some(600));
+        let second = bash_wait_executing_state("reused-id", "b-second", Some(600));
+        let (mut rt, _storage) =
+            build_runtime_with_state_and_queue("bash-wait-reused", first.clone(), vec![]);
+        rt.deadline = None;
+        rt.state = second;
+        rt.state_updated_at = Utc::now();
+        rt.manage_deadline(&first);
+        let scheduler_remaining = rt.deadline.unwrap() - tokio::time::Instant::now();
+        assert!(scheduler_remaining <= Duration::from_secs(601));
+        assert!(scheduler_remaining > Duration::from_secs(600));
+        let settlement_remaining = rt.bash_wait_transition_remaining(&rt.state).unwrap();
+        assert!(settlement_remaining <= Duration::from_secs(605));
+        assert!(settlement_remaining > Duration::from_secs(604));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_bash_wait_transition_fails_stop_before_retrying_persistence() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-transition-bound",
+            bash_wait_executing_state("wait-bound", "b-bound", Some(0)),
+            vec![],
+        );
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(6);
+        let result = rt
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                ToolResult::success("wait-bound".to_string(), "late result".to_string()),
+            )))
+            .await;
+        assert!(result
+            .unwrap_err()
+            .contains("absolute settlement deadline; fatal local authority fence closed"));
+        assert!(rt.fatal_local_authority_fence.is_closed());
+        assert!(rt.live_state_owner().is_err());
+        assert!(storage
+            .get_all_messages("bash-wait-transition-bound")
+            .is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bash_wait_mid_persistence_expiry_closes_authority_and_blocks_publication() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "bash-wait-mid-persist",
+            bash_wait_executing_state("wait-mid-persist", "b-mid-persist", Some(0)),
+            vec![],
+        );
+        rt.state_updated_at = Utc::now() - chrono::Duration::seconds(1);
+        let remaining = rt.bash_wait_transition_remaining(&rt.state).unwrap();
+        assert!(remaining < Duration::from_secs(5));
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        let (write_started, write_release) = storage.gate_tool_round_persist();
+        let transition = tokio::spawn(async move {
+            let result = rt
+                .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Completed(
+                    ToolResult::success(
+                        "wait-mid-persist".to_string(),
+                        "completed before persistence stalled".to_string(),
+                    ),
+                )))
+                .await;
+            (rt, result)
+        });
+
+        write_started.await.unwrap();
+        assert!(!fence.is_closed());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        let (rt, result) = transition.await.unwrap();
+        assert!(result
+            .unwrap_err()
+            .contains("absolute settlement deadline; fatal local authority fence closed"));
+        assert!(fence.is_closed());
+        assert!(fence.try_acquire().is_err());
+        assert!(rt.live_state_owner().is_err());
+        assert!(storage.get_all_messages("bash-wait-mid-persist").is_empty());
+        assert!(write_release.send(()).is_err());
     }
 
     #[tokio::test]
@@ -20661,6 +22255,18 @@ mod steer_drain_detector_tests {
                 recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
                 resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ConversationTurn,
             },
+            ConvState::ServerOverloadRetrying {
+                retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                    target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                    phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                    attempt: 2,
+                    started_at: Utc::now(),
+                    deadline_at: Utc::now() + chrono::Duration::seconds(120),
+
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
+                },
+            },
             ConvState::AwaitingTaskApproval {
                 task_file: "tasks/1.md".into(),
                 title: "task".into(),
@@ -20820,6 +22426,57 @@ mod steer_drain_detector_tests {
                 output: "authenticated payload".to_string(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_survives_overload_retry_after_credential_recovery() {
+        let now = Utc::now();
+        let retry = phoenix_core::domain::sm_state::ServerOverloadRetry {
+            target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+            phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+            attempt: 1,
+            started_at: now,
+            deadline_at: now + chrono::Duration::seconds(120),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
+        };
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-overload-auth-recovery",
+            ConvState::AwaitingRecovery {
+                message: "credential helper active".to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                    retry,
+                },
+            },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+            output: "authenticated payload".to_string(),
+        }];
+
+        rt.process_event(Event::CredentialBecameAvailable { observed_at: now })
+            .await
+            .expect("resume ordinary overload retry");
+
+        assert!(matches!(
+            rt.state,
+            ConvState::ServerOverloadRetrying {
+                retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                    target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                    phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                    attempt: 2,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
+        if let Some(task) = rt.llm_task_handle.take() {
+            task.abort();
+        }
     }
 
     #[tokio::test]
@@ -22533,8 +24190,22 @@ mod retry_timer_epoch_tests {
         ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
 
     fn runtime_requesting() -> TestRuntime {
+        runtime_requesting_with_role(false)
+    }
+
+    fn runtime_requesting_with_role(is_sub_agent: bool) -> TestRuntime {
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("conv-retry", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = if is_sub_agent {
+            ConvContext::sub_agent(
+                "conv-retry",
+                PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+                "root-conv",
+            )
+        } else {
+            ConvContext::new("conv-retry", PathBuf::from("/tmp"), "test-model", 200_000)
+        };
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -22561,7 +24232,19 @@ mod retry_timer_epoch_tests {
             error_kind: crate::db::ErrorKind::Network,
             attempt: 0,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
+        }
+    }
+
+    fn server_overload() -> Event {
+        Event::ServerOverloaded {
+            message: "capacity".to_string(),
+            detected_at: Utc::now(),
+            guidance: None,
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
         }
     }
 
@@ -22625,6 +24308,479 @@ mod retry_timer_epoch_tests {
         assert!(
             rt.retry_timeout_is_stale(scheduled_gen),
             "the cancelled timer's fire must now be stale"
+        );
+    }
+
+    #[test]
+    fn legacy_continuation_request_identity_is_stable_and_conversation_scoped() {
+        let first = continuation_request_identity(
+            "conversation-a",
+            phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID,
+        );
+        assert_eq!(
+            first,
+            continuation_request_identity(
+                "conversation-a",
+                phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID,
+            )
+        );
+        assert_ne!(
+            first,
+            continuation_request_identity(
+                "conversation-b",
+                phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID,
+            )
+        );
+        assert_eq!(
+            continuation_request_identity("conversation-a", "normal-operation"),
+            "normal-operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_continuation_overload_uses_operation_id_as_logical_request_identity() {
+        let mut rt = runtime_requesting();
+        rt.llm_client
+            .queue_error(phoenix_llm::LlmError::server_overloaded("capacity"));
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        rt.event_tx = event_tx;
+
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "continuation-operation-identity".into(),
+            attempt: 1,
+            rejected_tool_calls: vec![],
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+
+        let storage = Arc::clone(&rt.storage);
+        crate::runtime::traits::MessageStore::add_message_with_seq(
+            storage.as_ref(),
+            "continuation-source",
+            &rt.context.conversation_id,
+            1,
+            &MessageContent::User(crate::db::UserContent::new("summarize this history")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(rt
+            .execute_effect(Effect::RequestContinuation { request })
+            .await
+            .unwrap()
+            .is_none());
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("continuation provider task settles")
+            .expect("mock overload produces a continuation event");
+        assert!(matches!(
+            event,
+            Event::ContinuationServerOverloaded {
+                operation_id,
+                logical_request_id,
+                ..
+            } if operation_id == "continuation-operation-identity"
+                && logical_request_id == operation_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn capped_overload_continuation_opening_atomically_settles_direct_turn() {
+        let mut rt = runtime_requesting();
+        let storage = Arc::clone(&rt.storage);
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(901),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                reason: "overload exhausted".into(),
+            },
+        ));
+        let now = Utc::now();
+        rt.state = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                attempt: 5,
+                started_at: now,
+                deadline_at: now + chrono::Duration::seconds(120),
+                logical_request_id: "capped-continuation-request".into(),
+                model_id: "test-model".into(),
+            },
+        };
+        storage
+            .update_state(&rt.context.conversation_id, &rt.state, rt.state_updated_at)
+            .await
+            .unwrap();
+        let usage = phoenix_llm::Usage {
+            input_tokens: 190_000,
+            output_tokens: 17,
+            reasoning_tokens: None,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            LlmOutcome::Response {
+                provider_replay: None,
+                content: vec![ContentBlock::text("final response before continuation")],
+                tool_calls: vec![],
+                end_turn: true,
+                usage: usage.clone(),
+                request_id: "capped-continuation-operation".into(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            rt.state,
+            ConvState::RecoverableContinuationFailure { ref failure }
+                if failure.request.operation_id == "capped-continuation-operation"
+                    && failure.request.attempt == 5
+        ));
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        let messages = storage.recorded_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, "capped-continuation-operation");
+        assert_eq!(messages[0].usage_data.as_ref(), Some(&usage));
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Agent(content) if content == &vec![ContentBlock::text("final response before continuation")]
+        ));
+        assert!(matches!(
+            storage
+                .get_state_snapshot(&rt.context.conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::RecoverableContinuationFailure { .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_overload_schedule_uses_persisted_remaining_delay() {
+        let mut rt = runtime_requesting();
+        let now = Utc::now();
+        rt.state = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: now - chrono::Duration::seconds(1),
+                },
+                attempt: 2,
+                started_at: now - chrono::Duration::seconds(10),
+                deadline_at: now + chrono::Duration::seconds(110),
+                logical_request_id: "elapsed-retry-delay".into(),
+                model_id: "test-model".into(),
+            },
+        };
+
+        rt.execute_effect(Effect::ScheduleRetry {
+            delay: Duration::from_secs(30),
+            attempt: 2,
+            max_attempts: 5,
+            reason: phoenix_core::domain::llm_error_kind::LlmAttemptReason::ServerOverloaded,
+            resets_at: None,
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            rt.retry_outcome_rx.try_recv(),
+            Ok((_generation, 2))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overload_backoff_cleanup_retires_timer_generation_and_admission() {
+        let mut cancelled = runtime_requesting();
+        let cancel_fence = Arc::clone(&cancelled.fatal_local_authority_fence);
+        cancelled
+            .process_event(server_overload())
+            .await
+            .expect("overload schedules backoff");
+        let cancel_generation = cancelled.retry_generation;
+        assert!(matches!(
+            cancelled.state,
+            ConvState::ServerOverloadRetrying { .. }
+        ));
+        assert!(cancelled.retry_timer_handle.is_some());
+        assert_eq!(cancel_fence.owner_count(), 1);
+
+        cancelled
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .expect("cancel transitions");
+        tokio::task::yield_now().await;
+        assert!(matches!(cancelled.state, ConvState::Idle));
+        assert!(cancelled.retry_timer_handle.is_none());
+        assert!(cancelled.retry_generation > cancel_generation);
+        assert!(!route_retry_timeout(&mut cancelled, cancel_generation, 2).await);
+        assert_eq!(cancel_fence.owner_count(), 0);
+
+        let mut torn_down = runtime_requesting();
+        let teardown_fence = Arc::clone(&torn_down.fatal_local_authority_fence);
+        torn_down
+            .process_event(server_overload())
+            .await
+            .expect("overload schedules backoff");
+        let teardown_generation = torn_down.retry_generation;
+        assert_eq!(teardown_fence.owner_count(), 1);
+        torn_down.abort_external_effects().await;
+        tokio::task::yield_now().await;
+        assert!(torn_down.retry_timer_handle.is_none());
+        assert!(torn_down.retry_generation > teardown_generation);
+        assert!(!route_retry_timeout(&mut torn_down, teardown_generation, 2).await);
+        assert_eq!(teardown_fence.owner_count(), 0);
+
+        let mut fatally_aborted = runtime_requesting();
+        let fatal_fence = Arc::clone(&fatally_aborted.fatal_local_authority_fence);
+        fatally_aborted
+            .process_event(server_overload())
+            .await
+            .expect("overload schedules fatal-cleanup backoff");
+        let fatal_generation = fatally_aborted.retry_generation;
+        assert_eq!(fatal_fence.owner_count(), 1);
+        fatally_aborted.abort_external_effects_in_memory();
+        tokio::task::yield_now().await;
+        assert!(fatally_aborted.retry_timer_handle.is_none());
+        assert!(fatally_aborted.retry_generation > fatal_generation);
+        assert!(!route_retry_timeout(&mut fatally_aborted, fatal_generation, 2).await);
+        assert_eq!(fatal_fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_settlement_rechecks_expired_overload_deadline_before_adoption() {
+        let helper =
+            phoenix_llm::CredentialHelper::new("exit 1".to_string(), Duration::from_secs(60));
+        let stream = Arc::clone(&helper).run_and_stream().await;
+        let _events: Vec<_> = tokio_stream::StreamExt::collect(stream).await;
+        helper.wait_for_settlement().await;
+        assert_eq!(
+            helper.credential_status().await,
+            phoenix_llm::credential_helper::CredentialStatus::Failed
+        );
+
+        let mut rt = runtime_requesting().with_credential_helper(Some(helper));
+        let storage = Arc::clone(&rt.storage);
+        let now = Utc::now();
+        rt.state = ConvState::AwaitingRecovery {
+            message: "refreshing credentials".into(),
+            error_kind: crate::db::ErrorKind::Auth,
+            recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+            resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                    target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                    phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                    attempt: 3,
+                    started_at: now - chrono::Duration::seconds(121),
+                    deadline_at: now - chrono::Duration::seconds(1),
+                    logical_request_id: "expired-invalid-helper".into(),
+                    model_id: "test-model".into(),
+                },
+            },
+        };
+
+        rt.handle_credential_settlement().await;
+
+        assert!(matches!(
+            rt.state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::ServerOverloaded,
+                ref message,
+                ..
+            } if message.contains("deadline elapsed")
+        ));
+        assert!(matches!(
+            storage
+                .get_state_snapshot(&rt.context.conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::ServerOverloaded,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_overload_credential_failure_respects_absolute_deadline() {
+        async fn persisted_error_for_deadline(deadline_at: chrono::DateTime<Utc>) -> ConvState {
+            let mut rt = runtime_requesting();
+            let storage = Arc::clone(&rt.storage);
+            let now = Utc::now();
+            rt.state = ConvState::AwaitingRecovery {
+                message: "refreshing credentials".into(),
+                error_kind: crate::db::ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                        attempt: 3,
+                        started_at: now - chrono::Duration::seconds(119),
+                        deadline_at,
+                        logical_request_id: "credential-deadline-request".into(),
+                        model_id: "test-model".into(),
+                    },
+                },
+            };
+            let runtime = tokio::spawn(rt.run());
+            let persisted = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(state @ ConvState::Error { .. }) =
+                        storage.get_current_state("conv-retry")
+                    {
+                        break state;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("startup recovery reaches durable error");
+            runtime.abort();
+            let _ = runtime.await;
+            persisted
+        }
+
+        let before_deadline =
+            persisted_error_for_deadline(Utc::now() + chrono::Duration::seconds(30)).await;
+        assert!(matches!(
+            before_deadline,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::Auth,
+                ..
+            }
+        ));
+
+        let at_deadline = persisted_error_for_deadline(Utc::now()).await;
+        assert!(matches!(
+            at_deadline,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::ServerOverloaded,
+                ref message,
+                ..
+            } if message.contains("deadline elapsed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_expired_subagent_overload_persists_and_exits_terminal() {
+        let mut rt = runtime_requesting_with_role(true);
+        let storage = Arc::clone(&rt.storage);
+        let now = Utc::now();
+        rt.state = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: now - chrono::Duration::seconds(1),
+                },
+                attempt: 4,
+                started_at: now - chrono::Duration::seconds(121),
+                deadline_at: now - chrono::Duration::seconds(1),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
+            },
+        };
+        let runtime = tokio::spawn(rt.run());
+
+        let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(state @ ConvState::Failed { .. }) =
+                    storage.get_current_state("conv-retry")
+                {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup expiry reaches durable terminal state");
+        let ConvState::Failed {
+            error: message,
+            error_kind,
+        } = persisted
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            error_kind,
+            phoenix_core::domain::db_schema::ErrorKind::ServerOverloaded
+        );
+        assert!(message.contains("deadline elapsed"));
+        assert!(!message.contains("Retry-After"));
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), runtime)
+                .await
+                .expect("terminalized startup runtime exits")
+                .expect("runtime task joins"),
+            RuntimeExitDisposition::Terminal
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_expired_continuation_overload_persists_recoverable_terminal() {
+        let mut rt = runtime_requesting();
+        let storage = Arc::clone(&rt.storage);
+        let now = Utc::now();
+        rt.state = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation {
+                    operation_id: "startup-expired-continuation".to_string(),
+                    rejected_tool_calls: vec![],
+                },
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: now - chrono::Duration::seconds(1),
+                },
+                attempt: 4,
+                started_at: now - chrono::Duration::seconds(121),
+                deadline_at: now - chrono::Duration::seconds(1),
+
+                logical_request_id: "logical-request".to_string(),
+                model_id: "test-model".to_string(),
+            },
+        };
+        let runtime = tokio::spawn(rt.run());
+
+        let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(state @ ConvState::RecoverableContinuationFailure { .. }) =
+                    storage.get_current_state("conv-retry")
+                {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup expiry reaches durable recovery state");
+        let ConvState::RecoverableContinuationFailure { failure } = persisted else {
+            unreachable!()
+        };
+        assert_eq!(failure.request.operation_id, "startup-expired-continuation");
+        assert_eq!(failure.request.attempt, 4);
+        assert!(failure.message.contains("deadline elapsed"));
+        assert!(!failure.message.contains("Retry-After"));
+
+        runtime.abort();
+        assert!(
+            matches!(runtime.await, Err(error) if error.is_cancelled()),
+            "the test runtime remains available for an explicit user retry after publishing recovery"
         );
     }
 
@@ -23688,6 +25844,133 @@ mod llm_generation_guard_tests {
         assert!(
             !rt.llm_outcome_is_stale(5),
             "an outcome stamped with the current generation must be processed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod overload_startup_tests {
+    use super::*;
+    use phoenix_core::domain::sm_state::{
+        ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+    };
+
+    fn retry(phase: ServerOverloadPhase, now: chrono::DateTime<Utc>) -> ServerOverloadRetry {
+        ServerOverloadRetry {
+            target: ServerOverloadTarget::Ordinary,
+            phase,
+            attempt: 2,
+            started_at: now,
+            deadline_at: now + chrono::Duration::seconds(120),
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
+        }
+    }
+
+    #[test]
+    fn recovered_waiting_retry_schedules_once_or_dispatches_when_due() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let future = retry(
+            ServerOverloadPhase::Waiting {
+                retry_at: now + chrono::Duration::seconds(7),
+            },
+            now,
+        );
+        assert_eq!(
+            overload_startup_action(&future, now),
+            OverloadStartupAction::Schedule {
+                delay: std::time::Duration::from_secs(7),
+                attempt: 2,
+            }
+        );
+        let due = retry(ServerOverloadPhase::Waiting { retry_at: now }, now);
+        assert_eq!(
+            overload_startup_action(&due, now),
+            OverloadStartupAction::Dispatch
+        );
+    }
+
+    #[test]
+    fn recovered_mixed_failure_wait_uses_persisted_observation_relative_schedule() {
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:37Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let retry_at = observed_at + chrono::Duration::seconds(11);
+        let persisted = ServerOverloadRetry {
+            target: ServerOverloadTarget::Continuation {
+                operation_id: "mixed-op".to_string(),
+                rejected_tool_calls: vec![],
+            },
+            phase: ServerOverloadPhase::Waiting { retry_at },
+            attempt: 4,
+            started_at: observed_at - chrono::Duration::seconds(37),
+            deadline_at: observed_at + chrono::Duration::seconds(83),
+
+            logical_request_id: "logical-request".to_string(),
+            model_id: "test-model".to_string(),
+        };
+        let restored: ServerOverloadRetry =
+            serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
+        assert_eq!(
+            overload_startup_action(&restored, observed_at + chrono::Duration::seconds(3)),
+            OverloadStartupAction::Schedule {
+                delay: std::time::Duration::from_secs(8),
+                attempt: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn recovered_credential_wait_uses_persisted_overload_deadline() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let state = ConvState::AwaitingRecovery {
+            message: "refreshing credentials".to_string(),
+            error_kind: crate::db::ErrorKind::Auth,
+            recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+            resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                retry: ServerOverloadRetry {
+                    target: ServerOverloadTarget::Ordinary,
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: 2,
+                    started_at: now,
+                    deadline_at: now + chrono::Duration::seconds(120),
+                    logical_request_id: "logical-request".to_string(),
+                    model_id: "test-model".to_string(),
+                },
+            },
+        };
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+
+        assert_eq!(
+            overload_recovery_deadline_for(&restored, now + chrono::Duration::seconds(113)),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            overload_recovery_deadline_for(&restored, now + chrono::Duration::seconds(120)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn recovered_retry_expires_or_redispatches_in_flight() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut expired = retry(ServerOverloadPhase::Waiting { retry_at: now }, now);
+        expired.deadline_at = now;
+        assert_eq!(
+            overload_startup_action(&expired, now),
+            OverloadStartupAction::Expire
+        );
+        let in_flight = retry(ServerOverloadPhase::InFlight, now);
+        assert_eq!(
+            overload_startup_action(&in_flight, now),
+            OverloadStartupAction::Dispatch
         );
     }
 }

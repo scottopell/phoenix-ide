@@ -1,0 +1,3 @@
+# Extend existing conversation watches to durable wait entry
+
+Emit typed task-approval and ask-user-question wait-entry outcomes through the existing conversation watch event set. Deduplicate by durable wait identity across persistence/reload/restart; new wait identities alert anew. Preserve commit-before-notify, active-turn state, terminal outcomes, continuation membership, unsubscribe/closed-subscription and historical-enrollment behavior. Add runtime race/restart/subscriber-resume regressions and update outcome wire/UI/tool contracts. No separate attention subscription, polling or reminders. Coordinate executor hunks with Close1669/capacity20385. No primary heavy Rust build or reserved remote deployment checkout.

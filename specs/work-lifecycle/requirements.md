@@ -46,7 +46,7 @@ AND SHALL NOT expose those deprecated verbs as current writable lifecycle choice
 
 WHEN bedrock requests retirement inspection for one exact Close attempt
 THE SYSTEM SHALL inspect every attached `WorkScope` that owns a Git-backed worktree
-AND SHALL bind each evidence set to that exact Close attempt and exact attached `WorkScope` identity
+AND SHALL bind each evidence set to that original Close authority, exact run ordinal, and exact attached `WorkScope` identity
 AND SHALL inspect only state whose durability depends on that scope's attached worktree and owned resources
 AND SHALL classify loss risk into these independent categories:
 - staged tracked paths
@@ -67,7 +67,12 @@ AND SHALL include every relevant path row and every detached-commit identity rat
 AND SHALL require explicit discard confirmation before destructive retirement begins
 
 WHEN no category is present
+AND fresh identity and reconstruction evidence proves that the targeted disposable state is reconstructible without losing unique work
 THE SYSTEM SHALL allow retirement to proceed without a discard confirmation
+
+WHEN reconstruction or loss evidence is uncertain
+THE SYSTEM SHALL preserve the targeted state and require a concrete proposal and explicit discard decision before deleting it
+AND SHALL NOT equate a clean status result, ignored-path exclusion, durable branch presence, or lack of inspection evidence with proof of reconstructibility
 
 WHEN multiple attached `WorkScope`s own Git-backed worktrees
 THE SYSTEM SHALL determine confirmation from the union of their exact per-scope inventories
@@ -83,9 +88,9 @@ WHEN retirement inspection completes for attached Git-backed `WorkScope`s
 THE SYSTEM SHALL produce one inspection generation and workspace fingerprint with the categorized results for each exact attached worktree-owning scope
 
 WHEN that inspection requires discard confirmation
-THE SYSTEM SHALL expose one concrete user-facing discard-confirmation affordance that issues `UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)`
+THE SYSTEM SHALL expose one concrete user-facing discard-confirmation affordance that issues `UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, run_ordinal, inspection_generation, inspection_fingerprint)`
 AND SHALL expose that affordance only while the exact active Close obligation for that `product_conversation` remains in `awaiting_loss_confirmation`
-AND SHALL bind that affordance to the exact active Close-attempt identity, inspection generation, and workspace fingerprint currently held on that Close obligation
+AND SHALL bind that affordance to the exact active Close-attempt identity, running run ordinal, inspection generation, and workspace fingerprint held on that Close obligation
 AND SHALL NOT expose that affordance for any stale inspection, completed Close attempt, superseded Close attempt, or non-active transcript row within the same product conversation
 
 WHEN the user confirms discard after a warning-producing inspection
@@ -97,7 +102,7 @@ THE SYSTEM SHALL invalidate the outstanding confirmation
 AND SHALL require reinspection before retirement may proceed
 
 WHEN the user declines to continue from that warning state before destructive retirement begins
-THE SYSTEM SHALL preserve bedrock's pre-retirement `UserCancelsClose(product_conversation, attempt_id)` cancellation path as the only cancel affordance
+THE SYSTEM SHALL preserve bedrock's pre-retirement `UserCancelsClose(product_conversation, attempt_id, run_ordinal)` cancellation path as the only cancel affordance
 AND SHALL NOT reinterpret that cancellation as a discard confirmation
 
 WHEN a product conversation has no attached `WorkScope` that owns a Git-backed worktree
@@ -118,9 +123,10 @@ THE SYSTEM SHALL treat it as a typed inspection-mismatch path that returns the C
 WHEN bedrock requests resource retirement for one exact Close attempt
 THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources for every attached `WorkScope` targeted by that ProductConversation operation, including each worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that exact WorkScope
 
-THE SYSTEM SHALL seal one admission gate for each exact attached `WorkScope` before retiring its currently owned resources
+THE SYSTEM SHALL seal one admission gate for each exact attached `WorkScope` before retiring its owned resources
 AND SHALL derive cleanup authority only from the exact ProductConversation's committed Close retirement operation targeting that attached `WorkScope`
-AND SHALL reject new resource admission through that sealed gate until the attempt either completes or enters typed repair
+AND SHALL reject new resource admission through that sealed gate while Close is in progress or stopped with unresolved shutdown or cleanup
+AND SHALL NOT reopen the gate as a side effect of failure, notification receipt, restart, or retry
 
 THE SYSTEM SHALL treat transcript rows and subordinate execution conversations within the same ordinary Open ProductConversation as participants in that one aggregate rather than as independent WorkScope owners
 AND SHALL NOT let those subordinate participants independently own, veto, or delay destructive retirement of the ProductConversation's attached `WorkScope`
@@ -141,26 +147,36 @@ THE SYSTEM SHALL treat the WorkScope admission gate and Phoenix-created private 
 AND SHALL perform final directory retirement only through a random Phoenix-owned private directory with owner-only permissions after descriptor-bound identity validation of that directory and the object being removed
 
 WHEN a crash or external mutation makes that identity ambiguous
-THE SYSTEM SHALL preserve any safe leftover and route the exact Close attempt to `NeedsRepair`
+THE SYSTEM SHALL preserve any safe leftover and stop the exact Close run with typed failure
+AND SHALL let bedrock classify confirmed conversation-and-process shutdown as History with `cleanup_attention`, or uncertain shutdown as Open with `CloseIncomplete`
 
 Concurrent malicious mutation inside a Phoenix-owned private namespace, and mutation of resources outside Phoenix ownership, are outside the supported Close reliability boundary
 
 WHEN retirement succeeds overall
-THE SYSTEM SHALL emit success only after the sealed gate has stopped its currently owned process-epoch resources and the required durable tmux and worktree outcomes are recorded
+THE SYSTEM SHALL emit success only after the sealed gate has stopped its owned process-epoch resources and the required durable tmux and worktree outcomes are recorded
 
 WHEN retirement cannot retire a required durable resource or worktree
 THE SYSTEM SHALL report typed residual cleanup state and repair information rather than silently succeeding
 
 WHEN the worktree is already absent
 THE SYSTEM SHALL bind that absence evidence to the exact retirement attempt and attached `WorkScope`
-AND SHALL accept the absence only when retained worktree identity and same-attempt evidence show that the requested retirement removed it or is adopting that exact absence
+AND SHALL accept the absence only when retained worktree identity and exact-run evidence show that the requested retirement removed it or is adopting that exact absence through fresh observation
 AND SHALL otherwise report typed residual evidence rather than silently treating the absence as success
 
-WHEN Phoenix resumes an interrupted Close attempt
-THE SYSTEM SHALL reseal its exact WorkScope gate and reinspect the current worktree before destructive worktree removal
+WHEN a Close run encounters its first failure or is interrupted
+THE SYSTEM SHALL stop all further Close effects for that run across all targeted scopes
+AND SHALL retain exact successful steps, failed-step identity, residual resources, and confirmed or uncertain shutdown as durable evidence
+AND SHALL NOT continue to a later step, replay the failed step, or invoke automatic repair
+
+WHEN Phoenix starts with an interrupted Close run
+THE SYSTEM SHALL observe its retained identities and residual state only
+AND SHALL NOT reseal and dispatch cleanup, stop processes, remove resources, or resume the interrupted run
+
+WHEN an explicit fresh safe retry is admitted under REQ-WL-002c
+THE SYSTEM SHALL reinspect the exact remaining targets and prove reconstructibility immediately before destructive worktree removal
 AND SHALL safely retire a tmux server only when its sealed socket path and Phoenix-controlled server token identify the same server
 AND SHALL leave process-epoch resources that have no live in-memory permit untouched
-AND SHALL route an ambiguous tmux server, worktree, or ownership record to `NeedsRepair`
+AND SHALL stop on ambiguous tmux, worktree, ownership, or shutdown evidence rather than guessing continuity
 
 WHEN the attached `WorkScope` also owns attachments or other work-affine retained resources that are shared across transcript rows of the same open product conversation
 THE SYSTEM SHALL retire or preserve those resources according to that same WorkScope ownership boundary rather than according to individual transcript-row ownership
@@ -170,7 +186,7 @@ CONFIRMED retirement SHALL NOT create a branch, tag, commit, stash, patch, diff 
 THE SYSTEM SHALL leave every branch, tag, stash, remote-tracking ref, and pull request untouched
 AND SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or retarget any branch or pull request as a side effect of Close or retirement
 
-**Rationale:** Retirement must reclaim exactly the resources Phoenix owns, converge safely across retries and restarts, and never disguise destructive teardown as repository management or automatic backup creation.
+**Rationale:** Retirement reclaims only proven Phoenix-owned disposable resources. A failed run ends rather than converging automatically; exact evidence constrains any explicitly admitted fresh retry. Repository management and automatic backup creation are not Close effects.
 
 ---
 
@@ -180,7 +196,7 @@ WHEN Phoenix creates a tmux server for a `WorkScope`
 THE SYSTEM SHALL allocate a Phoenix-controlled server token before server creation
 AND SHALL seal the server's socket path and token as the durable tmux identity for a Close attempt
 
-WHEN Phoenix resumes retirement after a restart
+WHEN Phoenix performs tmux retirement in an explicitly admitted Close run
 THE SYSTEM SHALL retire a tmux server only when its sealed socket path and Phoenix-controlled server token prove the same server remains live
 AND SHALL treat a socket path alone as insufficient authority
 
@@ -188,7 +204,8 @@ WHEN the sealed tmux identity proves that the requested server is absent and a d
 THE SYSTEM SHALL leave the replacement untouched and record the requested server's exact-attempt absence outcome
 
 WHEN Phoenix cannot prove the sealed tmux identity
-THE SYSTEM SHALL preserve the server and route the Close attempt to `NeedsRepair`
+THE SYSTEM SHALL preserve the server and stop the run with typed failure
+AND SHALL retain uncertain process shutdown as `CloseIncomplete` rather than claiming History
 
 **Rationale:** tmux is intentionally process-persistent. Ordinary execution resources belong to one Phoenix process epoch and Close does not retain universal per-resource restart identity for them.
 
@@ -207,7 +224,7 @@ AND SHALL NOT fabricate a replacement `WorkScope`, worktree attachment, detached
 THE SYSTEM SHALL integrate that typed condition with Close repair and retry semantics
 AND SHALL allow later Close inspection, Close retry, or manual repair flows to adopt an exact `missing` observation idempotently only when exact identity evidence proves that adoption
 AND SHALL NOT treat an `inaccessible` observation as absence authority
-AND SHALL keep inaccessible observations in typed repair until a later exact observation proves `missing` or the resource is retired normally
+AND SHALL retain inaccessible observations as uncertainty until a later exact read-only observation proves `missing` or an explicitly admitted run retires the resource
 AND SHALL otherwise route conflicts to typed repair rather than silently succeeding
 
 **Rationale:** A missing registered worktree after restart is a repair-class ownership problem, not a hidden terminal lifecycle. Keeping the product aggregate Open preserves the one Close/reconciliation contract while typed evidence lets later retries reason from persisted ownership without guessing.
@@ -221,21 +238,31 @@ Each persisted `WorkScope` SHALL have exactly one ordinary `ProductConversation`
 
 ---
 
-### REQ-WL-002c: Needs-Repair Retry Reuses the Same Exact Close Attempt
+### REQ-WL-002c: Explicit Safe Retry Creates a Fresh Bounded Run Under Original Close Authority
 
-WHEN resource retirement for one exact Close attempt fails and leaves the product conversation in a visible needs-repair state
-THE SYSTEM SHALL expose a retry affordance bound to that same exact `attempt_id`
-AND SHALL issue `CloseRetirementRetryRequested(product_conversation, attempt_id)` from that visible needs-repair state rather than from a fresh local lifecycle mutation
+WHEN a Close run is stopped with `CloseIncomplete` or `cleanup_attention`
+THE SYSTEM SHALL permit read-only investigation of its exact failure and remaining resources
+AND SHALL NOT treat investigation, notification receipt, startup, elapsed time, or an external precondition change as retry authority
 
-WHEN the user invokes retry from needs-repair
-THE SYSTEM SHALL request retirement again for that same exact Close attempt
-AND SHALL preserve the attempt-bound retirement evidence and residual state already recorded for prior steps
-AND SHALL NOT mint a new Close attempt, silently complete the Close obligation, or mutate ProductConversation lifecycle state outside the typed Close retry command
+WHEN the user or Global explicitly requests a safe retry
+THE SYSTEM SHALL admit it only after fresh read-only evidence proves that the failed precondition has resolved and the exact remaining effects are safe under the original Close authority
+AND SHALL issue `CloseSafeRetryRequested(product_conversation, attempt_id, failed_run_ordinal, safety_evidence)`
+AND SHALL create a fresh durable run with a new monotonically increasing run ordinal under that original `attempt_id`
+AND SHALL retain the stopped run unchanged and bind new inspection, effects, failures, and outcomes to the fresh run ordinal
+AND SHALL permit at most one running Close run for that operation
+AND SHALL reject stale or repeated admission for the same failed run
 
-WHEN repair completes automatically through operator action or an idempotent external precondition change
-THE SYSTEM SHALL converge by driving the same exact-attempt retry/completion authority rather than by fabricating an unbound success path that bypasses the visible needs-repair attempt
+THE SYSTEM SHALL restrict that fresh run to the exact remaining resources and effect kinds authorized by the original Close
+AND SHALL freshly verify ownership, identity, shutdown, reconstructibility, loss risk, and resolved failure preconditions before dispatch
+AND SHALL NOT repeat an unresolved failure, replay already-completed effects, expand the target set, reopen the conversation from History, or resume the failed run
+AND SHALL stop the fresh run at its first failure under the same contract as normal Close
 
-**Rationale:** A transient retirement failure should stay user-retryable on the exact visible Close attempt. Reusing the same attempt preserves evidence continuity and avoids hidden local lifecycle drift.
+WHEN safe retry would change loss risk, discard unique or uncertain work, expand effects, or require database surgery
+THE SYSTEM SHALL stop without performing those effects
+AND SHALL require a concrete proposal describing exact targets, evidence, risk, intended mutation, and required user decision
+AND SHALL NOT derive that additional authority from the original Close, Global's failure receipt, or a generic retry request
+
+**Rationale:** Original Close authority permits a narrowly bounded explicit safe retry, not automatic recovery or open-ended repair. Separate run ordinals make each stopped execution and its failure observable without rewriting history.
 
 ---
 
@@ -259,3 +286,25 @@ THE SYSTEM SHALL NOT automatically close a conversation because a PR appears mer
 AND SHALL NOT treat PR state as ownership of the conversation lifecycle
 
 **Rationale:** PR state helps the user understand whether work appears shipped, but Phoenix does not observe every repository event with enough authority to close work automatically. Close remains an explicit user decision.
+
+
+---
+
+### REQ-WL-004: Every Distinct Close Failure Durably Notifies Global Once
+
+WHEN a Close run records a distinct failure, including partial cleanup or interruption
+THE SYSTEM SHALL atomically retain a durable failure identity bound to the ProductConversation, original Close authority, run ordinal, failed step, shutdown evidence, and exact residual state
+AND SHALL enqueue one mandatory Global event for that failure through the same unified durable delivery/outbox path used for conversation observations
+AND SHALL deliver it regardless of watch enrollment or source transition to History
+AND SHALL preserve it until durable delivery acceptance
+AND SHALL deduplicate failure recording and delivery by that exact failure identity across repeated observations, reconnects, and restarts
+AND SHALL NOT create a second mandatory event for the same failure when a watch also observes it
+AND SHALL NOT depend on optional logging, an in-memory callback, or an independently managed notification path
+
+WHEN a fresh Close retry run encounters a distinct failure
+THE SYSTEM SHALL record its new run-bound failure and deliver its own once-per-failure Global event
+
+WHEN Global receives a Close failure event
+THE SYSTEM SHALL convey the difference between lifecycle ended and resources retired, exact remaining resources, failure reason, and allowed read-only investigation
+AND SHALL NOT treat delivery acceptance as cleanup success, repair approval, or authority for further mutation
+AND SHALL permit further effects only through REQ-WL-002c or a separately approved concrete proposal

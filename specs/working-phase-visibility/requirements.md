@@ -156,6 +156,10 @@ tokens does not trigger it.
 
 ### REQ-WPV-005: Connection State Does Not Mask Agent State
 
+THE SYSTEM SHALL use the same authoritative conversation-status projection in Global and ordinary conversation StateBars, including working phases, waits, errors, connection precedence, and watchdog degradation.
+AND SHALL keep subscription counts and details in the activity disclosure without replacing or crowding out that status indicator.
+
+
 WHEN the SSE connection state is `reconnecting` or `offline` during a working
 phase
 THE SYSTEM SHALL display BOTH the connection state AND the last-known agent

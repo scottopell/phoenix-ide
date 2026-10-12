@@ -20,6 +20,26 @@
   border-bottom: 1px solid var(--border-color);
 }
 
+.product-conversation-page__close-status {
+  flex: 0 0 auto;
+  max-height: 30vh;
+  overflow: auto;
+  padding: 12px 16px;
+  border: 1px solid var(--warning-color, #eab308);
+  border-left-width: 4px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.product-conversation-page__close-status strong {
+  color: var(--warning-color, #eab308);
+}
+
+.product-conversation-page__close-status summary {
+  cursor: pointer;
+}
+
 .product-conversation-page__title {
   flex: 0 1 auto;
   min-width: 0;

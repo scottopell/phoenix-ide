@@ -189,6 +189,20 @@ AND SHALL reject a bare identifier whose identity domain is ambiguous rather tha
 THE resolved target SHALL include the WorkScope attached to the selected transcript member, its lifecycle and environment kind, authoritative cwd and worktree path, and an effective path that prefers worktree path over cwd
 AND SHALL mark those paths as server-filesystem locations rather than caller-local paths
 
+WHEN an app-local `/c/<id>` reference identifies an authoritative ordinary ProductConversation and carries no explicit transcript or message selector
+THE SYSTEM SHALL interpret it as stable navigation that follows the current continuation
+AND SHALL emit `/c/<product_conversation_id>` as its canonical ordinary conversation route
+AND SHALL preserve `/product-conversations/<id>` as a compatibility alias
+
+WHEN an app-local reference contains a `source_transcript` selector
+THE SYSTEM SHALL validate that the selected transcript belongs to the referenced conversation and identity domain before selecting it
+AND SHALL reject empty, duplicate, malformed, or nonmember selectors without silently following the current member
+AND SHALL preserve message anchors and other query parameters through browser canonicalization
+
+WHEN a legacy slug or explicit historical member link is opened
+THE SYSTEM SHALL resolve its authoritative binding rather than infer an identity domain from UUID spelling
+AND SHALL preserve explicit historical evidence, Global Coordinator routing, and the existing desktop `phoenix://conversation/<id>` handoff
+
 WHEN a stable ProductConversation reference is resolved
 THE SYSTEM SHALL resolve the current transcript member and its attached WorkScope from one database point in time
 
@@ -363,12 +377,24 @@ THE SYSTEM SHALL durably record a factual notification obligation with its sourc
 
 THE SYSTEM SHALL exclude successful continuation handoff and awaiting-question or awaiting-approval states from stop notifications.
 
+WHEN a watched conversation durably enters an awaiting-question or awaiting-task-approval state
+THE SYSTEM SHALL record a distinct wait-entry outcome through the same event outbox without settling the active execution as terminal.
+
+THE SYSTEM SHALL identify a question wait by its authoritative request identity when present. For a wait without a request identity, THE SYSTEM SHALL allocate its occurrence identity atomically with the committed wait entry and its notification obligations. Re-persisting an identical pending wait SHALL NOT create another occurrence; leaving and re-entering that wait SHALL create a new occurrence. Enrollment during an already-persisted wait SHALL NOT replay that wait.
+
 THE SYSTEM SHALL deliver factual packets with source identity, occurrence identity, outcome, time, and supported cause information, without behavioral instructions or recovery recommendations. Natural-language derived facts are permitted.
 
 THE SYSTEM SHALL admit notifications through ordinary durable input admission or steering, with stable replay identity, and SHALL NOT introduce a separate execution scheduler.
 
-WHEN removal or source Close precedes notification acceptance
-THE SYSTEM SHALL suppress the unaccepted notification.
+WHEN removal or source Close precedes subscription notification acceptance
+THE SYSTEM SHALL suppress the unaccepted subscription notification.
+
+WHEN a distinct Close cleanup failure is durably recorded
+THE SYSTEM SHALL append a mandatory factual notification to the same event outbox, regardless of watch enrollment or source History membership, and SHALL route it to the current Global Coordinator transcript.
+
+THE SYSTEM SHALL identify the mandatory notification by the persisted failure occurrence, SHALL deduplicate replay of that occurrence, and SHALL emit a new notification for a distinct failure of a newly authorized cleanup run.
+
+THE SYSTEM SHALL preserve the failure and notification atomically, SHALL distinguish confirmed conversation-and-process shutdown from uncertain shutdown in the notification, and SHALL NOT treat notification delivery or failure as authorization to resume cleanup.
 
 WHEN notification acceptance precedes removal or source Close
 THE SYSTEM SHALL retain accepted input without retraction.

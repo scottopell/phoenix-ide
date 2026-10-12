@@ -1549,6 +1549,10 @@ function MessageListImpl({
     } : undefined,
   });
 
+  const scrollTranscriptBy = useCallback((delta: number) => {
+    transcriptRef.current?.scrollBy(delta);
+  }, []);
+
   useImperativeHandle(
     ref,
     () => ({ scrollToUnitIndex, scrollToMessageId, captureHistoryRestoreBasis }),
@@ -1904,6 +1908,7 @@ function MessageListImpl({
         messages={messages}
         destination={reactionDestination}
         returnToSource={returnToReactionSource}
+        scrollTranscriptBy={scrollTranscriptBy}
       />
       <MessageContextMenu
         messages={messages}

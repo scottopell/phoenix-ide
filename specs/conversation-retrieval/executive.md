@@ -53,8 +53,8 @@ construction.
 ## Status Summary
 
 The FTS5/BM25 backend and existing consumers provide the retrieval substrate.
-The ordinary-parent predecessor capability in REQ-RET-009 is specified but
-not implemented; ADR-051 records its separate host binding.
+Ordinary parents receive the separately host-bound predecessor capability from
+ADR-051, including restricted planning parents.
 
 | Requirement | Status | Notes |
 |---|---|---|
@@ -66,29 +66,30 @@ not implemented; ADR-051 records its separate host binding.
 | **REQ-RET-006:** Results Carry Provenance | ✅ Complete | `RetrievedChunk` carries conversation/message/type/timestamp |
 | **REQ-RET-007:** Scope Is Applied In-Query, Not Post-Hoc | ✅ Complete | Scope is a query predicate so `top_k` is honored after scoping |
 | **REQ-RET-008:** Scope Is Host-Bound When Retrieval Is a Tool | ✅ Complete | Agent supplies query only; host fixes scope at tool construction (`chain_qa.rs` `qa_tools` / `execute_tool`) |
-| **REQ-RET-009:** Continuing Agents Can Discover and Inspect Predecessor Transcripts | Not implemented | Host-bound ordinary-parent list/search/read and continuation orientation; task 58058 |
+| **REQ-RET-009:** Continuing Agents Can Discover and Inspect Predecessor Transcripts | ✅ Complete | `PreviousTranscriptsBinding`, `GlobalReadService::previous_transcripts`, and `ToolRegistryExecutor` lifecycle coverage |
 
 ## Predecessor Recall Delivery
 
-REQ-RET-009 is tracked in [task 58058](../../tasks/58058-p2-ready--predecessor-transcript-recall.md),
-a bounded child of the ProductConversation program coordinated with gate 6
-(task 92015). Task 58058 owns predecessor discovery and agent recall; gate 6
-retains follow-up source/provenance and UI retrieval ownership.
+`previous_transcripts` gives each ordinary parent a closed list/search/read
+surface bound to its persisted ProductConversation identity and executing
+transcript. Each operation revalidates the strict predecessor prefix from the
+ordinary aggregate. Search applies that prefix before ranking; listing and
+bounded source reads remain usable independently of index readiness.
 
-The shipped `coordinator_tools::writing_tools` supplies global search/read to
-write-capable parents. `chain_qa` separately supplies scope-bound tools and
-orientation to a read-only Q&A agent. Neither provides an ordinary parent's
-strict-predecessor discovery capability. Verification must cover host binding,
-planner eligibility, continuation/restart orientation, in-query scope,
-index-independent reads, bounded results, and rejected out-of-scope targets.
+Runtime construction supplies the capability to planning and write-capable
+parents but not sub-agents or the Coordinator. The same binding supplies
+host-authored immediate-predecessor orientation and survives runtime
+reconstruction and Explore-to-Work registry upgrades. Focused verification
+covers topology exclusion, forged bindings, authentic message provenance,
+closed authority, scope- and target-bound cursors, serialized byte ceilings,
+and lifecycle preservation.
 
 ## Scope
 
-The implemented scope is REQ-RET-001 through REQ-RET-008 with the
-FTS5/BM25 backend and chain Q&A as a consumer. REQ-RET-008 (host-bound
-tool scope) makes REQ-CHN-009's "agent cannot widen past its chain"
-structural. Application-wide Q&A uses the same `Global` retrieval scope.
-REQ-RET-009 remains specified but not implemented.
+The implemented scope is REQ-RET-001 through REQ-RET-009 with the
+FTS5/BM25 backend, chain Q&A, and ordinary-parent predecessor recall as
+consumers. REQ-RET-008 makes host-bound tool scope structural. Application-wide
+Q&A uses `Global`; predecessor recall uses only the authenticated strict prefix.
 
 ## Out of Scope (Tracked for Future)
 
