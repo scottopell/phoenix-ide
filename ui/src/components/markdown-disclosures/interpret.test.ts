@@ -140,6 +140,52 @@ describe('disclosure syntax and native contexts', () => {
   }
 });
 
+describe('native paragraph provenance across tag yields', () => {
+  const pair = envelope('a', 'A') + envelope('b', 'B');
+  it.each([
+    pair,
+    '<summary>stray</summary>' + pair,
+    '</details></summary>' + pair,
+    '<details><summary>unfinished ' + pair,
+    '<details><summary>T</summary>unfinished ' + pair,
+    pair.repeat(200),
+  ])('keeps adjacent inline candidates in one paragraph: %s', body => {
+    const source = 'prefix ' + body + ' suffix';
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([]);
+    expect(result.tree.children.map(n => n.type)).toEqual(['paragraph']);
+    expect(nodes(result.tree, 'text').map(n => n.value).join('')).toBe(source);
+    expect(result.stats.documentBytes + result.stats.horizonBytes + result.stats.dispatch).toBeLessThan(8 * source.length);
+  });
+  it.each(['\n', '\n\n', '\r\n', '\r'])('releases paragraph ownership at native boundary %j', boundary => {
+    const prefix = 'prefix ' + pair.repeat(50) + boundary;
+    const source = prefix + pair;
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([
+      { start: prefix.length, end: prefix.length + envelope('a', 'A').length },
+      { start: prefix.length + envelope('a', 'A').length, end: source.length },
+    ]);
+  });
+  it('does not lend a closed root admission to subsequent prose', () => {
+    const root = envelope('root');
+    const source = root + ' prose ' + pair.repeat(100) + ' suffix';
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toEqual([{ start: 0, end: root.length }]);
+    expect(result.tree.children.map(n => n.type)).toEqual(['disclosureDetails', 'paragraph']);
+  });
+  it.each([50, 200])('bounds native traversals across %i same-line root envelopes', count => {
+    const source = pair.repeat(count);
+    const result = interpretMarkdown(source, gfmOptions);
+    expect(result.ranges).toHaveLength(2 * count);
+    expect(result.stats.documentBytes + result.stats.horizonBytes + result.stats.dispatch).toBeLessThan(8 * source.length);
+  });
+  it('restarts after a malformed but closed root envelope', () => {
+    const prefix = '<details>missing summary</details>';
+    const source = prefix + envelope('valid');
+    expect(interpretMarkdown(source).ranges).toEqual([{ start: prefix.length, end: source.length }]);
+  });
+});
+
 describe('global references and summary phrasing', () => {
   for (const definition of ['[docs]: <details>', '[docs]: https://example.com "<details></details></summary>"', '[docs]: https://example.com\n  "first\n<details>\n</summary>\nlast"']) {
     it.each(['before', 'body', 'after'])(`uses native decoded definition ${definition} in %s`, where => {

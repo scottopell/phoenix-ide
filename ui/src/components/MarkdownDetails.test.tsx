@@ -37,6 +37,40 @@ describe('ReactMarkdown with the actual disclosure parser', () => {
     expect(container.querySelector('details')).toBeNull();
     expect(container.querySelector('pre code')?.textContent).toContain('<details>');
   });
+  for (const count of [1, 50]) it.each([
+    '', '<summary>stray</summary>', '</details></summary>',
+    '<details><summary>unfinished ', '<details><summary>T</summary>unfinished ',
+  ])('keeps repeated inline envelopes in one rendered paragraph after %j', lead => {
+    const source = 'prefix ' + lead + '<details><summary>A</summary>a</details><details><summary>B</summary>b</details>'.repeat(count) + ' suffix';
+    const { container } = markdown(source);
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.querySelectorAll('p')).toHaveLength(1);
+    expect(container.textContent).toBe(source);
+  });
+
+  it.each(['\n', '\n\n'])('renders independent roots after a long inline paragraph and %j', boundary => {
+    const unit = '<details><summary>A</summary>a</details>';
+    const prefix = 'prefix ' + unit.repeat(50) + boundary;
+    const { container } = markdown(prefix + unit + unit);
+    expect(container.querySelectorAll('details')).toHaveLength(2);
+    expect(container.querySelector('p')?.textContent).toBe(prefix.trimEnd());
+  });
+
+  it('keeps prose after a closed root from lending admission to inline siblings', () => {
+    const unit = '<details><summary>A</summary>a</details>';
+    const prose = 'prose ' + unit.repeat(50) + ' suffix';
+    const { container } = markdown(unit + prose);
+    expect(container.querySelectorAll('details')).toHaveLength(1);
+    expect(container.querySelector(':scope > p')?.textContent).toBe(prose);
+  });
+
+  it('renders an independent same-line root after a malformed complete root', () => {
+    const prefix = '<details>missing summary</details>';
+    const { container } = markdown(prefix + '<details><summary>A</summary>a</details>');
+    expect(container.querySelectorAll('details')).toHaveLength(1);
+    expect(container.querySelector('p')?.textContent).toBe(prefix);
+  });
+
   it('rejects inline nesting in a completed root envelope', () => {
     const source = '<details><summary>Outer</summary>prefix <details><summary>T</summary>B</details> suffix</details>';
     const { container } = markdown(source);
