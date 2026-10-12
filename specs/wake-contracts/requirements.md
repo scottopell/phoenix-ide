@@ -83,7 +83,7 @@ database, or that retired wake execution can be restored by binary rollback.
 
 REQ-WAKE-001 through REQ-WAKE-018 are retired identifiers, retained for historical
 traceability only and SHALL NOT authorize feature behavior. The decisions behind
-them remain recorded in ADR-006, ADR-011, and ADR-012; ADR-095 supersedes their wake
+them remain recorded in ADR-006, ADR-011, and ADR-012; ADR-097 supersedes their wake
 execution obligations without rewriting that history.
 
 ## Related Contracts

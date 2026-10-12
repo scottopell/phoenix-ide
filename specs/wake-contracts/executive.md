@@ -2,7 +2,7 @@
 
 ## Decision and Scope
 
-The user explicitly approved removing the durable wake feature. ADR-095 records
+The user explicitly approved removing the durable wake feature. ADR-097 records
 that decision; ADR-006, ADR-011, and ADR-012 remain historical context, not current
 execution authority. The wake registration/router/profile contract and its Allium
 models are retired, without a replacement framework or promise of redesign.
@@ -49,10 +49,15 @@ Workspace all-target Clippy finishes with exit 0 and warnings denied. Its guard
 recorded exit-time descendant cleanup; final process/group absence was verified
 before reservation release. Changed Allium models, task metadata, and Rust
 formatting validate. The shared
-ADR chain has an integration gate: federation PR #860 reserves ADRs 092–094 and
-migrations 124–125; this candidate reserves ADR-095 and migration 126. Spec-shape
-sequence validation must be rerun after the reserved predecessors are integrated
-and the candidate rebased. No merge or deployment is implied by local tests.
+ADR chain has an integration gate: federation merge
+`1839a37f67c27d13f479068717d59a5aa413c450` supplies ADRs 092–094 and
+migrations 124–125, and this candidate is rebased onto that exact commit.
+Resource PR #888 reserves ADRs 095–096; wake uses ADR-097 and migration 126.
+Spec-shape sequence validation requires the resource predecessors and a
+rebase/recheck before merge. Prior qualification receipts predate the federation
+rebase; semantic seam review found no blocking defect, but post-rebase test
+receipts must be distinguished from the earlier results. No merge or deployment
+is implied by local tests.
 Old wake feature tests are historical evidence, not acceptance of retirement.
 
 ## Authorities
@@ -60,4 +65,4 @@ Old wake feature tests are historical evidence, not acceptance of retirement.
 - `requirements.md`: retirement and historical-data contract.
 - `../durable-workflows/requirements.md`: retained foundation, direct-turn, and creation behavior.
 - `../compatibility/requirements.md`: forward migration and paired rollback policy.
-- `../adrs/095_retire-wake-execution-and-preserve-history.md`: explicit removal decision.
+- `../adrs/097_retire-wake-execution-and-preserve-history.md`: explicit removal decision.

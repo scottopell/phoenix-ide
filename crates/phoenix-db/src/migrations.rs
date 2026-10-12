@@ -19169,6 +19169,8 @@ mod tests {
                     (120, 'temporarily_skip_coordinator_question_wait_events'),
                     (122, 'temporarily_skip_coordinator_event_child_indexes'),
                     (123, 'temporarily_skip_close_startup_interruption'),
+                    (124, 'temporarily_skip_federation_peer_tls_trust'),
+                    (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
                     (126, 'temporarily_skip_wake_feature_retirement')",
         )
         .execute(&pool)
@@ -20031,6 +20033,8 @@ mod tests {
                     (120, 'temporarily_skip_coordinator_question_wait_events'),
                     (122, 'temporarily_skip_coordinator_event_child_indexes'),
                     (123, 'temporarily_skip_close_startup_interruption'),
+                    (124, 'temporarily_skip_federation_peer_tls_trust'),
+                    (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
                     (126, 'temporarily_skip_wake_feature_retirement')",
         )
         .execute(pool)
