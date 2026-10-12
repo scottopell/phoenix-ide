@@ -5213,7 +5213,10 @@ def _start_kache_daemon_locked(
 ) -> str | None:
     running, status_error = _kache_daemon_is_running(binary, cargo_cwd=cargo_cwd)
     if status_error:
-        return f"cannot verify existing daemon environment: {status_error}"
+        safe_status = _safe_kache_startup_diagnostic(
+            status_error, environment=os.environ
+        )
+        return f"cannot verify existing daemon environment: {safe_status}"
     if running:
         if _kache_daemon_receipt_matches(socket, identity):
             return None

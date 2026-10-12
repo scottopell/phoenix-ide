@@ -934,6 +934,30 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIn(str(socket), error or "")
         self.assertIn("without a Phoenix ownership receipt", error or "")
 
+    def test_second_status_failure_is_sanitized_at_full_daemon_boundary(self):
+        socket = Path("/tmp/run=one.sock")
+        secret = "fixture-secret"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "KACHE_SOCKET_PATH": str(socket),
+                "AWS_SECRET_ACCESS_KEY": secret,
+            },
+            clear=True,
+        ), mock.patch.object(
+            self.dev, "_effective_kache_socket", return_value=(socket, None)
+        ), mock.patch.object(
+            self.dev, "_kache_socket_lock", return_value=contextlib.nullcontext()
+        ), mock.patch.object(
+            self.dev,
+            "_kache_daemon_is_running",
+            return_value=(False, f'1 | "to\\u006ben" = "{secret}"'),
+        ), mock.patch.object(self.dev.subprocess, "Popen") as spawn:
+            error = self.dev._ensure_kache_daemon("/bin/kache")
+        self.assertNotIn(secret, error or "")
+        self.assertIn("[redacted backend diagnostic]", error or "")
+        spawn.assert_not_called()
+
     def test_operator_socket_reuses_only_matching_phoenix_started_daemon(self):
         socket = Path("/tmp/operator.sock")
         events = []
