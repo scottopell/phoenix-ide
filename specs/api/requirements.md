@@ -353,4 +353,4 @@ THE SYSTEM SHALL reject unknown boundary representations.
 THE SYSTEM SHALL keep the newest transcript identity distinct from write readiness
 AND SHALL NOT advertise a reserved successor as writable before its continuation opening is accepted.
 
-Web consumption is specified by `specs/conversation-ui` REQ-CONV-023 and REQ-CONV-025.
+Web consumption is specified by `specs/conversation-ui` REQ-CONV-023 and REQ-CONV-026.

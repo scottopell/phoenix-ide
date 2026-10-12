@@ -346,7 +346,7 @@ export function TaskApprovalReader({
     ? getTaskApprovalContextRecommendation(contextUsage)
     : null;
 
-  const markdownDisplayBlocks = useMemo(() => buildMarkdownDisplayBlocks(plan), [plan]);
+  const markdownDisplayBlocks = useMemo(() => buildMarkdownDisplayBlocks(plan, 'standard'), [plan]);
   const findablePlanBlocks = useMemo(
     () => markdownDisplayBlocks.map((block) => ({ id: block.id, lineNumber: block.lineNumber, text: block.searchableText })),
     [markdownDisplayBlocks],

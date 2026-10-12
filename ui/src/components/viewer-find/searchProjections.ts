@@ -1,6 +1,4 @@
-import remarkParse from 'remark-parse';
-import remarkGfm from 'remark-gfm';
-import { unified } from 'unified';
+import { prepareMarkdown, type MarkdownMode } from '../prepareMarkdown';
 
 import type { ContentBlock, Message, ToolResultContent } from '../../api';
 import type { BashToolProgress } from '../../generated/sse';
@@ -341,17 +339,17 @@ export type ConversationSearchProjection = SearchableSourceProjection<
 >;
 
 interface MarkdownNodePosition {
-  start?: { line?: number; offset?: number };
-  end?: { line?: number; offset?: number };
+  start?: { line?: number; offset?: number | undefined };
+  end?: { line?: number; offset?: number | undefined };
 }
 
 interface MarkdownNode {
   type: string;
-  position?: MarkdownNodePosition;
+  position?: MarkdownNodePosition | undefined;
   children?: MarkdownNode[];
-  value?: string;
-  alt?: string;
-  lang?: string;
+  value?: string | undefined;
+  alt?: string | null | undefined;
+  lang?: string | null | undefined;
 }
 
 export interface MarkdownDisplayBlock {
@@ -364,18 +362,25 @@ export interface MarkdownDisplayBlock {
 }
 
 function renderedMarkdownText(node: MarkdownNode): string {
-  if (node.type === 'image' || node.type === 'imageReference') return '';
-  if (typeof node.value === 'string') return node.value;
-  return node.children?.map(renderedMarkdownText).join('') ?? '';
+  const text: string[] = [];
+  const stack = [node];
+  while (stack.length) {
+    const current = stack.pop()!;
+    if (current.type === 'image' || current.type === 'imageReference') continue;
+    if (typeof current.value === 'string') text.push(current.value);
+    else if (current.children) for (let i = current.children.length - 1; i >= 0; i--) stack.push(current.children[i]!);
+  }
+  return text.join('');
 }
 
-export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownDisplayBlock[] {
-  const processor = unified().use(remarkParse).use(remarkGfm);
-  const tree = processor.runSync(processor.parse(markdown)) as MarkdownNode;
+export function buildMarkdownDisplayBlocks(markdown: string, mode: MarkdownMode): readonly MarkdownDisplayBlock[] {
+  const tree: MarkdownNode = prepareMarkdown(markdown, mode);
   const blocks: MarkdownDisplayBlock[] = [];
-  const visit = (node: MarkdownNode, path: readonly number[]) => {
+  const stack: { node: MarkdownNode; path: number[] }[] = [{ node: tree, path: [] }];
+  while (stack.length) {
+    const { node, path } = stack.pop()!;
     if (node.type !== 'root' && node.position?.start?.line && node.position.start.offset !== undefined && node.position.end?.offset !== undefined) {
-      const isDisplayBlock = ['paragraph', 'heading', 'tableCell', 'code'].includes(node.type);
+      const isDisplayBlock = ['paragraph', 'heading', 'tableCell', 'code', 'disclosureSummary'].includes(node.type);
       if (isDisplayBlock) {
         const searchableText = renderedMarkdownText(node);
         if (searchableText) {
@@ -390,9 +395,8 @@ export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownD
         }
       }
     }
-    node.children?.forEach((child, index) => visit(child, [...path, index]));
-  };
-  visit(tree, []);
+    if (node.children) for (let i = node.children.length - 1; i >= 0; i--) stack.push({ node: node.children[i]!, path: [...path, i] });
+  }
   return blocks;
 }
 
@@ -413,7 +417,7 @@ export interface BlockSearchSource extends SearchableSource<BlockSearchMatchTarg
 export type BlockSearchProjection = SearchableSourceProjection<BlockSearchMatchTarget, BlockSearchSource>;
 
 export function buildMarkdownFileSearchProjection(content: string, query: string): FileSearchProjection {
-  const sources: FileSearchSource[] = buildMarkdownDisplayBlocks(content)
+  const sources: FileSearchSource[] = buildMarkdownDisplayBlocks(content, 'standard')
     .filter((block) => block.kind !== 'code')
     .map((block) => ({
     id: `markdown:${block.id}`,
@@ -1583,7 +1587,7 @@ export function buildAgentTextFragments(
     if (block.type !== 'text') return;
     const sourceText = block.text ?? '';
     const markdownBlocks = options.forSearch
-      ? buildMarkdownDisplayBlocks(sourceText).filter((markdownBlock) => markdownBlock.kind !== 'code' || markdownBlock.language === 'mermaid')
+      ? buildMarkdownDisplayBlocks(sourceText, 'conversation').filter((markdownBlock) => markdownBlock.kind !== 'code' || markdownBlock.language === 'mermaid')
       : [];
     const semanticText = options.forSearch
       ? markdownBlocks.map((markdownBlock) => markdownBlock.searchableText).join('\n')

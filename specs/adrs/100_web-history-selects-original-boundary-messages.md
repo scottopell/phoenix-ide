@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-12
-- **Affects:** REQ-API-030, REQ-CONV-023, REQ-CONV-025, REQ-COMP-001
+- **Affects:** REQ-API-030, REQ-CONV-023, REQ-CONV-026, REQ-COMP-001
 
 ## Context
 
@@ -31,6 +31,6 @@ Both projections use the same aggregate read and cursor machinery. Global always
 ## References
 
 - [API requirements](../api/requirements.md), REQ-API-030.
-- [Conversation UI requirements](../conversation-ui/requirements.md), REQ-CONV-023 and REQ-CONV-025.
+- [Conversation UI requirements](../conversation-ui/requirements.md), REQ-CONV-023 and REQ-CONV-026.
 - [Compatibility requirements](../compatibility/requirements.md), REQ-COMP-001; ADR-034.
 - `BoundaryRepresentation`, `OrdinarySnapshotResponse`, `aggregate_messages`, `ProductConversationHistorySnapshotView`, `CoordinatorConversationSnapshotView`.

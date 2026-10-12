@@ -1,21 +1,19 @@
 import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
-import type { Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import type { Components, ExtraProps } from 'react-markdown';
+import type { Code } from 'mdast';
+import { MarkdownRenderer } from './MarkdownRenderer';
+import { prepareStreamingBlocks, type PreparedStreamingBlock } from './prepareStreamingBlocks';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { StreamingBuffer } from '../conversation/atom';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
-import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { ConversationMarkdownTable } from './conversationMarkdownTable';
 import { inlineCodeTokenKind } from './conversationMarkdownTableSemantics';
 import { CONVERSATION_MARKDOWN_URL_TRANSFORM, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { formatMessageTime } from './MessageComponents';
-
-// Stable markdown configuration — avoids creating new references on every render
-const REMARK_PLUGINS = [remarkGfm];
 
 type StreamingMarkdownComponentsContext = {
   rootDir?: string | undefined;
@@ -31,9 +29,18 @@ function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMa
         filePathCopyContext={rootDir ? { rootDir } : undefined}
       />
     ),
-    code: ({ children, node, ...props }: React.ComponentPropsWithoutRef<'code'> & { node?: unknown }) => {
-      void node;
+    code: ({ children, node, ...props }: React.ComponentPropsWithoutRef<'code'> & ExtraProps) => {
+      const language = /language-([^\s]+)/.exec(props.className ?? '')?.[1];
+      const complete = node?.properties['data-streaming-complete'];
+      if (typeof complete === 'boolean') return <StreamingCode content={String(children).replace(/\n$/, '')} lang={String(node?.properties['data-streaming-lang'] ?? '')} complete={complete} />;
+      if (language?.toLowerCase() === 'mermaid') return <MemoMermaid code={String(children)} />;
+      if (language) return <DisclosureCode language={language}>{String(children)}</DisclosureCode>;
       return <code {...props} data-token-kind={inlineCodeTokenKind(children)}>{children}</code>;
+    },
+    pre: ({ children, node, ...props }) => {
+      const code = node?.children[0];
+      if (code?.type === 'element' && typeof code.properties['data-streaming-complete'] === 'boolean') return <>{children}</>;
+      return <pre {...props}>{children}</pre>;
     },
     table: ConversationMarkdownTable,
     img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
@@ -44,6 +51,13 @@ function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMa
     ),
   } satisfies Components;
 }
+
+const MemoMermaid = memo(MermaidDiagram);
+
+const DisclosureCode = memo(function DisclosureCode({ language, children }: { language: string; children: string }) {
+  const { theme } = useTheme();
+  return <SyntaxHighlighter style={theme === 'light' ? oneLight : oneDark} language={language} PreTag="div">{children.replace(/\n$/, '')}</SyntaxHighlighter>;
+});
 
 const MARKDOWN_COMPONENTS = createStreamingMarkdownComponents({});
 
@@ -167,7 +181,7 @@ export function StreamingBlocks({
   }, []);
 
   // Parse once per text change, not on theme-only re-renders.
-  const blocks = useMemo(() => parseStreamingBlocks(displayText), [displayText]);
+  const blocks = useMemo(() => prepareStreamingBlocks(displayText), [displayText]);
   const markdownComponents = useMemo(
     () => (rootDir || onOpenFile
       ? createStreamingMarkdownComponents({ rootDir, onFileClick: onOpenFile })
@@ -185,60 +199,44 @@ export function StreamingBlocks({
 }
 
 type StreamingBlockProps = {
-  block: StreamingBlock;
+  block: PreparedStreamingBlock;
   syntaxStyle: Record<string, React.CSSProperties>;
   markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'];
 };
 
-// Each parse returns fresh block objects, so referential `memo` would never
-// hit. A completed block is immutable by construction — its rendered output
-// is fully determined by (type, content, complete, lang) + the syntax theme.
-// Comparing those fields lets every block except the growing tail skip the
-// per-frame ReactMarkdown re-parse / Prism re-highlight during streaming.
+// Canonical subtree revisions include changes to resolved global references.
 function streamingBlocksEqual(prev: StreamingBlockProps, next: StreamingBlockProps): boolean {
   if (prev.syntaxStyle !== next.syntaxStyle || prev.markdownComponents !== next.markdownComponents) return false;
   const a = prev.block;
   const b = next.block;
-  if (a.type !== b.type || a.content !== b.content) return false;
+  if (a.type !== b.type || a.content !== b.content || a.revision !== b.revision) return false;
   if (a.type === 'code' && b.type === 'code') {
-    return a.complete === b.complete && a.lang === b.lang;
+    return a.complete === b.complete && a.lang === b.lang && a.meta === b.meta;
   }
   return true;
 }
 
-const StreamingBlock = memo(function StreamingBlock({ block, syntaxStyle, markdownComponents }: StreamingBlockProps) {
+const StreamingBlock = memo(function StreamingBlock({ block, markdownComponents }: StreamingBlockProps) {
   if (block.type === 'markdown') {
     return (
       <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+        <MarkdownRenderer mode="conversation" tree={block.tree} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
           {block.content}
-        </ReactMarkdown>
+        </MarkdownRenderer>
       </div>
     );
   }
 
-  if (block.complete) {
-    if ((block.lang || '').toLowerCase() === 'mermaid') {
-      return <MermaidDiagram code={block.content} />;
-    }
-
-    return (
-      <SyntaxHighlighter
-        style={syntaxStyle}
-        language={block.lang || 'text'}
-        PreTag="div"
-      >
-        {block.content.replace(/\n$/, '')}
-      </SyntaxHighlighter>
-    );
-  }
-
-  // Incomplete (open) code block: render as plain monospace in a container
-  // that matches SyntaxHighlighter's dimensions exactly. When the closing
-  // fence arrives and complete flips to true, only colors change — no reflow.
-  return (
-    <pre className="streaming-code-pre">
-      <code className="streaming-code">{block.content}</code>
-    </pre>
-  );
+  return <StreamingCode content={block.content} lang={block.lang} complete={block.complete} />;
 }, streamingBlocksEqual);
+
+const StreamingCode = memo(function StreamingCode({ content, lang, complete }: {
+  content: string;
+  lang: Code['lang'];
+  complete: boolean;
+}) {
+  const { theme } = useTheme();
+  if (!complete) return <pre className="streaming-code-pre"><code className="streaming-code">{content}</code></pre>;
+  if (lang?.toLowerCase() === 'mermaid') return <MemoMermaid code={content} />;
+  return <SyntaxHighlighter style={theme === 'light' ? oneLight : oneDark} language={lang || 'text'} PreTag="div">{content}</SyntaxHighlighter>;
+});
