@@ -14,10 +14,10 @@ use crate::api::installation_ownership::{self, InstallationOwnership};
 use crate::api::process_sample::ProcessObservation;
 use crate::db::approximate_percentiles_from_histogram;
 use axum::{
-    Json,
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::Conversation;

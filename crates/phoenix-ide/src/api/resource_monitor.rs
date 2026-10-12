@@ -1,11 +1,11 @@
 //! Demand-driven, request-coalesced process resource observations.
 
-use super::AppState;
 use super::deployment::HostResources;
 use super::process_sample::{
-    ProcessIdentity, ProcessObservation, group_identities_by_pgid, process_identity_for_sampling,
-    sample_process_observations, session_member_identities_for_sampling,
+    group_identities_by_pgid, process_identity_for_sampling, sample_process_observations,
+    session_member_identities_for_sampling, ProcessIdentity, ProcessObservation,
 };
+use super::AppState;
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -409,11 +409,9 @@ mod tests {
             BTreeSet::from(["work:a".to_string(), "work:b".to_string()])
         );
         let missing_leader = BTreeMap::from([(10, BTreeMap::from([(11, identity(11, 2))]))]);
-        assert!(
-            capture_bash_members(&groups, Some(&missing_leader))
-                .2
-                .contains("work:a")
-        );
+        assert!(capture_bash_members(&groups, Some(&missing_leader))
+            .2
+            .contains("work:a"));
     }
 
     #[test]
@@ -515,11 +513,9 @@ mod tests {
         }
         let generations = futures::future::join_all(tasks).await;
         let first = generations[0].as_ref().unwrap();
-        assert!(
-            generations
-                .iter()
-                .all(|result| Arc::ptr_eq(first, result.as_ref().unwrap()))
-        );
+        assert!(generations
+            .iter()
+            .all(|result| Arc::ptr_eq(first, result.as_ref().unwrap())));
         assert_eq!(samples.load(Ordering::SeqCst), 1);
         assert_eq!(monitor.sample_count().await, 1);
     }
