@@ -49,16 +49,14 @@ Workspace all-target Clippy finishes with exit 0 and warnings denied. Its guard
 recorded exit-time descendant cleanup; final process/group absence was verified
 before reservation release. Changed Allium models, task metadata, and Rust
 formatting validate. The shared
-ADR chain has an integration gate: federation merge
-`1839a37f67c27d13f479068717d59a5aa413c450` supplies ADRs 092–094 and
-migrations 124–125, and this candidate is rebased onto that exact commit.
-Resource PR #888 reserves ADRs 095–096; wake uses ADR-097 and migration 126.
-Spec-shape sequence validation requires the resource predecessors and a
-rebase/recheck before merge. Post-federation qualification passes all eight retirement tests and all 94
-migration-module tests with clean corrected-guard receipts. Earlier runtime,
-tools, UI, and Clippy receipts predate this rebase; semantic seam review found no
-blocking defect but those receipts are not relabelled as post-rebase results. No merge or deployment
-is implied by local tests.
+ADR chain is reconciled against actual federation merge
+`1839a37f67c27d13f479068717d59a5aa413c450` and resource merge
+`eec3fae65f113705733cbd8c5f98b97a03fdcf81`. The candidate preserves resource
+ADRs 095–096 and ledger 124–125, then adds wake ADR-097 and migration 126.
+ADR/spec shape validation passes on that cumulative source. Earlier qualification
+receipts retain their exact predecessor heads; final cumulative test and review
+receipts are reported on the pull request rather than silently relabelled.
+No deployment is implied by local qualification.
 Old wake feature tests are historical evidence, not acceptance of retirement.
 
 ## Migration-aware rollback boundary
