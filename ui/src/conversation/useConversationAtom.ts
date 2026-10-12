@@ -189,6 +189,19 @@ export function useLastSseEventAt(slug: string): number {
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
+export function useConversationTranscriptAuthority(conversationId: string | null) {
+  const store = useConversationStore();
+  const subscribe = useCallback(
+    (listener: () => void) => conversationId ? store.subscribe(conversationId, listener) : () => {},
+    [store, conversationId],
+  );
+  const getSnapshot = useCallback(
+    () => conversationId ? store.getTranscriptAuthority(conversationId) : null,
+    [store, conversationId],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
 export type ConversationTranscriptView = Pick<ConversationPageView, 'conversationId' | 'messages' | 'phase' | 'streamingRequestId'>;
 
 /** Structural transcript fields from one atom revision; token content stays at the leaf. */
@@ -200,7 +213,7 @@ export function useConversationTranscriptView(slug: string | null): Conversation
     [store, slug],
   );
   const getSnapshot = useCallback(() => {
-    if (!slug) return null;
+    if (!slug || store.getTranscriptAuthority(slug).kind !== 'live') return null;
     const atom = store.getSnapshot(slug);
     if (!atom.conversationId) return null;
     const previous = lastRef.current;

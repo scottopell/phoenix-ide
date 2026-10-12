@@ -605,3 +605,13 @@ scroll-jump bugs caused by independent windowing, spacer, measurement, and
 compensation layers making incompatible geometry assumptions. The
 platform-neutral authority and web conformance requirements live in
 `specs/virtual-transcript/`.
+
+### REQ-MLRU-016: Product transcript authority across Close retry
+
+WHEN an accepted product snapshot removes the live transcript owner for incomplete Close or history
+THE SYSTEM SHALL retain snapshot authority for that transcript row across route changes and page remounts.
+
+WHEN that row becomes eligible for a live owner again
+THE SYSTEM SHALL retain snapshot authority until an accepted, matching, message-bearing hydration from a newly opened connection establishes live authority.
+
+A previous connection's hydration, a rejected connection epoch, or preserve-only hydration SHALL NOT restore live authority. Restoring authority SHALL publish the hydrated atom before notifying transcript subscribers, without exposing retained pre-Close content as live content.

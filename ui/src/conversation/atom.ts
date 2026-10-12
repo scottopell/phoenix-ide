@@ -225,7 +225,7 @@ export interface InitPayload {
 // closing the contamination window where a slug-bound dispatch captured by an
 // in-flight `await api.foo(...)` resolves after the user has navigated away.
 export type SSEAction =
-  | { type: 'sse_init'; payload: InitPayload; epoch?: number }
+  | { type: 'sse_init'; payload: InitPayload; epoch?: number; connectionId?: symbol }
   | { type: 'sse_message'; message: Message; sequenceId: number; epoch?: number }
   | {
       type: 'sse_message_updated';
@@ -327,7 +327,7 @@ export type SSEAction =
   // Carries the connection generation that just opened, so the atom can
   // start accepting events stamped with that epoch and reject events
   // stamped with any prior generation.
-  | { type: 'connection_opened'; epoch: number }
+  | { type: 'connection_opened'; epoch: number; connectionId?: symbol }
   // Synthesized by `useConnection` on hook mount, before any `OPEN_SSE`.
   // Nulls `connectionEpoch` so the new machine's first `connection_opened`
   // is accepted even when the atom retains a higher epoch from a prior

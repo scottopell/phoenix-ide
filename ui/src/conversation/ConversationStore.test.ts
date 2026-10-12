@@ -1,6 +1,59 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ConversationStore } from './ConversationStore';
-import type { Conversation } from '../api';
+import type { Conversation, ProductConversationSnapshotView } from '../api';
+import type { InitPayload, SSEAction } from './atom';
+import type { TranscriptAuthority } from './ConversationStore';
+
+function lifecycleSnapshot(
+  rowId: string,
+  overrides: Partial<ProductConversationSnapshotView> = {},
+): ProductConversationSnapshotView {
+  return {
+    product_conversation_id: 'product-alpha',
+    close: null,
+    canonical_route: '/c/product-alpha',
+    requested_transcript_row_id: 'row-root',
+    canonical_root: { transcript_row_id: 'row-root', slug: 'root-slug', title: null },
+    ordinary_lifecycle: 'open',
+    latest_transcript_row_id: rowId,
+    writable_transcript_row_id: rowId,
+    updated_at: '2024-06-01T00:00:00Z',
+    presentation: { kind: 'state', display_name: 'Alpha', presentation_mode: 'idle' },
+    work_identity: null,
+    source: null,
+    chain_qa_compatibility: null,
+    segments: [],
+    before: null,
+    has_older: false,
+    ...overrides,
+  };
+}
+
+function transcriptInit(rowId: string, transcriptCoverage: InitPayload['transcriptCoverage'] = 'complete'): InitPayload {
+  return {
+    conversation: makeConv('display-slug', { id: rowId }),
+    messages: [{
+      message_id: 'current-message', conversation_id: rowId, sequence_id: 1,
+      message_type: 'user', content: { text: 'Current transcript' },
+      created_at: '2024-06-01T00:00:00Z',
+    }],
+    steeringMessages: [],
+    phase: { type: 'idle' },
+    contextWindow: { used: 0 },
+    transcriptGeneration: 1,
+    streamIncarnation: 'current-stream',
+    lastAppliedEventSeq: 0,
+    pendingAnchorSequenceId: 0,
+    pendingEvents: [],
+    pendingTruncated: false,
+    transcriptCoverage,
+  };
+}
+
+function awaitTranscriptInit(store: ConversationStore, rowId: string): void {
+  store.observeProductConversationSnapshot(lifecycleSnapshot(rowId, { ordinary_lifecycle: 'history' }));
+  store.observeProductConversationSnapshot(lifecycleSnapshot(rowId));
+}
 
 function makeConv(
   slug: string,
@@ -17,6 +70,167 @@ function makeConv(
     ...overrides,
   } as Conversation;
 }
+
+describe('ConversationStore shared transcript authority', () => {
+  it.each([
+    { ordinary_lifecycle: 'history' as const },
+    { close: {
+      attempt_id: 'close-attempt', phase: 'needs_repair' as const,
+      outcome: 'close_incomplete' as const, run_ordinal: '1', run_status: 'stopped' as const,
+      failure: null, confirmation_snapshot: null, inspections: [], losses: [], residuals: [],
+    } },
+  ])('retains revocation and retry across subscribers and subscription remounts: %j', (revoked) => {
+    const store = new ConversationStore();
+    const rowId = 'row-latest';
+    store.dispatch(rowId, { type: 'sse_init', payload: transcriptInit(rowId) });
+    const retainedAtom = store.getSnapshot(rowId);
+    const firstReads: TranscriptAuthority[] = [];
+    const secondReads: TranscriptAuthority[] = [];
+    const unsubscribeFirst = store.subscribe(rowId, () => firstReads.push(store.getTranscriptAuthority(rowId)));
+    const unsubscribeSecond = store.subscribe(rowId, () => secondReads.push(store.getTranscriptAuthority(rowId)));
+    const unrelated = vi.fn();
+    const unsubscribeUnrelated = store.subscribe('row-other', unrelated);
+
+    store.observeProductConversationSnapshot(lifecycleSnapshot(rowId, revoked));
+    expect(firstReads).toEqual([{ kind: 'snapshot' }]);
+    expect(secondReads).toEqual(firstReads);
+    expect(store.getTranscriptAuthority('product-alpha')).toEqual({ kind: 'live' });
+    expect(store.getTranscriptAuthority('row-root')).toEqual({ kind: 'live' });
+    expect(store.getTranscriptAuthority('display-slug')).toEqual({ kind: 'live' });
+    expect(store.getSnapshot(rowId)).toBe(retainedAtom);
+    store.observeProductConversationSnapshot(lifecycleSnapshot(rowId, revoked));
+    expect(firstReads).toHaveLength(1);
+    unsubscribeFirst();
+    unsubscribeSecond();
+
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'snapshot' });
+    store.observeProductConversationSnapshot(lifecycleSnapshot(rowId));
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'awaiting_init', connectionId: null });
+    const remountedReads: TranscriptAuthority[] = [];
+    const unsubscribeRemounted = store.subscribe(rowId, () => remountedReads.push(store.getTranscriptAuthority(rowId)));
+    expect(store.getSnapshot(rowId)).toBe(retainedAtom);
+    store.observeProductConversationSnapshot(lifecycleSnapshot(rowId));
+    expect(remountedReads).toEqual([]);
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'awaiting_init', connectionId: null });
+    store.observeProductConversationSnapshot(lifecycleSnapshot(rowId, revoked));
+    expect(remountedReads).toEqual([{ kind: 'snapshot' }]);
+    expect(unrelated).not.toHaveBeenCalled();
+    unsubscribeRemounted();
+    unsubscribeUnrelated();
+  });
+
+  it('requires a new connection after retry, not an init from the previously live connection', () => {
+    const store = new ConversationStore();
+    const rowId = 'row-latest';
+    const oldConnectionId = Symbol('old');
+    store.dispatch(rowId, { type: 'connection_opened', epoch: 1, connectionId: oldConnectionId });
+    store.dispatch(rowId, { type: 'sse_init', epoch: 1, connectionId: oldConnectionId, payload: transcriptInit(rowId) });
+    awaitTranscriptInit(store, rowId);
+
+    store.dispatch(rowId, { type: 'sse_init', epoch: 1, connectionId: oldConnectionId, payload: transcriptInit(rowId) });
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'awaiting_init', connectionId: null });
+  });
+
+  it('rejects old identities even when a remounted machine reuses the same epoch', () => {
+    const store = new ConversationStore();
+    const rowId = 'row-latest';
+    const oldConnectionId = Symbol('old');
+    const currentConnectionId = Symbol('current');
+    store.dispatch(rowId, { type: 'connection_opened', epoch: 1, connectionId: oldConnectionId });
+    awaitTranscriptInit(store, rowId);
+    store.dispatch(rowId, { type: 'connection_reset' });
+    const beforeResetInit = store.getSnapshot(rowId);
+    store.dispatch(rowId, { type: 'sse_init', epoch: 1, connectionId: oldConnectionId, payload: transcriptInit(rowId) });
+    expect(store.getSnapshot(rowId)).toBe(beforeResetInit);
+    store.dispatch(rowId, { type: 'connection_opened', epoch: 1, connectionId: currentConnectionId });
+    const beforeStaleInit = store.getSnapshot(rowId);
+    const listener = vi.fn();
+    const unsubscribe = store.subscribe(rowId, listener);
+
+    store.dispatch(rowId, { type: 'sse_init', epoch: 1, connectionId: oldConnectionId, payload: transcriptInit(rowId) });
+    expect(store.getSnapshot(rowId)).toBe(beforeStaleInit);
+    expect(listener).not.toHaveBeenCalled();
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'awaiting_init', connectionId: currentConnectionId });
+    store.dispatch(rowId, { type: 'sse_init', epoch: 1, connectionId: currentConnectionId, payload: transcriptInit(rowId) });
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'live' });
+    expect(store.getSnapshot(rowId).messages).toEqual(transcriptInit(rowId).messages);
+    unsubscribe();
+  });
+
+  it('does not bind authority to an out-of-order connection_opened rejected by the reducer', () => {
+    const store = new ConversationStore();
+    const rowId = 'row-latest';
+    const currentConnectionId = Symbol('current');
+    awaitTranscriptInit(store, rowId);
+    store.dispatch(rowId, { type: 'connection_opened', epoch: 2, connectionId: currentConnectionId });
+    const before = store.getSnapshot(rowId);
+    store.dispatch(rowId, { type: 'connection_opened', epoch: 1, connectionId: Symbol('rejected') });
+    expect(store.getSnapshot(rowId)).toBe(before);
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'awaiting_init', connectionId: currentConnectionId });
+    store.dispatch(rowId, { type: 'sse_init', epoch: 2, connectionId: currentConnectionId, payload: transcriptInit(rowId) });
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'live' });
+  });
+
+  it.each(['stale epoch', 'missing identity', 'missing epoch', 'wrong row', 'preserve'] as const)(
+    'does not restore live authority for %s init', (scenario) => {
+      const store = new ConversationStore();
+      const rowId = 'row-latest';
+      const connectionId = Symbol('current');
+      awaitTranscriptInit(store, rowId);
+      store.dispatch(rowId, { type: 'connection_opened', epoch: 2, connectionId });
+      const before = store.getSnapshot(rowId);
+      const action: Extract<SSEAction, { type: 'sse_init' }> = {
+        type: 'sse_init', epoch: 2, connectionId, payload: transcriptInit(rowId),
+      };
+      if (scenario === 'stale epoch') action.epoch = 1;
+      if (scenario === 'missing identity') delete action.connectionId;
+      if (scenario === 'missing epoch') delete action.epoch;
+      if (scenario === 'wrong row') action.payload = transcriptInit('row-other');
+      if (scenario === 'preserve') action.payload = transcriptInit(rowId, 'preserve');
+      store.dispatch(rowId, action);
+      expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'awaiting_init', connectionId });
+      if (scenario === 'stale epoch') expect(store.getSnapshot(rowId)).toBe(before);
+    },
+  );
+
+  it.each(['complete', 'tail'] as const)('publishes %s init and live authority atomically to every subscriber', (coverage) => {
+    const store = new ConversationStore();
+    const rowId = 'row-latest';
+    const connectionId = Symbol('current');
+    awaitTranscriptInit(store, rowId);
+    const read = () => ({ authority: store.getTranscriptAuthority(rowId), atom: store.getSnapshot(rowId) });
+    const first = vi.fn(read);
+    const second = vi.fn(read);
+    const any = vi.fn(read);
+    const unsubscribers = [store.subscribe(rowId, first), store.subscribe(rowId, second), store.subscribeAny(any)];
+    store.dispatch(rowId, { type: 'connection_opened', epoch: 1, connectionId });
+    for (const subscriber of [first, second, any]) {
+      expect(subscriber.mock.results[0]?.value).toMatchObject({
+        authority: { kind: 'awaiting_init', connectionId }, atom: { connectionEpoch: 1 },
+      });
+      subscriber.mockClear();
+    }
+    store.dispatch(rowId, { type: 'sse_init', epoch: 1, connectionId, payload: transcriptInit(rowId, coverage) });
+    for (const subscriber of [first, second, any]) {
+      expect(subscriber).toHaveBeenCalled();
+      for (const result of subscriber.mock.results) {
+        expect(result.value).toMatchObject({ authority: { kind: 'live' }, atom: { conversationId: rowId } });
+        expect(result.value.atom.messages).toEqual(transcriptInit(rowId).messages);
+      }
+    }
+    unsubscribers.forEach((unsubscribe) => unsubscribe());
+  });
+
+  it('keeps snapshot authority revoked when the current connection delivers a complete init', () => {
+    const store = new ConversationStore();
+    const rowId = 'row-latest';
+    const connectionId = Symbol('current');
+    store.observeProductConversationSnapshot(lifecycleSnapshot(rowId, { ordinary_lifecycle: 'history' }));
+    store.dispatch(rowId, { type: 'connection_opened', epoch: 1, connectionId });
+    store.dispatch(rowId, { type: 'sse_init', epoch: 1, connectionId, payload: transcriptInit(rowId) });
+    expect(store.getTranscriptAuthority(rowId)).toEqual({ kind: 'snapshot' });
+  });
+});
 
 describe('ConversationStore.upsertSnapshot (task 08684)', () => {
   it('creates a snapshot-only atom on first upsert', () => {

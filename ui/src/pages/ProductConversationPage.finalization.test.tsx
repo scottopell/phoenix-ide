@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { forwardRef, memo, Profiler, StrictMode, useEffect, useImperativeHandle } from 'react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
 import type { EmbeddedConversationProjection } from './ConversationPage';
 import type { PendingUserMessage } from '../hooks/useMessageQueue';
@@ -17,6 +17,8 @@ import type { RenderUnit } from '../conversation/renderUnits';
 import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { VirtualTranscriptHandle, VirtualTranscriptProps } from '../components/VirtualTranscript';
 import { notifyProductConversationSnapshotChanged } from '../notifications';
+import { useConnection } from '../hooks/useConnection';
+import type { InitPayload } from '../conversation/atom';
 
 const probe = vi.hoisted(() => ({
   structuralRenders: 0,
@@ -121,9 +123,15 @@ function captureCommit() {
     key: node.dataset['ownedUnit']!, kind: node.dataset['kind']!, text: node.textContent ?? '',
   })));
 }
-async function open() {
-  render(<StrictMode><ConversationContext.Provider value={store}>
+function NavigationProbe() {
+  const navigate = useNavigate();
+  return <><button onClick={() => navigate('/product-conversations/other')}>leave A</button>
+    <button onClick={() => navigate('/product-conversations/pc-product-alpha')}>return A</button></>;
+}
+async function open(expected = 'Live question') {
+  const view = render(<StrictMode><ConversationContext.Provider value={store}>
     <MemoryRouter initialEntries={['/product-conversations/pc-product-alpha']}>
+    <NavigationProbe />
     <ConversationReadinessProvider><ViewerSlotProvider browserSessionActive={false}>
       <FileExplorerProvider><FocusScopeProvider>
         <Profiler id="product" onRender={captureCommit}><Routes>
@@ -133,7 +141,8 @@ async function open() {
     </ViewerSlotProvider></ConversationReadinessProvider>
     </MemoryRouter>
   </ConversationContext.Provider></StrictMode>);
-  await screen.findByText('Live question');
+  await screen.findByText(expected);
+  return view;
 }
 async function startStream(requestId = 'ordinary-final', text = 'RESPONSE_MARKER') {
   act(() => token(requestId, text));
@@ -271,8 +280,11 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     expect(screen.getByText('Live question')).toBeInTheDocument();
   });
 
-  it('retires the warm atom owner on close_incomplete and keeps refreshed same-message snapshot content', async () => {
-    await open();
+  it.each([
+    ['fresh init', 'in-place'], ['failed reconnect', 'in-place'],
+    ['fresh init', 'A→B→A'], ['fresh init', 'remount'],
+  ] as const)('keeps snapshot authority through %s / %s', async (reconnect, lifecycle) => {
+    let view = await open();
     expect(screen.getByText('composer owner')).toBeInTheDocument();
     const staleMessage = store.getSnapshot(latestRow).messages[0]!;
     expect(staleMessage.content).toEqual({ text: 'Live question' });
@@ -314,6 +326,94 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     await screen.findByText('REFRESHED_SNAPSHOT_MARKER');
     expect(screen.queryByText('RETIRED_ATOM_MARKER')).not.toBeInTheDocument();
     expect(screen.queryByText('FRESH_SNAPSHOT_MARKER')).not.toBeInTheDocument();
+
+    const retryClose = snapshot.close!;
+    if (lifecycle === 'A→B→A') {
+      const snapshotA = snapshot;
+      snapshot = { ...snapshot, product_conversation_id: 'other', latest_transcript_row_id: 'row-B',
+        close: null, writable_transcript_row_id: 'row-B', segments: [] };
+      seed('row-B');
+      fireEvent.click(screen.getByText('leave A'));
+      await screen.findByText('Live question');
+      snapshot = { ...snapshotA, close: null };
+      fireEvent.click(screen.getByText('return A'));
+      await screen.findByText('REFRESHED_SNAPSHOT_MARKER');
+    } else if (lifecycle === 'remount') {
+      view.unmount();
+      snapshot = { ...snapshot, close: null };
+      view = await open('REFRESHED_SNAPSHOT_MARKER');
+    }
+    expect(screen.queryByText('Live question')).not.toBeInTheDocument();
+    expect(screen.queryByText('RETIRED_ATOM_MARKER')).not.toBeInTheDocument();
+
+    const connectionCalls = vi.mocked(useConnection).mock.calls.length;
+    commits.length = 0;
+    snapshot = { ...snapshot, close: { ...retryClose, phase: 'settling_active_work',
+      outcome: null, run_ordinal: '2', run_status: 'running' } };
+    act(() => notifyProductConversationSnapshotChanged('pc-product-alpha'));
+    await waitFor(() => expect(vi.mocked(useConnection).mock.calls.length).toBeGreaterThan(connectionCalls));
+    const hydration = vi.mocked(useConnection).mock.calls.at(-1)![0];
+    expect(hydration.conversationId).toBe(latestRow);
+    expect(hydration.getLastAppliedEventSeq).toBeUndefined();
+    expect(hydration.getTranscriptGeneration).toBeUndefined();
+    expect(screen.queryByTestId('product-conversation-close-incomplete')).not.toBeInTheDocument();
+    expect(screen.queryByText('composer owner')).not.toBeInTheDocument();
+    expect(commits.length).toBeGreaterThan(0);
+    for (const commit of commits) {
+      expect(commit.find((row) => row.key === staleMessage.message_id)?.text).toBe('REFRESHED_SNAPSHOT_MARKER');
+      expect(commit.some((row) => row.text.includes('RETIRED_ATOM_MARKER'))).toBe(false);
+    }
+
+    const connectionId = Symbol('current-hydration');
+    const previousConnectionId = Symbol('previous-hydration');
+    act(() => {
+      hydration.dispatch({ type: 'connection_reset' });
+      hydration.dispatch({ type: 'connection_opened', epoch: 1, connectionId });
+      hydration.dispatch({ type: 'connection_state', state: 'live', epoch: 1 });
+    });
+    expect(screen.getByText('REFRESHED_SNAPSHOT_MARKER')).toBeInTheDocument();
+    expect(screen.queryByText('Live question')).not.toBeInTheDocument();
+    const payload: InitPayload = {
+      conversation: store.getSnapshot(latestRow).conversation!,
+      messages: [{ ...staleMessage, content: { text: 'FRESH_INIT_MARKER' } }],
+      steeringMessages: [], phase: { type: 'llm_requesting', attempt: 1 }, contextWindow: { used: 0 },
+      transcriptGeneration: 1, streamIncarnation: 'retry-stream',
+      lastAppliedEventSeq: 10, pendingAnchorSequenceId: 10, pendingEvents: [], pendingTruncated: false,
+      transcriptCoverage: 'complete',
+    };
+    act(() => hydration.dispatch({ type: 'sse_init', epoch: 0, connectionId, payload }));
+    act(() => hydration.dispatch({ type: 'sse_init', epoch: 1, connectionId: previousConnectionId, payload }));
+    expect(store.getSnapshot(latestRow).messages[0]).toBe(staleMessage);
+    expect(screen.getByText('REFRESHED_SNAPSHOT_MARKER')).toBeInTheDocument();
+
+    if (reconnect === 'failed reconnect') {
+      act(() => {
+        hydration.dispatch({ type: 'connection_state', state: 'failed', epoch: 1 });
+        hydration.dispatch({ type: 'sse_error', epoch: 1,
+          error: { type: 'ConnectionFailed', retriesExhausted: true } });
+      });
+      expect(screen.getByText('REFRESHED_SNAPSHOT_MARKER')).toBeInTheDocument();
+      expect(screen.queryByText('composer owner')).not.toBeInTheDocument();
+      expect(screen.queryByText('FRESH_INIT_MARKER')).not.toBeInTheDocument();
+      return;
+    }
+    // A preserve-only init cannot prove the cached transcript was refreshed.
+    act(() => hydration.dispatch({ type: 'sse_init', epoch: 1, connectionId,
+      payload: { ...payload, messages: [], transcriptCoverage: 'preserve' } }));
+    expect(screen.getByText('REFRESHED_SNAPSHOT_MARKER')).toBeInTheDocument();
+    commits.length = 0;
+    act(() => hydration.dispatch({ type: 'sse_init', epoch: 1, connectionId, payload }));
+    expect(screen.getByText('FRESH_INIT_MARKER')).toBeInTheDocument();
+    expect(screen.getByText('composer owner')).toBeInTheDocument();
+    expect(screen.queryByText('REFRESHED_SNAPSHOT_MARKER')).not.toBeInTheDocument();
+    for (const commit of commits) {
+      expect(commit.find((row) => row.key === staleMessage.message_id)?.text).toBe('FRESH_INIT_MARKER');
+    }
+    snapshot = { ...snapshot, close: null, writable_transcript_row_id: latestRow };
+    await act(async () => notifyProductConversationSnapshotChanged('pc-product-alpha'));
+    expect(store.getTranscriptAuthority(latestRow).kind).toBe('live');
+    await startStream('restored-stream', 'RESTORED_STREAM_MARKER');
+    expect(screen.getByText('RESTORED_STREAM_MARKER')).toBeInTheDocument();
   });
 
   it('switches the atom subscription with the latest member and ignores the previous member', async () => {

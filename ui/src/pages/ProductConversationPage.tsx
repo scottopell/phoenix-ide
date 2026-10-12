@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
@@ -27,7 +27,8 @@ import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { useConnection } from '../hooks/useConnection';
 import type { SSEAction } from '../conversation/atom';
-import { useConversationTranscriptView } from '../conversation/useConversationAtom';
+import { ConversationContext } from '../conversation/ConversationContext';
+import { useConversationTranscriptAuthority, useConversationTranscriptView } from '../conversation/useConversationAtom';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import {
   getProductConversationSnapshotChangeSequence,
@@ -63,6 +64,17 @@ const discardCloseLiveUpdateAction = (_action: SSEAction): void => {
 
 function CloseLiveUpdateOwner({ conversationId }: { conversationId: string }) {
   useConnection({ conversationId, dispatch: discardCloseLiveUpdateAction });
+  return null;
+}
+
+function RetryTranscriptHydrationOwner({ conversationId }: { conversationId: string }) {
+  const store = useContext(ConversationContext);
+  if (!store) throw new Error('Retry transcript hydration requires ConversationProvider');
+  const dispatch = useCallback((action: SSEAction) => {
+    store.dispatch(conversationId, action);
+  }, [conversationId, store]);
+  // No replay cursor: this owner requests message-bearing hydration, not preserve-only init.
+  useConnection({ conversationId, dispatch });
   return null;
 }
 
@@ -759,6 +771,8 @@ export function ProductConversationPage({ productId }: { productId?: string | un
 }
 
 function ProductConversationPageInner({ productId }: { productId?: string | undefined }) {
+  const conversationStore = useContext(ConversationContext);
+  if (!conversationStore) throw new Error('Product conversation requires ConversationProvider');
   const params = useParams<{ productConversationId: string }>();
   const productConversationId = productId ?? params.productConversationId;
   const viewerSlot = useViewerSlot();
@@ -803,13 +817,16 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
   }
   const paginationRequestRef = useRef(0);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
+  const transcriptAuthority = useConversationTranscriptAuthority(snapshot?.latest_transcript_row_id ?? null);
   const currentLatestProjection = snapshot
+    && transcriptAuthority?.kind === 'live'
     && latestProjection?.conversationId === snapshot.latest_transcript_row_id
     ? latestProjection
     : null;
   const isOpen = snapshot?.ordinary_lifecycle === 'open';
   const closeIncomplete = snapshot?.close?.outcome === 'close_incomplete';
-  const liveTranscriptRowId = isOpen && !closeIncomplete ? snapshot.latest_transcript_row_id : null;
+  const liveTranscriptRowId = isOpen && !closeIncomplete && transcriptAuthority?.kind === 'live'
+    ? snapshot.latest_transcript_row_id : null;
   const memberTranscript = useConversationTranscriptView(liveTranscriptRowId);
   const currentMemberTranscript = liveTranscriptRowId && memberTranscript?.conversationId === liveTranscriptRowId
     ? memberTranscript
@@ -892,6 +909,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
         }
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
+        conversationStore.observeProductConversationSnapshot(next);
         setOwnedSnapshot((current) => ({
           productConversationId,
           value: current?.productConversationId === productConversationId
@@ -929,7 +947,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     return () => {
       cancelled = true;
     };
-  }, [productConversationId, snapshotRetry]);
+  }, [conversationStore, productConversationId, snapshotRetry]);
 
   useEffect(() => {
     const canonicalId = snapshot?.product_conversation_id;
@@ -1087,6 +1105,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
     try {
       const { older, refreshedTail } = await fetchOlderSnapshotWithFreshCursor(productConversationId, snapshot.before);
       if (routeGenerationRef.current !== routeGeneration || paginationRequestRef.current !== requestGeneration) return;
+      if (refreshedTail) conversationStore.observeProductConversationSnapshot(refreshedTail);
       setOwnedSnapshot((current) => {
         if (!current || current.productConversationId !== ownerId) return current;
         const authoritativeTail = refreshedTail
@@ -1121,7 +1140,7 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
         setLoadingOlder(false);
       }
     }
-  }, [currentLatestProjection?.conversationId, historyGeneration, loadingOlder, productConversationId, snapshot]);
+  }, [conversationStore, currentLatestProjection?.conversationId, historyGeneration, loadingOlder, productConversationId, snapshot]);
 
   const messages = aggregateMessages;
   const cleanupAttention = snapshot?.close?.outcome === 'archived_cleanup_attention';
@@ -1296,6 +1315,12 @@ function ProductConversationPageInner({ productId }: { productId?: string | unde
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
+      {transcriptAuthority?.kind === 'awaiting_init' && (
+        <RetryTranscriptHydrationOwner
+          key={snapshot.latest_transcript_row_id}
+          conversationId={snapshot.latest_transcript_row_id}
+        />
+      )}
       {liveTranscriptRowId && (
         <div
           className="product-conversation-page__composer"
