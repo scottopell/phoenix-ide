@@ -674,6 +674,7 @@ mod tests {
 
     #[test]
     fn exempt_paths_are_correct() {
+        assert!(!is_exempt_path("/api/deployment/retrieval"));
         assert!(is_exempt_path("/"));
         assert!(is_exempt_path("/new"));
         // Direct loads of the home terminal and chain deep links must serve the

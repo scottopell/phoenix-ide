@@ -19,6 +19,33 @@ corpus, and so that every recall surface in Phoenix is built on one
 substrate rather than each re-deriving its own context-assembly
 strategy.
 
+## Startup availability correction — local qualification
+
+The candidate replaces deferred read-to-write orphan pruning with read-only
+keyset discovery and at most 128 revalidated candidates per `BEGIN IMMEDIATE`
+transaction. It does not reserve the writer for the full scan. Physical FTS
+rows and locators remain atomic within each page.
+
+Startup status distinguishes pending, running, ready, and failed. An owned
+attempt guard records interruption on cancellation or panic; no retry is added.
+`GET /api/deployment/retrieval` exposes this status under normal authentication
+without database work, raw errors, or content. Global and palette search retain
+readiness gating and distinguish terminal failure from warming.
+
+Local qualification at `034fece8d` executed 48 DB tests (47 retrieval-module
+tests plus the message-hiding retrieval regression) and three API/share tests,
+all passing with no ignored tests. This includes the WAL snapshot race,
+revalidation, rollback, cancellation/panic, nested database-code retention,
+orchestration-owned readiness, and authenticated status/search behavior.
+The harness expected 47 DB tests and recorded a false count assertion; the
+original receipt remains unchanged. A separate retained-output validator
+verified all 51 individual test names/results and the 48+3 summaries; an
+independent evidence review accepted this focused qualification.
+
+Hosted review corrections to benchmark setup and behavioral specifications
+require their own final-head checks. Hosted CI and review are tracked on
+PR #896; earlier local passes are not final-head or production-recovery proof.
+
 ## Technical Summary
 
 The index stores searchable text in an SQLite FTS5 virtual table,

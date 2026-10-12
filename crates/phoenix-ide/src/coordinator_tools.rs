@@ -1152,6 +1152,29 @@ mod tests {
         clippy::too_many_lines
     )]
     async fn production_conversation_search_benchmark() {
+        // This adapter is confined to the ignored immutable-fixture benchmark.
+        struct ValidatedFixtureRetriever(phoenix_db::retrieval::Fts5Retriever);
+        #[async_trait::async_trait]
+        impl MessageRetriever for ValidatedFixtureRetriever {
+            async fn retrieve(
+                &self,
+                request: phoenix_db::retrieval::RetrievalRequest,
+            ) -> Result<
+                Vec<phoenix_db::retrieval::RetrievedChunk>,
+                phoenix_db::retrieval::RetrievalError,
+            > {
+                self.0.retrieve(request).await
+            }
+            fn reconciliation_status(&self) -> phoenix_db::retrieval::ReconciliationStatus {
+                phoenix_db::retrieval::ReconciliationStatus::Ready
+            }
+            async fn is_fresh_for(
+                &self,
+                ids: &[String],
+            ) -> Result<bool, phoenix_db::retrieval::RetrievalError> {
+                self.0.is_fresh_for(ids).await
+            }
+        }
         enum InvocationResult {
             Retriever(Result<Vec<crate::db::RetrievedChunk>, String>),
             Tool {
@@ -1331,8 +1354,7 @@ mod tests {
             // Resolve the exact request policy before any timed operation. This
             // metadata applies even when EXPLAIN output is disabled.
             let policy_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
-            let policy_retriever = Arc::new(policy_db.fts_retriever());
-            policy_retriever.mark_reconciled();
+            let policy_retriever = Arc::new(ValidatedFixtureRetriever(policy_db.fts_retriever()));
             let policy_service = GlobalReadService::new(policy_db, policy_retriever.clone());
             if case_id == "broad-common" {
                 let request = policy_service
@@ -1430,7 +1452,6 @@ mod tests {
                 if explain {
                     let plan_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
                     let plan_retriever = Arc::new(plan_db.fts_retriever());
-                    plan_retriever.mark_reconciled();
                     let plan = plan_retriever
                         .explain(policy_request.clone())
                         .await
@@ -1445,8 +1466,7 @@ mod tests {
                 // connection observation. Subsequent calls are serial warm
                 // observations; OS cache state is intentionally uncontrolled.
                 let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
-                let retriever = Arc::new(db.fts_retriever());
-                retriever.mark_reconciled();
+                let retriever = Arc::new(ValidatedFixtureRetriever(db.fts_retriever()));
                 let service = GlobalReadService::new(db.clone(), retriever.clone());
                 let tool = SearchConversations(service.clone());
                 let retrieval_request = (*surface == "retriever").then(|| policy_request.clone());
