@@ -2301,6 +2301,32 @@ async fn resolve_message(
     })
 }
 
+async fn stable_reference_target(
+    service: &GlobalReadService,
+    product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+) -> Result<phoenix_core::domain::conversation_reference::ConversationReferenceTarget, AppError> {
+    match service
+        .db
+        .product_conversation_kind(&product_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        Some(
+            phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator,
+        ) => Ok(
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Coordinator,
+        ),
+        Some(phoenix_core::domain::product_conversation::ProductConversationKind::Ordinary) => Ok(
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                product_conversation_id,
+            },
+        ),
+        None => Err(AppError::NotFound(
+            "product conversation reference target not found".to_string(),
+        )),
+    }
+}
+
 async fn resolve_chain(
     service: &GlobalReadService,
     root_id: &str,
@@ -2346,9 +2372,7 @@ async fn resolve_chain(
     Ok(ResolveGlobalReferenceResponse {
         reference: qualified_reference(
             service,
-            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
-                product_conversation_id: root.product_conversation_id.clone(),
-            },
+            stable_reference_target(service, root.product_conversation_id.clone()).await?,
         )
         .await?,
         href: Some(format!("/chains/{root_id}")),
@@ -2422,9 +2446,7 @@ async fn resolve_work(
     Ok(ResolveGlobalReferenceResponse {
         reference: qualified_reference(
             service,
-            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
-                product_conversation_id: root.product_conversation_id.clone(),
-            },
+            stable_reference_target(service, root.product_conversation_id.clone()).await?,
         )
         .await?,
         href: Some(href),
@@ -4202,6 +4224,38 @@ mod tests {
         for reference in ["@chain:root-scope", "@work:root-scope"] {
             let resolved = service.resolve_reference(reference).await.unwrap();
             assert_eq!(resolved.reference, expected, "{reference}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_coordinator_aliases_preserve_coordinator_identity() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue\"}', state_kind = 'context_exhausted' WHERE id = ?1")
+            .bind(&coordinator.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let continuation = match db.continue_conversation(&coordinator.id).await.unwrap() {
+            crate::db::ContinueOutcome::Created(continuation) => continuation,
+            other => panic!("unexpected Coordinator continuation outcome: {other:?}"),
+        };
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let expected = phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+            db.instance_id().await.unwrap(),
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Coordinator,
+        );
+
+        for reference in [
+            format!("@chain:{}", coordinator.id),
+            format!("@work:{}", coordinator.id),
+        ] {
+            let resolved = service.resolve_reference(&reference).await.unwrap();
+            assert_eq!(resolved.reference, expected, "{reference}");
+            assert!(resolved.summary.contains(&continuation.id));
         }
     }
 
