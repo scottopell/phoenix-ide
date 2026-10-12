@@ -22,7 +22,7 @@ pub(crate) mod pr_monitoring;
 mod process_sample;
 mod product_conversations;
 mod release_updates;
-mod resource_monitor;
+pub(crate) mod resource_monitor;
 mod share_svg_artifacts;
 mod spa_routes;
 mod sse;
@@ -31,6 +31,7 @@ mod terminal_ws;
 mod types;
 pub(crate) mod usage;
 pub(crate) mod wire;
+pub(crate) mod work_scope_load;
 
 pub use deployment::{
     absolutize, DeploymentConfig, DiskCategory, DiskLocation, LaunchInstanceId, LogInfo,
@@ -354,7 +355,7 @@ impl AppState {
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
-        let resource_monitor = resource_monitor::ResourceMonitor::new();
+        let resource_monitor = runtime.work_scope_load().memory_monitor();
         Ok(Self {
             runtime,
             llm_registry,

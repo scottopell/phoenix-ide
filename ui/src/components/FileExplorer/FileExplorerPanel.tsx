@@ -34,6 +34,7 @@ interface Props {
   width?: number | undefined;
   workScopeKey?: string | null | undefined;
   liveWorkScope?: WorkScopeInventory | null | undefined;
+  executionCapable?: boolean;
   canOpenWorkspaceDiff?: boolean | undefined;
 }
 
@@ -116,7 +117,7 @@ function GitStatusDetails({ status }: { status: Extract<ConversationGitStatusRes
   );
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope, canOpenWorkspaceDiff = false }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope, executionCapable = false, canOpenWorkspaceDiff = false }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const { openDiffFullscreen } = useViewerSlotCommands();
   const [refreshKey, setRefreshKey] = useState(0);
@@ -336,6 +337,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
               scopeKey={workScopeKey}
               conversationId={conversationId}
               liveInventory={liveWorkScope}
+              executionCapable={executionCapable}
               expanded={workScopeExpanded}
               onToggleExpanded={setWorkScopeExpanded}
             />

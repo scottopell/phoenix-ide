@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useEffect, useRef } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
@@ -9,8 +9,9 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore, type InitPayload, type SSEAction } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
-import { api, ExpansionError, type Conversation, type Message } from '../api';
+import { api, ApiResponseError, ExpansionError, type Conversation, type Message, type ProductConversationSnapshotView } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
+import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { cacheDB } from '../cache';
 
@@ -30,6 +31,9 @@ vi.mock('../api', async () => {
       reconcileAcceptedMessages: vi.fn(),
       listConversations: vi.fn(() => Promise.resolve([])),
       listArchivedConversations: vi.fn(() => Promise.resolve([])),
+      listProductConversations: vi.fn(() => Promise.resolve({ product_conversations: [] })),
+      getProductConversationSnapshot: vi.fn(),
+      getGlobalCoordinator: vi.fn(() => Promise.reject(new Error('No coordinator in this test'))),
       getModels: vi.fn(() => Promise.resolve([])),
       getPrStatus: vi.fn(() => Promise.resolve({ found: false })),
       getCredentialStatus: vi.fn(() => Promise.resolve('valid')),
@@ -38,6 +42,8 @@ vi.mock('../api', async () => {
       continueConversation: vi.fn(),
       getSystemPrompt: vi.fn(() => Promise.resolve({ system_prompt: null })),
       getWorkScopeInventory: vi.fn(() => Promise.resolve({ bash: [], tmux: null, browser: null })),
+      getConversationTaskCount: vi.fn(() => Promise.resolve({ active: 0, closed: 0, blocked: 0, current: false })),
+      getConversationGitStatus: vi.fn(() => Promise.resolve({ kind: 'unavailable', reason: 'No git status in test' })),
       getLlmLanguageSetting: vi.fn(() => Promise.resolve({ language: 'en' })),
       getVersion: vi.fn(() => Promise.resolve({ version: 'test' })),
       getWakeStatus: vi.fn(() => Promise.resolve({ pending_count: 0, soonest_expires_at: null, contracts: [] })),
@@ -311,17 +317,157 @@ function renderPage(
   return { store, ...view, rerenderPage: () => view.rerender(page()) };
 }
 
+beforeEach(() => {
+  vi.mocked(api.getProductConversationSnapshot).mockRejectedValue(new ApiResponseError('Not found', 404));
+});
+
 afterEach(() => {
   viewportFlags.isDesktop = true;
   viewportFlags.isWideDesktop = true;
   authoritativeConversations.clear();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   hooksMockState.useConnection.mockImplementation(useConnectedConnection);
   localStorage.clear();
 });
 
 hooksMockState.useConnection.mockImplementation(useConnectedConnection);
+
+function LiveReadinessProbe({ conversationId }: { conversationId: string }) {
+  const { setConversationReadiness } = useConversationReadiness();
+  useEffect(() => {
+    setConversationReadiness({ conversationId, confirmedLive: true });
+    return () => setConversationReadiness({ conversationId: null, confirmedLive: false });
+  }, [conversationId, setConversationReadiness]);
+  return null;
+}
+
+function renderProductLayout(conversation: Conversation, route: string) {
+  const store = new ConversationStore();
+  store.dispatch(conversation.slug, {
+    type: 'set_initial_data', conversationId: conversation.id, conversation,
+    messages: [], phase: { type: 'idle' }, contextWindow: { used: 0 }, transcriptGeneration: 1,
+  });
+  return {
+    store,
+    ...render(
+      <ConversationContext.Provider value={store}>
+        <ConversationReadinessProvider>
+          <MemoryRouter initialEntries={[route]}>
+            <DesktopLayout><LiveReadinessProbe conversationId={conversation.id} /></DesktopLayout>
+          </MemoryRouter>
+        </ConversationReadinessProvider>
+      </ConversationContext.Provider>,
+    ),
+  };
+}
+
+describe('live work-scope load admission in DesktopLayout', () => {
+  const scopeKey = 'work:attached-1';
+  const inventory = (key: string) => ({ scope_key: key, bash: [], tmux: null, browser: null });
+  const loadRequests = (fetchMock: ReturnType<typeof vi.fn>) => fetchMock.mock.calls
+    .filter(([url]) => String(url).includes('/load?'));
+  const productSnapshot = (member: string, product = 'product-1') => ({
+    product_conversation_id: product,
+    requested_transcript_row_id: member,
+    latest_transcript_row_id: 'latest-transcript',
+  }) as ProductConversationSnapshotView;
+  beforeEach(() => {
+    vi.mocked(api.getWorkScopeInventory).mockImplementation(async (key) => inventory(key));
+  });
+
+  const mockLoadFetch = () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (!url.startsWith('/api/work-scope/') || !url.includes('/load?')) {
+        throw new Error(`Unexpected request: ${url}`);
+      }
+      return Promise.resolve({ ok: true, json: async () => ({
+        scope_key: scopeKey, measurement_basis: 'live_tracked_bash_groups', sampled_at: new Date().toISOString(), live_jobs: 0,
+        cpu_cores_latest: null, cpu_sampled_at: null,
+        cpu_one_minute: { average_cores: null, sampled_seconds: 0 },
+        cpu_five_minutes: { average_cores: null, sampled_seconds: 0 },
+        cpu_fifteen_minutes: { average_cores: null, sampled_seconds: 0 },
+        memory_bytes: null, process_count: null,
+      }) });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  };
+
+  it('loads once after the server-admitted initial inventory while the idle atom remains null', async () => {
+    const fetchMock = mockLoadFetch();
+    const inventoryResponse = deferred<ReturnType<typeof inventory>>();
+    vi.mocked(api.getWorkScopeInventory).mockReturnValue(inventoryResponse.promise);
+    renderPage(makeConversation({ work_scope_key: scopeKey, conv_mode_label: 'Explore' }));
+    await screen.findByText('keep this history visible');
+    expect(loadRequests(fetchMock)).toHaveLength(0);
+    await act(async () => { inventoryResponse.resolve(inventory(scopeKey)); });
+    await waitFor(() => expect(loadRequests(fetchMock)).toHaveLength(1));
+    expect(loadRequests(fetchMock)[0]?.[0]).toBe(`/api/work-scope/work%3Aattached-1/load?conversation_id=${conversationId}`);
+  });
+
+  it('rejects a mismatched initial inventory response without querying load', async () => {
+    const fetchMock = mockLoadFetch();
+    vi.mocked(api.getWorkScopeInventory).mockResolvedValue(inventory('work:other'));
+    renderPage(makeConversation({ work_scope_key: scopeKey, conv_mode_label: 'Explore' }));
+    await screen.findByText('keep this history visible');
+    await waitFor(() => expect(api.getWorkScopeInventory).toHaveBeenCalledWith(scopeKey, conversationId));
+    expect(loadRequests(fetchMock)).toHaveLength(0);
+  });
+
+  it('rejects an explicitly mismatched atom even when the initial inventory matches', async () => {
+    const fetchMock = mockLoadFetch();
+    const inventoryResponse = deferred<ReturnType<typeof inventory>>();
+    vi.mocked(api.getWorkScopeInventory).mockReturnValue(inventoryResponse.promise);
+    const { store } = renderPage(makeConversation({ work_scope_key: scopeKey }));
+    await screen.findByText('keep this history visible');
+    act(() => { store.dispatch(slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory('work:other') }); });
+    await act(async () => { inventoryResponse.resolve(inventory(scopeKey)); });
+    expect(loadRequests(fetchMock)).toHaveLength(0);
+  });
+
+  it('queries on the canonical product route after its latest transcript receives exact initial inventory', async () => {
+    const fetchMock = mockLoadFetch();
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(productSnapshot('latest-transcript'));
+    const conversation = makeConversation({ id: 'latest-id', slug: 'latest-transcript', work_scope_key: scopeKey, conv_mode_label: 'Explore' });
+    renderProductLayout(conversation, '/product-conversations/product-1');
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('product-1', { message_limit: 1 }));
+    await waitFor(() => expect(loadRequests(fetchMock)).toHaveLength(1));
+    expect(loadRequests(fetchMock)[0]?.[0]).toBe(`/api/work-scope/work%3Aattached-1/load?conversation_id=${conversation.id}`);
+  });
+
+  it('keeps a pinned historical transcript inert even if its cached state claims live readiness and inventory', async () => {
+    const fetchMock = mockLoadFetch();
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async (id) => productSnapshot(id === 'historical-row' ? 'historical-row' : 'latest-transcript'));
+    const conversation = makeConversation({ id: 'historical-id', slug: 'historical-row', work_scope_key: scopeKey });
+    const { store } = renderProductLayout(conversation, '/product-conversations/product-1?source_transcript=historical-row');
+    act(() => { store.dispatch(conversation.slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory(scopeKey) }); });
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('historical-row', { message_limit: 1 }));
+    expect(loadRequests(fetchMock)).toHaveLength(0);
+  });
+
+  it('does not query on the canonical product route with a mismatched attached atom', async () => {
+    const fetchMock = mockLoadFetch();
+    const inventoryResponse = deferred<ReturnType<typeof inventory>>();
+    vi.mocked(api.getWorkScopeInventory).mockReturnValue(inventoryResponse.promise);
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(productSnapshot('latest-transcript'));
+    const conversation = makeConversation({ id: 'latest-id', slug: 'latest-transcript', work_scope_key: scopeKey });
+    const { store } = renderProductLayout(conversation, '/product-conversations/product-1');
+    act(() => { store.dispatch(conversation.slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory('work:other') }); });
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('product-1', { message_limit: 1 }));
+    await act(async () => { inventoryResponse.resolve(inventory(scopeKey)); });
+    expect(loadRequests(fetchMock)).toHaveLength(0);
+  });
+
+  it('keeps archived and replay surfaces out of live load even with a matching inventory', async () => {
+    const fetchMock = mockLoadFetch();
+    const archived = renderPage(makeConversation({ work_scope_key: scopeKey, archived: true }));
+    act(() => { archived.store.dispatch(slug, { type: 'sse_work_scope_update', sequenceId: 1, inventory: inventory(scopeKey) }); });
+    await screen.findByText('keep this history visible');
+    expect(loadRequests(fetchMock)).toHaveLength(0);
+  });
+});
 
 describe('ConversationPage message viewer layout', () => {
   it('keeps a direct fullscreen message open out of split-pane layout', async () => {

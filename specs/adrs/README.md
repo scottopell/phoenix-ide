@@ -108,6 +108,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [092](092_federation-pins-imported-private-ca-trust-per-peer.md) | Federation pins imported private-CA trust per peer | Accepted | REQ-RQD-003, REQ-RQD-004; federation enrollment transfer and caller-side peer persistence |
 | [093](093_federation-validates-ca-capability-and-types-ipv6-persistence.md) | Federation validates CA capability and types IPv6 persistence | Accepted | REQ-RQD-003, REQ-RQD-004; peer origin and private-CA admission |
 | [094](094_owner-and-peer-credential-domains-are-disjoint.md) | Owner and peer credential domains are structurally disjoint | Accepted | REQ-AUTH-002, REQ-AUTH-009; `OwnerPassword`, `PeerBearerCredential` |
+| [095](095_workscope-cpu-history-and-demand-memory.md) | WorkScope CPU history with demand-driven memory | Accepted | REQ-WSLOAD-001–005, REQ-DEPLOY-007a |
+| [096](096_sampled-live-job-resource-visibility.md) | Sampled live-job visibility, not exhaustive accounting | Accepted | REQ-WSLOAD-001/002/005 |
 
 ## For agents: which decisions bind your task
 

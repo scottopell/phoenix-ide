@@ -1425,7 +1425,7 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
             &generation.observations,
         )
     };
-    let bash = if generation.bash_attribution_available {
+    let bash = if generation.incomplete_bash_scopes.is_empty() {
         build_category_from_observations(
             ManagedResourceCategoryKind::Bash,
             "Bash",
@@ -1446,7 +1446,10 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
             ManagedResourceCategoryKind::TmuxTerminal,
             "tmux/terminal",
             ManagedResourceAttribution::Available,
-            Some("shell-mode terminals are attributed; tmux server identity remains unavailable".to_string()),
+            Some(
+                "shell-mode terminals are attributed; tmux server identity remains unavailable"
+                    .to_string(),
+            ),
             pids,
             &generation.observations,
         ),
@@ -1461,7 +1464,11 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
     AboutResourcesSnapshot {
         sampled_at: generation.sampled_at,
         host: generation.host.clone(),
-        managed_total: totals_from_observations(&all_pids, &generation.observations),
+        managed_total: managed_totals_from_observations(
+            &all_pids,
+            &generation.observations,
+            generation.incomplete_bash_scopes.is_empty(),
+        ),
         categories: vec![
             api,
             bash,
@@ -1558,6 +1565,19 @@ fn unavailable_category(
         totals: ManagedResourceTotals::default(),
         processes: Vec::new(),
     }
+}
+
+fn managed_totals_from_observations(
+    expected_pids: &BTreeSet<u32>,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+    bash_complete: bool,
+) -> ManagedResourceTotals {
+    let mut totals = totals_from_observations(expected_pids, observed_rows_by_pid);
+    if !bash_complete {
+        totals.cpu_percent = None;
+        totals.memory_bytes = None;
+    }
+    totals
 }
 
 fn totals_from_observations(
@@ -2259,6 +2279,35 @@ mod tests {
         assert_eq!(totals.memory_bytes, None);
         assert_eq!(totals.process_count, 2);
         assert_eq!(totals.deduplicated_pid_count, 2);
+    }
+
+    #[test]
+    fn incomplete_bash_invalidates_managed_aggregate_not_known_pid_count() {
+        let expected_pids = BTreeSet::from([1, 10]);
+        let observations = [(1, "api", 2.0, 100), (10, "bash", 3.0, 200)]
+            .into_iter()
+            .map(|(pid, name, cpu, memory)| {
+                (
+                    pid,
+                    ProcessObservation {
+                        pid,
+                        name: name.into(),
+                        cpu_percent: Some(cpu),
+                        memory_bytes: Some(memory),
+                        thread_count: None,
+                        cpu_time_seconds: None,
+                    },
+                )
+            })
+            .collect();
+        let complete = managed_totals_from_observations(&expected_pids, &observations, true);
+        assert_eq!(complete.cpu_percent, Some(5.0));
+        assert_eq!(complete.memory_bytes, Some(300));
+        let incomplete = managed_totals_from_observations(&expected_pids, &observations, false);
+        assert_eq!(incomplete.cpu_percent, None);
+        assert_eq!(incomplete.memory_bytes, None);
+        assert_eq!(incomplete.process_count, 2);
+        assert_eq!(incomplete.deduplicated_pid_count, 2);
     }
 
     #[test]

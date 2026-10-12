@@ -503,12 +503,12 @@ THE SYSTEM SHALL derive their overlapping metrics from one timestamped observati
 WHEN concurrent consumers request metrics within the observation freshness lease
 THE SYSTEM SHALL coalesce them onto the same generation rather than repeat native process discovery and CPU measurement.
 
-WHILE no resource consumer requests observations
-THE SYSTEM SHALL perform no recurring process sampling.
+WHILE no resource consumer requests demand observations
+THE SYSTEM SHALL perform no recurring memory or host sampling. Owned bash CPU history SHALL follow the resource-aware cadence defined in `../work-scope-load/requirements.md` REQ-WSLOAD-002.
 
 THE SYSTEM SHALL preserve unavailable metrics as unavailable rather than zero, and SHALL protect process attribution against PID reuse by validating native process identity across the sampling interval.
 
-**Rationale:** CPU measurement requires an interval and proportional-memory reads are operating-system work. One demand-driven generation amortizes that work and gives overlapping surfaces consistent values without creating a permanent monitor when nobody is looking.
+**Rationale:** Demand CPU measurement requires an interval and proportional-memory reads are operating-system work. One shared generation amortizes those reads and gives overlapping surfaces consistent values. Owned bash CPU history uses lightweight cumulative CPU counters independently of demand memory and host collection.
 
 ---
 

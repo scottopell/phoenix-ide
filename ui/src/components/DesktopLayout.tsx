@@ -277,6 +277,17 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     : (activeConversation?.worktree_path ?? activeConversation?.cwd ?? null);
   const activeWorkScopeKey = activeConversationReadOnly ? undefined : activeConversation?.work_scope_key;
   const activeLiveWorkScope = activeConversationReadOnly ? undefined : liveWorkScope;
+  const executionCapable = productConversationId !== null
+    && !new URLSearchParams(location.search).has('source_transcript')
+    && activeConversation !== null
+    && !activeConversation.archived
+    && !activeConversationReadOnly
+    && readinessConversationId === activeConversation.id
+    && confirmedLive
+    && activeWorkScopeKey?.startsWith('work:') === true
+    && activeWorkScopeKey.length > 5
+    && (activeLiveWorkScope == null || activeLiveWorkScope.scope_key === activeWorkScopeKey);
+
   const browserSessionActive = activeConversation?.browser_session_active;
   const browserSessionStateLoaded = activeConversation !== null
     && readinessConversationId === activeConversation.id;
@@ -334,6 +345,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
             workScopeKey={activeWorkScopeKey}
             liveWorkScope={activeLiveWorkScope}
+            executionCapable={executionCapable}
             canOpenWorkspaceDiff={activeConversation?.conv_mode_label === 'Work' || activeConversation?.conv_mode_label === 'Branch' || activeConversation?.conv_mode_label === 'Approved Task'}
           />
         )}
