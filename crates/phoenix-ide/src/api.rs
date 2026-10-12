@@ -237,21 +237,8 @@ impl AppState {
             .map_err(std::io::Error::other)?;
         observe_running_close_runs(&db, || {
             runtime.kick_direct_turn_worker();
-            runtime.kick_wake_worker();
         })
         .await?;
-        let retired_wakes = db
-            .wake_repository()
-            .retire_all_registrations(phoenix_workflow::Timestamp(
-                u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-            ))
-            .await?;
-        if retired_wakes > 0 {
-            tracing::warn!(
-                retired = retired_wakes,
-                "retired automatic wake obligations before runtime startup"
-            );
-        }
         // Close inspection and exact retirement must fence resources before any
         // resource-producing bridge or worker begins admitting new instances.
         reconcile_startup_continuations(&runtime).await?;
@@ -263,11 +250,6 @@ impl AppState {
             .set_startup_obligated_conversations(db.terminal_obligated_conversation_ids().await?)
             .await;
         runtime.start_direct_turn_worker().await?;
-        runtime.require_startup_local_authority()?;
-        runtime
-            .start_wake_worker()
-            .await
-            .map_err(std::io::Error::other)?;
         runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await?;

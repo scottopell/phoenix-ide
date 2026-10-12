@@ -1,9 +1,11 @@
 # ADR-012: Wake-resume scheduling uses a durable acceptance outbox
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-098
 - **Date:** 2026-07-10
 - **Supersedes:** ADR-011 for the guarantee that a persisted inbox observation alone makes resume scheduling idempotent
 - **Affects:** REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-008, REQ-WAKE-012, `ResumeRequest`
+
+- **Retirement cross-reference:** [ADR-098](098_retire-wake-execution-and-preserve-history.md) supersedes wake execution obligations; the decision body below is historical. Shared foundation, direct-turn, and creation obligations are not retired.
 
 ## Context
 

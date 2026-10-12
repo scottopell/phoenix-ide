@@ -511,20 +511,6 @@ pub async fn delete_chain_handler(
     }
 
     refuse_busy_chain_members(&state, &member_ids).await?;
-    let wake_repo = state.db.wake_repository();
-    for id in &member_ids {
-        if wake_repo
-            .has_owed_work_for_conversation(id)
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?
-        {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                format!("Cannot delete chain: member {id} has pending background work."),
-                "pending_wake",
-            ))));
-        }
-    }
-
     let deleting_conversation_ids = member_ids.iter().cloned().collect();
     let mut prepared = Vec::with_capacity(member_ids.len());
     for id in &member_ids {

@@ -52,7 +52,6 @@ import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
 import './MessageComponents.css';
-import { UserMetaMessage } from './UserMetaMessage';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -381,22 +380,8 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const text = content.text || (typeof message.content === 'string' ? message.content : '');
   const images = content.images || [];
   const files = content.files || [];
-  const displayData = message.display_data as { type?: string } | null;
-  const isWakeMeta = displayData?.type === 'wake_result' && content.is_meta === true;
   const isMeta = content.is_meta === true || inputOriginPresentation(message.origin).className === 'meta';
   const timestamp = message.created_at;
-
-  if (isWakeMeta) {
-    return (
-      <UserMetaMessage
-        message={message}
-        text={text}
-        images={images}
-        files={files}
-        timestamp={timestamp}
-      />
-    );
-  }
 
   return (
     <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>

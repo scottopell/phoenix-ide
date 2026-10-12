@@ -91,49 +91,15 @@ impl ContinuationApplicationService {
             .has_completed_continuation_handoff(&admission.predecessor_conversation_id)
             .await
             .map_err(|error| error.to_string())?
-        {
-            if let Some(successor_id) = self
-                .runtime
-                .db()
-                .completed_continuation_successor(&admission.predecessor_conversation_id)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                let predecessor = self
-                    .runtime
-                    .db()
-                    .get_conversation(&admission.predecessor_conversation_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let successor = self
-                    .runtime
-                    .db()
-                    .get_conversation(&successor_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if predecessor.attached_work_scope_id == successor.attached_work_scope_id {
-                    crate::runtime::wake::transfer_active_for_continuation(
-                        &self.runtime,
-                        &admission.predecessor_conversation_id,
-                        &successor_id,
-                        phoenix_workflow::Timestamp(
-                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                        ),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                }
-            }
-            if self
+            && self
                 .runtime
                 .db()
                 .reconcile_completed_automatic_continuation(admission)
                 .await
                 .map_err(|error| error.to_string())?
                 .is_some()
-            {
-                return Ok(true);
-            }
+        {
+            return Ok(true);
         }
 
         let current = self.current_admission(admission).await?;
@@ -197,47 +163,12 @@ impl ContinuationApplicationService {
             .await
             .map_err(|error| error.to_string())?;
 
-        if plan.transfer_ownership {
-            let predecessor = self
-                .runtime
-                .db()
-                .get_conversation(&admission.predecessor_conversation_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            let shared_work_scope =
-                predecessor.attached_work_scope_id == successor.attached_work_scope_id;
-            if shared_work_scope {
-                crate::runtime::wake::transfer_active_for_continuation(
-                    &self.runtime,
-                    &admission.predecessor_conversation_id,
-                    &successor.id,
-                    phoenix_workflow::Timestamp(
-                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                    ),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            }
-            let transfer_settled = if shared_work_scope {
-                crate::runtime::wake::continuation_transfer_is_settled(
-                    &self.runtime,
-                    &admission.predecessor_conversation_id,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            } else {
-                true
-            };
-            if !transfer_settled {
-                return Err("continuation ownership transfer remains pending".to_string());
-            }
-            if automatic_intent {
-                self.advance_current(
-                    &admission.predecessor_conversation_id,
-                    AutomaticContinuationPhase::OwnershipTransferred,
-                )
-                .await?;
-            }
+        if plan.transfer_ownership && automatic_intent {
+            self.advance_current(
+                &admission.predecessor_conversation_id,
+                AutomaticContinuationPhase::OwnershipTransferred,
+            )
+            .await?;
         }
 
         if !automatic_intent {
@@ -346,14 +277,7 @@ impl ContinuationApplicationService {
                 .await?;
                 return Ok(AutomaticContinuationPhase::SuccessorReserved);
             }
-            if current.phase == AutomaticContinuationPhase::SuccessorReserved
-                && crate::runtime::wake::continuation_transfer_is_settled(
-                    &self.runtime,
-                    &admission.predecessor_conversation_id,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            {
+            if current.phase == AutomaticContinuationPhase::SuccessorReserved {
                 self.advance_current(
                     &admission.predecessor_conversation_id,
                     AutomaticContinuationPhase::OwnershipTransferred,

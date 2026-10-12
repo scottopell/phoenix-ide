@@ -320,12 +320,6 @@ entity Handle {
     kill_signal_sent:  KillSignal? when status = kill_pending_kernel
 }
 
--- A durable wake attached to a background handle. Coordinator handles are
--- manually polled and never acquire this relationship.
-entity DurableWorkScopeWake {
-    handle: Handle
-}
-
 -- A WorkScope inventory reconciliation scheduled from a terminal lifecycle
 -- edge. Coordinator handle lifecycle is consumed without creating one.
 entity WorkScopeReconciliation {
@@ -1217,11 +1211,6 @@ invariant LiveHandleCapBound {
 invariant HandleResourceScopeScoped {
     for h in Handle:
         h.owner_scope != null
-}
-
-invariant CoordinatorHandleHasNoDurableWake {
-    for h in Handle where h.controller_scope.kind = coordinator:
-        not DurableWorkScopeWake.exists(w => w.handle = h)
 }
 
 invariant CoordinatorHandleHasNoWorkScopeReconciliation {

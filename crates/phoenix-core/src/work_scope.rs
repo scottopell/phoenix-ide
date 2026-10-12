@@ -335,7 +335,6 @@ pub enum WorkScopeRetirementBlocker {
     CurrentUserOwner,
     UserSuccessor,
     ActiveSubAgent,
-    PendingWakeOrWorkflow,
     UnresolvedProductConversationOwnership,
 }
 

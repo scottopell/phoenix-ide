@@ -1,168 +1,100 @@
-# Wake Contracts — Executive Summary
+# Wake Retirement — Executive Summary
 
-## Requirements Summary
+## Decision and Scope
 
-Wake contracts let an LLM agent register a persistent, conversation-
-scoped commitment of the shape "wake me when condition X holds, or in
-N seconds, whichever comes first." Today's spawn-and-wait surfaces
-(`bash op=wait`, `tmux capture-pane` polling, `subagent` hardcoded
-block) all consume one full conversation turn per wait window. For a
-3-minute task with the default 30s wait, that's six turns of context
-re-feed, six tool-description re-feeds, and six assistant-message
-round-trips — all to deliver one bit of information (the task
-finished).
-
-Wake contracts replace the poll-loop with persistence + an asynchronous router:
-the LLM registers a contract, the conversation stays in `Idle`, and the runtime
-delivers exactly one synthetic terminal result into the conversation when the
-condition fires, expires, is cancelled, or becomes forgotten. The LLM consumes
-zero turns in between. Persistence makes the wait intent durable; it does not make
-every watched handle durable.
-
-V1 supports one condition kind over three concrete handle kinds:
-`HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
-`window_id`, or sub-agent handle reaches a terminal state. For sub-agents, the
-terminal payload covers every durable child terminal cause admitted by bedrock:
-explicit `submit_result`, explicit `submit_error`, timeout, child cancellation,
-turn-limit hard-stop fallback, implicit completion, runtime failure, and context
-exhaustion. Missing child handles resolve as `Forgotten`, not as fired child
-payloads. V1 does not define parent-to-child
-continuation, `NeedMoreBudget`, arbitrary child
-questions, automatic sub-agent budget extension, or a general conversation-actor
-framework.
-
-## Technical Summary
-
-A new `wake_contracts` SQLite table persists every contract with registration
-fields plus terminal accounting fields: `status`, `terminal_cause`,
-`forgotten_reason`, `terminal_payload`, and `resolved_at`. Terminal cause and the
-finite forgotten-reason discriminator are queryable columns for metrics;
-`terminal_payload` stores only the cause-specific body.
-A new background `wake_router` task polls contracts each tick (1s for
-HandleTerminal) and on resolution: marks the row terminal, appends a
-synthetic tool result to the conv message log, triggers the conv's
-next LLM turn, and emits SSE.
-
-**No new conversation state.** The conv stays in `Idle` while
-waiting; the contract row is the single source of truth for "is this
-conv waiting on something." The existing `Awaiting*` family of states
-in this codebase exclusively encodes "waiting on the user"
-(`AwaitingTaskApproval`, `AwaitingContinuation`); wake is "waiting on
-the runtime," which is a different category and should not block
-user interaction. `is_busy()` is augmented to return true when the
-conv has at least one pending contract (one extra SQLite count per
-evaluation; lifecycle endpoints already do at least one read).
-
-The synthetic tool result delivered on fire is byte-shape-identical to the tool
-result the equivalent synchronous wait would have returned when such a
-synchronous surface exists. Bash delivery mirrors `bash op=wait`; tmux delivery
-includes the watched `window_id` terminal status and final captured tail; sub-agent
-delivery uses the structured terminal outcome described above. This makes wake a
-drop-in replacement for polling from the LLM's vantage point: same payload, same
-`tool_use_id` correlation, just zero intervening turns.
-
-Wake contracts are conversation-scoped, not WorkScope-scoped: a contract is
-owned by one conversation and delivers its synthetic result there. The handles
-it can watch fall into two keying classes. Bash and tmux handles are
-WorkScope-keyed: when a conversation continues into a successor that inherits
-the same WorkScope, the handle transfers to the successor and a pending contract
-on it re-keys its `conv_id` along with it. A subagent handle is keyed by the
-sub-agent's own agent / child-conversation id (not by WorkScope), so a
-subagent-keyed contract is not transferred by WorkScope inheritance. A contract
-fires `Forgotten` only when its watched handle is genuinely destroyed (a Phoenix
-restart, or a hard-delete with no inheriting scope), not as a routine
-consequence of continuation.
-
-Mandatory `expires_at` (default 600s, cap 1800s) is the delivery deadline for the
-wait obligation and prevents unbounded commitments. While Phoenix is running, the
-router resolves a pending contract no later than the first tick at or after that
-timestamp. After downtime, restart resync delivers in-deadline durable terminal
-evidence, emits `Forgotten` for handles that became unknowable, expires only
-evaluable contracts with no such evidence, or re-registers still-pending durable
-handles.
-
-The LLM-facing surface is a single unified `wait_until { handle: {
-kind, id }, condition, max_wait_seconds }` tool with a `#[serde(tag
-= "kind")]` enum on the handle discriminator. No per-substrate
-variants (`bash_wait_until`, etc.) — keeps tool-description tax low
-and forward-aligns with the unified `WorkHandle` trait that will
-land separately.
+The user explicitly approved removing the durable wake feature. ADR-098 records
+that decision; ADR-006, ADR-011, and ADR-012 remain historical context, not current
+execution authority. The wake registration/router/profile contract and its Allium
+models are retired, without a replacement framework or promise of redesign.
 
 ## Current Reality
 
-The durable workflow substrate exists: typed wake profiles, persisted bindings,
-background observation, terminal projection, replay-safe materialization and
-runtime acceptance, restart recovery, and continuation transfer. Phoenix does
-not expose the specified agent-facing `wait_until` tool, so no ordinary bash or
-tmux handle creation registers a wake obligation. The substrate is intentionally
-dormant until an explicit registration surface owns that lifecycle.
+The candidate branch removes operational wake admission, worker startup,
+automatic adoption, and wake-only lifecycle coupling. Migration 126 records
+explicit feature retirement additively for workflows, occurrence pointers, and
+coordinator wake events. Predecessor local migration and runtime regressions have
+passed; the historical prompt, owned-deletion, and coordinator-event corrections
+have source-only authored regressions awaiting execution. Integration and deployment
+are separate and are not claimed here.
 
-Because no explicit agent-facing registration surface exists, the wake worker is
-not started. Startup retires and suppresses persisted automatic bindings through
-canonical workflow transitions so they neither resume turns nor remain owed work;
-message and workflow audit records remain intact. The explicit wait surface will
-define its activation boundary when it is implemented.
+Historical wake workflows, effect payloads and statuses, bindings, receipts,
+messages, deliveries, acceptance records, and links must remain intact. Additive
+feature-retirement metadata makes those workflows inert without falsifying their
+historical execution outcomes. Historical wake pointers remain evidence only.
 
-## Status Summary
+Already-admitted DirectTurns, including ones originating in wake delivery, remain
+normal direct-turn work with their existing ownership, recovery, cancellation,
+and settlement authority. Unaccepted wake delivery must not admit new work.
+Ordinary Bash waits, tmux operations, sub-agent fan-in, and Close are not replaced.
 
-| Requirement | Status | Notes |
-|-------------|--------|-------|
-| REQ-WAKE-001 Registration | Proposed | LLM-facing tool surface; no synchronous payload; no conv state mutation |
-| REQ-WAKE-002 Persistence | Partial | Durable workflow-backed bindings, receipts, and restart reconciliation exist; agent-facing registration remains proposed |
-| REQ-WAKE-003 Router Service | Partial | Background observation and replay-safe delivery exist; no ordinary tool implicitly enrolls a handle |
-| REQ-WAKE-004 `is_busy()` Derivation | Proposed | Reads contract table; no new state machine variant |
-| REQ-WAKE-005 V1 Condition Kinds | Partial | Durable substrate models bash, tmux, and sub-agent terminal handles; explicit tool surface is proposed |
-| REQ-WAKE-006 Wake Event Delivery | Partial | Terminal projection/materialization exists; agent-facing explicit registration is proposed |
-| REQ-WAKE-007 Mandatory Timeout | Proposed | Default 600s, cap 1800s |
-| REQ-WAKE-008 User Status + Cancel | Proposed | UI/CLI wake status on Idle conv + cancel endpoint |
-| REQ-WAKE-009 Conv-Scoped | Proposed | Not WorkScope-scoped; explicit deconfliction |
-| REQ-WAKE-010 Independent Contracts | Proposed | No auto-cancel on sibling fire |
-| REQ-WAKE-011 Terminal Cause | Partial | Typed Fired / Expired / Cancelled / Forgotten projections exist in the durable substrate |
-| REQ-WAKE-012 Continuation Inheritance | Partial | WorkScope transfer and reconciliation exist in the durable substrate |
-| REQ-WAKE-013 User Messages | Proposed | Conv stays Idle; user messages just work |
-| REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
-| REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
-| REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
-| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Tagged exhaustive sub-agent terminal causes; missing child is Forgotten |
-| REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
+## Requirement Status
 
-No requirement is complete end-to-end because the unified agent-facing tool is
-not implemented. Requirements marked Partial identify reusable runtime and
-persistence infrastructure rather than a shipped wake-contract journey.
+| Requirement | Status | Verification evidence / boundary |
+| --- | --- | --- |
+| REQ-WAKE-RETIRE-001 no wake execution authority | Candidate corrections awaiting validation | Registration, worker, adoption, and wake lifecycle gates removed; predecessor `startup_does_not_resume_historical_wake_pointer` passed. Coordinator pending discovery now excludes explicitly retired events, and database admission rejects their new direct-turn/steering delivery. |
+| REQ-WAKE-RETIRE-002 additive retirement migration | Candidate corrections awaiting validation | Predecessor migration receipts cover byte-preserving upgrade/reopen, workflow statuses, delivery shape, and rollback. The synthetic fixture now includes pending, accepted, and suppressed coordinator wake events plus all other subscription source kinds; exact-event retirement, unchanged-history, discovery, and admission assertions are authored but unrun. |
+| REQ-WAKE-RETIRE-003 already-admitted DirectTurns | Implemented in candidate branch; locally verified | `historical_wake_pointer_does_not_fence_or_settle_direct_turn` passes; Direct Turn database and runtime ownership/recovery regressions pass. |
+| REQ-WAKE-RETIRE-004 history without replacement feature | Implemented in candidate branch; locally verified | Historical storage and pointers retained. Runtime selection passes 802 tests with one existing ignored test; tool suite passes 533 tests with one macOS registry-test failure separately tracked. |
+| REQ-WAKE-RETIRE-005 forward-only compatibility | Specified | Apply the existing compatibility policy; no downgrade or wake-restoration guarantee. |
 
-## Dependencies
+## Verification Boundary
 
-- `specs/bash/` REQ-BASH-002 (wait semantics) — REQ-WAKE-006 reuses
-  bash wait response shape for delivery
-- `specs/tmux-integration/` — TmuxPane handle condition kind
-- `specs/subagents/` — SubAgent handle condition kind
-- `specs/bedrock/` REQ-BED-032 (hard-delete cascade) — REQ-WAKE-004
-  is_busy() augmentation joins the cascade's busy-check
+The source-only corrections restore `render_messages`' historical adoption filter
+without a wake runtime type and restore binding-selected workflow deletion in
+`delete_conversation_row_with_dependents` before owner deletion. Authored regressions
+are `ordinary_new_turn_prompt_excludes_unadopted_historical_wake_results`,
+`permanent_delete_removes_only_owned_retired_wake_workflows_and_children`,
+`wake_feature_retirement_excludes_coordinator_wake_events_without_rewriting_history`,
+and `wake_feature_retirement_fences_event_admission_but_keeps_accepted_direct_turns`.
+The deletion fixture checks foreign keys before and after deletion and retains a
+separately-owned wake workflow and unrelated non-wake workflow. These corrections
+have not been compiled, formatted, or tested; predecessor receipts below do not
+qualify them.
 
-## Related Work
+Local qualification is not deployment evidence. The initial complete database
+run exposed nine legacy-fixture failures because partial-schema fixtures admitted
+the new migration; those fixture boundaries were corrected and all 92 migration
+tests subsequently passed. Existing Direct Turn, Close, creation, and shared
+foundation tests passed in that database run. Full project-check completion is
+not claimed by these focused receipts.
 
-- **`specs/bash/` REQ-BASH-WS-001 / -WS-002** — bash handles are
-  WorkScope-keyed and inherit across a scope-sharing continuation, so
-  REQ-WAKE-012 transfers a bash-keyed contract to the child along with
-  its handle
-- **`specs/subagents/`** — a sub-agent is tracked by its own agent /
-  child-conversation id, so a subagent-keyed contract is keyed
-  independently of the parent's WorkScope (REQ-WAKE-012)
-- **WorkScope foundation** — the resource-cleanup cascade
-  infrastructure this spec extends with cancel-on-lifecycle
-  (REQ-WAKE-004 join)
+The Python client suite passes 14 tests, including absent wake commands/methods.
+TypeScript, UI lint, and Vitest qualification passed after the surface removal.
+Workspace all-target Clippy finishes with exit 0 and warnings denied. Its guard
+recorded exit-time descendant cleanup; final process/group absence was verified
+before reservation release. Changed Allium models, task metadata, and Rust
+formatting validate. The shared
+ADR chain is reconciled against actual federation merge
+`1839a37f67c27d13f479068717d59a5aa413c450` and resource merge
+`eec3fae65f113705733cbd8c5f98b97a03fdcf81`. The candidate preserves resource
+ADRs 095–096 and ledger 124–125, then adds wake ADR-098 and migration 126. P1 retrieval merge
+`be1fbc52c394e299e48268c4a5079dc22851f5ac` is the actual cumulative base;
+its bounded-retrieval ADR-097 and implementation are preserved.
+ADR/spec shape validation passes on that cumulative source. Earlier qualification
+receipts retain their exact predecessor heads; final cumulative test and review
+receipts are reported on the pull request rather than silently relabelled.
+No deployment is implied by local qualification.
+Old wake feature tests are historical evidence, not acceptance of retirement.
 
-## Why This Spec Exists
+## Migration-aware rollback boundary
 
-Without an explicit wake tool, every spawn-and-wait flow that exceeds
-`wait_seconds` pays a full LLM round-trip per poll. The
-handle-cap (8) and ring-size (4MB) are explicit budgets in
-`specs/bash/`; turn-count is not budgeted anywhere. Wake contracts
-are the runtime acknowledging that turn-count is a first-class cost
-the same way bytes-in-ring are.
+Retirement is a forward migration, not a reversible switch. Replacing only the
+binary neither undoes migration 126 nor establishes authority to resume retired
+wake obligations. Older code does not interpret the new retirement metadata;
+using it against the migrated database is unsupported and may reinterpret
+preserved historical status as active work. A binary-only rollback therefore
+cannot promise continued retirement or safe wake restoration.
 
-The secondary motivation is correctness: if the LLM stops polling,
-an exit reaches no one. The tombstone sits in memory until Phoenix
-restart wipes it. Wake contracts make every spawn-and-wait
-deliver a terminal answer in all cases — `Fired`, `Expired`,
-`Cancelled`, or `Forgotten` — never silently abandoned.
+A supported version rollback follows the existing compatibility policy: offline
+restoration of a matching pre-upgrade database and binary, or a separately
+specified qualified paired deployment transaction. Such a restore returns the
+older database state rather than reversing retirement in place, and may contain
+its older obligations. No automatic reexecution, down migration, data purge, or
+new rollback subsystem is introduced by wake removal.
+
+## Authorities
+
+- `requirements.md`: retirement and historical-data contract.
+- `../durable-workflows/requirements.md`: retained foundation, direct-turn, and creation behavior.
+- `../compatibility/requirements.md`: forward migration and paired rollback policy.
+- `../adrs/098_retire-wake-execution-and-preserve-history.md`: explicit removal decision.

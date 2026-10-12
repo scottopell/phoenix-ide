@@ -2158,61 +2158,6 @@ fn workflow_clone_preserves_erased_acceptance_and_schedule_occurrence_state() {
     );
 }
 
-#[test]
-fn wake_profile_delivery_and_runtime_mapping_matches_events() {
-    use crate::wake_profile::*;
-
-    let terminal = WakeTerminalPayload::Fired {
-        contract_id: "c".into(),
-        resource: WakeResourceIdentity::Subagent(SubagentResourceIdentity {
-            child_conversation_id: "child".into(),
-        }),
-        evidence: WakeTerminalEvidence::Subagent(SubagentTerminalEvidence {
-            identity: SubagentResourceIdentity {
-                child_conversation_id: "child".into(),
-            },
-            occurred_at: Timestamp(1),
-            persisted_child_terminal_record: PersistedChildTerminalRecord::new("record")
-                .expect("record"),
-            outcome: SubagentTerminalOutcome::SubmitResult {
-                result: "ok".into(),
-            },
-        }),
-        resolved_at: Timestamp(2),
-    };
-    let item = DeliveryItem::<WakeProfile> {
-        id: DeliveryId(1),
-        effect_id: Some(REGISTRATION_EFFECT_ID),
-        barrier_id: None,
-        consumer_kind: "reducer",
-        event_codec: terminal_codec(),
-        requires_runtime_acceptance: false,
-        payload: DeliveryPayload::Receipt(terminal.clone()),
-        status: DeliveryStatus::Pending,
-        runtime_acceptance_status: None,
-        suppression_reason: None,
-        accepted_by: None,
-    };
-    assert!(WakeProfile::decision_handles_delivery(
-        &item,
-        &WakeRegistrationEvent::TerminalProjected {
-            terminal: Box::new(terminal.clone())
-        }
-    ));
-    assert!(WakeProfile::decision_handles_runtime_acceptance(
-        &item,
-        &WakeRegistrationEvent::RuntimeAccepted {
-            terminal: Box::new(terminal.clone())
-        }
-    ));
-    assert!(WakeProfile::decision_handles_runtime_suppression(
-        &item,
-        &WakeRegistrationEvent::RuntimeSuppressed {
-            terminal: Box::new(terminal)
-        }
-    ));
-}
-
 proptest! {
     #[test]
     fn version_conflicts_never_mutate_state(stale_version in 0u64..5) {
