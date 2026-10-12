@@ -733,8 +733,6 @@ mod tests {
     use super::*;
     use crate::tmux::fake_backend::FakeTmuxBackend;
     use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry};
-    use crate::{RegisterWakeInput, RegisteredWake, WakeRegistrar};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -744,35 +742,6 @@ mod tests {
             .cloned()
             .or_else(|| serde_json::from_str(out.output()).ok())
             .expect("response should be JSON")
-    }
-
-    #[derive(Default)]
-    struct MockWakeRegistrar {
-        register_calls: AtomicUsize,
-    }
-
-    impl MockWakeRegistrar {
-        fn new() -> Arc<Self> {
-            Arc::new(Self::default())
-        }
-
-        fn register_calls(&self) -> usize {
-            self.register_calls.load(Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl WakeRegistrar for MockWakeRegistrar {
-        async fn register(&self, _input: RegisterWakeInput) -> Result<RegisteredWake, String> {
-            self.register_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(RegisteredWake::Registered {
-                workflow_id: phoenix_workflow::WorkflowId(1),
-            })
-        }
-
-        async fn cancel(&self, _input: crate::CancelWakeInput) -> Result<RegisteredWake, String> {
-            Ok(RegisteredWake::CancelStale)
-        }
     }
 
     fn ctx(
@@ -795,19 +764,15 @@ mod tests {
         )
     }
 
-    fn ctx_with_registrar(
+    fn test_context(
         conv: &str,
         working_dir: PathBuf,
         registry: Arc<TmuxRegistry>,
         worktree_path: Option<PathBuf>,
-        registrar: Option<Arc<dyn WakeRegistrar>>,
     ) -> ToolContext {
-        let mut ctx = ctx(conv, working_dir, registry, worktree_path)
-            .with_root_conversation_id("root-tmux-wake".to_string())
-            .with_tool_use_id("tool-tmux-wake");
-        if let Some(registrar) = registrar {
-            ctx = ctx.with_wake_registrar(Some(registrar));
-        }
+        let ctx = ctx(conv, working_dir, registry, worktree_path)
+            .with_root_conversation_id("root-tmux".to_string())
+            .with_tool_use_id("tool-tmux");
         ctx
     }
 
@@ -932,18 +897,16 @@ mod tests {
     }
 
     /// REQ-TMUX-014: `return_immediately` reports `started` for a running
-    /// command and never registers a wake.
+    /// command.
     #[tokio::test]
-    async fn tmux_run_return_immediately_reports_started_without_wake() {
+    async fn tmux_run_return_immediately_reports_started() {
         let tmux = FakeTmux::new();
         let cwd = TempDir::new().unwrap();
-        let registrar = MockWakeRegistrar::new();
-        let run_ctx = ctx_with_registrar(
+        let run_ctx = test_context(
             "tmux-run-immediate",
             cwd.path().to_path_buf(),
             tmux.registry.clone(),
             None,
-            Some(registrar.clone()),
         );
 
         let result = TmuxRunTool
@@ -956,10 +919,6 @@ mod tests {
         assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "started");
-        assert!(v.get("wake_registration").is_none());
-        let provider: Value = serde_json::from_str(result.output()).unwrap();
-        assert!(provider.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
     }
 
     /// Explicit cleanup kills exactly the window `tmux_run` reported.

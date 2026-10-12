@@ -22,7 +22,6 @@ mod svg_artifacts;
 pub mod traits;
 pub mod usage_limit_sweep;
 pub mod user_facing_error;
-pub(crate) mod wake;
 
 #[cfg(test)]
 pub mod testing;
@@ -37,7 +36,7 @@ use crate::tools::browser::session::{
 };
 use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BashTerminalEffect, BrowserSessionManager,
-    ExploreToolPolicy, TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
+    ExploreToolPolicy, TmuxLifecycleEvent, TmuxRegistry, ToolRegistry,
 };
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
@@ -702,14 +701,9 @@ pub struct RuntimeManager {
     work_scope_browser_rx: RwLock<Option<mpsc::UnboundedReceiver<ResourceScopeKey>>>,
     creation_kick_tx: tokio::sync::watch::Sender<u64>,
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
-    wake_kick_tx: tokio::sync::watch::Sender<u64>,
-    wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
-    #[cfg(test)]
-    wake_worker_exit: AsyncMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     fatal_local_authority_fence: Arc<FatalLocalAuthorityFence>,
-    wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -2395,15 +2389,9 @@ impl RuntimeManager {
         // edge, so the work-scope bridge re-broadcasts a `WorkScopeUpdate`.
         let (work_scope_browser_tx, work_scope_browser_rx) = mpsc::unbounded_channel();
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
-        let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
         let (aggregate_event_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         let fatal_local_authority_fence = FatalLocalAuthorityFence::new();
-        let wake_registrar: Arc<dyn WakeRegistrar> =
-            Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
-                db.wake_repository(),
-                wake_kick_tx.clone(),
-            ));
         let bash_handles = Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
             bash_lifecycle_tx,
         )));
@@ -2485,14 +2473,9 @@ impl RuntimeManager {
             work_scope_browser_rx: RwLock::new(Some(work_scope_browser_rx)),
             creation_kick_tx,
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
-            wake_kick_tx,
-            wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
-            #[cfg(test)]
-            wake_worker_exit: AsyncMutex::new(None),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
             fatal_local_authority_fence,
-            wake_registrar: Some(wake_registrar),
         }
     }
 
@@ -2700,10 +2683,6 @@ impl RuntimeManager {
     /// terminal attach path).
     pub fn tmux_registry(&self) -> &Arc<TmuxRegistry> {
         &self.tmux_registry
-    }
-
-    pub fn wake_registrar(&self) -> Option<Arc<dyn WakeRegistrar>> {
-        self.wake_registrar.clone()
     }
 
     /// Get the spawn channel sender (cloned for each runtime)
@@ -3469,16 +3448,6 @@ impl RuntimeManager {
                 }
                 manager.kick_creation_worker();
                 manager
-                    .db
-                    .cancel_close_settlement_wakes(obligation.attempt_id().as_str())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                manager
-                    .db
-                    .suppress_materialized_close_settlement_wakes(obligation.attempt_id().as_str())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                manager
                     .settle_close_direct_turn_targets(obligation.attempt_id().as_str())
                     .await?;
                 match manager
@@ -3566,11 +3535,6 @@ impl RuntimeManager {
 
     pub(crate) fn local_authority_is_closed(&self) -> bool {
         self.fatal_local_authority_fence.is_closed()
-    }
-
-    pub(crate) fn local_authority_cancellation(&self) -> tokio_util::sync::CancellationToken {
-        self.fatal_local_authority_fence
-            .external_effect_cancellation()
     }
 
     pub(crate) fn acquire_local_authority_pass(&self) -> Result<AdmittedOperation, ()> {
@@ -3697,11 +3661,6 @@ impl RuntimeManager {
     pub fn kick_creation_worker(&self) {
         let next = self.creation_kick_tx.borrow().wrapping_add(1);
         let _ = self.creation_kick_tx.send(next);
-    }
-
-    pub fn kick_wake_worker(&self) {
-        let next = self.wake_kick_tx.borrow().wrapping_add(1);
-        let _ = self.wake_kick_tx.send(next);
     }
 
     pub(crate) async fn dispatch_standalone_turn(
@@ -4406,68 +4365,6 @@ impl RuntimeManager {
         }
         self.kick_direct_turn_worker();
         Ok(())
-    }
-
-    pub async fn start_wake_worker(self: &Arc<Self>) -> Result<(), String> {
-        let rx = self.wake_kick_rx.write().await.take();
-        let Some(rx) = rx else {
-            tracing::debug!("wake worker already started; skipping");
-            return Ok(());
-        };
-        let manager = Arc::clone(self);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let mut worker = tokio::spawn(async move {
-            Box::pin(crate::runtime::wake::run(manager, rx, ready_tx)).await
-        });
-        tokio::select! {
-            ready = ready_rx => ready.map_err(|_| "wake worker stopped before startup reconciliation completed".to_string())?,
-            exited = &mut worker => {
-                return Err(format!(
-                    "wake worker stopped before startup reconciliation completed: {}",
-                    Self::describe_wake_worker_exit(exited)
-                ));
-            }
-        };
-        let manager = Arc::clone(self);
-        #[cfg(test)]
-        let wake_worker_exit = {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            *self.wake_worker_exit.lock().await = Some(rx);
-            Some(tx)
-        };
-        tokio::spawn(async move {
-            match worker.await {
-                Ok(Ok(crate::runtime::wake::WakeWorkerExit::CoordinatedShutdown)) => {
-                    tracing::info!("wake worker stopped for coordinated shutdown");
-                }
-                result => {
-                    let detail = Self::describe_wake_worker_exit(result);
-                    tracing::error!(%detail, "wake worker lost local authority");
-                    manager.signal_fatal_local_authority("wake_worker_exit");
-                }
-            }
-            #[cfg(test)]
-            if let Some(exit) = wake_worker_exit {
-                let _ = exit.send(());
-            }
-        });
-        self.kick_wake_worker();
-        Ok(())
-    }
-
-    fn describe_wake_worker_exit(
-        result: Result<
-            Result<crate::runtime::wake::WakeWorkerExit, String>,
-            tokio::task::JoinError,
-        >,
-    ) -> String {
-        match result {
-            Ok(Ok(crate::runtime::wake::WakeWorkerExit::CoordinatedShutdown)) => {
-                "wake worker exited for coordinated shutdown".to_string()
-            }
-            Ok(Err(error)) => format!("wake worker exited: {error}"),
-            Err(error) => format!("wake worker join failure: {error}"),
-        }
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests
@@ -6219,7 +6116,6 @@ impl RuntimeManager {
         let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
 
         let runtime = runtime
-            .with_wake_registrar(self.wake_registrar())
             .with_startup_llm_recovery(startup_llm_recovery)
             .with_startup_llm_recovery_ack(startup_llm_recovery_ack_tx)
             .with_state_updated_at(initial_state_updated_at)
@@ -10873,30 +10769,6 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn production_wake_worker_exit_is_coordinated_during_process_shutdown() {
-        let manager = Arc::new(test_manager().await);
-        manager
-            .start_wake_worker()
-            .await
-            .expect("start production wake supervisor");
-        let fatal = manager.fatal_local_authority_receiver();
-
-        manager.begin_process_shutdown();
-        manager.kick_wake_worker();
-        manager
-            .wake_worker_exit
-            .lock()
-            .await
-            .take()
-            .expect("wake worker exit observer")
-            .await
-            .expect("wake supervisor publishes exit");
-
-        assert_eq!(*fatal.borrow(), None);
-        manager.drain_process_shutdown().await;
-    }
-
-    #[tokio::test]
     async fn fatal_fence_does_not_block_on_full_runtime_event_channel() {
         let manager = test_manager().await;
         let (event_tx, _event_rx) = mpsc::channel(1);
@@ -13583,9 +13455,52 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn startup_resumes_typed_wake_and_interaction_occurrences() {
+    async fn startup_does_not_resume_historical_wake_pointer() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "historical-wake-startup";
+        manager
+            .db()
+            .create_conversation(conversation_id, "History", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "historical-startup-input",
+                conversation_id,
+                &crate::db::MessageContent::user("Historical background observation"),
+                Some(&serde_json::json!({"type": "wake_result", "adopted": true})),
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES (?1, 'historical-startup-input', 'wake')")
+            .bind(conversation_id).execute(manager.db().pool()).await.unwrap();
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let pointer: String = sqlx::query_scalar(
+            "SELECT source_kind FROM steering_execution_occurrences WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(pointer, "wake");
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_typed_seeded_and_interaction_occurrences() {
         for (source_kind, conversation_id) in [
-            ("wake", "restart-adopted-wake"),
             ("seeded_fork", "restart-seeded-fork"),
             ("interaction_response", "restart-interaction-response"),
         ] {
@@ -13804,7 +13719,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'response-less-occurrence', 'wake')",
+             VALUES (?1, 'response-less-occurrence', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -13847,7 +13762,7 @@ mod scope_liveness_tests {
             .add_message(
                 "completed-occurrence-source",
                 conversation_id,
-                &crate::db::MessageContent::user("accepted wake"),
+                &crate::db::MessageContent::user("accepted seeded input"),
                 None,
                 None,
             )
@@ -13856,7 +13771,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'completed-occurrence-source', 'wake')",
+             VALUES (?1, 'completed-occurrence-source', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14116,7 +14031,7 @@ mod scope_liveness_tests {
             .add_message(
                 "invalid-model-occurrence",
                 conversation_id,
-                &crate::db::MessageContent::user("accepted wake"),
+                &crate::db::MessageContent::user("accepted seeded input"),
                 None,
                 None,
             )
@@ -14125,7 +14040,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'invalid-model-occurrence', 'wake')",
+             VALUES (?1, 'invalid-model-occurrence', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14199,7 +14114,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'occurrence-text-input', 'wake')",
+             VALUES (?1, 'occurrence-text-input', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14241,67 +14156,6 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         ));
-    }
-
-    #[tokio::test]
-    async fn restart_marker_preserves_exact_batched_wake_occurrence() {
-        let manager = Arc::new(test_manager().await);
-        let conversation_id = "restart-occurrence-batched-wake-marker";
-        manager
-            .db()
-            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        for (message_id, terminal) in [
-            ("resumable-wake", "Completed"),
-            ("later-cancelled-wake", "Cancelled"),
-        ] {
-            manager
-                .db()
-                .add_message(
-                    message_id,
-                    conversation_id,
-                    &crate::db::MessageContent::user("wake"),
-                    Some(&serde_json::json!({
-                        "type": "wake_result",
-                        "adopted": true,
-                        "terminal": { terminal: {} },
-                    })),
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-        sqlx::query(
-            "INSERT INTO steering_execution_occurrences
-                 (conversation_id, message_id, source_kind)
-             VALUES (?1, 'resumable-wake', 'wake')",
-        )
-        .bind(conversation_id)
-        .execute(manager.db().pool())
-        .await
-        .unwrap();
-        manager
-            .db()
-            .add_message(
-                "wake-restart-marker",
-                conversation_id,
-                &crate::db::MessageContent::System(crate::db::SystemContent {
-                    text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
-                }),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        let recovery = manager
-            .execution_occurrence_recovery(conversation_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovery.source_message_id, "resumable-wake");
-        assert_eq!(recovery.disposition, ExecutionOccurrenceDisposition::Resume);
     }
 
     #[tokio::test]
@@ -14407,7 +14261,7 @@ mod scope_liveness_tests {
             .add_message(
                 "conflicted-occurrence",
                 conversation_id,
-                &crate::db::MessageContent::user("accepted wake"),
+                &crate::db::MessageContent::user("accepted seeded input"),
                 None,
                 None,
             )
@@ -14416,7 +14270,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'conflicted-occurrence', 'wake')",
+             VALUES (?1, 'conflicted-occurrence', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14474,7 +14328,7 @@ mod scope_liveness_tests {
             .add_message(
                 "new-exhaustion-occurrence",
                 conversation_id,
-                &crate::db::MessageContent::user("new accepted wake"),
+                &crate::db::MessageContent::user("new accepted seeded input"),
                 None,
                 None,
             )
@@ -14483,7 +14337,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'new-exhaustion-occurrence', 'wake')",
+             VALUES (?1, 'new-exhaustion-occurrence', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14545,7 +14399,7 @@ mod scope_liveness_tests {
                 .add_message(
                     message_id,
                     conversation_id,
-                    &crate::db::MessageContent::user("wake"),
+                    &crate::db::MessageContent::user("seeded input"),
                     None,
                     None,
                 )
@@ -14555,7 +14409,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'replacement-initialization-occurrence', 'wake')",
+             VALUES (?1, 'replacement-initialization-occurrence', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14625,7 +14479,7 @@ mod scope_liveness_tests {
                 .add_message(
                     message_id,
                     conversation_id,
-                    &crate::db::MessageContent::user("wake"),
+                    &crate::db::MessageContent::user("seeded input"),
                     None,
                     None,
                 )
@@ -14635,7 +14489,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'replacement-new-occurrence', 'wake')",
+             VALUES (?1, 'replacement-new-occurrence', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14667,7 +14521,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn exhausted_wake_occurrence_atomically_releases_baton() {
+    async fn exhausted_seeded_occurrence_atomically_releases_baton() {
         let manager = Arc::new(test_manager().await);
         let conversation_id = "restart-interaction-occurrence-exhausted";
         materialize_restart_direct_turn(&manager, conversation_id).await;
@@ -14690,7 +14544,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'exhausted-interaction-response', 'wake')",
+             VALUES (?1, 'exhausted-interaction-response', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14867,7 +14721,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'classified-occurrence', 'wake')",
+             VALUES (?1, 'classified-occurrence', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -14901,7 +14755,7 @@ mod scope_liveness_tests {
             .add_message(
                 "replacement-occurrence",
                 conversation_id,
-                &crate::db::MessageContent::user("newer accepted wake"),
+                &crate::db::MessageContent::user("newer accepted seeded input"),
                 None,
                 None,
             )
@@ -14910,7 +14764,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'replacement-occurrence', 'wake')
+             VALUES (?1, 'replacement-occurrence', 'seeded_fork')
              ON CONFLICT(conversation_id) DO UPDATE SET
                  message_id = excluded.message_id,
                  source_kind = excluded.source_kind",
@@ -14962,7 +14816,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'occurrence-wait-input', 'wake')",
+             VALUES (?1, 'occurrence-wait-input', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -15056,9 +14910,9 @@ mod scope_liveness_tests {
         manager
             .db()
             .add_message(
-                "newer-wake-input",
+                "newer-seeded-input",
                 conversation_id,
-                &crate::db::MessageContent::user("newer durable wake"),
+                &crate::db::MessageContent::user("newer seeded input"),
                 None,
                 None,
             )
@@ -15067,7 +14921,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'newer-wake-input', 'wake')",
+             VALUES (?1, 'newer-seeded-input', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())
@@ -15140,7 +14994,7 @@ mod scope_liveness_tests {
         sqlx::query(
             "INSERT INTO steering_execution_occurrences
                  (conversation_id, message_id, source_kind)
-             VALUES (?1, 'occurrence-persist-input', 'wake')",
+             VALUES (?1, 'occurrence-persist-input', 'seeded_fork')",
         )
         .bind(conversation_id)
         .execute(manager.db().pool())

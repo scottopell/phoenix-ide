@@ -4,6 +4,8 @@
 - **Date:** 2026-07-12
 - **Affects:** REQ-DWF-013, REQ-DWF-019, REQ-DWF-022, REQ-DWF-029, REQ-DWF-030, REQ-DWF-031, REQ-DWF-032, REQ-DWF-CREATE-001, REQ-DWF-WAKE-003, REQ-DWF-WAKE-004
 
+- **Retirement cross-reference:** [ADR-092](092_retire-wake-execution-and-preserve-history.md) supersedes wake execution obligations; the decision body below is historical. Shared foundation, direct-turn, and creation obligations are not retired.
+
 ## Context
 
 A durable workflow begins at acceptance, but acceptance may occur across a

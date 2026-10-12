@@ -14,6 +14,29 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(phoenix_client)
 
 
+class PhoenixClientRemovedWakeTests(unittest.TestCase):
+    def test_client_has_no_wake_methods(self):
+        self.assertFalse(hasattr(phoenix_client.PhoenixClient, "get_wake_status"))
+        self.assertFalse(hasattr(phoenix_client.PhoenixClient, "cancel_wake"))
+
+    def test_help_does_not_advertise_removed_wake_options(self):
+        result = CliRunner().invoke(phoenix_client.main, ["--help"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn("--wake-status", result.output)
+        self.assertNotIn("--wake-cancel", result.output)
+
+    def test_removed_wake_options_are_rejected_before_client_creation(self):
+        for args in (["--wake-status"], ["--wake-cancel", "contract"]):
+            with self.subTest(args=args):
+                with patch.object(phoenix_client, "PhoenixClient") as client:
+                    result = CliRunner().invoke(
+                        phoenix_client.main, ["-c", "conversation", *args]
+                    )
+                    self.assertEqual(result.exit_code, 2, result.output)
+                    self.assertIn(f"No such option: {args[0]}", result.output)
+                    client.assert_not_called()
+
+
 class PhoenixClientStateTests(unittest.TestCase):
     def test_poll_raises_nested_recoverable_continuation_failure_message(self):
         client = phoenix_client.PhoenixClient("http://localhost:1")

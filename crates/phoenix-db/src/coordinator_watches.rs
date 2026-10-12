@@ -310,7 +310,6 @@ pub(crate) async fn record_terminal_event_tx(
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MessageExecutionSource {
     Steering,
-    Wake,
     SeededFork,
     InteractionResponse,
 }
@@ -319,7 +318,6 @@ impl MessageExecutionSource {
     pub(crate) fn from_db(value: &str) -> DbResult<Self> {
         match value {
             "steering" => Ok(Self::Steering),
-            "wake" => Ok(Self::Wake),
             "seeded_fork" => Ok(Self::SeededFork),
             "interaction_response" => Ok(Self::InteractionResponse),
             _ => Err(DbError::Serialization(format!(
@@ -331,7 +329,6 @@ impl MessageExecutionSource {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Steering => "steering",
-            Self::Wake => "wake",
             Self::SeededFork => "seeded_fork",
             Self::InteractionResponse => "interaction_response",
         }

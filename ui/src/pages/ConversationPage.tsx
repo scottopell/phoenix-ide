@@ -42,7 +42,6 @@ import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { PaneDivider } from '../components/PaneDivider';
 import { QuestionPanel } from '../components/QuestionPanel';
-import { WakeStatusBar } from '../components/WakeStatusBar';
 import {
   useMessageQueue,
   useConnection,
@@ -2594,7 +2593,6 @@ function ConversationPageContent({
         </RenderProfiler>
         </>
       ) : null}
-      <WakeStatusBar conversationId={conversationId!} />
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}
