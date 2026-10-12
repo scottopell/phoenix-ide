@@ -228,7 +228,13 @@ impl Fixture {
             .current_dir(self.dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.dir.path().join("child-stderr"))
+                    .unwrap(),
+            );
         for marker in ["structured-marker", "fatal-marker"] {
             std::fs::write(self.dir.path().join(marker), "untouched").unwrap();
         }
@@ -236,6 +242,11 @@ impl Fixture {
     }
 
     fn assert_isolated(&self, sentinel: &TcpListener) {
+        let stderr = std::fs::read_to_string(self.dir.path().join("child-stderr")).unwrap();
+        assert!(
+            !stderr.contains("PHOENIX_DISCOVERY_CONSTRUCTED"),
+            "observation child constructed discovery: {stderr}"
+        );
         assert_eq!(std::fs::read(&self.path).unwrap(), self.original);
         for suffix in ["-wal", "-shm", "-journal"] {
             assert!(!Path::new(&format!("{}{suffix}", self.path.display())).exists());
@@ -281,10 +292,8 @@ impl Fixture {
 }
 
 fn sentinel() -> TcpListener {
-    // These ports are in DiscoveryConfig's normal probe range.
-    let listener = (9000..=9099)
-        .find_map(|port| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).ok())
-        .expect("disposable discovery sentinel port");
+    let listener =
+        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("ephemeral provider sentinel");
     listener.set_nonblocking(true).unwrap();
     listener
 }
@@ -671,4 +680,40 @@ async fn observation_startup_errors_do_not_log_migrate_or_fall_back_to_live() {
         assert!(!output.status.success());
         fixture.assert_isolated(&sentinel);
     }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn live_child_positive_control_records_discovery_construction() {
+    let fixture = Fixture::new(true).await;
+    let provider = sentinel();
+    let mut command = fixture.command(&provider);
+    command
+        .env("PHOENIX_BIND_ADDR", "127.0.0.1")
+        .env("PHOENIX_PORT", "0")
+        .stdout(std::fs::File::create(fixture.dir.path().join("child-stdout")).unwrap());
+    let mut child = Server(command.spawn().unwrap());
+    let pid = child.0.id();
+    let marker = format!("PHOENIX_DISCOVERY_CONSTRUCTED pid={pid} enabled=true");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let stderr = std::fs::read_to_string(fixture.dir.path().join("child-stderr")).unwrap();
+        if stderr.contains(&marker) {
+            break;
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "live control exited before construction: stderr={stderr} stdout={}",
+            std::fs::read_to_string(fixture.dir.path().join("child-stdout")).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "live construction control deadline: stderr={stderr} stdout={}",
+            std::fs::read_to_string(fixture.dir.path().join("child-stdout")).unwrap()
+        );
+        // test-timing-allow: Child-owned stderr construction marker is the causal oracle; deadline bounds liveness and Child lacks a notification API.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
 }

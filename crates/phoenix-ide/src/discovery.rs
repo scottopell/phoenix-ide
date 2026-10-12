@@ -82,6 +82,16 @@ pub struct DiscoveryServicesResponse {
 }
 
 pub fn start(config: DiscoveryConfig) -> Arc<DiscoveryRegistry> {
+    #[cfg(debug_assertions)]
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "PHOENIX_DISCOVERY_CONSTRUCTED pid={} enabled={}",
+            std::process::id(),
+            config.enabled
+        );
+    }
     let registry = Arc::new(DiscoveryRegistry::new(config.clone()));
     if config.enabled {
         supervisor::start(config, registry.clone());
