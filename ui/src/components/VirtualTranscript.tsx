@@ -104,6 +104,7 @@ interface PhysicalStore<T> {
   viewportTop: number;
   viewportExtent: number;
   overscan: number;
+  revealPublicationPending: boolean;
   activeAnchor: VirtualTranscriptAnchor | null;
   scroller: HTMLDivElement | null;
   headerElement: HTMLDivElement | null;
@@ -188,6 +189,13 @@ function clampNonNegative(value: number): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+function isLayoutHidden(element: Element | null): boolean {
+  for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+    if (getComputedStyle(ancestor).display === 'none') return true;
+  }
+  return false;
+}
+
 function viewportExtentForScroller(scroller: HTMLElement, measuredExtent = scroller.clientHeight): number {
   const styles = getComputedStyle(scroller);
   const reserved = (Number.parseFloat(styles.paddingTop) || 0) + (Number.parseFloat(styles.paddingBottom) || 0);
@@ -216,7 +224,9 @@ function buildPhysicalSnapshot<T>(
   targetIndex?: number,
   targetSelector?: string,
 ): VirtualTranscriptPhysicalSnapshot {
-  const visibleRange = computeVisibleRange(store);
+  const hidden = isLayoutHidden(store.scroller);
+  if (hidden) store.revealPublicationPending = true;
+  const visibleRange = hidden ? null : computeVisibleRange(store);
   const baseSnapshot = {
     renderedRange: normalizeRange(store.range),
     visibleRange: normalizeRange(visibleRange),
@@ -239,8 +249,8 @@ function buildPhysicalSnapshot<T>(
   return {
     ...baseSnapshot,
     targetIndex,
-    targetOffset: offset === undefined ? null : offset - settledViewportTop(store),
-    targetMeasured: store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
+    targetOffset: hidden || offset === undefined ? null : offset - settledViewportTop(store),
+    targetMeasured: !hidden && store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
   };
 }
 
@@ -249,9 +259,11 @@ function synchronizedPhysicalSnapshot<T>(
   targetIndex?: number,
   targetSelector?: string,
 ): VirtualTranscriptPhysicalSnapshot {
-  store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
-  store.viewportExtent = store.scroller ? viewportExtentForScroller(store.scroller) : store.viewportExtent;
-  recompute(store);
+  if (!isLayoutHidden(store.scroller)) {
+    store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
+    store.viewportExtent = store.scroller ? viewportExtentForScroller(store.scroller) : store.viewportExtent;
+    recompute(store);
+  }
   return buildPhysicalSnapshot(store, targetIndex, targetSelector);
 }
 
@@ -441,6 +453,12 @@ function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscri
 }
 
 function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: ResizeObserverEntry[]): void {
+  if (isLayoutHidden(store.scroller)) {
+    store.revealPublicationPending = true;
+    return;
+  }
+  const revealed = store.revealPublicationPending;
+  store.revealPublicationPending = false;
   let physicalChanged = false;
   let viewportChanged = false;
   const anchor = anchorForChange(store);
@@ -486,8 +504,8 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
     return;
   }
 
-  if (viewportChanged) {
-    if (wasPinned && (store.tailFollowAllowed || store.scroller?.classList.contains('reaction-dock-reserved'))) {
+  if (viewportChanged || revealed) {
+    if (viewportChanged && wasPinned && (store.tailFollowAllowed || store.scroller?.classList.contains('reaction-dock-reserved'))) {
       setScrollerScrollTop(store, totalPhysicalExtent(store));
     }
     recompute(store);
@@ -525,6 +543,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     viewportTop: 0,
     viewportExtent: 0,
     overscan: clampNonNegative(props.overscan ?? 0),
+    revealPublicationPending: false,
     activeAnchor: null,
     scroller: null,
     headerElement: null,
@@ -630,7 +649,8 @@ function VirtualTranscriptInner<T>(
       current.rowElements.set(key, element);
       const anchor = anchorForChange(current);
       const wasPinned = current.pinned;
-      const changed = updateMeasuredExtent(current, key, measureElementExtent(element));
+      const changed = !isLayoutHidden(element)
+        && updateMeasuredExtent(current, key, measureElementExtent(element));
       observeElement(current, publish, element);
       if (changed) {
         applyPhysicalChange(current, anchor, wasPinned);
@@ -668,7 +688,9 @@ function VirtualTranscriptInner<T>(
     current.headerElement = element;
     const anchor = topAnchorForChange(current);
     const wasPinned = current.pinned;
-    const nextExtent = element ? measureElementExtent(element) : 0;
+    const nextExtent = element
+      ? isLayoutHidden(element) ? current.headerExtent : measureElementExtent(element)
+      : 0;
     const changed = current.headerExtent !== nextExtent;
     current.headerExtent = nextExtent;
     if (element) observeElement(current, publish, element);
@@ -692,8 +714,10 @@ function VirtualTranscriptInner<T>(
 
     current.scroller = element;
     if (element) {
-      current.viewportTop = element.scrollTop;
-      current.viewportExtent = viewportExtentForScroller(element);
+      if (!isLayoutHidden(element)) {
+        current.viewportTop = element.scrollTop;
+        current.viewportExtent = viewportExtentForScroller(element);
+      }
       observeElement(current, publish, element);
       if (current.initialTailPending && current.layout.count > 0) {
         current.initialTailPending = false;

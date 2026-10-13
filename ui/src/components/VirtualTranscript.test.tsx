@@ -46,7 +46,15 @@ class TestResizeObserver implements ResizeObserver {
   }
 }
 
+function isHiddenByAncestor(element: Element): boolean {
+  for (let ancestor: Element | null = element; ancestor; ancestor = ancestor.parentElement) {
+    if (ancestor.hasAttribute('hidden') || (ancestor instanceof HTMLElement && ancestor.style.display === 'none')) return true;
+  }
+  return false;
+}
+
 function heightFromElement(element: Element): number {
+  if (isHiddenByAncestor(element)) return 0;
   const direct = element.getAttribute('data-height');
   if (direct) return Number(direct);
   const child = element.querySelector('[data-height]');
@@ -93,6 +101,7 @@ beforeEach(() => {
   Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
     configurable: true,
     get() {
+      if (isHiddenByAncestor(this)) return 0;
       if (this.classList.contains('virtual-transcript')) return 100;
       return heightFromElement(this);
     },
@@ -1082,6 +1091,120 @@ describe('VirtualTranscript', () => {
     expect(totals).toEqual([200]);
     expect(pinnedStates).toEqual([false, true]);
     expect(rowIndexes()).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  });
+
+  it.each(['hidden', 'display-none'] as const)('retains cached row extents through ancestor %s and positive reveal observations', (mode) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const totals: number[] = [];
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
+    render(
+      <div data-testid="retained-wrapper">
+        {/* happy-dom does not supply the browser's hidden-attribute UA rule. */}
+        <style>{'[hidden] { display: none; }'}</style>
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(5)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={20}
+          initialTail={false}
+          header={<div data-height={30}>Header</div>}
+          renderItem={renderRow}
+          onTotalExtentChange={(extent) => totals.push(extent)}
+          onRangeChange={(snapshot) => ranges.push(snapshot)}
+        />
+      </div>,
+    );
+    const wrapper = screen.getByTestId('retained-wrapper');
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
+    const rows = virtualRows();
+    expect(rows).toHaveLength(5);
+    expect(totals.at(-1)).toBe(130);
+
+    if (mode === 'hidden') wrapper.hidden = true;
+    else wrapper.style.display = 'none';
+    act(() => resizeObservers[0]!.triggerEntries([
+      [scroller, 0], [header, 0], ...rows.map((row): [Element, number] => [row, 0]),
+    ]));
+    act(() => ref.current?.scrollToIndex(0, 'start'));
+    expect(ranges.at(-1)?.visibleRange).toBeNull();
+
+    wrapper.hidden = false;
+    wrapper.style.display = '';
+    // Unmounted rows cannot report their positive sizes on reveal.
+    act(() => resizeObservers[0]!.triggerEntries([[scroller, 100], [header, 30]]));
+    expect(totals.at(-1)).toBe(130);
+    expect(rowIndexes()).toEqual([0, 1, 2, 3, 4]);
+    expect(ranges.at(-1)?.visibleRange).not.toBeNull();
+    act(() => ref.current?.scrollToIndex(0, 'start'));
+    expect(ref.current?.physicalSnapshot(0)).toMatchObject({ targetMeasured: true, targetOffset: 0 });
+  });
+
+  it.each(['snapshot-first', 'observer-first', 'snapshot-only'] as const)('positions and remounts a target without hidden measurement poisoning (%s)', (order) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
+    render(
+      <div data-testid="retained-wrapper">
+        {/* happy-dom does not supply the browser's hidden-attribute UA rule. */}
+        <style>{'[hidden] { display: none; }'}</style>
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(40)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={20}
+          initialTail={false}
+          header={<div data-height={30}>Header</div>}
+          renderItem={renderRow}
+          onRangeChange={(snapshot) => ranges.push(snapshot)}
+        />
+      </div>,
+    );
+    const wrapper = screen.getByTestId('retained-wrapper');
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
+    const hiddenEntries: [Element, number][] = [[scroller, 0], [header, 0], ...virtualRows().map((row): [Element, number] => [row, 0])];
+    wrapper.hidden = true;
+    act(() => {
+      if (order !== 'observer-first') ref.current?.physicalSnapshot();
+      if (order !== 'snapshot-only') resizeObservers[0]!.triggerEntries(hiddenEntries);
+      if (order === 'observer-first') ref.current?.physicalSnapshot();
+      ref.current?.scrollToIndex(20, 'start');
+      ref.current?.physicalSnapshot(20);
+    });
+    // A cached extent is not evidence that a hidden target is physically visible.
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({ visibleRange: null, targetMeasured: false });
+    expect(ranges.at(-1)?.visibleRange).toBeNull();
+
+    wrapper.hidden = false;
+    act(() => resizeObservers[0]!.triggerEntries([[scroller, 100], [header, 30]]));
+    expect(screen.getByTestId('payload-item-20')).toBeInTheDocument();
+    act(() => resizeObservers[0]!.triggerEntries(virtualRows().map((row): [Element, number] => [row, 20])));
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({ targetMeasured: true, targetOffset: 0 });
+    expect(ranges.at(-1)?.visibleRange).toEqual({ startIndex: 20, endIndex: 24 });
+  });
+
+  it('accepts a legitimate zero-height row while its ancestors remain displayed', () => {
+    const totals: number[] = [];
+    render(
+      <VirtualTranscript
+        ariaLabel="Transcript"
+        items={makeItems(10)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={20}
+        initialTail={false}
+        renderItem={renderRow}
+        onTotalExtentChange={(extent) => totals.push(extent)}
+      />,
+    );
+    const row = virtualRows()[0]!;
+    screen.getByTestId('payload-item-0').setAttribute('data-height', '0');
+    act(() => resizeObservers[0]!.triggerEntries([[row, 0]]));
+    expect(totals.at(-1)).toBe(180);
   });
 
   it('updates viewport geometry through ResizeObserver before publishing range', () => {
