@@ -46,6 +46,8 @@ import type { ConversationHistoryBoundaryView } from '../generated/ConversationH
 import type { CoordinatorConversationSnapshotView } from '../generated/CoordinatorConversationSnapshotView';
 import type { ComponentProps } from 'react';
 import './ProductConversationPage.css';
+import type { ContinuationOpeningView } from '../generated/ContinuationOpeningView';
+import { reconcileOpening } from '../conversation/opening';
 
 type AcquiredMessage = EnrichedMessage | Message;
 type ProductConversationSegmentView = Omit<ConversationHistorySegmentView, 'messages'> & { messages: AcquiredMessage[] };
@@ -244,6 +246,31 @@ function representedOpeningBoundary(
   ));
 }
 
+function reconcileSnapshotOpening(snapshot: HistorySnapshot, observation: ContinuationOpeningView | null): HistorySnapshot {
+  if (!observation || observation.status === 'none') return snapshot;
+  const edge = observation.edge;
+  const boundary = snapshot.boundaries.find(item => item.message_id === edge.continuation_message_id
+    && item.predecessor_transcript_row_id === edge.predecessor_transcript_row_id
+    && item.successor_transcript_row_id === edge.successor_transcript_row_id);
+  if (edge.product_conversation_id !== snapshot.product_conversation_id
+    || edge.successor_transcript_row_id !== snapshot.latest_transcript_row_id
+    || !snapshot.segments.some(segment => segment.transcript_row_id === edge.successor_transcript_row_id)
+    || !snapshot.segments.some(segment => segment.transcript_row_id === edge.predecessor_transcript_row_id)
+    || !boundary) return snapshot;
+  const opening = reconcileOpening(snapshot.latest_opening, observation)!;
+  const represented = opening.status === 'accepted' && opening.presentation === 'boundary' ? opening.accepted_message_id : null;
+  if (snapshot.latest_opening === opening && boundary.represented_successor_opening_message_id === represented) return snapshot;
+  return { ...snapshot, latest_opening: opening, boundaries: snapshot.boundaries.map(item => item === boundary
+    ? { ...item, represented_successor_opening_message_id: represented } : item) };
+}
+
+function deferPendingOpening(messages: Message[], opening: ContinuationOpeningView): Message[] {
+  if (opening.status !== 'pending') return messages;
+  return messages.filter(message => message.conversation_id !== opening.edge.successor_transcript_row_id
+    || (message.message_id !== opening.client_turn_key
+      && message.message_id !== `${opening.edge.successor_transcript_row_id}:${opening.client_turn_key}`));
+}
+
 function omitRepresentedOpenings<T extends AcquiredMessage>(messages: T[], boundaries: ConversationHistoryBoundaryView[]): T[] {
   return messages.filter(message => !boundaries.some(boundary => boundary.successor_transcript_row_id === message.conversation_id
     && boundary.represented_successor_opening_message_id === message.message_id));
@@ -355,6 +382,9 @@ function mergeRefreshedTail(
   current: HistorySnapshot,
   refreshed: HistorySnapshot,
 ): HistorySnapshot {
+  if (current.latest_opening.status === 'accepted' && refreshed.latest_opening.status === 'pending') {
+    refreshed = reconcileSnapshotOpening(refreshed, current.latest_opening);
+  }
   const segmentsByRowId = new Map(
     refreshed.segments.map((segment) => [segment.transcript_row_id, segment]),
   );
@@ -838,10 +868,10 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
   const ownedSnapshotRef = useRef<OwnedSnapshot | null>(null);
   const snapshotChangeSequenceRef = useRef(0);
-  const snapshot = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
+  const baseSnapshot = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
     ? ownedSnapshot.value
     : null;
-  const ordinarySnapshot = snapshot?.kind === 'ordinary' ? snapshot : null;
+  const baseOrdinarySnapshot = baseSnapshot?.kind === 'ordinary' ? baseSnapshot : null;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [snapshotRetry, setSnapshotRetry] = useState(0);
@@ -880,32 +910,44 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   }
   const paginationRequestRef = useRef(0);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
-  const transcriptAuthority = useConversationTranscriptAuthority(snapshot?.latest_transcript_row_id ?? null);
-  const currentLatestProjection = snapshot
+  const transcriptAuthority = useConversationTranscriptAuthority(baseSnapshot?.latest_transcript_row_id ?? null);
+  const currentLatestProjection = baseSnapshot
     && transcriptAuthority?.kind === 'live'
-    && latestProjection?.conversationId === snapshot.latest_transcript_row_id
+    && latestProjection?.conversationId === baseSnapshot.latest_transcript_row_id
     ? latestProjection
     : null;
-  const isOpen = !!snapshot && (!ordinarySnapshot || ordinarySnapshot.ordinary_lifecycle === 'open');
-  const closeIncomplete = ordinarySnapshot?.close?.outcome === 'close_incomplete';
+  const isOpen = !!baseSnapshot && (!baseOrdinarySnapshot || baseOrdinarySnapshot.ordinary_lifecycle === 'open');
+  const closeIncomplete = baseOrdinarySnapshot?.close?.outcome === 'close_incomplete';
   const liveTranscriptRowId = isOpen && !closeIncomplete && transcriptAuthority?.kind === 'live'
-    ? snapshot.latest_transcript_row_id : null;
+    ? baseSnapshot.latest_transcript_row_id : null;
   const memberTranscript = useConversationTranscriptView(liveTranscriptRowId);
   const currentMemberTranscript = liveTranscriptRowId && memberTranscript?.conversationId === liveTranscriptRowId
     ? memberTranscript
     : null;
+  const snapshot = baseSnapshot;
+  const ordinarySnapshot = snapshot?.kind === 'ordinary' ? snapshot : null;
+  const liveOpening = currentMemberTranscript?.opening ?? null;
+  useEffect(() => {
+    if (!liveOpening) return;
+    setOwnedSnapshot(current => {
+      if (!current || current.productConversationId !== productConversationId) return current;
+      const next = reconcileSnapshotOpening(current.value, liveOpening);
+      return next === current.value ? current : { ...current, value: next };
+    });
+  }, [liveOpening, productConversationId]);
   const liveMessages = currentMemberTranscript?.messages ?? null;
   const aggregateMessages = useMemo(
-    () => snapshot ? makeAggregateMessages(snapshot, liveMessages) : [],
+    () => snapshot ? deferPendingOpening(makeAggregateMessages(snapshot, liveMessages), snapshot.latest_opening) : [],
     [liveMessages, snapshot],
   );
   const aggregatePendingMessages = useMemo(() => {
     const acknowledgedIds = new Set(aggregateMessages.map((message) => message.message_id));
     return (currentLatestProjection?.pendingMessages ?? []).filter((message) => (
-      !acknowledgedIds.has(message.localId)
+      !(snapshot?.latest_opening.status === 'pending' && snapshot.latest_opening.edge.successor_transcript_row_id === currentLatestProjection?.conversationId && (message.localId === snapshot.latest_opening.client_turn_key || message.localId === `${snapshot.latest_opening.edge.successor_transcript_row_id}:${snapshot.latest_opening.client_turn_key}`))
+      && !acknowledgedIds.has(message.localId)
       && !acknowledgedIds.has(`${currentLatestProjection?.conversationId}:${message.localId}`)
     ));
-  }, [aggregateMessages, currentLatestProjection?.conversationId, currentLatestProjection?.pendingMessages]);
+  }, [aggregateMessages, currentLatestProjection?.conversationId, currentLatestProjection?.pendingMessages, snapshot?.latest_opening]);
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   const isWideDesktop = useIsWideDesktop();
   const showSplitPaneViewer = isWideDesktop && aggregateMessageSlot?.presentation === 'pane';
@@ -1107,13 +1149,11 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   }, [ordinarySnapshot?.close, productConversationId, snapshot]);
 
   const observedContinuationId = currentLatestProjection?.conversation?.continued_in_conv_id ?? null;
-  const observedOpeningMessageId = snapshot?.latest_opening_pending
-    ? liveMessages?.find((message) => message.message_type === 'user' || message.message_type === 'continuation')?.message_id ?? null
-    : null;
+
   useEffect(() => {
     if (currentLatestProjection?.conversationId !== snapshot?.latest_transcript_row_id) return;
-    if (observedContinuationId || observedOpeningMessageId) setSnapshotRetry((value) => value + 1);
-  }, [currentLatestProjection?.conversationId, observedContinuationId, observedOpeningMessageId, snapshot?.latest_transcript_row_id]);
+    if (observedContinuationId) setSnapshotRetry((value) => value + 1);
+  }, [currentLatestProjection?.conversationId, observedContinuationId, snapshot?.latest_transcript_row_id]);
 
   useEffect(() => {
     if (!currentLatestProjection?.conversationId || !ordinarySnapshot) return;
@@ -1335,7 +1375,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     && jumpCompletion?.commandKey === desiredPositioningKey
     ? { kind: 'idle', view: transcriptView }
     : desiredPositioning;
-  const liveControlsEnabled = isOpen && !closeInProgress && !snapshot?.latest_opening_pending;
+  const liveControlsEnabled = isOpen && !closeInProgress && snapshot?.latest_opening.status !== 'pending';
   const initialSnapshotReady = snapshot !== null;
 
   useEffect(() => {

@@ -283,7 +283,7 @@ function makeSnapshot(overrides: Partial<SnapshotFixtureInput> = {}): ProductCon
     ordinary_lifecycle: 'open',
     latest_transcript_row_id: 'row-2',
     writable_transcript_row_id: 'row-2',
-    latest_opening_pending: false,
+    latest_opening: { status: 'none' },
     updated_at: '2026-01-01T00:00:00Z',
     presentation: { kind: 'state', display_name: 'Product Alpha', presentation_mode: 'idle' },
     work_identity: {
@@ -393,12 +393,22 @@ function HistoryRouteControls() {
   </>;
 }
 
+function pendingOpening(): import('../generated/ContinuationOpeningView').ContinuationOpeningView {
+  return { status: 'pending', edge: { product_conversation_id: 'pc-1', predecessor_transcript_row_id: 'row-1', successor_transcript_row_id: 'row-2', continuation_message_id: 'cont-1' }, client_turn_key: 'reserved-key', opening_authority: 'generated_predecessor_context' };
+}
+
+function acceptedOpening(id: string, presentation: 'boundary' | 'separate_message'): import('../generated/ContinuationOpeningView').ContinuationOpeningView {
+  const pending = pendingOpening();
+  if (pending.status !== 'pending') throw new Error('fixture must be pending');
+  return { status: 'accepted', edge: pending.edge, accepted_message_id: id, opening_authority: pending.opening_authority, presentation };
+}
+
 function coordinatorSnapshot(snapshot: ProductConversationSnapshotView) {
   return {
     product_conversation_id: snapshot.product_conversation_id,
     canonical_route: '/global/row-2', requested_transcript_row_id: 'row-1',
     canonical_root: snapshot.canonical_root, latest_transcript_row_id: snapshot.latest_transcript_row_id,
-    writable_transcript_row_id: snapshot.writable_transcript_row_id, latest_opening_pending: snapshot.latest_opening_pending, updated_at: snapshot.updated_at,
+    writable_transcript_row_id: snapshot.writable_transcript_row_id, latest_opening: snapshot.latest_opening, updated_at: snapshot.updated_at,
     segments: snapshot.segments, boundaries: snapshot.boundaries, before: snapshot.before, has_older: snapshot.has_older,
   };
 }
@@ -464,6 +474,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     conversationId: id,
     conversation: { id, slug: projection.slug, updated_at: '2026-01-01', ...projection.conversation } as Conversation,
     messages: projection.messages as Message[],
+    opening: (overrides['opening'] ?? null) as import('../generated/ContinuationOpeningView').ContinuationOpeningView | null,
     phase: projection.convState as ConversationState,
     contextWindow: { used: 0 },
   });
@@ -614,18 +625,106 @@ describe('ProductConversationPage', () => {
 
   it.each([[false, 'user'], [true, 'user'], [false, 'continuation'], [true, 'continuation']] as const)('keeps a reserved opening read-only until its accepted signal refreshes readiness (Global=%s, opening=%s)', async (global, openingType) => {
     const { api } = await import('../api');
-    const pending = makeSnapshot({ latest_opening_pending: true, writable_transcript_row_id: null, before: null, has_older: false });
+    const pending = makeSnapshot({ latest_opening: pendingOpening(), writable_transcript_row_id: null, before: null, has_older: false });
     pending.segments = pending.segments.map((segment) => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [] } : segment);
     const opening = { ...makeMessage('accepted-opening', 1, 'row-2'), message_type: openingType, content: openingType === 'continuation' ? { type: 'continuation', summary: 'generated opening' } : { type: 'user', text: 'accepted opening' } };
-    const ready = { ...pending, latest_opening_pending: false, writable_transcript_row_id: 'row-2', segments: pending.segments.map((segment) => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [opening] } : segment) };
-    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(pending)).mockResolvedValueOnce(coordinatorSnapshot(ready));
-    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(pending).mockResolvedValueOnce(ready);
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(pending));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(pending);
     renderPage(global ? '/global/row-1' : '/product-conversations/pc-1');
     await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(false));
-    emitLatestProjection({ messages: [opening], phase: { type: 'idle' } });
+    emitLatestProjection({ messages: [opening], opening: acceptedOpening(opening.message_id, 'separate_message'), phase: { type: 'idle' } });
     await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(true));
-    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(1);
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+  });
+
+  it.each([false, true].flatMap(global => ['live', 'init', 'replay'].flatMap(mode => [false, true].map(prefixed => [global, mode, prefixed] as const))))('settles only typed opening authority without GET success (Global=%s, path=%s, prefixed=%s)', async (global, mode, prefixed) => {
+    const { api } = await import('../api');
+    const pending = makeSnapshot({ latest_opening: pendingOpening(), writable_transcript_row_id: null, before: null, has_older: false });
+    pending.segments = pending.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [] } : segment);
+    const loader = global ? vi.mocked(api.getCoordinatorHistory) : vi.mocked(api.getProductConversationHistorySnapshot);
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(pending)).mockRejectedValueOnce(new Error('typed refresh failed'));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(pending).mockRejectedValueOnce(new Error('typed refresh failed'));
+    renderPage(global ? '/global/row-1?source_transcript=row-1' : '/product-conversations/pc-1?source_transcript=row-1');
+    await waitForPageReady();
+    const opening = { ...makeMessage(prefixed ? 'row-2:reserved-key' : 'reserved-key', 1, 'row-2'), content: { type: 'user', text: 'First handoff' } };
+    const manual = { ...makeMessage('manual-equal-text', 2, 'row-2'), content: { type: 'user', text: 'First handoff' } };
+    act(() => emitLatestProjection({ messages: [opening, manual] }));
+    expect(screen.getByTestId('message-order')).toHaveTextContent('manual-equal-text');
+    expect(screen.getByTestId('message-order')).not.toHaveTextContent('reserved-key');
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(false);
+    const accepted = acceptedOpening(opening.message_id, 'boundary');
+    act(() => {
+      if (mode === 'live') conversationStore.dispatch('row-2', { type: 'sse_message', message: opening, sequenceId: 1, opening: accepted });
+      else conversationStore.dispatch('row-2', { type: 'sse_init', payload: {
+        conversation: conversationStore.getSnapshot('row-2').conversation!, messages: mode === 'init' ? [opening, manual] : [], steeringMessages: [],
+        opening: mode === 'init' ? accepted : null, phase: { type: 'idle' }, contextWindow: { used: 0 }, transcriptGeneration: 1,
+        streamIncarnation: 'typed-opening', lastAppliedEventSeq: mode === 'init' ? 2 : 1, pendingAnchorSequenceId: mode === 'init' ? 2 : 0,
+        pendingEvents: mode === 'replay' ? [{ type: 'message', message: opening, sequence_id: 1, opening: accepted }] : [],
+        pendingTruncated: false, transcriptCoverage: 'tail',
+      } });
+    });
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(true));
+    expect(screen.getByTestId('message-order')).not.toHaveTextContent('reserved-key');
+    expect(screen.getByTestId('message-order')).toHaveTextContent('manual-equal-text');
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('typed refresh failed'));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(true);
+    expect(loader).toHaveBeenCalledTimes(2);
+    const floor = conversationStore.getSnapshot('row-2').lastAppliedEventSeq;
+    act(() => conversationStore.dispatch('row-2', { type: 'sse_message_updated', sequenceId: floor + 1, messageId: opening.message_id,
+      content: { text: 'Edited opening' }, transcriptGeneration: 2, opening: acceptedOpening(opening.message_id, 'separate_message') }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(opening.message_id));
+    expect(screen.getByTestId('message-text-order')).toHaveTextContent('Edited opening');
+    act(() => conversationStore.dispatch('row-2', { type: 'sse_message_updated', sequenceId: floor + 2, messageId: opening.message_id,
+      content: { text: 'First handoff' }, transcriptGeneration: 3, opening: accepted }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).not.toHaveTextContent('reserved-key'));
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(pending));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(pending);
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+    await waitFor(() => expect(loader).toHaveBeenCalledTimes(3));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(true);
+  });
+
+  it.each(['history', 'closing'] as const)('does not grant newest readiness to a read-only %s aggregate', async lifecycle => {
+    const { api } = await import('../api');
+    const snapshot = makeSnapshot({ latest_opening: pendingOpening(), writable_transcript_row_id: null, before: null, has_older: false,
+      ordinary_lifecycle: lifecycle === 'history' ? 'history' : 'open',
+      close: lifecycle === 'closing' ? { attempt_id: 'closing', phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null, confirmation_snapshot: null, inspections: [], losses: [], residuals: [] } : null });
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(snapshot);
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => conversationStore.dispatch('row-2', { type: 'set_initial_data', conversationId: 'row-2', conversation: { id: 'row-2', slug: 'row-2' } as Conversation, messages: [makeMessage('accepted-readonly', 1, 'row-2')], opening: acceptedOpening('accepted-readonly', 'boundary'), phase: { type: 'idle' }, contextWindow: { used: 0 } }));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).not.toBe(true);
+  });
+
+  it('permits an authoritative accepted GET presentation update after an earlier live receipt', async () => {
+    const { api } = await import('../api');
+    const pending = makeSnapshot({ latest_opening: pendingOpening(), writable_transcript_row_id: null, before: null, has_older: false });
+    const id = 'opening-update';
+    const ready = makeSnapshot({ latest_opening: acceptedOpening(id, 'separate_message'), before: null, has_older: false });
+    ready.segments = ready.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [makeMessage(id, 1, 'row-2')] } : segment);
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(pending).mockResolvedValueOnce(ready);
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => emitLatestProjection({ opening: acceptedOpening(id, 'boundary'), messages: [makeMessage(id, 1, 'row-2')] }));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(true));
+    expect(screen.getByTestId('message-order')).not.toHaveTextContent(id);
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(id));
+  });
+
+  it.each(['product_conversation_id', 'predecessor_transcript_row_id', 'successor_transcript_row_id', 'continuation_message_id'] as const)('rejects a foreign opening %s while preserving pending authority', async field => {
+    const { api } = await import('../api');
+    const pending = makeSnapshot({ latest_opening: pendingOpening(), writable_transcript_row_id: null, before: null, has_older: false });
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(pending);
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    const accepted = acceptedOpening('foreign-opening', 'boundary');
+    if (accepted.status !== 'accepted') throw new Error('fixture');
+    act(() => emitLatestProjection({ messages: [makeMessage('foreign-opening', 1, 'row-2')], opening: { ...accepted, edge: { ...accepted.edge, [field]: 'foreign' } } }));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(false);
+    expect(screen.getByTestId('message-order')).toHaveTextContent('foreign-opening');
   });
 
   it.each([false, true])('rejects loaded evidence owned by another pinned transcript (Global=%s)', async global => {
@@ -750,7 +849,7 @@ describe('ProductConversationPage', () => {
 
   it.each([false, true])('does not fabricate pending opening authority or hide a failed readiness refresh (Global=%s)', async global => {
     const { api } = await import('../api');
-    const pending = makeSnapshot({ latest_opening_pending: true, writable_transcript_row_id: null, before: null, has_older: false });
+    const pending = makeSnapshot({ latest_opening: pendingOpening(), writable_transcript_row_id: null, before: null, has_older: false });
     pending.segments = pending.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [] } : segment);
     const opening = { ...makeMessage('pending-generated-opening', 1, 'row-2'), message_type: 'continuation' as const, content: { type: 'continuation', summary: 'First handoff' } };
     if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(pending)).mockRejectedValueOnce(new Error('opening authority refresh failed'));
@@ -758,6 +857,7 @@ describe('ProductConversationPage', () => {
     renderPage(global ? '/global/row-1' : '/product-conversations/pc-1');
     await waitForPageReady();
     act(() => emitLatestProjection({ messages: [opening], pendingMessages: [], convState: { type: 'idle' } }));
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('opening authority refresh failed'));
     expect(pending.boundaries[0]?.represented_successor_opening_message_id).toBeNull();
     expect(screen.getByTestId('message-order').textContent).toBe('m-1,m-2,cont-1,pending-generated-opening');
@@ -918,7 +1018,7 @@ describe('ProductConversationPage', () => {
 
   it.each([[false, false], [true, false], [false, true], [true, true]])('does not invent a boundary for an empty unrepresented source pin (Global=%s, pending=%s)', async (global, pending) => {
     const { api } = await import('../api');
-    const initial = makeSnapshot({ before: null, has_older: false, latest_opening_pending: pending, writable_transcript_row_id: pending ? null : 'row-2' });
+    const initial = makeSnapshot({ before: null, has_older: false, latest_opening: pending ? pendingOpening() : { status: 'none' }, writable_transcript_row_id: pending ? null : 'row-2' });
     initial.segments = initial.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [] } : segment);
     if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(initial));
     else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(initial);

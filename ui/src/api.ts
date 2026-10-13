@@ -2,6 +2,7 @@ import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
+import { ContinuationOpeningSchema } from './conversation/opening';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
 import type { SqliteReportWindow } from './generated/SqliteReportWindow';
@@ -1858,7 +1859,8 @@ export const api = {
     if (options?.before) params.set('before', options.before);
     const response = await fetch(`/api/global/coordinator/history/${encodeURIComponent(reference)}?${params}`);
     if (!response.ok) throw new ApiResponseError('Unable to read Global conversation history', response.status);
-    return response.json();
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getProductConversationHistorySnapshot(
@@ -1871,7 +1873,8 @@ export const api = {
     if (options?.open_id) params.set('open_id', options.open_id);
     const response = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}?${params}`);
     if (!response.ok) throw new ApiResponseError('Unable to read product conversation history', response.status);
-    return response.json();
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getProductConversationSnapshot(
@@ -1898,7 +1901,8 @@ export const api = {
         : 'Failed to fetch product conversation snapshot';
       throw new ApiResponseError(detail, resp.status);
     }
-    return resp.json();
+    const snapshot = await resp.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {

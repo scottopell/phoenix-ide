@@ -62,7 +62,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
     product_conversation_id: 'pc-product-alpha',
     close: null,
     boundaries: [],
-    latest_opening_pending: false,
+    latest_opening: { status: 'none' },
     canonical_route: '/product-conversations/pc-product-alpha',
     requested_transcript_row_id: 'row-work',
     canonical_root: { transcript_row_id: 'row-root', slug: 'product-alpha-root', title: 'Product Alpha root' },
@@ -314,7 +314,7 @@ export function coordinatorSnapshot(snapshot: ProductConversationSnapshotView): 
     canonical_root: snapshot.canonical_root,
     latest_transcript_row_id: snapshot.latest_transcript_row_id,
     writable_transcript_row_id: snapshot.writable_transcript_row_id,
-    latest_opening_pending: snapshot.latest_opening_pending,
+    latest_opening: snapshot.latest_opening,
     updated_at: snapshot.updated_at, segments: snapshot.segments,
     boundaries: snapshot.boundaries, before: snapshot.before, has_older: snapshot.has_older,
   };
