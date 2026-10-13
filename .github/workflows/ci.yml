@@ -270,17 +270,24 @@ jobs:
         working-directory: pinned-app
         run: |
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, shutil, subprocess
+          import hashlib, json, pathlib, shutil, subprocess
           root = pathlib.Path.cwd()
-          candidates = []
-          for executable in (root/'target/debug/deps').glob('phoenix_ide-*'):
-              if not executable.is_file() or not os.access(executable, os.X_OK):
-                  continue
-              listed = subprocess.run([str(executable), '--list'], capture_output=True, text=True, timeout=10)
-              if listed.returncode == 0 and 'opening_qualifier::actual_server_opening_qualifier: test' in listed.stdout:
-                  candidates.append(executable)
+          selector = ['cargo', 'test', '-p', 'phoenix-ide', '--lib', '--no-run', '--message-format=json']
+          selected = subprocess.run(selector, capture_output=True, text=True, timeout=120)
+          (root.parent/'opening-instrumented-selector.log').write_text(selected.stdout+selected.stderr)
+          assert selected.returncode == 0, 'libtest artifact metadata selection failed'
+          artifacts = [json.loads(line) for line in selected.stdout.splitlines() if line.startswith('{')]
+          candidates = [pathlib.Path(artifact['executable']) for artifact in artifacts
+                        if artifact.get('reason') == 'compiler-artifact'
+                        and artifact.get('target',{}).get('name') == 'phoenix_ide'
+                        and 'lib' in artifact.get('target',{}).get('kind',[])
+                        and artifact.get('profile',{}).get('test') is True
+                        and artifact.get('executable')]
           assert len(candidates) == 1, f'ambiguous instrumented libtest candidates: {candidates}'
           executable = candidates[0]
+          assert executable.resolve().is_relative_to((root/'target').resolve())
+          listed = subprocess.run([str(executable), '--list'], capture_output=True, text=True, timeout=10)
+          assert listed.returncode == 0 and 'opening_qualifier::actual_server_opening_qualifier: test' in listed.stdout
           destination = root.parent/'opening-instrumented-libtest'
           shutil.copyfile(executable, destination)
           destination.chmod(0o700)
@@ -291,6 +298,7 @@ jobs:
           receipt.update({'evidence_class':'instrumented_cfg_test_library_not_shipping_runtime',
                           'executable_sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),
                           'compiled_executable_path':str(executable.relative_to(root)),
+                          'compiler_artifact_selector':selector,
                           'focused_test_command':command[1:], 'focused_test_exit':completed.returncode,
                           'ignored_driver':'opening_qualifier::actual_server_opening_qualifier'})
           (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
@@ -311,6 +319,7 @@ jobs:
             opening-instrumented-libtest
             opening-instrumented-receipt.json
             opening-instrumented-unit.log
+            opening-instrumented-selector.log
 
   check-ui:
     name: check (ui/specs)
