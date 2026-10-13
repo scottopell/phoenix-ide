@@ -19,8 +19,8 @@ import {
 import { useChainAtom, type InflightQa } from '../chain';
 import { parseConversationState } from '../utils';
 import type { EnrichedMessage } from '../generated/EnrichedMessage';
-import type { RestoreBasis } from '../conversation/historyExpansion';
-import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
+import type { HistoryScrollCommand, RestoreBasis } from '../conversation/historyExpansion';
+import { transcriptPositioningInputCommandKey, type TranscriptPositioningCompletion, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '../components/MessageContextMenu';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
@@ -814,7 +814,8 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   if (hashNavigationRef.current.key !== location.key) {
     hashNavigationRef.current = { key: location.key, token: ++scrollCommandTokenRef.current };
   }
-  const [handledPositioningToken, setHandledPositioningToken] = useState<number | null>(null);
+  const [jumpCompletion, setJumpCompletion] = useState<TranscriptPositioningCompletion | null>(null);
+  const desiredJumpRef = useRef<Extract<HistoryScrollCommand, { kind: 'jump_to_message' }> | null>(null);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
   const ownedSnapshotRef = useRef<OwnedSnapshot | null>(null);
   const snapshotChangeSequenceRef = useRef(0);
@@ -1284,18 +1285,29 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const hashTargetLoaded = !!resolvedHashTargetMessageId && messages.some((message) => message.message_id === resolvedHashTargetMessageId);
   const hashTargetExhausted = !!hashTargetMessageId && !hashTargetLoaded && snapshot?.has_older === false;
   const positioningTargetMessageId = readerSelection.kind === 'unavailable' ? undefined : hashTargetLoaded ? resolvedHashTargetMessageId : transcriptTargetMessage?.message_id;
-  const transcriptPositioning = (restoreCommand?.navigationToken === hashNavigationRef.current.token ? restoreCommand.positioning : null) ?? (positioningTargetMessageId && handledPositioningToken !== hashNavigationRef.current.token
-    ? {
-      kind: 'positioning' as const,
-      command: {
-        kind: 'jump_to_message' as const,
-        token: hashNavigationRef.current.token,
-        requestToken: 0,
-        view: transcriptView,
-        targetMessageId: positioningTargetMessageId,
-      },
+  const previousJump = desiredJumpRef.current;
+  const completedJump = previousJump
+    && previousJump.token === hashNavigationRef.current.token
+    && previousJump.view.conversationId === transcriptView.conversationId
+    && previousJump.targetMessageId === positioningTargetMessageId
+    && jumpCompletion?.commandKey === transcriptPositioningInputCommandKey({ kind: 'positioning', command: previousJump });
+  const desiredJump = positioningTargetMessageId
+    ? completedJump ? previousJump : {
+      kind: 'jump_to_message' as const,
+      token: hashNavigationRef.current.token,
+      requestToken: 0,
+      view: transcriptView,
+      targetMessageId: positioningTargetMessageId,
     }
-    : { kind: 'idle' as const, view: transcriptView });
+    : null;
+  desiredJumpRef.current = desiredJump;
+  const desiredPositioning: TranscriptPositioningInput = (restoreCommand?.navigationToken === hashNavigationRef.current.token ? restoreCommand.positioning : null)
+    ?? (desiredJump ? { kind: 'positioning', command: desiredJump } : { kind: 'idle', view: transcriptView });
+  const desiredPositioningKey = transcriptPositioningInputCommandKey(desiredPositioning);
+  const transcriptPositioning: TranscriptPositioningInput = desiredPositioningKey !== null
+    && jumpCompletion?.commandKey === desiredPositioningKey
+    ? { kind: 'idle', view: transcriptView }
+    : desiredPositioning;
   const liveControlsEnabled = isOpen && !closeInProgress && !snapshot?.latest_opening_pending;
   const initialSnapshotReady = snapshot !== null;
   useLayoutEffect(() => {
@@ -1425,10 +1437,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           onViewAnchorProbe={journey.registerAnchorProbe}
           viewAnchorIntent={{
             scope: `${hashNavigationRef.current.token}:${observedSegmentId ?? ''}:${historyGeneration}`,
-            ...(positioningTargetMessageId ? { command: {
-              kind: 'jump_to_message' as const, token: hashNavigationRef.current.token, requestToken: 0,
-              view: transcriptView, targetMessageId: positioningTargetMessageId,
-            } } : { command: null, view: transcriptView }),
+            ...(desiredJump ? { command: desiredJump } : { command: null, view: transcriptView }),
           }}
           historyBoundaries={snapshot.boundaries}
           streamingRequestId={closeInProgress ? null : currentMemberTranscript?.streamingRequestId ?? null}
@@ -1453,13 +1462,14 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           loadingOlderMessages={loadingOlder}
           olderHistoryError={olderError}
           transcriptPositioning={transcriptPositioning}
-          onHistoryScrollCommandHandled={(token, result) => {
-            if (token === hashNavigationRef.current.token) {
-              journey.anchor(result);
-              setHandledPositioningToken(token);
+          onHistoryScrollCommandHandled={(completion) => {
+            if (completion.commandKey !== desiredPositioningKey) return;
+            journey.anchor(completion.result);
+            if (desiredPositioning.kind === 'positioning' && desiredPositioning.command.kind === 'jump_to_message') {
+              setJumpCompletion(completion);
             }
             setRestoreCommand((current) => (
-              current?.positioning.kind === 'positioning' && current.positioning.command.token === token ? null : current
+              current && transcriptPositioningInputCommandKey(current.positioning) === completion.commandKey ? null : current
             ));
           }}
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
