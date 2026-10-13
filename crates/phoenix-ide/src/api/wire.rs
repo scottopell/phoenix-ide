@@ -3,7 +3,7 @@
 //! This module is the single Rust-side source of truth for the shape of SSE
 //! events on the wire. `SseWireEvent` (internally tagged by `type`) replaces
 //! the hand-rolled `json!()` macros that used to live in [`super::sse`]: every
-//! broadcast [`crate::runtime::SseEvent`] is `From`-converted into an
+//! broadcast [`crate::runtime::SseEvent`] is projected into an
 //! `SseWireEvent`, then `serde_json::to_string`'d into the SSE `data:` line.
 //!
 //! The typed path doubles as the codegen source: `#[derive(ts_rs::TS)]` +
@@ -95,6 +95,7 @@ impl ErrorPresentation {
 pub struct EnrichedMessage {
     pub message_id: String,
     pub origin: InputOrigin,
+    pub event_presentation: Option<super::event_presentation::EventPresentation>,
     pub conversation_id: String,
     pub sequence_id: i64,
     pub message_type: MessageType,
@@ -106,12 +107,16 @@ pub struct EnrichedMessage {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<&Message> for EnrichedMessage {
-    fn from(msg: &Message) -> Self {
+impl EnrichedMessage {
+    pub(crate) fn new(
+        msg: &Message,
+        presentations: &super::event_presentation::EventPresentations,
+    ) -> Self {
         let content = enrich_content(msg);
         Self {
             message_id: msg.message_id.clone(),
             origin: msg.origin.clone(),
+            event_presentation: presentations.for_message(msg),
             conversation_id: msg.conversation_id.clone(),
             sequence_id: msg.sequence_id,
             message_type: msg.message_type,
@@ -120,12 +125,6 @@ impl From<&Message> for EnrichedMessage {
             usage_data: msg.usage_data.clone(),
             created_at: msg.created_at,
         }
-    }
-}
-
-impl From<Message> for EnrichedMessage {
-    fn from(msg: Message) -> Self {
-        Self::from(&msg)
     }
 }
 
@@ -477,9 +476,12 @@ impl SseWireEvent {
     }
 }
 
-impl From<SseEvent> for SseWireEvent {
+impl SseWireEvent {
     #[allow(clippy::too_many_lines)]
-    fn from(event: SseEvent) -> Self {
+    pub(crate) fn with_presentations(
+        event: SseEvent,
+        presentations: &super::event_presentation::EventPresentations,
+    ) -> Self {
         match event {
             SseEvent::Init {
                 sequence_id,
@@ -501,7 +503,10 @@ impl From<SseEvent> for SseWireEvent {
                 SseWireEvent::Init {
                     sequence_id,
                     conversation,
-                    messages: messages.iter().map(EnrichedMessage::from).collect(),
+                    messages: messages
+                        .iter()
+                        .map(|message| presentations.enrich(message))
+                        .collect(),
                     steering_messages: steering_messages
                         .iter()
                         .map(QueuedSteeringMessage::from)
@@ -515,7 +520,10 @@ impl From<SseEvent> for SseWireEvent {
                     transcript_generation,
                     transcript_coverage,
                     pending_anchor_sequence_id,
-                    pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
+                    pending_events: pending_events
+                        .into_iter()
+                        .map(|event| Self::with_presentations(event, presentations))
+                        .collect(),
                     pending_truncated,
                 }
             }
@@ -526,7 +534,7 @@ impl From<SseEvent> for SseWireEvent {
                 let sequence_id = message.sequence_id;
                 SseWireEvent::Message {
                     sequence_id,
-                    message: EnrichedMessage::from(message),
+                    message: presentations.enrich(&message),
                 }
             }
             SseEvent::MessageUpdated {
@@ -841,3 +849,19 @@ mod chain_wire_tests {
 // onto them without depending on `api`. The `tools` layer and the ts-rs
 // codegen both source them from phoenix-core directly, so `api::wire` does not
 // re-export them.
+
+#[cfg(test)]
+impl From<&Message> for EnrichedMessage {
+    fn from(message: &Message) -> Self {
+        super::event_presentation::EventPresentations::redacted().enrich(message)
+    }
+}
+// Replay-ring byte accounting has no database access; HTTP uses with_presentations.
+impl From<SseEvent> for SseWireEvent {
+    fn from(event: SseEvent) -> Self {
+        Self::with_presentations(
+            event,
+            &super::event_presentation::EventPresentations::redacted(),
+        )
+    }
+}
