@@ -1,4 +1,4 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation } from './qualify-view-telemetry.mjs';
 

@@ -19,6 +19,13 @@ import type { VirtualTranscriptHandle, VirtualTranscriptProps } from '../compone
 import { notifyProductConversationSnapshotChanged } from '../notifications';
 import { useConnection } from '../hooks/useConnection';
 import type { InitPayload } from '../conversation/atom';
+vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
+  const actual = await importOriginal<typeof import('../hooks/conversationViewTelemetry')>();
+  return { ...actual, ViewJourneyReporter: class extends actual.ViewJourneyReporter {
+    constructor() { super({ sampleRate: 1, send: async () => new Response(null, { status: 204 }) }); }
+  } };
+});
+
 
 const probe = vi.hoisted(() => ({
   structuralRenders: 0,
