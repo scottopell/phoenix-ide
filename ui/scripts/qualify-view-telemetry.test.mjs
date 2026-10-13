@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck } from './qualify-view-telemetry.mjs';
+import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck, runPendingPagehideCheck } from './qualify-view-telemetry.mjs';
 
 test('retains insufficient natural sampling as inconclusive, never overhead clearance', () => {
   const result = summarizeTrials([{ route: 'ordinary', sampled: true }]);
@@ -62,5 +62,29 @@ test('unauthenticated collector check uses empty state and cleans up even on fai
     if (status === 401) assert.equal((await runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {})).status, 401);
     else await assert.rejects(runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {}));
     assert.ok(disposed && closed);
+  }
+});
+test('pending pagehide case requires actual incomplete report, not relabeled ready, and closes context', async () => {
+  for (const outcome of ['incomplete', 'ready']) {
+    const listeners = {};
+    let finishReadiness;
+    let closed = false;
+    const report = { open_id: 'journey', outcome, marks: { meaningful_transcript: null }, correlations: [{ kind: 'request', id: 'request' }] };
+    const page = {
+      on: (event, callback) => { listeners[event] = callback; },
+      waitForFunction: () => new Promise(resolve => { finishReadiness = resolve; }),
+      goto: async url => {
+        if (url === 'about:blank') {
+          listeners.request({ url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', method: () => 'POST', postData: () => JSON.stringify(report) });
+          listeners.response({ url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', status: () => 204 });
+          finishReadiness();
+        } else queueMicrotask(() => listeners.request({ url: () => 'http://127.0.0.1:8123/api/product-conversations/product/history?open_id=request', method: () => 'GET' }));
+      },
+    };
+    const browser = { newContext: async () => ({ newPage: async () => page, newCDPSession: async () => ({ send: async () => {} }), close: async () => { closed = true; } }) };
+    const args = { browser, storageState: { cookies: [], origins: [] }, baseURL: 'http://127.0.0.1:8123', route: '/c/product', attempts: 1 };
+    if (outcome === 'incomplete') assert.equal((await runPendingPagehideCheck(args)).status, 'observed_incomplete');
+    else await assert.rejects(runPendingPagehideCheck(args));
+    assert.ok(closed);
   }
 });

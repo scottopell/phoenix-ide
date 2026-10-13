@@ -64,6 +64,74 @@ export async function runUnauthenticatedCollectorCheck(browser, baseURL, validRe
   } finally { await isolated.close(); }
 }
 
+export async function runPendingPagehideCheck({ browser, storageState, baseURL, route, outputDir, attempts = 8 }) {
+  assert.ok(Number.isInteger(attempts) && attempts > 0 && attempts <= 8);
+  const destination = candidateDestination(route, baseURL);
+  const trials = [];
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const owned = await browser.newContext({ storageState, viewport: { width: 1280, height: 900 } });
+    const trial = { attempt, sampled: false, reports: [], statuses: [], event: 'actual_cross_document_pagehide' };
+    try {
+      const candidate = await owned.newPage();
+      const cdp = await owned.newCDPSession(candidate);
+      await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 200, downloadThroughput: 1000000, uploadThroughput: 1000000 });
+      let signal;
+      const requestSeen = new Promise(resolveRequest => { signal = resolveRequest; });
+      candidate.on('request', request => {
+        const url = new URL(request.url());
+        if (url.origin === new URL(baseURL).origin && url.searchParams.has('open_id')
+          && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/'))) {
+          trial.sampled = true;
+          trial.requestId = url.searchParams.get('open_id');
+          signal();
+        }
+        if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
+          const body = request.postData() ?? '';
+          if (Buffer.byteLength(body) > 8192) trial.failure = 'report byte bound';
+          else {
+            try { trial.reports.push(JSON.parse(body)); } catch { trial.failure = 'invalid report JSON'; }
+          }
+        }
+      });
+      candidate.on('response', response => {
+        if (new URL(response.url()).pathname === '/api/telemetry/conversation-view') trial.statuses.push(response.status());
+      });
+      const navigation = candidate.goto(destination, { timeout: 10000, waitUntil: 'domcontentloaded' });
+      const readiness = candidate.waitForFunction(visibleReadiness, undefined, { timeout: 10000 }).then(() => 'ready', () => 'readiness_unavailable');
+      const winner = await Promise.race([requestSeen.then(() => 'request'), readiness]);
+      await navigation;
+      assert.notEqual(winner, 'readiness_unavailable', 'case readiness unavailable before sampled request');
+      if (winner === 'request') {
+        await candidate.goto('about:blank');
+        await readiness.catch(() => {});
+        const deadline = Date.now() + 4000;
+        while (!trial.statuses.length && Date.now() < deadline) await new Promise(resolveWait => setTimeout(resolveWait, 20));
+        assert.ok(!trial.failure, trial.failure);
+        assert.equal(trial.reports.length, 1, 'sampled pagehide must report once');
+        assert.deepEqual(trial.statuses, [204]);
+        const report = trial.reports[0];
+        assert.equal(report.outcome, 'incomplete', 'pagehide outcome is incomplete, not synthetic cancellation');
+        assertRequestCorrelation([trial.requestId], report);
+        assert.equal(report.marks.meaningful_transcript, null, 'incomplete case must precede presentation');
+        trial.status = 'observed_incomplete';
+      } else trial.status = 'unsampled_or_already_ready';
+    } catch (error) {
+      trial.failure = error.message;
+      throw error;
+    } finally {
+      trials.push(trial);
+      await owned.close();
+      if (outputDir) {
+        mkdirSync(outputDir, { recursive: true });
+        writeFileSync(resolve(outputDir, 'telemetry-pagehide-trials.json'), JSON.stringify({ scope: 'pagehide_incomplete_only_not_canceled_resume_or_background', trials }, null, 2));
+      }
+    }
+    if (trial.status === 'observed_incomplete') return { status: 'observed_incomplete', trials };
+  }
+  return { status: 'inconclusive_sampling_budget', trials };
+}
+
 function visibleReadiness() {
   const visible = element => {
     if (!element || document.visibilityState !== 'visible') return false;
