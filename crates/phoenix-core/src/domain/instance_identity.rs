@@ -123,6 +123,32 @@ impl fmt::Display for PeerBaseUrl {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceSelector {
+    Id(InstanceId),
+    DisplayName(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("instance selector cannot be empty")]
+pub struct InstanceSelectorError;
+
+impl InstanceSelector {
+    /// Interpret `UUIDv4` values as exact identities and all other non-empty values as display names.
+    ///
+    /// # Errors
+    /// Returns [`InstanceSelectorError`] when the selector is empty.
+    pub fn parse(value: impl Into<String>) -> Result<Self, InstanceSelectorError> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(InstanceSelectorError);
+        }
+        Ok(InstanceId::from_str(trimmed)
+            .map_or_else(|_| Self::DisplayName(trimmed.to_string()), Self::Id))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerHost<'a> {
     DomainOrIpv4(&'a str),
@@ -496,6 +522,20 @@ impl fmt::Display for FederationCredentialVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_selector_distinguishes_uuid_and_display_name() {
+        let id = InstanceId::new();
+        assert_eq!(
+            InstanceSelector::parse(id.to_string()).unwrap(),
+            InstanceSelector::Id(id)
+        );
+        assert_eq!(
+            InstanceSelector::parse("  remote mbp  ").unwrap(),
+            InstanceSelector::DisplayName("remote mbp".to_string())
+        );
+        assert!(InstanceSelector::parse("  ").is_err());
+    }
 
     #[test]
     fn peer_base_url_requires_a_bare_https_origin() {
