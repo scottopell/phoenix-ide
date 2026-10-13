@@ -380,10 +380,23 @@ function mergeRefreshedTail(
       ),
     });
   }
-  const retainedPrefix = earliestRefreshedOrdinal != null
-    && current.segments.some(
-      (segment) => segment.segment_ordinal < earliestRefreshedOrdinal,
-    );
+  const firstRefreshedSegment = sortSegments(refreshed).find(segment => segment.messages.length > 0);
+  const firstRefreshedMessage = firstRefreshedSegment?.messages.slice()
+    .sort((a, b) => a.sequence_id - b.sequence_id || a.message_id.localeCompare(b.message_id))[0];
+  const sameTopology = current.segments.length === refreshed.segments.length
+    && refreshed.segments.every(segment => current.segments.some(retained => (
+      retained.transcript_row_id === segment.transcript_row_id && retained.segment_ordinal === segment.segment_ordinal
+    )));
+  const retainedPrefix = sameTopology && firstRefreshedSegment !== undefined && firstRefreshedMessage !== undefined
+    && current.segments.some(segment => segment.transcript_row_id === firstRefreshedSegment.transcript_row_id
+      && segment.messages.some(message => message.message_id === firstRefreshedMessage.message_id
+        && message.sequence_id === firstRefreshedMessage.sequence_id))
+    && current.segments.some(segment => segment.messages.some(message => (
+      segment.segment_ordinal < firstRefreshedSegment.segment_ordinal
+      || (segment.segment_ordinal === firstRefreshedSegment.segment_ordinal
+        && (message.sequence_id < firstRefreshedMessage.sequence_id
+          || (message.sequence_id === firstRefreshedMessage.sequence_id && message.message_id < firstRefreshedMessage.message_id)))
+    )));
   return {
     ...refreshed,
     segments: Array.from(segmentsByRowId.values())
@@ -1290,8 +1303,14 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     ? representedOpeningBoundary(snapshot.boundaries, { kind: 'message', messageId: hashTargetMessageId })
     : undefined;
   const resolvedHashTargetMessageId = representedBoundary?.message_id ?? hashTargetMessageId;
-  const hashTargetLoaded = !!resolvedHashTargetMessageId && messages.some((message) => message.message_id === resolvedHashTargetMessageId);
-  const hashTargetExhausted = !!hashTargetMessageId && !hashTargetLoaded && snapshot?.has_older === false;
+  const hashTargetMessage = messages.find(message => message.message_id === resolvedHashTargetMessageId);
+  const hashTargetTranscriptId = representedBoundary?.successor_transcript_row_id
+    ?? hashTargetMessage?.conversation_id
+    ?? snapshot?.boundaries.find(boundary => boundary.message_id === hashTargetMessageId)?.predecessor_transcript_row_id;
+  const hashTargetSourceMismatch = readerSelection.kind === 'transcript' && hashTargetTranscriptId !== undefined
+    && hashTargetTranscriptId !== readerSelection.segment.transcript_row_id;
+  const hashTargetLoaded = hashTargetMessage !== undefined && !hashTargetSourceMismatch;
+  const hashTargetExhausted = !!hashTargetMessageId && (hashTargetSourceMismatch || (!hashTargetLoaded && snapshot?.has_older === false));
   const positioningTargetMessageId = readerSelection.kind === 'unavailable' ? undefined : hashTargetLoaded ? resolvedHashTargetMessageId : transcriptTargetMessage?.message_id;
   const previousJump = desiredJumpRef.current;
   const completedJump = previousJump
@@ -1347,11 +1366,11 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   }, [initialSnapshotReady, openSnapshotGeneration, productConversationId]);
 
   useEffect(() => {
-    const needsMessage = !!hashTargetMessageId && !hashTargetLoaded;
+    const needsMessage = !!hashTargetMessageId && !hashTargetLoaded && !hashTargetExhausted;
     const needsTranscript = !hashTargetMessageId && readerSelection.kind === 'transcript' && !transcriptTargetMessage && !transcriptTargetExhausted;
     if ((!needsMessage && !needsTranscript) || !snapshot?.has_older || loadingOlder || olderError || readerSelection.kind === 'unavailable') return;
     void loadOlderMessages();
-  }, [hashTargetLoaded, hashTargetMessageId, loadOlderMessages, loadingOlder, olderError, readerSelection.kind, snapshot?.has_older, transcriptTargetExhausted, transcriptTargetMessage]);
+  }, [hashTargetExhausted, hashTargetLoaded, hashTargetMessageId, loadOlderMessages, loadingOlder, olderError, readerSelection.kind, snapshot?.has_older, transcriptTargetExhausted, transcriptTargetMessage]);
 
   if (loading) {
     return (

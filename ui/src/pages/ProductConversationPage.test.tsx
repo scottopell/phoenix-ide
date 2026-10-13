@@ -380,7 +380,12 @@ function HistoryRouteControls() {
   const navigate = useNavigate();
   const location = useLocation();
   return <><div data-testid="history-location">{location.pathname}{location.search}{location.hash}</div>
-    <button onClick={() => navigate({ ...location, hash: '#message-m-3' })}>jump latest message</button>
+    <button onClick={() => {
+      const query = new URLSearchParams(location.search);
+      if (query.has('source_transcript')) query.set('source_transcript', 'row-2');
+      query.delete('source_tool');
+      navigate({ ...location, search: query.toString(), hash: '#message-m-3' });
+    }}>jump latest message</button>
     <button onClick={() => navigate({ ...location, hash: '' })}>clear message hash</button>
     <button onClick={() => navigate({ pathname: location.pathname, search: '', hash: '' }, { state: { chapterSelection: 'pending' } })}>select pending chapter</button>
     <button onClick={() => navigate(-1)}>history back</button>
@@ -621,6 +626,142 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(true));
     expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+  });
+
+  it.each([false, true])('rejects loaded evidence owned by another pinned transcript (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const snapshot = makeSnapshot({ before: 'still-older', has_older: true });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(snapshot));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(snapshot);
+    renderPage(global ? '/global/row-1?source_transcript=row-1&source_tool=wrong-tool&keep=yes#message-m-3' : '/product-conversations/pc-1?source_transcript=row-1&source_tool=wrong-tool&keep=yes#message-m-3');
+    await waitForPageReady();
+    expect(screen.getByRole('alert')).toHaveTextContent('linked message is not available');
+    expect(currentPositioning().kind).toBe('idle');
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(1);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+    expect(screen.getByTestId('history-location')).toHaveTextContent('source_transcript=row-1&source_tool=wrong-tool&keep=yes#message-m-3');
+  });
+
+  it.each([false, true])('pages unknown hash identity before rejecting a mismatched source pin (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot();
+    const page = { ...initial, before: null, has_older: false, segments: initial.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [makeMessage('unloaded-wrong-owner', 1, 'row-2')] } : { ...segment, messages: [] }) };
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(initial)).mockResolvedValueOnce(coordinatorSnapshot(page));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockResolvedValueOnce(page);
+    renderPage(global ? '/global/row-1?source_transcript=row-1#message-unloaded-wrong-owner' : '/product-conversations/pc-1?source_transcript=row-1#message-unloaded-wrong-owner');
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('unloaded-wrong-owner'));
+    expect(screen.getByRole('alert')).toHaveTextContent('linked message is not available');
+    expect(currentPositioning().kind).toBe('idle');
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])('rejects an opening alias pinned to its predecessor rather than its exact successor (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const snapshot = makeSnapshot({ before: 'still-older', has_older: true, boundaries: [{ message_id: 'cont-1', represented_successor_opening_message_id: 'exact-opening', predecessor_transcript_row_id: 'row-1', successor_transcript_row_id: 'row-2', segment_ordinal: 1 }] });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(snapshot));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(snapshot);
+    renderPage(global ? '/global/row-1?source_transcript=row-1#message-exact-opening' : '/product-conversations/pc-1?source_transcript=row-1#message-exact-opening');
+    await waitForPageReady();
+    expect(screen.getByRole('alert')).toHaveTextContent('linked message is not available');
+    expect(currentPositioning().kind).toBe('idle');
+  });
+
+  it.each([false, true])('rejects a predecessor boundary hash pinned to the successor without an opening alias (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const snapshot = makeSnapshot({ before: null, has_older: false, boundaries: [{ message_id: 'cont-1', represented_successor_opening_message_id: 'exact-opening', predecessor_transcript_row_id: 'row-1', successor_transcript_row_id: 'row-2', segment_ordinal: 1 }] });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(snapshot));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(snapshot);
+    renderPage(global ? '/global/row-2?source_transcript=row-2#message-cont-1' : '/product-conversations/pc-1?source_transcript=row-2#message-cont-1');
+    await waitForPageReady();
+    expect(screen.getByRole('alert')).toHaveTextContent('linked message is not available');
+    expect(currentPositioning().kind).toBe('idle');
+  });
+
+  it.each([false, true])('retains an advanced cursor through a full empty-prefix topology roster refresh (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const complete = makeSnapshot();
+    const initial = { ...complete, segments: complete.segments.map(segment => segment.transcript_row_id === 'row-1' ? { ...segment, messages: [] } : segment), before: 'tail-cursor' };
+    const acquired = { ...complete, before: 'advanced-cursor', has_older: true };
+    const refreshed = { ...initial, before: 'refreshed-tail', updated_at: '2026-01-02T00:00:00Z' };
+    const exhausted = { ...complete, before: null, has_older: false };
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(initial)).mockResolvedValueOnce(coordinatorSnapshot(acquired)).mockResolvedValueOnce(coordinatorSnapshot(refreshed)).mockResolvedValueOnce(coordinatorSnapshot(exhausted));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockResolvedValueOnce(acquired).mockResolvedValueOnce(refreshed).mockResolvedValueOnce(exhausted);
+    renderPage(global ? '/global/row-2#message-m-3' : '/product-conversations/pc-1#message-m-3');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('m-1'));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(3));
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenLastCalledWith(global ? 'row-1' : 'pc-1', { message_limit: 100, before: 'advanced-cursor' });
+    expect(screen.getByTestId('message-order').textContent).toBe('m-1,m-2,cont-1,m-3,m-4');
+    expect(currentPositioning().kind).toBe('idle');
+  });
+
+  it.each([false, true])('retains exhausted same-row sequence coverage when a refreshed tail still advertises older rows (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const rows = Array.from({ length: 20 }, (_, index) => makeMessage(`covered-${index + 1}`, index + 1, 'row-2'));
+    const initial = makeSnapshot({ boundaries: [], segments: [{ segment_ordinal: 0, transcript_row_id: 'row-1', slug: 'row-1', title: 'Empty root', messages: [] }, { segment_ordinal: 1, transcript_row_id: 'row-2', slug: 'row-2', title: 'Latest', messages: rows.slice(10) }] });
+    const acquired = { ...initial, before: null, has_older: false, segments: initial.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: rows.slice(0, 10) } : segment) };
+    const refreshed = { ...initial, before: 'fresh-tail' };
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(initial)).mockResolvedValueOnce(coordinatorSnapshot(acquired)).mockResolvedValueOnce(coordinatorSnapshot(refreshed));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockResolvedValueOnce(acquired).mockResolvedValueOnce(refreshed);
+    renderPage(global ? '/global/row-2' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(3));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false);
+    expect(screen.getByTestId('message-order').textContent).toBe(rows.map(message => message.message_id).join(','));
+  });
+
+  it.each([[false, 'continuation'], [true, 'continuation'], [false, 'gap'], [true, 'gap']] as const)('adopts a fresh cursor instead of extrapolating coverage (Global=%s, change=%s)', async (global, change) => {
+    const { api } = await import('../api');
+    const rows = Array.from({ length: 30 }, (_, index) => makeMessage(`anchor-${index + 1}`, index + 1, 'row-2'));
+    const root = { segment_ordinal: 0, transcript_row_id: 'row-1', slug: 'row-1', title: 'Empty root', messages: [] };
+    const member = { segment_ordinal: 1, transcript_row_id: 'row-2', slug: 'row-2', title: 'Latest', messages: rows.slice(10, 20) };
+    const initial = makeSnapshot({ boundaries: [], segments: [root, member], before: 'old-tail' });
+    const acquired = { ...initial, before: 'advanced-old-generation', segments: [root, { ...member, messages: rows.slice(0, 10) }] };
+    const refreshed = change === 'continuation'
+      ? { ...initial, latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', before: 'fresh-generation', segments: [root, member, { segment_ordinal: 2, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('new-member', 1, 'row-3')] }] }
+      : { ...initial, before: 'fresh-gap', segments: [root, { ...member, messages: rows.slice(25) }] };
+    const older = { ...refreshed, before: null, has_older: false, segments: [root, { ...member, messages: rows.slice(20, 25) }] };
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(initial)).mockResolvedValueOnce(coordinatorSnapshot(acquired)).mockResolvedValueOnce(coordinatorSnapshot(refreshed)).mockResolvedValueOnce(coordinatorSnapshot(older));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockResolvedValueOnce(acquired).mockResolvedValueOnce(refreshed).mockResolvedValueOnce(older);
+    renderPage(global ? '/global/row-2#message-anchor-11' : '/product-conversations/pc-1#message-anchor-11');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('anchor-1,'));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(3));
+    expect(currentPositioning().kind).toBe('idle');
+    act(() => { void (conversationNavStackSpy.mock.lastCall?.[0]?.onLoadOlderMessages as (basis: unknown) => Promise<void>)({ kind: 'reader_anchor', messageId: 'anchor-11', viewportStartOffset: 7 }); });
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenLastCalledWith(global ? 'row-1' : 'pc-1', { message_limit: 100, before: refreshed.before });
+    expect(screen.getByTestId('message-order')).toHaveTextContent('anchor-1,anchor-2');
+    expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { kind: 'restore_after_prefix_expansion', messageId: 'anchor-11', viewportStartOffset: 7 } });
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe(change === 'continuation' ? 'row-3' : 'row-2');
+  });
+
+  it.each([false, true])('does not fabricate pending opening authority or hide a failed readiness refresh (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const pending = makeSnapshot({ latest_opening_pending: true, writable_transcript_row_id: null, before: null, has_older: false });
+    pending.segments = pending.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [] } : segment);
+    const opening = { ...makeMessage('pending-generated-opening', 1, 'row-2'), message_type: 'continuation' as const, content: { type: 'continuation', summary: 'First handoff' } };
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(pending)).mockRejectedValueOnce(new Error('opening authority refresh failed'));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(pending).mockRejectedValueOnce(new Error('opening authority refresh failed'));
+    renderPage(global ? '/global/row-1' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => emitLatestProjection({ messages: [opening], pendingMessages: [], convState: { type: 'idle' } }));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('opening authority refresh failed'));
+    expect(pending.boundaries[0]?.represented_successor_opening_message_id).toBeNull();
+    expect(screen.getByTestId('message-order').textContent).toBe('m-1,m-2,cont-1,pending-generated-opening');
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(false);
   });
 
   it('keeps a completed navigation idle after a subsequent reader-anchor restoration finishes', async () => {
