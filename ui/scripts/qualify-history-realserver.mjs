@@ -144,7 +144,7 @@ async function run() {
       const mid = randomUUID();
       const accepted = await request('POST', `/api/conversations/${row}/chat`, { text, images: [], files: [], message_id: mid });
       assert.ok(accepted.queued === true && accepted.steering !== true, 'delivered admission, not steering');
-      await settled(row, expected, mid);
+      await settled(row, expected, `${row}:${mid}`);
       return mid;
     }
     async function visibleMessage(mid) {
@@ -315,7 +315,7 @@ async function run() {
       assert.equal(new URL(req.url()).pathname, `/api/conversations/${latest}/chat`);
       const body = req.postDataJSON();
       assert.equal(body.text, text);
-      await settled(latest, 'idle', body.message_id);
+      await settled(latest, 'idle', `${latest}:${body.message_id}`);
       checked(`${prefix}: historical reader composer sends to newest writable member`, { latest, message_id: body.message_id });
       await page.screenshot({ path: resolve(output, `${prefix}-historical-reader.png`) });
 

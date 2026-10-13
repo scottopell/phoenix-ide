@@ -236,7 +236,7 @@ jobs:
         working-directory: harness
         run: |
           uv run tests/e2e/history_browser.test.py
-          node --test ui/scripts/qualify-history-realserver.test.mjs
+          node --test ui/scripts/qualify-history-realserver.selftest.mjs
           node --check ui/scripts/qualify-history-realserver.mjs
       - name: Build matching pinned UI and install pinned Chromium
         working-directory: pinned-app/ui

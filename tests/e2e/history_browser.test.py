@@ -33,6 +33,8 @@ class QualificationTests(unittest.TestCase):
         fixture.wait = MagicMock(side_effect=lambda row, exhausted, mid: {"messages": [{"message_id": mid}]})
         fixture.send("row", "probe")
         self.assertEqual(fixture.wait.call_count, 1)
+        client_key = fixture.request.call_args.args[2]["message_id"]
+        self.assertEqual(fixture.wait.call_args.args[2], f"row:{client_key}")
         fixture.request.return_value = {"queued": True, "steering": True}
         with self.assertRaises(AssertionError):
             fixture.send("row", "probe")

@@ -179,10 +179,11 @@ class Fixture:
         accepted = self.request("POST", f"/api/conversations/{row}/chat",
                                 {"text": text, "images": [], "files": [], "message_id": mid})
         assert accepted.get("queued") is True and accepted.get("steering") is not True, accepted
-        data = self.wait(row, exhausted, mid)
-        assert any(m["message_id"] == mid for m in data["messages"]), "send not persisted"
+        canonical_mid = f"{row}:{mid}"
+        data = self.wait(row, exhausted, canonical_mid)
+        assert any(m["message_id"] == canonical_mid for m in data["messages"]), "send not persisted"
         if not exhausted:
-            assert self.h._has_agent_after_message(data["messages"], mid), "no agent after accepted send"
+            assert self.h._has_agent_after_message(data["messages"], canonical_mid), "no agent after accepted send"
         return data
 
     def continued(self, row):
