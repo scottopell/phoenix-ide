@@ -11,7 +11,7 @@ import type { ConversationState, Message } from '../api';
 import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
 import { MessageList } from './MessageList';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
-import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
+import { transcriptPositioningCommandKey, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
@@ -131,6 +131,8 @@ vi.mock('./MessageContextMenu', () => ({
 // `handleTotalListHeightChanged` test group).
 const virtualTranscriptMock = {
   scrollToIndex: vi.fn(),
+  scrollToOwnedIndex: vi.fn(),
+  cancelPosition: vi.fn(),
   scrollToTail: vi.fn(),
   setTailFollowAllowed: vi.fn(),
   isProgrammaticScroll: vi.fn(),
@@ -153,6 +155,8 @@ function indexOrZero(index: number): number {
 
 beforeEach(() => {
   virtualTranscriptMock.scrollToIndex = vi.fn();
+  virtualTranscriptMock.scrollToOwnedIndex = vi.fn((_owner: string, ...args: unknown[]) => virtualTranscriptMock.scrollToIndex(...args));
+  virtualTranscriptMock.cancelPosition = vi.fn();
   virtualTranscriptMock.scrollToTail = vi.fn();
   virtualTranscriptMock.setTailFollowAllowed = vi.fn();
   virtualTranscriptMock.isProgrammaticScroll = vi.fn(() => false);
@@ -216,6 +220,8 @@ vi.mock('./VirtualTranscript', async () => {
       }
       useImperativeHandle(ref, () => ({
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
+        scrollToOwnedIndex: virtualTranscriptMock.scrollToOwnedIndex,
+        cancelPosition: virtualTranscriptMock.cancelPosition,
         scrollToTail: virtualTranscriptMock.scrollToTail,
         setTailFollowAllowed: virtualTranscriptMock.setTailFollowAllowed,
         isProgrammaticScroll: virtualTranscriptMock.isProgrammaticScroll,
@@ -1271,6 +1277,29 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetMeasured: true }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['idle', 'user-interrupted', 'replacement'] as const)('cancels only the finished physical owner before acknowledging supersession (%s)', (transition) => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const owner = transcriptPositioningCommandKey(command);
+    const onHistoryScrollCommandHandled = vi.fn(() => {
+      expect(virtualTranscriptMock.cancelPosition).toHaveBeenCalledWith(owner);
+    });
+    const props = {
+      streamingRequestId: null, messages: [makeMessage(1), makeMessage(2), makeMessage(3)], pendingMessages: [],
+      convState: idleState, onRetry: vi.fn(), onOpenFile: undefined, conversationId: 'conv-history', onHistoryScrollCommandHandled,
+    };
+    const { container, rerender } = render(withConvContext(<MessageList {...props} transcriptPositioning={{ kind: 'positioning', command }} />));
+    if (transition === 'user-interrupted') fireEvent.wheel(container.querySelector('#messages')!, { deltaY: 10 });
+    else rerender(withConvContext(<MessageList {...props} transcriptPositioning={transition === 'idle'
+      ? { kind: 'idle', view: command.view }
+      : { kind: 'positioning', command: { ...command, token: 2 } }} />));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', command.view);
+    expect(virtualTranscriptMock.cancelPosition.mock.calls).toEqual([[owner]]);
+    expect(virtualTranscriptMock.scrollToOwnedIndex.mock.calls[0]?.[0]).toBe(owner);
+    if (transition === 'replacement') {
+      expect(virtualTranscriptMock.scrollToOwnedIndex.mock.calls.at(-1)?.[0]).toBe(transcriptPositioningCommandKey({ ...command, token: 2 }));
+    }
   });
 
   it('suppresses continuity until user input releases it before machine interaction dispatch', () => {

@@ -1315,6 +1315,81 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it.each(['snapshot-first', 'observer-first'] as const)('retires superseded hidden physical work without cancelling its replacement (%s)', (order) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const items = makeItems(40);
+    items[20]!.height = 320;
+    render(
+      <div data-testid="retained-wrapper">
+        <VirtualTranscript ariaLabel="Transcript" ref={ref} items={items} getKey={(item) => item.id}
+          estimatedExtent={(item) => item.height} overscan={20} initialTail={false}
+          header={<div data-height={30}>Header</div>}
+          renderItem={(item) => <div data-height={item.height}>{item.label}<span data-tool={item.id}>Tool</span></div>} />
+      </div>,
+    );
+    act(() => ref.current?.scrollToIndex(20, 'start'));
+    const wrapper = screen.getByTestId('retained-wrapper');
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const tool = document.querySelector<HTMLElement>('[data-tool="item-20"]')!;
+    const rect = tool.getBoundingClientRect();
+    tool.getBoundingClientRect = () => isHiddenByAncestor(tool)
+      ? { ...rect, top: 0, bottom: 0, height: 0 }
+      : { ...rect, top: 200, bottom: 220, height: 20 };
+    let nativeTop = 0;
+    const write = vi.fn((top: number) => { if (!isHiddenByAncestor(scroller)) nativeTop = top; });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => nativeTop, set: write });
+    const issue = (owner: string, index: number, selector?: string) => ref.current!.scrollToOwnedIndex(owner, index, 'start', 0, selector);
+    const cancel = (owner: string) => ref.current!.cancelPosition(owner);
+    const reveal = () => {
+      wrapper.style.display = '';
+      act(() => {
+        if (order === 'snapshot-first') ref.current?.physicalSnapshot();
+        else resizeObservers[0]!.triggerEntries([[scroller, 100]]);
+      });
+    };
+    wrapper.style.display = 'none';
+    act(() => issue('old-command', 20, '[data-tool="item-20"]'));
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({ viewportTop: 430, visibleRange: null, targetMeasured: false });
+    act(() => cancel('old-command'));
+    reveal();
+    expect(write).not.toHaveBeenCalled();
+    expect(ref.current?.physicalSnapshot()).toMatchObject({ viewportTop: 0, visibleRange: { startIndex: 0, endIndex: 3 } });
+    act(() => expect(ref.current?.captureVisibleAnchor()).toEqual({ index: 0, key: 'item-0', offset: 30 }));
+
+    wrapper.style.display = 'none';
+    act(() => {
+      issue('old-command', 20, '[data-tool="item-20"]');
+      issue('new-command', 10);
+      cancel('old-command');
+    });
+    reveal();
+    expect(write.mock.calls).toEqual([[230]]);
+    expect(ref.current?.physicalSnapshot(10)).toMatchObject({ viewportTop: 230, targetOffset: 0 });
+  });
+
+  it.each(['snapshot-first', 'observer-first'] as const)('genuine scrolling retires a hidden target and owed write while preserving the reader anchor (%s)', (order) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    render(<div data-testid="retained-wrapper"><VirtualTranscript ariaLabel="Transcript" ref={ref}
+      items={makeItems(40)} getKey={(item) => item.id} estimatedExtent={20} initialTail={false} renderItem={renderRow} /></div>);
+    const wrapper = screen.getByTestId('retained-wrapper');
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    let nativeTop = 0;
+    const write = vi.fn((top: number) => { if (!isHiddenByAncestor(scroller)) nativeTop = top; });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => nativeTop, set: write });
+    wrapper.style.display = 'none';
+    act(() => ref.current?.scrollToIndex(20, 'start', 0, '[data-missing-tool]'));
+    wrapper.style.display = '';
+    nativeTop = 80;
+    fireEvent.scroll(scroller);
+    act(() => {
+      if (order === 'snapshot-first') ref.current?.physicalSnapshot();
+      else resizeObservers[0]!.triggerEntries([[scroller, 100]]);
+    });
+    expect(write).not.toHaveBeenCalled();
+    expect(ref.current?.physicalSnapshot()).toMatchObject({ viewportTop: 80, visibleRange: { startIndex: 4, endIndex: 8 } });
+    act(() => expect(ref.current?.captureVisibleAnchor()).toEqual({ index: 4, key: 'item-4', offset: 0 }));
+  });
+
   it('does not acknowledge an unresolved selector as a measured row and lets an absolute position supersede it', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     render(

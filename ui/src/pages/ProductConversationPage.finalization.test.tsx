@@ -46,6 +46,8 @@ vi.mock('../components/VirtualTranscript', async () => {
         scrollToTail: probe.scrollToTail,
         setTailFollowAllowed: (allowed) => { probe.followAllowed = allowed; },
         scrollToIndex: () => {},
+        scrollToOwnedIndex: () => {},
+        cancelPosition: () => {},
         scrollBy: () => {},
         isProgrammaticScroll: () => false,
         captureVisibleAnchor: () => null,

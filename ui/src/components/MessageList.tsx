@@ -1613,16 +1613,18 @@ function MessageListImpl({
                   ? `#message-${CSS.escape(location.memberMessageId)}, [data-message-id="${CSS.escape(location.memberMessageId)}"]`
                   : undefined;
               if (targetSelector) {
-                transcriptRef.current?.scrollToIndex(
+                transcriptRef.current?.scrollToOwnedIndex(
+                  effect.commandKey,
                   effect.targetIndex,
                   effect.align,
                   effect.viewportStartOffset,
                   targetSelector,
                 );
               } else if (effect.viewportStartOffset === undefined) {
-                transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align);
+                transcriptRef.current?.scrollToOwnedIndex(effect.commandKey, effect.targetIndex, effect.align);
               } else {
-                transcriptRef.current?.scrollToIndex(
+                transcriptRef.current?.scrollToOwnedIndex(
+                  effect.commandKey,
                   effect.targetIndex,
                   effect.align,
                   effect.viewportStartOffset,
@@ -1632,7 +1634,7 @@ function MessageListImpl({
             }
           } else {
             continuityRestoreInFlightRef.current = true;
-            transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
+            transcriptRef.current?.scrollToOwnedIndex(effect.commandKey, effect.targetIndex, effect.align, effect.viewportStartOffset);
           }
           const physicalTargetSelector = effect.command.kind === 'jump_to_message'
             ? (() => {
@@ -1674,6 +1676,7 @@ function MessageListImpl({
           break;
         }
         case 'finish':
+          if (effect.result === 'superseded') transcriptRef.current?.cancelPosition(effect.commandKey);
           if (effect.command.kind === 'restore_after_prefix_expansion') {
             continuityRestoreInFlightRef.current = false;
           }
