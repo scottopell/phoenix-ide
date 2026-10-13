@@ -5042,7 +5042,9 @@ async fn cancel_conversation(
             | AppError::TypedBadRequest { .. }
             | AppError::Forbidden(_)
             | AppError::UnprocessableEntity(_) => ("request_error", false),
-            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+            AppError::Internal(_)
+            | AppError::TypedInternal { .. }
+            | AppError::TranscriptSnapshotChanged => ("server_error", true),
         };
         span.record("outcome", outcome);
         if is_server_error {

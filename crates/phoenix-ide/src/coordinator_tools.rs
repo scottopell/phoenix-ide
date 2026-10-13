@@ -1030,6 +1030,9 @@ fn app_error_message(error: crate::api::handlers::AppError) -> String {
         | crate::api::handlers::AppError::Internal(message)
         | crate::api::handlers::AppError::TypedBadRequest { message, .. }
         | crate::api::handlers::AppError::TypedInternal { message, .. } => message,
+        crate::api::handlers::AppError::TranscriptSnapshotChanged => {
+            "transcript changed during opening observation read".to_string()
+        }
         crate::api::handlers::AppError::Conflict(_)
         | crate::api::handlers::AppError::UnprocessableEntity(_) => {
             "reference resolution failed".to_string()
@@ -1059,6 +1062,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn snapshot_instability_is_reported_as_an_error_message() {
+        assert_eq!(
+            app_error_message(crate::api::handlers::AppError::TranscriptSnapshotChanged),
+            "transcript changed during opening observation read"
+        );
+    }
 
     struct NoLlm;
 

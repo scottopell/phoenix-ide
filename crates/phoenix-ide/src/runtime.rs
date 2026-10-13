@@ -1208,7 +1208,7 @@ impl AdmittedPublication<'_> {
             .read_message_continuation_opening(&message.message_id)
             .await
         {
-            Ok(opening) => opening.map(crate::api::types::ContinuationOpeningView::from),
+            Ok(opening) => opening.map(crate::api::ContinuationOpeningView::from),
             Err(error) => {
                 tracing::error!(message_id = %message.message_id, %error, "committed opening projection read failed");
                 let _ = self.event(|sequence_id| SseEvent::Error {
@@ -2058,7 +2058,7 @@ pub enum SseEvent {
         /// renders the DB snapshot and waits for the next live event to
         /// repopulate the in-flight UI.
         pending_truncated: bool,
-        opening: Option<crate::api::types::ContinuationOpeningView>,
+        opening: Option<crate::api::ContinuationOpeningView>,
     },
     /// A newly-persisted message joins the conversation. Uses `message.sequence_id`
     /// as its envelope `sequence_id` — no separate field needed because
@@ -2066,14 +2066,14 @@ pub enum SseEvent {
     /// [`SseBroadcaster::send_message`], folds into the broadcaster's counter.
     Message {
         message: crate::db::Message,
-        opening: Option<crate::api::types::ContinuationOpeningView>,
+        opening: Option<crate::api::ContinuationOpeningView>,
     },
     /// An existing message's mutable fields changed. Carries only the delta —
     /// `message_id` is the target; `sequence_id` is the envelope id used by
     /// the client reducer for dedup (task 02675). The message's persistent
     /// `sequence_id` is immutable and not repeated here.
     MessageUpdated {
-        opening: Option<crate::api::types::ContinuationOpeningView>,
+        opening: Option<crate::api::ContinuationOpeningView>,
         sequence_id: i64,
         message_id: String,
         /// Conversation transcript generation after a persisted mutation commits.
