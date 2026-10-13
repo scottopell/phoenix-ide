@@ -341,6 +341,24 @@ describe('ViewJourneyLifecycle', () => {
     expect(payload()).toMatchObject({ outcome: 'ready', anchor_result: 'applied' });
   });
 
+  it('rechecks the owning tail after a reader leaves bottom before initial breadcrumb readiness', async () => {
+    const { root, controller } = view();
+    hydrate(root, controller);
+    let settled = true;
+    controller.registerAnchorProbe(() => ({ kind: 'tail', settled }));
+    controller.tailAnchorSettled();
+    controller.inspect();
+    settled = false;
+    enable(root);
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).not.toHaveBeenCalled();
+    settled = true;
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ outcome: 'ready' });
+  });
+
   it('expires unfinished views and coalesces inspection work, with no observer after completion', async () => {
     const { controller } = view();
     for (let i = 0; i < 1000; i++) controller.scheduleInspection();

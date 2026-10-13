@@ -46,7 +46,6 @@ export class ViewJourneyLifecycle {
   private targetMessageId: string | null = null;
   private targetApplied = false;
   private anchorProbe: ViewAnchorProbe | null = null;
-  private resumed = false;
   private transcriptSeen = false;
   private breadcrumbSeen = false;
   private breadcrumbEnabled = false;
@@ -185,7 +184,6 @@ export class ViewJourneyLifecycle {
   }
 
   resume(trigger: JourneyTrigger = 'pwa_resume'): void {
-    this.resumed = true;
     this.finish('incomplete');
     this.identity = { ...this.identity, trigger, visible: true, cache: 'retained', response_size_bucket: 'unknown' };
     this.attempt = undefined;
@@ -248,7 +246,7 @@ export class ViewJourneyLifecycle {
       attempt.measurement.mark('breadcrumb_enabled');
       this.breadcrumbEnabled = true;
     }
-    if (this.resumed && this.anchorProbe) {
+    if (this.anchorProbe) {
       const observation = this.anchorProbe();
       this.tailSettled = observation.kind === 'tail' && observation.settled;
       this.targetApplied = observation.kind === 'target' && observation.messageId === this.targetMessageId && observation.disposition === 'applied';
