@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks } from './qualify-view-telemetry.mjs';
+import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck } from './qualify-view-telemetry.mjs';
 
 test('retains insufficient natural sampling as inconclusive, never overhead clearance', () => {
   const result = summarizeTrials([{ route: 'ordinary', sampled: true }]);
@@ -50,4 +50,17 @@ test('collector negatives distinguish schema validation from bounded semantic re
 test('collector negative fail-open is a failed qualification', async () => {
   const context = { request: { post: async () => ({ status: () => 204, dispose: async () => {} }) } };
   await assert.rejects(runCollectorNegativeChecks(context, 'http://127.0.0.1:8123', {}));
+});
+test('unauthenticated collector check uses empty state and cleans up even on fail-open', async () => {
+  for (const status of [401, 204]) {
+    let disposed = false;
+    let closed = false;
+    const browser = { newContext: async options => {
+      assert.deepEqual(options.storageState, { cookies: [], origins: [] });
+      return { request: { post: async () => ({ status: () => status, dispose: async () => { disposed = true; } }) }, close: async () => { closed = true; } };
+    } };
+    if (status === 401) assert.equal((await runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {})).status, 401);
+    else await assert.rejects(runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {}));
+    assert.ok(disposed && closed);
+  }
 });

@@ -53,6 +53,17 @@ export async function runCollectorNegativeChecks(context, baseURL, validReport) 
   return results;
 }
 
+export async function runUnauthenticatedCollectorCheck(browser, baseURL, validReport) {
+  const isolated = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+  try {
+    const response = await isolated.request.post(candidateDestination('/api/telemetry/conversation-view', baseURL), { data: validReport, timeout: 3000 });
+    try {
+      assert.equal(response.status(), 401, 'synthetic server must enforce collector authentication');
+      return { name: 'unauthenticated_report', status: response.status() };
+    } finally { await response.dispose(); }
+  } finally { await isolated.close(); }
+}
+
 function visibleReadiness() {
   const visible = element => {
     if (!element || document.visibilityState !== 'visible') return false;
@@ -176,6 +187,7 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
     }
     assert.ok(negativeTemplate, 'at least one naturally sampled report required for collector negatives');
     result.collectorNegatives = await runCollectorNegativeChecks(context, baseURL, negativeTemplate);
+    result.collectorNegatives.push(await runUnauthenticatedCollectorCheck(context.browser(), baseURL, negativeTemplate));
     result.comparison = summarizeTrials(result.trials);
     result.acceptance = 'partial_initial_open_retrieval_and_raw_overhead_only';
     return result;

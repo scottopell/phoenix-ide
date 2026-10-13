@@ -18,6 +18,7 @@ def assertPhoenixTelemetry(output, service_name, run_id, expected_cases, forbidd
         drain_receipt = json.loads(Path(drain_receipt).read_text())
     if drain_receipt != {"run_id": run_id, "service_name": service_name, "app_stopped": True, "receiver_stopped": True, "errors": []}:
         raise ValueError("missing owned app/export teardown receipt")
+    scope = {"qualification": "semantic_export_only", "full_acceptance": False}
     if isinstance(expected_cases, (str, Path)):
         receipt = json.loads(Path(expected_cases).read_text())
         if receipt["runId"] != run_id or receipt["serviceName"] != service_name:
@@ -26,6 +27,9 @@ def assertPhoenixTelemetry(output, service_name, run_id, expected_cases, forbidd
         forbidden = tuple(forbidden) + tuple(receipt.get("forbidden", []))
         if receipt.get("failure"):
             raise ValueError("browser checks failed")
+        scope["browser_scope"] = receipt.get("acceptance", "unspecified")
+        scope["capabilities"] = receipt.get("capabilities", {})
+        scope["comparison"] = receipt.get("comparison", {})
     if not 0 < len(expected_cases) <= 64 or len({case["open_id"] for case in expected_cases}) != len(expected_cases):
         raise ValueError("invalid journey acceptance inventory")
     index = final_index(output)
@@ -42,7 +46,7 @@ def assertPhoenixTelemetry(output, service_name, run_id, expected_cases, forbidd
     if {record["attributes"].get("open.id") for record in service_views} != {case["open_id"] for case in expected_cases} or len(service_views) != len(expected_cases):
         raise ValueError("unexpected exported journey/event volume")
     return {"run_id": run_id, "service_name": service_name, "retrieved": retrieved,
-            "bytes": index["bytes"], "spans": index["spans"], "batches": index["batches"]}
+            "bytes": index["bytes"], "spans": index["spans"], "batches": index["batches"], "scope": scope}
 
 
 if __name__ == "__main__":

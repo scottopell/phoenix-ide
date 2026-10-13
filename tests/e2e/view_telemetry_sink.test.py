@@ -227,6 +227,15 @@ class SinkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 assertPhoenixTelemetry(capture.output, service, "final", cases, drain_receipt={})
             self.assertEqual(len(assertPhoenixTelemetry(capture.output, service, "final", cases, drain_receipt=drain)["retrieved"]), 1)
+            self.assertFalse(assertPhoenixTelemetry(capture.output, service, "final", cases, drain_receipt=drain)["scope"]["full_acceptance"])
+            partial = Path(directory) / "partial.json"
+            partial.write_text(json.dumps({"runId": "final", "serviceName": service, "journeys": cases,
+                "acceptance": "partial_initial_open_retrieval_and_raw_overhead_only",
+                "capabilities": {"bfcache_resume": "not_exercised"}, "comparison": {"overhead_clearance": False}}))
+            semantic = assertPhoenixTelemetry(capture.output, service, "final", partial, drain_receipt=drain)
+            self.assertEqual(semantic["scope"]["capabilities"]["bfcache_resume"], "not_exercised")
+            self.assertFalse(semantic["scope"]["full_acceptance"])
+            self.assertFalse(semantic["scope"]["comparison"]["overhead_clearance"])
             path = Path(directory) / "browser.json"
             path.write_text(json.dumps({"runId": "final", "serviceName": service, "journeys": cases, "failure": "oracle failed"}))
             with self.assertRaises(ValueError):
