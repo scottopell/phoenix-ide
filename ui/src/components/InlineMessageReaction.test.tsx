@@ -78,6 +78,7 @@ beforeEach(() => {
   });
 });
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
   window.getSelection()?.removeAllRanges();
   Object.defineProperty(window, 'visualViewport', { configurable: true, value: initialVisualViewport });
@@ -216,7 +217,8 @@ describe('inline message reactions', () => {
     expect(screen.getByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
   });
 
-  it('uses the current gesture when the same range is deliberately reselected', async () => {
+  it('uses the current gesture when the same range is deliberately reselected', () => {
+    vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame'] });
     setCoarsePointer(true);
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} />);
@@ -224,11 +226,14 @@ describe('inline message reactions', () => {
     fireEvent.pointerDown(text, { pointerType: 'mouse' });
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'mouse' });
-    expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+    act(() => vi.advanceTimersToNextFrame());
+    expect(screen.getByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
     fireEvent.pointerDown(text, { pointerType: 'touch', clientX: 100, clientY: 60 });
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'touch' });
-    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('floating');
+    act(() => vi.advanceTimersToNextFrame());
+    expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
   });
 
