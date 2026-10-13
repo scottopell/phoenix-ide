@@ -30,12 +30,12 @@ async function assertSourceCall(page, id, viewport, outDir) {
 
 async function assertSupersededBoundary(page, id, viewport, outDir) {
   await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-hold-older')));
-  await page.getByRole('button', { name: 'Load context boundary 2: history-2', exact: true }).click();
+  await page.getByRole('button', { name: 'Load context boundary 2', exact: true }).click();
   await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureOlderSnapshotRequests === '1');
   await page.getByRole('button', { name: /Member 3 request$/ }).click();
   await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-history-prompt-3'));
   await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-release-older')));
-  await page.getByRole('button', { name: 'Context boundary: history-2', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Context boundary 2', exact: true }).waitFor();
   await page.waitForFunction(() => {
     const row = [...document.querySelectorAll('.virtual-transcript [data-render-unit-key]')].find(element => element.textContent.includes('Member 3 request'));
     const viewport = document.querySelector('.product-conversation-page__transcript .chat-main-area');
@@ -56,9 +56,9 @@ async function assertSupersededBoundary(page, id, viewport, outDir) {
 async function assertLazyHistory(page, id, viewport, outDir) {
   const initialLocation = await page.locator('html').getAttribute('data-source-fixture-location');
   if (await fixtureValue(page, 'older-snapshot-requests') !== null) throw new Error('Older history was acquired before navigation');
-  await page.getByRole('button', { name: 'Load context boundary 1: history-1', exact: true }).click();
+  await page.getByRole('button', { name: 'Load context boundary 1', exact: true }).click();
   await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureOlderSnapshotRequests === '2');
-  await page.getByRole('button', { name: 'Context boundary: history-1', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Context boundary 1', exact: true }).waitFor();
   const boundary = page.locator('[data-render-unit-key="continue-history-1"] .conversation-history-boundary');
   await boundary.waitFor({ state: 'visible' });
   const disclosure = boundary.locator('details');
@@ -68,7 +68,7 @@ async function assertLazyHistory(page, id, viewport, outDir) {
   await boundary.getByText('Preserved summary from member 1', { exact: true }).waitFor({ state: 'visible' });
   for (const value of ['history-1', 'history-2', 'continue-history-1']) await boundary.getByText(value, { exact: true }).waitFor();
   await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--boundary-expanded.png`, fullPage: true });
-  await page.getByRole('button', { name: 'Context boundary: history-2', exact: true }).click();
+  await page.getByRole('button', { name: 'Context boundary 2', exact: true }).click();
   await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-continue-history-2'));
   if (await fixtureValue(page, 'older-snapshot-requests') !== '2') throw new Error('Loaded boundary requested a duplicate cursor page');
   await page.goBack();

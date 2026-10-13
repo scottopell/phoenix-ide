@@ -82,8 +82,9 @@ describe('aggregate boundary navigation', () => {
     } }]);
     rerender(<ConversationNav chapters={loaded} activeUnitIndex={0} onJump={jump} historyBoundaries={[boundary]} onJumpBoundary={boundaryJump} />);
     expect(screen.getAllByRole('button')).toHaveLength(1);
-    const marker = screen.getByRole('button', { name: /Context boundary: predecessor/ });
+    const marker = screen.getByRole('button', { name: /Context boundary 1/ });
     expect(marker).toHaveClass('boundary', 'active');
+    expect(marker).not.toHaveAccessibleName(/predecessor|successor|exact-continuation/);
     expect(marker).not.toHaveTextContent('summary stays');
     fireEvent.click(marker);
     expect(boundaryJump).toHaveBeenLastCalledWith('exact-continuation');

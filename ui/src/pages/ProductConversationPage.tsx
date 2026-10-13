@@ -843,8 +843,8 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   const aggregateDeletedRef = useRef(false);
   const pendingAuthoritativeIdentitiesRef = useRef<ReadonlySet<string> | null>(null);
   const openMeasurementRef = useRef<ProductConversationOpenMeasurement | null>(null);
-  if (openMeasurementRef.current?.routeReference !== productConversationId) {
-    openMeasurementRef.current = productConversationId ? {
+  if (coordinator || openMeasurementRef.current?.routeReference !== productConversationId) {
+    openMeasurementRef.current = !coordinator && productConversationId ? {
       openId: generateUUID(),
       routeReference: productConversationId,
       request: undefined,

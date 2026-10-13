@@ -1030,6 +1030,15 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
   });
 
+  it('does not emit an uncorrelated ordinary-open journey for Global history', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot()));
+    renderPage('/global/row-2');
+    await waitForPageReady();
+    expect(api.getCoordinatorHistory).toHaveBeenCalledWith('row-1', { message_limit: 100 });
+    expect(api.reportProductConversationOpen).not.toHaveBeenCalled();
+  });
+
   it('correlates the initial snapshot with one bounded browser readiness report', async () => {
     const { api } = await import('../api');
     renderPage('/product-conversations/pc-telemetry');

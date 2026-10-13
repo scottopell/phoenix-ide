@@ -55,7 +55,7 @@ export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoun
         key: boundary.message_id,
         label: `Context ${boundary.segment_ordinal + 1} · load`,
         className: 'boundary',
-        ariaLabel: `Load context boundary ${boundary.segment_ordinal + 1}: ${boundary.predecessor_transcript_row_id}`,
+        ariaLabel: `Load context boundary ${boundary.segment_ordinal + 1}`,
         onClick: () => onJumpBoundary?.(boundary.message_id),
       })),
       ...chapters.map((chapter) => {
@@ -66,7 +66,7 @@ export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoun
           label: origin && origin.className === 'meta' ? `${origin.label} · ${chapter.label}` : chapter.label,
           active: isActive,
           className: chapter.kind === 'boundary' ? 'boundary' : chapter.kind === 'prose' ? 'assistant' : origin?.className,
-          ariaLabel: chapter.kind === 'boundary' ? `Context boundary: ${chapter.transcriptId}` : `${origin?.title ?? PROSE_TITLE}: ${chapter.label}`,
+          ariaLabel: chapter.kind === 'boundary' ? `Context boundary ${(historyBoundaries?.find(boundary => boundary.message_id === chapter.messageId)?.segment_ordinal ?? chapters.filter(candidate => candidate.kind === 'boundary' && candidate.unitIndex < chapter.unitIndex).length) + 1}` : `${origin?.title ?? PROSE_TITLE}: ${chapter.label}`,
           onClick: () => chapter.kind === 'boundary' && chapter.messageId && onJumpBoundary
             ? onJumpBoundary(chapter.messageId) : onJump(chapter),
         };

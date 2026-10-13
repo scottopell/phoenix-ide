@@ -1192,26 +1192,29 @@ impl Database {
             let summary = continuation_summary(&row, "continuation_content")?;
             let accepted_content =
                 message_content_from_row(&row, "accepted_message_type", "accepted_content")?;
-            let accepted_is_duplicate_summary = match accepted_content {
-                MessageContent::User(user) => user.text == summary,
-                MessageContent::Continuation(continuation) => continuation.summary == summary,
-                MessageContent::Agent(_)
-                | MessageContent::Tool(_)
-                | MessageContent::System(_)
-                | MessageContent::Error(_)
-                | MessageContent::Skill(_) => false,
-            };
+            let opening_authority = ContinuationOpeningAuthority::from_db_str(
+                &row.try_get::<String, _>("opening_authority")?,
+            )
+            .ok_or_else(|| {
+                DbError::Serialization("unknown continuation opening authority".to_string())
+            })?;
+            let accepted_is_duplicate_summary = opening_authority
+                == ContinuationOpeningAuthority::GeneratedPredecessorContext
+                && match accepted_content {
+                    MessageContent::User(user) => user.text == summary,
+                    MessageContent::Continuation(continuation) => continuation.summary == summary,
+                    MessageContent::Agent(_)
+                    | MessageContent::Tool(_)
+                    | MessageContent::System(_)
+                    | MessageContent::Error(_)
+                    | MessageContent::Skill(_) => false,
+                };
             return Ok(Some(ProductConversationHandoff::Completed {
                 predecessor_transcript_row_id: predecessor.to_string(),
                 successor_transcript_row_id: successor.to_string(),
                 continuation_message_id: row.try_get("continuation_message_id")?,
                 accepted_successor_message_id: row.try_get("accepted_successor_message_id")?,
-                opening_authority: ContinuationOpeningAuthority::from_db_str(
-                    &row.try_get::<String, _>("opening_authority")?,
-                )
-                .ok_or_else(|| {
-                    DbError::Serialization("unknown continuation opening authority".to_string())
-                })?,
+                opening_authority,
                 summary,
                 accepted_is_duplicate_summary,
             }));
@@ -1741,7 +1744,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn resolves_member_identity_and_reads_typed_handoff() {
+    async fn resolves_member_identity_and_preserves_equal_text_user_authorized_handoff() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
             .create_conversation("root", "root-slug", "/tmp", true, None, None)
@@ -1760,7 +1763,7 @@ mod tests {
                 &root.id,
                 NewContinuationDispatchIntent::user_authorized(
                     ClientTurnKey::try_from("opening").unwrap(),
-                    "accepted opening handoff".to_string(),
+                    "exact handoff".to_string(),
                     None,
                 ),
             )
@@ -1787,7 +1790,7 @@ mod tests {
         db.add_message(
             "opening",
             &successor.id,
-            &MessageContent::user("accepted opening handoff"),
+            &MessageContent::user("exact handoff"),
             None,
             None,
         )
