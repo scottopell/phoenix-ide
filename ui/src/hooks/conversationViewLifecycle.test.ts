@@ -1,0 +1,232 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ViewJourneyLifecycle, defaultViewIdentity } from './conversationViewLifecycle';
+import { ViewJourneyReporter } from './conversationViewTelemetry';
+
+const productId = crypto.randomUUID();
+const segmentId = crypto.randomUUID();
+let now = 0;
+let controllers: ViewJourneyLifecycle[] = [];
+const send = vi.fn<typeof fetch>();
+function view(route: 'global' | 'ordinary' = 'ordinary') {
+  const reporter = new ViewJourneyReporter({ sampleRate: 1, send });
+  const controller = new ViewJourneyLifecycle(defaultViewIdentity(route, 'navigation'), reporter, () => now);
+  controllers.push(controller);
+  const root = document.createElement('main');
+  root.innerHTML = '<section><div id="messages"></div><div id="conversation-nav-trail"><span class="conversation-nav-item" role="button" aria-disabled="true">Private breadcrumb</span></div></section>';
+  document.body.append(root);
+  controller.attach(root);
+  return { root, controller };
+}
+function hydrate(root: HTMLElement, controller: ViewJourneyLifecycle) {
+  root.querySelector('#messages')!.innerHTML = '<div data-render-unit-key="private-key"><article>Private transcript</article></div>';
+  controller.snapshotReceived(productId, segmentId);
+  controller.hydrationReady(productId, segmentId, 1499);
+  controller.chaptersReady(12);
+}
+function enable(root: HTMLElement) { root.querySelector('[role="button"]')!.removeAttribute('aria-disabled'); }
+function payload(index = 0) { return JSON.parse(send.mock.calls[index]![1]!.body as string); }
+
+describe('ViewJourneyLifecycle', () => {
+  beforeEach(() => {
+    now = 0;
+    controllers = [];
+    vi.useFakeTimers();
+    send.mockReset().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1));
+    vi.stubGlobal('cancelAnimationFrame', vi.fn());
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, bottom: 100, right: 100, width: 100, height: 100, toJSON: () => ({}) });
+  });
+  afterEach(async () => {
+    controllers.forEach(controller => controller.finish('canceled'));
+    await vi.advanceTimersByTimeAsync(0);
+    document.body.innerHTML = '';
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('separates a delayed network snapshot, meaningful content, and later enabled breadcrumb', async () => {
+    const { root, controller } = view();
+    controller.requestStarted(crypto.randomUUID());
+    now = 1000;
+    hydrate(root, controller);
+    now = 1005;
+    controller.inspect();
+    now = 1100;
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({
+      outcome: 'ready', product_conversation_id: productId, segment_id: segmentId,
+      message_count_bucket: '1001+', chapter_count_bucket: '11-100', cache: 'network',
+      anchor_result: 'tail_pinned', breadcrumb_ready_minus_meaningful_ms: 95,
+      marks: { snapshot_received: 1000, meaningful_transcript: 1005, breadcrumb_enabled: 1100 },
+      presentation_evidence: 'commit_frame_estimate',
+    });
+    expect(send.mock.calls[0]![1]!.body).not.toMatch(/Private|private-key/);
+  });
+
+  it('does not count retained Global content or command inventory while validation hides the ancestor', async () => {
+    const { root, controller } = view('global');
+    root.querySelector('section')!.setAttribute('hidden', '');
+    hydrate(root, controller);
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    controller.finish('incomplete');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ outcome: 'incomplete', marks: { meaningful_transcript: null, breadcrumb_presented: null, breadcrumb_enabled: null, anchor_settled: null } });
+  });
+
+  it('waits for validation release and never treats snapshot or skeleton availability as meaningful content', async () => {
+    const { root, controller } = view('global');
+    controller.hydrationReady(productId, segmentId, 10);
+    root.querySelector('#messages')!.innerHTML = '<div class="message-skeleton"></div><div data-render-unit-key="empty-slot"></div>';
+    root.querySelector('section')!.setAttribute('hidden', '');
+    enable(root);
+    controller.inspect();
+    expect(send).not.toHaveBeenCalled();
+    now = 30;
+    root.querySelector('section')!.removeAttribute('hidden');
+    controller.inspect();
+    expect(send).not.toHaveBeenCalled();
+    now = 90;
+    hydrate(root, controller);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ outcome: 'ready', breadcrumb_ready_minus_meaningful_ms: -60, marks: { meaningful_transcript: 90, breadcrumb_presented: 30 } });
+  });
+
+  it.each(['target_missing', 'superseded'] as const)('records %s without fabricating target settlement', async result => {
+    const { root, controller } = view();
+    controller.expectTarget(true);
+    hydrate(root, controller);
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    expect(send).not.toHaveBeenCalled();
+    controller.anchor(result);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ outcome: 'incomplete', anchor_result: result, marks: { anchor_settled: null } });
+  });
+
+  it('requires the owning applied result for a target even if the default tail is pinned', async () => {
+    const { root, controller } = view();
+    controller.expectTarget(true, 'target');
+    hydrate(root, controller);
+    root.querySelector('article')!.id = 'message-target';
+    root.querySelector('article')!.innerHTML = '<span>Private target</span>';
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    expect(send).not.toHaveBeenCalled();
+    now = 70;
+    controller.anchor('applied');
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ outcome: 'ready', anchor_result: 'applied', marks: { anchor_settled: 70 } });
+  });
+
+  it('does not mark an applied target while the transcript remains blank or the target has no rendered content', async () => {
+    const { root, controller } = view();
+    controller.expectTarget(true, 'target');
+    controller.hydrationReady(productId, segmentId, 10);
+    enable(root);
+    controller.anchor('applied');
+    controller.inspect();
+    root.querySelector('#messages')!.innerHTML = '<div data-render-unit-key="other"><article>Other visible message</article></div><div data-render-unit-key="target-slot"><div id="message-target"></div></div>';
+    controller.inspect();
+    controller.finish('incomplete');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ outcome: 'incomplete', anchor_result: null, marks: { anchor_settled: null } });
+  });
+
+  it('marks applied settlement only after the actual target is visibly rendered', async () => {
+    const { root, controller } = view();
+    controller.expectTarget(true, 'target');
+    hydrate(root, controller);
+    enable(root);
+    controller.anchor('applied');
+    controller.inspect();
+    expect(send).not.toHaveBeenCalled();
+    now = 90;
+    root.querySelector('article')!.id = 'message-target';
+    root.querySelector('article')!.innerHTML = '<span>Private target</span>';
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ outcome: 'ready', anchor_result: 'applied', marks: { anchor_settled: 90 } });
+  });
+
+  it('assigns fresh resume identity, preserves actual retained identity, and does not reuse old anchor evidence', async () => {
+    const { root, controller } = view('global');
+    hydrate(root, controller);
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    const first = payload();
+    now = 200;
+    controller.resume();
+    controller.inspect();
+    expect(send).toHaveBeenCalledTimes(1);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload(1)).toMatchObject({ trigger: 'pwa_resume', cache: 'retained', product_conversation_id: productId, segment_id: segmentId, marks: { snapshot_received: null, hydration_ready: 0 } });
+    expect(payload(1).open_id).not.toBe(first.open_id);
+    expect(payload(1).reporter_id).toBe(first.reporter_id);
+  });
+
+  it('does not attach a pre-resume request completion or failure to a fresh resume journey', async () => {
+    const { root, controller } = view();
+    const oldRequest = controller.requestStarted(crypto.randomUUID())!;
+    hydrate(root, controller);
+    controller.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    oldRequest.response({ size_bucket: '1m+', trace_id: '1234567890abcdef1234567890abcdef' });
+    oldRequest.snapshot(crypto.randomUUID(), crypto.randomUUID());
+    oldRequest.failed();
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload(1)).toMatchObject({ outcome: 'ready', product_conversation_id: productId, segment_id: segmentId, response_size_bucket: 'unknown', correlations: [], marks: { snapshot_received: null } });
+  });
+
+  it('rejects off-viewport content even when the DOM and style are mounted', async () => {
+    const { root, controller } = view();
+    hydrate(root, controller);
+    enable(root);
+    const content = root.querySelector('article')!;
+    vi.spyOn(content, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 10_000, top: 10_000, left: 0, bottom: 10_100, right: 100, width: 100, height: 100, toJSON: () => ({}) });
+    controller.tailAnchorSettled();
+    controller.inspect();
+    controller.finish('incomplete');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ marks: { meaningful_transcript: null, anchor_settled: null } });
+  });
+
+  it('reports scan-budget omissions rather than silently calling them absent', async () => {
+    const { root, controller } = view();
+    hydrate(root, controller);
+    root.querySelector('#messages')!.innerHTML = Array.from({ length: 65 }, (_, index) => `<div data-render-unit-key="${index}"><article ${index < 64 ? 'hidden' : ''}>Private</article></div>`).join('');
+    controller.inspect();
+    controller.finish('incomplete');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ observer_scan_limited: true, observer_inspection_count: 1, marks: { meaningful_transcript: null } });
+  });
+
+  it('expires unfinished views and coalesces inspection work, with no observer after completion', async () => {
+    const { controller } = view();
+    for (let i = 0; i < 1000; i++) controller.scheduleInspection();
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+    now = 300_000;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(payload()).toMatchObject({ outcome: 'incomplete', total_ms: 300_000, marks: { meaningful_transcript: null } });
+    controller.scheduleInspection();
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+});

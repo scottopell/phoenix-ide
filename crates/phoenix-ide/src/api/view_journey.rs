@@ -1,4 +1,5 @@
-use axum::{Json, http::StatusCode};
+use super::AppState;
+use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 
 macro_rules! wire_enum {
@@ -18,7 +19,11 @@ wire_enum!(Outcome { Ready => "ready", Failed => "failed", Canceled => "canceled
 wire_enum!(Route { Global => "global", Ordinary => "ordinary" });
 wire_enum!(Trigger { Navigation => "navigation", Reload => "reload", BackForward => "back_forward", PwaResume => "pwa_resume" });
 wire_enum!(Platform { Ios => "ios", Android => "android", Desktop => "desktop", Unknown => "unknown" });
-wire_enum!(Evidence { Commit => "react_commit_estimate" });
+wire_enum!(Evidence { Commit => "commit_frame_estimate" });
+wire_enum!(Cache { Network => "network", Retained => "retained", Unknown => "unknown" });
+wire_enum!(ResponseSizeBucket { Unknown => "unknown", Tiny => "0-10k", Small => "10k-100k", Medium => "100k-1m", Large => "1m+" });
+wire_enum!(CountBucket { Unknown => "unknown", Empty => "0", Small => "1-10", Medium => "11-100", Large => "101-1000", Huge => "1001+" });
+wire_enum!(AnchorResult { Applied => "applied", TailPinned => "tail_pinned", Empty => "empty", TargetMissing => "target_missing", Superseded => "superseded" });
 wire_enum!(CorrelationKind { Request => "request", Sse => "sse", Trace => "trace" });
 
 #[derive(Debug, Deserialize)]
@@ -72,11 +77,22 @@ pub(super) struct Report {
     standalone: bool,
     platform: Platform,
     frontend_source: Option<String>,
+    frontend_source_dirty: bool,
+    cache: Cache,
+    message_count_bucket: CountBucket,
+    chapter_count_bucket: CountBucket,
+    response_size_bucket: ResponseSizeBucket,
+    reconnect_count: u32,
     visible: bool,
     marks: Marks,
     outcome: Outcome,
     total_ms: f64,
     background_ms: f64,
+    background_interval_count: u32,
+    background_open: bool,
+    observer_inspection_count: u32,
+    observer_scan_limited: bool,
+    anchor_result: Option<AnchorResult>,
     timeline_saturated: bool,
     breadcrumb_ready_minus_meaningful_ms: Option<f64>,
     presentation_evidence: Evidence,
@@ -93,6 +109,16 @@ impl Report {
     fn valid(&self) -> bool {
         let bounded = |n: f64| n.is_finite() && (0.0..=300_000.0).contains(&n);
         let hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+        let counters = [
+            self.admitted_count,
+            self.sampled_count,
+            self.transport_dropped_count,
+            self.transport_failed_count,
+            self.dropped_correlations,
+            self.background_interval_count,
+            self.reconnect_count,
+            self.observer_inspection_count,
+        ];
         bounded(self.total_ms)
             && bounded(self.background_ms)
             && self.background_ms <= self.total_ms
@@ -117,6 +143,12 @@ impl Report {
                 .frontend_source
                 .as_deref()
                 .is_none_or(|s| (7..=40).contains(&s.len()) && hex(s))
+            && self.reconnect_count <= 10_000
+            && self.marks.anchor_settled.is_some()
+                == matches!(
+                    self.anchor_result.as_ref(),
+                    Some(AnchorResult::Applied | AnchorResult::TailPinned | AnchorResult::Empty)
+                )
             && self.correlations.len() <= 16
             && self.correlations.iter().all(|c| match c.kind {
                 CorrelationKind::Trace => c.id.len() == 32 && hex(&c.id),
@@ -128,30 +160,27 @@ impl Report {
             && self.sample_rate > 0.0
             && self.sample_rate <= 1.0
             && self.sampled_count <= self.admitted_count
-            && self.counters_saturated
-                == [
-                    self.admitted_count,
-                    self.sampled_count,
-                    self.transport_dropped_count,
-                    self.transport_failed_count,
-                ]
-                .contains(&10_000)
-            && [
-                self.admitted_count,
-                self.sampled_count,
-                self.dropped_correlations,
-                self.transport_dropped_count,
-                self.transport_failed_count,
-            ]
-            .into_iter()
-            .all(|n| n <= 10_000)
+            && self.counters_saturated == counters.contains(&10_000)
+            && counters.into_iter().all(|n| n <= 10_000)
+            && (self.background_interval_count > 0
+                || (self.background_ms == 0.0 && !self.background_open))
     }
 }
 
-pub(super) async fn report(Json(report): Json<Report>) -> StatusCode {
+pub(super) async fn report(
+    State(state): State<AppState>,
+    Json(report): Json<Report>,
+) -> StatusCode {
     if !report.valid() {
         return StatusCode::BAD_REQUEST;
     }
+    let instance_id = match state.db.instance_id().await {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::warn!("view telemetry instance identity unavailable");
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    };
     let span = tracing::info_span!(target: "phoenix_ide::otel", "browser.conversation_view",
         "open.id" = %report.open_id,
         "browser.reporter_id" = %report.reporter_id,
@@ -162,9 +191,21 @@ pub(super) async fn report(Json(report): Json<Report>) -> StatusCode {
         "browser.outcome" = report.outcome.as_str(), "browser.platform" = report.platform.as_str(),
         "browser.standalone" = report.standalone, "browser.visible" = report.visible,
         "browser.frontend_source" = report.frontend_source.as_deref(),
+        "browser.frontend_source_dirty" = report.frontend_source_dirty,
+        "browser.cache" = report.cache.as_str(),
+        "browser.message_count_bucket" = report.message_count_bucket.as_str(),
+        "browser.chapter_count_bucket" = report.chapter_count_bucket.as_str(),
+        "browser.response_size_bucket" = report.response_size_bucket.as_str(),
+        "browser.reconnect_count" = report.reconnect_count,
+        "browser.anchor_result" = report.anchor_result.as_ref().map(AnchorResult::as_str),
         "server.backend_source" = env!("PHOENIX_GIT_SHA"),
+        "server.instance_id" = %instance_id,
         "browser.presentation_evidence" = report.presentation_evidence.as_str(),
         "browser.total_ms" = report.total_ms, "browser.background_ms" = report.background_ms,
+        "browser.background_interval_count" = report.background_interval_count,
+        "browser.background_open" = report.background_open,
+        "browser.observer_inspection_count" = report.observer_inspection_count,
+        "browser.observer_scan_limited" = report.observer_scan_limited,
         "browser.timeline_saturated" = report.timeline_saturated,
         "browser.shell_ms" = report.marks.shell,
         "browser.snapshot_received_ms" = report.marks.snapshot_received,
@@ -201,11 +242,14 @@ mod tests {
             "reporter_id": uuid::Uuid::new_v4(), "counters_saturated": false,
             "route": "global", "trigger": "pwa_resume", "standalone": true, "platform": "ios",
             "frontend_source": "b8fc23f", "visible": true,
+            "frontend_source_dirty": false, "cache": "unknown", "message_count_bucket": "unknown", "chapter_count_bucket": "unknown", "reconnect_count": 0, "anchor_result": null,
+            "response_size_bucket": "unknown", "background_interval_count": 1, "background_open": false,
+            "observer_inspection_count": 0, "observer_scan_limited": false,
             "marks": { "shell": 0, "snapshot_received": null, "hydration_ready": null,
                 "meaningful_transcript": 50, "chapter_data_ready": null, "breadcrumb_presented": 10,
                 "breadcrumb_enabled": 10, "anchor_settled": null },
             "outcome": "canceled", "total_ms": 100, "background_ms": 40, "timeline_saturated": false,
-            "breadcrumb_ready_minus_meaningful_ms": -40, "presentation_evidence": "react_commit_estimate",
+            "breadcrumb_ready_minus_meaningful_ms": -40, "presentation_evidence": "commit_frame_estimate",
             "correlations": [], "dropped_correlations": 0, "sample_rate": 0.25,
             "admitted_count": 4, "sampled_count": 1, "transport_dropped_count": 0, "transport_failed_count": 0
         })
@@ -214,11 +258,9 @@ mod tests {
     #[test]
     fn accepts_missing_canceled_reordered_marks_but_not_fabricated_success() {
         let value = payload();
-        assert!(
-            serde_json::from_value::<Report>(value.clone())
-                .unwrap()
-                .valid()
-        );
+        assert!(serde_json::from_value::<Report>(value.clone())
+            .unwrap()
+            .valid());
         let mut success = value;
         success["outcome"] = "ready".into();
         assert!(!serde_json::from_value::<Report>(success).unwrap().valid());
@@ -245,11 +287,9 @@ mod tests {
         let mut value = payload();
         value["timeline_saturated"] = true.into();
         value["total_ms"] = 300_000.into();
-        assert!(
-            !serde_json::from_value::<Report>(value.clone())
-                .unwrap()
-                .valid()
-        );
+        assert!(!serde_json::from_value::<Report>(value.clone())
+            .unwrap()
+            .valid());
         value["breadcrumb_ready_minus_meaningful_ms"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<Report>(value).unwrap().valid());
     }

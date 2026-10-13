@@ -1,4 +1,12 @@
 import { ConversationViewJourney, type JourneyReport, type JourneyTrigger } from './conversationViewJourney';
+import type { ResponseSizeBucket } from './conversationViewResponse';
+import { generateUUID } from '../utils/uuid';
+
+export type CountBucket = 'unknown' | '0' | '1-10' | '11-100' | '101-1000' | '1001+';
+export function countBucket(count: number): CountBucket {
+  if (!Number.isInteger(count) || count < 0) return 'unknown';
+  return count === 0 ? '0' : count <= 10 ? '1-10' : count <= 100 ? '11-100' : count <= 1000 ? '101-1000' : '1001+';
+}
 
 export interface ViewIdentity {
   product_conversation_id: string | null;
@@ -8,6 +16,12 @@ export interface ViewIdentity {
   standalone: boolean;
   platform: 'ios' | 'android' | 'desktop' | 'unknown';
   frontend_source: string | null;
+  frontend_source_dirty: boolean;
+  cache: 'network' | 'retained' | 'unknown';
+  message_count_bucket: CountBucket;
+  chapter_count_bucket: CountBucket;
+  response_size_bucket: ResponseSizeBucket;
+  reconnect_count: number;
   visible: boolean;
 }
 export interface ViewJourneyPayload extends ViewIdentity, JourneyReport {
@@ -20,11 +34,22 @@ export interface ViewJourneyPayload extends ViewIdentity, JourneyReport {
   transport_dropped_count: number;
   transport_failed_count: number;
 }
-export interface SampledViewJourney {
-  openId: string;
-  measurement: ConversationViewJourney;
-  identity: ViewIdentity;
+class SampledRecord {
+  readonly #owner: object;
+  readonly openId = generateUUID();
+  readonly measurement: ConversationViewJourney;
+  readonly identity: ViewIdentity;
+
+  constructor(owner: object, identity: ViewIdentity, measurement: ConversationViewJourney) {
+    this.#owner = owner;
+    this.identity = identity;
+    this.measurement = measurement;
+    Object.freeze(this);
+  }
+
+  ownedBy(owner: object): boolean { return owner === this.#owner; }
 }
+export type SampledViewJourney = SampledRecord;
 const MAX_COUNT = 10_000;
 const increment = (n: number) => Math.min(MAX_COUNT, n + 1);
 const opaqueId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -35,6 +60,12 @@ function cleanIdentity(identity: ViewIdentity): ViewIdentity {
     product_conversation_id: identity.product_conversation_id && opaqueId.test(identity.product_conversation_id) ? identity.product_conversation_id : null,
     segment_id: identity.segment_id && opaqueId.test(identity.segment_id) ? identity.segment_id : null,
     frontend_source: identity.frontend_source && sourceId.test(identity.frontend_source) ? identity.frontend_source : null,
+    frontend_source_dirty: identity.frontend_source_dirty === true,
+    cache: ['network', 'retained', 'unknown'].includes(identity.cache) ? identity.cache : 'unknown',
+    message_count_bucket: ['unknown', '0', '1-10', '11-100', '101-1000', '1001+'].includes(identity.message_count_bucket) ? identity.message_count_bucket : 'unknown',
+    chapter_count_bucket: ['unknown', '0', '1-10', '11-100', '101-1000', '1001+'].includes(identity.chapter_count_bucket) ? identity.chapter_count_bucket : 'unknown',
+    response_size_bucket: ['unknown', '0-10k', '10k-100k', '100k-1m', '1m+'].includes(identity.response_size_bucket) ? identity.response_size_bucket : 'unknown',
+    reconnect_count: Number.isFinite(identity.reconnect_count) ? Math.min(10_000, Math.max(0, Math.floor(identity.reconnect_count))) : 0,
     route: identity.route === 'global' ? 'global' : 'ordinary',
     trigger: ['navigation', 'reload', 'back_forward', 'pwa_resume'].includes(identity.trigger) ? identity.trigger : 'navigation',
     standalone: identity.standalone === true,
@@ -44,60 +75,71 @@ function cleanIdentity(identity: ViewIdentity): ViewIdentity {
 }
 
 export class ViewJourneyReporter {
-  private readonly reporterId = crypto.randomUUID();
-  private admitted = 0;
-  private sampled = 0;
-  private dropped = 0;
-  private failed = 0;
-  private busy = false;
-  private readonly sampleRate: number;
-  private readonly random: () => number;
-  private readonly send: typeof fetch;
+  readonly #owner = {};
+  readonly #reporterId = generateUUID();
+  #admitted = 0;
+  #sampled = 0;
+  #dropped = 0;
+  #failed = 0;
+  #busy = false;
+  readonly #sampleRate: number;
+  readonly #random: () => number;
+  readonly #send: typeof fetch;
 
   constructor(options: { sampleRate?: number; random?: () => number; send?: typeof fetch } = {}) {
-    this.sampleRate = options.sampleRate ?? 0.25;
-    if (!(this.sampleRate > 0 && this.sampleRate <= 1)) throw new Error('Invalid journey sampling rate');
-    this.random = options.random ?? Math.random;
-    this.send = options.send ?? fetch;
+    this.#sampleRate = options.sampleRate ?? 0.25;
+    if (!(this.#sampleRate > 0 && this.#sampleRate <= 1)) throw new Error('Invalid journey sampling rate');
+    this.#random = options.random ?? Math.random;
+    this.#send = options.send ?? fetch;
+    Object.freeze(this);
   }
 
   begin(identity: ViewIdentity, clock?: () => number): SampledViewJourney | null {
-    this.admitted = increment(this.admitted);
-    if (this.random() >= this.sampleRate) return null;
-    this.sampled = increment(this.sampled);
+    this.#admitted = increment(this.#admitted);
+    if (this.#random() >= this.#sampleRate) return null;
+    this.#sampled = increment(this.#sampled);
     const clean = cleanIdentity(identity);
     const measurement = new ConversationViewJourney(clock);
     measurement.visibility(clean.visible);
-    return { openId: crypto.randomUUID(), measurement, identity: clean };
+    return new SampledRecord(this.#owner, clean, measurement);
   }
 
   report(journey: SampledViewJourney, outcome: JourneyReport['outcome']): void {
-    const report = journey.measurement.finish(outcome);
-    if (!report) return;
-    if (this.busy) {
-      this.dropped = increment(this.dropped);
+    if (!journey.ownedBy(this.#owner)) {
+      this.#dropped = increment(this.#dropped);
       return;
     }
+    const report = journey.measurement.finish(outcome);
+    if (!report) return;
+    if (!opaqueId.test(journey.openId)) {
+      this.#dropped = increment(this.#dropped);
+      return;
+    }
+    if (this.#busy) {
+      this.#dropped = increment(this.#dropped);
+      return;
+    }
+    const identity = cleanIdentity(journey.identity);
     const payload: ViewJourneyPayload = {
-      ...cleanIdentity(journey.identity), ...report, open_id: journey.openId,
-      reporter_id: this.reporterId,
-      counters_saturated: [this.admitted, this.sampled, this.dropped, this.failed].includes(MAX_COUNT),
-      sample_rate: this.sampleRate, admitted_count: this.admitted, sampled_count: this.sampled,
-      transport_dropped_count: this.dropped, transport_failed_count: this.failed,
+      ...identity, ...report, open_id: journey.openId,
+      reporter_id: this.#reporterId,
+      counters_saturated: [this.#admitted, this.#sampled, this.#dropped, this.#failed, report.dropped_correlations, report.background_interval_count, report.observer_inspection_count, identity.reconnect_count].includes(MAX_COUNT),
+      sample_rate: this.#sampleRate, admitted_count: this.#admitted, sampled_count: this.#sampled,
+      transport_dropped_count: this.#dropped, transport_failed_count: this.#failed,
     };
-    this.busy = true;
+    this.#busy = true;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3000);
-    void Promise.resolve().then(() => this.send('/api/telemetry/conversation-view', {
+    void Promise.resolve().then(() => this.#send('/api/telemetry/conversation-view', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload), keepalive: true, signal: controller.signal,
     })).then(response => {
-      if (!response.ok) this.failed = increment(this.failed);
+      if (!response.ok) this.#failed = increment(this.#failed);
     }).catch(() => {
-      this.failed = increment(this.failed);
+      this.#failed = increment(this.#failed);
     }).finally(() => {
       clearTimeout(timeout);
-      this.busy = false;
+      this.#busy = false;
     });
   }
 }

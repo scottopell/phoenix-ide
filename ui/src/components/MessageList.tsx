@@ -199,6 +199,7 @@ interface MessageListProps {
    *  chapter `unitIndex` values are guaranteed to be in virtual transcript
    *  coordinate space — no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
+  onViewTailSettled?: (() => void) | undefined;
   hasOlderMessages?: boolean | undefined;
   onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => Promise<void>) | undefined;
   onUpdateOlderMessagesRestore?: ((restoreBasis: RestoreBasis) => void) | undefined;
@@ -575,6 +576,7 @@ function MessageListImpl({
   reactionDestination,
   onVisibleRangeChange,
   onChaptersChange,
+  onViewTailSettled,
   hasOlderMessages = false,
   onLoadOlderMessages,
   onUpdateOlderMessagesRestore,
@@ -977,12 +979,18 @@ function MessageListImpl({
     }
   }, [scheduleDomBottomWrite, scheduleTailFollow, startSettleWatch, stopSettleWatch]);
 
+  const viewTailSettledRef = useRef(onViewTailSettled);
+  viewTailSettledRef.current = onViewTailSettled;
   const dispatchScrollEvent = useCallback((event: ScrollEvent) => {
     const next = reduceScrollMachine(scrollMachineRef.current, event);
     scrollMachineRef.current = next.state;
     // REQ-VT-008: intent follows every reduction.
+
     transcriptRef.current?.setTailFollowAllowed(tailFollowGranted(next.state));
     applyScrollEffects(next.effects);
+    if (next.state.kind === 'live' && next.state.follow.kind === 'following' && next.state.geometry.atBottom && next.state.gesture.kind === 'idle') {
+      viewTailSettledRef.current?.();
+    }
   }, [applyScrollEffects]);
   dispatchScrollEventRef.current = dispatchScrollEvent;
 

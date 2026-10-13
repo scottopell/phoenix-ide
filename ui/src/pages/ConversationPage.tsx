@@ -205,6 +205,7 @@ interface EmbeddedConversationHostProps {
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   onCloseCompleted?: () => void;
+  onStreamAttempt?: ((conversationId: string, openId: string, retryAttempt: number) => void) | undefined;
 }
 
 interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
@@ -232,6 +233,7 @@ export function EmbeddedConversationPage({
   onProjectionChange,
   suppressMessageViewerOwner = false,
   onCloseCompleted,
+  onStreamAttempt,
   suppressTaskApprovalOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
@@ -269,6 +271,7 @@ export function EmbeddedConversationPage({
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
         suppressTaskApprovalOwner={suppressTaskApprovalOwner}
+        onStreamAttempt={onStreamAttempt}
         {...(onProjectionChange ? { onProjectionChange } : {})}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />
@@ -306,6 +309,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner,
   suppressTaskApprovalOwner,
   onCloseCompleted,
+  onStreamAttempt,
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
@@ -320,6 +324,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner: boolean;
   suppressTaskApprovalOwner: boolean;
   onCloseCompleted?: () => void;
+  onStreamAttempt?: ((conversationId: string, openId: string, retryAttempt: number) => void) | undefined;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -773,6 +778,7 @@ function ConversationPageContent({
   }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
 
   const connectionInfo = useConnection({
+    ...(onStreamAttempt ? { onStreamAttempt } : {}),
     conversationId: navigator.onLine ? resolvedRouteConversationId ?? undefined : undefined,
     dispatch,
     getLastAppliedEventSeq: () => atomRef.current.conversationId === resolvedRouteConversationId

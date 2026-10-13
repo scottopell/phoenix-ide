@@ -161,6 +161,7 @@ interface UseConnectionOptions {
   onValidatedInit?: (payload: InitPayload) => void;
   /** Called when a validated live event transfers one steering identity to server authority. */
   onValidatedSteeringQueued?: (messageId: string) => void;
+  onStreamAttempt?: (conversationId: string, openId: string, retryAttempt: number) => void;
 }
 
 function buildStreamUrl(
@@ -228,6 +229,7 @@ export function useConnection({
   getTranscriptGeneration,
   onValidatedInit,
   onValidatedSteeringQueued,
+  onStreamAttempt,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -261,6 +263,8 @@ export function useConnection({
   const getTranscriptGenerationRef = useRef(getTranscriptGeneration);
   const onValidatedInitRef = useRef(onValidatedInit);
   const onValidatedSteeringQueuedRef = useRef(onValidatedSteeringQueued);
+  const onStreamAttemptRef = useRef(onStreamAttempt);
+  useEffect(() => { onStreamAttemptRef.current = onStreamAttempt; }, [onStreamAttempt]);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -378,6 +382,7 @@ export function useConnection({
           es.addEventListener('open', () => measurement.nativeOpen());
           eventSourceRef.current = es;
           openMeasurementRef.current = measurement;
+          onStreamAttemptRef.current?.(convId, openId, openAttempt);
           const isCurrentOwner = () =>
             conversationIdRef.current === convId &&
             machineStateRef.current.epoch === epoch &&

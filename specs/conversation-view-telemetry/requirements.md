@@ -20,7 +20,7 @@ A route replacement cancels the preceding journey. A failed initial request term
 
 WHEN the view observes shell, snapshot receipt, hydration readiness, meaningful transcript, chapter-data readiness, breadcrumb presentation, breadcrumb enablement, or anchor settlement
 THE SYSTEM SHALL retain the first observation on a client monotonic timeline
-AND SHALL identify presentation evidence as a React commit estimate, not compositor/pixel proof
+AND SHALL identify presentation evidence as `commit_frame_estimate`, a commit/frame-scheduling and visible-geometry estimate rather than compositor/pixel proof
 AND SHALL derive breadcrumb-ready-minus-meaningful-transcript from the later of breadcrumb presentation and enablement
 AND SHALL preserve signed differences when observations arrive out of order.
 
@@ -28,7 +28,7 @@ WHEN a duration exceeds five minutes
 THE SYSTEM SHALL explicitly mark the timeline saturated, treat its bounded values as lower-bound/censored observations, and omit the primary readiness difference
 AND SHALL NOT silently present clamped values as exact timings.
 
-Client and server wall clocks SHALL NOT be subtracted. Anchor settlement SHALL come from the owning positioning lifecycle, not an arbitrary elapsed timer. Ready requires meaningful transcript, breadcrumb presentation and enablement, and anchor settlement; absent marks remain visible even on a ready report.
+Client and server wall clocks SHALL NOT be subtracted. Anchor settlement SHALL come from the owning positioning lifecycle and visible rendered target evidence, not an arbitrary elapsed timer, data availability, navigation inventory, or an empty virtual slot. A target positioning result of `applied` SHALL NOT establish presentation while that target lacks visible rendered content. A resume SHALL obtain fresh anchor observations rather than copy a preceding journey's settlement mark. Ready requires meaningful transcript, breadcrumb presentation and enablement, and anchor settlement; absent marks remain visible even on a ready report.
 
 ### REQ-CVT-003: Bounded correlation and privacy
 

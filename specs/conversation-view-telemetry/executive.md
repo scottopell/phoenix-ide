@@ -4,21 +4,25 @@ Task 32005 is user-commissioned, independently owned telemetry work. Global reta
 
 ## Implemented source increment
 
-- `ConversationViewJourney`: first-once monotonic marks, signed readiness difference, null missing marks, canceled/failed/incomplete outcomes, censored five-minute saturation, sixteen observed correlations and drop counters, background duration.
-- `ViewJourneyReporter`: admission-time 25% sampling, independent journey UUIDs, per-reporter denominators, one keepalive request with a three-second abort deadline; busy reports drop, with no retry/offline queue.
-- `view_journey::report`: authenticated existing API routing, eight-KiB body limit, fixed schema/enums/UUIDs and duration validation, backend source identity, allowlisted `browser.conversation_view` and bounded `browser.view_correlation` exporter spans.
-- API requirements explicitly label legacy `first_paint_ms` as a frame scheduling estimate, not compositor proof.
+- `ConversationViewJourney`: first-once monotonic marks, signed readiness difference, null missing marks, canceled/failed/incomplete outcomes, censored five-minute saturation, sixteen observed correlations and drop counters, bounded background and observer counters. Presentation evidence is `commit_frame_estimate`, not pixel proof.
+- `ViewJourneyReporter`: admission-time 25% sampling, independent journey UUIDs, per-reporter denominators, one keepalive request with a three-second abort deadline; busy reports drop, with no retry/offline queue. Final serialization re-projects identity; private/frozen measurement ownership prevents caller mutation of internal marks.
+- `ViewJourneyLifecycle` and `useConversationViewJourney`: router/reload/Back/Forward/PWA/BFCache admission, attempt-bound finite response callbacks, coalesced root-scoped observation with a 64-candidate inspection limit, actual visible rendered transcript and actionable breadcrumb evidence. Applied positioning alone is insufficient: the actual target must contain visible rendered content. Missing/superseded positioning stays incomplete.
+- Existing App alias wrappers admit failed opens before ProductConversationPage mounts; inherited lifecycle preserves ancestor visibility without changing route validation, fetch ordering, scroll, or hidden-state semantics. Global retains legacy ordinary-telemetry suppression.
+- Bounded request/SSE identities, finite response header buckets, message/chapter buckets, frontend source and dirty status, and authoritative backend instance/source identity are threaded through the existing pipeline. No response body is read for telemetry.
+- `view_journey::report`: authenticated existing API routing, eight-KiB body limit, fixed schema/enums/UUIDs and duration validation, allowlisted `browser.conversation_view`, `browser.view_correlation`, and `coordinator.history_open` exporter spans.
 
 ## Verification and remaining qualification
 
 | Requirement | Evidence | Remaining |
 |---|---|---|
-| REQ-CVT-001 | Pure admission/outcome/unique-ID tests | Route, reload, Back/Forward and PWA-resume hook integration |
-| REQ-CVT-002 | Injected network/UI delay, reordered/missing marks, background and saturation tests | Actual aggregate/chapters/breadcrumb/anchor observations |
-| REQ-CVT-003 | Privacy-projection and correlation-cap tests; strict collector source | Backend compilation/tests and real trace retrieval |
-| REQ-CVT-004 | Fake-timer abort/offline/drop tests; no queue | Real-browser overhead and suspension qualification |
-| REQ-CVT-005 | Focused UI tests, narrow TypeScript and lint | Continuation/deep-link lifecycle tests; exact-head hosted CI and independent cumulative review; Global and ordinary candidate correlated traces |
+| REQ-CVT-001 | Router tests exercise StrictMode, navigation, Back, reload, standalone foreground, BFCache event ordering; failed alias admission covered | Retained resume readiness without a new positioning/scroll callback |
+| REQ-CVT-002 | Injected network/UI delay; reordered/missing marks; hidden Global inventory, skeleton/empty virtual slot, off-viewport and missing/unrendered target controls; saturation tests | Actual candidate presentation/anchor qualification; fresh retained-anchor observation on resume |
+| REQ-CVT-003 | Privacy projection, ownership and correlation-cap tests; finite response metadata allowlist/invalid-header controls; strict collector source | Backend compilation/tests and retrievable correlated traces |
+| REQ-CVT-004 | Fake-timer abort/offline/drop tests; one coalesced RAF for repeated inspections; no queue | Actual browser overhead, background/suspension and export qualification |
+| REQ-CVT-005 | 73 focused UI tests across seven files, full application TypeScript and changed-source lint | Exact-head hosted CI and final cumulative review; Global and ordinary candidate correlated traces |
 
-Independent bounded source review found a mutable identity privacy bypass; the final serialization boundary now re-projects and sanitizes identity, with a regression. No Rust/server build has been admitted or run on this host. No production collector/configuration, retention, credential or deployment changes were made. No historical phone incident reconstruction is claimed.
+A resumed retained view resets the old anchor evidence. Independent read-only review identified that no new MessageList scroll/positioning callback is guaranteed on foreground, so such a view can remain incomplete despite visible content. This is a known implementation gap, not acceptance; the followup must obtain fresh owning-state/rendered-target evidence without reissuing history commands or copying the previous journey mark.
 
-Shared page/anchor changes await the history owner's concrete minimal partition. Existing ordinary telemetry suppression on Global is untouched. Attribution expansion is evidence-led, not included merely because the pipeline exists.
+The inherited history PR898 candidate app `3a7ea7e4484ab984370bf6b784856434d389ac3a` has a real-browser blank predecessor navigation failure in qualification PR903 run `38416631893` (artifact `11824533576`). Green source tests do not qualify that journey. The history owner alone owns its hidden/reveal regression and fix; telemetry does not compensate by changing rendering/scroll/hide semantics. Its hypothesized mechanism is not established, and it is distinct from the unmeasured historical iPhone fifteen-second observation.
+
+No Rust/server build or candidate browser capture has been admitted or run on this host. No production collector/configuration, retention, credential or deployment changes were made. No historical phone incident reconstruction is claimed. Evidence and dirty-source recovery are retained in the owner-local ignored `target/` directory. Attribution expansion remains evidence-led.

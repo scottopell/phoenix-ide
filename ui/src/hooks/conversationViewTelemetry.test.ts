@@ -4,6 +4,8 @@ const identity: ViewIdentity = {
   product_conversation_id: crypto.randomUUID(), segment_id: crypto.randomUUID(),
   route: 'ordinary', trigger: 'navigation', standalone: false, platform: 'desktop',
   frontend_source: 'b8fc23f', visible: true,
+  frontend_source_dirty: false, cache: 'unknown', message_count_bucket: 'unknown', chapter_count_bucket: 'unknown', reconnect_count: 0,
+  response_size_bucket: 'unknown',
 };
 
 describe('ViewJourneyReporter', () => {
@@ -19,7 +21,7 @@ describe('ViewJourneyReporter', () => {
     expect(failed.openId).not.toBe(canceled.openId);
     reporter.report(failed, 'failed');
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
-    const payload = JSON.parse(send.mock.calls[0][1]!.body as string);
+    const payload = JSON.parse(send.mock.calls[0]![1]!.body as string);
     expect(payload).toMatchObject({ outcome: 'failed', admitted_count: 3, sampled_count: 2, sample_rate: 0.25 });
   });
 
@@ -36,7 +38,7 @@ describe('ViewJourneyReporter', () => {
     send.mockResolvedValue(new Response(null, { status: 204 }));
     reporter.report(reporter.begin(identity)!, 'failed');
     await vi.advanceTimersByTimeAsync(0);
-    expect(JSON.parse(send.mock.calls[1][1]!.body as string)).toMatchObject({
+    expect(JSON.parse(send.mock.calls[1]![1]!.body as string)).toMatchObject({
       transport_dropped_count: 1, transport_failed_count: 1,
     });
     await vi.advanceTimersByTimeAsync(10_000);
@@ -50,7 +52,7 @@ describe('ViewJourneyReporter', () => {
     Object.assign(journey.identity, { message_text: 'private transcript', frontend_source: '/private/path' });
     reporter.report(journey, 'canceled');
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
-    expect(send.mock.calls[0][1]!.body).not.toMatch(/private|message_text/);
+    expect(send.mock.calls[0]![1]!.body).not.toMatch(/private|message_text/);
   });
 
   it('does not spread caller extras, labels, queries, or invalid source identities onto the wire', async () => {
@@ -59,7 +61,7 @@ describe('ViewJourneyReporter', () => {
     const unsafe = { ...identity, label: 'secret text', query: '?token=secret', frontend_source: '/private/path', segment_id: 'secret' };
     reporter.report(reporter.begin(unsafe)!, 'canceled');
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
-    const body = send.mock.calls[0][1]!.body as string;
+    const body = send.mock.calls[0]![1]!.body as string;
     expect(body).not.toMatch(/secret|private|query|label/);
     expect(JSON.parse(body)).toMatchObject({ segment_id: null, frontend_source: null });
   });

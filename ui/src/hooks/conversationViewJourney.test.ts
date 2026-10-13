@@ -16,7 +16,7 @@ describe('ConversationViewJourney', () => {
     const report = journey.finish('incomplete')!;
     expect(report.breadcrumb_ready_minus_meaningful_ms).toBe(100);
     expect(report.marks.snapshot_received).toBe(1000);
-    expect(report.presentation_evidence).toBe('react_commit_estimate');
+    expect(report.presentation_evidence).toBe('commit_frame_estimate');
   });
 
   it('keeps reordered, missing and canceled observations without inventing success', () => {
@@ -60,6 +60,14 @@ describe('ConversationViewJourney', () => {
       background_ms: 300_000,
       breadcrumb_ready_minus_meaningful_ms: null,
     });
+  });
+
+  it('does not convert missing or superseded anchor commands into successful settlement', () => {
+    for (const result of ['target_missing', 'superseded'] as const) {
+      const journey = new ConversationViewJourney(() => 0);
+      journey.anchor(result);
+      expect(journey.finish('ready')).toMatchObject({ outcome: 'incomplete', anchor_result: result, marks: { anchor_settled: null } });
+    }
   });
 
   it('measures background time with the same monotonic clock', () => {

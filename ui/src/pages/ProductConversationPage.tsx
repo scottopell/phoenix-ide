@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
@@ -41,6 +41,8 @@ import {
   subscribeProductConversationsReconciled,
 } from '../notifications';
 import { generateUUID } from '../utils/uuid';
+import { useConversationViewJourney } from '../hooks/useConversationViewJourney';
+import type { ViewJourneyLifecycle } from '../hooks/conversationViewLifecycle';
 import type { ConversationHistorySegmentView } from '../generated/ConversationHistorySegmentView';
 import type { ConversationHistoryBoundaryView } from '../generated/ConversationHistoryBoundaryView';
 import type { CoordinatorConversationSnapshotView } from '../generated/CoordinatorConversationSnapshotView';
@@ -61,7 +63,7 @@ async function fetchOrdinarySnapshot(reference: string, options: HistoryOptions)
 async function fetchCoordinatorSnapshot(reference: string, options: HistoryOptions): Promise<HistorySnapshot> {
   return { kind: 'coordinator', ...await api.getCoordinatorHistory(reference, options) };
 }
-type HistoryPageProps = { productId?: string | undefined; globalShell?: { composerQuickAction: ComponentProps<typeof EmbeddedConversationPage>['composerQuickAction']; stateBarExtension: ComponentProps<typeof EmbeddedConversationPage>['stateBarExtension'] } };
+type HistoryPageProps = { productId?: string | undefined; journey?: ViewJourneyLifecycle | undefined; globalShell?: { composerQuickAction: ComponentProps<typeof EmbeddedConversationPage>['composerQuickAction']; stateBarExtension: ComponentProps<typeof EmbeddedConversationPage>['stateBarExtension'] } };
 
 
 const PAGE_SIZE = 100;
@@ -794,8 +796,11 @@ export function ProductConversationPage(props: HistoryPageProps = {}) {
   return <ProductConversationPageInner {...props} />;
 }
 
-function ProductConversationPageInner({ productId, globalShell }: HistoryPageProps) {
+function ProductConversationPageInner({ productId, globalShell, journey: inheritedJourney }: HistoryPageProps) {
   const coordinator = globalShell !== undefined;
+  const journey = useConversationViewJourney(coordinator ? 'global' : 'ordinary', inheritedJourney);
+  const journeyRef = useRef(journey);
+  useLayoutEffect(() => { journeyRef.current = journey; }, [journey]);
   const fetchSnapshot = coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot;
   const conversationStore = useContext(ConversationContext);
   if (!conversationStore) throw new Error('Product conversation requires ConversationProvider');
@@ -925,12 +930,16 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
       && candidateMeasurement.snapshotReceivedAt === undefined
       ? candidateMeasurement
       : null;
+    const requestJourney = journeyRef.current;
+    const requestId = measurement?.openId ?? requestJourney.openId;
+    const requestObservation = requestId && !isBackgroundRefresh ? requestJourney.requestStarted(requestId) : undefined;
     const request = measurement
       ? (measurement.request ??= fetchSnapshot(productConversationId, {
           message_limit: PAGE_SIZE,
           open_id: measurement.openId,
+          ...(requestObservation ? { onTelemetry: requestObservation.response } : {}),
         }))
-      : fetchSnapshot(productConversationId, { message_limit: PAGE_SIZE });
+      : fetchSnapshot(productConversationId, { message_limit: PAGE_SIZE, ...(!isBackgroundRefresh && requestId ? { open_id: requestId } : {}), ...(requestObservation ? { onTelemetry: requestObservation.response } : {}) });
     request
       .then((next) => {
         if (cancelled || aggregateDeletedRef.current) return;
@@ -945,6 +954,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
           setError('This product conversation was deleted.');
           return;
         }
+        requestObservation?.snapshot(next.product_conversation_id, next.requested_transcript_row_id);
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
         const previous = ownedSnapshotRef.current;
@@ -975,6 +985,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
       })
       .catch((err) => {
         if (cancelled) return;
+        requestObservation?.failed();
         if (measurement && openMeasurementRef.current === measurement) {
           measurement.request = undefined;
         }
@@ -1287,6 +1298,14 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     : { kind: 'idle' as const, view: transcriptView });
   const liveControlsEnabled = isOpen && !closeInProgress && !snapshot?.latest_opening_pending;
   const initialSnapshotReady = snapshot !== null;
+  useLayoutEffect(() => {
+    journey.expectTarget(!!hashTargetMessageId || readerSelection.kind !== 'latest' || awaitingRouteTopology, positioningTargetMessageId ?? null);
+  }, [journey, hashTargetMessageId, readerSelection.kind, awaitingRouteTopology, positioningTargetMessageId]);
+  const observedSegmentId = readerSelection.kind === 'transcript' ? readerSelection.segment.transcript_row_id : snapshot?.latest_transcript_row_id;
+  useEffect(() => {
+    if (snapshot && observedSegmentId) journey.hydrationReady(snapshot.product_conversation_id, observedSegmentId, messages.length);
+    if (hashTargetExhausted || transcriptTargetExhausted || readerSelection.kind === 'unavailable') journey.anchor('target_missing');
+  }, [journey, snapshot, observedSegmentId, messages.length, hashTargetExhausted, transcriptTargetExhausted, readerSelection.kind]);
 
   useEffect(() => {
     const measurement = openMeasurementRef.current;
@@ -1324,7 +1343,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
 
   if (loading) {
     return (
-      <main className="product-conversation-page" data-testid="product-conversation-page">
+      <main className="product-conversation-page" data-testid="product-conversation-page" ref={coordinator || inheritedJourney ? undefined : journey.attach}>
         <section id="chat-view" className="view active product-conversation-page__transcript">
           <div id="messages"><MessageListSkeleton count={6} /></div>
         </section>
@@ -1335,7 +1354,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   if (!snapshot) {
     const fallbackSlug = productConversationId;
     return (
-      <main className="product-conversation-page">
+      <main className="product-conversation-page" ref={coordinator || inheritedJourney ? undefined : journey.attach}>
         <div role="alert">{error ?? 'Unable to open this product conversation.'} Showing cached row if available.</div>
         <button className="btn-secondary" type="button" onClick={() => setSnapshotRetry((retry) => retry + 1)}>Retry</button>
         {fallbackSlug && (
@@ -1355,6 +1374,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     <main
       className={`product-conversation-page${showSplitPaneViewer ? ' product-conversation-page--split-pane' : ''}`}
       data-testid="product-conversation-page"
+      ref={coordinator || inheritedJourney ? undefined : journey.attach}
     >
       {ordinarySnapshot && <ProductConversationHeader
         snapshot={ordinarySnapshot}
@@ -1400,6 +1420,8 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
       <section className="view active product-conversation-page__transcript" data-testid="product-conversation-transcript">
         <ConversationNavStack
           messages={messages}
+          onViewChaptersReady={journey.chaptersReady}
+          onViewTailSettled={journey.tailAnchorSettled}
           historyBoundaries={snapshot.boundaries}
           streamingRequestId={closeInProgress ? null : currentMemberTranscript?.streamingRequestId ?? null}
           pendingMessages={aggregatePendingMessages}
@@ -1423,8 +1445,11 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
           loadingOlderMessages={loadingOlder}
           olderHistoryError={olderError}
           transcriptPositioning={transcriptPositioning}
-          onHistoryScrollCommandHandled={(token) => {
-            if (token === hashNavigationRef.current.token) setHandledPositioningToken(token);
+          onHistoryScrollCommandHandled={(token, result) => {
+            if (token === hashNavigationRef.current.token) {
+              journey.anchor(result);
+              setHandledPositioningToken(token);
+            }
             setRestoreCommand((current) => (
               current?.positioning.kind === 'positioning' && current.positioning.command.token === token ? null : current
             ));
@@ -1453,6 +1478,7 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
             mutationEnabled={liveControlsEnabled}
             aggregateLifecycleOpen={isOpen}
             onProjectionChange={setLatestProjection}
+            onStreamAttempt={journey.streamStarted}
             routePrefix={coordinator ? "/global" : "/c"}
             composerQuickAction={globalShell?.composerQuickAction}
             stateBarExtension={globalShell?.stateBarExtension}
