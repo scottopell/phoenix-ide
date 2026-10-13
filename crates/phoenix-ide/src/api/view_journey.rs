@@ -66,6 +66,10 @@ struct Correlation {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "wire flags describe independent environment and censoring observations, not mutually exclusive states"
+)]
 pub(super) struct Report {
     open_id: uuid::Uuid,
     reporter_id: uuid::Uuid,
@@ -128,7 +132,7 @@ impl Report {
                 .into_iter()
                 .flatten()
                 .all(|n| bounded(n) && n <= self.total_ms)
-            && (!self.timeline_saturated || self.total_ms == 300_000.0)
+            && (!self.timeline_saturated || self.total_ms.to_bits() == 300_000.0_f64.to_bits())
             && self.breadcrumb_ready_minus_meaningful_ms
                 == if self.timeline_saturated {
                     None
@@ -174,12 +178,9 @@ pub(super) async fn report(
     if !report.valid() {
         return StatusCode::BAD_REQUEST;
     }
-    let instance_id = match state.db.instance_id().await {
-        Ok(id) => id,
-        Err(_) => {
-            tracing::warn!("view telemetry instance identity unavailable");
-            return StatusCode::SERVICE_UNAVAILABLE;
-        }
+    let Ok(instance_id) = state.db.instance_id().await else {
+        tracing::warn!("view telemetry instance identity unavailable");
+        return StatusCode::SERVICE_UNAVAILABLE;
     };
     let span = tracing::info_span!(target: "phoenix_ide::otel", "browser.conversation_view",
         "open.id" = %report.open_id,
@@ -291,6 +292,11 @@ mod tests {
             .unwrap()
             .valid());
         value["breadcrumb_ready_minus_meaningful_ms"] = serde_json::Value::Null;
-        assert!(serde_json::from_value::<Report>(value).unwrap().valid());
+        let mut report = serde_json::from_value::<Report>(value).unwrap();
+        assert!(report.valid());
+        report.total_ms = f64::from_bits(300_000.0_f64.to_bits() - 1);
+        assert!(!report.valid());
+        report.total_ms = f64::from_bits(300_000.0_f64.to_bits() + 1);
+        assert!(!report.valid());
     }
 }
