@@ -35,7 +35,7 @@ import uuid
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-PIN = "6bb39c66a569ce6f7b260314c375799cdb4714e0"
+PIN = "da381abc6fba0fdd0a73195bc2aa195db4a2f455"
 ROOT = Path(__file__).resolve().parents[2]
 FAST = "[[perf:1]] [[ttft:0]]"
 
