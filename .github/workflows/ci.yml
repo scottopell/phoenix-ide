@@ -191,7 +191,7 @@ jobs:
         run: ./dev.py check --lanes e2e
 
   qualify-history-realserver:
-    name: qualify pinned 3a7 realserver history (harness only)
+    name: qualify pinned app realserver history (harness only)
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qualification/continuous-history-realserver' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 3a7ea7e4484ab984370bf6b784856434d389ac3a
+          ref: 1bce568033667400e2daaab49e6cfae4494db837
           path: pinned-app
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -247,7 +247,7 @@ jobs:
       - name: Build pinned real server through existing E2E lane
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 3a7ea7e4484ab984370bf6b784856434d389ac3a
+          test "$(git rev-parse HEAD)" = 1bce568033667400e2daaab49e6cfae4494db837
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py check --lanes e2e
@@ -261,7 +261,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: history-3a7-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          name: history-app-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: warn
           path: |

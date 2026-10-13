@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText } from './qualify-history-realserver.mjs';
+import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText, boundedDiagnosticJson } from './qualify-history-realserver.mjs';
 
 test('only literal HTTP loopback ports are accepted', () => {
   assert.equal(loopback('http://127.0.0.1:54321'), 'http://127.0.0.1:54321');
@@ -39,4 +39,11 @@ test('rendered readiness probes survive frozen 40-character prompt clipping', ()
   for (const probe of [APPEND_PROBE, CONTINUATION_PROBE]) {
     assert.ok(probeText(probe).slice(0, 40).includes(probe));
   }
+});
+
+test('diagnostic bounds are bytes and retain valid truncation metadata', () => {
+  const bounded = boundedDiagnosticJson({ html: '🌏'.repeat(5000) }, 1024);
+  assert.ok(bounded.length <= 1024);
+  assert.equal(JSON.parse(bounded.toString()).truncated, true);
+  assert.deepEqual(JSON.parse(boundedDiagnosticJson({ ok: true }).toString()), { ok: true });
 });

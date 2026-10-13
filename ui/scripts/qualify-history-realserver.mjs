@@ -25,6 +25,13 @@ export function sourceLink(aggregate, row, message, tool) {
 export function anchorMatches(before, after) {
   return !!before && !!after && before.key === after.key && Math.abs(before.offset - after.offset) <= 2;
 }
+export function boundedDiagnosticJson(value, limit = 1_000_000) {
+  assert.ok(limit >= 1024);
+  const bytes = Buffer.from(JSON.stringify(value, null, 2));
+  if (bytes.length <= limit) return bytes;
+  return Buffer.from(JSON.stringify({ truncated: true, original_bytes: bytes.length,
+    prefix_base64: bytes.subarray(0, Math.floor(limit / 2)).toString('base64') }));
+}
 export const APPEND_PROBE = 'append-probe';
 export const CONTINUATION_PROBE = 'live-probe';
 export function probeText(probe) { return `${probe} [[perf:1]] [[ttft:0]]`; }
@@ -199,12 +206,16 @@ async function run() {
       const started = performance.now();
       await goto(a.route + '?qualification=retained');
       const tail = await snapshotSeen(a, s => s.has_older, firstSnapshot);
+      await poll(() => anchor(), 'first meaningful visible transcript row');
+      const meaningfulTranscriptMs = performance.now() - started;
       const boundary = page.locator('#conversation-nav [role="button"][aria-label="Load context boundary 1"], #conversation-nav [role="button"][aria-label="Context boundary 1"]').first();
       await boundary.waitFor({ state: 'visible' });
       await poll(() => boundary.isEnabled(), 'enabled boundary navigation');
       const enabledMs = performance.now() - started;
       checked(`${prefix}: enabled navigation readiness`, {
         navigation_ms: enabledMs, first_snapshot_ms: tail.at_ms - started,
+        meaningful_transcript_observed_ms: meaningfulTranscriptMs,
+        observation_note: 'upper-bound driver observation after navigation/snapshot, not first-paint instrumentation',
         elapsed_after_snapshot_ms: performance.now() - tail.at_ms,
         threshold: null, threshold_note: 'readiness observed, no invented performance pass threshold',
       });
@@ -360,7 +371,28 @@ async function run() {
     result.status = 'passed_assertions';
   } catch (error) {
     result.error = String(error.stack ?? error);
-    if (page) await page.screenshot({ path: resolve(output, 'failure.png') }).catch(() => {});
+    if (page) {
+      await page.screenshot({ path: resolve(output, 'failure.png') }).catch(() => {});
+      const diagnostic = await page.evaluate(() => {
+        const viewport = document.querySelector('#messages');
+        const ancestors = [];
+        for (let element = viewport; element; element = element.parentElement) {
+          const rect = element.getBoundingClientRect();
+          ancestors.push({ tag: element.tagName, id: element.id, classes: element.className,
+            hidden: element.hidden, display: getComputedStyle(element).display,
+            top: rect.top, height: rect.height });
+        }
+        return { url: location.href, ancestors, scrollTop: viewport?.scrollTop,
+          clientHeight: viewport?.clientHeight, scrollHeight: viewport?.scrollHeight,
+          rows: [...(viewport?.querySelectorAll('[data-virtual-key]') ?? [])].map(element => {
+            const rect = element.getBoundingClientRect();
+            return { key: element.dataset.virtualKey, top: rect.top, height: rect.height };
+          }) };
+      }).catch(error => ({ diagnostic_error: String(error) }));
+      writeFileSync(resolve(output, 'failure-dom.json'), boundedDiagnosticJson(diagnostic));
+      const html = await page.content().catch(() => '');
+      writeFileSync(resolve(output, 'failure.html'), Buffer.from(html).subarray(0, 1_000_000));
+    }
     process.exitCode = 1;
   } finally {
     if (context) await context.setOffline(false).catch(() => {});
