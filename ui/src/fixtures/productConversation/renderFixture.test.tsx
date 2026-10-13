@@ -29,12 +29,12 @@ describe('ProductConversationFixture', () => {
     const { container } = render(<ProductConversationFixture scenario={getProductConversationScenario(id)} />);
     await waitFor(() => expect(container.querySelector(`[data-product-conversation-fixture-ready="${id}"]`)).not.toBeNull());
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-hold-older')));
-    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 2: history-2' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 2' }));
     await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('1'));
     fireEvent.click(await screen.findByRole('button', { name: /Member 3 request$/ }));
     await waitFor(() => expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('#message-history-prompt-3'));
     act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-older')));
-    await screen.findByRole('button', { name: 'Context boundary: history-2' });
+    await screen.findByRole('button', { name: 'Context boundary 2' });
     expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('#message-history-prompt-3');
     expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('1');
     expect(screen.getByPlaceholderText('Type a message...')).toBeEnabled();
@@ -70,11 +70,11 @@ describe('ProductConversationFixture', () => {
     const history = vi.spyOn(api, id === 'global-lazy-history' ? 'getCoordinatorHistory' : 'getProductConversationHistorySnapshot');
     const legacy = vi.spyOn(api, 'getProductConversationSnapshot');
     expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBeUndefined();
-    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 1: history-1' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 1' }));
     await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('2'));
     expect(history.mock.calls.map(call => call[1]?.before)).toEqual(['history-before-3', 'history-before-2']);
     expect(legacy).not.toHaveBeenCalled();
-    expect(await screen.findByRole('button', { name: 'Context boundary: history-1' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Context boundary 1' })).toBeInTheDocument();
     expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('#message-continue-history-1');
     expect(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']).toContain('history-3');
     expect(screen.getByPlaceholderText('Type a message...')).toBeEnabled();
