@@ -29,6 +29,13 @@ import {
   notifyProductConversationsReconciled,
 } from '../notifications';
 
+vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
+  const actual = await importOriginal<typeof import('../hooks/conversationViewTelemetry')>();
+  return { ...actual, ViewJourneyReporter: class extends actual.ViewJourneyReporter {
+    constructor() { super({ sampleRate: 1, send: async () => new Response(null, { status: 204 }) }); }
+  } };
+});
+
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
 const viewerSpy = vi.fn();
@@ -1051,7 +1058,9 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot()));
     renderPage('/global/row-2');
     await waitForPageReady();
-    expect(api.getCoordinatorHistory).toHaveBeenCalledWith('row-1', { message_limit: 100 });
+    expect(api.getCoordinatorHistory).toHaveBeenCalledWith('row-1', {
+      message_limit: 100, open_id: expect.any(String), onTelemetry: expect.any(Function),
+    });
     expect(api.reportProductConversationOpen).not.toHaveBeenCalled();
   });
 

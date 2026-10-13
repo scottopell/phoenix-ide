@@ -19,7 +19,7 @@ Task 32005 is user-commissioned, independently owned telemetry work. Global reta
 | REQ-CVT-002 | Injected network/UI delay; reordered/missing marks; hidden Global inventory, skeleton/empty virtual slot, off-viewport and missing/unrendered target controls; saturation tests | Actual candidate presentation/anchor qualification; fresh retained-anchor observation on resume |
 | REQ-CVT-003 | Privacy projection, ownership and correlation-cap tests; finite response metadata allowlist/invalid-header controls; strict collector source | Backend compilation/tests and retrievable correlated traces |
 | REQ-CVT-004 | Fake-timer abort/offline/drop tests; one coalesced RAF for repeated inspections; no queue | Actual browser overhead, background/suspension and export qualification |
-| REQ-CVT-005 | 73 focused UI tests across seven files, full application TypeScript and changed-source lint | Exact-head hosted CI and final cumulative review; Global and ordinary candidate correlated traces |
+| REQ-CVT-005 | 203 UI tests across nine files (73 telemetry/alias controls plus page suites), deterministic sampled reporter transport mocks, full application TypeScript, changed-source lint and spec-shape/dev.py tests | Exact-head hosted CI and final cumulative review; Global and ordinary candidate correlated traces |
 
 A resumed retained view resets the old anchor evidence. Independent read-only review identified that no new MessageList scroll/positioning callback is guaranteed on foreground, so such a view can remain incomplete despite visible content. This is a known implementation gap, not acceptance; the followup must obtain fresh owning-state/rendered-target evidence without reissuing history commands or copying the previous journey mark.
 

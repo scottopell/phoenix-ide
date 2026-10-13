@@ -5,6 +5,13 @@ import { CoordinatorPage } from './CoordinatorPage';
 import { COORDINATOR_BRIEFING_PROMPT } from './coordinatorBriefing';
 import type { Conversation } from '../api';
 
+vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
+  const actual = await importOriginal<typeof import('../hooks/conversationViewTelemetry')>();
+  return { ...actual, ViewJourneyReporter: class extends actual.ViewJourneyReporter {
+    constructor() { super({ sampleRate: 1, send: async () => new Response(null, { status: 204 }) }); }
+  } };
+});
+
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     ensureGlobalCoordinator: vi.fn(),
