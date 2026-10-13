@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 5c182bb4d31389680587b6eb5bfbc012b0ce0690
+          ref: 0621b5475f5f2fe6b8eb12d0900eb2d87ac33178
           path: pinned-app
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -247,7 +247,7 @@ jobs:
       - name: Build pinned real server through existing E2E lane
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 5c182bb4d31389680587b6eb5bfbc012b0ce0690
+          test "$(git rev-parse HEAD)" = 0621b5475f5f2fe6b8eb12d0900eb2d87ac33178
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py check --lanes e2e
