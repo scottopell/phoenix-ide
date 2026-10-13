@@ -150,7 +150,19 @@ describe('CoordinatorPage', () => {
       handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123, can_stop: true,
     }]);
 
+    let releaseCanonicalValidation!: (value: { conversation: { id: string } }) => void;
+    apiMock.getConversation
+      .mockResolvedValueOnce({ conversation: { id: 'source-1' } })
+      .mockReturnValueOnce(new Promise(resolve => { releaseCanonicalValidation = resolve; }));
     renderPage('/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source');
+
+    await waitFor(() => expect(apiMock.getConversation).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
+    expect(screen.getByText('UI tests').closest('.coordinator-conversation')).toHaveAttribute('hidden');
+    expect(screen.getByText('output →')).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    expect(screen.queryByRole('link', { name: 'output →' })).not.toBeInTheDocument();
+    await act(async () => releaseCanonicalValidation({ conversation: { id: 'source-1' } }));
+    const output = await screen.findByRole('link', { name: 'output →' });
 
     await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
     const running = await screen.findByRole('region', { name: 'Running commands' });
@@ -162,7 +174,7 @@ describe('CoordinatorPage', () => {
     fireEvent.click(commandDetails!.querySelector('summary')!);
     expect(running).toHaveTextContent('/repo/ui');
     expect(running).toHaveTextContent('b-live');
-    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    expect(output).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
     fireEvent.click(screen.getByRole('button', { name: 'stop' }));
     await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
