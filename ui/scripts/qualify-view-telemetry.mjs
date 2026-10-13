@@ -2,6 +2,28 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
 
+export function captureReport(body, forbidden = []) {
+  if (body.length > 8192 || Buffer.byteLength(body) > 8192 || forbidden.some(secret => body.includes(secret))) throw new Error('unsafe telemetry report rejected before retention');
+  let report;
+  try { report = JSON.parse(body); } catch { throw new Error('invalid telemetry report JSON'); }
+  if (forbidden.some(secret => JSON.stringify(report).includes(secret))) throw new Error('unsafe telemetry report rejected before retention');
+  const fields = new Set(['open_id', 'reporter_id', 'product_conversation_id', 'segment_id', 'route', 'trigger', 'standalone', 'platform',
+    'frontend_source', 'frontend_source_dirty', 'cache', 'message_count_bucket', 'chapter_count_bucket', 'response_size_bucket', 'reconnect_count', 'visible',
+    'marks', 'outcome', 'total_ms', 'timeline_saturated', 'background_ms', 'background_interval_count', 'background_open', 'observer_inspection_count',
+    'observer_scan_limited', 'anchor_result', 'breadcrumb_ready_minus_meaningful_ms', 'presentation_evidence', 'correlations', 'dropped_correlations',
+    'counters_saturated', 'sample_rate', 'admitted_count', 'sampled_count', 'transport_dropped_count', 'transport_failed_count']);
+  if (!report || typeof report !== 'object' || Array.isArray(report) || Object.keys(report).some(key => !fields.has(key))) throw new Error('unknown telemetry report field');
+  for (const [key, value] of Object.entries(report)) {
+    if (key === 'marks') {
+      const marks = ['shell', 'snapshot_received', 'hydration_ready', 'meaningful_transcript', 'chapter_data_ready', 'breadcrumb_presented', 'breadcrumb_enabled', 'anchor_settled'];
+      if (!value || Object.entries(value).some(([mark, time]) => !marks.includes(mark) || (time !== null && !Number.isFinite(time)))) throw new Error('invalid telemetry marks');
+    } else if (key === 'correlations') {
+      if (!Array.isArray(value) || value.length > 16 || value.some(entry => !entry || Object.keys(entry).some(field => !['kind', 'id'].includes(field)) || !['request', 'sse', 'trace'].includes(entry.kind) || typeof entry.id !== 'string')) throw new Error('invalid telemetry correlations');
+    } else if (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) throw new Error('invalid telemetry scalar');
+  }
+  return report;
+}
+
 export function summarizeTrials(trials, minimum = 8) {
   const strata = {};
   for (const route of ['ordinary', 'global']) {
@@ -72,6 +94,8 @@ export function journeyExpectation(report, identity) {
     'server.backend_source': identity.appSource, 'server.instance_id': identity.serverInstanceId,
     'browser.frontend_source': identity.frontendSource, 'browser.outcome': report.outcome,
     'browser.route': report.route, 'browser.trigger': report.trigger,
+    ...(Object.hasOwn(report, 'product_conversation_id') && report.product_conversation_id !== null ? { 'product_conversation.id': report.product_conversation_id } : {}),
+    ...(Object.hasOwn(report, 'cache') ? { 'browser.cache': report.cache } : {}),
     'browser.presentation_evidence': report.presentation_evidence, 'browser.total_ms': report.total_ms,
   };
   for (const mark of ['meaningful_transcript', 'breadcrumb_presented', 'breadcrumb_enabled', 'anchor_settled']) expected[`browser.${mark}_ms`] = report.marks[mark];
@@ -89,7 +113,7 @@ export function appendTerminalInventory(result, terminal, identity, forbidden = 
   result.capabilities.pagehide_incomplete = terminal.status;
 }
 
-export async function runPendingPagehideCheck({ browser, storageState, baseURL, route, outputDir, attempts = 8, budgetMs = 40000 }) {
+export async function runPendingPagehideCheck({ browser, storageState, baseURL, route, outputDir, forbidden = [], attempts = 8, budgetMs = 40000 }) {
   assert.ok(Number.isInteger(attempts) && attempts > 0 && attempts <= 8);
   assert.ok(Number.isInteger(budgetMs) && budgetMs > 0 && budgetMs <= 40000);
   const caseDeadline = Date.now() + budgetMs;
@@ -117,7 +141,7 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
           const body = request.postData() ?? '';
           if (Buffer.byteLength(body) > 8192) trial.failure = 'report byte bound';
           else {
-            try { trial.reports.push(JSON.parse(body)); } catch { trial.failure = 'invalid report JSON'; }
+            try { trial.reports.push(captureReport(body, forbidden)); } catch { trial.failure = 'invalid or unsafe report JSON'; }
           }
         }
       });
@@ -228,7 +252,7 @@ export function observePendingFiniteRequest(page, request, baseURL, expectedIden
     let report;
     try {
       assert.ok(body.length <= 8192 && Buffer.byteLength(body) <= 8192);
-      report = JSON.parse(body);
+      report = captureReport(body, expectedIdentity.forbidden ?? []);
       if (!report.correlations?.some(correlation => correlation.kind === 'request' && correlation.id === requestId)) return;
       assertRequestCorrelation([requestId], report);
       assert.equal(report.product_conversation_id, expectedIdentity.productConversationId, 'terminal report must belong to the fixture view');
@@ -370,6 +394,164 @@ export async function runBFCacheRoundTrip(page, baseURL) {
   }
 }
 
+export function appendLifecycleInventory(result, stage, identity, forbidden = []) {
+  const added = [];
+  const ids = new Set(result.journeys.map(journey => journey.open_id));
+  for (const trial of stage.trials) for (const report of trial.reports) {
+    captureReport(JSON.stringify(report), forbidden);
+    assert.ok(!ids.has(report.open_id), 'unique lifecycle journey required');
+    ids.add(report.open_id);
+    added.push(journeyExpectation(report, identity));
+  }
+  assert.ok(result.journeys.length + added.length <= 64, 'final journey inventory bound');
+  result.journeys.push(...added);
+  result.lifecycle = stage;
+  for (const trial of stage.trials) result.capabilities[trial.kind] = trial.status;
+}
+
+export async function runLifecycleQualificationStage({ browser, storageState, baseURL, fixture, outputDir, forbidden = [], budgetMs = 90000, onTrial = () => {} }) {
+  assert.ok(fixture && Object.hasOwn(fixture, 'productConversationId'), 'authoritative lifecycle fixture product identity required');
+  const destination = candidateDestination(fixture.route, baseURL);
+  assert.ok(typeof fixture.spaSelector === 'string' && fixture.spaSelector.length > 0, 'existing SPA anchor selector required');
+  assert.ok(Number.isInteger(budgetMs) && budgetMs > 0 && budgetMs <= 90000);
+  const deadline = Date.now() + budgetMs;
+  const stage = { scope: 'real_browser_actions_when_invoked_not_candidate_acceptance_or_overhead', trials: [] };
+  for (const kind of ['pending_background', 'spa_canceled', 'bfcache_resume']) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let owned;
+      const trial = { kind, attempt, reports: [], statuses: [], status: 'started' };
+      let capture;
+      let page;
+      const posts = new Map();
+      let ledgerFailure = null;
+      let captureArmed = false;
+      let canceled = false;
+      let finiteSeen;
+      const pending = new Promise(resolvePending => { finiteSeen = resolvePending; });
+      try {
+        assert.ok(Date.now() < deadline, 'lifecycle stage admission deadline');
+        const operation = (async () => {
+          owned = await boundedObservation(browser.newContext({ storageState, viewport: { width: 1280, height: 900 } }).then(async created => {
+            if (canceled) {
+              await boundedObservation(created.close(), 5000, 'late lifecycle context cleanup');
+              throw new Error('lifecycle context arrived after cancellation');
+            }
+            return created;
+          }), 5000, 'lifecycle context');
+          page = await boundedObservation(owned.newPage(), 5000, 'lifecycle page');
+          assert.ok(!canceled, 'lifecycle page admission canceled');
+          const cdp = await owned.newCDPSession(page);
+          await cdp.send('Network.enable');
+          await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 400, downloadThroughput: 1000000, uploadThroughput: 1000000 });
+          page.on('request', request => {
+            const url = new URL(request.url());
+            if (url.origin !== new URL(baseURL).origin) return;
+            if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
+              if (trial.reports.length >= 16) { ledgerFailure ??= new Error('lifecycle report count bound'); return; }
+              const body = request.postData() ?? '';
+              try {
+                assert.ok(body.length <= 8192 && Buffer.byteLength(body) <= 8192);
+                const report = captureReport(body, forbidden);
+                trial.reports.push(report);
+                posts.set(request, report);
+              } catch (error) { ledgerFailure ??= error; }
+            } else if (!captureArmed && url.searchParams.has('open_id') && request.method() === 'GET'
+              && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/'))) {
+              try {
+                captureArmed = true;
+                capture = observePendingFiniteRequest(page, request, baseURL, { ...fixture, forbidden });
+                finiteSeen('pending');
+              } catch (error) { ledgerFailure ??= error; finiteSeen('invalid_pending'); }
+            }
+          });
+          page.on('response', response => {
+            if (posts.has(response.request())) trial.statuses.push({ open_id: posts.get(response.request()).open_id, status: response.status() });
+          });
+          const navigation = page.goto(destination, { timeout: 10000, waitUntil: 'domcontentloaded' });
+          const ready = page.waitForFunction(visibleReadiness, undefined, { timeout: 10000 }).then(() => 'ready', () => 'unavailable');
+          const winner = await Promise.race([pending, ready]);
+          await navigation;
+          if (ledgerFailure) throw ledgerFailure;
+          if (winner === 'ready') {
+            trial.status = 'inconclusive_unsampled_or_already_ready';
+          } else {
+            assert.equal(winner, 'pending', 'actual pending admission required');
+            if (kind === 'pending_background') {
+              trial.witness = await runPendingBackgroundRoundTrip({ page, context: owned, capture });
+              trial.status = trial.witness.status;
+            } else if (kind === 'spa_canceled') {
+              trial.witness = await runPendingSPACancellation({ page, baseURL, selector: fixture.spaSelector, capture });
+              trial.status = trial.witness.status;
+              await page.waitForFunction(visibleReadiness, undefined, { timeout: 10000 });
+            } else {
+              assert.equal(await ready, 'ready');
+              const initial = await capture.waitReport();
+              assert.equal(initial.outcome, 'ready');
+              capture.assertFinal();
+              capture.close();
+              capture = null;
+              const preceding = trial.reports.length;
+              trial.witness = await runBFCacheRoundTrip(page, baseURL);
+              trial.status = trial.witness.status;
+              if (trial.status === 'actual_bfcache_restore_observed') {
+                const until = Math.min(deadline, Date.now() + 5000);
+                while (trial.reports.length === preceding && Date.now() < until) await new Promise(resolveWait => setTimeout(resolveWait, 20));
+                const resumed = trial.reports.slice(preceding);
+                if (!resumed.length) trial.status = 'actual_bfcache_restore_resume_sampling_inconclusive';
+                else {
+                  assert.equal(resumed.length, 1);
+                  assert.notEqual(resumed[0].open_id, initial.open_id, 'fresh resumed journey identity required');
+                  assert.equal(resumed[0].trigger, 'back_forward');
+                  assert.equal(resumed[0].outcome, 'ready');
+                  assert.equal(resumed[0].visible, true);
+                  assert.equal(resumed[0].product_conversation_id, fixture.productConversationId);
+                  assert.equal(resumed[0].route, initial.route);
+                  assert.equal(resumed[0].cache, 'retained');
+                  assert.equal(page.url(), destination);
+                  for (const mark of ['meaningful_transcript', 'breadcrumb_presented', 'breadcrumb_enabled', 'anchor_settled']) assert.ok(Number.isFinite(resumed[0].marks[mark]));
+                  trial.status = 'observed_bfcache_fresh_ready_report';
+                }
+              }
+            }
+          }
+          // Report-response drain is tied to every observed POST, including sampled SPA successor admissions.
+          const until = Math.min(deadline, Date.now() + 5000);
+          while (trial.statuses.length < trial.reports.length && Date.now() < until) await new Promise(resolveWait => setTimeout(resolveWait, 20));
+          assert.equal(trial.statuses.length, trial.reports.length, 'every observed report must have collector response');
+          assert.ok(trial.statuses.every(response => response.status === 204));
+          if (ledgerFailure) throw ledgerFailure;
+          if (capture && !trial.status.startsWith('unsupported')) capture.assertFinal();
+        })();
+        await boundedObservation(operation, Math.max(1, deadline - Date.now()), 'absolute lifecycle stage');
+      } catch (error) {
+        trial.failure = error.message;
+        throw error;
+      } finally {
+        canceled = true;
+        try {
+          if (owned) await boundedObservation(owned.close(), 5000, 'lifecycle context cleanup');
+          if (ledgerFailure) throw ledgerFailure;
+          if (!trial.failure) {
+            assert.equal(trial.statuses.length, trial.reports.length, 'final report-response drain');
+            assert.equal(new Set(trial.reports.map(report => report.open_id)).size, trial.reports.length);
+            if (trial.status === 'observed_bfcache_fresh_ready_report') assert.equal(trial.reports.length, 2);
+          }
+          if (!trial.failure && capture && !trial.status.startsWith('unsupported')) capture.assertFinal();
+        } catch (error) { trial.failure ??= error.message; throw error; }
+        finally {
+          capture?.close();
+          stage.trials.push(trial);
+          try { onTrial(trial, stage); }
+          catch (error) { trial.failure ??= error.message; throw error; }
+          finally { if (outputDir) writeFileSync(resolve(outputDir, 'telemetry-lifecycle-trials.json'), JSON.stringify(stage, null, 2)); }
+        }
+      }
+      if (!trial.status.startsWith('inconclusive')) break;
+    }
+  }
+  return stage;
+}
+
 function visibleReadiness() {
   const visible = element => {
     if (!element || document.visibilityState !== 'visible') return false;
@@ -400,104 +582,147 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
     candidateDestination(aggregate.route, baseURL);
     return aggregate;
   });
+  assert.ok(fixtures.lifecycle && Object.hasOwn(fixtures.lifecycle, 'productConversationId'), 'authoritative lifecycle fixture required before contexts');
+  candidateDestination(fixtures.lifecycle.route, baseURL);
+  assert.ok(fixtures.lifecycle.spaSelector, 'existing SPA navigation anchor required before contexts');
   const result = { runId, serviceName, identity: fixtures.identity, trials: [], journeys: [], forbidden: fixtures.forbidden ?? [],
     capabilities: { physical_mobile: 'not_tested', standalone_resume: 'not_exercised', bfcache_resume: 'not_exercised', background_terminal: 'not_exercised' } };
   mkdirSync(outputDir, { recursive: true });
   const receiptPath = resolve(outputDir, 'telemetry-browser-result.json');
-  const storageState = await context.storageState();
+  const outerDeadline = Date.now() + 285_000;
+  const storageState = await boundedObservation(context.storageState(), 5000, 'qualification storage state');
   let negativeTemplate = null;
-  const deadline = Date.now() + 180_000;
-  try {
-    for (let index = 0; index < 56; index++) {
-      assert.ok(Date.now() < deadline, 'telemetry context budget deadline');
-      const aggregate = aggregates[index % 2];
-      const owned = await context.browser().newContext({ storageState, viewport: { width: 1280, height: 900 } });
-      const trial = { index, route: aggregate.kind, warmup: index < 2, sampled: false, posts: 0, payloadBytes: 0, correlatedRequests: 0 };
-      try {
-        const candidate = await owned.newPage();
-        const cdp = await owned.newCDPSession(candidate);
-        await cdp.send('Performance.enable');
-        await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
-        const requests = [];
-        const reports = [];
-        const statuses = [];
-        const captureErrors = [];
-        candidate.on('request', request => {
-          const url = new URL(request.url());
-          if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
-            trial.posts++;
-            const body = request.postData() ?? '';
-            trial.payloadBytes += Buffer.byteLength(body);
-            if (Buffer.byteLength(body) > 8192) captureErrors.push('report byte bound');
-            else {
-              try { reports.push(JSON.parse(body)); } catch { captureErrors.push('invalid report JSON'); }
-            }
-          } else if (url.origin === new URL(baseURL).origin && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/')) && url.searchParams.has('open_id')) requests.push(url.searchParams.get('open_id'));
-        });
-        candidate.on('response', response => {
-          if (new URL(response.url()).pathname === '/api/telemetry/conversation-view') statuses.push(response.status());
-        });
-        const before = await cdp.send('Performance.getMetrics');
-        await candidate.goto(candidateDestination(aggregate.route, baseURL), { timeout: 10_000 });
-        await candidate.waitForFunction(visibleReadiness, undefined, { timeout: 10_000 });
-        await candidate.evaluate(() => new Promise(resolveFrame => requestAnimationFrame(() => requestAnimationFrame(resolveFrame))));
-        const after = await cdp.send('Performance.getMetrics');
-        trial.rawMetrics = { before: before.metrics, after: after.metrics };
-        trial.metric_reset = after.metrics.some(m => ['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration'].includes(m.name) && m.value < (before.metrics.find(b => b.name === m.name)?.value ?? 0));
-        assert.deepEqual(captureErrors, []);
-        trial.metrics = Object.fromEntries(after.metrics.filter(m => ['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration', 'JSHeapUsedSize'].includes(m.name)).map(m => [m.name, m.value]));
-        trial.metric_method = 'navigation-scoped post-readiness raw counters; no aboutblank subtraction';
-        trial.sampled = requests.length > 0;
-        trial.correlatedRequests = requests.length;
-        if (trial.sampled) {
-          const reportDeadline = Date.now() + 5000;
-          while ((!reports.length || !statuses.length) && Date.now() < reportDeadline) await new Promise(resolveWait => setTimeout(resolveWait, 20));
-          assert.equal(reports.length, 1, 'one sampled initial journey report required');
-          assert.deepEqual(statuses, [204], 'actual collector acceptance required');
-          const report = reports[0];
-          negativeTemplate ??= report;
-          assertRequestCorrelation(requests, report);
-          assert.equal(report.outcome, 'ready');
-          assert.equal(report.presentation_evidence, 'commit_frame_estimate');
-          assert.equal(report.route, aggregate.kind);
-          assert.equal(report.frontend_source, fixtures.identity.frontendSource);
-          assert.equal(report.frontend_source_dirty, false);
-          assert.equal(report.sample_rate, 0.25);
-          assert.equal(report.visible, true);
-          assert.ok(report.open_id && report.marks.meaningful_transcript !== null && report.marks.breadcrumb_enabled !== null && report.marks.anchor_settled !== null);
-          assert.ok((fixtures.forbidden ?? []).every(secret => !JSON.stringify(report).includes(secret)), 'report sentinel privacy');
-          assert.ok(report.correlations.length <= 16);
-          assert.equal(report.breadcrumb_ready_minus_meaningful_ms, Math.max(report.marks.breadcrumb_presented, report.marks.breadcrumb_enabled) - report.marks.meaningful_transcript);
-          result.journeys.push(journeyExpectation(report, fixtures.identity));
-        }
-        if (!trial.sampled) {
-          assert.equal(trial.posts, 0, 'unsampled cohort must not contain report POST');
-          assert.deepEqual(reports, []);
-        }
-        if (!result.visibilityWitness && trial.sampled) {
-          result.visibilityWitness = await runVisibilityRoundTrip(candidate, owned);
-          result.capabilities.tab_visibility = result.visibilityWitness.status;
-        }
-        assert.ok(trial.posts <= 1, 'no per-frame or repeated POST');
-      } finally {
-        result.trials.push(trial);
-        await owned.close();
-      }
-      if (Object.values(summarizeTrials(result.trials).strata).every(s => s.status === 'raw_cohorts_ready_for_review')) break;
+  const deadline = Math.min(outerDeadline, Date.now() + 150_000);
+  const ownedContexts = new Set();
+  const browser = { newContext: async options => {
+    assert.ok(Date.now() < outerDeadline, 'outer context admission deadline');
+    const owned = await context.browser().newContext(options);
+    ownedContexts.add(owned);
+    owned.on?.('close', () => ownedContexts.delete(owned));
+    if (Date.now() >= outerDeadline) {
+      await boundedObservation(owned.close(), 5000, 'late context cleanup');
+      throw new Error('outer context creation deadline');
     }
-    assert.ok(negativeTemplate, 'at least one naturally sampled report required for collector negatives');
-    result.collectorNegatives = await runCollectorNegativeChecks(context, baseURL, negativeTemplate);
-    result.collectorNegatives.push(await runUnauthenticatedCollectorCheck(context.browser(), baseURL, negativeTemplate));
-    const terminal = await runPendingPagehideCheck({ browser: context.browser(), storageState, baseURL,
-      route: aggregates[0].route, outputDir, attempts: 8 });
-    appendTerminalInventory(result, terminal, fixtures.identity, fixtures.forbidden ?? []);
-    result.comparison = summarizeTrials(result.trials);
-    result.acceptance = 'partial_initial_and_pagehide_incomplete_export_raw_overhead_only';
-    return result;
+    return owned;
+  } };
+  let execution;
+  try {
+    execution = (async () => {
+      for (let index = 0; index < 48; index++) {
+        assert.ok(Date.now() < deadline, 'telemetry context budget deadline');
+        const aggregate = aggregates[index % 2];
+        const owned = await browser.newContext({ storageState, viewport: { width: 1280, height: 900 } });
+        const trial = { index, route: aggregate.kind, warmup: index < 2, sampled: false, posts: 0, payloadBytes: 0, correlatedRequests: 0 };
+        try {
+          const candidate = await owned.newPage();
+          const cdp = await owned.newCDPSession(candidate);
+          await cdp.send('Performance.enable');
+          await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+          const requests = [];
+          const reports = [];
+          const statuses = [];
+          const captureErrors = [];
+          candidate.on('request', request => {
+            const url = new URL(request.url());
+            if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
+              trial.posts++;
+              const body = request.postData() ?? '';
+              trial.payloadBytes += Buffer.byteLength(body);
+              if (Buffer.byteLength(body) > 8192) captureErrors.push('report byte bound');
+              else {
+                try { reports.push(captureReport(body, fixtures.forbidden ?? [])); } catch { captureErrors.push('invalid or unsafe report JSON'); }
+              }
+            } else if (url.origin === new URL(baseURL).origin && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/')) && url.searchParams.has('open_id')) requests.push(url.searchParams.get('open_id'));
+          });
+          candidate.on('response', response => {
+            if (new URL(response.url()).pathname === '/api/telemetry/conversation-view') statuses.push(response.status());
+          });
+          const before = await cdp.send('Performance.getMetrics');
+          const navigationStart = performance.now();
+          await candidate.goto(candidateDestination(aggregate.route, baseURL), { timeout: 10_000 });
+          await candidate.waitForFunction(visibleReadiness, undefined, { timeout: 10_000 });
+          trial.navigation_to_visible_readiness_ms = performance.now() - navigationStart;
+          trial.readiness_clock = 'driver_monotonic_includes_automation_latency_not_paint';
+          assert.ok(Number.isFinite(trial.navigation_to_visible_readiness_ms) && trial.navigation_to_visible_readiness_ms >= 0);
+          await candidate.evaluate(() => new Promise(resolveFrame => requestAnimationFrame(() => requestAnimationFrame(resolveFrame))));
+          const after = await cdp.send('Performance.getMetrics');
+          trial.rawMetrics = { before: before.metrics, after: after.metrics };
+          trial.metric_reset = after.metrics.some(m => ['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration'].includes(m.name) && m.value < (before.metrics.find(b => b.name === m.name)?.value ?? 0));
+          assert.deepEqual(captureErrors, []);
+          trial.metrics = Object.fromEntries(after.metrics.filter(m => ['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration', 'JSHeapUsedSize'].includes(m.name)).map(m => [m.name, m.value]));
+          trial.metric_method = 'navigation-scoped post-readiness raw counters; no aboutblank subtraction';
+          trial.sampled = requests.length > 0;
+          trial.correlatedRequests = requests.length;
+          if (trial.sampled) {
+            const reportDeadline = Date.now() + 5000;
+            while ((!reports.length || !statuses.length) && Date.now() < reportDeadline) await new Promise(resolveWait => setTimeout(resolveWait, 20));
+            assert.equal(reports.length, 1, 'one sampled initial journey report required');
+            assert.deepEqual(statuses, [204], 'actual collector acceptance required');
+            const report = reports[0];
+            negativeTemplate ??= report;
+            assertRequestCorrelation(requests, report);
+            assert.equal(report.outcome, 'ready');
+            assert.equal(report.presentation_evidence, 'commit_frame_estimate');
+            assert.equal(report.route, aggregate.kind);
+            assert.equal(report.frontend_source, fixtures.identity.frontendSource);
+            assert.equal(report.frontend_source_dirty, false);
+            assert.equal(report.sample_rate, 0.25);
+            assert.equal(report.visible, true);
+            assert.ok(report.open_id && report.marks.meaningful_transcript !== null && report.marks.breadcrumb_enabled !== null && report.marks.anchor_settled !== null);
+            assert.ok((fixtures.forbidden ?? []).every(secret => !JSON.stringify(report).includes(secret)), 'report sentinel privacy');
+            assert.ok(report.correlations.length <= 16);
+            assert.equal(report.breadcrumb_ready_minus_meaningful_ms, Math.max(report.marks.breadcrumb_presented, report.marks.breadcrumb_enabled) - report.marks.meaningful_transcript);
+            result.journeys.push(journeyExpectation(report, fixtures.identity));
+            assert.ok(Number.isInteger(report.observer_inspection_count) && report.observer_inspection_count >= 0);
+            assert.equal(typeof report.observer_scan_limited, 'boolean');
+            trial.observer = { inspection_count: report.observer_inspection_count, scan_limited: report.observer_scan_limited,
+              background_ms: report.background_ms, background_interval_count: report.background_interval_count,
+              sample_rate: report.sample_rate, admitted_count: report.admitted_count, sampled_count: report.sampled_count,
+              transport_dropped_count: report.transport_dropped_count, transport_failed_count: report.transport_failed_count };
+          }
+          if (!trial.sampled) {
+            assert.equal(trial.posts, 0, 'unsampled cohort must not contain report POST');
+            assert.deepEqual(reports, []);
+          }
+          if (!result.visibilityWitness && trial.sampled) {
+            result.visibilityWitness = await runVisibilityRoundTrip(candidate, owned);
+            result.capabilities.tab_visibility = result.visibilityWitness.status;
+          }
+          assert.ok(trial.posts <= 1, 'no per-frame or repeated POST');
+        } finally {
+          result.trials.push(trial);
+          await owned.close();
+        }
+        if (Object.values(summarizeTrials(result.trials).strata).every(s => s.status === 'raw_cohorts_ready_for_review')) break;
+      }
+      assert.ok(negativeTemplate, 'at least one naturally sampled report required for collector negatives');
+      result.collectorNegatives = await runCollectorNegativeChecks(context, baseURL, negativeTemplate);
+      result.collectorNegatives.push(await runUnauthenticatedCollectorCheck(browser, baseURL, negativeTemplate));
+      const terminal = await runPendingPagehideCheck({ browser, storageState, baseURL,
+        route: aggregates[0].route, outputDir, forbidden: fixtures.forbidden ?? [], attempts: 2, budgetMs: 20000 });
+      appendTerminalInventory(result, terminal, fixtures.identity, fixtures.forbidden ?? []);
+      await runLifecycleQualificationStage({ browser, storageState, baseURL,
+        fixture: fixtures.lifecycle, outputDir, forbidden: fixtures.forbidden ?? [], onTrial: (trial, stage) => {
+          result.lifecycle = stage;
+          appendLifecycleInventory(result, { trials: [trial] }, fixtures.identity, fixtures.forbidden ?? []);
+          result.lifecycle = stage;
+        } });
+      result.comparison = summarizeTrials(result.trials);
+      result.acceptance = 'partial_initial_terminal_and_lifecycle_export_raw_overhead_only';
+      return result;
+    })();
+    return await boundedObservation(execution, Math.max(1, outerDeadline - Date.now()), 'absolute browser qualification');
   } catch (error) {
     result.failure = error.message;
     throw error;
   } finally {
+    const failedBeforeCleanup = Boolean(result.failure);
+    let cleanupFailed = false;
+    try {
+      await boundedObservation(Promise.all([...ownedContexts].map(owned => owned.close())), 5000, 'outer context cleanup');
+      if (result.failure && execution) await boundedObservation(execution.catch(() => {}), 5000, 'outer operation drain');
+    } catch { result.failure ??= 'outer cleanup or operation drain failed'; cleanupFailed = true; }
     writeFileSync(receiptPath, JSON.stringify(result, null, 2));
+    if (cleanupFailed && !failedBeforeCleanup) throw new Error('outer cleanup or operation drain failed');
   }
 }
