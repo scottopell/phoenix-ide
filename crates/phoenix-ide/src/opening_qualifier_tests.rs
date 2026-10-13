@@ -68,7 +68,7 @@ impl Gate {
         }
         let reservation = Reservation {
             predecessor,
-            key: ClientTurnKey::try_from(key).map_err(|e| e.to_string())?,
+            key: ClientTurnKey::try_from(key).map_err(ToString::to_string)?,
         };
         let mut accepted = false;
         self.state.send_if_modified(|state| {
@@ -478,7 +478,7 @@ async fn actual_server_opening_qualifier() {
                 let _ = timeout(Duration::from_secs(60), &mut server).await;
                 break result;
             },
-            _ = tokio::time::sleep_until(deadline) => {
+            () = tokio::time::sleep_until(deadline) => {
                 gate.fail();
                 let _ = timeout(Duration::from_secs(60), &mut server).await;
                 break Err("driver deadline".to_owned());
