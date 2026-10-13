@@ -2333,17 +2333,25 @@ mod tests {
             .await
             .unwrap()
             .is_pending());
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = NULL WHERE id = ?1")
-            .bind(&root.id)
-            .execute(db.pool())
+        let invalid_edge =
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = NULL WHERE id = ?1")
+                .bind(&root.id)
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+        let sqlx::Error::Database(constraint) = invalid_edge else {
+            panic!("expected continuation edge constraint rejection");
+        };
+        assert_eq!(constraint.code().as_deref(), Some("1811"));
+        assert_eq!(
+            constraint.message(),
+            "continuation must connect parent transcripts in one ProductConversation"
+        );
+        assert!(db
+            .read_continuation_opening_at_snapshot(&successor.id, current_generation, current_tail)
             .await
-            .unwrap();
-        assert!(matches!(
-            db.read_continuation_opening_at_snapshot(&successor.id, current_generation, current_tail)
-                .await,
-            Err(DbError::Serialization(message))
-                if message == "opening receipt/intent has invalid continuation topology"
-        ));
+            .unwrap()
+            .is_pending());
     }
 
     #[tokio::test]
