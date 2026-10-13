@@ -143,7 +143,7 @@ async function run() {
     async function send(row, text, expected = 'idle') {
       const mid = randomUUID();
       const accepted = await request('POST', `/api/conversations/${row}/chat`, { text, images: [], files: [], message_id: mid });
-      assert.ok(!accepted.queued && !accepted.steering, 'sequential runtime acceptance');
+      assert.ok(accepted.queued === true && accepted.steering !== true, 'delivered admission, not steering');
       await settled(row, expected, mid);
       return mid;
     }

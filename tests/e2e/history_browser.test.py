@@ -26,6 +26,18 @@ def page(segment, sequences):
 
 
 class QualificationTests(unittest.TestCase):
+    def test_delivered_chat_queue_ack_requires_exact_persisted_response(self):
+        fixture = object.__new__(hb.Fixture)
+        fixture.h = types.SimpleNamespace(_has_agent_after_message=lambda messages, mid: True)
+        fixture.request = MagicMock(return_value={"queued": True})
+        fixture.wait = MagicMock(side_effect=lambda row, exhausted, mid: {"messages": [{"message_id": mid}]})
+        fixture.send("row", "probe")
+        self.assertEqual(fixture.wait.call_count, 1)
+        fixture.request.return_value = {"queued": True, "steering": True}
+        with self.assertRaises(AssertionError):
+            fixture.send("row", "probe")
+        self.assertEqual(fixture.wait.call_count, 1)
+
     def test_complete_paging_rejects_missing_interior_occurrence(self):
         full = page(0, [1, 2, 3])
         full["boundaries"] = []

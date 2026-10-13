@@ -178,7 +178,7 @@ class Fixture:
         mid = str(uuid.uuid4())
         accepted = self.request("POST", f"/api/conversations/{row}/chat",
                                 {"text": text, "images": [], "files": [], "message_id": mid})
-        assert not accepted.get("queued") and not accepted.get("steering"), accepted
+        assert accepted.get("queued") is True and accepted.get("steering") is not True, accepted
         data = self.wait(row, exhausted, mid)
         assert any(m["message_id"] == mid for m in data["messages"]), "send not persisted"
         if not exhausted:
