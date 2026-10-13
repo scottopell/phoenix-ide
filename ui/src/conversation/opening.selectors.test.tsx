@@ -22,3 +22,21 @@ it('publishes opening-only changes to the direct transcript selector without re-
   expect(transcriptRenders).toBeGreaterThan(baseline.transcript);
   expect(controlsRenders).toBe(baseline.controls);
 });
+
+
+it('selects generation coherently and isolates continued token content', () => {
+  const store = new ConversationStore();
+  store.dispatch('successor', { type: 'set_initial_data', conversationId: 'successor',
+    conversation: { id: 'successor', slug: 'successor' } as Conversation, messages: [], phase: { type: 'idle' }, contextWindow: { used: 0 } });
+  const wrapper = ({ children }: { children: ReactNode }) => <ConversationContext.Provider value={store}>{children}</ConversationContext.Provider>;
+  let renders = 0;
+  const transcript = renderHook(() => { renders++; return useConversationTranscriptView('successor'); }, { wrapper });
+  act(() => store.dispatch('successor', { type: 'sse_message_updated', sequenceId: 1, messageId: 'opening', opening: null, transcriptGeneration: 2 }));
+  expect(transcript.result.current?.transcriptGeneration).toBe(2);
+  act(() => store.dispatch('successor', { type: 'sse_token', sequenceId: 2, requestId: 'request', delta: 'first' }));
+  const baseline = renders;
+  const view = transcript.result.current;
+  act(() => store.dispatch('successor', { type: 'sse_token', sequenceId: 3, requestId: 'request', delta: 'second' }));
+  expect(renders).toBe(baseline);
+  expect(transcript.result.current).toBe(view);
+});

@@ -202,7 +202,7 @@ export function useConversationTranscriptAuthority(conversationId: string | null
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
-export type ConversationTranscriptView = Pick<ConversationPageView, 'conversationId' | 'messages' | 'phase' | 'streamingRequestId'> & Pick<ConversationAtom, 'opening'>;
+export type ConversationTranscriptView = Pick<ConversationPageView, 'conversationId' | 'messages' | 'phase' | 'streamingRequestId'> & Pick<ConversationAtom, 'opening' | 'transcriptGeneration'>;
 
 /** Structural transcript fields from one atom revision; token content stays at the leaf. */
 export function useConversationTranscriptView(slug: string | null): ConversationTranscriptView | null {
@@ -219,11 +219,12 @@ export function useConversationTranscriptView(slug: string | null): Conversation
     const previous = lastRef.current;
     const streamingRequestId = atom.streamingBuffer?.requestId ?? null;
     if (previous?.conversationId === atom.conversationId
+      && previous.transcriptGeneration === atom.transcriptGeneration
       && previous.opening === atom.opening
       && previous.messages === atom.messages
       && previous.phase === atom.phase
       && previous.streamingRequestId === streamingRequestId) return previous;
-    const next = { conversationId: atom.conversationId, messages: atom.messages, phase: atom.phase, streamingRequestId, opening: atom.opening };
+    const next = { conversationId: atom.conversationId, messages: atom.messages, phase: atom.phase, streamingRequestId, opening: atom.opening, transcriptGeneration: atom.transcriptGeneration };
     lastRef.current = next;
     return next;
   }, [store, slug]);
