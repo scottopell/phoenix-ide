@@ -53,6 +53,64 @@ export function belongsToAggregate(aggregate, response) {
     : path === aggregate.endpoint;
 }
 
+export function olderRequest(aggregate, url, latest) {
+  const parsed = new URL(url);
+  const path = parsed.pathname;
+  const members = [...aggregate.members, latest];
+  const matches = aggregate.kind === 'global'
+    ? members.some(member => member && path === `/api/global/coordinator/history/${encodeURIComponent(member)}`)
+    : path === aggregate.endpoint;
+  const cursors = parsed.searchParams.getAll('before');
+  return matches && cursors.length === 1 && cursors[0]
+    ? { endpoint: path, cursor: cursors[0] } : null;
+}
+export function failedOlderRequest(aggregate, entry, latest) {
+  return entry.method === 'GET' && entry.failure?.errorText === 'net::ERR_INTERNET_DISCONNECTED'
+    ? olderRequest(aggregate, entry.url, latest) : null;
+}
+export function retryMatches(aggregate, response, failed, latest) {
+  const request = olderRequest(aggregate, response.url, latest);
+  return !!request && request.endpoint === failed.endpoint && request.cursor === failed.cursor
+    && response.status === 200 && belongsToAggregate(aggregate, response)
+    && response.data.latest_transcript_row_id === latest;
+}
+export function tailSamplesReady(samples, expectedTail) {
+  if (samples.length !== 4) return false;
+  const first = samples[0];
+  if (!first || !expectedTail) return false;
+  const geometry = ['scrollTop', 'scrollHeight', 'clientHeight', 'viewportTop', 'viewportLeft',
+    'viewportWidth', 'viewportHeight', 'tailTop', 'tailBottom'];
+  return samples.every((s, index) => s && s.tailId === expectedTail && !!s.tailKey
+    && s.tailKey === first.tailKey && Number.isFinite(s.frame)
+    && (index === 0 || s.frame > samples[index - 1].frame)
+    && geometry.every(key => Number.isFinite(s[key]) && s[key] === first[key])
+    && s.clientHeight > 0 && s.viewportWidth > 0 && s.viewportHeight > 0
+    && s.scrollHeight > s.clientHeight && s.scrollTop > 0
+    && Math.abs(s.scrollHeight - s.clientHeight - s.scrollTop) <= 2
+    && s.tailBottom > s.tailTop && s.tailBottom > s.viewportTop
+    && s.tailTop < s.viewportTop + s.viewportHeight);
+}
+export async function offlineOlderWitness(page, context, aggregate, latest, sample, alert, poll) {
+  let failed;
+  const witness = req => {
+    const entry = { url: req.url(), method: req.method(), failure: req.failure(), at_ms: performance.now() };
+    const match = failedOlderRequest(aggregate, entry, latest);
+    if (match && !failed) failed = { ...match, ...entry };
+  };
+  page.on('requestfailed', witness);
+  try {
+    await context.setOffline(true);
+    await page.locator('#messages').hover();
+    // A native wheel transfers reader ownership; geometry writes do not.
+    await page.mouse.wheel(0, -(sample.scrollHeight + sample.clientHeight));
+    await poll(async () => failed && await alert.isVisible(), 'disconnected older request and visible history alert');
+    return failed;
+  } finally {
+    try { await context.setOffline(false); }
+    finally { page.off('requestfailed', witness); }
+  }
+}
+
 async function run() {
   const app = resolve(process.env.APP_ROOT);
   const output = resolve(process.env.HISTORY_OUTPUT);
@@ -94,7 +152,9 @@ async function run() {
       bounded('page-errors.jsonl', { error: String(error) });
     });
     page.on('console', msg => bounded('console.jsonl', { type: msg.type(), text: msg.text() }));
-    page.on('requestfailed', req => bounded('network-errors.jsonl', { url: req.url(), failure: req.failure() }));
+    page.on('requestfailed', req => bounded('network-errors.jsonl', {
+      url: req.url(), method: req.method(), failure: req.failure(), at_ms: performance.now(),
+    }));
     page.on('response', response => {
       if (!new URL(response.url()).pathname.startsWith('/api/')) return;
       const task = (async () => {
@@ -107,7 +167,7 @@ async function run() {
             entry.truncated = raw.length > 64000;
             const data = JSON.parse(raw);
             if (Array.isArray(data.segments) && Array.isArray(data.boundaries)) {
-              snapshots.push({ url: response.url(), data, at_ms: entry.at_ms });
+              snapshots.push({ url: response.url(), status: response.status(), data, at_ms: entry.at_ms });
             }
           } catch (error) { entry.read_error = String(error); }
         }
@@ -347,23 +407,46 @@ async function run() {
       }
       checked(`${prefix}: foreign and duplicate transcript pins rejected visibly`);
 
-      // Real offline transport failure, not an API/EventSource stub. Latest route
-      // starts with a bounded tail; top scrolling invokes the production loader.
+      const current = await settled(latest);
+      const expectedTail = current.messages.at(-1).message_id;
+      const offlineStart = snapshots.length;
       await goto((a.kind === 'global' ? `/global/${latest}` : a.route) + '?qualification=retained');
       await page.locator('#conversation-nav').waitFor({ state: 'visible' });
-      const current = await settled(latest);
-      await visibleMessage(current.messages.at(-1).message_id);
-      await context.setOffline(true);
-      try {
-        await page.locator('#messages').evaluate(el => { el.scrollTop = 0; });
-        await page.getByRole('alert').filter({ hasText: 'Could not load earlier history:' }).waitFor({ state: 'visible' });
-      } finally { await context.setOffline(false); }
+      const offlineTail = await snapshotSeen(a, s => s.has_older && s.latest_transcript_row_id === latest, offlineStart);
+      await visibleMessage(expectedTail);
+      const samples = [];
+      await poll(async () => {
+        const sample = await page.evaluate(mid => new Promise(resolve => requestAnimationFrame(frame => {
+          const scroller = document.querySelector('#messages');
+          const tail = scroller?.querySelector(`[id="${CSS.escape(`message-${mid}`)}"], [data-message-id="${CSS.escape(mid)}"]`);
+          if (!scroller || !tail) { resolve(null); return; }
+          const viewport = scroller.getBoundingClientRect();
+          const box = tail.getBoundingClientRect();
+          resolve({ frame, tailId: mid, tailKey: tail.closest('[data-virtual-key]')?.dataset.virtualKey,
+            scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight, clientHeight: scroller.clientHeight,
+            viewportTop: viewport.top, viewportLeft: viewport.left, viewportWidth: viewport.width,
+            viewportHeight: viewport.height, tailTop: box.top, tailBottom: box.bottom });
+        })), expectedTail);
+        samples.push(sample);
+        if (samples.length > 4) samples.shift();
+        return tailSamplesReady(samples, expectedTail);
+      }, 'four fresh stable native-bottom frames before offline');
+      bounded('readiness.jsonl', { name: `${prefix}: offline physical tail setup`,
+        snapshot_url: offlineTail.url, snapshot_at_ms: offlineTail.at_ms,
+        has_older: offlineTail.data.has_older, latest_transcript_row_id: offlineTail.data.latest_transcript_row_id,
+        expectedTail, samples: [...samples] });
+      const historyAlert = page.getByRole('alert').filter({ hasText: 'Could not load earlier history:' });
+      assert.equal(await historyAlert.count(), 0, 'no earlier-history alert before offline input');
+      const failed = await offlineOlderWitness(page, context, a, latest, samples.at(-1), historyAlert, poll);
+      bounded('older-transport.jsonl', { phase: 'failed', kind: prefix, ...failed });
       const retryStart = snapshots.length;
       const retryAnchor = await anchor();
-      await page.getByRole('button', { name: 'Retry', exact: true }).click();
-      await snapshotSeen(a, () => true, retryStart);
-      await poll(async () => (await page.getByRole('alert').filter({ hasText: 'Could not load earlier history:' }).count()) === 0, 'retry recovered');
-      assert.ok(snapshots.slice(retryStart).some(s => belongsToAggregate(a, s) && new URL(s.url).searchParams.has('before')));
+      await historyAlert.getByRole('button', { name: 'Retry', exact: true }).click();
+      const recovered = await poll(() => snapshots.slice(retryStart).find(s => retryMatches(a, s, failed, latest)),
+        'successful Retry of failed older endpoint and cursor');
+      await poll(async () => (await historyAlert.count()) === 0, 'retry recovered');
+      bounded('older-transport.jsonl', { phase: 'recovered', kind: prefix, url: recovered.url,
+        status: recovered.status, endpoint: failed.endpoint, cursor: failed.cursor });
       await sameAnchor(retryAnchor, `${prefix}: physical anchor after real prefix Retry`);
       checked(`${prefix}: actual failed earlier transport then successful Retry`);
     }

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { tailSamplesReady, olderRequest, failedOlderRequest, retryMatches, offlineOlderWitness } from './qualify-history-realserver.mjs';
 import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText, boundedDiagnosticJson, COMPOSER_SELECTOR, pinRejection } from './qualify-history-realserver.mjs';
 
 test('only literal HTTP loopback ports are accepted', () => {
@@ -65,4 +67,100 @@ test('negative pin expectations belong to ordinary and Global admission gates', 
     }
   }
   assert.notEqual(pinRejection('ordinary', false).text, pinRejection('ordinary', true).text);
+});
+
+test('offline setup needs four fresh, stable, positive-overflow native-bottom tail frames', () => {
+  const samples = [1, 2, 3, 4].map(frame => ({ frame, tailId: 'tail', tailKey: 'message:tail',
+    scrollTop: 10196, scrollHeight: 10936, clientHeight: 740,
+    viewportTop: 80, viewportLeft: 10, viewportWidth: 1000, viewportHeight: 740,
+    tailTop: 700, tailBottom: 810 }));
+  assert.equal(tailSamplesReady(samples, 'tail'), true);
+  assert.equal(tailSamplesReady(samples.slice(1), 'tail'), false);
+  assert.equal(tailSamplesReady(samples, 'other'), false);
+  assert.equal(tailSamplesReady([null, ...samples.slice(1)], 'tail'), false);
+  for (const change of [
+    { tailId: 'wrong' }, { tailKey: '' }, { tailKey: 'replacement' }, { frame: 3 }, { frame: 2 },
+    { frame: NaN }, { scrollTop: NaN }, { scrollTop: 10193 }, { scrollHeight: 10937 },
+    { clientHeight: 741 }, { viewportTop: 81 }, { viewportLeft: 11 },
+    { viewportWidth: 999 }, { viewportHeight: 739 }, { tailTop: 701 }, { tailBottom: 811 },
+  ]) {
+    assert.equal(tailSamplesReady(samples.map((s, i) => i === 3 ? { ...s, ...change } : s), 'tail'), false, JSON.stringify(change));
+  }
+  for (const change of [
+    { scrollTop: 0, scrollHeight: 740 }, { scrollTop: -1 }, { clientHeight: 0 },
+    { viewportWidth: 0 }, { viewportHeight: 0 }, { tailTop: 820, tailBottom: 840 },
+    { tailTop: 50, tailBottom: 80 }, { tailTop: 810, tailBottom: 810 },
+    { scrollTop: 10000 },
+  ]) {
+    assert.equal(tailSamplesReady(samples.map(s => ({ ...s, ...change })), 'tail'), false, JSON.stringify(change));
+  }
+});
+
+const globalAggregate = { kind: 'global', members: ['root', 'child'] };
+const ordinaryAggregate = { kind: 'ordinary', members: ['ordinary-root'], endpoint: '/api/product-conversations/pc' };
+const historyUrl = member => `http://127.0.0.1:1/api/global/coordinator/history/${member}?before=cursor%2B1`;
+const disconnected = url => ({ url, method: 'GET', failure: { errorText: 'net::ERR_INTERNET_DISCONNECTED' } });
+
+test('failed older witness requires a GET cursor on this aggregate including its new latest member', () => {
+  for (const member of ['root', 'child', 'new-latest']) {
+    assert.deepEqual(failedOlderRequest(globalAggregate, disconnected(historyUrl(member)), 'new-latest'), {
+      endpoint: `/api/global/coordinator/history/${member}`, cursor: 'cursor+1',
+    });
+  }
+  assert.ok(failedOlderRequest(ordinaryAggregate, disconnected('http://127.0.0.1:1/api/product-conversations/pc?before=old'), 'new'));
+  for (const url of [
+    historyUrl('foreign'), historyUrl('new-latest') + '&before=another', historyUrl('child').split('?')[0],
+    'http://127.0.0.1:1/api/global/coordinator/history/child?before=',
+    'http://127.0.0.1:1/api/global/coordinator/history/child/extra?before=old',
+    'http://127.0.0.1:1/api/coordinator/watches?before=old',
+    'http://127.0.0.1:1/api/product-conversations/other?before=old',
+  ]) assert.equal(failedOlderRequest(globalAggregate, disconnected(url), 'new-latest'), null);
+  assert.equal(failedOlderRequest(ordinaryAggregate, disconnected(historyUrl('child')), 'new'), null);
+  assert.equal(failedOlderRequest(globalAggregate, { ...disconnected(historyUrl('child')), method: 'POST' }, 'new-latest'), null);
+  assert.equal(failedOlderRequest(globalAggregate, { ...disconnected(historyUrl('child')), failure: { errorText: 'net::ERR_ABORTED' } }, 'new-latest'), null);
+});
+
+test('successful Retry must recover the same failed endpoint and cursor with correct canonical/latest identity', () => {
+  const url = historyUrl('new-latest');
+  const failed = olderRequest(globalAggregate, url, 'new-latest');
+  const response = { url, status: 200, data: { canonical_root: { transcript_row_id: 'root' }, latest_transcript_row_id: 'new-latest' } };
+  assert.equal(retryMatches(globalAggregate, response, failed, 'new-latest'), true);
+  for (const change of [
+    { url: historyUrl('child') }, { url: url.replace('cursor%2B1', 'different') },
+    { url: url.split('?')[0] }, { status: 500 },
+    { data: { ...response.data, canonical_root: { transcript_row_id: 'foreign' } } },
+    { data: { ...response.data, latest_transcript_row_id: 'child' } },
+  ]) assert.equal(retryMatches(globalAggregate, { ...response, ...change }, failed, 'new-latest'), false);
+  const ordinary = { url: 'http://127.0.0.1:1/api/product-conversations/pc?before=cursor', status: 200,
+    data: { latest_transcript_row_id: 'new' } };
+  assert.equal(retryMatches(ordinaryAggregate, ordinary, olderRequest(ordinaryAggregate, ordinary.url, 'new'), 'new'), true);
+  assert.equal(retryMatches(ordinaryAggregate, { ...ordinary, url: ordinary.url.replace('/pc?', '/foreign?') },
+    olderRequest(ordinaryAggregate, ordinary.url, 'new'), 'new'), false);
+});
+
+test('offline orchestration registers first, wheels once over measured extent, requires request AND alert, always restores online', async () => {
+  for (const mode of ['success', 'no-request', 'aborted', 'no-alert', 'wheel-error']) {
+    const calls = [];
+    const page = new EventEmitter();
+    page.locator = selector => ({ hover: async () => { assert.equal(selector, '#messages'); calls.push('hover'); } });
+    const context = { setOffline: async value => {
+      assert.equal(page.listenerCount('requestfailed'), 1, 'witness registered before going offline and retained through cleanup');
+      calls.push(`offline:${value}`);
+    } };
+    page.mouse = { wheel: async (x, y) => {
+      assert.equal(x, 0); assert.equal(y, -10936 - 740); calls.push('wheel');
+      if (mode === 'wheel-error') throw new Error('wheel error');
+      if (mode !== 'no-request') {
+        const failure = mode === 'aborted' ? 'net::ERR_ABORTED' : 'net::ERR_INTERNET_DISCONNECTED';
+        page.emit('requestfailed', { url: () => historyUrl('new-latest'), method: () => 'GET', failure: () => ({ errorText: failure }) });
+      }
+    } };
+    const alert = { isVisible: async () => mode !== 'no-alert' };
+    const poll = async fn => { calls.push('poll'); assert.ok(await fn(), 'both witnesses required'); };
+    const action = offlineOlderWitness(page, context, globalAggregate, 'new-latest', { scrollHeight: 10936, clientHeight: 740 }, alert, poll);
+    if (mode === 'success') assert.equal((await action).cursor, 'cursor+1');
+    else await assert.rejects(action);
+    assert.deepEqual(calls, ['offline:true', 'hover', 'wheel', ...(mode === 'wheel-error' ? [] : ['poll']), 'offline:false']);
+    assert.equal(page.listenerCount('requestfailed'), 0);
+  }
 });
