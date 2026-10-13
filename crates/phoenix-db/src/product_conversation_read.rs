@@ -104,6 +104,17 @@ impl ContinuationOpeningRead {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContinuationOpeningUpdateRead {
+    Current(ContinuationOpeningRead),
+    Superseded {
+        content: MessageContent,
+        transcript_generation: i64,
+        display_data: Option<serde_json::Value>,
+        opening: ContinuationOpeningRead,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductConversationSnapshotRead {
     pub aggregate: ProductConversationAggregate,
@@ -1241,21 +1252,21 @@ impl Database {
         result
     }
 
-    /// Reads receipt authority only when it describes the content update being delivered.
+    /// Reads a current opening observation or a coherent committed replacement.
     ///
     /// # Errors
-    /// Missing generation, superseded content/generation, or invalid receipts require reconciliation.
+    /// Missing/future generation, wrong current content, or invalid receipts require reconciliation.
     pub async fn read_message_continuation_opening_at_update(
         &self,
         message_id: &str,
         generation: Option<i64>,
         content: &MessageContent,
-    ) -> DbResult<Option<ContinuationOpeningRead>> {
+    ) -> DbResult<Option<ContinuationOpeningUpdateRead>> {
         let mut tx = self.pool.begin().await?;
         let result = async {
             let row = sqlx::query(
                 "SELECT handoff.successor_conversation_id, conversation.transcript_generation,
-                        message.message_type, message.content
+                        message.*
                  FROM completed_continuation_handoffs handoff
                  JOIN messages message ON message.message_id = handoff.accepted_successor_message_id
                  JOIN conversations conversation ON conversation.id = message.conversation_id
@@ -1269,13 +1280,31 @@ impl Database {
             };
             let actual_generation: i64 = row.try_get("transcript_generation")?;
             let actual_content = message_content_from_row(&row, "message_type", "content")?;
-            if generation != Some(actual_generation) || content != &actual_content {
+            let successor: String = row.try_get("successor_conversation_id")?;
+            let mut message = super::parse_message_row(row)?;
+            message.content = actual_content;
+            super::hydrate_attachments_conn(&mut tx, std::slice::from_mut(&mut message)).await?;
+            let actual_content = message.content;
+            let Some(generation) = generation else {
+                return Err(DbError::TranscriptSnapshotChanged);
+            };
+            if generation < 0
+                || generation > actual_generation
+                || (generation == actual_generation && content != &actual_content)
+            {
                 return Err(DbError::TranscriptSnapshotChanged);
             }
-            let successor: String = row.try_get("successor_conversation_id")?;
-            Self::read_continuation_opening_on(&mut tx, &successor)
-                .await
-                .map(Some)
+            let opening = Self::read_continuation_opening_on(&mut tx, &successor).await?;
+            Ok(Some(if generation == actual_generation {
+                ContinuationOpeningUpdateRead::Current(opening)
+            } else {
+                ContinuationOpeningUpdateRead::Superseded {
+                    content: actual_content,
+                    transcript_generation: actual_generation,
+                    display_data: message.display_data,
+                    opening,
+                }
+            }))
         }
         .await;
         tx.rollback().await?;
@@ -2146,7 +2175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_update_fence_rejects_delayed_edit_and_restored_content_generation() {
+    async fn opening_update_reconciles_superseded_edits_and_rejects_wrong_current_generation() {
         let (db, _, successor) = opening_fixture(true).await;
         let restored = MessageContent::Continuation(ContinuationContent {
             summary: "exact opening context".into(),
@@ -2173,9 +2202,9 @@ mod tests {
             tx.commit().await.unwrap();
         }
         for (generation, content) in [
-            (Some(1), &edited),
             (Some(2), &edited),
-            (Some(1), &restored),
+            (Some(3), &restored),
+            (Some(-1), &restored),
             (None, &restored),
         ] {
             assert!(matches!(
@@ -2188,11 +2217,25 @@ mod tests {
             db.read_message_continuation_opening_at_update("reserved:key", Some(2), &restored)
                 .await
                 .unwrap(),
-            Some(ContinuationOpeningRead::Accepted {
-                presentation: ContinuationOpeningPresentation::Boundary,
-                ..
-            })
+            Some(ContinuationOpeningUpdateRead::Current(
+                ContinuationOpeningRead::Accepted {
+                    presentation: ContinuationOpeningPresentation::Boundary,
+                    ..
+                }
+            ))
         ));
+        for content in [&edited, &restored] {
+            assert!(matches!(
+                db.read_message_continuation_opening_at_update("reserved:key", Some(1), content).await.unwrap(),
+                Some(ContinuationOpeningUpdateRead::Superseded {
+                    content,
+                    transcript_generation: 2,
+                    opening: ContinuationOpeningRead::Accepted {
+                        presentation: ContinuationOpeningPresentation::Boundary, ..
+                    }, ..
+                }) if content == restored
+            ));
+        }
     }
 
     #[tokio::test]

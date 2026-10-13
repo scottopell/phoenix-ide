@@ -976,6 +976,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         other @ (crate::db::DbError::Sqlx(_)
         | crate::db::DbError::MessageNotFound(_)
         | crate::db::DbError::MessageConflict(_)
+        | crate::db::DbError::TranscriptSnapshotChanged
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::ConversationAlreadyExists(_)
         | crate::db::DbError::Serialization(_)
@@ -1029,6 +1030,7 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::ConversationAlreadyExists(_)
         | crate::db::DbError::MessageNotFound(_)
         | crate::db::DbError::MessageConflict(_)
+        | crate::db::DbError::TranscriptSnapshotChanged
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::SubAgentLifecycleConflict(_)
@@ -2254,6 +2256,14 @@ mod tests {
 
     #[test]
     fn typed_db_errors_map_to_distinct_service_errors() {
+        assert!(matches!(
+            map_conversation_load_error(crate::db::DbError::TranscriptSnapshotChanged),
+            SendChatServiceError::Internal(_)
+        ));
+        assert!(matches!(
+            map_direct_turn_accept_error(crate::db::DbError::TranscriptSnapshotChanged),
+            SendChatServiceError::Internal(_)
+        ));
         assert!(matches!(
             map_conversation_load_error(crate::db::DbError::ConversationNotFound(
                 "missing".to_string()

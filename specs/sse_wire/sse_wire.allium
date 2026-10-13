@@ -79,9 +79,13 @@
 -- null means no observation, not no opening evidence. A committed message
 -- observation is attached only to the exact receipt's accepted message ID.
 -- No summary text is copied into this envelope. Content updates recompute the
--- observation in the same read transaction as an exact content/generation check
--- against the event being delivered. Both live updates and init pending_events
--- use this fence; mismatches and read errors log and close for reconciliation.
+-- observation in the same read transaction as a content/generation fence.
+-- A strictly older nonnegative generation is replaced by a coherent committed
+-- content/generation/display/opening envelope for the same accepted identity;
+-- its event cursor is retained. Both live and init pending delivery use this
+-- reconciliation, leaving other owed events and ring ownership unchanged.
+-- Missing/future generations, wrong content at the current generation, and
+-- invalid receipts/read errors log and close; they never borrow newer authority.
 -- Init snapshot generation/tail mismatches retry the bounded stable read;
 -- invalid persisted authority remains an error, never absent evidence.
 -- Token-shared live and replayed envelopes omit pending observations (null) to avoid exposing an

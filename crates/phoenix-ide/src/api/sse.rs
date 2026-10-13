@@ -104,17 +104,40 @@ async fn enrich_update_opening(
         transcript_generation,
         content: Some(content),
         opening,
+        display_data,
+        duration_ms,
         ..
     } = event
     {
-        *opening = db
+        use phoenix_db::ContinuationOpeningUpdateRead;
+        *opening = match db
             .read_message_continuation_opening_at_update(
                 message_id,
                 *transcript_generation,
                 content,
             )
             .await?
-            .map(super::types::ContinuationOpeningView::from);
+        {
+            None => None,
+            Some(ContinuationOpeningUpdateRead::Current(read)) => Some(read.into()),
+            Some(ContinuationOpeningUpdateRead::Superseded {
+                content: committed_content,
+                transcript_generation: committed_generation,
+                display_data: committed_display,
+                opening: read,
+            }) => {
+                tracing::debug!(%message_id, ?transcript_generation, committed_generation,
+                    "reconciling superseded SSE opening update from committed state");
+                *content = committed_content;
+                *transcript_generation = Some(committed_generation);
+                *duration_ms = committed_display
+                    .as_ref()
+                    .and_then(|display| display.get("duration_ms"))
+                    .and_then(serde_json::Value::as_u64);
+                *display_data = committed_display;
+                Some(read.into())
+            }
+        };
     }
     Ok(())
 }
@@ -1644,7 +1667,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn delayed_update_cannot_borrow_restored_boundary_in_live_or_replay_delivery() {
+    async fn delayed_update_reconciles_committed_content_without_poisoning_reconnect() {
         use phoenix_core::domain::db_schema::ContinuationContent;
         use phoenix_db::{ContinueOutcome, NewContinuationDispatchIntent};
         use phoenix_workflow::ClientTurnKey;
@@ -1691,7 +1714,7 @@ mod tests {
             sequence_id: 22,
             message_id: "opening-key".into(),
             transcript_generation: Some(1),
-            display_data: None,
+            display_data: Some(json!({"stale-display": true})),
             content: Some(edited.clone()),
             duration_ms: None,
         };
@@ -1731,33 +1754,170 @@ mod tests {
             SseStreamAudience::Authenticated,
             SseStreamAudience::SharedTranscript,
         ] {
-            assert!(matches!(
-                prepare_sse_delivery(&db, delayed.clone(), audience).await,
-                Err(crate::db::DbError::TranscriptSnapshotChanged)
-            ));
-            assert!(matches!(
-                prepare_sse_delivery(&db, update_test_init(vec![delayed.clone()]), audience).await,
-                Err(crate::db::DbError::TranscriptSnapshotChanged)
-            ));
-            for replay in [false, true] {
-                let (tx, rx) = tokio::sync::broadcast::channel(8);
-                let init = if replay {
-                    update_test_init(vec![delayed.clone()])
-                } else {
-                    tx.send(delayed.clone()).unwrap();
-                    update_test_init(vec![])
-                };
+            let broadcaster = crate::runtime::SseBroadcaster::new(16, 20);
+            let live_rx = broadcaster.subscribe();
+            broadcaster
+                .send_seq(|sequence_id| {
+                    let mut event = delayed.clone();
+                    if let SseEvent::MessageUpdated {
+                        sequence_id: seq, ..
+                    } = &mut event
+                    {
+                        *seq = sequence_id;
+                    }
+                    event
+                })
+                .unwrap();
+            broadcaster
+                .send_seq(|sequence_id| SseEvent::Token {
+                    sequence_id,
+                    text: "owed-token".into(),
+                    request_id: "update-test".into(),
+                })
+                .unwrap();
+
+            // Use the same durable read/fence as the init handler, not an empty fixture snapshot.
+            let conversation = db.get_conversation(&successor.id).await.unwrap();
+            let messages = db.get_messages(&successor.id).await.unwrap();
+            let opening = db
+                .read_continuation_opening_at_snapshot(
+                    &successor.id,
+                    conversation.transcript_generation,
+                    messages.iter().map(|message| message.sequence_id).max(),
+                )
+                .await
+                .unwrap();
+            let make_init = |pending_events| {
+                let mut init = update_test_init(pending_events);
+                if let SseEvent::Init {
+                    conversation: view,
+                    transcript,
+                    opening: observation,
+                    transcript_generation,
+                    ..
+                } = &mut init
+                {
+                    view.inner = crate::runtime::PresentationConversation(conversation.clone());
+                    *transcript = crate::runtime::InitTranscript::Complete(messages.clone());
+                    *observation = Some(opening.clone().into());
+                    *transcript_generation = conversation.transcript_generation;
+                }
+                init
+            };
+            let response = sse_stream(
+                db.clone(),
+                successor.id.clone(),
+                make_init(vec![]),
+                live_rx,
+                None,
+                audience,
+            )
+            .into_response();
+            let mut body = response.into_body().into_data_stream();
+            for expected in ["event: init", "event: message_updated", "owed-token"] {
+                let chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+                    .await
+                    .expect("stream makes progress")
+                    .expect("stream must not close")
+                    .unwrap();
+                let chunk = String::from_utf8(chunk.to_vec()).unwrap();
+                assert!(chunk.contains(expected), "{chunk}");
+                assert!(!chunk.contains("stale-display"));
+                assert!(
+                    !chunk.contains("edit A"),
+                    "old content must not borrow current authority"
+                );
+                if expected == "event: message_updated" {
+                    assert!(chunk.contains("boundary"));
+                    assert!(chunk.contains("context"));
+                    assert!(chunk.contains("\"transcript_generation\":2"));
+                }
+            }
+            drop(body);
+            // The ring still holds the old event. Two reconnects must both reach init and live traffic.
+            for _ in 0..2 {
+                let rx = broadcaster.subscribe();
+                let (anchor, truncated, highest, pending) = broadcaster.snapshot_pending();
+                assert!(!truncated);
+                assert_eq!(
+                    pending.len(),
+                    2,
+                    "no owed event is removed from the shared ring"
+                );
+                let mut init = make_init(pending);
+                if let SseEvent::Init {
+                    pending_anchor_sequence_id,
+                    sequence_id,
+                    last_sequence_id,
+                    ..
+                } = &mut init
+                {
+                    *pending_anchor_sequence_id = anchor;
+                    *sequence_id = highest;
+                    *last_sequence_id = highest;
+                }
                 let response =
                     sse_stream(db.clone(), successor.id.clone(), init, rx, None, audience)
                         .into_response();
-                let body = tokio::time::timeout(
+                let mut body = response.into_body().into_data_stream();
+                let chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+                    .await
+                    .unwrap()
+                    .expect("reconnect must deliver current init")
+                    .unwrap();
+                let chunk = String::from_utf8(chunk.to_vec()).unwrap();
+                assert!(chunk.contains("event: init"));
+                assert!(chunk.contains("context") && chunk.contains("boundary"));
+                assert!(chunk.contains("owed-token"));
+                assert!(!chunk.contains("stale-display"));
+                assert!(!chunk.contains("edit A"));
+                broadcaster
+                    .send_live_projection(|sequence_id| SseEvent::Token {
+                        sequence_id,
+                        text: "still-live".into(),
+                        request_id: "update-test".into(),
+                    })
+                    .unwrap();
+                let chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+                    .await
+                    .unwrap()
+                    .expect("reconnected stream remains open")
+                    .unwrap();
+                assert!(String::from_utf8(chunk.to_vec())
+                    .unwrap()
+                    .contains("still-live"));
+            }
+            for generation in [None, Some(2), Some(3)] {
+                let mut wrong = delayed.clone();
+                if let SseEvent::MessageUpdated {
+                    transcript_generation,
+                    ..
+                } = &mut wrong
+                {
+                    *transcript_generation = generation;
+                }
+                assert!(matches!(
+                    prepare_sse_delivery(&db, wrong.clone(), audience).await,
+                    Err(crate::db::DbError::TranscriptSnapshotChanged)
+                ));
+                let (_tx, rx) = tokio::sync::broadcast::channel(8);
+                let response = sse_stream(
+                    db.clone(),
+                    successor.id.clone(),
+                    make_init(vec![wrong]),
+                    rx,
+                    None,
+                    audience,
+                )
+                .into_response();
+                let bytes = tokio::time::timeout(
                     Duration::from_secs(1),
                     axum::body::to_bytes(response.into_body(), usize::MAX),
                 )
                 .await
-                .expect("mismatch closes instead of skipping the update")
+                .expect("invalid evidence still closes instead of skipping it")
                 .unwrap();
-                assert!(!String::from_utf8(body.to_vec()).unwrap().contains("edit A"));
+                assert!(bytes.is_empty());
             }
         }
         let latest = SseEvent::MessageUpdated {
