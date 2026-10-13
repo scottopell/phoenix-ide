@@ -113,7 +113,6 @@ interface PhysicalStore<T> {
   initialTailPending: boolean;
   preservedViewport: { top: number; firstKey: string | null } | null;
   pendingTarget: {
-    index: number;
     key: string;
     align: 'start' | 'end';
     viewportStartOffset: number;
@@ -250,7 +249,7 @@ function buildPhysicalSnapshot<T>(
     ...baseSnapshot,
     targetIndex,
     targetOffset: hidden || offset === undefined ? null : offset - settledViewportTop(store),
-    targetMeasured: !hidden && store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
+    targetMeasured: !hidden && store.pendingTarget?.key !== key && store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
   };
 }
 
@@ -261,6 +260,12 @@ function synchronizedPhysicalSnapshot<T>(
 ): VirtualTranscriptPhysicalSnapshot {
   if (!isLayoutHidden(store.scroller)) {
     store.viewportExtent = store.scroller ? viewportExtentForScroller(store.scroller) : store.viewportExtent;
+    if (store.revealPublicationPending) {
+      const anchor = anchorForChange(store);
+      const wasPinned = store.pinned;
+      if (measureMountedExtents(store)) applyPhysicalChange(store, anchor, wasPinned);
+    }
+    resolvePendingTarget(store);
     if (store.revealPublicationPending && store.pendingScrollTop !== null) {
       setScrollerScrollTop(store, store.pendingScrollTop);
     }
@@ -387,6 +392,27 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   }
 }
 
+function resolvePendingTarget<T>(current: PhysicalStore<T>): boolean {
+  const pending = current.pendingTarget;
+  if (!pending || isLayoutHidden(current.scroller)) return false;
+  const key = pending.key;
+  const element = current.rowElements.get(key);
+  const index = current.keys.indexOf(key);
+  const targetElement = resolveTarget(element, pending.selector);
+  const unit = current.layout.itemAt(index);
+  if (!element || !targetElement || !unit) return false;
+  current.pendingTarget = null;
+  const intraRowOffset = targetElement.getBoundingClientRect().top - element.getBoundingClientRect().top;
+  const physicalOffset = current.headerExtent + unit.offset + current.drift;
+  const physicalEnd = current.headerExtent + unit.end + current.drift;
+  const target = pending.align === 'end'
+    ? physicalEnd - current.viewportExtent + pending.viewportStartOffset
+    : physicalOffset + intraRowOffset - pending.viewportStartOffset;
+  current.activeAnchor = { index, key, offset: physicalOffset - target };
+  setScrollerScrollTop(current, target);
+  return true;
+}
+
 function isProgrammaticScrollTop<T>(store: PhysicalStore<T>, scrollTop: number): boolean {
   return store.pendingProgrammaticTop !== null
     && Math.abs(scrollTop - store.pendingProgrammaticTop) <= 1;
@@ -447,10 +473,26 @@ function updateMeasuredExtent<T>(store: PhysicalStore<T>, key: string, nextExten
   return true;
 }
 
+function measureMountedExtents<T>(store: PhysicalStore<T>): boolean {
+  let changed = false;
+  if (store.headerElement && !isLayoutHidden(store.headerElement)) {
+    const extent = measureElementExtent(store.headerElement);
+    changed = store.headerExtent !== extent;
+    store.headerExtent = extent;
+  }
+  for (const [key, row] of store.rowElements) {
+    if (!isLayoutHidden(row)) changed = updateMeasuredExtent(store, key, measureElementExtent(row)) || changed;
+  }
+  return changed;
+}
+
 function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null, wasPinned: boolean): void {
   store.layout = buildStoreLayout(store);
   const followTail = wasPinned && store.tailFollowAllowed;
-  if (store.scroller && (followTail || store.initialTailPending)) {
+  if (resolvePendingTarget(store)) {
+    // The resolved selector supplies the new physical anchor.
+    anchor = store.activeAnchor;
+  } else if (store.scroller && (followTail || store.initialTailPending)) {
     store.initialTailPending = false;
     setScrollerScrollTop(store, totalPhysicalExtent(store));
   } else if (!store.initialTailPending) {
@@ -506,12 +548,14 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
     }
   }
 
+  if (revealed) physicalChanged = measureMountedExtents(store) || physicalChanged;
   if (physicalChanged) {
     applyPhysicalChange(store, anchor, wasPinned);
     publish();
     return;
   }
 
+  if (revealed) resolvePendingTarget(store);
   if (revealed && store.pendingScrollTop !== null) {
     setScrollerScrollTop(store, store.pendingScrollTop);
   }
@@ -668,23 +712,9 @@ function VirtualTranscriptInner<T>(
         applyPhysicalChange(current, anchor, wasPinned);
         publish();
       }
-      const pending = current.pendingTarget;
-      if (pending?.key === key) {
-        const targetElement = resolveTarget(element, pending.selector);
-        const unit = current.layout.itemAt(pending.index);
-        if (targetElement && unit) {
-          current.pendingTarget = null;
-          const intraRowOffset = targetElement.getBoundingClientRect().top - element.getBoundingClientRect().top;
-          const physicalOffset = current.headerExtent + unit.offset + current.drift;
-          const physicalEnd = current.headerExtent + unit.end + current.drift;
-          const target = pending.align === 'end'
-            ? physicalEnd - current.viewportExtent + pending.viewportStartOffset
-            : physicalOffset + intraRowOffset - pending.viewportStartOffset;
-          current.activeAnchor = { index: pending.index, key, offset: physicalOffset - target };
-          setScrollerScrollTop(current, target);
-          recompute(current);
-          publish();
-        }
+      if (resolvePendingTarget(current)) {
+        recompute(current);
+        publish();
       }
     };
     rowRefCallbacks.current.set(key, callback);
@@ -854,8 +884,8 @@ function VirtualTranscriptInner<T>(
       const intraRowOffset = targetElement && row
         ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
         : 0;
-      current.pendingTarget = targetSelector && !targetElement
-        ? { index, key: unit.key, align, viewportStartOffset, selector: targetSelector }
+      current.pendingTarget = targetSelector && (!targetElement || isLayoutHidden(current.scroller))
+        ? { key: unit.key, align, viewportStartOffset, selector: targetSelector }
         : null;
       const physicalOffset = current.headerExtent + unit.offset + current.drift;
       const physicalEnd = current.headerExtent + unit.end + current.drift;
@@ -870,6 +900,7 @@ function VirtualTranscriptInner<T>(
     scrollToTail() {
       const current = storeRef.current;
       if (!current) return;
+      current.pendingTarget = null;
       current.activeAnchor = null;
       setScrollerScrollTop(current, totalPhysicalExtent(current));
       recompute(current);
@@ -878,6 +909,7 @@ function VirtualTranscriptInner<T>(
     scrollBy(delta) {
       const current = storeRef.current;
       if (!current?.scroller || !Number.isFinite(delta) || delta === 0) return;
+      current.pendingTarget = null;
       current.viewportExtent = viewportExtentForScroller(current.scroller);
       setScrollerScrollTop(current, current.scroller.scrollTop + delta);
       current.activeAnchor = captureTopAnchor(current);
@@ -966,8 +998,8 @@ function VirtualTranscriptInner<T>(
     const current = storeRef.current;
     if (!current) return;
     if (current.pendingScrollTop !== null && !isLayoutHidden(current.scroller)) {
-      const target = current.pendingScrollTop;
-      setScrollerScrollTop(current, target);
+      if (current.revealPublicationPending) synchronizedPhysicalSnapshot(current);
+      else if (!resolvePendingTarget(current)) setScrollerScrollTop(current, current.pendingScrollTop);
       recompute(current);
       publish();
       return;

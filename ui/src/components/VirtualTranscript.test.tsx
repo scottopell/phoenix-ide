@@ -1260,6 +1260,134 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it.each(['snapshot-first', 'observer-first'] as const)('recomputes a mounted selector offset before replaying a hidden jump (%s)', (order) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const items = makeItems(40);
+    items[20]!.height = 320;
+    render(
+      <div data-testid="retained-wrapper">
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={items}
+          getKey={(item) => item.id}
+          estimatedExtent={(item) => item.height}
+          overscan={20}
+          initialTail={false}
+          header={<div data-height={30}>Header</div>}
+          renderItem={(item) => <div data-height={item.height}>{item.label}<span data-tool={item.id}>Tool</span></div>}
+        />
+      </div>,
+    );
+    act(() => ref.current?.scrollToIndex(20, 'start'));
+    const wrapper = screen.getByTestId('retained-wrapper');
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const row = document.querySelector<HTMLElement>('[data-virtual-index="20"]')!;
+    const tool = row.querySelector<HTMLElement>('[data-tool="item-20"]')!;
+    const rect = tool.getBoundingClientRect();
+    tool.getBoundingClientRect = () => isHiddenByAncestor(tool)
+      ? { ...rect, top: 0, bottom: 0, height: 0 }
+      : { ...rect, top: 200, bottom: 220, height: 20 };
+    let nativeTop = 0;
+    const write = vi.fn((top: number) => {
+      if (!isHiddenByAncestor(scroller)) nativeTop = top;
+    });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => nativeTop, set: write });
+    wrapper.style.display = 'none';
+    act(() => {
+      resizeObservers[0]!.triggerEntries([[scroller, 0], [row, 0]]);
+      ref.current?.scrollToIndex(20, 'start', 0, '[data-tool="item-20"]');
+    });
+    expect(scroller.scrollTop).toBe(0);
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({ targetMeasured: false, visibleRange: null });
+    expect(write).not.toHaveBeenCalled();
+
+    wrapper.style.display = '';
+    act(() => {
+      if (order === 'snapshot-first') ref.current?.physicalSnapshot(20);
+      else resizeObservers[0]!.triggerEntries([[scroller, 100]]);
+    });
+    expect(scroller.scrollTop).toBe(630);
+    expect(write.mock.calls).toEqual([[630]]);
+    expect(ref.current?.physicalSnapshot(20, '[data-tool="item-20"]')).toMatchObject({
+      viewportTop: 630, targetMeasured: true, targetOffset: 0,
+      visibleRange: { startIndex: 20, endIndex: 20 },
+    });
+  });
+
+  it('does not acknowledge an unresolved selector as a measured row and lets an absolute position supersede it', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    render(
+      <div data-testid="retained-wrapper">
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(40)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          initialTail={false}
+          renderItem={renderRow}
+        />
+      </div>,
+    );
+    const wrapper = screen.getByTestId('retained-wrapper');
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    wrapper.style.display = 'none';
+    act(() => ref.current?.scrollToIndex(20, 'start', 0, '[data-missing-tool]'));
+    wrapper.style.display = '';
+    act(() => resizeObservers[0]!.triggerEntries([[scroller, 100]]));
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({ targetMeasured: false });
+    act(() => ref.current?.scrollToIndex(20, 'start', 10));
+    expect(scroller.scrollTop).toBe(390);
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({ targetMeasured: true, targetOffset: 10 });
+  });
+
+  it.each(['observer-only', 'snapshot-first'] as const)('remeasures a mounted row that becomes genuinely zero while hidden (%s)', (order) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const totals: number[] = [];
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
+    render(
+      <div data-testid="retained-wrapper">
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={100}
+          initialTail={false}
+          renderItem={renderRow}
+          onTotalExtentChange={(extent) => totals.push(extent)}
+          onRangeChange={(snapshot) => ranges.push(snapshot)}
+        />
+      </div>,
+    );
+    act(() => ref.current?.scrollToIndex(3, 'start'));
+    const wrapper = screen.getByTestId('retained-wrapper');
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const row = document.querySelector<HTMLElement>('[data-virtual-index="0"]')!;
+    expect(scroller.scrollTop).toBe(60);
+    expect(totals.at(-1)).toBe(400);
+    wrapper.style.display = 'none';
+    screen.getByTestId('payload-item-0').setAttribute('data-height', '0');
+    act(() => resizeObservers[0]!.triggerEntries([[scroller, 0], [row, 0]]));
+    expect(totals.at(-1)).toBe(400);
+
+    wrapper.style.display = '';
+    act(() => {
+      if (order === 'snapshot-first') {
+        expect(ref.current?.physicalSnapshot(3)).toMatchObject({ viewportTop: 40, targetOffset: 0 });
+      }
+      // The row's last observed size was already zero: only the viewport reports reveal.
+      resizeObservers[0]!.triggerEntries([[scroller, 100]]);
+    });
+    expect(totals.at(-1)).toBe(380);
+    expect(document.querySelector<HTMLElement>('.virtual-transcript__inner')!.style.height).toBe('380px');
+    expect(scroller.scrollTop).toBe(40);
+    expect(ranges.at(-1)?.visibleRange).toEqual({ startIndex: 3, endIndex: 7 });
+    expect(ref.current?.physicalSnapshot(3)).toMatchObject({ targetMeasured: true, targetOffset: 0 });
+  });
+
   it('accepts a legitimate zero-height row while its ancestors remain displayed', () => {
     const totals: number[] = [];
     render(
