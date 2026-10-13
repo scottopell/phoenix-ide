@@ -993,19 +993,21 @@ impl BashHandleRegistry {
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
             }
-            for handle in &permit.removed_handles {
-                if handle.live_pgid().await.is_none() {
-                    continue;
-                }
+            signal_retirement_handles(&permit.removed_handles, &mut report, |handle| async move {
                 #[cfg(unix)]
-                if let Err(error) = handle.signal_live_incarnation(libc::SIGKILL).await {
-                    report.kill_failures.push((
-                        i32::try_from(handle.launch_identity.process.pid).unwrap_or(i32::MAX),
-                        error.to_string(),
-                    ));
-                    break;
+                {
+                    handle
+                        .signal_live_incarnation(libc::SIGKILL)
+                        .await
+                        .map(|_| ())
                 }
-            }
+                #[cfg(not(unix))]
+                {
+                    let _ = handle;
+                    Ok(())
+                }
+            })
+            .await;
         }
 
         let verified = self.verify_exact_absence(permit).await;
@@ -1277,6 +1279,28 @@ fn record_retirement_target_in_report(
     target: &BashRetirementTarget,
 ) {
     record_handle_in_report(report, target.pgid, target.pid, target.kill_pending_kernel);
+}
+
+async fn signal_retirement_handles<F, Fut>(
+    handles: &[Arc<Handle>],
+    report: &mut CascadeBashReport,
+    mut signal: F,
+) where
+    F: FnMut(Arc<Handle>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    for handle in handles {
+        if handle.live_pgid().await.is_none() {
+            continue;
+        }
+        if let Err(error) = signal(Arc::clone(handle)).await {
+            report.kill_failures.push((
+                i32::try_from(handle.launch_identity.process.pid).unwrap_or(i32::MAX),
+                error.to_string(),
+            ));
+            break;
+        }
+    }
 }
 
 async fn snapshot_retirement_targets(handles: &[Arc<Handle>]) -> Vec<BashRetirementTarget> {
@@ -2095,27 +2119,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cascade_bash_on_delete_records_live_pgids_and_drops_entry() {
-        let registry = Arc::new(BashHandleRegistry::new());
-        let handles_arc = registry.get_or_create(&scope("conv-1")).await;
+    async fn retirement_snapshots_all_live_handles_and_fences_the_empty_table() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-1");
+        let handles = registry.get_or_create(&owner).await;
         {
-            let mut g = handles_arc.write().await;
-            g.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES));
-            g.insert(make_handle("conv-1", "b-2", RING_BUFFER_BYTES));
+            let mut table = handles.write().await;
+            for (id, pid) in [("b-1", 12345), ("b-2", 12346)] {
+                table.insert(make_handle_with_identity(
+                    "conv-1",
+                    id,
+                    id,
+                    pid,
+                    u32::try_from(pid).unwrap(),
+                    RING_BUFFER_BYTES,
+                ));
+            }
         }
-
-        let report =
-            cascade_bash_on_delete(&registry, &scope("conv-1"), &work_actor("owner"), None).await;
-        assert_eq!(report.live_handle_pgids.len(), 2);
-        assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
-        #[cfg(target_os = "linux")]
-        assert!(
-            report.kill_failures.is_empty(),
-            "already-absent synthetic process identities are a verified absence: {report:?}"
-        );
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(report.kill_failures.len(), 2);
+        let permit = registry.begin_retirement(&owner).await;
+        let mut pgids: Vec<_> = permit.exact_process_groups.iter().map(|t| t.pgid).collect();
+        pgids.sort_unstable();
+        assert_eq!(pgids, vec![12345, 12346]);
+        assert_eq!(permit.removed_handles.len(), 2);
+        assert!(registry.owner_handles(&owner).await.is_empty());
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
         assert_eq!(registry.scope_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_stops_signaling_after_the_first_failure() {
+        let handles = vec![
+            make_handle_with_identity("owner", "first", "first", 41, 41, RING_BUFFER_BYTES),
+            make_handle_with_identity("owner", "second", "second", 42, 42, RING_BUFFER_BYTES),
+        ];
+        let mut calls = Vec::new();
+        let mut report = CascadeBashReport::default();
+        signal_retirement_handles(&handles, &mut report, |handle| {
+            calls.push(handle.handle_id.as_str().to_owned());
+            std::future::ready(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "signal denied",
+            )))
+        })
+        .await;
+        assert_eq!(calls, vec!["first"]);
+        assert_eq!(report.kill_failures.len(), 1);
+        assert_eq!(report.kill_failures[0].0, 41);
+        assert!(report.kill_failures[0].1.contains("signal denied"));
+    }
+
+    #[tokio::test]
+    async fn retirement_signals_every_live_handle_when_all_signals_succeed() {
+        let handles = vec![
+            make_handle_with_identity("owner", "first", "first", 41, 41, RING_BUFFER_BYTES),
+            make_handle_with_identity("owner", "second", "second", 42, 42, RING_BUFFER_BYTES),
+        ];
+        let mut calls = Vec::new();
+        let mut report = CascadeBashReport::default();
+        signal_retirement_handles(&handles, &mut report, |handle| {
+            calls.push(handle.handle_id.as_str().to_owned());
+            std::future::ready(Ok(()))
+        })
+        .await;
+        assert_eq!(calls, vec!["first", "second"]);
+        assert!(report.kill_failures.is_empty());
     }
 
     #[tokio::test]
