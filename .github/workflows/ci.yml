@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 891e28f3b21ca40564267bbf03986624c6ea004a
+          ref: 6002226dad1ddcf7ef2e7bb73f4cb777aad8b8e5
           path: pinned-app
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -247,7 +247,7 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 891e28f3b21ca40564267bbf03986624c6ea004a
+          test "$(git rev-parse HEAD)" = 6002226dad1ddcf7ef2e7bb73f4cb777aad8b8e5
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
@@ -261,6 +261,8 @@ jobs:
               'app_source': subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
               'app_tree': subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(),
               'harness_source': '${{ github.event.pull_request.head.sha }}',
+              'rustc': subprocess.check_output(['rustc','--version'],text=True).strip(),
+              'cargo_lock_sha256': hashlib.sha256((root/'Cargo.lock').read_bytes()).hexdigest(),
               'codegen_command': './dev.py codegen', 'generated_files': files}, indent=2))
           PY
       - name: Retain receipts on success or failure
