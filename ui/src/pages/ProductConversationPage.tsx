@@ -233,6 +233,17 @@ function isLatestSegment(snapshot: HistorySnapshot, transcriptRowId: string): bo
   return transcriptRowId === snapshot.latest_transcript_row_id;
 }
 
+function representedOpeningBoundary(
+  boundaries: ConversationHistoryBoundaryView[],
+  target: { kind: 'message'; messageId: string } | { kind: 'transcript'; transcriptRowId: string },
+): ConversationHistoryBoundaryView | undefined {
+  return boundaries.find(boundary => boundary.represented_successor_opening_message_id !== null && (
+    target.kind === 'message'
+      ? boundary.represented_successor_opening_message_id === target.messageId
+      : boundary.successor_transcript_row_id === target.transcriptRowId
+  ));
+}
+
 function omitRepresentedOpenings<T extends AcquiredMessage>(messages: T[], boundaries: ConversationHistoryBoundaryView[]): T[] {
   return messages.filter(message => !boundaries.some(boundary => boundary.successor_transcript_row_id === message.conversation_id
     && boundary.represented_successor_opening_message_id === message.message_id));
@@ -1263,13 +1274,21 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   const readerSelection = snapshot && !pendingChapterSelected
     ? transcriptReaderSelection(snapshot, location.search, routeReaderSelectionRef.current?.transcriptPin ?? null)
     : { kind: 'latest' as const };
-  const transcriptTargetMessage = !hashTargetMessageId && readerSelection.kind === 'transcript'
+  const selectedTranscriptMessage = !hashTargetMessageId && readerSelection.kind === 'transcript'
     ? messages.find((message) => message.conversation_id === readerSelection.segment.transcript_row_id)
     : undefined;
+  const transcriptBoundary = snapshot && !hashTargetMessageId && readerSelection.kind === 'transcript' && !selectedTranscriptMessage
+    ? representedOpeningBoundary(snapshot.boundaries, { kind: 'transcript', transcriptRowId: readerSelection.segment.transcript_row_id })
+    : undefined;
+  const transcriptTargetMessage = selectedTranscriptMessage ?? (transcriptBoundary
+    ? messages.find(message => message.message_id === transcriptBoundary.message_id)
+    : undefined);
   const transcriptTargetExhausted = !hashTargetMessageId && readerSelection.kind === 'transcript' && !transcriptTargetMessage && (
-    snapshot?.has_older === false || snapshot?.segments.some((segment) => segment.segment_ordinal < readerSelection.segment.segment_ordinal && segment.messages.length > 0)
+    snapshot?.has_older === false || (!transcriptBoundary && snapshot?.segments.some((segment) => segment.segment_ordinal < readerSelection.segment.segment_ordinal && segment.messages.length > 0))
   );
-  const representedBoundary = hashTargetMessageId ? snapshot?.boundaries.find(boundary => boundary.represented_successor_opening_message_id === hashTargetMessageId) : undefined;
+  const representedBoundary = snapshot && hashTargetMessageId
+    ? representedOpeningBoundary(snapshot.boundaries, { kind: 'message', messageId: hashTargetMessageId })
+    : undefined;
   const resolvedHashTargetMessageId = representedBoundary?.message_id ?? hashTargetMessageId;
   const hashTargetLoaded = !!resolvedHashTargetMessageId && messages.some((message) => message.message_id === resolvedHashTargetMessageId);
   const hashTargetExhausted = !!hashTargetMessageId && !hashTargetLoaded && snapshot?.has_older === false;
