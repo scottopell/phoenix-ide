@@ -105,6 +105,7 @@ async function fetchOlderSnapshotWithFreshCursor(
   productConversationId: string,
   before: string,
   coordinator: boolean,
+  onFreshTailRequest: () => void,
 ): Promise<{ older: HistorySnapshot; refreshedTail?: HistorySnapshot }> {
   try {
     return { older: await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, {
@@ -113,6 +114,7 @@ async function fetchOlderSnapshotWithFreshCursor(
     }) };
   } catch (error) {
     if (!(error instanceof ApiResponseError) || error.status !== 400) throw error;
+    onFreshTailRequest();
     const refreshed = await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, { message_limit: PAGE_SIZE });
     if (!refreshed.has_older || !refreshed.before) throw error;
     return {
@@ -1265,10 +1267,8 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   const loadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!productConversationId || !snapshot?.has_older || !snapshot.before || loadingOlder) return;
     const ownerId = productConversationId;
-    const requestAtom = conversationStore.getSnapshot(snapshot.latest_transcript_row_id);
-    const requestObservation: OpeningObservation | null = requestAtom.conversationId ? {
-      transcriptRowId: requestAtom.conversationId, opening: requestAtom.opening,
-    } : null;
+    let freshTailOwner: HistorySnapshot | null = null;
+    let freshTailOpenings = new Map<string, ContinuationOpeningView | null>();
     const routeGeneration = routeGenerationRef.current;
     const requestGeneration = ++paginationRequestRef.current;
     const pendingRestore = { requestGeneration, basis: restoreBasis };
@@ -1283,23 +1283,31 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
     setLoadingOlder(true);
     setOlderError(null);
     try {
-      const { older, refreshedTail } = await fetchOlderSnapshotWithFreshCursor(productConversationId, snapshot.before, coordinator);
+      const { older, refreshedTail } = await fetchOlderSnapshotWithFreshCursor(productConversationId, snapshot.before, coordinator, () => {
+        freshTailOwner = ownedSnapshotRef.current?.value ?? null;
+        freshTailOpenings = new Map(conversationStore.listSnapshots().map(conversation => [
+          conversation.id, conversationStore.getSnapshot(conversation.id).opening,
+        ]));
+      });
+      const requestObservation: OpeningObservation | null = refreshedTail && freshTailOpenings.has(refreshedTail.latest_transcript_row_id) ? {
+        transcriptRowId: refreshedTail.latest_transcript_row_id,
+        opening: freshTailOpenings.get(refreshedTail.latest_transcript_row_id) ?? null,
+      } : null;
       if (routeGenerationRef.current !== routeGeneration || paginationRequestRef.current !== requestGeneration) return;
-      if (ownedSnapshotRef.current?.value === snapshot && refreshedTail?.kind === 'ordinary') {
+      if (ownedSnapshotRef.current?.value === freshTailOwner && refreshedTail?.kind === 'ordinary') {
         conversationStore.observeProductConversationSnapshot(refreshedTail);
       }
       setOwnedSnapshot((current) => {
         if (!current || current.productConversationId !== ownerId) return current;
-        const authoritativeTail = current.value === snapshot
-          ? (refreshedTail
-            ? mergeRefreshedTail(current.value, refreshedTail)
-            : { ...older, segments: current.value.segments })
+        const appliesFreshTail = current.value === freshTailOwner && !!refreshedTail;
+        const authoritativeTail = appliesFreshTail
+          ? mergeRefreshedTail(current.value, refreshedTail)
           : current.value;
-        const acquiredPage = current.value === snapshot ? older : {
+        const acquiredPage = current.value === snapshot || appliesFreshTail ? older : {
           ...older, before: current.value.before, has_older: current.value.has_older,
         };
         return { ...current, value: mergeOlderSegments(authoritativeTail, acquiredPage),
-          openingProvenance: current.value === snapshot && refreshedTail?.latest_opening.status === 'accepted'
+          openingProvenance: appliesFreshTail && refreshedTail?.latest_opening.status === 'accepted'
             ? { source: 'snapshot', observation: requestObservation } : current.openingProvenance };
       });
       setHistoryGeneration((generation) => generation + 1);
