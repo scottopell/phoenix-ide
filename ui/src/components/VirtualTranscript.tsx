@@ -55,6 +55,14 @@ export interface VirtualTranscriptHandle {
     viewportStartOffset?: number,
     targetSelector?: VirtualTranscriptTarget,
   ): void;
+  scrollToOwnedIndex(
+    commandKey: string,
+    index: number,
+    align: 'start' | 'end',
+    viewportStartOffset?: number,
+    targetSelector?: VirtualTranscriptTarget,
+  ): void;
+  cancelPosition(commandKey: string): void;
   scrollToTail(): void;
   scrollBy(delta: number): void;
   /** Grant or withdraw tail-following. The scroll policy owns this intent;
@@ -92,6 +100,8 @@ export interface VirtualTranscriptProps<T> {
   onPinnedChange?: (pinned: boolean) => void;
 }
 
+type PositionOwner = { kind: 'unowned' } | { kind: 'command'; commandKey: string };
+
 interface PhysicalStore<T> {
   items: readonly T[];
   keys: string[];
@@ -112,6 +122,7 @@ interface PhysicalStore<T> {
   resizeObserver: ResizeObserver | null;
   initialTailPending: boolean;
   preservedViewport: { top: number; firstKey: string | null } | null;
+  positionOwner: PositionOwner;
   pendingTarget: {
     key: string;
     align: 'start' | 'end';
@@ -392,6 +403,42 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   }
 }
 
+function retirePosition<T>(current: PhysicalStore<T>): void {
+  current.positionOwner = { kind: 'unowned' };
+  current.pendingTarget = null;
+  current.pendingScrollTop = null;
+  current.pendingProgrammaticTop = null;
+}
+
+function positionAtIndex<T>(
+  current: PhysicalStore<T>,
+  owner: PositionOwner,
+  index: number,
+  align: 'start' | 'end',
+  viewportStartOffset: number,
+  targetSelector: VirtualTranscriptTarget | undefined,
+): void {
+  const unit = current.layout.itemAt(index);
+  if (!unit) return;
+  current.positionOwner = owner;
+  const row = current.rowElements.get(unit.key);
+  const targetElement = resolveTarget(row, targetSelector);
+  const intraRowOffset = targetElement && row
+    ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
+    : 0;
+  current.pendingTarget = targetSelector && (!targetElement || isLayoutHidden(current.scroller))
+    ? { key: unit.key, align, viewportStartOffset, selector: targetSelector }
+    : null;
+  const physicalOffset = current.headerExtent + unit.offset + current.drift;
+  const physicalEnd = current.headerExtent + unit.end + current.drift;
+  const target = align === 'end'
+    ? physicalEnd - current.viewportExtent + viewportStartOffset
+    : physicalOffset + intraRowOffset - viewportStartOffset;
+  current.activeAnchor = { index, key: unit.key, offset: physicalOffset - target };
+  setScrollerScrollTop(current, target);
+  recompute(current);
+}
+
 function resolvePendingTarget<T>(current: PhysicalStore<T>): boolean {
   const pending = current.pendingTarget;
   if (!pending || isLayoutHidden(current.scroller)) return false;
@@ -607,6 +654,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     resizeObserver: null,
     initialTailPending: props.initialTail ?? true,
     preservedViewport: null,
+    positionOwner: { kind: 'unowned' },
     pendingTarget: null,
     pinned: true,
     revision: 0,
@@ -877,29 +925,28 @@ function VirtualTranscriptInner<T>(
     scrollToIndex(index, align, viewportStartOffset = 0, targetSelector) {
       const current = storeRef.current;
       if (!current) return;
-      const unit = current.layout.itemAt(index);
-      if (!unit) return;
-      const row = current.rowElements.get(unit.key);
-      const targetElement = resolveTarget(row, targetSelector);
-      const intraRowOffset = targetElement && row
-        ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
-        : 0;
-      current.pendingTarget = targetSelector && (!targetElement || isLayoutHidden(current.scroller))
-        ? { key: unit.key, align, viewportStartOffset, selector: targetSelector }
-        : null;
-      const physicalOffset = current.headerExtent + unit.offset + current.drift;
-      const physicalEnd = current.headerExtent + unit.end + current.drift;
-      const target = align === 'end'
-        ? physicalEnd - current.viewportExtent + viewportStartOffset
-        : physicalOffset + intraRowOffset - viewportStartOffset;
-      current.activeAnchor = { index, key: unit.key, offset: physicalOffset - target };
-      setScrollerScrollTop(current, target);
+      positionAtIndex(current, { kind: 'unowned' }, index, align, viewportStartOffset, targetSelector);
+      publish();
+    },
+    scrollToOwnedIndex(commandKey, index, align, viewportStartOffset = 0, targetSelector) {
+      const current = storeRef.current;
+      if (!current) return;
+      positionAtIndex(current, { kind: 'command', commandKey }, index, align, viewportStartOffset, targetSelector);
+      publish();
+    },
+    cancelPosition(commandKey) {
+      const current = storeRef.current;
+      if (!current || current.positionOwner.kind !== 'command' || current.positionOwner.commandKey !== commandKey) return;
+      retirePosition(current);
+      current.viewportTop = current.scroller?.scrollTop ?? current.viewportTop;
+      current.activeAnchor = captureTopAnchor(current);
       recompute(current);
       publish();
     },
     scrollToTail() {
       const current = storeRef.current;
       if (!current) return;
+      current.positionOwner = { kind: 'unowned' };
       current.pendingTarget = null;
       current.activeAnchor = null;
       setScrollerScrollTop(current, totalPhysicalExtent(current));
@@ -909,6 +956,7 @@ function VirtualTranscriptInner<T>(
     scrollBy(delta) {
       const current = storeRef.current;
       if (!current?.scroller || !Number.isFinite(delta) || delta === 0) return;
+      current.positionOwner = { kind: 'unowned' };
       current.pendingTarget = null;
       current.viewportExtent = viewportExtentForScroller(current.scroller);
       setScrollerScrollTop(current, current.scroller.scrollTop + delta);
@@ -980,7 +1028,7 @@ function VirtualTranscriptInner<T>(
       publish();
       return;
     }
-    current.pendingProgrammaticTop = null;
+    retirePosition(current);
     current.lastScrollAtMs = Date.now();
     current.viewportTop = current.scroller.scrollTop;
     if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
