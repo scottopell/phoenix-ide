@@ -1146,7 +1146,9 @@ impl Database {
             });
         }
         let Some(root) = transcript_rows.first().cloned() else {
-            return Err(DbError::Serialization(format!("ordinary ProductConversation {product_conversation_id} has no parent transcript root")));
+            return Err(DbError::Serialization(format!(
+                "ordinary ProductConversation {product_conversation_id} has no parent transcript root"
+            )));
         };
         let mut segments = Vec::with_capacity(transcript_rows.len());
         for transcript_row in transcript_rows {
@@ -2287,8 +2289,17 @@ mod tests {
     #[tokio::test]
     async fn opening_snapshot_rejects_old_transcript_tail_and_wrong_edge() {
         let (db, root, successor) = opening_fixture(true).await;
+        let (generation, tail): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT transcript_generation,
+                    (SELECT MAX(sequence_id) FROM messages WHERE conversation_id = conversations.id)
+             FROM conversations WHERE id = ?1",
+        )
+        .bind(&successor.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert!(db
-            .read_continuation_opening_at_snapshot(&successor.id, 0, None)
+            .read_continuation_opening_at_snapshot(&successor.id, generation, tail)
             .await
             .unwrap()
             .is_pending());
@@ -2301,16 +2312,38 @@ mod tests {
         )
         .await
         .unwrap();
+        let (current_generation, current_tail): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT transcript_generation,
+                    (SELECT MAX(sequence_id) FROM messages WHERE conversation_id = conversations.id)
+             FROM conversations WHERE id = ?1",
+        )
+        .bind(&successor.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(current_generation, generation);
+        assert_ne!(current_tail, tail);
+        assert!(matches!(
+            db.read_continuation_opening_at_snapshot(&successor.id, generation, tail)
+                .await,
+            Err(DbError::TranscriptSnapshotChanged)
+        ));
         assert!(db
-            .read_continuation_opening_at_snapshot(&successor.id, 0, None)
+            .read_continuation_opening_at_snapshot(&successor.id, current_generation, current_tail)
             .await
-            .is_err());
+            .unwrap()
+            .is_pending());
         sqlx::query("UPDATE conversations SET continued_in_conv_id = NULL WHERE id = ?1")
             .bind(&root.id)
             .execute(db.pool())
             .await
             .unwrap();
-        assert!(db.read_continuation_opening(&successor.id).await.is_err());
+        assert!(matches!(
+            db.read_continuation_opening_at_snapshot(&successor.id, current_generation, current_tail)
+                .await,
+            Err(DbError::Serialization(message))
+                if message == "opening receipt/intent has invalid continuation topology"
+        ));
     }
 
     #[tokio::test]
