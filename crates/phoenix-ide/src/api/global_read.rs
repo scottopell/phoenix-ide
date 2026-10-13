@@ -1195,6 +1195,8 @@ pub struct QualifiedSearchHit {
     pub source: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
     pub stable_conversation:
         Option<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    pub role: String,
+    pub sender: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub snippet: String,
 }
@@ -1205,6 +1207,7 @@ pub(crate) async fn qualify_search_hits(
 ) -> Result<Vec<QualifiedSearchHit>, DbError> {
     let instance_id = service.db.instance_id().await?;
     let mut qualified = Vec::with_capacity(hits.len());
+    let mut sender_kinds = std::collections::HashMap::new();
     for hit in hits {
         let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(
             hit.conversation_id.clone(),
@@ -1243,6 +1246,9 @@ pub(crate) async fn qualify_search_hits(
                 },
             ),
             stable_conversation,
+            role: attributed_role(hit.message_type, &hit.origin).to_string(),
+            sender: attributed_sender_with_cache(&service.db, &hit.origin, &mut sender_kinds)
+                .await?,
             created_at: hit.created_at,
             snippet: hit.snippet.clone(),
         });
@@ -3653,32 +3659,39 @@ mod tests {
         for (origin, expected) in cases {
             message.origin = origin.clone();
             hit.origin = origin;
-            let search = format_global_search_hits(&service, &[hit.clone()])
+            let search = qualify_search_hits(&service, std::slice::from_ref(&hit))
                 .await
-                .unwrap();
+                .unwrap()
+                .remove(0);
             let full = render_global_message_line(&service.db, &conv, &message)
                 .await
                 .unwrap();
-            assert!(search.contains(&format!("@conv:{}", conv.product_conversation_id)));
-            assert!(search.contains(&format!(
-                "@transcript:{}#message-{}",
-                hit.conversation_id, hit.message_id
-            )));
-            assert!(search.contains(expected), "{search}");
+            assert!(matches!(
+                search.stable_conversation.as_ref().map(|reference| &reference.target),
+                Some(phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation { product_conversation_id })
+                    if product_conversation_id == &conv.product_conversation_id
+            ));
+            assert!(matches!(
+                &search.source.target,
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message { transcript_id, message_id }
+                    if transcript_id.as_str() == hit.conversation_id && message_id.as_str() == hit.message_id
+            ));
+            assert!(format!("{}{}", search.role, search.sender).contains(expected));
             assert!(full.contains(expected), "{full}");
             if expected != "User API" {
-                assert!(!search.contains("User API"), "{search}");
+                assert_ne!(search.role, "User API");
             }
             message.message_type = MessageType::Skill;
             hit.message_type = MessageType::Skill;
-            let search = format_global_search_hits(&service, &[hit.clone()])
+            let search = qualify_search_hits(&service, std::slice::from_ref(&hit))
                 .await
-                .unwrap();
+                .unwrap()
+                .remove(0);
             let full = render_global_message_line(&service.db, &conv, &message)
                 .await
                 .unwrap();
             let skill_label = format!("Skill · {expected}");
-            assert!(search.contains(&skill_label), "{search}");
+            assert!(format!("{}{}", search.role, search.sender).contains(&skill_label));
             assert!(full.contains(&skill_label), "{full}");
             message.message_type = MessageType::User;
             hit.message_type = MessageType::User;
