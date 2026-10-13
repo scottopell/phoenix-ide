@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText, boundedDiagnosticJson, COMPOSER_SELECTOR } from './qualify-history-realserver.mjs';
+import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText, boundedDiagnosticJson, COMPOSER_SELECTOR, pinRejection } from './qualify-history-realserver.mjs';
 
 test('only literal HTTP loopback ports are accepted', () => {
   assert.equal(loopback('http://127.0.0.1:54321'), 'http://127.0.0.1:54321');
@@ -53,4 +53,16 @@ test('composer targets the actual owning InputArea textarea identity', () => {
   const input = readFileSync(new URL('../src/components/InputArea.tsx', import.meta.url), 'utf8');
   assert.equal(COMPOSER_SELECTOR, 'textarea#message-input');
   assert.match(input, /<textarea[\s\S]*?id="message-input"/);
+});
+
+test('negative pin expectations belong to ordinary and Global admission gates', () => {
+  for (const [kind, file] of [['ordinary', '../src/App.tsx'], ['global', '../src/pages/CoordinatorPage.tsx']]) {
+    const owner = readFileSync(new URL(file, import.meta.url), 'utf8');
+    for (const duplicate of [false, true]) {
+      const expected = pinRejection(kind, duplicate);
+      assert.ok(owner.includes(expected.text));
+      assert.equal(expected.selector, kind === 'global' ? '.coordinator-error' : '[role="alert"]');
+    }
+  }
+  assert.notEqual(pinRejection('ordinary', false).text, pinRejection('ordinary', true).text);
 });

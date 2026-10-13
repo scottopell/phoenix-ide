@@ -32,6 +32,12 @@ export function boundedDiagnosticJson(value, limit = 1_000_000) {
   return Buffer.from(JSON.stringify({ truncated: true, original_bytes: bytes.length,
     prefix_base64: bytes.subarray(0, Math.floor(limit / 2)).toString('base64') }));
 }
+export function pinRejection(kind, duplicate) {
+  return kind === 'global'
+    ? { selector: '.coordinator-error', text: 'Original source conversation unavailable' }
+    : { selector: '[role="alert"]', text: duplicate ? 'Invalid exact transcript reference.'
+      : 'Exact transcript unavailable or not a member of this conversation.' };
+}
 export const COMPOSER_SELECTOR = 'textarea#message-input';
 export const APPEND_PROBE = 'append-probe';
 export const CONTINUATION_PROBE = 'live-probe';
@@ -332,13 +338,11 @@ async function run() {
       await page.screenshot({ path: resolve(output, `${prefix}-historical-reader.png`) });
 
       const foreign = aggregates.find(other => other.kind !== a.kind).members[0];
-      for (const pin of [`source_transcript=${foreign}`, `source_transcript=${a.members[0]}&source_transcript=${a.members[1]}`]) {
+      for (const [index, pin] of [`source_transcript=${foreign}`, `source_transcript=${a.members[0]}&source_transcript=${a.members[1]}`].entries()) {
         await goto(a.route + '?' + pin + '&qualification=retained', false);
-        if (a.kind === 'global') {
-          await page.locator('.coordinator-page-status').filter({ hasText: 'Original source conversation unavailable' }).waitFor({ state: 'visible' });
-        } else {
-          await page.getByRole('alert').filter({ hasText: 'Original source transcript unavailable.' }).waitFor({ state: 'visible' });
-        }
+        const rejection = pinRejection(a.kind, index === 1);
+        await page.locator(rejection.selector).filter({ hasText: rejection.text }).waitFor({ state: 'visible' });
+        assert.equal(await page.locator('#messages').isVisible(), false, 'invalid pin must not expose a fallback transcript');
         assert.equal(new URL(page.url()).searchParams.get('qualification'), 'retained');
       }
       checked(`${prefix}: foreign and duplicate transcript pins rejected visibly`);
