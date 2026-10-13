@@ -30,6 +30,29 @@ export function assertRequestCorrelation(requests, report) {
   assert.ok(requests.every(id => correlated.has(id)), 'finite requests must belong to this reported journey');
 }
 
+export async function runCollectorNegativeChecks(context, baseURL, validReport) {
+  const endpoint = candidateDestination('/api/telemetry/conversation-view', baseURL);
+  const cases = [
+    ['private_unknown_field', 422, { ...validReport, transcript_text: 'synthetic-private-negative' }],
+    ['invalid_journey_id', 422, { ...validReport, open_id: 'not-a-uuid' }],
+    ['invalid_outcome', 422, { ...validReport, outcome: 'invented' }],
+    ['excess_correlations', 400, { ...validReport, correlations: Array.from({ length: 17 }, () => ({ kind: 'request', id: validReport.open_id })) }],
+    ['invalid_duration', 400, { ...validReport, total_ms: 300001 }],
+  ];
+  const results = [];
+  for (const [name, expectedStatus, report] of cases) {
+    const response = await context.request.post(endpoint, { data: report, timeout: 3000 });
+    assert.equal(response.status(), expectedStatus, `collector must reject ${name}`);
+    results.push({ name, status: response.status() });
+    await response.dispose();
+  }
+  const oversized = await context.request.post(endpoint, { data: 'x'.repeat(8193), headers: { 'Content-Type': 'application/json' }, timeout: 3000 });
+  assert.equal(oversized.status(), 413, 'collector body bound');
+  results.push({ name: 'oversized_body', status: oversized.status() });
+  await oversized.dispose();
+  return results;
+}
+
 function visibleReadiness() {
   const visible = element => {
     if (!element || document.visibilityState !== 'visible') return false;
@@ -65,6 +88,7 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
   mkdirSync(outputDir, { recursive: true });
   const receiptPath = resolve(outputDir, 'telemetry-browser-result.json');
   const storageState = await context.storageState();
+  let negativeTemplate = null;
   const deadline = Date.now() + 240_000;
   try {
     for (let index = 0; index < 64; index++) {
@@ -114,6 +138,7 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
           assert.equal(reports.length, 1, 'one sampled initial journey report required');
           assert.deepEqual(statuses, [204], 'actual collector acceptance required');
           const report = reports[0];
+          negativeTemplate ??= report;
           assertRequestCorrelation(requests, report);
           assert.equal(report.outcome, 'ready');
           assert.equal(report.presentation_evidence, 'commit_frame_estimate');
@@ -149,6 +174,8 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
       }
       if (Object.values(summarizeTrials(result.trials).strata).every(s => s.status === 'raw_cohorts_ready_for_review')) break;
     }
+    assert.ok(negativeTemplate, 'at least one naturally sampled report required for collector negatives');
+    result.collectorNegatives = await runCollectorNegativeChecks(context, baseURL, negativeTemplate);
     result.comparison = summarizeTrials(result.trials);
     result.acceptance = 'partial_initial_open_retrieval_and_raw_overhead_only';
     return result;

@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation } from './qualify-view-telemetry.mjs';
+import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks } from './qualify-view-telemetry.mjs';
 
 test('retains insufficient natural sampling as inconclusive, never overhead clearance', () => {
   const result = summarizeTrials([{ route: 'ordinary', sampled: true }]);
@@ -31,4 +31,23 @@ test('finite request identity must be present in journey correlation, not equal 
   assertRequestCorrelation(['request'], report);
   assert.throws(() => assertRequestCorrelation(['unrelated'], report));
   assert.throws(() => assertRequestCorrelation([], report));
+});
+test('collector negatives distinguish schema validation from bounded semantic rejection', async () => {
+  const statuses = [422, 422, 422, 400, 400, 413];
+  const requests = [];
+  let disposed = 0;
+  const context = { request: { post: async (url, options) => {
+    requests.push({ url, options });
+    const status = statuses.shift();
+    return { status: () => status, dispose: async () => { disposed++; } };
+  } } };
+  const result = await runCollectorNegativeChecks(context, 'http://127.0.0.1:8123', { open_id: 'journey' });
+  assert.equal(result.length, 6);
+  assert.equal(disposed, 6);
+  assert.equal(requests[5].options.data.length, 8193);
+  assert.ok(requests.every(request => request.options.timeout === 3000));
+});
+test('collector negative fail-open is a failed qualification', async () => {
+  const context = { request: { post: async () => ({ status: () => 204, dispose: async () => {} }) } };
+  await assert.rejects(runCollectorNegativeChecks(context, 'http://127.0.0.1:8123', {}));
 });
