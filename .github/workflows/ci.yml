@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 41e6d85a1d430b07235953826ce5524d9f875582
+          ref: 6b5c9a9107e93a4e24bd7af23caebab73c2d8a47
           path: pinned-app
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -247,7 +247,7 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 41e6d85a1d430b07235953826ce5524d9f875582
+          test "$(git rev-parse HEAD)" = 6b5c9a9107e93a4e24bd7af23caebab73c2d8a47
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
@@ -265,6 +265,38 @@ jobs:
               'cargo_lock_sha256': hashlib.sha256((root/'Cargo.lock').read_bytes()).hexdigest(),
               'codegen_command': './dev.py codegen', 'generated_files': files}, indent=2))
           PY
+      - name: Verify and retain instrumented libtest executable (not shipping runtime)
+        shell: bash
+        working-directory: pinned-app
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, subprocess
+          root = pathlib.Path.cwd()
+          candidates = []
+          for executable in (root/'target/debug/deps').glob('phoenix_ide-*'):
+              if not executable.is_file() or not os.access(executable, os.X_OK):
+                  continue
+              listed = subprocess.run([str(executable), '--list'], capture_output=True, text=True, timeout=10)
+              if listed.returncode == 0 and 'opening_qualifier::actual_server_opening_qualifier: test' in listed.stdout:
+                  candidates.append(executable)
+          assert len(candidates) == 1, f'ambiguous instrumented libtest candidates: {candidates}'
+          executable = candidates[0]
+          destination = root.parent/'opening-instrumented-libtest'
+          shutil.copyfile(executable, destination)
+          destination.chmod(0o700)
+          command = [str(destination), 'opening_qualifier::', '--nocapture', '--test-threads=1']
+          completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
+          (root.parent/'opening-instrumented-unit.log').write_text(completed.stdout+completed.stderr)
+          receipt = json.loads((root.parent/'opening-codegen-receipt.json').read_text())
+          receipt.update({'evidence_class':'instrumented_cfg_test_library_not_shipping_runtime',
+                          'executable_sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),
+                          'compiled_executable_path':str(executable.relative_to(root)),
+                          'focused_test_command':command[1:], 'focused_test_exit':completed.returncode,
+                          'ignored_driver':'opening_qualifier::actual_server_opening_qualifier'})
+          (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+          assert completed.returncode == 0, 'instrumentation guard tests failed; see retained log'
+          assert '5 passed; 0 failed; 1 ignored' in completed.stdout, completed.stdout
+          PY
       - name: Retain receipts on success or failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -276,6 +308,9 @@ jobs:
             opening-codegen-receipt.json
             opening-codegen.log
             pinned-app/ui/src/generated/
+            opening-instrumented-libtest
+            opening-instrumented-receipt.json
+            opening-instrumented-unit.log
 
   check-ui:
     name: check (ui/specs)
