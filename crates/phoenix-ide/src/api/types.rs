@@ -363,6 +363,7 @@ pub enum ProductConversationCloseUnavailableReasonView {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
+#[allow(clippy::struct_field_names)]
 pub struct ContinuationOpeningEdgeView {
     pub product_conversation_id: String,
     pub predecessor_transcript_row_id: String,
