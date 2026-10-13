@@ -2,7 +2,7 @@
 
 This harness-only branch does not alter PR898 or its frozen application source `3a7ea7e4484ab984370bf6b784856434d389ac3a`. Application and harness identities are separate in receipts.
 
-The narrow `qualify-history-realserver` job in the existing CI workflow runs only on the trusted same-repository `test/continuous-history-realserver-qualification` PR branch. It checks out the immutable app and the exact harness head independently, uses existing action/dependency versions (Rust1.95.0, Node26, pinned pnpm/Playwright), builds matching UI, installs Chromium, and builds the app via `./dev.py check --lanes e2e`. No dispatch/release/signing, credentials, public preview, deployment or production data access. Existing CI concurrency applies; total job bound30minutes, runtime bound900seconds, browser bound300seconds, artifact retention7days.
+The narrow `qualify-history-realserver` job in the existing CI workflow runs only on the trusted same-repository `qualification/continuous-history-realserver` PR branch. It checks out the immutable app and the exact harness head independently, uses existing action/dependency versions (Rust1.95.0, Node26, pinned pnpm/Playwright), builds matching UI, installs Chromium, and builds the app via `./dev.py check --lanes e2e`. No dispatch/release/signing, credentials, public preview, deployment or production data access. Existing CI concurrency applies; total job bound30minutes, runtime bound900seconds, browser bound300seconds, artifact retention7days.
 
 After an independently prepared app build, exact commands are:
 
