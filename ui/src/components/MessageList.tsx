@@ -86,6 +86,7 @@ import type { HistoryView, RestoreBasis } from '../conversation/historyExpansion
 import {
   initialTranscriptPositioningState,
   reduceTranscriptPositioning,
+  transcriptPositioningCommandKey,
   type TranscriptPositioningEffect,
   type TranscriptPositioningEvent,
   type TranscriptPositioningInput,
@@ -860,6 +861,10 @@ function MessageListImpl({
   const transcriptPositioningStateRef = useRef(initialTranscriptPositioningState(
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   ));
+  const authoritativePositioningKey = transcriptPositioning.kind === 'positioning'
+    && transcriptPositioning.command.view.conversationId === conversationId
+    ? transcriptPositioningCommandKey(transcriptPositioning.command)
+    : null;
   const dispatchTranscriptPositioningRef = useRef<(event: TranscriptPositioningEvent) => void>(() => {});
   const lastPhysicalSnapshotRef = useRef<VirtualTranscriptPhysicalSnapshot | null>(null);
   const viewAnchorIntentRef = useRef(viewAnchorIntent);
@@ -1715,10 +1720,12 @@ function MessageListImpl({
   }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted, sourceToolId]);
 
   const dispatchTranscriptPositioning = useCallback((event: TranscriptPositioningEvent) => {
+    if ((event.type === 'physical_observed' || event.type === 'position_issued' || event.type === 'target_resolved' || event.type === 'target_missing')
+      && event.commandKey !== authoritativePositioningKey) return;
     const next = reduceTranscriptPositioning(transcriptPositioningStateRef.current, event);
     transcriptPositioningStateRef.current = next.state;
     applyTranscriptPositioningEffects(next.effects);
-  }, [applyTranscriptPositioningEffects]);
+  }, [applyTranscriptPositioningEffects, authoritativePositioningKey]);
   dispatchTranscriptPositioningRef.current = dispatchTranscriptPositioning;
 
   useLayoutEffect(() => {
@@ -1920,6 +1927,9 @@ function MessageListImpl({
             key={conversationId ?? '__empty__'}
             ref={transcriptRef}
             scrollerId="messages"
+            positioningAuthority={authoritativePositioningKey === null
+              ? { kind: 'absent' }
+              : { kind: 'command', commandKey: authoritativePositioningKey }}
             ariaLabel="Conversation transcript"
             scrollerRef={handleScrollerRef}
             items={allUnits}

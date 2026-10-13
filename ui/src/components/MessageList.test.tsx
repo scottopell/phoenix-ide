@@ -6,7 +6,7 @@ import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScop
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
 import { GESTURE_STALE_MS } from './VirtualTranscript';
-import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange } from './VirtualTranscript';
+import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange, VirtualTranscriptPositioningAuthority } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
 import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
 import { MessageList } from './MessageList';
@@ -145,6 +145,8 @@ const virtualTranscriptMock = {
   totalExtentChanged: null as ((height: number) => void) | null,
   pinnedChanged: null as ((pinned: boolean) => void) | null,
   rangeChanged: null as ((snapshot: VirtualTranscriptRangeChange) => void) | null,
+  publishDuringLayout: false,
+  positioningAuthority: { kind: 'absent' } as VirtualTranscriptPositioningAuthority,
   currentSnapshot: { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 1, targetMeasured: false } as VirtualTranscriptPhysicalSnapshot,
   renderedIndices: null as Set<number> | null,
 };
@@ -172,6 +174,8 @@ beforeEach(() => {
   virtualTranscriptMock.totalExtentChanged = null;
   virtualTranscriptMock.pinnedChanged = null;
   virtualTranscriptMock.rangeChanged = null;
+  virtualTranscriptMock.publishDuringLayout = false;
+  virtualTranscriptMock.positioningAuthority = { kind: 'absent' };
   virtualTranscriptMock.renderedIndices = null;
   agentRenderCounter.count = 0;
   agentMessageProps.length = 0;
@@ -192,6 +196,7 @@ vi.mock('./VirtualTranscript', async () => {
       onPinnedChange,
       onRangeChange,
       header,
+      positioningAuthority,
       empty,
     }: {
       items: readonly T[];
@@ -202,10 +207,12 @@ vi.mock('./VirtualTranscript', async () => {
       onTotalExtentChange?: (height: number) => void;
       onPinnedChange?: (pinned: boolean) => void;
       onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
+      positioningAuthority?: VirtualTranscriptPositioningAuthority;
       header?: React.ReactNode;
       empty?: React.ReactNode;
     }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; setTailFollowAllowed: (allowed: boolean) => void; isProgrammaticScroll: (scrollTop: number) => boolean; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
+      virtualTranscriptMock.positioningAuthority = positioningAuthority ?? { kind: 'absent' };
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
       }
@@ -232,6 +239,12 @@ vi.mock('./VirtualTranscript', async () => {
         layoutRevision: virtualTranscriptMock.layoutRevision,
         physicalSnapshot: virtualTranscriptMock.physicalSnapshot,
       }), []);
+      useLayoutEffect(() => {
+        if (virtualTranscriptMock.publishDuringLayout) {
+          virtualTranscriptMock.publishDuringLayout = false;
+          onRangeChange?.(virtualTranscriptMock.currentSnapshot);
+        }
+      });
       useLayoutEffect(() => {
         scrollerRef?.(containerRef.current);
         return () => scrollerRef?.(null);
@@ -1303,6 +1316,28 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetMeasured: true }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['idle', 'view-reset', 'replacement'] as const)('rejects child-layout settlement from the old render authority (%s)', (transition) => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const handled = vi.fn();
+    const props = { streamingRequestId: null, messages: [makeMessage(1), makeMessage(2), makeMessage(3)], pendingMessages: [],
+      convState: idleState, onRetry: vi.fn(), onOpenFile: undefined, conversationId: 'conv-history', onHistoryScrollCommandHandled: handled };
+    const mounted = render(withConvContext(<MessageList {...props} transcriptPositioning={{ kind: 'positioning', command }} />));
+    expect(handled).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.positioningAuthority).toEqual({ kind: 'command', commandKey: transcriptPositioningCommandKey(command) });
+    virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-24);
+    virtualTranscriptMock.currentSnapshot = { renderedRange: { startIndex: 1, endIndex: 1 }, visibleRange: { startIndex: 1, endIndex: 1 },
+      viewportTop: 100, layoutRevision: 2, targetMeasured: true };
+    virtualTranscriptMock.publishDuringLayout = true;
+    const next: TranscriptPositioningInput = transition === 'replacement'
+      ? { kind: 'positioning', command: { ...command, token: 2 } }
+      : { kind: 'idle', view: { ...command.view, transcriptGeneration: transition === 'view-reset' ? 2 : 1 } };
+    mounted.rerender(withConvContext(<MessageList {...props} transcriptPositioning={next} />));
+    expect(handled.mock.calls).toEqual(transition === 'replacement'
+      ? [[1, 'superseded', command.view], [2, 'applied', command.view]] : [[1, 'superseded', command.view]]);
+    expect(virtualTranscriptMock.positioningAuthority).toEqual(next.kind === 'positioning'
+      ? { kind: 'command', commandKey: transcriptPositioningCommandKey(next.command) } : { kind: 'absent' });
   });
 
   it.each(['idle', 'user-interrupted', 'replacement'] as const)('cancels only the finished physical owner before acknowledging supersession (%s)', (transition) => {
