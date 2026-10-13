@@ -1187,6 +1187,79 @@ describe('VirtualTranscript', () => {
     expect(ranges.at(-1)?.visibleRange).toEqual({ startIndex: 20, endIndex: 24 });
   });
 
+  it.each(['snapshot-first', 'observer-first'] as const)('replays a hidden-issued viewport write when unchanged geometry is revealed (%s)', (order) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
+    render(
+      <div data-testid="retained-wrapper">
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(40)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={20}
+          initialTail={false}
+          header={<div data-height={30}>Header</div>}
+          renderItem={renderRow}
+          onRangeChange={(snapshot) => ranges.push(snapshot)}
+        />
+      </div>,
+    );
+    const wrapper = screen.getByTestId('retained-wrapper');
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
+    let nativeTop = scroller.scrollTop;
+    const write = vi.fn((top: number) => {
+      // A browser without a layout box may ignore scrollTop assignments.
+      if (!isHiddenByAncestor(scroller)) nativeTop = top;
+    });
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => nativeTop,
+      set: write,
+    });
+    expect(scroller.scrollTop).toBe(0);
+    const hiddenEntries: [Element, number][] = [[scroller, 0], [header, 0], ...virtualRows().map((row): [Element, number] => [row, 0])];
+    wrapper.style.display = 'none';
+    act(() => {
+      if (order === 'snapshot-first') ref.current?.physicalSnapshot();
+      resizeObservers[0]!.triggerEntries(hiddenEntries);
+      ref.current?.scrollToIndex(20, 'start');
+    });
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({
+      viewportTop: 430, visibleRange: null, targetOffset: null, targetMeasured: false,
+    });
+    act(() => resizeObservers[0]!.triggerEntries(hiddenEntries));
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({
+      viewportTop: 430, visibleRange: null, targetMeasured: false,
+    });
+    expect(ranges.at(-1)?.visibleRange).toBeNull();
+    expect(scroller.scrollTop).toBe(0);
+
+    wrapper.style.display = '';
+    act(() => {
+      if (order === 'snapshot-first') {
+        expect(ref.current?.physicalSnapshot(20)).toMatchObject({ viewportTop: 430, targetOffset: 0 });
+        expect(scroller.scrollTop).toBe(430);
+      }
+      resizeObservers[0]!.triggerEntries([[scroller, 100], [header, 30]]);
+    });
+    expect(scroller.scrollTop).toBe(430);
+    expect(write).toHaveBeenCalledWith(430);
+    expect(screen.getByTestId('payload-item-20')).toBeInTheDocument();
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({ viewportTop: 430, targetOffset: 0 });
+    act(() => resizeObservers[0]!.triggerEntries(virtualRows().map((row): [Element, number] => [row, 20])));
+    expect(ref.current?.physicalSnapshot(20)).toMatchObject({
+      viewportTop: 430, targetMeasured: true, targetOffset: 0,
+      visibleRange: { startIndex: 20, endIndex: 24 },
+    });
+    expect(ranges.at(-1)?.visibleRange).toEqual({ startIndex: 20, endIndex: 24 });
+    act(() => {
+      expect(ref.current?.captureVisibleAnchor()).toEqual({ index: 20, key: 'item-20', offset: 0 });
+    });
+  });
+
   it('accepts a legitimate zero-height row while its ancestors remain displayed', () => {
     const totals: number[] = [];
     render(
