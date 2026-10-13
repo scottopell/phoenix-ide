@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText, boundedDiagnosticJson } from './qualify-history-realserver.mjs';
+import { readFileSync } from 'node:fs';
+import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText, boundedDiagnosticJson, COMPOSER_SELECTOR } from './qualify-history-realserver.mjs';
 
 test('only literal HTTP loopback ports are accepted', () => {
   assert.equal(loopback('http://127.0.0.1:54321'), 'http://127.0.0.1:54321');
@@ -46,4 +47,10 @@ test('diagnostic bounds are bytes and retain valid truncation metadata', () => {
   assert.ok(bounded.length <= 1024);
   assert.equal(JSON.parse(bounded.toString()).truncated, true);
   assert.deepEqual(JSON.parse(boundedDiagnosticJson({ ok: true }).toString()), { ok: true });
+});
+
+test('composer targets the actual owning InputArea textarea identity', () => {
+  const input = readFileSync(new URL('../src/components/InputArea.tsx', import.meta.url), 'utf8');
+  assert.equal(COMPOSER_SELECTOR, 'textarea#message-input');
+  assert.match(input, /<textarea[\s\S]*?id="message-input"/);
 });

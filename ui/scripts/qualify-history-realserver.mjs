@@ -32,6 +32,7 @@ export function boundedDiagnosticJson(value, limit = 1_000_000) {
   return Buffer.from(JSON.stringify({ truncated: true, original_bytes: bytes.length,
     prefix_base64: bytes.subarray(0, Math.floor(limit / 2)).toString('base64') }));
 }
+export const COMPOSER_SELECTOR = 'textarea#message-input';
 export const APPEND_PROBE = 'append-probe';
 export const CONTINUATION_PROBE = 'live-probe';
 export function probeText(probe) { return `${probe} [[perf:1]] [[ttft:0]]`; }
@@ -315,7 +316,7 @@ async function run() {
       await sameAnchor(before, `${prefix}: anchor after actual fourth continuation`);
       assert.equal(new URL(page.url()).searchParams.get('source_transcript'), a.members[1]);
 
-      const composer = page.locator('textarea.input-textarea');
+      const composer = page.locator(COMPOSER_SELECTOR);
       await composer.waitFor({ state: 'visible' });
       await poll(() => composer.isEnabled(), 'newest composer enabled');
       const text = `[[perf:1]] [[ttft:0]] composer-${randomUUID()}`;
