@@ -190,6 +190,84 @@ jobs:
       - name: ./dev.py check (e2e)
         run: ./dev.py check --lanes e2e
 
+  qualify-history-realserver:
+    name: qualify pinned 3a7 realserver history (harness only)
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'test/continuous-history-realserver-qualification' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      APP_ROOT: ${{ github.workspace }}/pinned-app
+      APP_BUILD_RECEIPT: ${{ github.workspace }}/history-build.json
+      PHOENIX_CHECK_ALL: "1"
+      PHOENIX_CHECK_WORKERS: "2"
+      CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 3a7ea7e4484ab984370bf6b784856434d389ac3a
+          path: pinned-app
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '1.95.0'
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pinned-app -> target
+          shared-key: check-e2e
+          prefix-key: v1-rust
+          save-if: false
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: astral-sh/setup-uv@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: pinned-app/ui/package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '26'
+      - name: Compiler-free harness regressions
+        working-directory: harness
+        run: |
+          uv run tests/e2e/history_browser.test.py
+          node --test ui/scripts/qualify-history-realserver.test.mjs
+          node --check ui/scripts/qualify-history-realserver.mjs
+      - name: Build matching pinned UI and install pinned Chromium
+        working-directory: pinned-app/ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+          pnpm exec playwright install --with-deps chromium
+      - name: Build pinned real server through existing E2E lane
+        working-directory: pinned-app
+        run: |
+          test "$(git rev-parse HEAD)" = 3a7ea7e4484ab984370bf6b784856434d389ac3a
+          git config user.email ci@phoenix-ide.invalid
+          git config user.name 'Phoenix CI'
+          ./dev.py check --lanes e2e
+      - name: Bind application source and artifacts to harness receipt
+        run: |
+          uv run harness/tests/e2e/history_browser.py --build-receipt "$APP_BUILD_RECEIPT"
+      - name: Real HTTP SSE browser history qualification
+        run: |
+          uv run harness/tests/e2e/history_browser.py --output "$GITHUB_WORKSPACE/history-evidence" --timeout 900
+      - name: Retain receipts on success or failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-3a7-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            history-build.json
+            history-evidence/
+
   check-ui:
     name: check (ui/specs)
     needs: plan_check

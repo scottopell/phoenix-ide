@@ -25,6 +25,9 @@ export function sourceLink(aggregate, row, message, tool) {
 export function anchorMatches(before, after) {
   return !!before && !!after && before.key === after.key && Math.abs(before.offset - after.offset) <= 2;
 }
+export const APPEND_PROBE = 'append-probe';
+export const CONTINUATION_PROBE = 'live-probe';
+export function probeText(probe) { return `${probe} [[perf:1]] [[ttft:0]]`; }
 export function occurrences(snapshot) {
   return snapshot.segments.flatMap(s => s.messages.map(m => [s.segment_ordinal, m.sequence_id, m.message_id]));
 }
@@ -172,9 +175,12 @@ async function run() {
     }
     async function sameAnchor(before, label) {
       assert.ok(before, 'physical visible anchor captured');
+      let consecutiveFrames = 0;
       const after = await poll(async () => {
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
         const value = await anchor(before.key);
-        return anchorMatches(before, value) && value;
+        consecutiveFrames = anchorMatches(before, value) ? consecutiveFrames + 1 : 0;
+        return consecutiveFrames >= 4 && value;
       }, label);
       checked(label, { before, after, tolerance_css_px: 2 });
     }
@@ -277,22 +283,24 @@ async function run() {
       const before = await anchor();
       const liveStart = snapshots.length;
       let latest = a.members.at(-1);
-      await send(latest, '[[perf:1]] [[ttft:0]] actual append during historical reading');
-      await poll(() => page.locator('#conversation-nav [role="button"]').evaluateAll(buttons =>
-        buttons.some(button => button.textContent.includes('actual append during historical reading'))), 'append reflected in browser navigation');
+      await send(latest, probeText(APPEND_PROBE));
+      await poll(() => page.locator('#conversation-nav [role="button"]').evaluateAll((buttons, probe) =>
+        buttons.some(button => button.textContent.includes(probe)), APPEND_PROBE), 'append reflected in browser navigation');
       // Read real HTTP tail as well as browser SSE-derived refresh.
       const appended = await request('GET', a.endpoint + '?boundary_representation=original_messages');
       assert.equal(appended.latest_transcript_row_id, latest);
       await sameAnchor(before, `${prefix}: anchor after actual append`);
       await send(latest, '[[scenario:context_window_exceeded]] [[ttft:0]]', 'context_exhausted');
       const continued = await request('POST', `/api/conversations/${latest}/continue`, {
-        handoff: '[[perf:1]] [[ttft:0]] live continuation', message_id: randomUUID(),
+        handoff: probeText(CONTINUATION_PROBE), message_id: randomUUID(),
       });
       assert.equal(continued.status, 'accepted');
       assert.notEqual(continued.conversation_id, latest);
       latest = continued.conversation_id;
       await settled(latest);
       await snapshotSeen(a, s => s.latest_transcript_row_id === latest, liveStart);
+      await poll(() => page.locator('#conversation-nav [role="button"]').evaluateAll((buttons, probe) =>
+        buttons.some(button => button.textContent.includes(probe)), CONTINUATION_PROBE), 'successor opening adopted in rendered navigation');
       await sameAnchor(before, `${prefix}: anchor after actual fourth continuation`);
       assert.equal(new URL(page.url()).searchParams.get('source_transcript'), a.members[1]);
 

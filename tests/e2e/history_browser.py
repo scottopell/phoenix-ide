@@ -128,6 +128,17 @@ def validate_pages(pages):
     return keys
 
 
+def complete_occurrences(pages, members):
+    omitted = {b["represented_successor_opening_message_id"] for b in pages[0]["boundaries"]
+               if b["represented_successor_opening_message_id"] is not None}
+    expected = [(ordinal, m["sequence_id"], m["message_id"])
+                for ordinal, messages in enumerate(members) for m in messages
+                if m["message_id"] not in omitted]
+    actual = validate_pages(pages)
+    assert actual == expected, "aggregate paging differs from authoritative member occurrences"
+    return actual
+
+
 class Fixture:
     def __init__(self, harness, base, output):
         import httpx
@@ -204,6 +215,7 @@ class Fixture:
         assert disabled["auto_continue_on_context_exhaustion"] is False
         members, old, tool = [], None, None
         persisted = 0
+        member_messages = []
         for chapter in range(3):
             members.append(row)
             for turn in range(36):
@@ -218,7 +230,9 @@ class Fixture:
                                 tool = {"message_id": m["message_id"], "tool_id": block["id"]}
             if chapter != 2:
                 row = self.continued(row)
-            persisted += len(self.request("GET", f"/api/conversations/{members[-1]}")["messages"])
+            messages = self.request("GET", f"/api/conversations/{members[-1]}")["messages"]
+            member_messages.append(messages)
+            persisted += len(messages)
         assert persisted > 201 and len(set(members)) >= 3 and tool is not None
         pages, cursor, cursors = [], None, set()
         for _ in range(8):
@@ -234,7 +248,7 @@ class Fixture:
             cursors.add(cursor)
         else:
             raise AssertionError("paging exceeded eight pages")
-        keys = validate_pages(pages)
+        keys = complete_occurrences(pages, member_messages)
         assert len(keys) > 201 and len(pages) >= 3
         assert pages[0]["latest_transcript_row_id"] == row
         assert len(pages[0]["boundaries"]) >= 2
@@ -368,11 +382,29 @@ def qualify(app, output, timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--output", type=Path)
+    mode.add_argument("--build-receipt", type=Path,
+                      help="bind an already-built pinned checkout to artifact hashes; never builds")
     parser.add_argument("--timeout", type=int, default=600, help="whole-run wall bound, 120..1200 seconds")
     args = parser.parse_args()
     if not 120 <= args.timeout <= 1200:
         parser.error("timeout must be between 120 and 1200 seconds")
+    if args.build_receipt:
+        app = Path(os.environ["APP_ROOT"]).resolve(strict=True)
+        if git(app, "rev-parse", "HEAD") != PIN or git(app, "status", "--porcelain", "--untracked-files=no"):
+            raise ValueError("receipt requires clean frozen app source")
+        binary = app / "target/debug/phoenix_ide"
+        receipt = {"source_sha": PIN, "source_tree": git(app, "rev-parse", "HEAD^{tree}"),
+                   "binary_sha256": digest(binary), "ui_files": ui_hashes(app),
+                   "harness_sha": git(ROOT, "rev-parse", "HEAD"),
+                   "cargo_lock_sha256": digest(app / "Cargo.lock"),
+                   "ui_lock_sha256": digest(app / "ui/pnpm-lock.yaml"),
+                   "toolchains": {name: subprocess.check_output([name, "--version"], cwd=app, text=True, timeout=10).strip()
+                                  for name in ("rustc", "cargo", "node", "pnpm")}}
+        write_json(args.build_receipt.resolve(), receipt)
+        identity(app, args.build_receipt.resolve())
+        return
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     result = {"status": "failed", "app_pin": PIN}

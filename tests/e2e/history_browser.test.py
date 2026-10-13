@@ -26,6 +26,16 @@ def page(segment, sequences):
 
 
 class QualificationTests(unittest.TestCase):
+    def test_complete_paging_rejects_missing_interior_occurrence(self):
+        full = page(0, [1, 2, 3])
+        full["boundaries"] = []
+        self.assertEqual(hb.complete_occurrences([full], [full["segments"][0]["messages"]]),
+                         [(0, n, f"m-0-{n}") for n in (1, 2, 3)])
+        dropped = page(0, [1, 3])
+        dropped["boundaries"] = []
+        with self.assertRaisesRegex(AssertionError, "authoritative member"):
+            hb.complete_occurrences([dropped], [full["segments"][0]["messages"]])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

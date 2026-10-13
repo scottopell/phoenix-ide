@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate } from './qualify-history-realserver.mjs';
+import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText } from './qualify-history-realserver.mjs';
 
 test('only literal HTTP loopback ports are accepted', () => {
   assert.equal(loopback('http://127.0.0.1:54321'), 'http://127.0.0.1:54321');
@@ -33,4 +33,10 @@ test('Global responses can change pinned member without changing aggregate ident
   assert.equal(belongsToAggregate(a, response), true);
   assert.equal(belongsToAggregate({ ...a, members: ['foreign'] }, response), false);
   assert.equal(belongsToAggregate({ kind: 'ordinary', endpoint: '/api/product-conversations/pc' }, { ...response, url: 'http://127.0.0.1:1/api/product-conversations/pc?before=real' }), true);
+});
+
+test('rendered readiness probes survive frozen 40-character prompt clipping', () => {
+  for (const probe of [APPEND_PROBE, CONTINUATION_PROBE]) {
+    assert.ok(probeText(probe).slice(0, 40).includes(probe));
+  }
 });
