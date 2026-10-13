@@ -80,10 +80,18 @@ export interface VirtualTranscriptHandle {
   physicalSnapshot(targetIndex?: number, targetSelector?: string): VirtualTranscriptPhysicalSnapshot;
 }
 
+export type VirtualTranscriptPositioningAuthority =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'command'; readonly commandKey: string };
+
+const NO_POSITIONING_AUTHORITY: VirtualTranscriptPositioningAuthority = { kind: 'absent' };
+
 export interface VirtualTranscriptProps<T> {
   items: readonly T[];
   getKey: (item: T, index: number) => string;
   renderItem: (item: T, index: number) => ReactNode;
+  /** Omission denies owned writes; generic scroll operations remain unowned. */
+  readonly positioningAuthority?: VirtualTranscriptPositioningAuthority;
   header?: ReactNode;
   empty?: ReactNode;
   overscan?: number;
@@ -123,6 +131,7 @@ interface PhysicalStore<T> {
   initialTailPending: boolean;
   preservedViewport: { top: number; firstKey: string | null } | null;
   positionOwner: PositionOwner;
+  positioningAuthority: VirtualTranscriptPositioningAuthority;
   pendingTarget: {
     key: string;
     align: 'start' | 'end';
@@ -269,6 +278,7 @@ function synchronizedPhysicalSnapshot<T>(
   targetIndex?: number,
   targetSelector?: string,
 ): VirtualTranscriptPhysicalSnapshot {
+  retireUnauthorizedPosition(store);
   if (!isLayoutHidden(store.scroller)) {
     store.viewportExtent = store.scroller ? viewportExtentForScroller(store.scroller) : store.viewportExtent;
     if (store.revealPublicationPending) {
@@ -383,6 +393,7 @@ function computeRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
 }
 
 function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void {
+  if (retireUnauthorizedPosition(store)) return;
   const scroller = store.scroller;
   const maxScrollTop = Math.max(0, totalPhysicalExtent(store) - store.viewportExtent);
   const scrollTop = Math.max(0, Math.min(nextTop, maxScrollTop));
@@ -410,6 +421,20 @@ function retirePosition<T>(current: PhysicalStore<T>): void {
   current.pendingProgrammaticTop = null;
 }
 
+function positionIsAuthorized<T>(store: PhysicalStore<T>, owner: PositionOwner = store.positionOwner): boolean {
+  return owner.kind === 'unowned'
+    || (store.positioningAuthority.kind === 'command' && store.positioningAuthority.commandKey === owner.commandKey);
+}
+
+function retireUnauthorizedPosition<T>(store: PhysicalStore<T>): boolean {
+  if (positionIsAuthorized(store)) return false;
+  retirePosition(store);
+  store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
+  store.activeAnchor = captureTopAnchor(store);
+  recompute(store);
+  return true;
+}
+
 function positionAtIndex<T>(
   current: PhysicalStore<T>,
   owner: PositionOwner,
@@ -418,6 +443,7 @@ function positionAtIndex<T>(
   viewportStartOffset: number,
   targetSelector: VirtualTranscriptTarget | undefined,
 ): void {
+  if (!positionIsAuthorized(current, owner)) return;
   const unit = current.layout.itemAt(index);
   if (!unit) return;
   current.positionOwner = owner;
@@ -440,6 +466,7 @@ function positionAtIndex<T>(
 }
 
 function resolvePendingTarget<T>(current: PhysicalStore<T>): boolean {
+  if (retireUnauthorizedPosition(current)) return false;
   const pending = current.pendingTarget;
   if (!pending || isLayoutHidden(current.scroller)) return false;
   const key = pending.key;
@@ -655,6 +682,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     initialTailPending: props.initialTail ?? true,
     preservedViewport: null,
     positionOwner: { kind: 'unowned' },
+    positioningAuthority: props.positioningAuthority ?? NO_POSITIONING_AUTHORITY,
     pendingTarget: null,
     pinned: true,
     revision: 0,
@@ -695,6 +723,8 @@ function VirtualTranscriptInner<T>(
     storeRef.current = createStore(props);
   }
   const store = storeRef.current;
+  store.positioningAuthority = props.positioningAuthority ?? NO_POSITIONING_AUTHORITY;
+  retireUnauthorizedPosition(store);
   const resolvedPhysicalKeys = useMemo(
     () => resolvePhysicalKeys(items, getKey),
     [getKey, items],

@@ -1,4 +1,7 @@
-import { type ReactElement } from 'react';
+import { useCallback, useLayoutEffect, useRef, type ReactElement } from 'react';
+import { initialTranscriptPositioningState, reduceTranscriptPositioning, transcriptPositioningCommandKey, type TranscriptPositioningInput, type TranscriptPositioningEvent } from '../conversation/transcriptPositioning';
+import type { HistoryScrollCommand } from '../conversation/historyExpansion';
+
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { GESTURE_STALE_MS, VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
@@ -1315,18 +1318,116 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it('denies owned writes without matching authority while generic scrolling remains valid', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const items = makeItems(40);
+    const getKey = (item: TestItem) => item.id;
+    const mounted = render(<VirtualTranscript ref={ref} ariaLabel="Transcript" items={items} getKey={getKey}
+      estimatedExtent={20} initialTail={false} renderItem={renderRow} />);
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    act(() => ref.current!.scrollToOwnedIndex('missing-authority', 20, 'start'));
+    expect(scroller.scrollTop).toBe(0);
+    act(() => ref.current!.scrollToIndex(10, 'start'));
+    expect(scroller.scrollTop).toBe(200);
+    mounted.rerender(<VirtualTranscript ref={ref} ariaLabel="Transcript" items={items} getKey={getKey}
+      estimatedExtent={20} initialTail={false} renderItem={renderRow} positioningAuthority={{ kind: 'command', commandKey: 'current' }} />);
+    act(() => ref.current!.scrollToOwnedIndex('stale', 20, 'start'));
+    expect(scroller.scrollTop).toBe(200);
+    act(() => ref.current!.scrollToOwnedIndex('current', 20, 'start'));
+    expect(scroller.scrollTop).toBe(400);
+  });
+
+  it.each(['idle', 'view-reset', 'replacement', 'unchanged'] as const)('fences hidden replay before the parent layout input change (%s)', (transition) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const items = makeItems(40);
+    const getKey = (item: TestItem) => item.id;
+    const oldCommand: HistoryScrollCommand = { kind: 'jump_to_message', token: 1, requestToken: 11,
+      view: { conversationId: 'conv', generation: 1, transcriptGeneration: 1 }, targetMessageId: 'item-20' };
+    const replacement: HistoryScrollCommand = { ...oldCommand, token: 2, targetMessageId: 'item-10' };
+    const finished = vi.fn();
+    const order: string[] = [];
+    // The parent uses the same reducer/effect/layout boundary as MessageList.
+    function Parent({ input, hidden }: { input: TranscriptPositioningInput; hidden: boolean }) {
+      const state = useRef(initialTranscriptPositioningState(oldCommand.view));
+      const dispatch = useCallback((event: TranscriptPositioningEvent): void => {
+        const next = reduceTranscriptPositioning(state.current, event);
+        state.current = next.state;
+        for (const effect of next.effects) {
+          if (effect.type === 'resolve_target') dispatch({ type: 'target_resolved', commandKey: effect.commandKey,
+            targetIndex: effect.targetMessageId === 'item-20' ? 20 : 10 });
+          if (effect.type === 'position') {
+            ref.current!.scrollToOwnedIndex(effect.commandKey, effect.targetIndex, 'start');
+            const snapshot = ref.current!.physicalSnapshot(effect.targetIndex);
+            dispatch({ type: 'position_issued', commandKey: effect.commandKey, targetIndex: effect.targetIndex, layoutRevision: snapshot.layoutRevision });
+          }
+          if (effect.type === 'finish') {
+            if (effect.result === 'superseded') ref.current!.cancelPosition(effect.commandKey);
+            finished(effect.command.token, effect.result, effect.command.view);
+          }
+        }
+      }, []);
+      useLayoutEffect(() => {
+        order.push('parent-input');
+        dispatch({ type: 'input_changed', input });
+      }, [dispatch, input]);
+      return <div data-testid="parent-wrapper" style={{ display: hidden ? 'none' : '' }}>
+        <VirtualTranscript ref={ref} ariaLabel="Transcript" items={items} getKey={getKey} estimatedExtent={20}
+          initialTail={false} renderItem={renderRow}
+          positioningAuthority={input.kind === 'positioning'
+            ? { kind: 'command', commandKey: transcriptPositioningCommandKey(input.command) } : { kind: 'absent' }}
+          onRangeChange={() => {
+            order.push('child-observation');
+            const active = state.current.active;
+            const phase = state.current.phase;
+            if (active && phase?.kind === 'awaiting_physical') {
+              const snapshot = ref.current!.physicalSnapshot(phase.targetIndex);
+              dispatch({ type: 'physical_observed', commandKey: active.key, range: snapshot.visibleRange,
+                actualOffset: null, layoutRevision: snapshot.layoutRevision, targetMeasured: snapshot.targetMeasured ?? false });
+            }
+          }} />
+      </div>;
+    }
+    const initial: TranscriptPositioningInput = { kind: 'positioning', command: oldCommand };
+    const mounted = render(<Parent input={{ kind: 'idle', view: oldCommand.view }} hidden={false} />);
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    let nativeTop = 0;
+    const write = vi.fn((top: number) => { order.push(`write:${top}`); if (!isHiddenByAncestor(scroller)) nativeTop = top; });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => nativeTop, set: write });
+    mounted.rerender(<Parent input={initial} hidden={true} />);
+    expect(ref.current!.physicalSnapshot(20).targetMeasured).toBe(false);
+    expect(finished).not.toHaveBeenCalled();
+    order.length = 0;
+    write.mockClear();
+    const next: TranscriptPositioningInput = transition === 'unchanged' ? initial
+      : transition === 'replacement' ? { kind: 'positioning', command: replacement }
+      : { kind: 'idle', view: { ...oldCommand.view, generation: transition === 'view-reset' ? 2 : 1 } };
+    mounted.rerender(<Parent input={next} hidden={false} />);
+    if (transition === 'unchanged') {
+      expect(write.mock.calls).toEqual([[400]]);
+      expect(finished.mock.calls).toEqual([[1, 'applied', oldCommand.view]]);
+    } else {
+      expect(order.indexOf('child-observation')).toBeLessThan(order.indexOf('parent-input'));
+      expect(finished.mock.calls).toEqual(transition === 'replacement'
+        ? [[1, 'superseded', oldCommand.view], [2, 'applied', replacement.view]]
+        : [[1, 'superseded', oldCommand.view]]);
+      expect(write.mock.calls).toEqual(transition === 'replacement' ? [[200]] : []);
+    }
+  });
+
   it.each(['snapshot-first', 'observer-first'] as const)('retires superseded hidden physical work without cancelling its replacement (%s)', (order) => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     const items = makeItems(40);
     items[20]!.height = 320;
-    render(
+    const view = (commandKey: string) => (
       <div data-testid="retained-wrapper">
         <VirtualTranscript ariaLabel="Transcript" ref={ref} items={items} getKey={(item) => item.id}
+          positioningAuthority={{ kind: 'command', commandKey }}
           estimatedExtent={(item) => item.height} overscan={20} initialTail={false}
           header={<div data-height={30}>Header</div>}
           renderItem={(item) => <div data-height={item.height}>{item.label}<span data-tool={item.id}>Tool</span></div>} />
-      </div>,
+      </div>
     );
+    const mounted = render(view('old-command'));
     act(() => ref.current?.scrollToIndex(20, 'start'));
     const wrapper = screen.getByTestId('retained-wrapper');
     const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
@@ -1338,7 +1439,10 @@ describe('VirtualTranscript', () => {
     let nativeTop = 0;
     const write = vi.fn((top: number) => { if (!isHiddenByAncestor(scroller)) nativeTop = top; });
     Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => nativeTop, set: write });
-    const issue = (owner: string, index: number, selector?: string) => ref.current!.scrollToOwnedIndex(owner, index, 'start', 0, selector);
+    const issue = (owner: string, index: number, selector?: string) => {
+      mounted.rerender(view(owner));
+      act(() => ref.current!.scrollToOwnedIndex(owner, index, 'start', 0, selector));
+    };
     const cancel = (owner: string) => ref.current!.cancelPosition(owner);
     const reveal = () => {
       wrapper.style.display = '';
@@ -1348,7 +1452,7 @@ describe('VirtualTranscript', () => {
       });
     };
     wrapper.style.display = 'none';
-    act(() => issue('old-command', 20, '[data-tool="item-20"]'));
+    issue('old-command', 20, '[data-tool="item-20"]');
     expect(ref.current?.physicalSnapshot(20)).toMatchObject({ viewportTop: 430, visibleRange: null, targetMeasured: false });
     act(() => cancel('old-command'));
     reveal();
@@ -1357,11 +1461,9 @@ describe('VirtualTranscript', () => {
     act(() => expect(ref.current?.captureVisibleAnchor()).toEqual({ index: 0, key: 'item-0', offset: 30 }));
 
     wrapper.style.display = 'none';
-    act(() => {
-      issue('old-command', 20, '[data-tool="item-20"]');
-      issue('new-command', 10);
-      cancel('old-command');
-    });
+    issue('old-command', 20, '[data-tool="item-20"]');
+    issue('new-command', 10);
+    act(() => cancel('old-command'));
     reveal();
     expect(write.mock.calls).toEqual([[230]]);
     expect(ref.current?.physicalSnapshot(10)).toMatchObject({ viewportTop: 230, targetOffset: 0 });
