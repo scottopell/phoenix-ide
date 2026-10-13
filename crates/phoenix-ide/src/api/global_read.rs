@@ -33,8 +33,7 @@ pub struct ResolveGlobalReferenceRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ResolveGlobalReferenceResponse {
-    pub kind: String,
-    pub id: String,
+    pub reference: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
     pub href: Option<String>,
     pub title: Option<String>,
     pub work_scope: ResolvedWorkScope,
@@ -973,11 +972,6 @@ impl GlobalReadService {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn search(&self, query: &str) -> Result<String, String> {
-        let hits = self.search_hits(query).await?;
-        self.format_search_hits(&hits).await
-    }
-
     pub(crate) async fn search_hits(
         &self,
         query: &str,
@@ -1001,17 +995,21 @@ impl GlobalReadService {
         Ok(hits)
     }
 
-    pub(crate) async fn format_search_hits(
+    pub(crate) async fn qualified_search(
         &self,
-        hits: &[crate::db::RetrievedChunk],
-    ) -> Result<String, String> {
-        if hits.is_empty() {
-            Ok("No matching messages found.".to_string())
-        } else {
-            format_global_search_hits(self, hits)
-                .await
-                .map_err(|e| format!("search citation failed: {e}"))
-        }
+        query: &str,
+    ) -> Result<Vec<QualifiedSearchHit>, String> {
+        let hits = self.search_hits(query).await?;
+        qualify_search_hits(self, &hits)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn resolve_federation_peer(
+        &self,
+        selector: &phoenix_core::domain::instance_identity::InstanceSelector,
+    ) -> Result<crate::db::FederationPeerConnection, crate::db::FederationPeerSelectionError> {
+        self.db.resolve_federation_peer(selector).await
     }
 
     pub(crate) async fn search_request(&self, query: &str) -> Result<RetrievalRequest, String> {
@@ -1192,6 +1190,73 @@ async fn ordinary_product_citation(
         }))
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QualifiedSearchHit {
+    pub source: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub stable_conversation:
+        Option<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    pub role: String,
+    pub sender: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub snippet: String,
+}
+
+pub(crate) async fn qualify_search_hits(
+    service: &GlobalReadService,
+    hits: &[crate::db::RetrievedChunk],
+) -> Result<Vec<QualifiedSearchHit>, DbError> {
+    let instance_id = service.db.instance_id().await?;
+    let mut qualified = Vec::with_capacity(hits.len());
+    let mut sender_kinds = std::collections::HashMap::new();
+    for hit in hits {
+        let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(
+            hit.conversation_id.clone(),
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let message_id =
+            phoenix_core::domain::conversation_reference::MessageId::parse(hit.message_id.clone())
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let stable_conversation = match service.db.get_conversation(&hit.conversation_id).await {
+            Ok(conversation) => ordinary_product_citation(&service.db, &conversation)
+                .await?
+                .map(|(product_id, _)| {
+                    phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                        product_id,
+                    )
+                    .map(|product_conversation_id| {
+                        phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                            instance_id,
+                            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                                product_conversation_id,
+                            },
+                        )
+                    })
+                    .map_err(|error| DbError::Serialization(error.to_string()))
+                })
+                .transpose()?,
+            Err(DbError::ConversationNotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        qualified.push(QualifiedSearchHit {
+            source: phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                instance_id,
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message {
+                    transcript_id,
+                    message_id,
+                },
+            ),
+            stable_conversation,
+            role: attributed_role(hit.message_type, &hit.origin).to_string(),
+            sender: attributed_sender_with_cache(&service.db, &hit.origin, &mut sender_kinds)
+                .await?,
+            created_at: hit.created_at,
+            snippet: hit.snippet.clone(),
+        });
+    }
+    Ok(qualified)
+}
+
+#[cfg(test)]
 pub(crate) async fn format_global_search_hits(
     service: &GlobalReadService,
     hits: &[crate::db::RetrievedChunk],
@@ -1817,7 +1882,7 @@ fn decode_route_value(value: &str) -> Result<String, AppError> {
 
 enum WebReferenceResolution {
     Product(String),
-    Exact(ResolveGlobalReferenceResponse),
+    Exact(Box<ResolveGlobalReferenceResponse>),
     NotWeb,
 }
 
@@ -1979,17 +2044,36 @@ async fn resolve_web_reference(
             if let Some(message_id) = fragment.and_then(message_id_fragment) {
                 return resolve_message(service, conv, &decode_route_value(message_id)?, global)
                     .await
+                    .map(Box::new)
                     .map(WebReferenceResolution::Exact);
             }
-            return Ok(WebReferenceResolution::Exact(
-                resolve_conversation(service, conv, global).await,
-            ));
+            return Ok(WebReferenceResolution::Exact(Box::new(
+                resolve_conversation(service, conv, global).await?,
+            )));
         }
     }
     Ok(canonical_product.map_or(
         WebReferenceResolution::NotWeb,
         WebReferenceResolution::Product,
     ))
+}
+
+async fn qualified_reference(
+    service: &GlobalReadService,
+    target: phoenix_core::domain::conversation_reference::ConversationReferenceTarget,
+) -> Result<phoenix_core::domain::conversation_reference::QualifiedConversationReference, AppError>
+{
+    let instance_id = service
+        .db
+        .instance_id()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(
+        phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+            instance_id,
+            target,
+        ),
+    )
 }
 
 async fn resolve_reference_impl(
@@ -1999,7 +2083,7 @@ async fn resolve_reference_impl(
     let reference = raw.trim();
     let canonical_product = match resolve_web_reference(service, reference).await? {
         WebReferenceResolution::Product(id) => Some(id),
-        WebReferenceResolution::Exact(resolved) => return Ok(resolved),
+        WebReferenceResolution::Exact(resolved) => return Ok(*resolved),
         WebReferenceResolution::NotWeb => None,
     };
     if let Some(rest) = reference
@@ -2040,8 +2124,13 @@ async fn resolve_reference_impl(
         }
         let current = resolve_current_member_and_work_scope(service, id).await?;
         return Ok(ResolveGlobalReferenceResponse {
-            kind: "product_conversation".to_string(),
-            id: typed_id.to_string(),
+            reference: qualified_reference(
+                service,
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                    product_conversation_id: typed_id.clone(),
+                },
+            )
+            .await?,
             href: Some(format!("/c/{typed_id}")),
             title: aggregate
                 .root
@@ -2078,7 +2167,7 @@ async fn resolve_reference_impl(
         if let Some(message_id) = message_id {
             return resolve_message(service, conv, message_id, false).await;
         }
-        return Ok(resolve_conversation(service, conv, false).await);
+        return resolve_conversation(service, conv, false).await;
     }
     if let Some(rest) = reference.strip_prefix("@work:") {
         let (id, _) = split_fragment(rest);
@@ -2189,16 +2278,24 @@ async fn resolve_conversation(
     service: &GlobalReadService,
     conv: Conversation,
     global_href: bool,
-) -> ResolveGlobalReferenceResponse {
+) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let href = Some(if global_href {
         format!("/global/{}", conv.id)
     } else {
         conversation_href(&conv)
     });
     let title = conv.title.clone().or(conv.slug.clone());
-    ResolveGlobalReferenceResponse {
-        kind: "conversation".to_string(),
-        id: conv.id.clone(),
+    Ok(ResolveGlobalReferenceResponse {
+        reference: qualified_reference(
+            service,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Transcript {
+                transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                    conv.id.clone(),
+                )
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+            },
+        )
+        .await?,
         href,
         title: title.clone(),
         work_scope: resolve_work_scope(service, &conv).await,
@@ -2208,7 +2305,7 @@ async fn resolve_conversation(
             conv.updated_at,
             conv.state.variant_name()
         ),
-    }
+    })
 }
 
 async fn resolve_message(
@@ -2242,8 +2339,20 @@ async fn resolve_message(
         .await
         .map_err(|error| AppError::Internal(format!("sender attribution failed: {error}")))?;
     Ok(ResolveGlobalReferenceResponse {
-        kind: "message".to_string(),
-        id: message.message_id.clone(),
+        reference: qualified_reference(
+            service,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message {
+                transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                    conv.id.clone(),
+                )
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+                message_id: phoenix_core::domain::conversation_reference::MessageId::parse(
+                    message.message_id.clone(),
+                )
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+            },
+        )
+        .await?,
         href,
         title,
         work_scope: resolve_work_scope(service, &conv).await,
@@ -2257,6 +2366,32 @@ async fn resolve_message(
             trim_chars(render_full_message_text(&message).trim(), 240)
         ),
     })
+}
+
+async fn stable_reference_target(
+    service: &GlobalReadService,
+    product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+) -> Result<phoenix_core::domain::conversation_reference::ConversationReferenceTarget, AppError> {
+    match service
+        .db
+        .product_conversation_kind(&product_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        Some(
+            phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator,
+        ) => Ok(
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Coordinator,
+        ),
+        Some(phoenix_core::domain::product_conversation::ProductConversationKind::Ordinary) => Ok(
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                product_conversation_id,
+            },
+        ),
+        None => Err(AppError::NotFound(
+            "product conversation reference target not found".to_string(),
+        )),
+    }
 }
 
 async fn resolve_chain(
@@ -2302,8 +2437,11 @@ async fn resolve_chain(
         |member| format!("@transcript:{member}"),
     );
     Ok(ResolveGlobalReferenceResponse {
-        kind: "chain".to_string(),
-        id: root_id.to_string(),
+        reference: qualified_reference(
+            service,
+            stable_reference_target(service, root.product_conversation_id.clone()).await?,
+        )
+        .await?,
         href: Some(format!("/chains/{root_id}")),
         title: root
             .chain_name
@@ -2337,6 +2475,11 @@ async fn resolve_work(
     if chain_root.as_deref().is_some_and(|root_id| root_id != id) {
         return Err(AppError::NotFound(
             "work reference target not found".to_string(),
+        ));
+    }
+    if root.parent_conversation_id.is_some() {
+        return Err(AppError::BadRequest(
+            "sub-agent work references are not stable ProductConversation targets".to_string(),
         ));
     }
     let member_ids = service
@@ -2373,8 +2516,11 @@ async fn resolve_work(
         .or(current.slug.clone())
         .unwrap_or_else(|| current.id.clone());
     Ok(ResolveGlobalReferenceResponse {
-        kind: "work".to_string(),
-        id: id.to_string(),
+        reference: qualified_reference(
+            service,
+            stable_reference_target(service, root.product_conversation_id.clone()).await?,
+        )
+        .await?,
         href: Some(href),
         title: Some(title),
         work_scope: resolve_work_scope(service, current).await,
@@ -3218,9 +3364,9 @@ mod previous_transcripts_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_global_search_hits, message_id_fragment, render_full_message_text,
-        render_global_message_line, resolve_conversation_read_target, resolve_reference_impl,
-        resolve_work_scope, split_fragment, ConversationReadTarget,
+        format_global_search_hits, message_id_fragment, qualify_search_hits,
+        render_full_message_text, render_global_message_line, resolve_conversation_read_target,
+        resolve_reference_impl, resolve_work_scope, split_fragment, ConversationReadTarget,
         CoordinatorWorkScopeTargetError, GlobalMessageTarget, GlobalMessageTargetError,
         GlobalReadService, ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
         WorkScopeUnavailableReason,
@@ -3513,32 +3659,39 @@ mod tests {
         for (origin, expected) in cases {
             message.origin = origin.clone();
             hit.origin = origin;
-            let search = format_global_search_hits(&service, &[hit.clone()])
+            let search = qualify_search_hits(&service, std::slice::from_ref(&hit))
                 .await
-                .unwrap();
+                .unwrap()
+                .remove(0);
             let full = render_global_message_line(&service.db, &conv, &message)
                 .await
                 .unwrap();
-            assert!(search.contains(&format!("@conv:{}", conv.product_conversation_id)));
-            assert!(search.contains(&format!(
-                "@transcript:{}#message-{}",
-                hit.conversation_id, hit.message_id
-            )));
-            assert!(search.contains(expected), "{search}");
+            assert!(matches!(
+                search.stable_conversation.as_ref().map(|reference| &reference.target),
+                Some(phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation { product_conversation_id })
+                    if product_conversation_id == &conv.product_conversation_id
+            ));
+            assert!(matches!(
+                &search.source.target,
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message { transcript_id, message_id }
+                    if transcript_id.as_str() == hit.conversation_id && message_id.as_str() == hit.message_id
+            ));
+            assert!(format!("{}{}", search.role, search.sender).contains(expected));
             assert!(full.contains(expected), "{full}");
             if expected != "User API" {
-                assert!(!search.contains("User API"), "{search}");
+                assert_ne!(search.role, "User API");
             }
             message.message_type = MessageType::Skill;
             hit.message_type = MessageType::Skill;
-            let search = format_global_search_hits(&service, &[hit.clone()])
+            let search = qualify_search_hits(&service, std::slice::from_ref(&hit))
                 .await
-                .unwrap();
+                .unwrap()
+                .remove(0);
             let full = render_global_message_line(&service.db, &conv, &message)
                 .await
                 .unwrap();
             let skill_label = format!("Skill · {expected}");
-            assert!(search.contains(&skill_label), "{search}");
+            assert!(format!("{}{}", search.role, search.sender).contains(&skill_label));
             assert!(full.contains(&skill_label), "{full}");
             message.message_type = MessageType::User;
             hit.message_type = MessageType::User;
@@ -3618,11 +3771,44 @@ mod tests {
             message_count: 1,
         };
 
-        let output = format_global_search_hits(&service, &[hit]).await.unwrap();
+        let output = format_global_search_hits(&service, std::slice::from_ref(&hit))
+            .await
+            .unwrap();
 
         assert!(output.contains("Effective Rename"), "{output}");
         assert!(!output.contains("Aggregate Title"), "{output}");
         assert!(!output.contains("Successor Local Title"), "{output}");
+
+        let qualified = qualify_search_hits(&service, std::slice::from_ref(&hit))
+            .await
+            .unwrap();
+        assert_eq!(qualified.len(), 1);
+        assert_eq!(
+            qualified[0].source.instance_id,
+            service.db.instance_id().await.unwrap()
+        );
+        assert_eq!(
+            qualified[0].source.target,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message {
+                transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                    hit.conversation_id.clone(),
+                )
+                .unwrap(),
+                message_id: phoenix_core::domain::conversation_reference::MessageId::parse(
+                    hit.message_id.clone(),
+                )
+                .unwrap(),
+            }
+        );
+        assert!(matches!(
+            qualified[0]
+                .stable_conversation
+                .as_ref()
+                .map(|reference| &reference.target),
+            Some(
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation { .. }
+            )
+        ));
     }
 
     #[test]
@@ -3812,14 +3998,24 @@ mod tests {
         (service, product_id, root_scope_id, current_scope_id)
     }
 
-    #[tokio::test]
-    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
-        let (service, product_id, root_scope_id, current_scope_id) =
-            continued_scope_fixture().await;
+    async fn assert_stable_reference_resolution(
+        service: &GlobalReadService,
+        product_id: &phoenix_core::domain::product_conversation::ProductConversationId,
+        current_scope_id: phoenix_core::work_scope::WorkScopeId,
+    ) {
         let stable = service
             .resolve_reference(&format!("@conv:{product_id}"))
             .await
             .unwrap();
+        assert_eq!(
+            stable.reference,
+            phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                service.db.instance_id().await.unwrap(),
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                    product_conversation_id: product_id.clone(),
+                },
+            )
+        );
         assert_eq!(
             stable.work_scope,
             ResolvedWorkScope::Available {
@@ -3840,21 +4036,33 @@ mod tests {
             "/product-conversations/root-scope".to_string(),
         ] {
             let canonical = service.resolve_reference(&reference).await.unwrap();
-            assert_eq!(canonical.id, stable.id);
+            assert_eq!(canonical.reference, stable.reference);
             assert_eq!(canonical.work_scope, stable.work_scope);
             assert_eq!(canonical.href, Some(format!("/c/{product_id}")));
         }
-        let stable_json = serde_json::to_value(&stable).unwrap();
-        assert_eq!(stable_json["work_scope"]["status"], "available");
-        assert_eq!(
-            stable_json["work_scope"]["path_semantics"],
-            "server_filesystem"
-        );
+    }
 
+    async fn assert_exact_reference_resolution(
+        service: &GlobalReadService,
+        product_id: &phoenix_core::domain::product_conversation::ProductConversationId,
+        root_scope_id: phoenix_core::work_scope::WorkScopeId,
+    ) {
         let exact = service
             .resolve_reference("@transcript:root-scope")
             .await
             .unwrap();
+        assert_eq!(
+            exact.reference,
+            phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                service.db.instance_id().await.unwrap(),
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Transcript {
+                    transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                        "root-scope",
+                    )
+                    .unwrap(),
+                },
+            )
+        );
         assert_eq!(
             exact.href.as_deref(),
             Some("/c/root-scope?source_transcript=root-scope")
@@ -3863,7 +4071,7 @@ mod tests {
             .resolve_reference(exact.href.as_deref().unwrap())
             .await
             .unwrap();
-        assert_eq!(pinned.id, exact.id);
+        assert_eq!(pinned.reference, exact.reference);
         assert_eq!(pinned.work_scope, exact.work_scope);
         for path in [
             format!("/c/{product_id}"),
@@ -3875,7 +4083,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(pinned.id, exact.id);
+            assert_eq!(pinned.reference, exact.reference);
             assert_eq!(pinned.work_scope, exact.work_scope);
             for suffix in [
                 "source_transcript=",
@@ -3888,7 +4096,6 @@ mod tests {
                     .is_err());
             }
         }
-
         assert_eq!(
             exact.work_scope,
             ResolvedWorkScope::Available {
@@ -3901,6 +4108,14 @@ mod tests {
                 path_semantics: ServerPathSemantics::ServerFilesystem,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
+        let (service, product_id, root_scope_id, current_scope_id) =
+            continued_scope_fixture().await;
+        assert_stable_reference_resolution(&service, &product_id, current_scope_id).await;
+        assert_exact_reference_resolution(&service, &product_id, root_scope_id).await;
     }
 
     #[tokio::test]
@@ -3938,7 +4153,19 @@ mod tests {
                 .resolve_reference(&format!("{prefix}{product}#message-root%3Amessage"))
                 .await
                 .unwrap();
-            assert_eq!(found.id, root_message.message_id);
+            assert_eq!(
+                found.reference.target,
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message {
+                    transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                        "root-scope",
+                    )
+                    .unwrap(),
+                    message_id: phoenix_core::domain::conversation_reference::MessageId::parse(
+                        root_message.message_id.clone(),
+                    )
+                    .unwrap(),
+                }
+            );
             assert!(found.href.unwrap().contains("source_transcript=root-scope"));
             assert!(service
                 .resolve_reference(&format!("{prefix}{product}#message-foreign-message"))
@@ -4030,7 +4257,15 @@ mod tests {
             .resolve_reference("@transcript:race-root")
             .await
             .unwrap();
-        assert_eq!(historical.id, "race-root");
+        assert_eq!(
+            historical.reference.target,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Transcript {
+                transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                    "race-root",
+                )
+                .unwrap(),
+            }
+        );
         assert_eq!(
             historical.work_scope,
             ResolvedWorkScope::Available {
@@ -4094,6 +4329,88 @@ mod tests {
                 reason: WorkScopeUnavailableReason::RecordNotFound,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_chain_and_work_aliases_preserve_stable_product_identity() {
+        let (service, product_id, _, _) = continued_scope_fixture().await;
+        let expected = phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+            service.db.instance_id().await.unwrap(),
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: product_id,
+            },
+        );
+
+        for reference in ["@chain:root-scope", "@work:root-scope"] {
+            let resolved = service.resolve_reference(reference).await.unwrap();
+            assert_eq!(resolved.reference, expected, "{reference}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_work_alias_rejects_subagent_identity_inheritance() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let parent = db
+            .create_conversation("parent", "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let child = db
+            .create_conversation("child", "child", "/tmp", false, Some(&parent.id), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            child.product_conversation_id,
+            parent.product_conversation_id
+        );
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+
+        let error = service
+            .resolve_reference(&format!("@work:{}", child.id))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::api::handlers::AppError::BadRequest(message) if message.contains("sub-agent work references"))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_coordinator_aliases_preserve_coordinator_identity() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue\"}', state_kind = 'context_exhausted' WHERE id = ?1")
+            .bind(&coordinator.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let continuation = match db.continue_conversation(&coordinator.id).await.unwrap() {
+            crate::db::ContinueOutcome::Created(continuation) => continuation,
+            crate::db::ContinueOutcome::AlreadyContinued(conversation) => {
+                panic!(
+                    "unexpected existing Coordinator continuation: {}",
+                    conversation.id
+                )
+            }
+            crate::db::ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                panic!("Coordinator fixture state was {state_variant}, not context_exhausted")
+            }
+        };
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let expected = phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+            db.instance_id().await.unwrap(),
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Coordinator,
+        );
+
+        for reference in [
+            format!("@chain:{}", coordinator.id),
+            format!("@work:{}", coordinator.id),
+        ] {
+            let resolved = service.resolve_reference(&reference).await.unwrap();
+            assert_eq!(resolved.reference, expected, "{reference}");
+            assert!(resolved.summary.contains(&continuation.id));
+        }
     }
 
     #[tokio::test]

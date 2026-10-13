@@ -113,6 +113,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [097](097_bounded-retrieval-reconciliation.md) | Bounded orphan pruning and terminal retrieval readiness | Accepted | REQ-RET-003 |
 | [098](098_retire-wake-execution-and-preserve-history.md) | Retire wake execution and preserve history | Accepted; supersedes wake execution obligations | REQ-WAKE-RETIRE-001–005; retired REQ-WAKE-001–018, REQ-DWF-WAKE-001–005, REQ-SA-009 |
 | [099](099_bounded-markdown-disclosures.md) | Recognize bounded Markdown disclosures within native parsing contexts | Accepted | REQ-CONV-025; REQ-CONV-002/019 |
+| [100](100_federated-subscriptions-carry-bounded-terminal-facts.md) | Federated subscriptions carry bounded durable terminal facts | Accepted | REQ-FED-015; extends ADR-070 across authenticated peers |
 
 ## For agents: which decisions bind your task
 
@@ -129,6 +130,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Implementing federation instance identity or bounded known-credential SQL exclusions | 083, within 034's compatibility scope |
 | Implementing federation peer TLS trust, enrollment transfer, or peer origins | 093, then 092, 083, and 034 |
 | Changing owner-password or federation peer-credential domains | 094, then 083 and 034 |
+| Implementing federated terminal-fact subscriptions | 100, then 070, 083, and 034 |
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Specifying Close failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 088 supersedes the Close recovery/finalization consequences of 026/040/041/042/080; retain their identity and ownership safeguards |

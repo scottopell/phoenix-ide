@@ -15,6 +15,7 @@ pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
     PendingWatchEvent, WatchEventRoute, WatchOutcome, WatchSnapshot,
 };
+pub use federation_peers::{FederationPeerConnection, FederationPeerSelectionError};
 mod ddl;
 mod git_repository_reconciliation;
 mod message_attachments;

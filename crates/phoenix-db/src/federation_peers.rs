@@ -2,7 +2,8 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use phoenix_core::domain::instance_identity::{
-    InstanceId, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem, PeerHost, PeerTlsTrust,
+    InstanceId, InstanceSelector, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem,
+    PeerHost, PeerTlsTrust,
 };
 use sqlx::Row;
 
@@ -15,6 +16,16 @@ pub struct FederationPeerConnection {
     pub bearer_credential: PeerBearerCredential,
     pub tls_trust: PeerTlsTrust,
     pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FederationPeerSelectionError {
+    #[error("peer not found")]
+    NotFound,
+    #[error("peer display name is ambiguous")]
+    Ambiguous,
+    #[error(transparent)]
+    Database(#[from] DbError),
 }
 
 impl Database {
@@ -139,6 +150,44 @@ impl Database {
         .transpose()
     }
 
+    /// Resolve one exact peer identity or one unambiguous display name.
+    ///
+    /// # Errors
+    /// Returns a database error for malformed persisted data, and a typed selection error when the
+    /// selector is missing or ambiguous.
+    pub async fn resolve_federation_peer(
+        &self,
+        selector: &InstanceSelector,
+    ) -> Result<FederationPeerConnection, FederationPeerSelectionError> {
+        match selector {
+            InstanceSelector::Id(id) => self
+                .federation_peer_connection(*id)
+                .await?
+                .ok_or(FederationPeerSelectionError::NotFound),
+            InstanceSelector::DisplayName(name) => {
+                let ids: Vec<String> = sqlx::query_scalar(
+                    "SELECT peer_instance_id FROM federation_peer_connections
+                     WHERE peer_display_name = ?1 ORDER BY peer_instance_id LIMIT 2",
+                )
+                .bind(name)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(DbError::from)?;
+                match ids.as_slice() {
+                    [] => Err(FederationPeerSelectionError::NotFound),
+                    [id] => self
+                        .federation_peer_connection(
+                            InstanceId::from_str(id)
+                                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                        )
+                        .await?
+                        .ok_or(FederationPeerSelectionError::NotFound),
+                    [_, _, ..] => Err(FederationPeerSelectionError::Ambiguous),
+                }
+            }
+        }
+    }
+
     /// Remove one caller-side directional peer connection.
     ///
     /// # Errors
@@ -159,6 +208,56 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_selector_requires_exact_id_or_unambiguous_display_name() {
+        let db = Database::open_in_memory().await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let first = InstanceId::new();
+        let second = InstanceId::new();
+        for (id, url, token) in [
+            (
+                first,
+                PeerBaseUrl::from_str("https://first.peer.example").unwrap(),
+                PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap(),
+            ),
+            (
+                second,
+                PeerBaseUrl::from_str("https://second.peer.example").unwrap(),
+                PeerBearerCredential::parse(format!("phx_peer_{}", "b".repeat(43))).unwrap(),
+            ),
+        ] {
+            db.save_federation_peer_connection(
+                id,
+                "duplicate",
+                &url,
+                &token,
+                &PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.resolve_federation_peer(&InstanceSelector::Id(first))
+                .await
+                .unwrap()
+                .peer_instance_id,
+            first
+        );
+        assert!(matches!(
+            db.resolve_federation_peer(&InstanceSelector::DisplayName("missing".to_string()))
+                .await,
+            Err(FederationPeerSelectionError::NotFound)
+        ));
+        assert!(matches!(
+            db.resolve_federation_peer(&InstanceSelector::DisplayName("duplicate".to_string()))
+                .await,
+            Err(FederationPeerSelectionError::Ambiguous)
+        ));
+    }
 
     #[tokio::test]
     async fn schema_rejects_malformed_peer_identity_and_origins() {
