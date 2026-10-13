@@ -9,6 +9,29 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 const EXTERNAL_MODEL_DEFAULT_OUTPUT_RESERVE: usize = 2_000;
 
+/// Endpoint-specific request addressing. Never use this value to infer model capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestModelName(String);
+
+impl RequestModelName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for RequestModelName {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for RequestModelName {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffortCapabilities {
     Unsupported,
@@ -329,8 +352,8 @@ pub enum ModelSource {
 pub struct ModelSpec {
     /// User-facing model ID (e.g., "claude-4.5-opus")
     pub id: String,
-    /// API name used by the provider (e.g., "claude-haiku-4-5-20251001")
-    pub api_name: String,
+    /// Default endpoint request spelling. `api_name` in external model config sets this.
+    pub default_request_name: RequestModelName,
     /// Backend route + wire protocol for this model.
     pub backend: ModelBackend,
     /// User-facing provider family.
@@ -385,18 +408,9 @@ impl ModelSpec {
         self.max_output_tokens
     }
 
-    /// Provider compatibility-header value. A prefixed wire model name is the
-    /// routing authority; bare names fall back to the backend family.
-    #[must_use]
-    pub fn provider_header_value(&self) -> &str {
-        self.api_name
-            .split_once('/')
-            .map_or_else(|| self.backend.header_value(), |(prefix, _)| prefix)
-    }
-
     #[must_use]
     pub fn effort_capabilities_for(&self, service: &dyn crate::LlmService) -> EffortCapabilities {
-        if matches!(self.api_name.as_str(), "gpt-6-sol" | "gpt-6-luna") {
+        if matches!(self.id.as_str(), "gpt-6-sol" | "gpt-6-luna") {
             if service.uses_codex_bridge() {
                 effort_gpt_6_sol_luna_codex()
             } else {
@@ -414,14 +428,14 @@ impl ModelSpec {
     ) -> ServiceTierCapabilities {
         let openai_fast = service.uses_codex_bridge()
             || (matches!(
-                self.api_name.as_str(),
+                self.id.as_str(),
                 "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
             ) && service.uses_official_openai_responses());
         // Anthropic Fast mode is a research-preview capability of the official
         // direct Claude API only. A compatible/proxy base URL or a cloud route
         // must not advertise it, so gate on the official-Anthropic route.
         let anthropic_fast = self.backend == ModelBackend::Anthropic
-            && self.api_name == "claude-opus-5-5"
+            && self.id == "claude-opus-5-5"
             && service.uses_official_anthropic();
         if openai_fast || anthropic_fast {
             self.service_tier_capabilities
@@ -582,7 +596,7 @@ fn external_model_spec_from_config(
     }
     Ok(ModelSpec {
         id,
-        api_name,
+        default_request_name: api_name.into(),
         backend,
         family,
         description,
@@ -629,7 +643,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         // older models). See migration 009 for legacy `-1m` id rewrite.
         ModelSpec {
             id: "claude-opus-5-5".into(),
-            api_name: "claude-opus-5-5".into(),
+            default_request_name: "claude-opus-5-5".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Opus 5.5 (most capable, adaptive thinking)".into(),
@@ -646,7 +660,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-opus-4-8".into(),
-            api_name: "claude-opus-4-8".into(),
+            default_request_name: "claude-opus-4-8".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Opus 4.8 (most capable, slower)".into(),
@@ -660,7 +674,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-opus-4-7".into(),
-            api_name: "claude-opus-4-7".into(),
+            default_request_name: "claude-opus-4-7".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Opus 4.7 (legacy)".into(),
@@ -674,7 +688,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-opus-4-6".into(),
-            api_name: "claude-opus-4-6".into(),
+            default_request_name: "claude-opus-4-6".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Opus 4.6 (legacy)".into(),
@@ -688,7 +702,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-sonnet-5-5".into(),
-            api_name: "claude-sonnet-5-5".into(),
+            default_request_name: "claude-sonnet-5-5".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Sonnet 5.5 (balanced performance, adaptive thinking)".into(),
@@ -702,7 +716,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-sonnet-5".into(),
-            api_name: "claude-sonnet-5".into(),
+            default_request_name: "claude-sonnet-5".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Sonnet 5 (balanced performance)".into(),
@@ -716,7 +730,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-sonnet-4-6".into(),
-            api_name: "claude-sonnet-4-6".into(),
+            default_request_name: "claude-sonnet-4-6".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Sonnet 4.6 (legacy)".into(),
@@ -730,7 +744,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "claude-haiku-4-5".into(),
-            api_name: "claude-haiku-4-5-20251001".into(),
+            default_request_name: "claude-haiku-4-5-20251001".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
@@ -750,7 +764,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         // only for direct/provider-compatible routes.
         ModelSpec {
             id: "gpt-6-astra".into(),
-            api_name: "gpt-6-astra".into(),
+            default_request_name: "gpt-6-astra".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-6 Astra (most capable)".into(),
@@ -764,7 +778,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-6.1-sol".into(),
-            api_name: "gpt-6.1-sol".into(),
+            default_request_name: "gpt-6.1-sol".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-6.1 Sol (balanced speed and intelligence, 1.05M context)".into(),
@@ -781,7 +795,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-6-sol".into(),
-            api_name: "gpt-6-sol".into(),
+            default_request_name: "gpt-6-sol".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-6 Sol (workhorse, 1.05M context)".into(),
@@ -795,7 +809,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-6-luna".into(),
-            api_name: "gpt-6-luna".into(),
+            default_request_name: "gpt-6-luna".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-6 Luna (fast, affordable, 1.05M context)".into(),
@@ -809,7 +823,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-5.6-sol".into(),
-            api_name: "gpt-5.6-sol".into(),
+            default_request_name: "gpt-5.6-sol".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-5.6 Sol (frontier, 1M context)".into(),
@@ -823,7 +837,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-5.6-luna".into(),
-            api_name: "gpt-5.6-luna".into(),
+            default_request_name: "gpt-5.6-luna".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-5.6 Luna (frontier, 1M context)".into(),
@@ -837,7 +851,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         },
         ModelSpec {
             id: "gpt-5.6-terra".into(),
-            api_name: "gpt-5.6-terra".into(),
+            default_request_name: "gpt-5.6-terra".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
             description: "GPT-5.6 Terra (frontier, 1M context)".into(),
@@ -852,7 +866,7 @@ pub fn all_models() -> Vec<ModelSpec> {
         // Mock model for frontend development without API keys
         ModelSpec {
             id: "mock".into(),
-            api_name: "mock".into(),
+            default_request_name: "mock".into(),
             backend: ModelBackend::Mock,
             family: "Mock".into(),
             description: "Mock (lorem ipsum for UI dev)".into(),
@@ -881,7 +895,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         let model = &models[0];
         assert_eq!(model.id, "baseten/moonshotai/Kimi-K2.6");
-        assert_eq!(model.api_name, model.id);
+        assert_eq!(model.default_request_name.as_str(), model.id);
         assert_eq!(model.backend, ModelBackend::Anthropic);
         assert_eq!(model.backend.api_format(), ApiFormat::Anthropic);
         assert_eq!(model.context_window, 262_000);
@@ -910,7 +924,7 @@ mod tests {
         };
 
         let opus_55 = by_id("claude-opus-5-5");
-        assert_eq!(opus_55.api_name, "claude-opus-5-5");
+        assert_eq!(opus_55.default_request_name.as_str(), "claude-opus-5-5");
         assert_eq!(opus_55.context_window, 1_000_000);
         assert_eq!(opus_55.output_token_limit(), Some(128_000));
         assert_eq!(opus_55.effort_capabilities, effort_anthropic_opus_55());
@@ -921,7 +935,7 @@ mod tests {
         );
 
         let sonnet_55 = by_id("claude-sonnet-5-5");
-        assert_eq!(sonnet_55.api_name, "claude-sonnet-5-5");
+        assert_eq!(sonnet_55.default_request_name.as_str(), "claude-sonnet-5-5");
         assert_eq!(sonnet_55.context_window, 1_000_000);
         assert_eq!(sonnet_55.output_token_limit(), Some(128_000));
         assert_eq!(sonnet_55.effort_capabilities, effort_anthropic_xhigh());
@@ -1001,7 +1015,7 @@ mod tests {
             .into_iter()
             .find(|model| model.id == "gpt-6.1-sol")
             .unwrap();
-        assert_eq!(sol_61.api_name, "gpt-6.1-sol");
+        assert_eq!(sol_61.default_request_name.as_str(), "gpt-6.1-sol");
         assert_eq!(sol_61.context_window, 1_050_000);
         assert_eq!(sol_61.output_token_limit(), Some(128_000));
         assert_eq!(
@@ -1082,7 +1096,10 @@ mod tests {
         assert_eq!(model.backend, ModelBackend::OpenAIChatCompletions);
         assert_eq!(model.backend.api_format(), ApiFormat::OpenAIChatCompletions);
         assert_eq!(model.family, "Example AI");
-        assert_eq!(model.provider_header_value(), "provider");
+        assert_eq!(
+            model.default_request_name.as_str(),
+            "provider/example/chat-model"
+        );
         assert_eq!(model.output_token_limit(), Some(8_192));
     }
 
@@ -1137,7 +1154,7 @@ mod tests {
             .find(|spec| spec.id == "claude-sonnet-4-6")
             .unwrap();
 
-        assert_ne!(sonnet.api_name, "other-wire-name");
+        assert_ne!(sonnet.default_request_name.as_str(), "other-wire-name");
         assert_ne!(sonnet.context_window, 123);
     }
 }
