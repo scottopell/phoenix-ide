@@ -226,27 +226,29 @@ export class ViewJourneyLifecycle {
   inspect(): void {
     const attempt = this.attempt;
     const root = this.root;
-    if (!attempt || !root || this.finished) return;
+    if (!attempt || !root || this.finished || document.visibilityState !== 'visible') return;
     attempt.measurement.observerInspection();
     const transcript = root.querySelector('#messages');
-    if (!this.transcriptSeen && this.hydrated && isCommitVisible(transcript)) {
-      if (transcript && anyVisible(transcript, '[data-render-unit-key] > *, .empty-state', transcript, attempt.measurement)) {
-        attempt.measurement.mark('meaningful_transcript');
-        this.transcriptSeen = true;
-      }
+    const transcriptVisible = this.hydrated && isCommitVisible(transcript) && transcript !== null
+      && anyVisible(transcript, '[data-render-unit-key] > *, .empty-state', transcript, attempt.measurement);
+    if (transcriptVisible && !this.transcriptSeen) {
+      attempt.measurement.mark('meaningful_transcript');
+      this.transcriptSeen = true;
     }
     const nav = root.querySelector('#conversation-nav-trail');
-    if ((!this.breadcrumbSeen || !this.breadcrumbEnabled) && isCommitVisible(nav)) {
-      if (nav && anyVisible(nav, '.conversation-nav-item', nav, attempt.measurement)) {
-        attempt.measurement.mark('breadcrumb_presented');
-        this.breadcrumbSeen = true;
-      }
-      if (nav && anyVisible(nav, '.conversation-nav-item[role="button"]:not([aria-disabled="true"]):not([disabled])', nav, attempt.measurement)) {
-        attempt.measurement.mark('breadcrumb_enabled');
-        this.breadcrumbEnabled = true;
-      }
+    const breadcrumbVisible = isCommitVisible(nav) && nav !== null
+      && anyVisible(nav, '.conversation-nav-item', nav, attempt.measurement);
+    const breadcrumbEnabled = breadcrumbVisible && nav !== null
+      && anyVisible(nav, '.conversation-nav-item[role="button"]:not([aria-disabled="true"]):not([disabled])', nav, attempt.measurement);
+    if (breadcrumbVisible && !this.breadcrumbSeen) {
+      attempt.measurement.mark('breadcrumb_presented');
+      this.breadcrumbSeen = true;
     }
-    if (this.resumed && !this.anchorSeen && this.anchorProbe) {
+    if (breadcrumbEnabled && !this.breadcrumbEnabled) {
+      attempt.measurement.mark('breadcrumb_enabled');
+      this.breadcrumbEnabled = true;
+    }
+    if (this.resumed && this.anchorProbe) {
       const observation = this.anchorProbe();
       this.tailSettled = observation.kind === 'tail' && observation.settled;
       this.targetApplied = observation.kind === 'target' && observation.messageId === this.targetMessageId && observation.disposition === 'applied';
@@ -256,23 +258,25 @@ export class ViewJourneyLifecycle {
         return;
       }
     }
-    if (this.needsTarget && !this.anchorSeen && this.targetApplied && this.transcriptSeen && transcript && this.targetMessageId !== null) {
-      const target = document.getElementById(`message-${this.targetMessageId}`);
-      if (target && transcript.contains(target) && isCommitVisible(target, transcript)
-        && anyVisible(target, ':scope > *', transcript, attempt.measurement)) {
-        attempt.measurement.anchor('applied');
-        this.anchorSeen = true;
-      }
+    const target = this.targetMessageId === null ? null : document.getElementById(`message-${this.targetMessageId}`);
+    const targetVisible = this.needsTarget && this.targetApplied && transcriptVisible && transcript !== null
+      && target !== null && transcript.contains(target) && isCommitVisible(target, transcript)
+      && anyVisible(target, ':scope > *', transcript, attempt.measurement);
+    if (targetVisible && !this.anchorSeen) {
+      attempt.measurement.anchor('applied');
+      this.anchorSeen = true;
     }
-    if (!this.needsTarget && !this.anchorSeen && this.transcriptSeen && this.tailSettled) {
+    if (!this.needsTarget && !this.anchorSeen && transcriptVisible && this.tailSettled) {
       attempt.measurement.anchor('tail_pinned');
       this.anchorSeen = true;
     }
-    if (!this.needsTarget && !this.anchorSeen && this.transcriptSeen && transcript?.querySelector('.empty-state')) {
+    if (!this.needsTarget && !this.anchorSeen && transcriptVisible && isCommitVisible(transcript?.querySelector('.empty-state') ?? null, transcript)) {
       attempt.measurement.anchor('empty');
       this.anchorSeen = true;
     }
-    if (this.transcriptSeen && this.breadcrumbSeen && this.breadcrumbEnabled && this.anchorSeen) this.finish('ready');
+    const anchorCurrent = this.needsTarget ? targetVisible
+      : this.tailSettled || isCommitVisible(transcript?.querySelector('.empty-state') ?? null, transcript);
+    if (transcriptVisible && breadcrumbVisible && breadcrumbEnabled && this.anchorSeen && anchorCurrent) this.finish('ready');
   }
 }
 

@@ -289,6 +289,58 @@ describe('ViewJourneyLifecycle', () => {
     expect(JSON.stringify(payload(1))).not.toContain('Private target');
   });
 
+  it.each(['document', 'ancestor', 'breadcrumb'] as const)('does not finish a resumed tail from cached marks while current %s is hidden or disabled', async hidden => {
+    const { root, controller } = view();
+    hydrate(root, controller);
+    enable(root);
+    let settled = false;
+    controller.registerAnchorProbe(() => ({ kind: 'tail', settled }));
+    controller.finish('incomplete');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.resume('pwa_resume');
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    const button = root.querySelector('[role="button"]')!;
+    if (hidden === 'document') {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+      controller.visibility(false);
+    } else if (hidden === 'ancestor') root.setAttribute('aria-hidden', 'true');
+    else button.setAttribute('aria-disabled', 'true');
+    settled = true;
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    if (hidden === 'document') {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      controller.visibility(true);
+    } else if (hidden === 'ancestor') root.removeAttribute('aria-hidden');
+    else button.removeAttribute('aria-disabled');
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload(1)).toMatchObject({ outcome: 'ready', trigger: 'pwa_resume' });
+  });
+
+  it('does not reuse a prior visible target while waiting for breadcrumb enablement', async () => {
+    const { root, controller } = view();
+    controller.expectTarget(true, 'target');
+    hydrate(root, controller);
+    const target = root.querySelector('article')!;
+    target.id = 'message-target';
+    target.innerHTML = '<span>Private target</span>';
+    controller.anchor('applied');
+    controller.inspect();
+    target.hidden = true;
+    root.querySelector('#messages')!.insertAdjacentHTML('beforeend', '<div data-render-unit-key="other"><article>Other message</article></div>');
+    enable(root);
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).not.toHaveBeenCalled();
+    target.hidden = false;
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({ outcome: 'ready', anchor_result: 'applied' });
+  });
+
   it('expires unfinished views and coalesces inspection work, with no observer after completion', async () => {
     const { controller } = view();
     for (let i = 0; i < 1000; i++) controller.scheduleInspection();
