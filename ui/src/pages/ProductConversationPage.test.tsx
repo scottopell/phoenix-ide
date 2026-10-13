@@ -593,6 +593,22 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
   });
 
+  it.each([[false, false], [true, false], [false, true], [true, true]])('positions an omitted generated-opening bookmark at its exact persisted boundary (Global=%s, lazy=%s)', async (global, lazy) => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ before: null, has_older: false, boundaries: [{
+      message_id: 'cont-1', represented_successor_opening_message_id: 'represented-opening', predecessor_transcript_row_id: 'row-1', successor_transcript_row_id: 'row-2', segment_ordinal: 0,
+    }] });
+    const tail = lazy ? { ...initial, before: 'alias-older', has_older: true, segments: initial.segments.map(segment => ({ ...segment, messages: segment.messages.filter(message => message.message_id !== 'cont-1') })) } : initial;
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(initial)).mockResolvedValueOnce(coordinatorSnapshot(tail));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(initial).mockResolvedValueOnce(tail);
+    renderPage(global ? '/global/row-2?source_transcript=row-2#message-represented-opening' : '/product-conversations/pc-1?source_transcript=row-2#message-represented-opening');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'cont-1' } }));
+    expect(screen.queryByText('The linked message is not available')).not.toBeInTheDocument();
+    expect(screen.getByTestId('history-location')).toHaveTextContent('#message-represented-opening');
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(lazy ? 2 : 1);
+  });
+
   it.each([false, true])('excludes only the exact represented successor opening from live hydration (Global=%s)', async (global) => {
     const { api } = await import('../api');
     const boundary = { ...makeMessage('original-boundary', 2, 'row-1'), message_type: 'continuation' as const, content: { type: 'continuation', summary: 'Persisted summary' } };

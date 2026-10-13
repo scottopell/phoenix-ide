@@ -1268,9 +1268,11 @@ function ProductConversationPageInner({ productId, globalShell }: HistoryPagePro
   const transcriptTargetExhausted = !hashTargetMessageId && readerSelection.kind === 'transcript' && !transcriptTargetMessage && (
     snapshot?.has_older === false || snapshot?.segments.some((segment) => segment.segment_ordinal < readerSelection.segment.segment_ordinal && segment.messages.length > 0)
   );
-  const hashTargetLoaded = !!hashTargetMessageId && messages.some((message) => message.message_id === hashTargetMessageId);
+  const representedBoundary = hashTargetMessageId ? snapshot?.boundaries.find(boundary => boundary.represented_successor_opening_message_id === hashTargetMessageId) : undefined;
+  const resolvedHashTargetMessageId = representedBoundary?.message_id ?? hashTargetMessageId;
+  const hashTargetLoaded = !!resolvedHashTargetMessageId && messages.some((message) => message.message_id === resolvedHashTargetMessageId);
   const hashTargetExhausted = !!hashTargetMessageId && !hashTargetLoaded && snapshot?.has_older === false;
-  const positioningTargetMessageId = readerSelection.kind === 'unavailable' ? undefined : hashTargetLoaded ? hashTargetMessageId : transcriptTargetMessage?.message_id;
+  const positioningTargetMessageId = readerSelection.kind === 'unavailable' ? undefined : hashTargetLoaded ? resolvedHashTargetMessageId : transcriptTargetMessage?.message_id;
   const transcriptPositioning = (restoreCommand?.navigationToken === hashNavigationRef.current.token ? restoreCommand.positioning : null) ?? (positioningTargetMessageId && handledPositioningToken !== hashNavigationRef.current.token
     ? {
       kind: 'positioning' as const,
