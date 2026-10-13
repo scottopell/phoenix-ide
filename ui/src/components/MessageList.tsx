@@ -86,6 +86,7 @@ import {
   initialTranscriptPositioningState,
   reduceTranscriptPositioning,
   transcriptPositioningCommandKey,
+  type TranscriptPositioningCompletion,
   type TranscriptPositioningEffect,
   type TranscriptPositioningEvent,
   type TranscriptPositioningInput,
@@ -206,7 +207,7 @@ interface MessageListProps {
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
   transcriptPositioning: TranscriptPositioningInput;
-  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryView) => void) | undefined;
+  onHistoryScrollCommandHandled?: ((completion: TranscriptPositioningCompletion) => void) | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -1685,7 +1686,7 @@ function MessageListImpl({
           if (effect.command.kind === 'restore_after_prefix_expansion') {
             continuityRestoreInFlightRef.current = false;
           }
-          onHistoryScrollCommandHandled?.(effect.command.token, effect.result, effect.command.view);
+          onHistoryScrollCommandHandled?.({ commandKey: effect.commandKey, result: effect.result });
           break;
       }
     }
