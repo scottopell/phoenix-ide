@@ -161,20 +161,212 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
 
 export async function runVisibilityRoundTrip(page, context) {
   const witness = { scope: 'actual_tab_visibility_only_not_telemetry_background_readiness_or_physical_suspend', before: null, background: null, foreground: null };
-  const other = await context.newPage();
+  const other = await boundedObservation(context.newPage(), 5000, 'owned tab creation');
   try {
-    await page.bringToFront();
-    witness.before = await page.evaluate(() => document.visibilityState);
-    await other.bringToFront();
-    witness.background = await page.evaluate(() => document.visibilityState);
-    await page.bringToFront();
-    witness.foreground = await page.evaluate(() => document.visibilityState);
+    await boundedObservation(page.bringToFront(), 5000, 'foreground tab');
+    witness.before = await observePage(page, () => document.visibilityState);
+    await boundedObservation(other.bringToFront(), 5000, 'background tab');
+    witness.background = await observePage(page, () => document.visibilityState);
+    await boundedObservation(page.bringToFront(), 5000, 'foreground tab');
+    witness.foreground = await observePage(page, () => document.visibilityState);
     assert.equal(witness.before, 'visible');
     assert.equal(witness.foreground, 'visible');
     witness.status = witness.background === 'hidden' ? 'actual_tab_background_observed' : 'unsupported_no_actual_hidden_visibility';
     return witness;
   } finally {
-    try { await page.bringToFront(); } finally { await other.close(); }
+    try { await boundedObservation(page.bringToFront(), 5000, 'foreground tab'); } finally { await boundedObservation(other.close(), 5000, 'owned tab cleanup'); }
+  }
+}
+
+async function boundedObservation(promise, timeout, label) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} deadline`)), timeout);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+async function observePage(page, expression) {
+  return boundedObservation(page.evaluate(expression), 5000, 'page observation');
+}
+
+export function observePendingFiniteRequest(page, request, baseURL, expectedIdentity) {
+  assert.ok(expectedIdentity && Object.hasOwn(expectedIdentity, 'productConversationId'));
+  const requestURL = new URL(candidateDestination(request.url(), baseURL));
+  const requestId = requestURL.searchParams.get('open_id');
+  assert.ok(requestId && request.method() === 'GET');
+  assert.ok(requestURL.pathname.startsWith('/api/product-conversations/') || requestURL.pathname.startsWith('/api/global/coordinator/history/'));
+  assert.equal(request.timing().responseEnd, -1, 'capture must be armed before finite completion');
+  const reports = [];
+  const posts = new Map();
+  let navigationFailure = null;
+  let captureFailure = null;
+  let observedPosts = 0;
+  const onNavigation = frame => {
+    if (frame !== page.mainFrame()) return;
+    try { candidateDestination(frame.url(), baseURL); }
+    catch (error) { navigationFailure ??= error; }
+  };
+  let finished = false;
+  let finish;
+  let accepted;
+  const completion = new Promise(resolveCompletion => { finish = resolveCompletion; });
+  const terminal = new Promise(resolveTerminal => { accepted = resolveTerminal; });
+  const onFinished = observed => {
+    if (observed === request) { finished = true; finish({ ok: true }); }
+  };
+  const onFailed = observed => {
+    if (observed === request) { finished = true; finish({ ok: false }); }
+  };
+  const onRequest = observed => {
+    const url = new URL(observed.url());
+    if (url.origin !== new URL(baseURL).origin || url.pathname !== '/api/telemetry/conversation-view' || observed.method() !== 'POST') return;
+    if (observedPosts >= 16 || reports.length >= 2) { captureFailure ??= new Error('terminal report count bound'); accepted({ error: captureFailure }); return; }
+    observedPosts++;
+    const body = observed.postData() ?? '';
+    let report;
+    try {
+      assert.ok(body.length <= 8192 && Buffer.byteLength(body) <= 8192);
+      report = JSON.parse(body);
+      if (!report.correlations?.some(correlation => correlation.kind === 'request' && correlation.id === requestId)) return;
+      assertRequestCorrelation([requestId], report);
+      assert.equal(report.product_conversation_id, expectedIdentity.productConversationId, 'terminal report must belong to the fixture view');
+    } catch (error) { captureFailure ??= error; accepted({ error }); return; }
+    reports.push(report);
+    if (posts.size === 0) posts.set(observed, report);
+  };
+  const onResponse = response => {
+    const report = posts.get(response.request());
+    if (report) accepted({ report, status: response.status() });
+  };
+  page.on('framenavigated', onNavigation);
+  page.on('requestfinished', onFinished);
+  page.on('requestfailed', onFailed);
+  page.on('request', onRequest);
+  page.on('response', onResponse);
+  return {
+    requestId, reports,
+    assertPending() {
+      if (navigationFailure) throw navigationFailure;
+      assert.ok(!finished && request.timing().responseEnd === -1, 'finite request must still be pending');
+      assert.equal(reports.length, 0, 'journey must not already be terminal');
+    },
+    async waitFinished() {
+      assert.equal((await boundedObservation(completion, 10000, 'finite response completion')).ok, true, 'finite request failed');
+    },
+    async waitReport() {
+      const result = await boundedObservation(terminal, 5000, 'terminal collector response');
+      if (navigationFailure) throw navigationFailure;
+      if (captureFailure) throw captureFailure;
+      if (result.error) throw result.error;
+      assert.equal(reports.length, 1, 'one terminal report required');
+      assert.equal(result.status, 204, 'actual collector acceptance required');
+      return result.report;
+    },
+    assertFinal() {
+      if (navigationFailure) throw navigationFailure;
+      if (captureFailure) throw captureFailure;
+      assert.equal(reports.length, 1, 'late duplicate report must fail case drain');
+    },
+    close() {
+      page.off('framenavigated', onNavigation);
+      page.off('requestfinished', onFinished);
+      page.off('requestfailed', onFailed);
+      page.off('request', onRequest);
+      page.off('response', onResponse);
+    },
+  };
+}
+
+export async function runPendingBackgroundRoundTrip({ page, context, capture }) {
+  assert.equal(page.context(), context);
+  capture.assertPending();
+  const startingURL = page.url();
+  const origin = await observePage(page, () => performance.timeOrigin);
+  const witness = { scope: 'pending_finite_response_actual_tab_visibility_not_physical_suspend', background: null, foregroundAt: null };
+  const other = await boundedObservation(context.newPage(), 5000, 'owned tab creation');
+  try {
+    await boundedObservation(other.bringToFront(), 5000, 'background tab');
+    witness.background = await observePage(page, () => document.visibilityState);
+    if (witness.background !== 'hidden') {
+      witness.status = 'unsupported_no_actual_hidden_visibility';
+      return witness;
+    }
+    capture.assertPending();
+    await capture.waitFinished();
+    assert.equal(await observePage(page, () => document.visibilityState), 'hidden', 'response must finish while actually hidden');
+    assert.equal(capture.reports.length, 0, 'pending hidden view must not become ready');
+    witness.foregroundAt = await observePage(page, () => performance.now());
+    await boundedObservation(page.bringToFront(), 5000, 'foreground tab');
+    await page.waitForFunction(visibleReadiness, undefined, { timeout: 10000 });
+    witness.status = 'actual_hidden_response_then_visible_readiness';
+    witness.report = await capture.waitReport();
+    assertRequestCorrelation([capture.requestId], witness.report);
+    assertBackgroundReport(witness, witness.report);
+    assert.equal(page.url(), startingURL, 'background case must retain its fixture view');
+    assert.equal(await observePage(page, () => performance.timeOrigin), origin);
+    return witness;
+  } finally {
+    try { await boundedObservation(page.bringToFront(), 5000, 'foreground tab'); } finally { await boundedObservation(other.close(), 5000, 'owned tab cleanup'); }
+  }
+}
+
+export function assertBackgroundReport(witness, report) {
+  assert.equal(witness.status, 'actual_hidden_response_then_visible_readiness');
+  assert.equal(report.outcome, 'ready');
+  assert.equal(report.visible, true);
+  assert.ok(Number.isFinite(witness.foregroundAt));
+  for (const mark of ['meaningful_transcript', 'breadcrumb_presented', 'breadcrumb_enabled', 'anchor_settled']) {
+    assert.ok(Number.isFinite(report.marks[mark]), `missing ${mark}`);
+  }
+  assert.ok(report.background_ms > 0, 'actual hidden interval must be retained');
+}
+
+export async function runPendingSPACancellation({ page, baseURL, selector, capture }) {
+  capture.assertPending();
+  candidateDestination(page.url(), baseURL);
+  const target = page.locator(selector);
+  const href = await target.getAttribute('href');
+  assert.ok(href, 'cancellation must use a real navigable anchor');
+  const destination = candidateDestination(href, baseURL);
+  assert.notEqual(destination, page.url(), 'route replacement must change destination');
+  const origin = await observePage(page, () => performance.timeOrigin);
+  capture.assertPending();
+  await target.click({ timeout: 10000 });
+  await page.waitForURL(destination, { timeout: 10000 });
+  assert.equal(await observePage(page, () => performance.timeOrigin), origin, 'cross-document pagehide is not SPA cancellation');
+  assert.equal(candidateDestination(page.url(), baseURL), destination);
+  const report = await capture.waitReport();
+  assert.equal(candidateDestination(page.url(), baseURL), destination);
+  assert.equal(await observePage(page, () => performance.timeOrigin), origin);
+  assert.equal(report.outcome, 'canceled', 'ready/incomplete may not be relabeled canceled');
+  assertRequestCorrelation([capture.requestId], report);
+  return { scope: 'actual_anchor_same_document_route_replacement', status: 'observed_spa_canceled', report };
+}
+
+export async function runBFCacheRoundTrip(page, baseURL) {
+  const startingURL = candidateDestination(page.url(), baseURL);
+  try {
+    const before = await boundedObservation(page.evaluate(() => {
+      window.__phoenixQualificationPageshow = null;
+      window.addEventListener('pageshow', event => {
+        window.__phoenixQualificationPageshow = { persisted: event.persisted, timeOrigin: performance.timeOrigin };
+      }, { once: true });
+      return performance.timeOrigin;
+    }), 5000, 'BFCache witness setup');
+    await page.goto('about:blank', { timeout: 10000 });
+    await page.goBack({ timeout: 10000, waitUntil: 'domcontentloaded' });
+    candidateDestination(page.url(), baseURL);
+    const observed = await boundedObservation(page.evaluate(() => window.__phoenixQualificationPageshow ?? null), 5000, 'BFCache witness read');
+    const restored = observed?.persisted === true && observed.timeOrigin === before;
+    if (restored) await page.waitForFunction(visibleReadiness, undefined, { timeout: 10000 });
+    return { scope: 'actual_pageshow_persisted_and_same_document_not_standalone_or_physical_suspend',
+      status: restored ? 'actual_bfcache_restore_observed' : 'unsupported_no_actual_bfcache_restore', observed };
+  } catch (error) {
+    try { await page.goto(startingURL, { timeout: 10000, waitUntil: 'domcontentloaded' }); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'BFCache case and bounded restoration failed'); }
+    throw error;
   }
 }
 
