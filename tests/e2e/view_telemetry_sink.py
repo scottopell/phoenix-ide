@@ -8,6 +8,10 @@ import argparse
 import json
 import math
 import threading
+import time
+import re
+from contextlib import contextmanager
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -185,8 +189,7 @@ def validate_view(record, expected, forbidden):
             raise ValueError("invalid signed readiness difference")
 
 
-def serve(output, receipt):
-    capture = Capture(output)
+def make_server(capture):
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
             super().setup()
@@ -212,7 +215,12 @@ def serve(output, receipt):
                     capture.errors.append("transport_rejected")
                     capture.finish()
                 self.send_error(400, "bounded synthetic export rejected")
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    return HTTPServer(("127.0.0.1", 0), Handler)
+
+
+def serve(output, receipt):
+    capture = Capture(output)
+    server = make_server(capture)
     stop = threading.Timer(300, server.shutdown)
     stop.daemon = True
     stop.start()
@@ -223,6 +231,76 @@ def serve(output, receipt):
         server.server_close()
         stop.cancel()
         capture.finish()
+
+
+@dataclass(frozen=True)
+class TelemetrySink:
+    endpoint: str
+    service: str
+    output: Path
+
+    @property
+    def env(self):
+        return {
+            "PHOENIX_TRACE_EXPORTER": "otlp",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": self.endpoint,
+            "OTEL_SERVICE_NAME": self.service,
+        }
+
+    def assert_receipt(self, result, *, timeout=10):
+        """Await expected semantic exports; caller stops app before final_index drain check."""
+        if not 0 < timeout <= 15:
+            raise ValueError("invalid export deadline")
+        if isinstance(result, (str, Path)):
+            result = json.loads(Path(result).read_text())
+        journeys = result.get("journeys", [])
+        if not 0 < len(journeys) <= 64 or len({j["open_id"] for j in journeys}) != len(journeys):
+            raise ValueError("invalid expected journey inventory")
+        for journey in journeys:
+            mandatory = {"server.backend_source", "server.instance_id", "browser.frontend_source", "browser.outcome", "browser.route", "browser.trigger"}
+            if not mandatory.issubset(journey["expected"]):
+                raise ValueError("missing candidate expectation identity")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                index = final_index(self.output)
+                retrieved = []
+                for journey in journeys:
+                    view, children = retrieve(index, self.service, journey["open_id"])
+                    validate_view(view, {**journey["expected"], "open.id": journey["open_id"]}, result.get("forbidden", []))
+                    validate_correlations(index, view, children, journey["correlations"])
+                    retrieved.append({"open_id": journey["open_id"], "trace_id": view["trace_id"], "correlations": len(children)})
+                return {"retrieved": retrieved, "bytes": index["bytes"], "spans": index["spans"]}
+            except (FileNotFoundError, ValueError):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
+@contextmanager
+def telemetry_sink(output_dir, run_id):
+    """Existing harness owns app/export drain; this context owns only loopback receiver."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", run_id):
+        raise ValueError("invalid synthetic run identity")
+    capture = Capture(Path(output_dir) / f"view-telemetry-{run_id}")
+    server = make_server(capture)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    stop = threading.Timer(300, server.shutdown)
+    stop.daemon = True
+    stop.start()
+    handle = TelemetrySink(f"http://127.0.0.1:{server.server_port}/v1/traces", f"phoenix-view-qualification-{run_id}", capture.output)
+    try:
+        yield handle
+    finally:
+        stop.cancel()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=4)
+        capture.finish()
+        if thread.is_alive():
+            raise RuntimeError("sink teardown deadline exceeded")
 
 
 if __name__ == "__main__":

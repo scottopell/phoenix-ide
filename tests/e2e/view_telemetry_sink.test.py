@@ -18,6 +18,7 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTrace
 
 spec = importlib.util.spec_from_file_location("sink", Path(__file__).with_name("view_telemetry_sink.py"))
 sink = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = sink
 spec.loader.exec_module(sink)
 OPEN = "a74e65c7-3bd0-43d5-87ed-1e2b3cfb7200"
 SERVICE = "synthetic-view-qualification"
@@ -180,6 +181,60 @@ class SinkTests(unittest.TestCase):
             finally:
                 process.terminate()
                 process.communicate(timeout=3)
+
+    def test_context_contract_isolated_env_semantic_receipt_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with sink.telemetry_sink(directory, "unit-run") as handle:
+                self.assertEqual(set(handle.env), {"PHOENIX_TRACE_EXPORTER", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_SERVICE_NAME"})
+                self.assertEqual(handle.env["PHOENIX_TRACE_EXPORTER"], "otlp")
+                request = wire(0)
+                request.resource_spans[0].resource.attributes[0].value.string_value = handle.service
+                view = request.resource_spans[0].scope_spans[0].spans[0]
+                for key, value in {"browser.frontend_source": "b" * 40, "browser.route": "ordinary", "browser.trigger": "navigation"}.items():
+                    view.attributes.add(key=key).value.string_value = value
+                expected = {"server.backend_source": "a" * 40, "server.instance_id": "candidate-instance", "browser.frontend_source": "b" * 40, "browser.outcome": "ready", "browser.route": "ordinary", "browser.trigger": "navigation"}
+                result = {"journeys": [{"open_id": OPEN, "expected": expected, "correlations": []}], "forbidden": ["private transcript"]}
+                with self.assertRaises(FileNotFoundError):
+                    handle.assert_receipt(result, timeout=0.01)
+                with urllib.request.urlopen(urllib.request.Request(handle.endpoint, data=request.SerializeToString(), headers={"Content-Type": "application/x-protobuf"}), timeout=3):
+                    pass
+                receipt = handle.assert_receipt(result, timeout=1)
+                self.assertEqual(receipt["retrieved"][0]["trace_id"], (b"t" * 16).hex())
+                with self.assertRaises(ValueError):
+                    handle.assert_receipt({"journeys": []}, timeout=1)
+            self.assertEqual(sink.final_index(handle.output)["spans"], 1)
+            with self.assertRaises(urllib.error.URLError):
+                urllib.request.urlopen(handle.endpoint, timeout=1)
+            with self.assertRaises(ValueError):
+                with sink.telemetry_sink(directory, "../invalid"):
+                    pass
+
+    def test_final_phoenix_helper_rejects_unexpected_export_and_browser_failure(self):
+        sys.path.insert(0, str(Path(__file__).parent))
+        from assert_view_telemetry import assertPhoenixTelemetry
+        with tempfile.TemporaryDirectory() as directory:
+            capture = sink.Capture(Path(directory) / "capture")
+            request = wire(0)
+            service = "history-qualification-final"
+            request.resource_spans[0].resource.attributes[0].value.string_value = service
+            span = request.resource_spans[0].scope_spans[0].spans[0]
+            for key, value in {"browser.frontend_source": "b" * 40, "browser.route": "ordinary", "browser.trigger": "navigation"}.items():
+                span.attributes.add(key=key).value.string_value = value
+            capture.accept(request.SerializeToString())
+            expected = {"server.backend_source": "a" * 40, "server.instance_id": "candidate-instance", "browser.frontend_source": "b" * 40, "browser.outcome": "ready", "browser.route": "ordinary", "browser.trigger": "navigation"}
+            cases = [{"open_id": OPEN, "expected": expected, "correlations": []}]
+            drain = {"run_id": "final", "service_name": service, "app_stopped": True, "receiver_stopped": True, "errors": []}
+            with self.assertRaises(ValueError):
+                assertPhoenixTelemetry(capture.output, service, "final", cases, drain_receipt={})
+            self.assertEqual(len(assertPhoenixTelemetry(capture.output, service, "final", cases, drain_receipt=drain)["retrieved"]), 1)
+            path = Path(directory) / "browser.json"
+            path.write_text(json.dumps({"runId": "final", "serviceName": service, "journeys": cases, "failure": "oracle failed"}))
+            with self.assertRaises(ValueError):
+                assertPhoenixTelemetry(capture.output, service, "final", path, drain_receipt=drain)
+            request.resource_spans[0].scope_spans[0].spans[0].attributes[0].value.string_value = "different-journey"
+            capture.accept(request.SerializeToString())
+            with self.assertRaises(ValueError):
+                assertPhoenixTelemetry(capture.output, service, "final", cases, drain_receipt=drain)
 
     def test_rejects_excess_correlation_children(self):
         index = {"errors": [], "records": sink.decode(wire(17).SerializeToString())}
