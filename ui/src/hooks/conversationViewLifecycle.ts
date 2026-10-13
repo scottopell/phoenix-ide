@@ -1,3 +1,4 @@
+import type { ViewAnchorProbe } from './conversationViewAnchorProbe';
 import type { AnchorResult, ConversationViewJourney, JourneyOutcome, JourneyTrigger } from './conversationViewJourney';
 import type { ViewResponseMetadata } from './conversationViewResponse';
 export interface ViewRequestObservation {
@@ -44,6 +45,8 @@ export class ViewJourneyLifecycle {
   private needsTarget = false;
   private targetMessageId: string | null = null;
   private targetApplied = false;
+  private anchorProbe: ViewAnchorProbe | null = null;
+  private resumed = false;
   private transcriptSeen = false;
   private breadcrumbSeen = false;
   private breadcrumbEnabled = false;
@@ -85,6 +88,8 @@ export class ViewJourneyLifecycle {
     root.addEventListener('animationend', this.scheduleInspection, { passive: true });
     this.scheduleInspection();
   };
+
+  registerAnchorProbe = (probe: ViewAnchorProbe | null): void => { this.anchorProbe = probe; };
 
   expectTarget(required: boolean, messageId: string | null = null): void {
     if (this.targetMessageId !== messageId) this.targetApplied = false;
@@ -180,6 +185,7 @@ export class ViewJourneyLifecycle {
   }
 
   resume(trigger: JourneyTrigger = 'pwa_resume'): void {
+    this.resumed = true;
     this.finish('incomplete');
     this.identity = { ...this.identity, trigger, visible: true, cache: 'retained', response_size_bucket: 'unknown' };
     this.attempt = undefined;
@@ -238,6 +244,16 @@ export class ViewJourneyLifecycle {
       if (nav && anyVisible(nav, '.conversation-nav-item[role="button"]:not([aria-disabled="true"]):not([disabled])', nav, attempt.measurement)) {
         attempt.measurement.mark('breadcrumb_enabled');
         this.breadcrumbEnabled = true;
+      }
+    }
+    if (this.resumed && !this.anchorSeen && this.anchorProbe) {
+      const observation = this.anchorProbe();
+      this.tailSettled = observation.kind === 'tail' && observation.settled;
+      this.targetApplied = observation.kind === 'target' && observation.messageId === this.targetMessageId && observation.disposition === 'applied';
+      if (observation.kind === 'target' && observation.messageId === this.targetMessageId && observation.disposition !== 'applied') {
+        attempt.measurement.anchor(observation.disposition);
+        this.finish('incomplete');
+        return;
       }
     }
     if (this.needsTarget && !this.anchorSeen && this.targetApplied && this.transcriptSeen && transcript && this.targetMessageId !== null) {

@@ -218,6 +218,77 @@ describe('ViewJourneyLifecycle', () => {
     expect(payload()).toMatchObject({ observer_scan_limited: true, observer_inspection_count: 1, marks: { meaningful_transcript: null } });
   });
 
+  it.each(['pwa_resume', 'back_forward'] as const)('observes fresh retained tail on %s without a new scroll event', async trigger => {
+    const { root, controller } = view();
+    hydrate(root, controller);
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    const probe = vi.fn(() => ({ kind: 'tail' as const, settled: true }));
+    controller.registerAnchorProbe(probe);
+    now = 90;
+    controller.resume(trigger);
+    expect(controller.openId).toBeDefined();
+    await Promise.resolve();
+    now = 95;
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(probe).toHaveBeenCalled();
+    expect(payload(1)).toMatchObject({ outcome: 'ready', trigger, marks: { anchor_settled: 5 } });
+  });
+
+  it('rejects supersession and hidden retained targets before a fresh applied observation', async () => {
+    const { root, controller } = view();
+    controller.expectTarget(true, 'target');
+    hydrate(root, controller);
+    enable(root);
+    const target = root.querySelector('article')!;
+    target.id = 'message-target';
+    target.innerHTML = '<span>Private target</span>';
+    controller.anchor('applied');
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    let applied = false;
+    controller.registerAnchorProbe(() => applied ? { kind: 'target', messageId: 'target', disposition: 'applied' } : { kind: 'pending' });
+    now = 90;
+    controller.resume('pwa_resume');
+    expect(controller.openId).toBeDefined();
+    await Promise.resolve();
+    controller.inspect();
+    expect(send).toHaveBeenCalledTimes(1);
+    applied = true;
+    target.hidden = true;
+    controller.inspect();
+    expect(send).toHaveBeenCalledTimes(1);
+    target.hidden = false;
+    now = 99;
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload(1)).toMatchObject({ outcome: 'ready', marks: { anchor_settled: 9 } });
+  });
+
+  it.each(['target_missing', 'superseded'] as const)('preserves current %s on resume instead of recycling successful settlement', async disposition => {
+    const { root, controller } = view();
+    controller.expectTarget(true, 'target');
+    hydrate(root, controller);
+    enable(root);
+    const target = root.querySelector('article')!;
+    target.id = 'message-target';
+    target.innerHTML = '<span>Private target</span>';
+    controller.anchor('applied');
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    controller.registerAnchorProbe(() => ({ kind: 'target', messageId: 'target', disposition }));
+    now = 90;
+    controller.resume('back_forward');
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload(1)).toMatchObject({ outcome: 'incomplete', anchor_result: disposition });
+    expect(payload(1).marks.anchor_settled).toBeNull();
+    expect(JSON.stringify(payload(1))).not.toContain('Private target');
+  });
+
   it('expires unfinished views and coalesces inspection work, with no observer after completion', async () => {
     const { controller } = view();
     for (let i = 0; i < 1000; i++) controller.scheduleInspection();

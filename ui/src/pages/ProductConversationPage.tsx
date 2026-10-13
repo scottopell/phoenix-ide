@@ -1422,6 +1422,14 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           messages={messages}
           onViewChaptersReady={journey.chaptersReady}
           onViewTailSettled={journey.tailAnchorSettled}
+          onViewAnchorProbe={journey.registerAnchorProbe}
+          viewAnchorIntent={{
+            scope: `${hashNavigationRef.current.token}:${observedSegmentId ?? ''}:${historyGeneration}`,
+            ...(positioningTargetMessageId ? { command: {
+              kind: 'jump_to_message' as const, token: hashNavigationRef.current.token, requestToken: 0,
+              view: transcriptView, targetMessageId: positioningTargetMessageId,
+            } } : { command: null, view: transcriptView }),
+          }}
           historyBoundaries={snapshot.boundaries}
           streamingRequestId={closeInProgress ? null : currentMemberTranscript?.streamingRequestId ?? null}
           pendingMessages={aggregatePendingMessages}

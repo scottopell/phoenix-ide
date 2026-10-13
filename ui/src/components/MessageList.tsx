@@ -1,3 +1,4 @@
+import { observeOwningAnchor, type ViewAnchorIntent, type ViewAnchorProbe, type ViewAnchorTerminal } from '../hooks/conversationViewAnchorProbe';
 import {
   memo,
   useState,
@@ -200,6 +201,8 @@ interface MessageListProps {
    *  coordinate space — no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
   onViewTailSettled?: (() => void) | undefined;
+  viewAnchorIntent?: ViewAnchorIntent | undefined;
+  onViewAnchorProbe?: ((probe: ViewAnchorProbe | null) => void) | undefined;
   hasOlderMessages?: boolean | undefined;
   onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => Promise<void>) | undefined;
   onUpdateOlderMessagesRestore?: ((restoreBasis: RestoreBasis) => void) | undefined;
@@ -577,6 +580,8 @@ function MessageListImpl({
   onVisibleRangeChange,
   onChaptersChange,
   onViewTailSettled,
+  viewAnchorIntent,
+  onViewAnchorProbe,
   hasOlderMessages = false,
   onLoadOlderMessages,
   onUpdateOlderMessagesRestore,
@@ -857,6 +862,17 @@ function MessageListImpl({
   ));
   const dispatchTranscriptPositioningRef = useRef<(event: TranscriptPositioningEvent) => void>(() => {});
   const lastPhysicalSnapshotRef = useRef<VirtualTranscriptPhysicalSnapshot | null>(null);
+  const viewAnchorIntentRef = useRef(viewAnchorIntent);
+  viewAnchorIntentRef.current = viewAnchorIntent;
+  const viewAnchorTerminalRef = useRef<ViewAnchorTerminal | null>(null);
+  const viewAnchorCommandOwnerRef = useRef<{ key: string; scope: string } | null>(null);
+  useLayoutEffect(() => {
+    onViewAnchorProbe?.(() => {
+      const intent = viewAnchorIntentRef.current;
+      return intent ? observeOwningAnchor(intent, viewAnchorTerminalRef.current, transcriptPositioningStateRef.current, scrollMachineRef.current, scrollerRef.current) : { kind: 'pending' };
+    });
+    return () => onViewAnchorProbe?.(null);
+  }, [onViewAnchorProbe]);
   const transcriptPositioningViewKeyRef = useRef(historyViewKey(
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   ));
@@ -1588,6 +1604,7 @@ function MessageListImpl({
     for (const effect of effects) {
       switch (effect.type) {
         case 'resolve_target': {
+          viewAnchorCommandOwnerRef.current = viewAnchorIntentRef.current ? { key: effect.commandKey, scope: viewAnchorIntentRef.current.scope } : null;
           const targetIndex = findUnitIndexByMessageId(effect.targetMessageId);
           dispatchTranscriptPositioningRef.current(
             targetIndex < 0
@@ -1682,6 +1699,9 @@ function MessageListImpl({
           break;
         }
         case 'finish':
+          if (viewAnchorCommandOwnerRef.current?.key === effect.commandKey) {
+            viewAnchorTerminalRef.current = { scope: viewAnchorCommandOwnerRef.current.scope, command: effect.command, result: effect.result };
+          }
           if (effect.command.kind === 'restore_after_prefix_expansion') {
             continuityRestoreInFlightRef.current = false;
           }

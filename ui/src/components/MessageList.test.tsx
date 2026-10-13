@@ -1067,6 +1067,32 @@ describe('MessageList', () => {
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps terminal probe ownership at issuance when a selected segment changes before finish', () => {
+    const message = makeMessage(1, 'user');
+    const view = { conversationId: 'probe-product', generation: 2, transcriptGeneration: 3 };
+    const command: HistoryScrollCommand = { kind: 'jump_to_message', token: 4, requestToken: 0, view, targetMessageId: message.message_id };
+    let probe: import('../hooks/conversationViewAnchorProbe').ViewAnchorProbe | null = null;
+    const register = (next: typeof probe) => { probe = next; };
+    virtualTranscriptMock.currentSnapshot = { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 1, targetMeasured: false };
+    const list = (scope: string) => withConvContext(<MessageList
+      streamingRequestId={null} messages={[message]} pendingMessages={[]} convState={idleState}
+      onRetry={vi.fn()} onOpenFile={undefined} conversationId="probe-product"
+      transcriptPositioning={{ kind: 'positioning', command }}
+      viewAnchorIntent={{ scope, command }} onViewAnchorProbe={register}
+    />);
+    const { rerender } = render(list('original-segment'));
+    expect(probe!()).toEqual({ kind: 'pending' });
+    virtualTranscriptMock.currentSnapshot = { renderedRange: { startIndex: 0, endIndex: 0 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: 2, targetMeasured: true };
+    rerender(list('new-segment'));
+    act(() => virtualTranscriptMock.rangeChanged?.(virtualTranscriptMock.currentSnapshot));
+    const calls = virtualTranscriptMock.physicalSnapshot.mock.calls.length;
+    expect(probe!()).toEqual({ kind: 'pending' });
+    expect(virtualTranscriptMock.physicalSnapshot).toHaveBeenCalledTimes(calls);
+    rerender(list('original-segment'));
+    expect(probe!()).toEqual({ kind: 'target', messageId: message.message_id, disposition: 'applied' });
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+  });
+
   it('does not apply a pending highlight to a new conversation reusing the same row key', () => {
     const listRef = createRef<React.ElementRef<typeof MessageList>>();
     const messages = [makeMessage(1, 'user')];
