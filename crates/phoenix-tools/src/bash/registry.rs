@@ -981,6 +981,15 @@ impl BashHandleRegistry {
         &self,
         permit: &BashRetirementPermit,
     ) -> BashRetirementOutcome {
+        self.complete_retirement_with_policy(permit, SignalFailurePolicy::Stop)
+            .await
+    }
+
+    async fn complete_retirement_with_policy(
+        &self,
+        permit: &BashRetirementPermit,
+        failure_policy: SignalFailurePolicy,
+    ) -> BashRetirementOutcome {
         let mut report = CascadeBashReport {
             teardown_generation: Some(permit.generation()),
             ..CascadeBashReport::default()
@@ -993,20 +1002,25 @@ impl BashHandleRegistry {
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
             }
-            signal_retirement_handles(&permit.removed_handles, &mut report, |handle| async move {
-                #[cfg(unix)]
-                {
-                    handle
-                        .signal_live_incarnation(libc::SIGKILL)
-                        .await
-                        .map(|_| ())
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = handle;
-                    Ok(())
-                }
-            })
+            signal_retirement_handles(
+                &permit.removed_handles,
+                &mut report,
+                failure_policy,
+                |handle| async move {
+                    #[cfg(unix)]
+                    {
+                        handle
+                            .signal_live_incarnation(libc::SIGKILL)
+                            .await
+                            .map(|_| ())
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = handle;
+                        Ok(())
+                    }
+                },
+            )
             .await;
         }
 
@@ -1148,7 +1162,10 @@ pub async fn teardown_bash_owner(
     work_scope: &ResourceScopeKey,
 ) -> CascadeBashReport {
     let permit = registry.begin_retirement(work_scope).await;
-    registry.complete_retirement(&permit).await.into_report()
+    registry
+        .complete_retirement_with_policy(&permit, SignalFailurePolicy::Continue)
+        .await
+        .into_report()
 }
 
 async fn kill_selected_handles(
@@ -1281,9 +1298,16 @@ fn record_retirement_target_in_report(
     record_handle_in_report(report, target.pgid, target.pid, target.kill_pending_kernel);
 }
 
+#[derive(Clone, Copy)]
+enum SignalFailurePolicy {
+    Stop,
+    Continue,
+}
+
 async fn signal_retirement_handles<F, Fut>(
     handles: &[Arc<Handle>],
     report: &mut CascadeBashReport,
+    failure_policy: SignalFailurePolicy,
     mut signal: F,
 ) where
     F: FnMut(Arc<Handle>) -> Fut,
@@ -1298,7 +1322,9 @@ async fn signal_retirement_handles<F, Fut>(
                 i32::try_from(handle.launch_identity.process.pid).unwrap_or(i32::MAX),
                 error.to_string(),
             ));
-            break;
+            if matches!(failure_policy, SignalFailurePolicy::Stop) {
+                break;
+            }
         }
     }
 }
@@ -2157,7 +2183,7 @@ mod tests {
         ];
         let mut calls = Vec::new();
         let mut report = CascadeBashReport::default();
-        signal_retirement_handles(&handles, &mut report, |handle| {
+        signal_retirement_handles(&handles, &mut report, SignalFailurePolicy::Stop, |handle| {
             calls.push(handle.handle_id.as_str().to_owned());
             std::future::ready(Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -2172,6 +2198,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_delete_attempts_every_handle_even_after_signal_failure() {
+        let handles = vec![
+            make_handle_with_identity("owner", "first", "first", 41, 41, RING_BUFFER_BYTES),
+            make_handle_with_identity("owner", "second", "second", 42, 42, RING_BUFFER_BYTES),
+        ];
+        let mut calls = Vec::new();
+        let mut report = CascadeBashReport::default();
+        signal_retirement_handles(
+            &handles,
+            &mut report,
+            SignalFailurePolicy::Continue,
+            |handle| {
+                calls.push(handle.handle_id.as_str().to_owned());
+                std::future::ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "signal denied",
+                )))
+            },
+        )
+        .await;
+        assert_eq!(calls, vec!["first", "second"]);
+        assert_eq!(
+            report
+                .kill_failures
+                .iter()
+                .map(|(pid, _)| *pid)
+                .collect::<Vec<_>>(),
+            vec![41, 42]
+        );
+    }
+
+    #[tokio::test]
     async fn retirement_signals_every_live_handle_when_all_signals_succeed() {
         let handles = vec![
             make_handle_with_identity("owner", "first", "first", 41, 41, RING_BUFFER_BYTES),
@@ -2179,7 +2237,7 @@ mod tests {
         ];
         let mut calls = Vec::new();
         let mut report = CascadeBashReport::default();
-        signal_retirement_handles(&handles, &mut report, |handle| {
+        signal_retirement_handles(&handles, &mut report, SignalFailurePolicy::Stop, |handle| {
             calls.push(handle.handle_id.as_str().to_owned());
             std::future::ready(Ok(()))
         })
