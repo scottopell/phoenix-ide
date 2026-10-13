@@ -1241,6 +1241,47 @@ impl Database {
         result
     }
 
+    /// Reads receipt authority only when it describes the content update being delivered.
+    ///
+    /// # Errors
+    /// Missing generation, superseded content/generation, or invalid receipts require reconciliation.
+    pub async fn read_message_continuation_opening_at_update(
+        &self,
+        message_id: &str,
+        generation: Option<i64>,
+        content: &MessageContent,
+    ) -> DbResult<Option<ContinuationOpeningRead>> {
+        let mut tx = self.pool.begin().await?;
+        let result = async {
+            let row = sqlx::query(
+                "SELECT handoff.successor_conversation_id, conversation.transcript_generation,
+                        message.message_type, message.content
+                 FROM completed_continuation_handoffs handoff
+                 JOIN messages message ON message.message_id = handoff.accepted_successor_message_id
+                 JOIN conversations conversation ON conversation.id = message.conversation_id
+                 WHERE handoff.accepted_successor_message_id = ?1",
+            )
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let actual_generation: i64 = row.try_get("transcript_generation")?;
+            let actual_content = message_content_from_row(&row, "message_type", "content")?;
+            if generation != Some(actual_generation) || content != &actual_content {
+                return Err(DbError::TranscriptSnapshotChanged);
+            }
+            let successor: String = row.try_get("successor_conversation_id")?;
+            Self::read_continuation_opening_on(&mut tx, &successor)
+                .await
+                .map(Some)
+        }
+        .await;
+        tx.rollback().await?;
+        result
+    }
+
     /// Fences an opening read against the transcript selected for SSE init.
     ///
     /// # Errors
@@ -1259,7 +1300,7 @@ impl Database {
                  FROM conversations WHERE id = ?1",
             ).bind(successor).fetch_one(&mut *tx).await?;
             if actual != (generation, tail) {
-                return Err(DbError::Serialization("transcript changed during opening snapshot read".into()));
+                return Err(DbError::TranscriptSnapshotChanged);
             }
             Self::read_continuation_opening_on(&mut tx, successor).await
         }.await;
@@ -2102,6 +2143,56 @@ mod tests {
                     .is_pending());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn opening_update_fence_rejects_delayed_edit_and_restored_content_generation() {
+        let (db, _, successor) = opening_fixture(true).await;
+        let restored = MessageContent::Continuation(ContinuationContent {
+            summary: "exact opening context".into(),
+        });
+        db.add_message("reserved:key", &successor.id, &restored, None, None)
+            .await
+            .unwrap();
+        let edited = MessageContent::Continuation(ContinuationContent {
+            summary: "edit A".into(),
+        });
+        for (generation, content) in [(1, &edited), (2, &restored)] {
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = 'reserved:key'")
+                .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE conversations SET transcript_generation = ?1 WHERE id = ?2")
+                .bind(generation)
+                .bind(&successor.id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        for (generation, content) in [
+            (Some(1), &edited),
+            (Some(2), &edited),
+            (Some(1), &restored),
+            (None, &restored),
+        ] {
+            assert!(matches!(
+                db.read_message_continuation_opening_at_update("reserved:key", generation, content)
+                    .await,
+                Err(DbError::TranscriptSnapshotChanged)
+            ));
+        }
+        assert!(matches!(
+            db.read_message_continuation_opening_at_update("reserved:key", Some(2), &restored)
+                .await
+                .unwrap(),
+            Some(ContinuationOpeningRead::Accepted {
+                presentation: ContinuationOpeningPresentation::Boundary,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

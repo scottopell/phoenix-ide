@@ -79,8 +79,12 @@
 -- null means no observation, not no opening evidence. A committed message
 -- observation is attached only to the exact receipt's accepted message ID.
 -- No summary text is copied into this envelope. Content updates recompute the
--- observation from committed content; read errors close the stream visibly.
--- Token-shared init omits pending observations (null) to avoid exposing an
+-- observation in the same read transaction as an exact content/generation check
+-- against the event being delivered. Both live updates and init pending_events
+-- use this fence; mismatches and read errors log and close for reconciliation.
+-- Init snapshot generation/tail mismatches retry the bounded stable read;
+-- invalid persisted authority remains an error, never absent evidence.
+-- Token-shared live and replayed envelopes omit pending observations (null) to avoid exposing an
 -- unpublished ClientTurnKey. Accepted transcript observations remain visible.
 -- Init opening authority is read in a transaction fenced by the selected
 -- transcript's generation and append watermark. Live acceptance is read after

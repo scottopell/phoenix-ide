@@ -229,6 +229,8 @@ pub enum DbError {
     MessageConflict(String),
     #[error("Slug already exists: {0}")]
     SlugExists(String),
+    #[error("transcript changed during opening observation read")]
+    TranscriptSnapshotChanged,
     #[error("Serialization error: {0}")]
     Serialization(String),
     #[error("Continuation precondition failed: {0}")]
