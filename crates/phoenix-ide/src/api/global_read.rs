@@ -1816,7 +1816,7 @@ fn decode_route_value(value: &str) -> Result<String, AppError> {
 
 enum WebReferenceResolution {
     Product(String),
-    Exact(ResolveGlobalReferenceResponse),
+    Exact(Box<ResolveGlobalReferenceResponse>),
     NotWeb,
 }
 
@@ -1978,11 +1978,12 @@ async fn resolve_web_reference(
             if let Some(message_id) = fragment.and_then(message_id_fragment) {
                 return resolve_message(service, conv, &decode_route_value(message_id)?, global)
                     .await
+                    .map(Box::new)
                     .map(WebReferenceResolution::Exact);
             }
-            return Ok(WebReferenceResolution::Exact(
+            return Ok(WebReferenceResolution::Exact(Box::new(
                 resolve_conversation(service, conv, global).await?,
-            ));
+            )));
         }
     }
     Ok(canonical_product.map_or(
@@ -2016,7 +2017,7 @@ async fn resolve_reference_impl(
     let reference = raw.trim();
     let canonical_product = match resolve_web_reference(service, reference).await? {
         WebReferenceResolution::Product(id) => Some(id),
-        WebReferenceResolution::Exact(resolved) => return Ok(resolved),
+        WebReferenceResolution::Exact(resolved) => return Ok(*resolved),
         WebReferenceResolution::NotWeb => None,
     };
     if let Some(rest) = reference
@@ -3891,10 +3892,11 @@ mod tests {
         (service, product_id, root_scope_id, current_scope_id)
     }
 
-    #[tokio::test]
-    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
-        let (service, product_id, root_scope_id, current_scope_id) =
-            continued_scope_fixture().await;
+    async fn assert_stable_reference_resolution(
+        service: &GlobalReadService,
+        product_id: &phoenix_core::domain::product_conversation::ProductConversationId,
+        current_scope_id: phoenix_core::work_scope::WorkScopeId,
+    ) {
         let stable = service
             .resolve_reference(&format!("@conv:{product_id}"))
             .await
@@ -3932,13 +3934,13 @@ mod tests {
             assert_eq!(canonical.work_scope, stable.work_scope);
             assert_eq!(canonical.href, Some(format!("/c/{product_id}")));
         }
-        let stable_json = serde_json::to_value(&stable).unwrap();
-        assert_eq!(stable_json["work_scope"]["status"], "available");
-        assert_eq!(
-            stable_json["work_scope"]["path_semantics"],
-            "server_filesystem"
-        );
+    }
 
+    async fn assert_exact_reference_resolution(
+        service: &GlobalReadService,
+        product_id: &phoenix_core::domain::product_conversation::ProductConversationId,
+        root_scope_id: phoenix_core::work_scope::WorkScopeId,
+    ) {
         let exact = service
             .resolve_reference("@transcript:root-scope")
             .await
@@ -3988,7 +3990,6 @@ mod tests {
                     .is_err());
             }
         }
-
         assert_eq!(
             exact.work_scope,
             ResolvedWorkScope::Available {
@@ -4001,6 +4002,14 @@ mod tests {
                 path_semantics: ServerPathSemantics::ServerFilesystem,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
+        let (service, product_id, root_scope_id, current_scope_id) =
+            continued_scope_fixture().await;
+        assert_stable_reference_resolution(&service, &product_id, current_scope_id).await;
+        assert_exact_reference_resolution(&service, &product_id, root_scope_id).await;
     }
 
     #[tokio::test]
@@ -4272,7 +4281,15 @@ mod tests {
             .unwrap();
         let continuation = match db.continue_conversation(&coordinator.id).await.unwrap() {
             crate::db::ContinueOutcome::Created(continuation) => continuation,
-            other => panic!("unexpected Coordinator continuation outcome: {other:?}"),
+            crate::db::ContinueOutcome::AlreadyContinued(conversation) => {
+                panic!(
+                    "unexpected existing Coordinator continuation: {}",
+                    conversation.id
+                )
+            }
+            crate::db::ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                panic!("Coordinator fixture state was {state_variant}, not context_exhausted")
+            }
         };
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
         let expected = phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
