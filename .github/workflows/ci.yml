@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 6002226dad1ddcf7ef2e7bb73f4cb777aad8b8e5
+          ref: 41e6d85a1d430b07235953826ce5524d9f875582
           path: pinned-app
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -247,7 +247,7 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 6002226dad1ddcf7ef2e7bb73f4cb777aad8b8e5
+          test "$(git rev-parse HEAD)" = 41e6d85a1d430b07235953826ce5524d9f875582
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
