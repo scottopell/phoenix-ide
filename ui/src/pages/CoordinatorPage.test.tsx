@@ -150,18 +150,27 @@ describe('CoordinatorPage', () => {
       handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123, can_stop: true,
     }]);
 
-    let releaseCanonicalValidation!: (value: { conversation: { id: string } }) => void;
+    let validationReleased = false;
+    const pendingValidations: Array<(value: { conversation: { id: string } }) => void> = [];
     apiMock.getConversation
       .mockResolvedValueOnce({ conversation: { id: 'source-1' } })
-      .mockReturnValueOnce(new Promise(resolve => { releaseCanonicalValidation = resolve; }));
-    renderPage('/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source');
+      .mockImplementation((id: string) => validationReleased
+        ? Promise.resolve({ conversation: { id } })
+        : new Promise(resolve => { pendingValidations.push(resolve); }));
+    render(<MemoryRouter initialEntries={['/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source']}><Routes>
+      <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+    </Routes></MemoryRouter>);
 
-    await waitFor(() => expect(apiMock.getConversation).toHaveBeenCalledTimes(2));
+    await screen.findByText('/global/source-1?source_transcript=source-1&source_tool=tool-1#message-source');
     await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
-    expect(screen.getByText('UI tests').closest('.coordinator-conversation')).toHaveAttribute('hidden');
+    await waitFor(() => expect(screen.getByText('UI tests').closest('.coordinator-conversation')).toHaveAttribute('hidden'));
+    expect(pendingValidations.length).toBeGreaterThan(0);
     expect(screen.getByText('output →')).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
     expect(screen.queryByRole('link', { name: 'output →' })).not.toBeInTheDocument();
-    await act(async () => releaseCanonicalValidation({ conversation: { id: 'source-1' } }));
+    await act(async () => {
+      validationReleased = true;
+      for (const release of pendingValidations) release({ conversation: { id: 'source-1' } });
+    });
     const output = await screen.findByRole('link', { name: 'output →' });
 
     await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
