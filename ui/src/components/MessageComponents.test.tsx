@@ -15,6 +15,25 @@ import { createInitialAtom } from '../conversation/atom';
 import { buildRenderUnits } from '../conversation/renderUnits';
 import { buildAgentTextFragments, buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
+describe('subscription event UserMessage branch', () => {
+  it('keeps original message identity and diagnostic text while rendering a compact fallback', () => {
+    const message: Message = {
+      message_id: 'event-message', sequence_id: 401, conversation_id: 'global', message_type: 'user',
+      origin: { kind: 'subscription_event', event_id: 'event-401' }, event_presentation: null,
+      content: { text: 'Original provider diagnostic: task complete is only text.' }, created_at: '2026-10-12T00:00:00Z',
+    };
+    const { container, rerender } = render(<MemoryRouter><UserMessage message={message} /></MemoryRouter>);
+    expect(container.querySelector('#message-event-message')).toHaveAttribute('data-sequence-id', '401');
+    expect(screen.getByText('Details unavailable')).toBeVisible();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(container.querySelector('[data-fragment-id="message-text"]')!.textContent).toBe('Original provider diagnostic: task complete is only text.');
+    expect(container.querySelector('details')).not.toHaveAttribute('open');
+    rerender(<MemoryRouter><UserMessage message={message} activeHighlight={{ owner: 'message-text', fragmentId: 'message-text', start: 0, end: 8 }} /></MemoryRouter>);
+    expect(container.querySelector('details')).toHaveAttribute('open');
+    expect(container.querySelector('mark')).toHaveTextContent('Original');
+  });
+});
+
 describe('Global coordinator tool results', () => {
   it('renders queued delivery truthfully with recipient navigation', () => {
     render(

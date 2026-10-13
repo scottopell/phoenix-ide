@@ -1,3 +1,4 @@
+import { ConversationEventCard } from './ConversationEventCard';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import { SvgArtifactCard } from './SvgArtifactCard';
 import { svgArtifactFromResult } from './svgArtifact';
@@ -383,6 +384,38 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const isMeta = content.is_meta === true || inputOriginPresentation(message.origin).className === 'meta';
   const timestamp = message.created_at;
 
+  const body = (
+    <div className="message-content">
+      <span data-fragment-id="message-text">
+        {activeHighlight?.owner === 'message-text' && activeHighlight.fragmentId === 'message-text'
+          ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+          : <SkillCommandText text={text} />}
+      </span>
+      {images.length > 0 && (
+        <div className="message-images">
+          {images.map((img, idx) => (
+            <img
+              key={idx}
+              src={`data:${img.media_type};base64,${img.data}`}
+              alt={`Attachment ${idx + 1}`}
+              className="message-image"
+            />
+          ))}
+        </div>
+      )}
+      <FileChips files={files} activeHighlight={activeHighlight} />
+    </div>
+  );
+  if (message.origin?.kind === 'subscription_event') {
+    return (
+      <div id={`message-${message.message_id}`} className="message meta conversation-event-message" data-sequence-id={message.sequence_id}>
+        <ConversationEventCard presentation={message.event_presentation} eventId={message.origin.event_id} originalText={text} activeHighlight={activeHighlight}>
+          {body}
+        </ConversationEventCard>
+      </div>
+    );
+  }
+
   return (
     <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
@@ -399,26 +432,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           <MessageCopyButton message={message} title={message.origin?.kind === 'system_generated' ? 'Copy system observation' : 'Copy input message'} />
         </span>
       </div>
-      <div className="message-content">
-        <span data-fragment-id="message-text">
-          {activeHighlight?.owner === 'message-text'
-            ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
-            : <SkillCommandText text={text} />}
-        </span>
-        {images.length > 0 && (
-          <div className="message-images">
-            {images.map((img, idx) => (
-              <img
-                key={idx}
-                src={`data:${img.media_type};base64,${img.data}`}
-                alt={`Attachment ${idx + 1}`}
-                className="message-image"
-              />
-            ))}
-          </div>
-        )}
-        <FileChips files={files} activeHighlight={activeHighlight} />
-      </div>
+      {body}
     </div>
   );
 }

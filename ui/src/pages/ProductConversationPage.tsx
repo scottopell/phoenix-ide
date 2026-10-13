@@ -158,6 +158,7 @@ function toMessage(message: EnrichedMessage, occurrenceToken?: string): Message 
     message_type: message.message_type,
     content: message.content as Message['content'],
     origin: message.origin,
+    event_presentation: message.event_presentation,
     display_data: occurrenceToken
       ? {
         ...(((message.display_data ?? null) as Exclude<Message['display_data'], undefined>) ?? {}),
