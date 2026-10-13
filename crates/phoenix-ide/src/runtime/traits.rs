@@ -1912,6 +1912,13 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
         use phoenix_db::workflow::PreflightDirectTurnMaterializationInput;
         use phoenix_workflow::TurnAuthorityId;
+        #[cfg(test)]
+        crate::opening_qualifier::before_authoritative_message(
+            &self.db,
+            authority.turn_id.0,
+            &payload.submitted.message_id,
+        )
+        .await?;
         let repo = self.db.workflow_repository();
         let local_authority = direct_turn_local_authority(authority);
         repo.preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
@@ -1935,6 +1942,13 @@ impl MessageStore for DatabaseStorage {
         use phoenix_workflow::TurnAuthorityId;
         let repo = self.db.workflow_repository();
         let local_authority = direct_turn_local_authority(&input.authority);
+        #[cfg(test)]
+        crate::opening_qualifier::before_authoritative_message(
+            &self.db,
+            input.authority.turn_id.0,
+            &input.payload.submitted.message_id,
+        )
+        .await?;
         let materialized = repo
             .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
                 turn_id: TurnAuthorityId(input.authority.turn_id.0),

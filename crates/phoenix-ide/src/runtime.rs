@@ -6687,6 +6687,11 @@ impl RuntimeManager {
             ));
         };
 
+        #[cfg(test)]
+        crate::opening_qualifier::before_reserved_message(&self.db, conversation_id, message_id)
+            .await
+            .map_err(SteeringAdmissionError::Internal)?;
+
         // Build SteerEntry and persist before touching the executor channel.
         let new_entry = crate::state_machine::event::SteerEntry {
             text: text.clone(),
