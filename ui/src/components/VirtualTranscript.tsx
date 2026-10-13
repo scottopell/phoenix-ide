@@ -260,8 +260,11 @@ function synchronizedPhysicalSnapshot<T>(
   targetSelector?: string,
 ): VirtualTranscriptPhysicalSnapshot {
   if (!isLayoutHidden(store.scroller)) {
-    store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
     store.viewportExtent = store.scroller ? viewportExtentForScroller(store.scroller) : store.viewportExtent;
+    if (store.revealPublicationPending && store.pendingScrollTop !== null) {
+      setScrollerScrollTop(store, store.pendingScrollTop);
+    }
+    store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
     recompute(store);
   }
   return buildPhysicalSnapshot(store, targetIndex, targetSelector);
@@ -371,8 +374,13 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   // Placing the viewport somewhere absolute retires that position, so the
   // correction goes with it — applied afterwards it would displace the
   // caller's chosen position by the drift (REQ-VT-004).
-  store.pendingScrollTop = null;
   store.viewportTop = scrollTop;
+  if (isLayoutHidden(scroller)) {
+    store.pendingScrollTop = scrollTop;
+    store.revealPublicationPending = true;
+    return;
+  }
+  store.pendingScrollTop = null;
   if (scroller && scroller.scrollTop !== scrollTop) {
     store.pendingProgrammaticTop = scrollTop;
     scroller.scrollTop = scrollTop;
@@ -473,7 +481,7 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
         store.viewportExtent = clampNonNegative(nextExtent);
         viewportChanged = true;
       }
-      const nextTop = store.scroller?.scrollTop ?? store.viewportTop;
+      const nextTop = (revealed ? store.pendingScrollTop : null) ?? store.scroller?.scrollTop ?? store.viewportTop;
       if (store.viewportTop !== nextTop) {
         store.viewportTop = nextTop;
         viewportChanged = true;
@@ -502,6 +510,10 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
     applyPhysicalChange(store, anchor, wasPinned);
     publish();
     return;
+  }
+
+  if (revealed && store.pendingScrollTop !== null) {
+    setScrollerScrollTop(store, store.pendingScrollTop);
   }
 
   if (viewportChanged || revealed) {
@@ -953,9 +965,8 @@ function VirtualTranscriptInner<T>(
   useLayoutEffect(() => {
     const current = storeRef.current;
     if (!current) return;
-    if (current.pendingScrollTop !== null) {
+    if (current.pendingScrollTop !== null && !isLayoutHidden(current.scroller)) {
       const target = current.pendingScrollTop;
-      current.pendingScrollTop = null;
       setScrollerScrollTop(current, target);
       recompute(current);
       publish();
