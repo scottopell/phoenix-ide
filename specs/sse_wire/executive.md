@@ -61,3 +61,7 @@ The client reducer (`ui/src/conversation/atom.ts`) is the dual of the ring: on a
 - **`specs/bedrock/`**: the source of `state_change`, `agent_done`, and metadata/lifecycle projection events. Bedrock owns the state machine; this spec owns the wire envelope.
 - **`specs/work-scope-ui/`**: `work_scope_update` is the attached-resource inventory event consumed by the conversation page and chain dock.
 - **`specs/chains/`**: a parallel broadcaster (`ChainBroadcaster` in `crates/phoenix-ide/src/chain_runtime.rs`) for chain Q&A streams. Reuses the sequence-id pattern but has no reconnect-replay obligation (the persisted `chain_qa` row is canonical for late readers).
+
+## Opening observation source status
+
+`SseWireEvent` threads `ContinuationOpeningView` through the init, message, and message_updated envelopes without modifying `EnrichedMessage` or `MessageContent`. Authenticated init reads opening authority with a transaction generation/tail fence; token-shared init redacts unpublished pending keys. The async committed-message publication path reads only the exact accepted receipt; content-update delivery recomputes authority and closes/logs on read failure. This is a row-stream observation, not an implementation of the normative aggregate root ledger or continuation_boundary carrier. Nontrivial projection parity and real-DB runtime publication regressions are authored but unexecuted. Rust compilation/tests and genuine ts-rs generation plus valibot/client updates remain required hosted gates.

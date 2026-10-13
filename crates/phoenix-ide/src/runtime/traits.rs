@@ -120,6 +120,10 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn read_message_continuation_opening(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::db::ContinuationOpeningRead>, String>;
     async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String>;
 
     async fn accepted_continuation_handoff_message_id(
@@ -776,6 +780,13 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn read_message_continuation_opening(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
+        (**self).read_message_continuation_opening(message_id).await
+    }
+
     async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String> {
         (**self).has_pending_continuation_opening(conv_id).await
     }
@@ -1576,6 +1587,16 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn read_message_continuation_opening(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
+        self.db
+            .read_message_continuation_opening(message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String> {
         self.db
             .has_pending_continuation_opening(conv_id)

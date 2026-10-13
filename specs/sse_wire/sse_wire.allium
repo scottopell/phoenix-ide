@@ -74,7 +74,47 @@
 -- and oldest entries evicted) between the anchor and the current tip.
 -- A truncated replay produces a partial in-flight view; the client can
 -- surface this to the user analogously to the broadcast-lag close path.
+-- Authenticated init has a non-null opening read, including explicit no-evidence.
+-- Message and message_updated envelopes have nullable opening observations:
+-- null means no observation, not no opening evidence. A committed message
+-- observation is attached only to the exact receipt's accepted message ID.
+-- No summary text is copied into this envelope. Content updates recompute the
+-- observation from committed content; read errors close the stream visibly.
+-- Token-shared init omits pending observations (null) to avoid exposing an
+-- unpublished ClientTurnKey. Accepted transcript observations remain visible.
+-- Init opening authority is read in a transaction fenced by the selected
+-- transcript's generation and append watermark. Live acceptance is read after
+-- message insertion commits, under the admitted publication owner, before its
+-- message envelope is broadcast. Its sequence remains the message sequence;
+-- this does not introduce a root-stream sequence ledger.
+-- Opening observations carry read authority, not MessageContent (REQ-BED-030,
+-- REQ-CONV-026). The wire status tags are none, pending, and accepted.
+entity ContinuationOpeningRead {}
+
+variant NoContinuationOpening : ContinuationOpeningRead {}
+
+value ContinuationOpeningEdge {
+    product_conversation_id: String
+    predecessor_transcript_row_id: String
+    successor_transcript_row_id: String
+    continuation_message_id: String
+}
+
+variant PendingContinuationOpening : ContinuationOpeningRead {
+    edge: ContinuationOpeningEdge
+    client_turn_key: String
+    opening_authority: user_authorized_instruction | generated_predecessor_context
+}
+
+variant AcceptedContinuationOpening : ContinuationOpeningRead {
+    edge: ContinuationOpeningEdge
+    accepted_message_id: String
+    opening_authority: user_authorized_instruction | generated_predecessor_context
+    presentation: boundary | separate_message
+}
+
 value InitSnapshot {
+    opening: ContinuationOpeningRead?
     product_conversation_lifecycle: ProductConversationLifecycleUpdate
     last_sequence_id: Integer
     stream_incarnation: String

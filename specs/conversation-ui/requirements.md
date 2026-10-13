@@ -739,4 +739,8 @@ THE SYSTEM SHALL keep the composer attached to the newest writable member indepe
 AND SHALL retain exact source-transcript and source-tool evidence selection until the reader explicitly selects a different anchor
 AND SHALL preserve unrelated query parameters and browser history when navigating boundaries
 
+Aggregate history SHALL expose one `latest_opening` authority sum rather than a parallel pending boolean. Pending authority SHALL permit temporary deferral only of its exact reserved opening identity. Accepted generated context with boundary presentation SHALL settle that identity as represented by the named boundary; accepted user-authorized or edited content SHALL remain separately visible. Neither message role nor equal text without a completed handoff receipt SHALL authorize suppression.
+
+A committed live opening observation SHALL settle opening readiness without requiring a successful aggregate refresh. Refresh failure SHALL remain visible without reverting that accepted edge to pending. Delayed pending snapshots SHALL NOT undo an accepted observation for the same edge. A content-update observation SHALL recompute presentation while retaining the accepted edge and message identity. These reconciliation rules SHALL preserve reader anchors, message order, and independent composer authority under REQ-CONV-002 and REQ-CONV-006.
+
 Global aggregate history SHALL NOT acquire ordinary Open/History lifecycle, Close actions, work identity, or ordinary mutation authority. Native Swift navigation is outside this web contract.

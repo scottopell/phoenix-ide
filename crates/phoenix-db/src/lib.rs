@@ -76,6 +76,7 @@ pub(crate) use git_repository_reconciliation::{
 };
 pub use migrations::run_pending_migrations;
 pub use product_conversation_read::{
+    ContinuationOpeningEdge, ContinuationOpeningPresentation, ContinuationOpeningRead,
     CoordinatorConversationSnapshotRead, ProductConversationAggregate,
     ProductConversationCloseAvailability, ProductConversationCloseUnavailableReason,
     ProductConversationHandoff, ProductConversationListLifecycle,

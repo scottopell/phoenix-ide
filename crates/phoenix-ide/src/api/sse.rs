@@ -62,10 +62,17 @@ impl SseStreamAudience {
             if let SseEvent::Init {
                 steering_messages,
                 pending_events,
+                opening,
                 ..
             } = &mut event
             {
                 steering_messages.clear();
+                if matches!(
+                    opening,
+                    Some(super::types::ContinuationOpeningView::Pending { .. })
+                ) {
+                    *opening = None;
+                }
                 pending_events.retain(|pending| self.allows(pending));
             }
         }
@@ -146,6 +153,7 @@ fn conversation_keep_alive() -> KeepAlive {
 /// events long enough to mask client UI as "stuck on stale phase" between
 /// transitions. No-op for TCP-level forwarders, harmless either way.
 pub fn sse_stream(
+    db: crate::db::Database,
     conv_id: String,
     init_event: SseEvent,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
@@ -178,6 +186,24 @@ pub fn sse_stream(
                 false
             }
             _ => true,
+        })
+        .then(move |result| {
+            let db = db.clone();
+            async move {
+                let mut event = result.map_err(|error| error.to_string())?;
+                if let SseEvent::MessageUpdated { message_id, content: Some(_), opening, .. } = &mut event {
+                    *opening = db.read_message_continuation_opening(message_id).await
+                        .map_err(|error| error.to_string())?
+                        .map(crate::api::types::ContinuationOpeningView::from);
+                }
+                Ok::<_, String>(event)
+            }
+        })
+        .take_while(|result| {
+            if let Err(error) = result {
+                tracing::error!(%error, "SSE opening observation read failed; closing stream for reconciliation");
+                false
+            } else { true }
         })
         .filter_map(move |result| match result {
             Ok(event) => audience
@@ -280,6 +306,7 @@ mod tests {
                 pending_events,
                 pending_truncated,
                 transcript_generation,
+                opening,
             } => {
                 let transcript_coverage = transcript.coverage();
                 let enriched_msgs: Vec<Value> = transcript
@@ -315,18 +342,21 @@ mod tests {
                     "pending_anchor_sequence_id": pending_anchor_sequence_id,
                     "pending_events": pending_json,
                     "pending_truncated": pending_truncated,
+                    "opening": opening,
                 })
             }
-            SseEvent::Message { message } => {
+            SseEvent::Message { message, opening } => {
                 let sequence_id = message.sequence_id;
                 let message_value = enrich_message_for_api(message);
                 json!({
                     "type": "message",
                     "sequence_id": sequence_id,
                     "message": message_value,
+                    "opening": opening,
                 })
             }
             SseEvent::MessageUpdated {
+                opening,
                 sequence_id,
                 message_id,
                 transcript_generation,
@@ -336,6 +366,7 @@ mod tests {
             } => {
                 let mut obj = json!({
                     "type": "message_updated",
+                    "opening": opening,
                     "sequence_id": sequence_id,
                     "message_id": message_id,
                     "transcript_generation": transcript_generation,
@@ -656,6 +687,7 @@ mod tests {
     #[test]
     fn parity_init() {
         let event = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: 42,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -716,9 +748,13 @@ mod tests {
                 presentation_mode: "working".to_string(),
                 state_updated_at: ts(),
             },
-            SseEvent::Message { message: eager },
+            SseEvent::Message {
+                opening: None,
+                message: eager,
+            },
         ];
         let event = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: 45,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -766,6 +802,7 @@ mod tests {
     #[test]
     fn parity_init_truncated() {
         let event = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: 99,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -788,8 +825,42 @@ mod tests {
     }
 
     #[test]
+    fn parity_opening_observation_is_envelope_authority_not_message_content() {
+        let opening = super::super::types::ContinuationOpeningView::Accepted {
+            edge: super::super::types::ContinuationOpeningEdgeView {
+                product_conversation_id: "product".into(), predecessor_transcript_row_id: "parent".into(),
+                successor_transcript_row_id: "successor".into(), continuation_message_id: "boundary".into(),
+            },
+            accepted_message_id: "accepted".into(),
+            opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            presentation: super::super::types::ContinuationOpeningPresentationView::Boundary,
+        };
+        let event = SseEvent::MessageUpdated {
+            sequence_id: 5,
+            message_id: "accepted".into(),
+            display_data: None,
+            content: None,
+            duration_ms: None,
+            transcript_generation: Some(1),
+            opening: Some(opening),
+        };
+        assert_eq!(
+            typed_sse_event_to_value(&event),
+            legacy_sse_event_to_json(&event)
+        );
+        assert_eq!(
+            typed_sse_event_to_value(&event)["opening"]["status"],
+            "accepted"
+        );
+        assert!(typed_sse_event_to_value(&event)["opening"]
+            .get("summary")
+            .is_none());
+    }
+
+    #[test]
     fn parity_message_user() {
         let event = SseEvent::Message {
+            opening: None,
             message: fixture_user_message(),
         };
         assert_parity(&event);
@@ -802,6 +873,7 @@ mod tests {
         // a `display` field on matching bash tool_use blocks. The typed
         // path must produce the same merged content.
         let event = SseEvent::Message {
+            opening: None,
             message: fixture_agent_message_with_bash(),
         };
         assert_parity(&event);
@@ -826,6 +898,7 @@ mod tests {
     #[test]
     fn parity_message_updated_with_display_data() {
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 7,
             message_id: "msg-abc".to_string(),
             transcript_generation: Some(3),
@@ -840,6 +913,7 @@ mod tests {
     fn parity_message_updated_with_content() {
         use phoenix_llm::ContentBlock;
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 9,
             message_id: "msg-def".to_string(),
             transcript_generation: Some(4),
@@ -855,6 +929,7 @@ mod tests {
     #[test]
     fn parity_message_updated_both_nulls() {
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 11,
             message_id: "msg-xyz".to_string(),
             transcript_generation: Some(5),
@@ -869,6 +944,7 @@ mod tests {
     fn parity_message_updated_with_duration_ms() {
         // Typed `duration_ms` must appear in the serialized output.
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 12,
             message_id: "msg-tool-result".to_string(),
             transcript_generation: Some(6),
@@ -1206,6 +1282,7 @@ mod tests {
     #[test]
     fn shared_audience_filters_steering_from_init_and_replay() {
         let init = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: 24,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -1307,6 +1384,7 @@ mod tests {
         // `applyIfNewer` guard on its live delivery.
         let init_seq = std::cmp::max(initial_last_seq, highest_pending_seq);
         let init = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -1407,6 +1485,7 @@ mod tests {
 
         let init_seq = std::cmp::max(0_i64, highest);
         let init = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -1460,6 +1539,7 @@ mod tests {
         // Regression on the label the client registers via
         // `addEventListener`.
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 42,
             message_id: "msg-abc".to_string(),
             transcript_generation: Some(9),
