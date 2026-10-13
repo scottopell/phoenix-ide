@@ -1415,6 +1415,75 @@ describe('conversationReducer', () => {
       expect(withPending.transcriptGeneration).toBe(12);
     });
 
+    it.each(['live', 'fresh replay', 'reconnect replay'] as const)(
+      'keeps the generation fence while applying mixed opening and ordinary updates: %s',
+      (delivery) => {
+        const opening = makeMessage(1, { message_type: 'continuation', content: { summary: 'context' } });
+        const ordinary = makeMessage(2);
+        const openingContent = { summary: 'restored context' };
+        const ordinaryContent = { text: 'owed ordinary edit' };
+        const messages = [opening, ordinary];
+        const initial = dispatch(createInitialAtom(), {
+          type: 'sse_init',
+          payload: makeInitPayload({ messages, transcriptGeneration: 1, lastAppliedEventSeq: 20 }),
+        });
+        let next: ConversationAtom;
+        if (delivery === 'live') {
+          next = dispatch(initial, {
+            type: 'sse_message_updated', sequenceId: 21, messageId: opening.message_id,
+            transcriptGeneration: 3, content: openingContent,
+          });
+          expect(next.transcriptGeneration).toBe(3);
+          next = dispatch(next, {
+            type: 'sse_message_updated', sequenceId: 22, messageId: ordinary.message_id,
+            transcriptGeneration: 2, content: ordinaryContent, displayData: { owed: true },
+          });
+        } else {
+          next = dispatch(delivery === 'fresh replay' ? createInitialAtom() : initial, {
+            type: 'sse_init',
+            payload: makeInitPayload({
+              messages, transcriptGeneration: 3, pendingAnchorSequenceId: 20, lastAppliedEventSeq: 22,
+              pendingEvents: [
+                { type: 'message_updated', sequence_id: 21, message_id: opening.message_id,
+                  transcript_generation: 3, content: openingContent, display_data: null },
+                { type: 'message_updated', sequence_id: 22, message_id: ordinary.message_id,
+                  transcript_generation: 2, content: ordinaryContent, display_data: { owed: true } },
+              ],
+            }),
+          });
+        }
+        expect(next.transcriptGeneration).toBe(3);
+        expect(next.lastAppliedEventSeq).toBe(22);
+        expect(next.messages[0]!.content).toEqual(openingContent);
+        expect(next.messages[1]!.content).toEqual(ordinaryContent);
+        expect(next.messages[1]!.display_data).toEqual({ owed: true });
+        expect(next.eventGap).toBeNull();
+      },
+    );
+
+    it('does not regress generation for an unknown target or a lower-generation same-owner init', () => {
+      let next = dispatch(createInitialAtom(), {
+        type: 'sse_init', payload: makeInitPayload({ transcriptGeneration: 3, lastAppliedEventSeq: 20 }),
+      });
+      next = dispatch(next, {
+        type: 'sse_message_updated', sequenceId: 21, messageId: 'not-yet-materialized',
+        transcriptGeneration: 2, content: { text: 'owed patch' },
+      });
+      expect(next.transcriptGeneration).toBe(3);
+      expect(next.pendingMessagePatches['not-yet-materialized']!.patches).toHaveLength(1);
+      next = dispatch(next, {
+        type: 'sse_init', payload: makeInitPayload({ transcriptGeneration: 2, lastAppliedEventSeq: 21 }),
+      });
+      expect(next.transcriptGeneration).toBe(3);
+      expect(next.lastAppliedEventSeq).toBe(21);
+      next = dispatch(next, {
+        type: 'sse_init', payload: makeInitPayload({
+          conversation: { ...testConversation, id: 'another-owner' }, transcriptGeneration: 1,
+        }),
+      });
+      expect(next.transcriptGeneration).toBe(1);
+    });
+
     it('replayed message_updated advances transcript generation', () => {
       const target = makeMessage(1);
       const payload = makeInitPayload({

@@ -694,6 +694,14 @@ function phaseIsTerminalFailure(phase: ConversationState): boolean {
   return phase.type === 'error' || phase.type === 'recoverable_continuation_failure';
 }
 
+function generationAfterObservation(
+  local: number | null,
+  incoming: number | null | undefined,
+): number | null {
+  if (incoming == null) return local;
+  return local === null ? incoming : Math.max(local, incoming);
+}
+
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
@@ -727,7 +735,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         const next = storePendingMessagePatch(atom, action.messageId, patch);
         return {
           ...next,
-          transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+          transcriptGeneration: generationAfterObservation(atom.transcriptGeneration, action.transcriptGeneration),
         };
       }
       const existingPending = atom.pendingMessagePatches[action.messageId] ?? {
@@ -745,7 +753,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       if (!applied.applied) {
         return {
           ...atom,
-          transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+          transcriptGeneration: generationAfterObservation(atom.transcriptGeneration, action.transcriptGeneration),
           pendingMessagePatches: nextPendingMessagePatches,
         };
       }
@@ -753,7 +761,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       newMessages[idx] = applied.message;
       return {
         ...atom,
-        transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+        transcriptGeneration: generationAfterObservation(atom.transcriptGeneration, action.transcriptGeneration),
         messages: newMessages,
         pendingMessagePatches: nextPendingMessagePatches,
       };
@@ -1382,7 +1390,10 @@ export function conversationReducer(
         lastAppliedEventSeq: phase1Floor,
         bufferedEventEnvelopes: {},
         eventGap: null,
-        transcriptGeneration: p.transcriptGeneration,
+        transcriptGeneration: generationAfterObservation(
+          ownsIncomingTranscript ? atom.transcriptGeneration : null,
+          p.transcriptGeneration,
+        ),
         transcriptCoverage: nextTranscriptCoverage,
         pendingMessagePatches: isFreshConnect || streamIncarnationChanged
           ? {}

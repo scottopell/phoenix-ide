@@ -84,6 +84,10 @@
 -- content/generation/display/opening envelope for the same accepted identity;
 -- its event cursor is retained. Both live and init pending delivery use this
 -- reconciliation, leaving other owed events and ring ownership unchanged.
+-- The client owns monotonic generation application (conversation_atom spec):
+-- a coherent replacement may precede an ordinary lower-generation update.
+-- That update remains owed; conversation generation is an invalidation fence,
+-- not a cross-message revision ordering or authority to discard its fields.
 -- Missing/future generations, wrong content at the current generation, and
 -- invalid receipts/read errors log and close; they never borrow newer authority.
 -- Init snapshot generation/tail mismatches retry the bounded stable read;

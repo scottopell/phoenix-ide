@@ -1665,6 +1665,18 @@ mod tests {
         }
     }
 
+    fn decode_update_test_chunk(chunk: &str) -> (i64, Value) {
+        let payload = chunk
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("event has JSON data");
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        let id = payload["sequence_id"]
+            .as_i64()
+            .expect("sequenced event has a payload cursor");
+        (id, payload)
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn delayed_update_reconciles_committed_content_without_poisoning_reconnect() {
@@ -1718,7 +1730,13 @@ mod tests {
             content: Some(edited.clone()),
             duration_ms: None,
         };
-        for (generation, content) in [(1, &edited), (2, &restored)] {
+        let ordinary = MessageContent::Continuation(ContinuationContent {
+            summary: "owed ordinary edit".into(),
+        });
+        db.add_message("ordinary-key", &successor.id, &ordinary, None, None)
+            .await
+            .unwrap();
+        for (generation, content) in [(1, &edited), (3, &restored)] {
             let mut tx = db.pool().begin().await.unwrap();
             sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = 'opening-key'")
                 .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
@@ -1756,6 +1774,7 @@ mod tests {
         ] {
             let broadcaster = crate::runtime::SseBroadcaster::new(16, 20);
             let live_rx = broadcaster.subscribe();
+            let live_cursor = broadcaster.current_seq();
             broadcaster
                 .send_seq(|sequence_id| {
                     let mut event = delayed.clone();
@@ -1766,6 +1785,17 @@ mod tests {
                         *seq = sequence_id;
                     }
                     event
+                })
+                .unwrap();
+            broadcaster
+                .send_seq(|sequence_id| SseEvent::MessageUpdated {
+                    opening: None,
+                    sequence_id,
+                    message_id: "ordinary-key".into(),
+                    transcript_generation: Some(2),
+                    display_data: Some(json!({"owed": true})),
+                    content: Some(ordinary.clone()),
+                    duration_ms: None,
                 })
                 .unwrap();
             broadcaster
@@ -1787,13 +1817,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let make_init = |pending_events| {
+            let make_init = |cursor, pending_events| {
                 let mut init = update_test_init(pending_events);
                 if let SseEvent::Init {
                     conversation: view,
                     transcript,
                     opening: observation,
                     transcript_generation,
+                    sequence_id,
+                    last_sequence_id,
+                    stream_incarnation,
                     ..
                 } = &mut init
                 {
@@ -1801,50 +1834,70 @@ mod tests {
                     *transcript = crate::runtime::InitTranscript::Complete(messages.clone());
                     *observation = Some(opening.clone().into());
                     *transcript_generation = conversation.transcript_generation;
+                    *sequence_id = cursor;
+                    *last_sequence_id = cursor;
+                    *stream_incarnation = broadcaster.stream_incarnation().into();
                 }
                 init
             };
             let response = sse_stream(
                 db.clone(),
                 successor.id.clone(),
-                make_init(vec![]),
+                make_init(live_cursor, vec![]),
                 live_rx,
                 None,
                 audience,
             )
             .into_response();
             let mut body = response.into_body().into_data_stream();
-            for expected in ["event: init", "event: message_updated", "owed-token"] {
+            let mut applied_cursor = live_cursor;
+            for (expected, expected_cursor) in [
+                ("event: init", 20),
+                ("restored-opening", 21),
+                ("owed ordinary edit", 22),
+                ("owed-token", 23),
+            ] {
                 let chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
                     .await
                     .expect("stream makes progress")
                     .expect("stream must not close")
                     .unwrap();
                 let chunk = String::from_utf8(chunk.to_vec()).unwrap();
-                assert!(chunk.contains(expected), "{chunk}");
+                let (cursor, payload) = decode_update_test_chunk(&chunk);
+                assert_eq!(cursor, expected_cursor);
+                if expected == "event: init" {
+                    assert!(chunk.contains(expected), "{chunk}");
+                    assert_eq!(payload["last_sequence_id"], applied_cursor);
+                } else {
+                    assert_eq!(cursor, applied_cursor + 1, "event must be applicable");
+                    applied_cursor = cursor;
+                    if expected != "restored-opening" {
+                        assert!(chunk.contains(expected), "{chunk}");
+                    }
+                }
                 assert!(!chunk.contains("stale-display"));
                 assert!(
                     !chunk.contains("edit A"),
                     "old content must not borrow current authority"
                 );
-                if expected == "event: message_updated" {
+                if expected == "restored-opening" {
                     assert!(chunk.contains("boundary"));
                     assert!(chunk.contains("context"));
-                    assert!(chunk.contains("\"transcript_generation\":2"));
+                    assert_eq!(payload["transcript_generation"], 3);
                 }
             }
             drop(body);
             // The ring still holds the old event. Two reconnects must both reach init and live traffic.
-            for _ in 0..2 {
+            for reconnect in 0..2 {
                 let rx = broadcaster.subscribe();
                 let (anchor, truncated, highest, pending) = broadcaster.snapshot_pending();
                 assert!(!truncated);
                 assert_eq!(
                     pending.len(),
-                    2,
+                    3 + reconnect,
                     "no owed event is removed from the shared ring"
                 );
-                let mut init = make_init(pending);
+                let mut init = make_init(highest, pending);
                 if let SseEvent::Init {
                     pending_anchor_sequence_id,
                     sequence_id,
@@ -1867,12 +1920,28 @@ mod tests {
                     .unwrap();
                 let chunk = String::from_utf8(chunk.to_vec()).unwrap();
                 assert!(chunk.contains("event: init"));
+                let (cursor, payload) = decode_update_test_chunk(&chunk);
+                assert_eq!(cursor, highest);
+                assert_eq!(payload["last_sequence_id"], highest);
+                let mut replay_cursor = anchor;
+                for event in payload["pending_events"].as_array().unwrap() {
+                    let seq = event["sequence_id"].as_i64().unwrap();
+                    assert_eq!(seq, replay_cursor + 1, "replay event must be applicable");
+                    replay_cursor = seq;
+                }
+                assert_eq!(replay_cursor, highest);
+                assert_eq!(payload["pending_events"][0]["transcript_generation"], 3);
+                assert_eq!(payload["pending_events"][1]["transcript_generation"], 2);
+                assert_eq!(
+                    payload["pending_events"][1]["content"],
+                    ordinary.to_stored_json()
+                );
                 assert!(chunk.contains("context") && chunk.contains("boundary"));
                 assert!(chunk.contains("owed-token"));
                 assert!(!chunk.contains("stale-display"));
                 assert!(!chunk.contains("edit A"));
                 broadcaster
-                    .send_live_projection(|sequence_id| SseEvent::Token {
+                    .send_seq(|sequence_id| SseEvent::Token {
                         sequence_id,
                         text: "still-live".into(),
                         request_id: "update-test".into(),
@@ -1883,11 +1952,16 @@ mod tests {
                     .unwrap()
                     .expect("reconnected stream remains open")
                     .unwrap();
-                assert!(String::from_utf8(chunk.to_vec())
-                    .unwrap()
-                    .contains("still-live"));
+                let chunk = String::from_utf8(chunk.to_vec()).unwrap();
+                let (cursor, payload) = decode_update_test_chunk(&chunk);
+                assert_eq!(
+                    cursor,
+                    highest + 1,
+                    "post-reconnect token must be applicable"
+                );
+                assert_eq!(payload["text"], "still-live");
             }
-            for generation in [None, Some(2), Some(3)] {
+            for generation in [None, Some(3), Some(4)] {
                 let mut wrong = delayed.clone();
                 if let SseEvent::MessageUpdated {
                     transcript_generation,
@@ -1904,7 +1978,7 @@ mod tests {
                 let response = sse_stream(
                     db.clone(),
                     successor.id.clone(),
-                    make_init(vec![wrong]),
+                    make_init(broadcaster.current_seq(), vec![wrong]),
                     rx,
                     None,
                     audience,
@@ -1924,7 +1998,7 @@ mod tests {
             opening: None,
             sequence_id: 23,
             message_id: "opening-key".into(),
-            transcript_generation: Some(2),
+            transcript_generation: Some(3),
             display_data: None,
             content: Some(restored),
             duration_ms: None,
