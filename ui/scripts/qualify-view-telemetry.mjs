@@ -159,6 +159,25 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
   return { status: 'inconclusive_sampling_budget', trials };
 }
 
+export async function runVisibilityRoundTrip(page, context) {
+  const witness = { scope: 'actual_tab_visibility_only_not_telemetry_background_readiness_or_physical_suspend', before: null, background: null, foreground: null };
+  const other = await context.newPage();
+  try {
+    await page.bringToFront();
+    witness.before = await page.evaluate(() => document.visibilityState);
+    await other.bringToFront();
+    witness.background = await page.evaluate(() => document.visibilityState);
+    await page.bringToFront();
+    witness.foreground = await page.evaluate(() => document.visibilityState);
+    assert.equal(witness.before, 'visible');
+    assert.equal(witness.foreground, 'visible');
+    witness.status = witness.background === 'hidden' ? 'actual_tab_background_observed' : 'unsupported_no_actual_hidden_visibility';
+    return witness;
+  } finally {
+    try { await page.bringToFront(); } finally { await other.close(); }
+  }
+}
+
 function visibleReadiness() {
   const visible = element => {
     if (!element || document.visibilityState !== 'visible') return false;
@@ -262,6 +281,10 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
         if (!trial.sampled) {
           assert.equal(trial.posts, 0, 'unsampled cohort must not contain report POST');
           assert.deepEqual(reports, []);
+        }
+        if (!result.visibilityWitness && trial.sampled) {
+          result.visibilityWitness = await runVisibilityRoundTrip(candidate, owned);
+          result.capabilities.tab_visibility = result.visibilityWitness.status;
         }
         assert.ok(trial.posts <= 1, 'no per-frame or repeated POST');
       } finally {

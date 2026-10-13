@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck, runPendingPagehideCheck, appendTerminalInventory } from './qualify-view-telemetry.mjs';
+import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck, runPendingPagehideCheck, appendTerminalInventory, runVisibilityRoundTrip } from './qualify-view-telemetry.mjs';
 
 test('retains insufficient natural sampling as inconclusive, never overhead clearance', () => {
   const result = summarizeTrials([{ route: 'ordinary', sampled: true }]);
@@ -102,4 +102,17 @@ test('terminal inventory preserves incomplete/null marks and forbids duplicate o
   assert.equal(result.capabilities.pagehide_incomplete, 'observed_incomplete');
   assert.throws(() => appendTerminalInventory(result, terminal, identity));
   assert.throws(() => appendTerminalInventory({ journeys: [], capabilities: {} }, terminal, identity, ['request']));
+});
+test('actual visibility witness never labels unsupported headless tab as physical suspension', async () => {
+  for (const supportsHidden of [true, false]) {
+    let state = 'visible';
+    let closed = false;
+    const page = { bringToFront: async () => { state = 'visible'; }, evaluate: async () => state };
+    const context = { newPage: async () => ({ bringToFront: async () => { state = supportsHidden ? 'hidden' : 'visible'; }, close: async () => { closed = true; } }) };
+    const witness = await runVisibilityRoundTrip(page, context);
+    assert.equal(witness.status, supportsHidden ? 'actual_tab_background_observed' : 'unsupported_no_actual_hidden_visibility');
+    assert.match(witness.scope, /not_telemetry_background_readiness_or_physical_suspend/);
+    assert.equal(state, 'visible');
+    assert.ok(closed);
+  }
 });
