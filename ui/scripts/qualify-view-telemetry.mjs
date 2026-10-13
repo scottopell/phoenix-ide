@@ -64,11 +64,38 @@ export async function runUnauthenticatedCollectorCheck(browser, baseURL, validRe
   } finally { await isolated.close(); }
 }
 
-export async function runPendingPagehideCheck({ browser, storageState, baseURL, route, outputDir, attempts = 8 }) {
+export function journeyExpectation(report, identity) {
+  assert.equal(report.frontend_source, identity.frontendSource);
+  assert.equal(report.frontend_source_dirty, false);
+  assert.equal(report.presentation_evidence, 'commit_frame_estimate');
+  const expected = {
+    'server.backend_source': identity.appSource, 'server.instance_id': identity.serverInstanceId,
+    'browser.frontend_source': identity.frontendSource, 'browser.outcome': report.outcome,
+    'browser.route': report.route, 'browser.trigger': report.trigger,
+    'browser.presentation_evidence': report.presentation_evidence, 'browser.total_ms': report.total_ms,
+  };
+  for (const mark of ['meaningful_transcript', 'breadcrumb_presented', 'breadcrumb_enabled', 'anchor_settled']) expected[`browser.${mark}_ms`] = report.marks[mark];
+  expected['browser.breadcrumb_ready_minus_meaningful_ms'] = report.breadcrumb_ready_minus_meaningful_ms;
+  return { open_id: report.open_id, correlations: report.correlations, expected };
+}
+
+export function appendTerminalInventory(result, terminal, identity, forbidden = []) {
+  for (const trial of terminal.trials) for (const report of trial.reports) {
+    assert.ok(forbidden.every(secret => !JSON.stringify(report).includes(secret)));
+    assert.ok(!result.journeys.some(j => j.open_id === report.open_id), 'journey identity must be unique across contexts');
+    result.journeys.push(journeyExpectation(report, identity));
+  }
+  result.terminal = terminal;
+  result.capabilities.pagehide_incomplete = terminal.status;
+}
+
+export async function runPendingPagehideCheck({ browser, storageState, baseURL, route, outputDir, attempts = 8, budgetMs = 40000 }) {
   assert.ok(Number.isInteger(attempts) && attempts > 0 && attempts <= 8);
+  assert.ok(Number.isInteger(budgetMs) && budgetMs > 0 && budgetMs <= 40000);
+  const caseDeadline = Date.now() + budgetMs;
   const destination = candidateDestination(route, baseURL);
   const trials = [];
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  for (let attempt = 0; attempt < attempts && Date.now() < caseDeadline; attempt++) {
     const owned = await browser.newContext({ storageState, viewport: { width: 1280, height: 900 } });
     const trial = { attempt, sampled: false, reports: [], statuses: [], event: 'actual_cross_document_pagehide' };
     try {
@@ -168,9 +195,9 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
   const receiptPath = resolve(outputDir, 'telemetry-browser-result.json');
   const storageState = await context.storageState();
   let negativeTemplate = null;
-  const deadline = Date.now() + 240_000;
+  const deadline = Date.now() + 180_000;
   try {
-    for (let index = 0; index < 64; index++) {
+    for (let index = 0; index < 56; index++) {
       assert.ok(Date.now() < deadline, 'telemetry context budget deadline');
       const aggregate = aggregates[index % 2];
       const owned = await context.browser().newContext({ storageState, viewport: { width: 1280, height: 900 } });
@@ -230,17 +257,7 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
           assert.ok((fixtures.forbidden ?? []).every(secret => !JSON.stringify(report).includes(secret)), 'report sentinel privacy');
           assert.ok(report.correlations.length <= 16);
           assert.equal(report.breadcrumb_ready_minus_meaningful_ms, Math.max(report.marks.breadcrumb_presented, report.marks.breadcrumb_enabled) - report.marks.meaningful_transcript);
-          result.journeys.push({ open_id: report.open_id, correlations: report.correlations,
-            expected: { 'server.backend_source': fixtures.identity.appSource, 'server.instance_id': fixtures.identity.serverInstanceId,
-              'browser.frontend_source': fixtures.identity.frontendSource, 'browser.outcome': report.outcome,
-              'browser.route': aggregate.kind, 'browser.trigger': report.trigger,
-              'browser.presentation_evidence': report.presentation_evidence,
-              'browser.total_ms': report.total_ms,
-              'browser.meaningful_transcript_ms': report.marks.meaningful_transcript,
-              'browser.breadcrumb_presented_ms': report.marks.breadcrumb_presented,
-              'browser.breadcrumb_enabled_ms': report.marks.breadcrumb_enabled,
-              'browser.anchor_settled_ms': report.marks.anchor_settled,
-              'browser.breadcrumb_ready_minus_meaningful_ms': report.breadcrumb_ready_minus_meaningful_ms } });
+          result.journeys.push(journeyExpectation(report, fixtures.identity));
         }
         if (!trial.sampled) {
           assert.equal(trial.posts, 0, 'unsampled cohort must not contain report POST');
@@ -256,8 +273,11 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
     assert.ok(negativeTemplate, 'at least one naturally sampled report required for collector negatives');
     result.collectorNegatives = await runCollectorNegativeChecks(context, baseURL, negativeTemplate);
     result.collectorNegatives.push(await runUnauthenticatedCollectorCheck(context.browser(), baseURL, negativeTemplate));
+    const terminal = await runPendingPagehideCheck({ browser: context.browser(), storageState, baseURL,
+      route: aggregates[0].route, outputDir, attempts: 8 });
+    appendTerminalInventory(result, terminal, fixtures.identity, fixtures.forbidden ?? []);
     result.comparison = summarizeTrials(result.trials);
-    result.acceptance = 'partial_initial_open_retrieval_and_raw_overhead_only';
+    result.acceptance = 'partial_initial_and_pagehide_incomplete_export_raw_overhead_only';
     return result;
   } catch (error) {
     result.failure = error.message;

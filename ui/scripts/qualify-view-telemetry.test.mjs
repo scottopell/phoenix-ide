@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck, runPendingPagehideCheck } from './qualify-view-telemetry.mjs';
+import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck, runPendingPagehideCheck, appendTerminalInventory } from './qualify-view-telemetry.mjs';
 
 test('retains insufficient natural sampling as inconclusive, never overhead clearance', () => {
   const result = summarizeTrials([{ route: 'ordinary', sampled: true }]);
@@ -87,4 +87,19 @@ test('pending pagehide case requires actual incomplete report, not relabeled rea
     else await assert.rejects(runPendingPagehideCheck(args));
     assert.ok(closed);
   }
+});
+test('terminal inventory preserves incomplete/null marks and forbids duplicate or private reports', () => {
+  const identity = { appSource: 'a'.repeat(40), frontendSource: 'b'.repeat(40), serverInstanceId: 'instance' };
+  const report = { open_id: 'terminal', frontend_source: identity.frontendSource, frontend_source_dirty: false,
+    presentation_evidence: 'commit_frame_estimate', outcome: 'incomplete', route: 'ordinary', trigger: 'navigation',
+    total_ms: 2, marks: { meaningful_transcript: null, breadcrumb_presented: null, breadcrumb_enabled: null, anchor_settled: null },
+    breadcrumb_ready_minus_meaningful_ms: null, correlations: [{ kind: 'request', id: 'request' }] };
+  const result = { journeys: [], capabilities: {} };
+  const terminal = { status: 'observed_incomplete', trials: [{ reports: [report] }] };
+  appendTerminalInventory(result, terminal, identity);
+  assert.equal(result.journeys[0].expected['browser.outcome'], 'incomplete');
+  assert.equal(result.journeys[0].expected['browser.meaningful_transcript_ms'], null);
+  assert.equal(result.capabilities.pagehide_incomplete, 'observed_incomplete');
+  assert.throws(() => appendTerminalInventory(result, terminal, identity));
+  assert.throws(() => appendTerminalInventory({ journeys: [], capabilities: {} }, terminal, identity, ['request']));
 });
