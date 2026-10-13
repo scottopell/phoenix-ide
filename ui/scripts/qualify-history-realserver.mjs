@@ -64,7 +64,7 @@ async function run() {
   const { chromium } = require('playwright');
   const result = { status: 'failed', checks: [], uncovered: [
     'Deterministically delayed older-page versus newer navigation race is not exercised (no response interception).',
-    'Physical devices, non-Chromium engines, real providers and production data are not qualified.',
+    'Mobile-emulated/physical devices, non-Chromium engines, real providers and production data are not qualified.',
   ] };
   const record = (file, data) => appendFileSync(resolve(output, file), JSON.stringify(data) + '\n');
   const checked = (name, data = {}) => { result.checks.push(name); record('assertions.jsonl', { name, ...data }); };
