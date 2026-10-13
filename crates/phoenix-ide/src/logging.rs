@@ -433,6 +433,8 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "conversation.stream.init"),
     ("phoenix_ide::otel", "browser.conversation_open"),
     ("phoenix_ide::otel", "browser.product_conversation_open"),
+    ("phoenix_ide::otel", "browser.conversation_view"),
+    ("phoenix_ide::otel", "browser.view_correlation"),
     ("phoenix_ide::otel", "product_conversation.detail_get"),
     (
         "phoenix_ide::otel",
