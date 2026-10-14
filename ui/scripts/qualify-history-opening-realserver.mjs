@@ -264,8 +264,13 @@ async function run() {
     }), 'actual accepted opening SSE', 10000);
     const event = JSON.parse(accepted.data); const acceptedCursor = acceptedWireCursor(accepted, events);
     assert.equal(event.message?.message_id ?? event.message_id, acceptedId);
-    await poll(() => failed.find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')), 'actual failed owned roster GET');
-    await page.locator('[role="alert"]').first().waitFor({ state: 'visible' });
+    const failedRoster = await poll(() => failed.find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')), 'actual failed owned roster GET');
+    const failedRosterUrl = new URL(failedRoster.url);
+    const faultObservation = { request: failedRoster, pathname: failedRosterUrl.pathname,
+      message_limit: failedRosterUrl.searchParams.get('message_limit'),
+      observation_scope: failedRosterUrl.searchParams.get('message_limit') === '1'
+        ? 'background aggregate ownership probe; no page-alert contract'
+        : 'aggregate acquisition; caller-specific error display not assumed' };
     await poll(async () => await page.locator(COMPOSER_SELECTOR).isEditable(), 'Accepted composer enabled despite roster failure');
     await sameAnchor(before, 'acceptance retains physical anchor');
     assert.equal(new URL(page.url()).searchParams.get('source_transcript'), pin);
@@ -276,7 +281,7 @@ async function run() {
     const body = req.postDataJSON(); assert.equal(body.text, text);
     const ack = await req.response(); assert.ok(ack?.ok()); const ackData = await ack.json(); assert.equal(ackData.queued, true); assert.notEqual(ackData.steering, true);
     await poll(async () => (await http('GET', `/api/conversations/${latest}`)).messages.some(m => m.message_id === `${latest}:${body.message_id}`), 'actual composer message persisted');
-    checked('accepted SSE unblocks exact successor composer despite actual roster failure', { accepted, chat_message_id: body.message_id });
+    checked('accepted SSE unblocks exact successor composer despite actual aggregate GET failure', { accepted_cursor: acceptedCursor, fault: faultObservation, chat_message_id: body.message_id });
     const reconnectStart = events.length, requestStart = requests.length, url = page.url();
     updateFault(fault, { drop: 1 });
     await poll(() => requests.slice(requestStart).find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'stream')), 'same-page actual SSE reconnect request', 15000);

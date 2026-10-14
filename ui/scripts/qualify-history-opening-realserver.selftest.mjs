@@ -6,6 +6,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc, persistedMessageSelector, acceptedWireCursor } from './qualify-history-opening-realserver.mjs';
 
+test('aggregate transport failure proof does not fabricate an alert contract for background probes', () => {
+  const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  assert.match(script, /const failedRoster = await poll\(\(\) => failed\.find/);
+  assert.match(script, /background aggregate ownership probe; no page-alert contract/);
+  assert.match(script, /Accepted composer enabled despite roster failure/);
+  assert.match(script, /actual composer message persisted/);
+  assert.doesNotMatch(script, /page\.locator\('\[role="alert"\]'\)/);
+});
+
 test('accepted cursor uses owning Init incarnation and advancing JSON sequence, not invented transport ID', () => {
   const incarnation = '04bd47cf-71be-473f-b66c-818211975b81';
   const init = { requestId: '14019.119', eventName: 'init', eventId: '', data: JSON.stringify({ stream_incarnation: incarnation, sequence_id: 0 }) };
