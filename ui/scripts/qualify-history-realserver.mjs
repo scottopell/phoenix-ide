@@ -46,11 +46,35 @@ export function occurrences(snapshot) {
   return snapshot.segments.flatMap(s => s.messages.map(m => [s.segment_ordinal, m.sequence_id, m.message_id]));
 }
 
+export function aggregateBoundaries(data) {
+  if (Array.isArray(data.boundaries)) return data.boundaries;
+  assert.ok(Array.isArray(data.segments), 'ordinary segments required');
+  return data.segments.flatMap((s, i) => {
+    assert.ok(Object.hasOwn(s, 'handoff'), 'ordinary segment handoff required');
+    const h = s.handoff;
+    if (h === null) return [];
+    assert.ok(['completed', 'historical'].includes(h?.kind), 'handoff discriminant');
+    assert.equal(h.predecessor_transcript_row_id, s.transcript_row_id);
+    assert.equal(h.successor_transcript_row_id, data.segments[i + 1]?.transcript_row_id);
+    assert.ok(typeof h.continuation_message_id === 'string' && h.continuation_message_id.length > 0);
+    assert.equal(typeof h.summary, 'string');
+    if (h.kind === 'completed') {
+      assert.ok(['user_authorized_instruction', 'generated_predecessor_context'].includes(h.opening_authority));
+      assert.ok(h.accepted_successor_message_id?.startsWith(h.successor_transcript_row_id + ':'));
+    }
+    return [{ message_id: h.continuation_message_id, segment_ordinal: s.segment_ordinal,
+      predecessor_transcript_row_id: h.predecessor_transcript_row_id, successor_transcript_row_id: h.successor_transcript_row_id,
+      represented_successor_opening_message_id: h.kind === 'completed' && h.opening_authority === 'generated_predecessor_context'
+        ? h.accepted_successor_message_id : null }];
+  });
+}
 export function belongsToAggregate(aggregate, response) {
-  const path = new URL(response.url).pathname;
-  return aggregate.kind === 'global'
-    ? path.startsWith('/api/global/coordinator/history/') && response.data.canonical_root?.transcript_row_id === aggregate.members[0]
-    : path === aggregate.endpoint;
+  const path = new URL(response.url).pathname, data = response.data;
+  const prefix = aggregate.kind === 'global' ? '/api/global/coordinator/history/' : '/api/product-conversations/';
+  const owned = path === aggregate.endpoint || [...aggregate.members, data?.latest_transcript_row_id].some(id => typeof id === 'string' && path === prefix + encodeURIComponent(id));
+  const product = aggregate.product_conversation_id ?? aggregate.manual_opening?.edge.product_conversation_id;
+  return owned && data?.canonical_root?.transcript_row_id === aggregate.members[0]
+    && typeof product === 'string' && product.length > 0 && data.product_conversation_id === product;
 }
 
 export function olderRequest(aggregate, url, latest) {
@@ -166,7 +190,7 @@ async function run() {
             entry.body = raw.slice(0, 64000);
             entry.truncated = raw.length > 64000;
             const data = JSON.parse(raw);
-            if (Array.isArray(data.segments) && Array.isArray(data.boundaries)) {
+            if (Array.isArray(data.segments) && (Array.isArray(data.boundaries) || data.segments.every(s => Object.hasOwn(s, 'handoff')))) {
               snapshots.push({ url: response.url(), status: response.status(), data, at_ms: entry.at_ms });
             }
           } catch (error) { entry.read_error = String(error); }

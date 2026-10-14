@@ -135,16 +135,20 @@ def equal_text_fixture(fixture, aggregate):
         cursors.add(cursor)
     else:
         raise AssertionError("equal-text fixture paging exceeded eight pages")
+    product = shipping.validate_wire_identity(pages, members, aggregate["endpoint"], aggregate["kind"], aggregate.get("product_conversation_id"))
     keys = shipping.complete_occurrences(pages, member_messages)
+    boundaries = shipping.member_boundaries(members, member_messages)
+    assert all(page["boundaries"] == boundaries for page in pages), "original boundary metadata differs from persisted member edges"
     assert len(keys) > 201 and len(pages) >= 3
     assert any(key[2] == aggregate["old_message"] for key in keys), "older anchor lost"
     latest = pages[0]
     assert latest["latest_transcript_row_id"] == successor
-    assert len(latest["boundaries"]) == len(aggregate["boundaries"]) + 1
+    assert len(boundaries) == len(aggregate["boundaries"]) + 1
     opening = latest["latest_opening"]
     assert (opening["status"], opening["opening_authority"], opening["presentation"]) == (
         "accepted", "user_authorized_instruction", "separate_message")
     assert opening["accepted_message_id"] == opening_id
+    assert opening["edge"]["product_conversation_id"] == product
     edge = opening["edge"]
     assert edge["predecessor_transcript_row_id"] == predecessor
     assert edge["successor_transcript_row_id"] == successor
@@ -156,7 +160,7 @@ def equal_text_fixture(fixture, aggregate):
     assert boundary_message["content"]["summary"] == opening_message["content"]["text"] == summary
     result = aggregate | {"members": members, "latest_transcript_row_id": successor,
         "persisted_rows": sum(map(len, member_messages)), "page_count": len(pages),
-        "occurrences": keys, "boundaries": latest["boundaries"], "manual_opening": opening}
+        "occurrences": keys, "boundaries": boundaries, "manual_opening": opening, "product_conversation_id": product}
     if aggregate["kind"] == "global":
         result["route"] = f"/global/{successor}"
     return result

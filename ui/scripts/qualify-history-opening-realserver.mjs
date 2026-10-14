@@ -6,9 +6,9 @@ import { resolve, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate } from './qualify-history-realserver.mjs';
+import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate, aggregateBoundaries } from './qualify-history-realserver.mjs';
 
-export function acceptedWireCursor(event, observedEvents) {
+export function ownedWireCursor(event, observedEvents) {
   const payload = JSON.parse(event.data);
   assert.ok(Number.isSafeInteger(payload.sequence_id) && payload.sequence_id >= 0, 'actual accepted wire sequence required');
   const index = observedEvents.indexOf(event);
@@ -21,6 +21,18 @@ export function acceptedWireCursor(event, observedEvents) {
   return { request_id: event.requestId, stream_incarnation: initial.stream_incarnation,
     init_sequence_id: initial.sequence_id, sequence_id: payload.sequence_id,
     transport_event_id: event.eventId };
+}
+
+export function acceptedWireCursor(event, observedEvents) {
+  const cursor = ownedWireCursor(event, observedEvents);
+  const payload = JSON.parse(event.data);
+  const index = observedEvents.indexOf(event);
+  const initial = JSON.parse(observedEvents.slice(0, index).findLast(e => e.requestId === event.requestId && e.eventName === 'init').data);
+  assert.equal(payload.opening?.status, 'accepted');
+  assert.ok(sameEdge(initial.opening?.edge, payload.opening?.edge), 'accepted Init full edge');
+  assert.equal(initial.conversation?.id, payload.opening?.edge.successor_transcript_row_id, 'accepted Init successor');
+  assert.equal(payload.message?.message_id ?? payload.message_id, payload.opening?.accepted_message_id, 'accepted event message identity');
+  return cursor;
 }
 
 export function persistedMessageSelector(id) {
@@ -38,6 +50,72 @@ export function openingMatches(value, evidence, status) {
     && (status === 'pending' ? value.client_turn_key === evidence.client_turn_key
       : value.accepted_message_id === `${evidence.successor_transcript_row_id}:${evidence.client_turn_key}`
         && value.presentation === 'separate_message');
+}
+export function validateOwnedAggregate(a, data, url) {
+  const fail = message => { throw Object.assign(new Error(message), { captureReason: 'wrong_aggregate' }); };
+  try {
+    assert.ok(belongsToAggregate(a, { url, data }), 'stable product/root/request ownership');
+    const segments = data.segments;
+    assert.ok(Array.isArray(segments) && segments.length > 0 && segments.length <= a.members.length);
+    assert.deepEqual(segments.map(s => s.transcript_row_id), a.members.slice(0, segments.length), 'ordered full roster');
+    segments.forEach((s, i) => {
+      assert.equal(s.segment_ordinal, i); assert.ok(Array.isArray(s.messages));
+      s.messages.forEach(m => { assert.ok(typeof m.message_id === 'string' && m.message_id.length > 0); assert.ok(Number.isSafeInteger(m.sequence_id) && m.sequence_id >= 0); });
+    });
+    assert.equal(data.latest_transcript_row_id, segments.at(-1).transcript_row_id);
+    assert.ok(segments.some(s => s.transcript_row_id === data.requested_transcript_row_id));
+    const path = new URL(url).pathname;
+    if (a.kind === 'ordinary' && path === a.endpoint) assert.equal(data.requested_transcript_row_id, a.members[0], 'stable product route selects root');
+    if (a.kind === 'global' || path !== a.endpoint) assert.equal(decodeURIComponent(path.split('/').at(-1)), data.requested_transcript_row_id, 'selected alias');
+    const original = new URL(url).searchParams.get('boundary_representation') === 'original_messages';
+    if (a.kind === 'global' || original) {
+      assert.ok(Array.isArray(data.boundaries), 'original/Global boundary wire');
+      assert.ok(segments.every(s => !Object.hasOwn(s, 'handoff')), 'original history segment wire');
+    } else {
+      assert.equal(Object.hasOwn(data, 'boundaries'), false, 'ordinary snapshot uses segments[].handoff');
+      assert.ok(segments.every(s => Object.hasOwn(s, 'handoff')), 'snapshot handoff wire');
+    }
+    const boundaries = aggregateBoundaries(data);
+    boundaries.forEach(b => {
+      assert.ok(Number.isInteger(b.segment_ordinal) && b.segment_ordinal >= 0);
+      assert.equal(b.predecessor_transcript_row_id, segments[b.segment_ordinal]?.transcript_row_id);
+      assert.equal(b.successor_transcript_row_id, segments[b.segment_ordinal + 1]?.transcript_row_id);
+      assert.ok(typeof b.message_id === 'string' && b.message_id.length > 0);
+      assert.ok(b.represented_successor_opening_message_id === null || b.represented_successor_opening_message_id?.startsWith(b.successor_transcript_row_id + ':'));
+    });
+    boundaries.forEach(b => {
+      const known = a.boundaries?.find(candidate => candidate.segment_ordinal === b.segment_ordinal);
+      const evidence = a.opening_evidence?.[b.successor_transcript_row_id];
+      if (known) { assert.equal(b.message_id, known.message_id); assert.equal(b.represented_successor_opening_message_id, known.represented_successor_opening_message_id); }
+      if (evidence) assert.equal(b.message_id, evidence.continuation_message_id);
+      const h = segments[b.segment_ordinal].handoff;
+      if (h?.kind === 'completed') {
+        const acceptedId = evidence ? `${evidence.successor_transcript_row_id}:${evidence.client_turn_key}`
+          : a.manual_opening.edge.successor_transcript_row_id === b.successor_transcript_row_id ? a.manual_opening.accepted_message_id : null;
+        if (acceptedId) assert.equal(h.accepted_successor_message_id, acceptedId);
+      }
+    });
+    const opening = data.latest_opening;
+    assert.ok(['pending', 'accepted'].includes(opening?.status), 'manual opening union');
+    assert.equal(opening.edge.product_conversation_id, a.product_conversation_id ?? a.manual_opening.edge.product_conversation_id);
+    assert.equal(opening.edge.successor_transcript_row_id, data.latest_transcript_row_id);
+    assert.equal(opening.edge.predecessor_transcript_row_id, segments.at(-2)?.transcript_row_id);
+    assert.equal(opening.opening_authority, 'user_authorized_instruction');
+    const expected = a.opening_evidence?.[data.latest_transcript_row_id];
+    if (expected) assert.ok(openingMatches(opening, expected, opening.status), 'committed opening evidence');
+    else { assert.equal(opening.status, 'accepted'); assert.deepEqual(opening, a.manual_opening, 'fixture manual opening identity'); }
+    if (opening.status === 'pending') assert.ok(typeof opening.client_turn_key === 'string' && opening.client_turn_key.length > 0);
+    else { assert.equal(opening.presentation, 'separate_message'); assert.ok(opening.accepted_message_id?.startsWith(data.latest_transcript_row_id + ':')); }
+    const edgeBoundary = boundaries.find(b => b.message_id === opening.edge.continuation_message_id);
+    if (a.kind === 'global' || original) assert.ok(edgeBoundary, 'original full boundary metadata');
+    if (edgeBoundary) {
+      assert.equal(edgeBoundary.predecessor_transcript_row_id, opening.edge.predecessor_transcript_row_id);
+      assert.equal(edgeBoundary.successor_transcript_row_id, opening.edge.successor_transcript_row_id);
+      assert.equal(edgeBoundary.represented_successor_opening_message_id, null);
+    }
+    return { product_conversation_id: data.product_conversation_id, canonical_root_transcript_row_id: data.canonical_root.transcript_row_id,
+      requested_transcript_row_id: data.requested_transcript_row_id, latest_transcript_row_id: data.latest_transcript_row_id };
+  } catch (error) { fail(error.message); }
 }
 export function faultTarget(method, url, state, kind) {
   const parsed = new URL(url, 'http://127.0.0.1:1');
@@ -167,14 +245,14 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     const metadata = identity(req), policy = capturePolicy(aggregate, metadata.method, metadata.url);
     const entry = { ...metadata, body: req.postData(), policy };
     requests.push(entry); record('browser-requests.jsonl', entry);
-    if (policy.kind === 'required_aggregate_json') required.set(metadata.request_ordinal, { metadata, outcome: 'awaiting_response' });
+    if (policy.kind === 'required_aggregate_json') required.set(metadata.request_ordinal, { metadata, outcome: 'awaiting_response', expected_transport_failure: expectedRequestFailure(entry) });
   };
   const onFailed = req => {
     const entry = { ...identity(req), failure: req.failure(), outcome: 'request_failed' };
     failed.push(entry); record('browser-failed.jsonl', entry);
     const state = required.get(entry.request_ordinal);
     if (state?.outcome === 'awaiting_response') {
-      state.outcome = 'request_failed'; state.expected_transport_failure = expectedRequestFailure(entry);
+      state.outcome = 'request_failed';
       record('browser-required-transport.jsonl', { ...entry, expected_transport_failure: state.expected_transport_failure });
     }
   };
@@ -219,15 +297,8 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
         let data;
         try { data = JSON.parse(raw); }
         catch (error) { error.captureReason = 'parse'; throw error; }
-        if (!Array.isArray(data?.segments) || !Array.isArray(data?.boundaries)
-          || data.canonical_root?.transcript_row_id !== aggregate.members[0]
-          || data.product_conversation_id !== aggregate.manual_opening.edge.product_conversation_id) {
-          throw Object.assign(new Error('required response is not the owned aggregate'), { captureReason: 'wrong_aggregate' });
-        }
+        const parsed_identity = validateOwnedAggregate(aggregate, data, metadata.url);
         assert.ok(snapshots.length < 300, 'aggregate snapshot bound');
-        const parsed_identity = { product_conversation_id: data.product_conversation_id,
-          canonical_root_transcript_row_id: data.canonical_root.transcript_row_id,
-          requested_transcript_row_id: data.requested_transcript_row_id, latest_transcript_row_id: data.latest_transcript_row_id };
         snapshots.push({ ...metadata, raw, data, parsed_identity });
         state.outcome = 'captured';
         record('browser-responses.jsonl', { ...metadata, outcome: 'captured', parsed_identity, body_bytes: bytes });
@@ -246,6 +317,7 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   page.on('request', onRequest); page.on('requestfailed', onFailed); page.on('response', onResponse);
   page.on('pageerror', onPageError); page.on('framenavigated', onNavigation); page.on('close', onClose);
   return { requests, failed, applicationErrors, captureErrors,
+    registerOpening(evidence) { aggregate.opening_evidence ??= {}; aggregate.opening_evidence[evidence.successor_transcript_row_id] = { ...evidence }; },
     registerMember(id) { assert.ok(typeof id === 'string' && id.length > 0); aggregate.members.push(id); },
     sealAndDrain() {
       if (drain) return drain;
@@ -332,16 +404,19 @@ async function run() {
       expectedRequestFailure: entry => faultTarget(entry.method, entry.url, JSON.parse(readFileSync(fault)), 'roster'),
     });
     ({ requests, failed } = recorder);
+    const streamRequests = new Map();
     const cdp = await context.newCDPSession(page); await cdp.send('Network.enable');
+    cdp.on('Network.requestWillBeSent', e => { streamRequests.set(e.requestId, e.request.url); });
     cdp.on('Network.eventSourceMessageReceived', event => { events.push(event); record('browser-sse.jsonl', event); });
 
     // Verify the already-accepted manual edge independently; identical payload is not suppression authority.
     const previous = await http('GET', a.endpoint + '?boundary_representation=original_messages');
+    validateOwnedAggregate(a, previous, api + a.endpoint + '?boundary_representation=original_messages');
     assert.equal(previous.latest_opening.status, 'accepted');
     assert.equal(previous.latest_opening.opening_authority, 'user_authorized_instruction');
     assert.equal(previous.latest_opening.presentation, 'separate_message');
     const oldEdge = previous.latest_opening.edge;
-    const boundary = previous.boundaries.find(b => b.message_id === oldEdge.continuation_message_id);
+    const boundary = aggregateBoundaries(previous).find(b => b.message_id === oldEdge.continuation_message_id);
     const openingId = previous.latest_opening.accepted_message_id;
     assert.ok(boundary); assert.equal(boundary.represented_successor_opening_message_id, null);
     const oldRow = await http('GET', `/api/conversations/${gate.predecessor}`);
@@ -352,7 +427,7 @@ async function run() {
     assert.ok(boundaryMessage); assert.equal(boundaryMessage.content.summary, openingMessage.content.text);
     await page.goto(ui + sourceLink(a, gate.predecessor, openingId), { waitUntil: 'domcontentloaded' });
     await page.locator(persistedMessageSelector(openingId)).first().waitFor({ state: 'visible' });
-    checked('manual equal-text accepted opening remains separate', { edge: oldEdge, opening_id: openingId, boundary_id: boundary.message_id });
+    checked('manual equal-text accepted opening remains separate', { edge: oldEdge, opening_id: openingId, boundary_id: oldEdge.continuation_message_id });
 
     assert.equal((await command({ command: 'arm', predecessor: gate.predecessor, client_turn_key: gate.key })).state, 'armed'); gate.armed = true;
     // POST acknowledgement may precede message persistence; only Entered certifies committed Pending.
@@ -360,10 +435,12 @@ async function run() {
     continuation.catch(() => {});
     const entered = await poll(async () => { const reply = await command({ command: 'entered' }); return reply.state === 'entered' && reply.evidence; }, 'committed Pending IPC', 10000);
     assert.equal(entered.predecessor_transcript_row_id, gate.predecessor); assert.equal(entered.client_turn_key, gate.key);
+    assert.equal(entered.product_conversation_id, a.manual_opening.edge.product_conversation_id);
     assert.equal(entered.edge, 'committed_intent_before_first_message_persistence');
     const latest = entered.successor_transcript_row_id, acceptedId = `${latest}:${gate.key}`;
-    recorder.registerMember(latest);
+    recorder.registerMember(latest); recorder.registerOpening(entered);
     const pending = await http('GET', a.endpoint + '?boundary_representation=original_messages');
+    validateOwnedAggregate({ ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } }, pending, api + a.endpoint + '?boundary_representation=original_messages');
     assert.equal(pending.latest_transcript_row_id, latest); assert.ok(openingMatches(pending.latest_opening, entered, 'pending'));
     const direct = await http('GET', `/api/conversations/${latest}`);
     assert.equal(direct.messages.some(m => [gate.key, acceptedId].includes(m.message_id)), false);
@@ -391,7 +468,7 @@ async function run() {
     checked('committed Pending: browser/HTTP/new SSE init available, opening deferred and composer readonly', { entered, before });
     const actualRoster = snapshots.slice(start).find(s => belongsToAggregate(a, s));
     updateFault(fault, { aggregatePath: new URL(actualRoster.url).pathname, failRoster: true });
-    const acceptedStart = events.length;
+    const acceptedStart = events.length, failureStart = failed.length;
     await releaseOnce(gate, command);
     const continued = await continuation; assert.equal(continued.status, 'accepted'); assert.equal(continued.conversation_id, latest);
     const accepted = await poll(() => events.slice(acceptedStart).find(e => {
@@ -399,7 +476,7 @@ async function run() {
     }), 'actual accepted opening SSE', 10000);
     const event = JSON.parse(accepted.data); const acceptedCursor = acceptedWireCursor(accepted, events);
     assert.equal(event.message?.message_id ?? event.message_id, acceptedId);
-    const failedRoster = await poll(() => failed.find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')), 'actual failed owned roster GET');
+    const failedRoster = await poll(() => failed.slice(failureStart).find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')), 'actual failed owned roster GET');
     const failedRosterUrl = new URL(failedRoster.url);
     const faultObservation = { request: failedRoster, pathname: failedRosterUrl.pathname,
       message_limit: failedRosterUrl.searchParams.get('message_limit'),
@@ -420,7 +497,7 @@ async function run() {
     const reconnectStart = events.length, requestStart = requests.length, url = page.url();
     updateFault(fault, { drop: 1 });
     await poll(() => requests.slice(requestStart).find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'stream')), 'same-page actual SSE reconnect request', 15000);
-    const reconnect = await poll(() => events.slice(reconnectStart).find(e => e.eventName === 'init' && openingMatches(JSON.parse(e.data).opening, entered, 'accepted')), 'same-page accepted reconnect Init', 15000);
+    const reconnect = await poll(() => events.slice(reconnectStart).find(e => e.requestId !== accepted.requestId && streamRequests.has(e.requestId) && faultTarget('GET', streamRequests.get(e.requestId), JSON.parse(readFileSync(fault)), 'stream') && e.eventName === 'init' && openingMatches(JSON.parse(e.data).opening, entered, 'accepted')), 'same-page accepted reconnect Init', 15000);
     const transport = readFileSync(resolve(output, 'preview-transport.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
     assert.ok(transport.some(t => t.action === 'drop-streams' && t.token === 1 && t.count > 0), 'owned preview actually destroyed live SSE responses');
     assert.equal(page.url(), url); assert.equal(new URL(page.url()).searchParams.get('source_transcript'), pin);
@@ -434,7 +511,7 @@ async function run() {
     await page.screenshot({ path: resolve(output, 'accepted-reconnected.png') });
     updateFault(fault, { failRoster: false });
     const restoredAggregate = page.waitForResponse(response => response.request().method() === 'GET'
-      && faultTarget('GET', response.url(), { ...JSON.parse(readFileSync(fault)), failRoster: true }, 'roster')
+      && capturePolicy({ ...a, members: [...a.members, latest] }, 'GET', response.url()).kind === 'required_aggregate_json'
       && response.ok());
     // An explicit chapter selection may move the reader; verify its persisted ID after the click.
     const chapter = page.locator('#conversation-nav [role="button"]').filter({ hasText: 'opening-probe' });

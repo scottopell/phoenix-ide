@@ -128,8 +128,58 @@ def validate_pages(pages):
     return keys
 
 
+def wire_boundaries(snapshot):
+    if "boundaries" in snapshot:
+        return snapshot["boundaries"]
+    result = []
+    for segment in snapshot["segments"]:
+        handoff = segment["handoff"]
+        if handoff is not None:
+            assert handoff["kind"] in ("completed", "historical")
+            assert handoff["predecessor_transcript_row_id"] == segment["transcript_row_id"]
+            result.append({"message_id": handoff["continuation_message_id"],
+                "predecessor_transcript_row_id": handoff["predecessor_transcript_row_id"],
+                "successor_transcript_row_id": handoff["successor_transcript_row_id"],
+                "segment_ordinal": segment["segment_ordinal"],
+                "represented_successor_opening_message_id": handoff["accepted_successor_message_id"]
+                    if handoff["kind"] == "completed" and handoff["opening_authority"] == "generated_predecessor_context" else None})
+    return result
+
+
+def member_boundaries(member_ids, member_messages):
+    result = []
+    for i, messages in enumerate(member_messages[:-1]):
+        rows = [m for m in messages if m["message_type"] == "continuation"]
+        assert len(rows) == 1, "one persisted continuation per predecessor required"
+        result.append({"message_id": rows[0]["message_id"], "segment_ordinal": i,
+            "predecessor_transcript_row_id": member_ids[i], "successor_transcript_row_id": member_ids[i + 1],
+            "represented_successor_opening_message_id": None})
+    return result
+
+
+def validate_wire_identity(pages, member_ids, endpoint, kind, product=None):
+    for page in pages:
+        actual_product = page["product_conversation_id"]
+        assert isinstance(actual_product, str) and actual_product
+        product = actual_product if product is None else product
+        assert actual_product == product
+        assert page["canonical_root"]["transcript_row_id"] == member_ids[0]
+        assert [s["transcript_row_id"] for s in page["segments"]] == member_ids
+        assert [s["segment_ordinal"] for s in page["segments"]] == list(range(len(member_ids)))
+        assert page["latest_transcript_row_id"] == member_ids[-1]
+        assert page["requested_transcript_row_id"] == member_ids[0]
+        if kind == "ordinary":
+            assert endpoint == f"/api/product-conversations/{product}"
+            assert isinstance(page["boundaries"], list)
+            assert all("handoff" not in segment for segment in page["segments"]), "original history segment wire"
+        else:
+            assert endpoint == f"/api/global/coordinator/history/{member_ids[0]}"
+            assert isinstance(page["boundaries"], list)
+    return product
+
+
 def complete_occurrences(pages, members):
-    omitted = {b["represented_successor_opening_message_id"] for b in pages[0]["boundaries"]
+    omitted = {b["represented_successor_opening_message_id"] for b in wire_boundaries(pages[0])
                if b["represented_successor_opening_message_id"] is not None}
     expected = [(ordinal, m["sequence_id"], m["message_id"])
                 for ordinal, messages in enumerate(members) for m in messages
@@ -249,16 +299,19 @@ class Fixture:
             cursors.add(cursor)
         else:
             raise AssertionError("paging exceeded eight pages")
+        product = validate_wire_identity(pages, members, endpoint, kind)
         keys = complete_occurrences(pages, member_messages)
+        boundaries = member_boundaries(members, member_messages)
+        assert all(page["boundaries"] == boundaries for page in pages), "original boundary metadata differs from persisted member edges"
         assert len(keys) > 201 and len(pages) >= 3
         assert pages[0]["latest_transcript_row_id"] == row
-        assert len(pages[0]["boundaries"]) >= 2
+        assert len(boundaries) >= 2
         if kind == "global":
             route = f"/global/{row}"
         return {"kind": kind, "route": route, "endpoint": endpoint, "members": members,
                 "old_message": old, "tool": tool, "persisted_rows": persisted,
                 "page_count": len(pages), "occurrences": keys,
-                "boundaries": pages[0]["boundaries"]}
+                "boundaries": boundaries, "product_conversation_id": product}
 
 
 def stop(proc):

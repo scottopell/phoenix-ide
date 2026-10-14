@@ -182,6 +182,24 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertLess(source.index('boundaryMessage.content.summary, openingMessage.content.text'),
                         source.index("command: 'arm'"))
 
+    def test_full_wire_identity_and_member_boundary_facts(self):
+        from copy import deepcopy
+        for kind in ("ordinary", "global"):
+            endpoint = "/api/product-conversations/product" if kind == "ordinary" else "/api/global/coordinator/history/root"
+            page = {"product_conversation_id": "product", "canonical_root": {"transcript_row_id": "root"},
+                "requested_transcript_row_id": "root", "latest_transcript_row_id": "successor", "boundaries": [],
+                "segments": [{"transcript_row_id": row, "segment_ordinal": i, "messages": []} for i, row in enumerate(["root", "successor"])]}
+            self.assertEqual(opening.shipping.validate_wire_identity([page], ["root", "successor"], endpoint, kind), "product")
+            for field in ["product_conversation_id", "requested_transcript_row_id", "latest_transcript_row_id"]:
+                bad = deepcopy(page); bad[field] = "foreign"
+                with self.subTest(kind=kind, field=field), self.assertRaises(AssertionError):
+                    opening.shipping.validate_wire_identity([bad], ["root", "successor"], endpoint, kind, "product")
+            bad = deepcopy(page); bad["segments"][0]["transcript_row_id"] = "foreign"
+            with self.assertRaises(AssertionError): opening.shipping.validate_wire_identity([bad], ["root", "successor"], endpoint, kind)
+        boundaries = opening.shipping.member_boundaries(["root", "successor"], [[{"message_id": "boundary", "message_type": "continuation"}], []])
+        self.assertEqual(boundaries[0]["successor_transcript_row_id"], "successor")
+        with self.assertRaises(AssertionError): opening.shipping.member_boundaries(["root", "successor"], [[], []])
+
     def test_no_compiler_or_shipping_server_invocation(self):
         source = Path(opening.__file__).read_text()
         self.assertNotIn("h._server()", source)

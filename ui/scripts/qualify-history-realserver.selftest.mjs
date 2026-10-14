@@ -31,11 +31,11 @@ test('pagination occurrences distinguish sequence restarts across real members',
   assert.deepEqual(occurrences(snapshot), [[0, 1, 'row0'], [1, 1, 'row1'], [2, 1, 'row2']]);
 });
 test('Global responses can change pinned member without changing aggregate identity', () => {
-  const a = { kind: 'global', members: ['root', 'child'] };
-  const response = { url: 'http://127.0.0.1:1/api/global/coordinator/history/child?before=real', data: { canonical_root: { transcript_row_id: 'root' } } };
+  const a = { kind: 'global', product_conversation_id: 'product', members: ['root', 'child'] };
+  const response = { url: 'http://127.0.0.1:1/api/global/coordinator/history/child?before=real', data: { product_conversation_id: 'product', canonical_root: { transcript_row_id: 'root' } } };
   assert.equal(belongsToAggregate(a, response), true);
   assert.equal(belongsToAggregate({ ...a, members: ['foreign'] }, response), false);
-  assert.equal(belongsToAggregate({ kind: 'ordinary', endpoint: '/api/product-conversations/pc' }, { ...response, url: 'http://127.0.0.1:1/api/product-conversations/pc?before=real' }), true);
+  assert.equal(belongsToAggregate({ kind: 'ordinary', endpoint: '/api/product-conversations/pc', members: ['root'], product_conversation_id: 'product' }, { ...response, url: 'http://127.0.0.1:1/api/product-conversations/pc?before=real' }), true);
 });
 
 test('rendered readiness probes survive frozen 40-character prompt clipping', () => {
@@ -96,8 +96,8 @@ test('offline setup needs four fresh, stable, positive-overflow native-bottom ta
   }
 });
 
-const globalAggregate = { kind: 'global', members: ['root', 'child'] };
-const ordinaryAggregate = { kind: 'ordinary', members: ['ordinary-root'], endpoint: '/api/product-conversations/pc' };
+const globalAggregate = { kind: 'global', product_conversation_id: 'product', members: ['root', 'child'] };
+const ordinaryAggregate = { kind: 'ordinary', product_conversation_id: 'product', members: ['ordinary-root'], endpoint: '/api/product-conversations/pc' };
 const historyUrl = member => `http://127.0.0.1:1/api/global/coordinator/history/${member}?before=cursor%2B1`;
 const disconnected = url => ({ url, method: 'GET', failure: { errorText: 'net::ERR_INTERNET_DISCONNECTED' } });
 
@@ -123,7 +123,7 @@ test('failed older witness requires a GET cursor on this aggregate including its
 test('successful Retry must recover the same failed endpoint and cursor with correct canonical/latest identity', () => {
   const url = historyUrl('new-latest');
   const failed = olderRequest(globalAggregate, url, 'new-latest');
-  const response = { url, status: 200, data: { canonical_root: { transcript_row_id: 'root' }, latest_transcript_row_id: 'new-latest' } };
+  const response = { url, status: 200, data: { product_conversation_id: 'product', canonical_root: { transcript_row_id: 'root' }, latest_transcript_row_id: 'new-latest' } };
   assert.equal(retryMatches(globalAggregate, response, failed, 'new-latest'), true);
   for (const change of [
     { url: historyUrl('child') }, { url: url.replace('cursor%2B1', 'different') },
@@ -132,7 +132,7 @@ test('successful Retry must recover the same failed endpoint and cursor with cor
     { data: { ...response.data, latest_transcript_row_id: 'child' } },
   ]) assert.equal(retryMatches(globalAggregate, { ...response, ...change }, failed, 'new-latest'), false);
   const ordinary = { url: 'http://127.0.0.1:1/api/product-conversations/pc?before=cursor', status: 200,
-    data: { latest_transcript_row_id: 'new' } };
+    data: { product_conversation_id: 'product', canonical_root: { transcript_row_id: 'ordinary-root' }, latest_transcript_row_id: 'new' } };
   assert.equal(retryMatches(ordinaryAggregate, ordinary, olderRequest(ordinaryAggregate, ordinary.url, 'new'), 'new'), true);
   assert.equal(retryMatches(ordinaryAggregate, { ...ordinary, url: ordinary.url.replace('/pc?', '/foreign?') },
     olderRequest(ordinaryAggregate, ordinary.url, 'new'), 'new'), false);

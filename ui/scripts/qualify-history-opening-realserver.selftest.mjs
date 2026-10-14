@@ -20,7 +20,7 @@ test('fault remains active through acceptance and same-page reconnect, but new p
 
 test('aggregate transport failure proof does not fabricate an alert contract for background probes', () => {
   const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
-  assert.match(script, /const failedRoster = await poll\(\(\) => failed\.find/);
+  assert.match(script, /const failedRoster = await poll\(\(\) => failed\.slice\(failureStart\)\.find/);
   assert.match(script, /background aggregate ownership probe; no page-alert contract/);
   assert.match(script, /Accepted composer enabled despite roster failure/);
   assert.match(script, /actual composer message persisted/);
@@ -29,8 +29,8 @@ test('aggregate transport failure proof does not fabricate an alert contract for
 
 test('accepted cursor uses owning Init incarnation and advancing JSON sequence, not invented transport ID', () => {
   const incarnation = '04bd47cf-71be-473f-b66c-818211975b81';
-  const init = { requestId: '14019.119', eventName: 'init', eventId: '', data: JSON.stringify({ stream_incarnation: incarnation, sequence_id: 0 }) };
-  const event = { requestId: init.requestId, eventName: 'message', eventId: '', data: JSON.stringify({ sequence_id: 1 }) };
+  const init = { requestId: '14019.119', eventName: 'init', eventId: '', data: JSON.stringify({ stream_incarnation: incarnation, sequence_id: 0, conversation: { id: 'successor' }, opening: { edge } }) };
+  const event = { requestId: init.requestId, eventName: 'message', eventId: '', data: JSON.stringify({ sequence_id: 1, opening: accepted, message: { message_id: accepted.accepted_message_id } }) };
   assert.deepEqual(acceptedWireCursor(event, [init, event]), { request_id: init.requestId, stream_incarnation: incarnation,
     init_sequence_id: 0, sequence_id: 1, transport_event_id: '' });
   assert.throws(() => acceptedWireCursor(event, [event]));
@@ -160,8 +160,9 @@ test('IPC command bounds reject before touching a socket', async () => {
 const { installAggregateRecorder, capturePolicy, REQUIRED_BODY_DEADLINE_MS, REQUIRED_BODY_MAX_BYTES } =
   await import('./qualify-history-opening-realserver.mjs');
 const aggregate = { kind: 'ordinary', endpoint: '/api/product-conversations/product', members: ['root', 'successor'],
-  manual_opening: { edge: { product_conversation_id: 'product' } } };
-const aggregateBody = { segments: [], boundaries: [], canonical_root: { transcript_row_id: 'root' },
+  product_conversation_id: 'product', manual_opening: { ...accepted, edge: { ...edge, predecessor_transcript_row_id: 'root' } } };
+const aggregateBody = { segments: aggregate.members.map((id, i) => ({ transcript_row_id: id, segment_ordinal: i, messages: [], handoff: null })),
+  canonical_root: { transcript_row_id: 'root' }, latest_opening: aggregate.manual_opening,
   product_conversation_id: 'product', requested_transcript_row_id: 'root', latest_transcript_row_id: 'successor' };
 function recorderFixture(options = {}, a = aggregate) {
   const page = new EventEmitter(), receipts = [], snapshots = [];
@@ -286,15 +287,14 @@ test('missing required outcome fails; requestfailed transport remains distinct f
   assert.throws(() => unexpected.recorder.assertQualified(), /exact expected transport failure/);
 });
 
-test('actual Global producer captures owned source alias and a registered committed successor', async () => {
+test('synthetic Global alias uses its own selected row and registered committed evidence (not runtime)', async () => {
   const a = { ...aggregate, kind: 'global', endpoint: '/api/global/coordinator/history/root' };
   const f = recorderFixture({}, a);
-  f.recorder.registerMember('new-successor');
-  for (const id of ['successor', 'new-successor']) {
-    const req = f.request('/api/global/coordinator/history/' + id); f.page.emit('request', req); f.respond(req);
-  }
-  await f.recorder.sealAndDrain(); f.recorder.assertQualified(); assert.equal(f.snapshots.length, 2);
-  assert.equal(a.members.includes('new-successor'), false, 'recorder does not mutate runtime fixture');
+  const body = { ...aggregateBody, requested_transcript_row_id: 'successor',
+    segments: aggregateBody.segments.map(({ handoff, ...s }) => s), boundaries: [{ message_id: 'boundary', segment_ordinal: 0,
+      predecessor_transcript_row_id: 'root', successor_transcript_row_id: 'successor', represented_successor_opening_message_id: null }] };
+  const req = f.request('/api/global/coordinator/history/successor'); f.page.emit('request', req); f.respond(req, async () => JSON.stringify(body));
+  await f.recorder.sealAndDrain(); f.recorder.assertQualified(); assert.equal(f.snapshots.length, 1);
 });
 
 test('byte bound accepts exact 2MiB raw JSON and rejects one extra byte without truncating a successful receipt', async () => {

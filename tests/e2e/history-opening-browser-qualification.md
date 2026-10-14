@@ -1,8 +1,8 @@
 # Instrumented opening browser qualification
 
 This harness is **instrumented runtime evidence, not shipping-binary proof**.
-`history_browser.py` and `qualify-history-realserver.mjs` remain unchanged and
-qualify the separate older shipping app. No new HTTP control endpoint exists.
+`history_browser.py` and `qualify-history-realserver.mjs` share the corrected
+wire identity helpers with this witness; the app source remains pinned unchanged. No new HTTP control endpoint exists.
 
 ## Inputs and hosted invocation
 
@@ -148,3 +148,111 @@ assertion remains mandatory. A status200 body failure is never forgiven by that
 exception. Both application errors and capture errors must be empty; cleanup
 failure still forces failed status/exit. Controllable response mocks exist only
 inside compiler-free selftests and invoke the actual installed producer.
+
+## PRE-DISPATCH audit of parent 323 (offline correction; no runtime rerun)
+
+**Disposition:** source/recorder correction and offline replay only. No hosted
+push/dispatch, app build, install, production operation, browser or server was
+performed. Independent parent review is the next gate. Roadmap was not refreshed
+because network access was expressly excluded; retained domain/artifact context
+was used. The original failed artifacts were not edited or relabeled.
+
+### Audit matrix
+
+| Surface/expectation | Finding and correction | Verification / remaining gate |
+|---|---|---|
+| Ordinary snapshot raw boundary shape | Default `ProductConversationSnapshotView` uses `segments[].handoff` (`null`, `historical`, `completed`), **not** top-level `boundaries`. Validate each handoff discriminant, adjacent full row IDs, continuation ID, summary type, completed authority and accepted successor ID. | Actual installed response handler captures all 25 retained ordinary full bodies; six handoff-field mutations fail closed. |
+| Ordinary original-message history | `boundary_representation=original_messages` returns `ProductConversationHistorySnapshotView`: history segments without `handoff`, plus full boundary metadata. This is a distinct genuine wire projection, not a fallback to tolerate broken snapshots. | Both projections are exercised in the 25 bodies. Driver still requires the exact original boundary and null represented opening ID before arm. |
+| Global history/root | Actual `CoordinatorConversationSnapshotView` **does** carry `canonical_root`, full `boundaries`, and history segments without handoff. Stable product ID differs from root/member IDs. | 13 actual browser Global bodies (first at line 272) + full driver body at line 22 = 14 captures. Root/product/member/ordinal mutations rejected. No fabricated instrumented Global fixture. |
+| Fixture full-wire identity | Python original-message pages now check stable product, canonical root, ordered full roster and ordinals, requested root, latest row and exact endpoint identity; boundary metadata equals persisted predecessor continuations. | Compiler-free Python identity/member-edge regressions; original occurrence-count, ordering, cursor progress, no omission and older-anchor checks remain. |
+| Pending / accepted union | Recorder validates full edge, exact committed key or accepted `successor:key`, manual authority and separate presentation against fixture or IPC evidence, not text or partial IDs. | Ordinary IPC/HTTP evidence supplies real successor registration. Global Pending is **synthetic mutation only**, explicitly not held-gate evidence. Wrong opening edge, owner, ID, authority and presentation fail. |
+| Latest versus selected | Last roster row is latest; selected row must belong to the roster and match alias request identity. Stable ordinary product route selects root. Known historical responses may precede newly registered successors. | Authentic Global responses include selected middle/root/latest aliases and later accepted successor; selected/latest mutation tests reject. |
+| Own Init / cursor | Acceptance cursor requires its own earlier CDP request Init, full edge, successor conversation identity, exact accepted message identity, valid incarnation and advancing JSON sequence. Transport `eventId` is retained, never treated as sequence. | Ordinary: 3 Init frames, 1 real acceptance-transition cursor, 2 later message cursors. Global: 8 accepted Init frames, 6 later message cursors, **0 acceptance-transition frames retained**. Foreign request and bad sequence mutations reject. |
+| Failure probe/status/body policy | Required owned GET remains HTTP 200 + JSON + full body + parse + contract; metadata-only APIs never retrieve bodies. Expected transport failure is fixed at request time and scoped to exact active fault target. Failure witness excludes pre-release failures. | Existing deadline, disposed, over-limit, malformed, missing, status/type, concurrency, pageerror and expected/unexpected transport tests remain. No blanket ignore. Actual post-correction runtime failure scenario not rerun. |
+| Drop/reconnect | New Init must have a different CDP request from acceptance and a CDP request URL matching the exact successor stream; proxy receipt must show token 1 destroyed at least one live response. | Source/selftest audit only. Real instrumented Global drop/reconnect remains unqualified. |
+| Restored pin GET | Acquisition uses owned capture policy over every registered alias, not only the faulted path. Global chapter selection can issue a different owned alias GET. | Existing restored-before-click, enabled composer, exact DOM ID/count, source pin and physical-anchor assertions retained. Runtime revalidation remains required. |
+| End-of-run 22 errors | Retained ordinary drain has 26 outcomes: 22 `capture_failed` (wrong aggregate), 3 captured original-history bodies, 1 expected request failure. The 25 raw bodies are all usable; the old rejection conflated snapshot projections. | Repaired handler accepts the 25 bodies offline; this does **not** retroactively pass the original runtime drain. New sealed drain still rejects every required body error and every application page error. |
+
+### Inputs, provenance and transformation receipts
+
+Local source evidence directory:
+`.phoenix/evidence/continuous-history/pre-dispatch323-offline/`.
+Final replay outputs are `ordinary-final/` and `global-final/`; `final/` has local
+symlinks for the mutation runner. Earlier attempts/logs remain retained.
+
+- Ordinary input: `instrumented323-artifact/opening-browser-evidence/ordinary/`
+  fixture, `browser-responses.jsonl` full `body_received` records, IPC evidence and
+  `browser-sse.jsonl`; its parent `identity.json` attributes the instrumented run.
+- Global input: `shipping-d4-artifact/history-evidence/` fixture, all full Global
+  bodies in `browser-api.jsonl`, `driver-api.jsonl`, `browser-sse.jsonl`, identity.
+  The missing fixture `manual_opening` is appended **only to the replay copy**
+  from the actual accepted aggregate at browser line 272. A later registered
+  successor/key is derived from the actual accepted aggregate at line 406.
+  `transformations.json` records source file/line/raw hashes, operation and value.
+  These are retained **shipping facts**, not instrumented Global fixture truth.
+- Source checkout is `target/history-hidden-geometry-repair`, verified read-only
+  at `d4c2772a95aa46da608b356c8fe7be074de1b7aa`, tree
+  `d9f0f0e1f49661ac0acc65ce70c7e7fd92f0dab9`, tracked-clean. Generated DTO hashes
+  include both ordinary projection types and the actual Global snapshot type.
+  Runtime source attribution remains the independent builder's attestation;
+  hashes do not prove how a binary was compiled.
+- Each output `manifest.json` hashes every supplied input, installed recorder,
+  shared helper, replay CLI, generated DTOs and output receipts. `provenance.json`
+  maps source JSONL line/hash/raw hash to replay request ordinal and retained
+  request ordinal (where present). Driver records lack a transport content-type
+  header; their JSON response adapter type is explicitly labeled inferred.
+  Browser records lack a request-method field in shipping capture; GET inference
+  is also labeled. Offline navigation epochs are not claimed as original epochs.
+- The adapters feed authentic **unchanged full raw bytes** to
+  `installAggregateRecorder`'s actual `request`/`response` listeners and drain.
+  This is not merely a call to its validation helper. Explicit truncation, byte
+  mismatch, over-bound inputs and unavailable/malformed required bodies reject.
+
+### Reproducible compiler-free commands and results
+
+```sh
+E=.phoenix/evidence/continuous-history
+F="$E/pre-dispatch323-offline"
+O="$E/instrumented323-artifact/opening-browser-evidence"
+G="$E/shipping-d4-artifact/history-evidence"
+# Use NEW output directories when repeating; CLI refuses existing output dirs.
+node ui/scripts/replay-history-opening-recorder.mjs \
+  --fixture "$O/ordinary/fixture.json" --kind ordinary \
+  --responses "$O/ordinary/browser-responses.jsonl" --identity "$O/identity.json" \
+  --source-root target/history-hidden-geometry-repair \
+  --sse "$O/ordinary/browser-sse.jsonl" --ipc "$O/ordinary/ipc.jsonl" \
+  --output "$F/ordinary-final"
+node ui/scripts/replay-history-opening-recorder.mjs \
+  --fixture "$G/fixture.json" --kind global \
+  --responses "$G/browser-api.jsonl" --responses "$G/driver-api.jsonl" \
+  --identity "$G/identity.json" --source-root target/history-hidden-geometry-repair \
+  --sse "$G/browser-sse.jsonl" --output "$F/global-final"
+HISTORY_OFFLINE_EVIDENCE="$F/final" node --test \
+  ui/scripts/replay-history-opening-recorder.selftest.mjs
+node --test ui/scripts/qualify-history-realserver.selftest.mjs \
+  ui/scripts/qualify-history-opening-realserver.selftest.mjs
+python3 -B tests/e2e/history_opening_browser.test.py
+uv run --offline tests/e2e/history_browser.test.py
+UV_OFFLINE=1 ./dev.py check --lanes task
+git diff --check
+```
+
+Results: 25 ordinary + 14 Global installed-handler captures; three authentic
+replay/mutation test groups pass (no skips with supplied evidence), including 12
+ownership/opening mutations per kind, malformed/truncated/foreign-request cases,
+six ordinary handoff mutations, synthetic Global Pending key mutation and real
+SSE cursor rejection cases. Node shared/opening selftests: 34 pass. Python
+opening: 12 pass; shipping: 14 pass using existing offline uv environment (plain
+system Python lacked httpx). Syntax checks of all three mjs drivers pass; task
+lane and whitespace check pass. Full Rust/UI/E2E lanes were intentionally not
+run under the no-build/no-new-runtime scope. Artifact-dependent mutation tests
+skip when `HISTORY_OFFLINE_EVIDENCE` is absent; they are not standalone runtime
+qualification. No dependencies or public configuration were changed.
+
+**Residual gates:** independent parent review before any hosted push/dispatch;
+new real ordinary/Global instrumented execution for held Pending, release,
+actual roster transport fault, composer, physical anchor, stream drop/reconnect
+and restored chapter acquisition. Global acceptance-transition cursor remains
+unobserved in the retained shipping SSE (only accepted Init + later messages).
+Generated-authority acceptance, shipping/provider/production and device/engine
+claims remain outside this evidence. Offline success does not waive these gates.
