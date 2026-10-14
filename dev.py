@@ -9512,6 +9512,7 @@ class ProdDeployControllerOptions:
     backend: str | None = None
     prepared_artifact: Path | None = None
     paired_database_upgrade: bool = False
+    current_schema_upgrade: bool = False
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
         if release is None:
@@ -10679,7 +10680,12 @@ def launchd_prod_deploy(
     controller = controller or ProdDeployControllerOptions()
     if controller.enabled and controller.prepared_artifact is None:
         release, _expected_full_commit = controller.require_exact_release(release)
-    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if controller.paired_database_upgrade and LAUNCHD_PLIST_PATH.is_file() else None
+    if controller.current_schema_upgrade and (
+        controller.paired_database_upgrade or controller.prepared_artifact is None
+        or controller.expected_full_commit is None or release is not None
+    ):
+        raise SystemExit("--current-schema-upgrade requires --prepared-artifact and --expected-full-commit, excludes --paired-database-upgrade and --release")
+    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if (controller.paired_database_upgrade or controller.current_schema_upgrade) and LAUNCHD_PLIST_PATH.is_file() else None
     launchd_env, _env_file = _launchd_candidate_env(controller)
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
@@ -10724,7 +10730,7 @@ def launchd_prod_deploy(
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
         if installed_config_hash is not None and _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
             raise SystemExit("installed configuration changed before claim acquisition")
-        if controller.paired_database_upgrade and installed_config_hash is not None:
+        if (controller.paired_database_upgrade or controller.current_schema_upgrade) and installed_config_hash is not None:
             launchd_env, _env_file = _launchd_candidate_env(controller)
             _preflight_prod_bind_auth(launchd_env, socket_activated=True)
             if _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
@@ -10736,8 +10742,8 @@ def launchd_prod_deploy(
         _fsync_directory(staging.parent)
         staging.chmod(0o700)
         if controller.prepared_artifact is not None:
-            if release or not controller.paired_database_upgrade or controller.expected_full_commit is None:
-                raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together and exclude --release")
+            if release or controller.paired_database_upgrade == controller.current_schema_upgrade or controller.expected_full_commit is None:
+                raise SystemExit("--prepared-artifact, --expected-full-commit, and exactly one upgrade mode are required together and exclude --release")
             prepared = _prepare_prepared_artifact(controller.prepared_artifact, controller.expected_full_commit)
         else:
             prepared = (
@@ -10829,6 +10835,16 @@ def launchd_prod_deploy(
             if subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip():
                 raise SystemExit("prepared-artifact deployment requires a clean controller checkout")
         _materialize_helper(controller_source_commit or source_commit, helper, "local_head" if controller_source_commit else source_kind)
+        migration_registry = None
+        if controller.current_schema_upgrade:
+            migration_registry = staging / "migrations.rs"
+            _materialize_source_file(
+                controller_source_commit,
+                "crates/phoenix-db/src/migrations.rs",
+                migration_registry,
+                "local_head",
+            )
+            migration_registry.chmod(0o600)
         python_executable = Path(sys.executable).resolve()
         protocol = subprocess.run(
             [str(python_executable), str(helper), "--protocol-version"],
@@ -10905,6 +10921,16 @@ def launchd_prod_deploy(
                 "controller_helper_sha256": _file_sha256(helper) if controller_source_commit else None,
                 "controller_helper_path": str(helper) if controller_source_commit else None,
             } if controller.paired_database_upgrade else None),
+            **({"current_schema_upgrade": {
+                "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
+                "backup_path": str(staging / "database-backup.sqlite3"),
+                "proof_path": str(staging / "database-backup-proof.json"),
+                "controller_source_commit": controller_source_commit,
+                "controller_helper_sha256": _file_sha256(helper),
+                "controller_helper_path": str(helper),
+                "migration_registry_sha256": _file_sha256(migration_registry),
+                "migration_registry_path": str(migration_registry),
+            }} if controller.current_schema_upgrade else {}),
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_json_atomic(staging / "manifest.json", manifest)
@@ -10913,6 +10939,8 @@ def launchd_prod_deploy(
             candidate_binary, candidate_plist, helper, helper_plist, staging / "manifest.json",
         ]
         retained_artifacts.extend(path for path in (rollback_binary, rollback_plist) if path.exists())
+        if migration_registry is not None:
+            retained_artifacts.append(migration_registry)
         for artifact in retained_artifacts:
             with artifact.open("rb") as stream:
                 os.fsync(stream.fileno())
@@ -10934,7 +10962,7 @@ def launchd_prod_deploy(
         if result.returncode != 0:
             raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
     except BaseException as exc:
-        if controller is not None and controller.paired_database_upgrade and bootstrap_attempted:
+        if controller is not None and (controller.paired_database_upgrade or controller.current_schema_upgrade) and bootstrap_attempted:
             raise
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         terminal_status_written = False
@@ -11392,15 +11420,19 @@ def cmd_prod_deploy(
 ):
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
-    supplied = (controller.prepared_artifact is not None, controller.paired_database_upgrade)
-    if controller.expected_full_commit is not None and release is None and not any(supplied):
-        raise SystemExit("--expected-full-commit requires all prepared paired options or an exact release controller")
-    if any(supplied) and (not all(supplied) or controller.expected_full_commit is None):
-        raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together")
+    upgrade_modes = (controller.paired_database_upgrade, controller.current_schema_upgrade)
+    if all(upgrade_modes):
+        raise SystemExit("--paired-database-upgrade and --current-schema-upgrade are mutually exclusive")
+    if controller.expected_full_commit is not None and release is None and controller.prepared_artifact is None and not any(upgrade_modes):
+        raise SystemExit("--expected-full-commit requires all prepared upgrade options or an exact release controller")
+    if (controller.prepared_artifact is not None or any(upgrade_modes)) and (
+        controller.prepared_artifact is None or controller.expected_full_commit is None or not any(upgrade_modes)
+    ):
+        raise SystemExit("--prepared-artifact, --expected-full-commit, and exactly one upgrade mode are required together")
     if controller.prepared_artifact is not None and (sys.platform != "darwin" or controller.backend not in (None, "launchd")):
-        raise SystemExit("prepared artifact paired deployment is supported only by macOS launchd")
+        raise SystemExit("prepared artifact upgrade is supported only by macOS launchd")
     if controller.prepared_artifact is not None and release:
-        raise SystemExit("prepared artifact paired deployment excludes --release")
+        raise SystemExit("prepared artifact upgrade excludes --release")
     env = controller.require_backend()
     if controller.enabled and not release and controller.prepared_artifact is None:
         raise SystemExit("controller mode requires --release")
@@ -11784,7 +11816,9 @@ def main():
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
     deploy_parser.add_argument("--expected-full-commit", help="Exact full SHA for --prepared-artifact")
-    deploy_parser.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
+    upgrade_group = deploy_parser.add_mutually_exclusive_group()
+    upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
+    upgrade_group.add_argument("--current-schema-upgrade", action="store_true", help="Explicit current-schema prepared-artifact database upgrade")
     recover_parser = prod_sub.add_parser("recover-paired", help="Verify and restore a retained failed paired transaction")
     recover_parser.add_argument("transaction_id")
     finalize_parser = prod_sub.add_parser("finalize-paired", help="Finalize retained committed paired publication/cleanup without runtime or database changes")
@@ -11963,6 +11997,7 @@ def main():
                     transaction_id=args.transaction_id,
                     prepared_artifact=args.prepared_artifact,
                     paired_database_upgrade=args.paired_database_upgrade,
+                    current_schema_upgrade=args.current_schema_upgrade,
                     backend=args.controller_backend,
                 ),
             )
