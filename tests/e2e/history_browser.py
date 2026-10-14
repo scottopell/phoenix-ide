@@ -35,7 +35,7 @@ import uuid
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-PIN = "adeb9c5dbd6213a7599d0fa026d24228d3e039eb"
+PIN = "d4c2772a95aa46da608b356c8fe7be074de1b7aa"
 ROOT = Path(__file__).resolve().parents[2]
 FAST = "[[perf:1]] [[ttft:0]]"
 
@@ -253,6 +253,8 @@ class Fixture:
         assert len(keys) > 201 and len(pages) >= 3
         assert pages[0]["latest_transcript_row_id"] == row
         assert len(pages[0]["boundaries"]) >= 2
+        assert all(b["represented_successor_opening_message_id"] is None
+                   for b in pages[0]["boundaries"]), "manual openings must remain separate messages"
         if kind == "global":
             route = f"/global/{row}"
         return {"kind": kind, "route": route, "endpoint": endpoint, "members": members,

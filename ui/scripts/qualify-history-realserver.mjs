@@ -46,6 +46,23 @@ export function occurrences(snapshot) {
   return snapshot.segments.flatMap(s => s.messages.map(m => [s.segment_ordinal, m.sequence_id, m.message_id]));
 }
 
+export function acceptedManualOpening(snapshot, predecessor, successor) {
+  const opening = snapshot.latest_opening;
+  if (opening?.status !== 'accepted' || opening.opening_authority !== 'user_authorized_instruction'
+    || opening.presentation !== 'separate_message' || !opening.accepted_message_id
+    || snapshot.latest_transcript_row_id !== successor || snapshot.writable_transcript_row_id !== successor) return false;
+  const edge = opening.edge;
+  if (!edge?.product_conversation_id || edge.predecessor_transcript_row_id !== predecessor
+    || edge.successor_transcript_row_id !== successor
+    || edge.product_conversation_id !== snapshot.product_conversation_id) return false;
+  const boundary = snapshot.boundaries.find(b => b.message_id === edge.continuation_message_id
+    && b.predecessor_transcript_row_id === predecessor && b.successor_transcript_row_id === successor);
+  return !!boundary && boundary.represented_successor_opening_message_id === null
+    && opening.accepted_message_id !== boundary.message_id
+    && snapshot.segments.some(s => s.transcript_row_id === successor
+      && s.messages.some(m => m.message_id === opening.accepted_message_id));
+}
+
 export function belongsToAggregate(aggregate, response) {
   const path = new URL(response.url).pathname;
   return aggregate.kind === 'global'
@@ -374,9 +391,13 @@ async function run() {
       });
       assert.equal(continued.status, 'accepted');
       assert.notEqual(continued.conversation_id, latest);
+      const predecessor = latest;
       latest = continued.conversation_id;
       await settled(latest);
-      await snapshotSeen(a, s => s.latest_transcript_row_id === latest, liveStart);
+      const acceptedOpening = await snapshotSeen(a, s => acceptedManualOpening(s, predecessor, latest), liveStart);
+      checked(`${prefix}: eventual accepted manual opening DTO`, { opening: acceptedOpening.data.latest_opening,
+        pending_interval_qualified: false });
+      result.uncovered.push(`${prefix}: deterministic pending reservation interval and stale opening-event ordering not qualified by eventual shipping-runtime observation.`);
       await poll(() => page.locator('#conversation-nav [role="button"]').evaluateAll((buttons, probe) =>
         buttons.some(button => button.textContent.includes(probe)), CONTINUATION_PROBE), 'successor opening adopted in rendered navigation');
       await sameAnchor(before, `${prefix}: anchor after actual fourth continuation`);
