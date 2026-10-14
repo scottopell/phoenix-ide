@@ -2891,7 +2891,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 if command[:2] == ["git", "status"] and dirty:
                     return subprocess.CompletedProcess(command, 0, " M dev.py\n", "")
                 if command[:2] == ["git", "show"]:
-                    return subprocess.CompletedProcess(command, 0, b"controller registry bytes\n", b"")
+                    return subprocess.CompletedProcess(command, 0, b"candidate registry bytes\n", b"")
                 if "--protocol-version" in command:
                     return subprocess.CompletedProcess(command, 0, str(self.dev.LAUNCHD_HANDOFF_PROTOCOL_VERSION) + "\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -2930,6 +2930,22 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(self.dev.subprocess, "run", side_effect=run))
             yield staging, controller, events
 
+    def test_ordinary_forward_installer_binds_candidate_registry_and_helper(self):
+        with self.deployment(paired=False, current=False) as (staging, controller, events):
+            self.dev.launchd_prod_deploy(controller=controller)
+            manifest = json.loads((staging / "manifest.json").read_text())
+            forward = manifest["ordinary_forward_migration"]
+            self.assertEqual(forward["database_path"], str(self.dev.PROD_DB_PATH))
+            self.assertEqual(forward["helper_path"], str(staging / "activate.py"))
+            self.assertEqual(
+                forward["helper_sha256"], self.dev._file_sha256(staging / "activate.py")
+            )
+            self.assertEqual(forward["migration_registry_path"], str(staging / "migrations.rs"))
+            self.assertIn(
+                ("command", ("git", "show", "a" * 40 + ":crates/phoenix-db/src/migrations.rs")),
+                events,
+            )
+
     def test_current_schema_direct_launchd_entry_rejects_missing_artifact_without_build(self):
         controller = self.dev.ProdDeployControllerOptions(current_schema_upgrade=True, expected_full_commit="a" * 40)
         with mock.patch.object(self.dev, "_prepare_local_candidate") as build:
@@ -2937,7 +2953,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 self.dev.launchd_prod_deploy(controller=controller)
             build.assert_not_called()
 
-    def test_current_schema_stages_controller_commit_registry_before_handoff(self):
+    def test_current_schema_stages_candidate_commit_registry_before_handoff(self):
         with self.deployment(current=True) as (staging, controller, events):
             self.dev.launchd_prod_deploy(controller=controller)
             manifest = json.loads((staging / "manifest.json").read_text())
@@ -2952,9 +2968,9 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             self.assertEqual(upgrade["controller_helper_sha256"], self.dev._file_sha256(staging / "activate.py"))
             self.assertEqual(upgrade["migration_registry_path"], str(registry))
             self.assertEqual(upgrade["migration_registry_sha256"], self.dev._file_sha256(registry))
-            self.assertEqual(registry.read_bytes(), b"controller registry bytes\n")
+            self.assertEqual(registry.read_bytes(), b"candidate registry bytes\n")
             self.assertEqual(registry.stat().st_mode & 0o777, 0o600)
-            self.assertIn(("command", ("git", "show", "d" * 40 + ":crates/phoenix-db/src/migrations.rs")), events)
+            self.assertIn(("command", ("git", "show", "a" * 40 + ":crates/phoenix-db/src/migrations.rs")), events)
             prepared = events.index(("status", "prepared"))
             self.assertLess(events.index(("file", "migrations.rs")), prepared)
             self.assertLess(events.index(("directory", staging)), prepared)
