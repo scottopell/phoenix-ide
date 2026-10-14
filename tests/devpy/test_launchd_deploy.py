@@ -2825,7 +2825,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
         cls.dev = load(ROOT / "dev.py", "devpy_launchd_controller_durability_test")
 
     @contextlib.contextmanager
-    def deployment(self, *, paired=True, current=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False):
+    def deployment(self, *, paired=True, current=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False):
         with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
             root = Path(td)
             deploy = root / "deploy"
@@ -2892,6 +2892,16 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, " M dev.py\n", "")
                 if command[:2] == ["git", "show"]:
                     return subprocess.CompletedProcess(command, 0, b"candidate registry bytes\n", b"")
+                if "bootstrap" in command and interrupt_handoff:
+                    real_write(
+                        deploy / "status.json",
+                        {
+                            "transaction_id": "durability",
+                            "state": "candidate_may_migrate",
+                            "finalization_pending": True,
+                        },
+                    )
+                    raise KeyboardInterrupt("controller lost accepted handoff")
                 if "--protocol-version" in command:
                     return subprocess.CompletedProcess(command, 0, str(self.dev.LAUNCHD_HANDOFF_PROTOCOL_VERSION) + "\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -2944,6 +2954,19 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             self.assertIn(
                 ("command", ("git", "show", "a" * 40 + ":crates/phoenix-db/src/migrations.rs")),
                 events,
+            )
+
+    def test_ordinary_interrupted_handoff_preserves_forward_boundary_and_claim(self):
+        with self.deployment(
+            paired=False, current=False, interrupt_handoff=True
+        ) as (staging, controller, _events):
+            with self.assertRaises(KeyboardInterrupt):
+                self.dev.launchd_prod_deploy(controller=controller)
+            status = json.loads((staging.parents[1] / "status.json").read_text())
+            self.assertEqual(status["state"], "candidate_may_migrate")
+            self.assertTrue(status["finalization_pending"])
+            self.assertEqual(
+                (staging.parents[1] / "active").read_text().strip(), "durability"
             )
 
     def test_current_schema_direct_launchd_entry_rejects_missing_artifact_without_build(self):

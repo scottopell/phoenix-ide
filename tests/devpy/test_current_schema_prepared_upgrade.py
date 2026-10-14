@@ -14,6 +14,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -289,6 +290,25 @@ sys.exit({7 if partial else 0})
         self.assertEqual(proof["source_logical_digest"], proof["backup_logical_digest"])
         self.assertEqual(proof["sha256"], helper.sha256(Path(current.backup_path)))
 
+    def test_ordinary_nonqualified_schema_does_not_impose_127_ceiling(self) -> None:
+        database = self.database(through=122)
+        manifest = self.ordinary_manifest(database)
+        ordinary = manifest.ordinary_forward_migration
+        registry = Path(ordinary.migration_registry_path)
+        source = registry.read_text()
+        source = source.replace(
+            "\n];",
+            '\n    Migration { version: 128, name: "future", sql: "SELECT 1" },\n];',
+            1,
+        )
+        registry.write_text(source)
+        object.__setattr__(
+            ordinary, "migration_registry_sha256", helper.sha256(registry)
+        )
+
+        helper.validate_manifest_mode(manifest)
+        self.assertFalse(helper.ordinary_forward_policy_applies(manifest))
+
     def test_current_finalization_verifies_commit_proof_before_candidate_start(self) -> None:
         database = self.database()
         manifest = self.manifest(database)
@@ -364,6 +384,158 @@ sys.exit({7 if partial else 0})
         status = json.loads(Path(manifest.status_path).read_text())
         self.assertTrue(status["finalization_pending"])
         self.assertIn("predecessor launch is forbidden", status["committed_diagnostic"])
+
+    def test_ordinary_failure_after_126_commit_retains_candidate_and_database(self) -> None:
+        database = self.database()
+        manifest = self.ordinary_manifest(database)
+        pending = [item for item in compiled_ledger() if 123 < item[0] <= 126]
+
+        class FailsBefore127:
+            def __init__(self) -> None:
+                self.start_calls = 0
+
+            def stop(self) -> int | None:
+                return 51
+
+            def start(self, old_pid, plist_path=None) -> None:
+                self.start_calls += 1
+                with sqlite3.connect(database) as connection:
+                    connection.executemany(
+                        "INSERT INTO _migrations (version, name) VALUES (?, ?)", pending
+                    )
+                raise helper.ActivationError("failed before migration 127")
+
+            def inspect(self):
+                return "not_loaded", None
+
+        launchctl = FailsBefore127()
+        with mock.patch.object(helper, "Launchctl", return_value=launchctl):
+            state = helper.activate(manifest)
+
+        self.assertEqual(state, "ordinary_activation_failed_forward_only")
+        self.assertEqual(helper.database_ledger(database)[-1][0], 126)
+        self.assertEqual(launchctl.start_calls, 1)
+        self.assertEqual(
+            helper.sha256(Path(manifest.target_binary)), manifest.candidate_binary_sha256
+        )
+
+    def test_ordinary_identity_failure_after_home_commit_preserves_forward_state(self) -> None:
+        database = self.database()
+        manifest = self.ordinary_manifest(database)
+        pending = [item for item in compiled_ledger() if item[0] > 123]
+
+        class CommitsHomeBeforeIdentityFailure:
+            def __init__(self) -> None:
+                self.start_calls = 0
+
+            def stop(self) -> int | None:
+                return 52
+
+            def start(self, old_pid, plist_path=None) -> None:
+                self.start_calls += 1
+                with sqlite3.connect(database) as connection:
+                    connection.executemany(
+                        "INSERT INTO _migrations (version, name) VALUES (?, ?)", pending
+                    )
+                    connection.execute(
+                        "CREATE TABLE coordinator_home_test (environment_kind TEXT NOT NULL)"
+                    )
+                    connection.execute(
+                        "INSERT INTO coordinator_home_test VALUES ('coordinator_home')"
+                    )
+
+            def inspect(self):
+                return "not_loaded", None
+
+        launchctl = CommitsHomeBeforeIdentityFailure()
+        with mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(
+            helper,
+            "wait_for_identity",
+            side_effect=helper.ActivationError("identity health failed"),
+        ):
+            state = helper.activate(manifest)
+
+        self.assertEqual(state, "ordinary_activation_failed_forward_only")
+        self.assertEqual(helper.database_ledger(database)[-1][0], 127)
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT environment_kind FROM coordinator_home_test"
+                ).fetchone(),
+                ("coordinator_home",),
+            )
+        self.assertEqual(launchctl.start_calls, 1)
+
+    def test_current_recovery_rechecks_unchanged_source_after_teardown(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        self.write_snapshot_proof(manifest)
+        Path(manifest.active_path).write_text(manifest.transaction_id)
+        helper.write_status(manifest, "activation_failed_rollback_failed", failure="crash")
+
+        class WriterDuringTeardown:
+            def __init__(self) -> None:
+                self.started = 0
+
+            def stop(self) -> int | None:
+                with sqlite3.connect(database) as connection:
+                    connection.execute(
+                        "INSERT INTO _migrations (version, name) VALUES (?, ?)",
+                        compiled_ledger(124)[-1],
+                    )
+                return None
+
+            def inspect(self):
+                return "not_loaded", None
+
+            def start(self, old_pid, plist_path=None) -> None:
+                self.started += 1
+
+        launchctl = WriterDuringTeardown()
+        with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(
+            helper, "assert_database_exclusive"
+        ):
+            state = helper.recover_paired(manifest, current_schema=True)
+
+        self.assertEqual(state, "activation_failed_rollback_failed")
+        self.assertIn(
+            "changed before exclusive snapshot replay",
+            json.loads(Path(manifest.status_path).read_text())["rollback_failure"],
+        )
+        self.assertEqual(helper.database_ledger(database)[-1][0], 124)
+        self.assertEqual(launchctl.started, 0)
+
+    def test_concurrent_forward_resume_preserves_status_and_claim(self) -> None:
+        database = self.database()
+        manifest = self.ordinary_manifest(database)
+        Path(manifest.active_path).write_text(manifest.transaction_id)
+        helper.write_status(
+            manifest,
+            "ordinary_activation_failed_forward_only",
+            finalization_pending=True,
+        )
+        original_status = Path(manifest.status_path).read_text()
+        argv = [
+            "launchd_deploy_helper.py",
+            "resume-forward",
+            "--manifest",
+            str(self.root / "manifest.json"),
+            "--helper-label",
+            manifest.helper_label,
+            "--uid",
+            str(manifest.uid),
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            helper.Manifest, "load", return_value=manifest
+        ), mock.patch.object(
+            helper, "resume_forward", side_effect=helper.ConcurrentDeploy("busy")
+        ), mock.patch.object(helper, "request_helper_bootout"):
+            self.assertEqual(helper.main(), 1)
+
+        self.assertEqual(Path(manifest.status_path).read_text(), original_status)
+        self.assertEqual(Path(manifest.active_path).read_text(), manifest.transaction_id)
 
     def test_forward_recovery_can_start_only_retained_candidate(self) -> None:
         database = self.database()

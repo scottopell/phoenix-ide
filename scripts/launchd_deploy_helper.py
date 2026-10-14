@@ -448,7 +448,9 @@ def validate_database(path: Path) -> None:
         raise ActivationError("SQLite foreign key check failed")
 
 
-def migration_registry(path: Path) -> tuple[tuple[int, str], ...]:
+def migration_registry(
+    path: Path, *, qualified_current_target: bool = True
+) -> tuple[tuple[int, str], ...]:
     try:
         source = path.read_text()
     except (OSError, UnicodeError) as exc:
@@ -470,11 +472,19 @@ def migration_registry(path: Path) -> tuple[tuple[int, str], ...]:
     versions = tuple(version for version, _name in migrations)
     if not migrations or versions != tuple(sorted(set(versions))):
         raise ActivationError("candidate migration registry is invalid")
-    registry = dict(migrations)
-    if any(registry.get(version) != name for version, name in CURRENT_SCHEMA_REQUIRED_MIGRATIONS.items()):
-        raise ActivationError("candidate migration registry lacks required irreversible migrations")
-    if migrations[-1][0] != max(CURRENT_SCHEMA_REQUIRED_MIGRATIONS):
-        raise ActivationError("candidate migration registry is newer than the qualified target")
+    if qualified_current_target:
+        registry = dict(migrations)
+        if any(
+            registry.get(version) != name
+            for version, name in CURRENT_SCHEMA_REQUIRED_MIGRATIONS.items()
+        ):
+            raise ActivationError(
+                "candidate migration registry lacks required irreversible migrations"
+            )
+        if migrations[-1][0] != max(CURRENT_SCHEMA_REQUIRED_MIGRATIONS):
+            raise ActivationError(
+                "candidate migration registry is newer than the qualified target"
+            )
     return migrations
 
 
@@ -1027,6 +1037,14 @@ def restore(
         if rollback_plist == Path(manifest.target_plist):
             rollback_plist = quarantined
     if upgrade is not None and database_snapshot:
+        assert_database_exclusive(manifest)
+        if (
+            manifest.current_schema_upgrade is not None
+            and not current_schema_database_is_uncommitted(manifest)
+        ):
+            raise ActivationError(
+                "current-schema database changed before exclusive snapshot replay"
+            )
         restore_database(manifest)
     elif upgrade is not None:
         assert_database_exclusive(manifest)
@@ -1183,7 +1201,7 @@ def validate_manifest_mode(manifest: Manifest) -> None:
         )
         if registry.parent != Path(manifest.candidate_binary).parent or helper.parent != registry.parent:
             raise ActivationError("ordinary forward evidence must belong to the helper transaction")
-        migration_registry(registry)
+        migration_registry(registry, qualified_current_target=False)
         if _plist_database_path(Path(manifest.candidate_plist)) != ordinary.database_path:
             raise ActivationError("ordinary migration database path differs from candidate configuration")
     if upgrade is None:
@@ -1915,11 +1933,6 @@ def recover_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
                     candidate_binary_mutated=False,
                     rollback_plist=plist,
                 )
-            elif (
-                manifest.current_schema_upgrade is not None
-                and not current_schema_database_is_uncommitted(manifest)
-            ):
-                raise ActivationError("current-schema database has committed writes; snapshot replay is forbidden")
             else:
                 restore(manifest, launchctl, None)
             finalize_verified_predecessor(manifest, status.get("failure"))
@@ -1998,21 +2011,30 @@ def main() -> int:
         print(state, flush=True)
         return 0 if state == "committed" or (args.command in {"recover-paired", "recover-current"} and state == "activation_failed_rolled_back") else 1
     except ConcurrentDeploy as exc:
-        if manifest is not None and prepared_database_upgrade(manifest) is None:
+        protected_recovery = {
+            "finalize-paired",
+            "finalize-current",
+            "resume-forward",
+        }
+        if (
+            manifest is not None
+            and prepared_database_upgrade(manifest) is None
+            and args.command not in protected_recovery
+        ):
             try:
                 if args.command in {"recover-paired", "recover-current"}:
                     record_recovery_error(manifest, str(exc))
-                elif args.command not in {"finalize-paired", "finalize-current"}:
+                else:
                     write_status(manifest, "rejected_concurrent", failure=str(exc))
             finally:
-                if args.command not in {"finalize-paired", "finalize-current"} and status_is_durable_terminal(manifest):
+                if status_is_durable_terminal(manifest):
                     release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
         if manifest is not None and args.command in {"recover-paired", "recover-current"}:
             record_recovery_error(manifest, exc)
-        if manifest is not None and args.command not in {"finalize-paired", "finalize-current"} and prepared_database_upgrade(manifest) is None and status_is_durable_terminal(manifest):
+        if manifest is not None and args.command not in {"finalize-paired", "finalize-current", "resume-forward"} and prepared_database_upgrade(manifest) is None and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1

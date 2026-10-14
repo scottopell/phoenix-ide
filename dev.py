@@ -11049,7 +11049,19 @@ def launchd_prod_deploy(
         if result.returncode != 0:
             raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
     except BaseException as exc:
-        if controller is not None and (controller.paired_database_upgrade or controller.current_schema_upgrade) and bootstrap_attempted:
+        if (
+            bootstrap_attempted
+            and (
+                ordinary_forward_migration
+                or (
+                    controller is not None
+                    and (
+                        controller.paired_database_upgrade
+                        or controller.current_schema_upgrade
+                    )
+                )
+            )
+        ):
             raise
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         terminal_status_written = False
