@@ -50,11 +50,27 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "authoritative member"):
             hb.complete_occurrences([dropped], [full["segments"][0]["messages"]])
 
-    def test_workflow_checkout_and_build_guard_match_full_application_pin(self):
+    @staticmethod
+    def instrumented_workflow_pin_matches(workflow, pin):
+        job = workflow.split("  qualify-history-realserver:\n", 1)[1].split("\n  check-ui:", 1)[0]
+        return (f"ref: {pin}\n          path: pinned-app" in job
+                and f'test "$(git rev-parse HEAD)" = {pin}' in job)
+
+    def test_workflow_checkout_and_build_guard_match_owning_instrumented_pin(self):
+        import ast
         workflow = (hb.ROOT / ".github/workflows/ci.yml").read_text()
-        self.assertEqual(len(hb.PIN), 40)
-        self.assertIn(f"ref: {hb.PIN}\n          path: pinned-app", workflow)
-        self.assertIn(f'test "$(git rev-parse HEAD)" = {hb.PIN}', workflow)
+        source = ast.parse((hb.ROOT / "tests/e2e/history_opening_browser.py").read_text())
+        pin = next(ast.literal_eval(node.value) for node in source.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "PIN" for target in node.targets))
+        self.assertEqual(hb.PIN, "d4c2772a95aa46da608b356c8fe7be074de1b7aa")
+        self.assertEqual(len(pin), 40)
+        self.assertNotEqual(pin, hb.PIN, "shipping receipt and integrated instrumented source are distinct authorities")
+        self.assertTrue(self.instrumented_workflow_pin_matches(workflow, pin))
+        self.assertFalse(self.instrumented_workflow_pin_matches(workflow, hb.PIN))
+        wrong_checkout = workflow.replace(f"ref: {pin}\n          path: pinned-app", f"ref: {hb.PIN}\n          path: pinned-app")
+        wrong_guard = workflow.replace(f'test "$(git rev-parse HEAD)" = {pin}', f'test "$(git rev-parse HEAD)" = {hb.PIN}')
+        self.assertFalse(self.instrumented_workflow_pin_matches(wrong_checkout, pin))
+        self.assertFalse(self.instrumented_workflow_pin_matches(wrong_guard, pin))
 
     def test_manual_equal_text_opening_is_not_a_represented_generated_opening(self):
         messages = [
