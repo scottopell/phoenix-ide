@@ -146,8 +146,8 @@ THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an ol
 **Condition:** When the exact target ledger was durably verified but candidate start or persistent plist publication did not finish,
 **System:** `prod finalize-current <transaction>` SHALL re-verify the retained helper, candidate, private plist, database commit proof, and claim before startup; MAY start only that exact candidate; SHALL NOT replay the snapshot or invoke offline migration again; and SHALL publish the persistent plist and release temporary restore capacity only after candidate identity succeeds. Normal startup MAY perform candidate-owned idempotent initialization and reconciliation because those writes use the already committed forward-compatible runtime.
 
-**Condition:** When activation failed with the exact source ledger and logical contents unchanged,
-**System:** `prod recover-current <transaction>` SHALL use the retained immutable transaction to restore and verify the predecessor, while refusing recovery whenever the database commit boundary is crossed or ambiguous.
+**Condition:** When activation failed before offline candidate migration was invoked and the stopped, exclusively owned database still has the exact source ledger and logical contents,
+**System:** `prod recover-current <transaction>` SHALL use the retained immutable transaction to restore and verify the predecessor, while refusing recovery whenever offline migration was invoked, the database changed, or either fact is ambiguous.
 
 **Rationale:** Current-schema committed-state finalization needs a compatible candidate runtime, whereas paired legacy finalization remains publication-only and never bootstraps a runtime.
 

@@ -93,10 +93,14 @@ variant CurrentSchemaSnapshotVerified : CurrentSchemaLifecycleObservation {
     offline_ownership_proof: String
 }
 
--- Unknown includes an interrupted or ambiguous write boundary; only source_unchanged
--- is eligible for predecessor recovery.
 enum CurrentSchemaDatabaseState {
     unknown | source_unchanged | writes_committed | target_verified
+}
+
+-- A migration_started checkpoint is irreversible even if the subprocess exits
+-- without an observed write.
+enum CurrentSchemaMigrationInvocation {
+    unknown | not_invoked | migration_started
 }
 
 enum PairedRecoveryMode { snapshot_restored | unchanged_predecessor }
@@ -151,6 +155,7 @@ variant PreparedArtifactDeployment : DeployTransaction {
 variant CurrentSchemaDeployment : DeployTransaction {
     current_lifecycle_observation: CurrentSchemaLifecycleObservation
     database_state: CurrentSchemaDatabaseState
+    migration_invocation: CurrentSchemaMigrationInvocation
     finalization: FinalizationOutcome
 }
 
@@ -257,9 +262,10 @@ external entity TargetService {
 --   controller/helper/candidate/predecessor identities and transaction ID.
 --   No candidate migration or startup precedes this proof.
 -- current_schema_source_unchanged(transaction) -> Boolean
---   Exclusive ownership and exact source 123 ledger plus logical contents equal
---   the verified snapshot, with affirmative proof no migration or reconciliation
---   write committed. Unknown write state is never treated as unchanged.
+--   After confirmed target stop and renewed exclusive DB/WAL/SHM ownership,
+--   immediately before replay, re-read the exact source 123 ledger and logical
+--   contents and compare them to the bound snapshot proof. Stale preflight or
+--   snapshot observations and ambiguous contents do not satisfy this check.
 -- current_schema_recovery_verified(transaction) -> Boolean
 --   Matching snapshot and source ledger/logical contents, predecessor binary,
 --   private loaded configuration and running identity were checked after restore;
@@ -268,11 +274,12 @@ external entity TargetService {
 --   The exact full target ledger through 127, SQLite integrity and foreign keys
 --   were durably checked after the candidate's bounded offline --migrate-only;
 --   exclusive database ownership remains proven before runtime traffic.
--- current_schema_committed_failure_is_fenced(transaction) -> Boolean
---   After any DB write commits, even a proper prefix of target ledger, the
---   predecessor and snapshot restore are forbidden; retain the claim and exact
---   compatible candidate artifacts. Persist candidate start/publication pending
---   when target is verified, otherwise migration repair required.
+-- current_schema_migration_failure_is_fenced(transaction) -> Boolean
+--   After offline migration is invoked, even if its failed process appears to
+--   leave the source ledger and contents unchanged, predecessor startup and
+--   snapshot replay are forbidden. Retain the claim and exact compatible
+--   candidate artifacts. Persist candidate start/publication pending when the
+--   target is verified, otherwise migration repair required.
 -- current_schema_finalization_context_is_valid(transaction) -> Boolean
 --   Retained immutable transaction, matching owned claim, absent activation
 --   helper, byte-bound controller helper/candidate/private plist, durable exact
@@ -301,10 +308,12 @@ external entity TargetService {
 --   evidence remain retained with the ownership fence; no predecessor launch or
 --   database rollback is authorized.
 -- current_schema_predecessor_recovery_is_valid(transaction) -> Boolean
---   Only the exact unchanged source ledger and logical contents authorize
---   offline matching snapshot and predecessor binary/configuration restoration;
---   teardown and exclusive ownership are re-proven before restore. An ambiguous
---   or committed write boundary refuses recovery.
+--   The retained durable invocation history proves --migrate-only was never
+--   invoked; missing or ambiguous history refuses recovery. After confirmed
+--   target teardown and renewed exclusive ownership, the exact source ledger
+--   and logical contents must be rechecked against the matching snapshot proof
+--   immediately before replay. Only then may the matching snapshot and captured
+--   predecessor binary/configuration be restored and verified.
 
 -- paired_database_proof_is_valid(transaction) -> Boolean
 --   True for ordinary and current-schema sources. For paired legacy, after quiesce the lifecycle
@@ -539,6 +548,7 @@ rule ObserveCurrentSchemaSnapshot {
         offline_ownership_proof: transaction.current_lifecycle_observation.offline_ownership_proof
     )
     ensures: transaction.database_state = source_unchanged
+    ensures: transaction.migration_invocation = not_invoked
     ensures: CurrentSchemaSnapshotProofPersisted(transaction)
 }
 
@@ -548,13 +558,15 @@ rule BeginCurrentSchemaMigration {
     requires: transaction.state = activating
     requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
     requires: transaction.database_state = source_unchanged
+    requires: transaction.migration_invocation = not_invoked
     requires: snapshot_proof_durable(transaction)
     ensures: atomic_candidate_install(transaction)
+    ensures: transaction.migration_invocation = migration_started
     ensures: transaction.database_state = unknown
     ensures: DurableStatusWritten(transaction)
 
     @guidance
-        -- Fence the write boundary durably before invoking the exact installed
+        -- Persist migration_started durably before invoking the exact installed
         -- candidate's bounded --migrate-only on the manifest-bound database.
         -- Maintain exclusive ownership until target verification; no runtime traffic.
 }
@@ -564,6 +576,7 @@ rule ObserveCurrentSchemaTarget {
     requires: transaction.kind = CurrentSchemaDeployment
     requires: transaction.state = activating
     requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
+    requires: transaction.migration_invocation = migration_started
     requires: current_schema_target_verified(transaction)
     ensures: transaction.database_state = target_verified
     ensures: DurableStatusWritten(transaction)
@@ -574,9 +587,10 @@ rule FenceCurrentSchemaCommittedWrites {
     requires: transaction.kind = CurrentSchemaDeployment
     requires: transaction.state = activating
     requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
+    requires: transaction.migration_invocation = migration_started
     requires: transaction.database_state = unknown
     ensures: transaction.database_state = writes_committed
-    ensures: current_schema_committed_failure_is_fenced(transaction)
+    ensures: current_schema_migration_failure_is_fenced(transaction)
     ensures: active_claim_retained(transaction)
     ensures: DurableStatusWritten(transaction)
 }
@@ -585,8 +599,9 @@ rule FenceUncertainCurrentSchemaMigration {
     when: CurrentSchemaMigrationUncertain(transaction)
     requires: transaction.kind = CurrentSchemaDeployment
     requires: transaction.state = activating
+    requires: transaction.migration_invocation = migration_started
     requires: transaction.database_state = unknown
-    ensures: current_schema_committed_failure_is_fenced(transaction)
+    ensures: current_schema_migration_failure_is_fenced(transaction)
     ensures: active_claim_retained(transaction)
     ensures: DurableStatusWritten(transaction)
 }
@@ -597,18 +612,8 @@ rule PreserveCurrentSchemaPendingCandidate {
     requires: transaction.state in { activating, committed }
     requires: transaction.database_state = target_verified
     ensures: transaction.finalization = pending
-    ensures: current_schema_committed_failure_is_fenced(transaction)
+    ensures: current_schema_migration_failure_is_fenced(transaction)
     ensures: active_claim_retained(transaction)
-    ensures: DurableStatusWritten(transaction)
-}
-
-rule VerifyCurrentSchemaUnchangedAfterFailure {
-    when: CurrentSchemaNoWritesVerified(transaction)
-    requires: transaction.kind = CurrentSchemaDeployment
-    requires: transaction.state = activating
-    requires: transaction.database_state = unknown
-    requires: current_schema_source_unchanged(transaction)
-    ensures: transaction.database_state = source_unchanged
     ensures: DurableStatusWritten(transaction)
 }
 
@@ -621,15 +626,15 @@ rule VerifyCurrentSchemaUnchangedAfterFailure {
 -- CurrentSchemaSnapshotProofPersisted(transaction)
 --   Matching verified proof was fsynced before any migration.
 -- CurrentSchemaMigrationRequested(transaction)
---   Begins a bounded offline migration on the exact installed candidate.
+--   Durably records migration_started before invoking bounded --migrate-only
+--   on the exact installed candidate. No later no-write exit clears this fence.
 -- CurrentSchemaTargetLedgerVerified(transaction)
 --   Exact target 127 ledger/integrity/FK proof is durable.
 -- CurrentSchemaWritesCommitted(transaction)
 --   A complete or partial DB write crossed the irreversible boundary.
--- CurrentSchemaNoWritesVerified(transaction)
---   Exact original logical contents and absence of committed writes are proven.
 -- CurrentSchemaMigrationUncertain(transaction)
---   Unproven write boundary fences predecessor and snapshot replay.
+--   After migration_started, an unproven write boundary fences predecessor
+--   and snapshot replay, including an apparent unchanged-ledger exit.
 -- CurrentSchemaActivationInterrupted(transaction)
 --   Exact target ledger was verified, but start or publication remains pending.
 
@@ -840,7 +845,9 @@ rule RecoverUnchangedCurrentSchemaSource {
     requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
     requires: snapshot_proof_durable(transaction)
     requires: transaction.database_state = source_unchanged
+    requires: transaction.migration_invocation = not_invoked
     requires: current_schema_predecessor_recovery_is_valid(transaction)
+    requires: current_schema_source_unchanged(transaction)
     requires: active_claim_retained(transaction)
     requires: exact_previous_restored(transaction, service)
     ensures: transaction.state = activation_failed_rolled_back
@@ -849,11 +856,12 @@ rule RecoverUnchangedCurrentSchemaSource {
     ensures: DurableStatusWritten(transaction)
 
     @guidance
-        -- Recover-current restores only the exact matched verified snapshot and
-        -- captured predecessor binary/configuration after confirmed candidate
-        -- teardown and exclusive offline ownership. Verify integrity, source
-        -- ledger, logical contents and predecessor identity before claim release.
-        -- Unknown or any committed DB write forbids restoration and predecessor start.
+        -- Recover-current confirms target stop and re-proves exclusive DB/WAL/SHM
+        -- ownership, then rechecks exact source ledger and logical contents against
+        -- the bound proof immediately before replay. Restore only the matching
+        -- snapshot and captured predecessor binary/configuration; verify integrity
+        -- and predecessor identity before claim release. Once migration_started was
+        -- persisted, even a no-write exit is forward-only with no predecessor.
 }
 
 -- CurrentSchemaFinalizationRequested(transaction)
@@ -861,7 +869,8 @@ rule RecoverUnchangedCurrentSchemaSource {
 -- CurrentSchemaFinalizationFinished(transaction, service)
 --   Candidate identity, persistent publication and cleanup were verified.
 -- CurrentSchemaRecoveryRequested(transaction, service)
---   Operator invoked prod recover-current for a proven unchanged source.
+--   Operator invoked prod recover-current for a proven never-invoked migration
+--   and exact unchanged source.
 -- current_schema_publication_and_cleanup_durable(transaction) -> Boolean
 --   Candidate plist publication and temporary restore capacity cleanup/fsync
 --   completed; audit snapshot and proof remain retained.
@@ -1222,14 +1231,23 @@ invariant CurrentSchemaPreparedModeIsDistinct {
             and transaction.previous != null
 }
 
-invariant CurrentSchemaCommittedWritesForbidPredecessor {
+invariant CurrentSchemaInvocationForbidsPredecessor {
     for transaction in DeployTransactions:
         transaction.kind = CurrentSchemaDeployment
         and transaction.state in { activating, committed }
-        and transaction.database_state in { unknown, writes_committed, target_verified } implies
+        and (transaction.migration_invocation != not_invoked
+            or transaction.database_state in { unknown, writes_committed, target_verified }) implies
             not DatabaseRollbackCompleted(transaction)
             and not PredecessorStartAuthorized(transaction)
             and (transaction.finalization = complete or active_claim_retained(transaction))
+}
+
+invariant CurrentSchemaRecoveryRequiresNeverInvokedMigration {
+    for transaction in DeployTransactions:
+        transaction.kind = CurrentSchemaDeployment
+        and transaction.state = activation_failed_rolled_back implies
+            transaction.migration_invocation = not_invoked
+            and current_schema_recovery_verified(transaction)
 }
 
 invariant CurrentSchemaCandidateStartupRequiresTarget {

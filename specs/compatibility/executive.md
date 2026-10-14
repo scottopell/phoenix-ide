@@ -21,7 +21,7 @@ Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as
 | Requirement | Current coverage / gap |
 | --- | --- |
 | REQ-COMP-013 | Ordinary no-backup pre-start rollback, post-start forward-only fence, no predecessor launch, and exact-candidate resume tests |
-| REQ-COMP-012 | Exact 123-to-127 registry qualification, irreversible 126/127 identity, unchanged-only rollback, and partial-write fail-closed tests in the launchd prepared helper |
+| REQ-COMP-012 | Exact 123-to-127 registry qualification, irreversible 126/127 identity, pre-invocation-only rollback, and partial/ambiguous-write fail-closed tests in the launchd prepared helper |
 | REQ-COMP-001 | The requirement is defined in `requirements.md`, and contributor guidance points agents to that authority. A broader guarantee inventory remains follow-up work. |
 | REQ-COMP-002 | Phoenix-managed forward migrations and intentional seeder gaps are implemented and tested. Damaged or manually changed ledgers, historical-binary access to newer migrations, and project-wide data preservation are not guaranteed. |
 | REQ-COMP-003 | Foundation acceptance covers manual offline paired restore, but production deployment can still launch an older candidate without proving that restore occurred, and the UI overstates runtime-artifact rollback. Enforcement and truthful messaging are tracked in task 44016. |
