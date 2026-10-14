@@ -514,12 +514,32 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIs(caught.exception, primary)
         self.assertIsInstance(primary.__cause__, OSError)
 
+    def test_normal_completion_primary_survives_partial_receipt_failure(self):
+        import contextlib
+        from unittest.mock import Mock
+        for code in (None, 1):
+            failures = opening.LifecycleFailures()
+            server = Mock(returncode=code)
+            if code is None:
+                server.wait.side_effect = opening.shipping.subprocess.TimeoutExpired("fake", 65)
+            def write_partial(path, value):
+                path.write_text('{"status":')
+                raise OSError("partial normal receipt")
+            with patch.object(opening.shipping, "write_json", side_effect=write_partial):
+                with self.assertRaises((TimeoutError, RuntimeError)) as caught:
+                    with failures.own(contextlib.nullcontext(server), "server"):
+                        opening.normal_server_completion(server, self.root,
+                            {"home": str(self.root / "missing")}, self.root / "missing.sock", failures)
+            self.assertIs(failures.primary[1], caught.exception)
+            self.assertIs(type(caught.exception), TimeoutError if code is None else RuntimeError)
+            self.assertEqual(failures.receipt()["cleanup"][0]["stage"], "normal_completion_receipt")
+
     def test_normal_server_completion_requires_zero_and_owned_cleanup(self):
         from unittest.mock import Mock
         home = self.root / "removed-driver-home"
         control = self.root / "removed-control.sock"
         server = Mock(returncode=0)
-        receipt = opening.normal_server_completion(server, self.root, {"home": str(home)}, control)
+        receipt = opening.normal_server_completion(server, self.root, {"home": str(home)}, control, opening.LifecycleFailures())
         server.wait.assert_called_once_with(timeout=65)
         self.assertEqual(receipt["status"], "success")
         self.assertEqual(json.loads((self.root / "server-completion.json").read_text()), receipt)
@@ -531,7 +551,7 @@ class OpeningQualificationTests(unittest.TestCase):
             if code is None:
                 server.wait.side_effect = opening.shipping.subprocess.TimeoutExpired("owned-fake", 65)
             with self.subTest(code=code), self.assertRaises((RuntimeError, TimeoutError)):
-                opening.normal_server_completion(server, self.root, {"home": str(self.root / "missing")}, self.root / "missing.sock")
+                opening.normal_server_completion(server, self.root, {"home": str(self.root / "missing")}, self.root / "missing.sock", opening.LifecycleFailures())
             receipt = json.loads((self.root / "server-completion.json").read_text())
             self.assertEqual(receipt["status"], status)
             self.assertEqual(receipt["returncode"], code)
@@ -545,7 +565,7 @@ class OpeningQualificationTests(unittest.TestCase):
             remaining.mkdir() if remaining == home else remaining.touch()
             for code in (0, -15):
                 with self.subTest(remaining=remaining, code=code), self.assertRaisesRegex(RuntimeError, "owned resources"):
-                    opening.normal_server_completion(Mock(returncode=code), self.root, {"home": str(home)}, control)
+                    opening.normal_server_completion(Mock(returncode=code), self.root, {"home": str(home)}, control, opening.LifecycleFailures())
                 receipt = json.loads((self.root / "server-completion.json").read_text())
                 self.assertEqual(receipt["status"], "cleanup_failed")
                 self.assertEqual(receipt["exit_status"], "success" if code == 0 else "signal_exit")

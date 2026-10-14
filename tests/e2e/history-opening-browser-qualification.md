@@ -1030,7 +1030,7 @@ success. The shared Node stage also retains its primary error when context
 cleanup fails and records the executed dependency manifest on failed stages.
 
 Actual source-only checks on the integrated candidate: shipping Python 16,
-base Node 14, opening Python 40, opening Node 27, joint Node 45, and focused
+base Node 14, opening Python 41, opening Node 29, joint Node 48, and focused
 application Vitest 86 tests across seven files all passed; changed producer
 TypeScript ESLint and Node syntax/diff checks passed. The first local pnpm
 focused-test launch aborted before tests when it attempted dependency
@@ -1038,6 +1038,17 @@ maintenance (`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`). It is retained
 separately. The passing focused ring used existing installed binaries through
 the verified dev.py Node environment without reinstalling or purging modules.
 Pre-existing SQLite fixture ResourceWarnings remain visible in Python logs.
+
+Exact integrated review additionally reproduced three boundary gaps: a failed
+normal-completion receipt could replace a shutdown failure, the outer browser
+cleanup could overwrite the primary browser error, and import/context admission
+failures could omit the dependency manifest. The successor requires the shared
+failure owner at normal completion, retains bounded outer cleanup facts without
+rewriting the primary, and owns manifest publication before import/context
+acquisition. Regressions exercise each boundary, including acquisition failure
+without claiming module checks executed. One intermediate regression used an
+incorrect type oracle (`TimeoutError` is an `OSError` subclass); its failed log
+is retained and the corrected exact-type regression passes.
 
 These are source/mock checks, not a new full UI, Rust/codegen, normal-shutdown,
 export, Global, or overhead qualification. No hosted publication, rerun,

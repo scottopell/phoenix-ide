@@ -443,8 +443,9 @@ def forced_server_shutdown(server, case, control, failures):
         shipping.write_json(case / "forced-server-shutdown.json", receipt)
 
 
-def normal_server_completion(server, case, startup, control):
+def normal_server_completion(server, case, startup, control, failures):
     """Called before owned_process's forced process-group cleanup."""
+    primary_error = None
     receipt = {"status": "failed", "normal_wait_timeout_seconds": SERVER_COMPLETION_TIMEOUT,
                "owned_home": startup["home"], "control": str(control), "returncode": None}
     try:
@@ -463,8 +464,18 @@ def normal_server_completion(server, case, startup, control):
             receipt["status"] = "cleanup_failed"
         if receipt["status"] != "success":
             raise RuntimeError("instrumented server did not complete normally with owned resources removed")
+    except BaseException as error:
+        primary_error = error
+        failures.remember_primary("normal_completion", error)
+        raise
     finally:
-        shipping.write_json(case / "server-completion.json", receipt)
+        try:
+            shipping.write_json(case / "server-completion.json", receipt)
+        except Exception as publication_error:
+            failures.remember_cleanup("normal_completion_receipt", publication_error)
+            if primary_error is not None:
+                raise primary_error from publication_error
+            raise
     return receipt
 
 
@@ -607,7 +618,7 @@ def qualify(app, exe, output, joint_telemetry=False):
                                     receiver_serving_check(receiver)
                                     receiver.assert_receipt(telemetry_result)
                                 completion = normal_server_completion(
-                                    server, case, startup, control)
+                                    server, case, startup, control, failures)
                                 app_stopped = (completion["status"] == "success"
                                                and server.poll() == 0)
                                 if receiver:

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, chmodSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc, persistedMessageSelector, acceptedWireCursor } from './qualify-history-opening-realserver.mjs';
+import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc, persistedMessageSelector, acceptedWireCursor, retainCleanupFailure } from './qualify-history-opening-realserver.mjs';
 
 test('fault remains active through acceptance and same-page reconnect, but new pin acquisition restores real transport', () => {
   const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
@@ -314,7 +314,45 @@ test('runtime seals before qualification, rechecks after cleanup and preserves f
   assert.match(script, /recorder\?\.assertQualified\(\)/);
   assert.match(script, /result\.application_page_errors = recorder\?\.applicationErrors/);
   assert.match(script, /result\.cdp_capture_errors = recorder\?\.captureErrors/);
-  assert.match(script, /result\.cleanup_error = String\(error\); process\.exitCode = 1/);
+  assert.match(script, /retainCleanupFailure\(result, 'browser_cleanup', error\); process\.exitCode = 1/);
+});
+
+test('outer runner retains primary when actual browser cleanup catches both fail (UNIT ONLY)', async () => {
+  const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  const start = script.indexOf('  } catch (error) {\n    result.error = ', script.indexOf('async function run()'));
+  const end = script.lastIndexOf('\n}\nif (process.argv');
+  assert.ok(start > 0 && end > start);
+  const tail = script.slice(start, end);
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const execute = new AsyncFunction('ctx', `
+    const { primary, result, process, page, recorder, gate, command, releaseOnce, record,
+      jointTelemetry, finalizeHistoryTelemetry, historyTelemetry, updateFault, fault,
+      clearTimeout, hardStop, writeFileSync, resolve, output, retainCleanupFailure } = ctx;
+    let browser = ctx.browser;
+    try { throw primary;
+    ${tail}
+  `);
+  const primary = new Error('ORIGINAL_DONOR_FAILURE'), result = { status: 'failed' }, writes = [];
+  const process = { exitCode: 0 };
+  await execute({ primary, result, process, page: null, recorder: null, gate: { armed: false },
+    command: async () => ({}), releaseOnce: async () => {}, record: () => {}, jointTelemetry: true,
+    browser: { close: async () => { throw new Error('OUTER_BROWSER_CLEANUP_FAILURE'); } },
+    finalizeHistoryTelemetry: null, historyTelemetry: null, updateFault: () => {}, fault: {},
+    clearTimeout: () => {}, hardStop: null, writeFileSync: (path, body) => writes.push(JSON.parse(body)),
+    resolve: (...parts) => parts.join('/'), output: '/UNIT_ONLY', retainCleanupFailure });
+  assert.equal(result.error, primary.stack);
+  assert.equal(process.exitCode, 1);
+  assert.equal(result.status, 'failed');
+  assert.deepEqual(result.cleanup_failures.map(f => f.stage), ['joint_browser_cleanup', 'browser_cleanup']);
+  assert.equal(writes[0].error, primary.stack);
+});
+
+test('cleanup-only runner failures fail closed and remain bounded (UNIT ONLY)', () => {
+  const result = { status: 'passed_assertions' };
+  for (let index = 0; index < 10; index++) retainCleanupFailure(result, 'browser_cleanup', new Error('x'.repeat(4096)));
+  assert.equal(result.status, 'failed'); assert.equal(result.error, undefined);
+  assert.equal(result.cleanup_failures.length, 8); assert.equal(result.cleanup_overflow, true);
+  assert.equal(result.cleanup_failures[0].error.length, 2048); assert.equal(result.cleanup_failures[0].truncated, true);
 });
 
 function controlledClock() {

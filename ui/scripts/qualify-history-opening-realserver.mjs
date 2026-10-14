@@ -765,6 +765,14 @@ export function selectGlobalPrefixFault(a, snapshots, mountedUrl, latest) {
     observation_scope: 'earlier-history acquisition failure; not full fresh-tail refresh' });
 }
 
+export function retainCleanupFailure(result, stage, error) {
+  result.status = 'failed';
+  const failures = result.cleanup_failures ??= [];
+  if (failures.length >= 8) { result.cleanup_overflow = true; return; }
+  const text = String(error.stack ?? error);
+  failures.push({ stage, error: text.slice(0, 2048), truncated: text.length > 2048 });
+}
+
 async function run() {
   const app = resolve(process.env.APP_ROOT), output = resolve(process.env.HISTORY_OUTPUT);
   const ui = loopback(process.env.HISTORY_BASE_URL), api = loopback(process.env.HISTORY_API_URL);
@@ -1135,11 +1143,11 @@ async function run() {
     if (page) await page.screenshot({ path: resolve(output, 'failure.png') }).catch(() => {});
   } finally {
     try { if (recorder) { await recorder.sealAndDrain(); recorder.assertQualified(); } }
-    catch (error) { result.status = 'failed'; result.capture_error = String(error); process.exitCode = 1; }
+    catch (error) { retainCleanupFailure(result, 'recorder_drain', error); process.exitCode = 1; }
     try { if (gate.armed && !gate.releaseAttempted) {
       const entered = await command({ command: 'entered' });
       if (entered.state === 'entered') await releaseOnce(gate, command);
-    } } catch (error) { record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; result.status = 'failed'; }
+    } } catch (error) { retainCleanupFailure(result, 'history_gate', error); record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; }
     if (jointTelemetry && browser) {
       try {
         await browser.close(); browser = undefined;
@@ -1148,14 +1156,14 @@ async function run() {
           finalizeHistoryTelemetry(inventory);
           record('observed-history-telemetry-inventory.jsonl', inventory);
         }
-      } catch (error) { result.status = 'failed'; result.error = String(error.stack ?? error); process.exitCode = 1; }
+      } catch (error) { retainCleanupFailure(result, 'joint_browser_cleanup', error); process.exitCode = 1; }
     }
-    try { await command({ command: 'stop' }); } catch (error) { record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; result.status = 'failed'; }
+    try { await command({ command: 'stop' }); } catch (error) { retainCleanupFailure(result, 'server_stop', error); record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; }
     try { updateFault(fault, { failRoster: false }); if (browser) await browser.close(); }
-    catch (error) { result.status = 'failed'; result.cleanup_error = String(error); process.exitCode = 1; }
+    catch (error) { retainCleanupFailure(result, 'browser_cleanup', error); process.exitCode = 1; }
     finally {
       try { recorder?.assertQualified(); }
-      catch (error) { result.status = 'failed'; result.capture_error = String(error); process.exitCode = 1; }
+      catch (error) { retainCleanupFailure(result, 'recorder_final', error); process.exitCode = 1; }
       result.application_page_errors = recorder?.applicationErrors ?? [];
       result.cdp_capture_errors = recorder?.captureErrors ?? [];
       clearTimeout(hardStop); writeFileSync(resolve(output, 'browser-result.json'), JSON.stringify(result, null, 2) + '\n');

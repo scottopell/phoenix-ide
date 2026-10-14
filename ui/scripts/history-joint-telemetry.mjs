@@ -204,14 +204,19 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
   const before = config.unitOnly ? config.dependencies : dependencyManifest();
   assert.deepEqual(before, config.dependencies, 'telemetry dependency changed before runtime import');
   const load = UNIT?.importModule ?? (url => import(url));
-  const module = await load(pathToFileURL(config.modulePath).href);
-  assert.equal(typeof module.runTelemetryChecks, 'function', 'installed telemetry module export required');
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-  let primaryError = null;
+  let context = null, primaryError = null, phase = 'runtime_import';
   try {
+    const module = await load(pathToFileURL(config.modulePath).href);
+    phase = 'export_admission';
+    assert.equal(typeof module.runTelemetryChecks, 'function', 'installed telemetry module export required');
+    phase = 'context_acquisition';
+    context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    phase = 'page_acquisition';
     const page = await context.newPage();
+    phase = 'module_checks';
     const result = await module.runTelemetryChecks({ page, context, baseURL,
       serviceName: config.input.serviceName, runId: config.input.runId, outputDir: resolve(outputDir, 'telemetry'), fixtures: config.input.fixtures });
+    phase = 'result_validation';
     const after = config.unitOnly ? config.dependencies : dependencyManifest();
     assert.deepEqual(after, before, 'telemetry dependency changed during runtime stage');
     const readyReportOracle = validateTelemetryResult(result);
@@ -236,7 +241,7 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
   } catch (error) { primaryError = error; throw error; }
   finally {
     const cleanupErrors = [];
-    try { await context.close(); } catch (error) { cleanupErrors.push(error); }
+    try { if (context) await context.close(); } catch (error) { cleanupErrors.push(error); }
     let after = null;
     try {
       after = config.unitOnly ? config.dependencies : dependencyManifest();
@@ -246,6 +251,7 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
       writeFileSync(resolve(outputDir, 'joint-telemetry-dependency-manifest.json'), JSON.stringify({
         evidence_class: config.unitOnly ? 'UNIT_ONLY_not_runtime' : 'runtime_dependency_bytes_not_acceptance',
         before, after, primary_failure: primaryError ? String(primaryError.message).slice(0, 1024) : null,
+        failure_phase: primaryError ? phase : null, context_acquired: context !== null,
         cleanup_failures: cleanupErrors.map(error => String(error.message).slice(0, 1024)),
       }, null, 2));
     } catch (error) { cleanupErrors.push(error); }

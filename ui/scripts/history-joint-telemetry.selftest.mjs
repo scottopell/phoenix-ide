@@ -91,6 +91,28 @@ test('UNIT ONLY stage owns a fresh context and closes it without promoting parti
     assert.match(result.receipt.scope.telemetry, /not telemetry lifecycle physical-target proof/);
   } finally { f.cleanup(); }
 });
+for (const phase of ['runtime_import', 'export_admission', 'context_acquisition'])
+  test(`UNIT ONLY ${phase} failure retains before/after manifest without claiming checks executed`, async () => {
+    const f = unitFiles(); try {
+      const config = prepareJointTelemetry({ env: f.env, appRoot: f.root, UNIT: f.UNIT });
+      const primary = new Error('admission failure'); let checks = 0;
+      const load = async () => {
+        if (phase === 'runtime_import') throw primary;
+        if (phase === 'export_admission') return {};
+        return { runTelemetryChecks: async () => { checks++; } };
+      };
+      const browser = { newContext: async () => { throw primary; } };
+      await assert.rejects(runJointTelemetryStage({ config, browser,
+        baseURL: 'http://127.0.0.1:12345', outputDir: f.root, harnessPath: import.meta.filename,
+        historyPhysical: { count: 1, visible: true, persistedMessageID: 'unit-exact' },
+        UNIT: { label: UNIT_ONLY, importModule: load } }),
+      error => phase === 'export_admission' ? /export required/.test(error.message) : error === primary);
+      const manifest = JSON.parse(readFileSync(resolve(f.root, 'joint-telemetry-dependency-manifest.json'), 'utf8'));
+      assert.equal(manifest.failure_phase, phase); assert.equal(manifest.context_acquired, false);
+      assert.deepEqual(manifest.before, manifest.after); assert.equal(checks, 0);
+      assert.equal(manifest.before[f.diagnostics], TELEMETRY_DIAGNOSTICS_SHA256);
+    } finally { f.cleanup(); }
+  });
 test('UNIT ONLY donor primary survives context cleanup failure and retains dependency manifests', async () => {
   const f = unitFiles(); try {
     const config = prepareJointTelemetry({ env: f.env, appRoot: f.root, UNIT: f.UNIT });
