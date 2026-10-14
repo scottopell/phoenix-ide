@@ -2,7 +2,7 @@
 
 ## Current Reality
 
-Phoenix has a destination owner-only Continue endpoint and a fixed HTTPS client transport. The local forward route resolves an ephemeral owner credential only when `PHOENIX_FEDERATION_OWNER_CREDENTIAL_INSTANCE_ID` independently names the requested destination and `PHOENIX_FEDERATION_OWNER_CREDENTIAL_PLIST` names an absolute, bounded LaunchAgent plist containing exactly one `PHOENIX_PASSWORD`. The value is read at request time and is not stored by Phoenix. The destination reuses the continuation application service and checked database transaction, while peer bearer authentication remains limited to peer routes. No Coordinator tool or cross-host secret retrieval is implied by this API surface; an authorized source must be locally available to the caller-side Phoenix before outbound authentication can occur.
+Phoenix has an owner-only local Continue endpoint plus a fixed delegated peer HTTPS endpoint. The caller's owner-authenticated forward route uses the enrolled peer credential only to establish caller identity. The destination admits the request only when `PHOENIX_FEDERATION_OWNER_CONTROL_CALLER_INSTANCE_ID` independently names that authenticated peer and `PHOENIX_FEDERATION_OWNER_CREDENTIAL_PLIST` names an absolute, bounded destination-local LaunchAgent plist whose single `PHOENIX_PASSWORD` matches the server's active owner password. The password never crosses the network or enters Phoenix persistence. The destination then reuses the continuation application service and checked database transaction. No Coordinator tool, generic peer mutation authority, or cross-host secret retrieval is implied by this API surface.
 
 ## Requirement Map
 

@@ -15,19 +15,20 @@ AND SHALL NOT fall back to a local conversation when the selected destination is
 
 ### REQ-FOC-002: Owner and peer authority remain distinct
 
-WHEN the control plane calls the destination owner Continue endpoint
-THE SYSTEM SHALL authenticate with an owner credential explicitly associated with that selected destination
-AND SHALL NOT accept a federation peer bearer as owner authority
-AND SHALL keep the association distinct from peer enrollment and from request-controlled fields
-AND SHALL report missing owner credential capability or authentication rejection truthfully.
+WHEN the control plane calls the destination's delegated owner Continue endpoint
+THE SYSTEM SHALL authenticate the caller with the enrolled peer credential
+AND SHALL separately require an owner-configured allowed caller `InstanceId` and a destination-local owner credential source that matches the destination server's active owner credential
+AND SHALL NOT treat the federation peer bearer alone as owner authority
+AND SHALL keep the narrow Continue delegation distinct from peer enrollment and from request-controlled fields
+AND SHALL report missing delegation, owner credential capability, or authentication rejection truthfully.
 
-The owner credential SHALL be borrowed from an operator-authorized secret source only for the authenticated HTTPS request. Phoenix SHALL NOT discover unrelated secret sources, return the credential, write it to its database or files, or include it in logs, errors, traces, tool input, or tool output.
+The destination owner credential SHALL be borrowed only from an operator-authorized source on the destination host and SHALL NOT traverse the network. Phoenix SHALL NOT discover unrelated secret sources, return the credential, write it to its database or files, or include it in logs, errors, traces, tool input, or tool output.
 
 ### REQ-FOC-003: Verified bounded transport
 
 WHEN sending destination owner Continue
-THE SYSTEM SHALL use the enrolled destination's typed HTTPS origin and selected TLS trust
-AND SHALL use only the fixed owner Continue path
+THE SYSTEM SHALL use the enrolled destination's typed HTTPS origin, selected TLS trust, and receiver-issued peer credential to establish caller identity
+AND SHALL use only the fixed delegated owner Continue path
 AND SHALL disable redirects and bound request and response sizes
 AND SHALL verify that a successful response names the selected destination, product, and predecessor
 AND SHALL NOT use SSH, remote filesystem access, plain HTTP, disabled certificate verification, or a generic mutation proxy.

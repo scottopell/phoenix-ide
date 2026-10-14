@@ -118,41 +118,66 @@ pub struct FederationOwnerContinueResponse {
     pub dispatch: FederationOwnerDispatchStatus,
 }
 
-pub struct DestinationOwnerCredentialAssociation {
-    destination_instance_id: InstanceId,
-    credential: phoenix_core::domain::instance_identity::OwnerPassword,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FederationPeerOwnerContinueRequest {
+    pub caller_instance_id: InstanceId,
+    pub request: FederationOwnerContinueRequest,
 }
 
-const OWNER_CREDENTIAL_DESTINATION_ENV: &str = "PHOENIX_FEDERATION_OWNER_CREDENTIAL_INSTANCE_ID";
+struct LocalOwnerContinueAuthority;
+
+enum OwnerContinueAuthority {
+    Owner(OwnerAuthenticated),
+    Delegated(LocalOwnerContinueAuthority),
+}
+
+const OWNER_CONTROL_CALLER_ENV: &str = "PHOENIX_FEDERATION_OWNER_CONTROL_CALLER_INSTANCE_ID";
 const OWNER_CREDENTIAL_PLIST_ENV: &str = "PHOENIX_FEDERATION_OWNER_CREDENTIAL_PLIST";
 const MAX_OWNER_CREDENTIAL_SOURCE_BYTES: u64 = 64 * 1024;
 
-fn configured_destination_owner_credential(
-    requested_destination: InstanceId,
-) -> Result<DestinationOwnerCredentialAssociation, FederationClientError> {
-    let configured_destination = std::env::var(OWNER_CREDENTIAL_DESTINATION_ENV)
+fn configured_local_owner_control_authority(
+    state: &AppState,
+    authenticated_caller: InstanceId,
+) -> Result<LocalOwnerContinueAuthority, FederationClientError> {
+    let configured_caller = std::env::var(OWNER_CONTROL_CALLER_ENV)
         .map_err(|_| FederationClientError::OwnerCredentialUnavailable)?
         .parse::<InstanceId>()
         .map_err(|_| FederationClientError::OwnerCredentialConfiguration)?;
     let source = std::env::var_os(OWNER_CREDENTIAL_PLIST_ENV)
         .map(std::path::PathBuf::from)
         .ok_or(FederationClientError::OwnerCredentialUnavailable)?;
-    destination_owner_credential_from_source(configured_destination, requested_destination, &source)
+    local_owner_control_authority_from_source(
+        configured_caller,
+        authenticated_caller,
+        state.password.as_ref(),
+        &source,
+    )
 }
 
-fn destination_owner_credential_from_source(
-    configured_destination: InstanceId,
-    requested_destination: InstanceId,
+fn local_owner_control_authority_from_source(
+    configured_caller: InstanceId,
+    authenticated_caller: InstanceId,
+    active_owner_password: Option<&phoenix_core::domain::instance_identity::OwnerPassword>,
     source: &std::path::Path,
-) -> Result<DestinationOwnerCredentialAssociation, FederationClientError> {
-    if configured_destination != requested_destination {
-        return Err(FederationClientError::OwnerCredentialDestinationMismatch);
+) -> Result<LocalOwnerContinueAuthority, FederationClientError> {
+    if configured_caller != authenticated_caller {
+        return Err(FederationClientError::OwnerControlCallerMismatch);
     }
-    let credential = read_owner_password_from_launch_agent(source)?;
-    Ok(DestinationOwnerCredentialAssociation {
-        destination_instance_id: configured_destination,
-        credential,
-    })
+    let configured_password = read_owner_password_from_launch_agent(source)?;
+    let active_owner_password =
+        active_owner_password.ok_or(FederationClientError::OwnerCredentialUnavailable)?;
+    let configured_verifier =
+        phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+            configured_password.expose().as_bytes(),
+        );
+    let active_verifier =
+        phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+            active_owner_password.expose().as_bytes(),
+        );
+    if configured_verifier != active_verifier {
+        return Err(FederationClientError::OwnerCredentialConfiguration);
+    }
+    Ok(LocalOwnerContinueAuthority)
 }
 
 fn plist_dict_value<'a, 'input>(
@@ -246,8 +271,8 @@ pub enum FederationClientError {
     DestinationMismatch,
     #[error("caller identity mismatch")]
     CallerMismatch,
-    #[error("destination owner credential is not associated with the selected instance")]
-    OwnerCredentialDestinationMismatch,
+    #[error("authenticated peer is not the configured owner-control caller")]
+    OwnerControlCallerMismatch,
     #[error("destination owner credential capability is unavailable")]
     OwnerCredentialUnavailable,
     #[error("destination owner credential source configuration is invalid")]
@@ -262,22 +287,22 @@ pub enum FederationClientError {
 
 pub async fn continue_remote_owner(
     db: &crate::db::Database,
-    association: DestinationOwnerCredentialAssociation,
     request: &FederationOwnerContinueRequest,
 ) -> Result<FederationOwnerContinueResponse, FederationClientError> {
-    if request.destination_instance_id != association.destination_instance_id {
-        return Err(FederationClientError::OwnerCredentialDestinationMismatch);
-    }
     let peer = db
         .federation_peer_connection(request.destination_instance_id)
         .await?
         .ok_or(FederationClientError::PeerNotFound)?;
-    let endpoint = peer.base_url.owner_continue_endpoint();
+    let caller_instance_id = db.instance_id().await?;
+    let endpoint = peer.base_url.peer_owner_continue_endpoint();
     let client = federation_client(&peer.tls_trust)?;
     let response = client
         .post(endpoint.as_url().clone())
-        .bearer_auth(association.credential.expose())
-        .json(request)
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&FederationPeerOwnerContinueRequest {
+            caller_instance_id,
+            request: request.clone(),
+        })
         .send()
         .await?;
     let status = response.status();
@@ -407,9 +432,7 @@ pub async fn forward_owner_continue(
     State(state): State<AppState>,
     Json(request): Json<FederationOwnerContinueRequest>,
 ) -> Result<Json<FederationOwnerContinueResponse>, Response> {
-    let association = configured_destination_owner_credential(request.destination_instance_id)
-        .map_err(|error| map_owner_continue_client_error(&error))?;
-    continue_remote_owner(&state.db, association, &request)
+    continue_remote_owner(&state.db, &request)
         .await
         .map(Json)
         .map_err(|error| map_owner_continue_client_error(&error))
@@ -465,6 +488,11 @@ fn map_owner_continue_client_error(error: &FederationClientError) -> Response {
                     "remote_owner_continue_rejected",
                     "destination owner Continue rejected the request",
                 ),
+                StatusCode::FAILED_DEPENDENCY => (
+                    StatusCode::FAILED_DEPENDENCY,
+                    "destination_owner_capability_unavailable",
+                    "destination owner-control capability is unavailable",
+                ),
                 StatusCode::TOO_MANY_REQUESTS => (
                     StatusCode::TOO_MANY_REQUESTS,
                     "destination_owner_throttled",
@@ -483,7 +511,7 @@ fn map_owner_continue_client_error(error: &FederationClientError) -> Response {
             };
             owner_continue_error_response(forwarded_status, error_type, message)
         }
-        FederationClientError::OwnerCredentialDestinationMismatch
+        FederationClientError::OwnerControlCallerMismatch
         | FederationClientError::DestinationMismatch
         | FederationClientError::ProductMismatch
         | FederationClientError::PredecessorMismatch => owner_continue_error_response(
@@ -508,10 +536,76 @@ fn map_owner_continue_client_error(error: &FederationClientError) -> Response {
     }
 }
 
+fn map_local_owner_control_authority_error(error: &FederationClientError) -> Response {
+    match error {
+        FederationClientError::OwnerControlCallerMismatch => owner_continue_error_response(
+            StatusCode::FORBIDDEN,
+            "federation_owner_control_caller_not_allowed",
+            "authenticated peer is not allowed to invoke owner Continue",
+        ),
+        FederationClientError::OwnerCredentialUnavailable => owner_continue_error_response(
+            StatusCode::FAILED_DEPENDENCY,
+            "destination_owner_credential_unavailable",
+            "destination owner credential capability is unavailable",
+        ),
+        FederationClientError::OwnerCredentialConfiguration => owner_continue_error_response(
+            StatusCode::FAILED_DEPENDENCY,
+            "destination_owner_credential_configuration_invalid",
+            "destination owner credential source configuration is invalid",
+        ),
+        FederationClientError::PeerNotFound
+        | FederationClientError::Database(_)
+        | FederationClientError::Request(_)
+        | FederationClientError::ResponseTooLarge(_)
+        | FederationClientError::RemoteRejected(_)
+        | FederationClientError::InvalidResponse(_)
+        | FederationClientError::DestinationMismatch
+        | FederationClientError::CallerMismatch
+        | FederationClientError::OwnerContinueRejected(_)
+        | FederationClientError::ProductMismatch
+        | FederationClientError::PredecessorMismatch => owner_continue_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "federation_owner_control_authority_failed",
+            "destination owner-control authority check failed",
+        ),
+    }
+}
+
 pub async fn continue_owner(
-    _owner: OwnerAuthenticated,
+    owner: OwnerAuthenticated,
     State(state): State<AppState>,
     Json(request): Json<FederationOwnerContinueRequest>,
+) -> Result<Json<FederationOwnerContinueResponse>, super::handlers::AppError> {
+    continue_owner_locally(&state, request, OwnerContinueAuthority::Owner(owner)).await
+}
+
+pub async fn continue_owner_from_peer(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(envelope): Json<FederationPeerOwnerContinueRequest>,
+) -> Result<Json<FederationOwnerContinueResponse>, Response> {
+    if envelope.caller_instance_id != peer.caller_instance_id {
+        return Err(owner_continue_error_response(
+            StatusCode::FORBIDDEN,
+            "federation_owner_control_caller_mismatch",
+            "authenticated peer does not match the declared owner-control caller",
+        ));
+    }
+    let authority = configured_local_owner_control_authority(&state, peer.caller_instance_id)
+        .map_err(|error| map_local_owner_control_authority_error(&error))?;
+    continue_owner_locally(
+        &state,
+        envelope.request,
+        OwnerContinueAuthority::Delegated(authority),
+    )
+    .await
+    .map_err(IntoResponse::into_response)
+}
+
+async fn continue_owner_locally(
+    state: &AppState,
+    request: FederationOwnerContinueRequest,
+    _authority: OwnerContinueAuthority,
 ) -> Result<Json<FederationOwnerContinueResponse>, super::handlers::AppError> {
     let local_instance_id = state
         .db
@@ -840,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_credential_source_is_bound_to_one_destination_and_one_plist_key() {
+    fn owner_credential_source_authorizes_only_the_configured_peer_caller() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("owner.plist");
         std::fs::write(
@@ -853,17 +947,28 @@ mod tests {
 </dict></dict></plist>"#,
         )
         .unwrap();
-        let destination = InstanceId::new();
-        let association =
-            destination_owner_credential_from_source(destination, destination, &source).unwrap();
-        assert_eq!(association.destination_instance_id, destination);
-        assert_eq!(association.credential.expose(), "fixture-owner-password");
+        let configured_caller = InstanceId::new();
+        let active_password = phoenix_core::domain::instance_identity::OwnerPassword::parse(
+            "fixture-owner-password".to_string(),
+        )
+        .unwrap();
+        assert!(local_owner_control_authority_from_source(
+            configured_caller,
+            configured_caller,
+            Some(&active_password),
+            &source,
+        )
+        .is_ok());
 
-        let result =
-            destination_owner_credential_from_source(destination, InstanceId::new(), &source);
+        let wrong_caller = local_owner_control_authority_from_source(
+            configured_caller,
+            InstanceId::new(),
+            Some(&active_password),
+            &source,
+        );
         assert!(matches!(
-            result,
-            Err(FederationClientError::OwnerCredentialDestinationMismatch)
+            wrong_caller,
+            Err(FederationClientError::OwnerControlCallerMismatch)
         ));
     }
 
@@ -941,7 +1046,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn owner_continue_uses_selected_https_peer_and_owner_credential() {
+    async fn owner_continue_uses_selected_https_peer_and_local_owner_delegation() {
         use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
@@ -979,6 +1084,7 @@ mod tests {
             .unwrap();
         let expected_destination = destination;
         let expected_product = product.clone();
+        let expected_caller = state.db.instance_id().await.unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(loaded.server));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -990,10 +1096,11 @@ mod tests {
                 stream.read_until(b'\n', &mut headers).await.unwrap();
             }
             let headers = String::from_utf8(headers).unwrap();
-            assert!(headers.starts_with("POST /api/federation/owner-continue "));
-            assert!(headers
-                .to_ascii_lowercase()
-                .contains("authorization: bearer destination-owner-password\r\n"));
+            assert!(headers.starts_with("POST /api/federation/peer/owner-continue "));
+            assert!(headers.to_ascii_lowercase().contains(&format!(
+                "authorization: bearer phx_peer_{}\r\n",
+                "a".repeat(43)
+            )));
             let content_length = headers
                 .lines()
                 .find_map(|line| {
@@ -1004,7 +1111,10 @@ mod tests {
                 .unwrap();
             let mut body = vec![0; content_length];
             stream.read_exact(&mut body).await.unwrap();
-            let request: FederationOwnerContinueRequest = serde_json::from_slice(&body).unwrap();
+            let envelope: FederationPeerOwnerContinueRequest =
+                serde_json::from_slice(&body).unwrap();
+            assert_eq!(envelope.caller_instance_id, expected_caller);
+            let request = envelope.request;
             assert_eq!(request.destination_instance_id, expected_destination);
             assert_eq!(request.product_conversation_id, expected_product);
             let response = serde_json::to_vec(&FederationOwnerContinueResponse {
@@ -1030,10 +1140,6 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let credential = phoenix_core::domain::instance_identity::OwnerPassword::parse(
-            "destination-owner-password".to_string(),
-        )
-        .unwrap();
         let request = FederationOwnerContinueRequest {
             destination_instance_id: destination,
             product_conversation_id: product,
@@ -1043,16 +1149,7 @@ mod tests {
             message_id: "two-instance-message".to_string(),
             user_agent: None,
         };
-        let response = continue_remote_owner(
-            &state.db,
-            DestinationOwnerCredentialAssociation {
-                destination_instance_id: destination,
-                credential,
-            },
-            &request,
-        )
-        .await
-        .unwrap();
+        let response = continue_remote_owner(&state.db, &request).await.unwrap();
         assert_eq!(response.successor_conversation_id, "successor");
         server.await.unwrap();
     }
@@ -1061,10 +1158,6 @@ mod tests {
     async fn owner_continue_never_falls_back_to_local_when_destination_is_unconfigured() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let destination = InstanceId::new();
-        let credential = phoenix_core::domain::instance_identity::OwnerPassword::parse(
-            "destination-owner-password".to_string(),
-        )
-        .unwrap();
         let request = FederationOwnerContinueRequest {
             destination_instance_id: destination,
             product_conversation_id:
@@ -1075,16 +1168,9 @@ mod tests {
             message_id: "missing-peer-message".to_string(),
             user_agent: None,
         };
-        let error = continue_remote_owner(
-            &state.db,
-            DestinationOwnerCredentialAssociation {
-                destination_instance_id: destination,
-                credential,
-            },
-            &request,
-        )
-        .await
-        .unwrap_err();
+        let error = continue_remote_owner(&state.db, &request)
+            .await
+            .unwrap_err();
         assert!(matches!(error, FederationClientError::PeerNotFound));
     }
 

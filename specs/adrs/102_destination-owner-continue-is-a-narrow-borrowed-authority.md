@@ -1,4 +1,4 @@
-# ADR-102: Destination owner Continue borrows narrow authority without promoting peers
+# ADR-102: Destination owner Continue uses explicit local delegation without promoting peers
 
 - **Status:** Accepted
 - **Date:** 2026-10-14
@@ -14,11 +14,11 @@ Continue also carries more authority than a transcript identifier. Product membe
 
 1. **Promote enrolled peer credentials to lifecycle authority** — convenient and requires no owner secret, but contradicts the disjoint owner/peer authority model and makes enrollment grant mutation power.
 2. **Persist destination owner credentials with peer connections** — enables unattended transport, but duplicates operator secrets and expands storage, query, backup, and migration exposure.
-3. **Borrow an explicitly selected destination owner credential for one fixed Continue operation** — keeps owner authentication intact, avoids persistent secret copies, and permits a narrow server-to-server operation at the cost of requiring an external trusted credential source.
+3. **Delegate one fixed Continue operation through an explicitly configured destination-local owner authority** — uses the peer credential only for caller identity, keeps the owner secret on the destination host, and requires a separate owner-configured caller binding.
 
 ## Decision
 
-Choose option 3. The outbound transport binds a borrowed `OwnerPassword` to one selected `InstanceId`, resolves only that enrolled destination's verified HTTPS origin, disables redirects, and calls one fixed owner Continue path. The local forward route obtains that association only when `PHOENIX_FEDERATION_OWNER_CREDENTIAL_INSTANCE_ID` names the requested destination and `PHOENIX_FEDERATION_OWNER_CREDENTIAL_PLIST` names an absolute, size-bounded LaunchAgent plist containing exactly one `PHOENIX_PASSWORD`. The credential is neither accepted from model/tool request fields nor persisted by Phoenix. Source authorization, source availability on the caller host, and successful remote authentication are separate facts; source code and operator consent do not prove that authentication occurred.
+Choose option 3. The caller's owner-authenticated forward route resolves only the selected enrolled destination's verified HTTPS origin, disables redirects, and calls one fixed delegated peer Continue path. The destination accepts the peer identity only when `PHOENIX_FEDERATION_OWNER_CONTROL_CALLER_INSTANCE_ID` names that exact caller and `PHOENIX_FEDERATION_OWNER_CREDENTIAL_PLIST` names an absolute, size-bounded LaunchAgent plist containing exactly one `PHOENIX_PASSWORD` that matches the server's active owner password. Peer enrollment alone grants no lifecycle authority. The owner credential is neither accepted from request fields, sent over the network, nor persisted by Phoenix. Source authorization, deployment configuration, and successful remote admission remain separate facts.
 
 The destination route requires ordinary owner authentication and a typed request naming destination, product, exact predecessor, expected WorkScope, message identity, and literal handoff. It revalidates those facts under product admission and a checked continuation transaction. Exact retries preserve the persisted winner; changed retries conflict; dispatch failure preserves the successor and durable intent. Dispatch acceptance is not execution completion.
 

@@ -657,6 +657,11 @@ pub fn create_router(state: AppState) -> Router {
             post(super::federation::query_database)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
+        .route(
+            "/api/federation/peer/owner-continue",
+            post(super::federation::continue_owner_from_peer)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             super::auth::peer_auth_middleware,
@@ -18184,6 +18189,7 @@ mod lifecycle_handler_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn owner_continue_requires_owner_auth_and_rejects_peer_credentials() {
         use tower::ServiceExt as _;
 
@@ -18253,6 +18259,48 @@ mod lifecycle_handler_tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
+
+        let peer_body = serde_json::json!({
+            "caller_instance_id": caller,
+            "request": serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        })
+        .to_string();
+        let owner_on_peer_route = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/owner-continue")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {owner_password}"),
+                    )
+                    .body(Body::from(peer_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_on_peer_route.status(), StatusCode::UNAUTHORIZED);
+
+        let peer_delegation_without_owner_configuration = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peer/owner-continue")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {peer_token}"),
+                    )
+                    .body(Body::from(peer_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            peer_delegation_without_owner_configuration.status(),
+            StatusCode::FAILED_DEPENDENCY
+        );
 
         let owner_response = create_router(state)
             .oneshot(
