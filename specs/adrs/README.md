@@ -118,6 +118,8 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
 | [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
+| [102](102_current_schema_prepared_activation_commits_at_database_write.md) | Current-schema prepared activation commits at the database-write boundary | Accepted | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
+| [103](103_ordinary_forward_launch_is_the_downgrade_boundary.md) | Ordinary forward candidate launch is the downgrade boundary | Accepted | REQ-COMP-013, REQ-LDD-023, REQ-PD-022 |
 
 ## For agents: which decisions bind your task
 

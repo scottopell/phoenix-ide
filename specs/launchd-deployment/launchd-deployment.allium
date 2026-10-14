@@ -1,6 +1,7 @@
 -- allium: 3
 -- Native macOS launchd deployment lifecycle
--- Requirement traceability: REQ-LDD-001 through REQ-LDD-016
+-- Requirement traceability: REQ-LDD-001 through REQ-LDD-023
+-- REQ-LDD-023 ordinary forward boundary applies only to an exact 123 -> 127 qualification.
 
 config {
     transition_timeout_seconds: Integer = 30
@@ -11,7 +12,8 @@ config {
 enum TransactionState {
     preparing | prepared | activating | committed |
     precondition_failed | activation_failed_rolled_back |
-    activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed | rejected_concurrent
+    activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed |
+    ordinary_forward_only_failed | rejected_concurrent
 }
 enum RestartState {
     preparing | prepared | restarting | committed |
@@ -53,13 +55,57 @@ variant PreparedArtifactSnapshotVerified : PreparedArtifactLifecycleObservation 
 }
 
 
+value CurrentSchemaPreflightProof {
+    shared_database_path: String
+    controller_source_commit: String
+    controller_helper_path: String
+    controller_helper_sha256: String
+    candidate_migration_registry_path: String
+    candidate_migration_registry_sha256: String
+    source_ledger: String
+}
+
+value CurrentSchemaSnapshotProof {
+    preflight: CurrentSchemaPreflightProof
+    snapshot_sha256: String
+    source_logical_contents: String
+    target_ledger: String
+    transaction_id: String
+    candidate_identity: RuntimeIdentity
+    predecessor_identity: RuntimeIdentity
+}
+
+entity CurrentSchemaLifecycleObservation {
+    kind: CurrentSchemaAwaitingPreparation | CurrentSchemaPreflight
+        | CurrentSchemaOfflineOwned | CurrentSchemaSnapshotVerified
+}
+
+variant CurrentSchemaAwaitingPreparation : CurrentSchemaLifecycleObservation {}
+variant CurrentSchemaPreflight : CurrentSchemaLifecycleObservation {
+    proof: CurrentSchemaPreflightProof
+}
+variant CurrentSchemaOfflineOwned : CurrentSchemaLifecycleObservation {
+    proof: CurrentSchemaPreflightProof
+    offline_ownership_proof: String
+}
+variant CurrentSchemaSnapshotVerified : CurrentSchemaLifecycleObservation {
+    proof: CurrentSchemaSnapshotProof
+    offline_ownership_proof: String
+}
+
+-- Unknown includes an interrupted or ambiguous write boundary; only source_unchanged
+-- is eligible for predecessor recovery.
+enum CurrentSchemaDatabaseState {
+    unknown | source_unchanged | writes_committed | target_verified
+}
+
 enum PairedRecoveryMode { snapshot_restored | unchanged_predecessor }
 
 enum FinalizationOutcome { not_committed | pending | complete }
 
 entity DeployTransaction {
     id: String
-    kind: LocalHeadDeployment | PublishedReleaseDeployment | PreparedArtifactDeployment
+    kind: LocalHeadDeployment | PublishedReleaseDeployment | PreparedArtifactDeployment | CurrentSchemaDeployment
     source_commit: String
     expected: RuntimeIdentity
     previous: RuntimeIdentity?
@@ -81,6 +127,8 @@ entity DeployTransaction {
         activating -> activation_failed_rolled_back
         activating -> activation_failed_rollback_failed
         activating -> ordinary_activation_failed_rollback_failed
+        activating -> ordinary_forward_only_failed
+        ordinary_forward_only_failed -> activating
         activation_failed_rollback_failed -> activation_failed_rolled_back
         activation_failed_rollback_failed -> activation_failed_rollback_failed
         terminal: committed, precondition_failed, activation_failed_rolled_back,
@@ -98,6 +146,12 @@ variant PreparedArtifactDeployment : DeployTransaction {
     paired_lifecycle_observation: PreparedArtifactLifecycleObservation
     finalization: FinalizationOutcome
     recovery_mode: PairedRecoveryMode?
+}
+
+variant CurrentSchemaDeployment : DeployTransaction {
+    current_lifecycle_observation: CurrentSchemaLifecycleObservation
+    database_state: CurrentSchemaDatabaseState
+    finalization: FinalizationOutcome
 }
 
 
@@ -141,7 +195,9 @@ external entity TargetService {
 -- helper_capacity_reserved(transaction) -> Boolean
 --   After handoff, the helper physically reserves private snapshot and restore
 --   capacity for DB plus WAL and margin before production stop. True for
---   ordinary sources, whose prepared runtime capacity is already held.
+--   ordinary sources, whose prepared runtime capacity is already held. Current
+--   schema reserves both backup and restore space after install overhead, with
+--   at least 20 GiB free remaining on every affected filesystem.
 -- HelperCapacityVerified(transaction)
 --   Emitted by the independent helper after successful capacity reservation.
 -- activation_claim_available() -> Boolean
@@ -150,8 +206,8 @@ external entity TargetService {
 --   A distinct one-shot LaunchAgent owns activation independently of Phoenix.
 -- atomic_candidate_install(transaction) -> Boolean
 --   Fsynced destination-filesystem artifacts replace the binary by rename.
---   Ordinary plist publication is complete; paired bootstrap remains private
---   with its atomic publication link prepared until durable commit.
+--   Ordinary plist publication is complete; both prepared-artifact modes retain
+--   a private bootstrap and atomic publication link until verified candidate commit.
 -- exact_identity_running(service, identity) -> Boolean
 --   The job has a PID, /api/version equals both identity fields, and the
 --   candidate git_sha is the complete 40-character source commit rather than a
@@ -168,29 +224,95 @@ external entity TargetService {
 --   A latest selection resolves to stable tag and metadata; an exact RC selection
 --   has matching tag, prerelease metadata, full embedded version, and commit. In
 --   either case the candidate's 40-character lowercase embedded git_sha equals
---   source_commit. A prepared_artifact candidate is independently verified.
+--   source_commit. Both prepared-artifact modes independently verify the receipt,
+--   signing, notarization and exact identity; neither accepts release or runtime-only source.
 -- prepared_artifact_source_is_valid(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, the protected host-target
+--   True for ordinary sources. For both prepared-artifact modes, the protected host-target
 --   candidate identity and receipt contents are valid; the operator establishes
 --   protected run/source association independently of JSON validation. Clean
 --   controller source/helper hash is independently verified, not receipt-derived.
---   This is
---   source-only evidence and does not assert database lifecycle observations.
+--   Source-only evidence does not assert database lifecycle observations.
 -- paired_database_preflight_is_valid(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, the immutable proof has
+--   True for ordinary and current-schema sources. For paired legacy, the immutable proof has
 --   Candidate and captured predecessor configure the same canonical path; the
 --   single shared_database_path is that value. The proof includes
 --   legacy-schema eligibility, one canonical database path shared by the
 --   installed predecessor and candidate, migration ledger at most 69, and the ProductConversation
 --   upgrade mode. It does not assert that quiesce, offline ownership, or a
 --   snapshot has happened.
+-- current_schema_preflight_is_valid(transaction) -> Boolean
+--   True for ordinary and paired legacy. CurrentSchemaDeployment is an explicit
+--   prepared_artifact mode with exact canonical DB path shared by predecessor
+--   and candidate, retained controller helper path/SHA-256 and candidate migration
+--   registry path/SHA-256 bound to the immutable transaction. The source ledger
+--   equals the complete qualified ordered ledger through 123, not merely MAX=123;
+--   absent, unknown, mismatched, gapped or newer entries reject. Required
+--   ProductConversation tables, SQLite integrity and foreign keys pass before
+--   disruption. No release or runtime-only source can select this mode.
+-- current_schema_snapshot_is_valid(transaction, proof) -> Boolean
+--   Proof matches the retained preflight and transaction. Offline exclusive
+--   DB/WAL/SHM ownership follows service stop; SQLite backup
+--   API snapshot in a private directory has verified hash, logical source contents
+--   and durable proof bound to source 123 and target 127 ledgers, path, exact
+--   controller/helper/candidate/predecessor identities and transaction ID.
+--   No candidate migration or startup precedes this proof.
+-- current_schema_source_unchanged(transaction) -> Boolean
+--   Exclusive ownership and exact source 123 ledger plus logical contents equal
+--   the verified snapshot, with affirmative proof no migration or reconciliation
+--   write committed. Unknown write state is never treated as unchanged.
+-- current_schema_recovery_verified(transaction) -> Boolean
+--   Matching snapshot and source ledger/logical contents, predecessor binary,
+--   private loaded configuration and running identity were checked after restore;
+--   durable status precedes release of only the owned claim.
+-- current_schema_target_verified(transaction) -> Boolean
+--   The exact full target ledger through 127, SQLite integrity and foreign keys
+--   were durably checked after the candidate's bounded offline --migrate-only;
+--   exclusive database ownership remains proven before runtime traffic.
+-- current_schema_committed_failure_is_fenced(transaction) -> Boolean
+--   After any DB write commits, even a proper prefix of target ledger, the
+--   predecessor and snapshot restore are forbidden; retain the claim and exact
+--   compatible candidate artifacts. Persist candidate start/publication pending
+--   when target is verified, otherwise migration repair required.
+-- current_schema_finalization_context_is_valid(transaction) -> Boolean
+--   Retained immutable transaction, matching owned claim, absent activation
+--   helper, byte-bound controller helper/candidate/private plist, durable exact
+--   target ledger commit proof and exclusive operation lock all re-verify
+--   before any candidate startup. It does not repeat offline migration.
+-- ordinary_forward_boundary_qualified(transaction) -> Boolean
+--   Only ordinary local HEAD or published release deployment with an exact
+--   complete migration-123 source ledger and exact migration-127 candidate
+--   registry. The exact registry, candidate identity/configuration and helper
+--   are retained with the transaction; no standalone database backup is required.
+-- ordinary_forward_no_start_proven(transaction) -> Boolean
+--   Affirmative durable proof that the candidate has never had a start attempt.
+--   Missing or ambiguous start evidence is not proof; once attempted, this
+--   predicate cannot become true again even after a failed resume.
+-- ordinary_forward_start_attempt_recorded(transaction) -> Boolean
+--   Durable first-attempt checkpoint precedes candidate bootstrap and remains
+--   retained across interruption and all resume attempts.
+-- ordinary_forward_resume_context_is_valid(transaction) -> Boolean
+--   Explicit operator authorization, matching ownership claim and retained
+--   transaction/helper, exact candidate binary/configuration and registry,
+--   stopped target and exclusive operation lock all re-verify before startup.
+-- ordinary_forward_failure_fenced(transaction) -> Boolean
+--   Candidate teardown is attempted and the target remains stopped when possible;
+--   failure to confirm stop is reported explicitly, never treated as safe to
+--   restart. Candidate binary/configuration, helper, registry and transaction
+--   evidence remain retained with the ownership fence; no predecessor launch or
+--   database rollback is authorized.
+-- current_schema_predecessor_recovery_is_valid(transaction) -> Boolean
+--   Only the exact unchanged source ledger and logical contents authorize
+--   offline matching snapshot and predecessor binary/configuration restoration;
+--   teardown and exclusive ownership are re-proven before restore. An ambiguous
+--   or committed write boundary refuses recovery.
+
 -- paired_database_proof_is_valid(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, after quiesce the lifecycle
+--   True for ordinary and current-schema sources. For paired legacy, after quiesce the lifecycle
 --   observation is PreparedArtifactSnapshotVerified: exclusive offline ownership
 --   and verified SQLite snapshot integrity bound to the immutable controller,
 --   predecessor and shared path. No future rollback result is required.
 -- controller_identity_is_independently_bound(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, the controller helper hash
+--   True for ordinary sources. For both prepared-artifact modes, the controller helper hash
 --   is bound to the recorded clean controller source and protocol. The controller
 --   and candidate commits may be equal when that independently bound helper is
 --   valid.
@@ -198,12 +320,13 @@ external entity TargetService {
 --   Separately requested retained-helper recovery verified matched database,
 --   runtime/configuration and predecessor identity before releasing ownership.
 -- CandidateStartupReady(transaction)
---   Emitted after quiesce and paired snapshot proof verification, before
---   candidate install/start; ordinary sources use their prepared inputs.
+--   Emitted after quiesce and paired snapshot proof, or after current-schema
+--   migration reached durably verified target 127; ordinary sources use preparation.
 -- candidate_startup_proof_is_valid(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, paired_database_proof_is_valid
---   holds and the verified snapshot follows exclusive offline ownership proof
---   before candidate startup.
+--   True for ordinary sources. Paired legacy requires paired_database_proof_is_valid.
+--   Current schema requires a durable matching snapshot proof, exact target 127
+--   ledger and integrity/FK verification after offline migration. In both modes
+--   exclusive offline ownership precedes snapshot and candidate startup.
 -- paired_predecessor_start_order_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, the matching database is
 --   restored and integrity-checked before predecessor startup, or no snapshot
@@ -313,11 +436,15 @@ rule PrepareCandidate {
     requires: selected_source_is_valid(transaction)
     requires: prepared_artifact_source_is_valid(transaction)
     requires: paired_database_preflight_is_valid(transaction)
+    requires: current_schema_preflight_is_valid(transaction)
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.paired_lifecycle_observation.kind = PreparedArtifactPreflight
+    requires: transaction.kind != CurrentSchemaDeployment
+        or transaction.current_lifecycle_observation.kind = CurrentSchemaPreflight
     requires: controller_identity_is_independently_bound(transaction)
     requires: previous_rollback_identity_is_valid(transaction)
-    requires: transaction.kind != PreparedArtifactDeployment or transaction.previous != null
+    requires: transaction.kind not in { PreparedArtifactDeployment, CurrentSchemaDeployment }
+        or transaction.previous != null
     ensures: transaction.state = prepared
     ensures: preparation_complete(transaction)
 }
@@ -375,6 +502,137 @@ rule ObserveSnapshotProof {
     ensures: PairedSnapshotProofPersisted(transaction)
 }
 
+rule ObserveCurrentSchemaPreflight {
+    when: CurrentSchemaPreflightVerified(transaction, proof)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = preparing
+    requires: transaction.current_lifecycle_observation.kind = CurrentSchemaAwaitingPreparation
+    requires: current_schema_preflight_is_valid(transaction)
+    ensures: transaction.current_lifecycle_observation = CurrentSchemaPreflight.created(proof: proof)
+}
+
+rule ObserveCurrentSchemaOfflineOwnership {
+    when: CurrentSchemaOfflineOwnershipVerified(transaction, ownership)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = activating
+    requires: helper_capacity_reserved(transaction)
+    requires: transaction.current_lifecycle_observation.kind = CurrentSchemaPreflight
+    ensures: transaction.current_lifecycle_observation = CurrentSchemaOfflineOwned.created(
+        proof: transaction.current_lifecycle_observation.proof,
+        offline_ownership_proof: ownership
+    )
+
+    @guidance
+        -- Stop the service only after exact ledger/table/integrity/FK checks and
+        -- physical backup/restore reservation leave 20 GiB free per filesystem.
+        -- Prove exclusive ownership of DB, WAL and SHM before snapshot.
+}
+
+rule ObserveCurrentSchemaSnapshot {
+    when: CurrentSchemaSnapshotVerifiedEvent(transaction, proof)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = activating
+    requires: transaction.current_lifecycle_observation.kind = CurrentSchemaOfflineOwned
+    requires: current_schema_snapshot_is_valid(transaction, proof)
+    ensures: transaction.current_lifecycle_observation = CurrentSchemaSnapshotVerified.created(
+        proof: proof,
+        offline_ownership_proof: transaction.current_lifecycle_observation.offline_ownership_proof
+    )
+    ensures: transaction.database_state = source_unchanged
+    ensures: CurrentSchemaSnapshotProofPersisted(transaction)
+}
+
+rule BeginCurrentSchemaMigration {
+    when: CurrentSchemaMigrationRequested(transaction)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = activating
+    requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
+    requires: transaction.database_state = source_unchanged
+    requires: snapshot_proof_durable(transaction)
+    ensures: atomic_candidate_install(transaction)
+    ensures: transaction.database_state = unknown
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Fence the write boundary durably before invoking the exact installed
+        -- candidate's bounded --migrate-only on the manifest-bound database.
+        -- Maintain exclusive ownership until target verification; no runtime traffic.
+}
+
+rule ObserveCurrentSchemaTarget {
+    when: CurrentSchemaTargetLedgerVerified(transaction)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = activating
+    requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
+    requires: current_schema_target_verified(transaction)
+    ensures: transaction.database_state = target_verified
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule FenceCurrentSchemaCommittedWrites {
+    when: CurrentSchemaWritesCommitted(transaction)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = activating
+    requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
+    requires: transaction.database_state = unknown
+    ensures: transaction.database_state = writes_committed
+    ensures: current_schema_committed_failure_is_fenced(transaction)
+    ensures: active_claim_retained(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule FenceUncertainCurrentSchemaMigration {
+    when: CurrentSchemaMigrationUncertain(transaction)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = activating
+    requires: transaction.database_state = unknown
+    ensures: current_schema_committed_failure_is_fenced(transaction)
+    ensures: active_claim_retained(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule PreserveCurrentSchemaPendingCandidate {
+    when: CurrentSchemaActivationInterrupted(transaction)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state in { activating, committed }
+    requires: transaction.database_state = target_verified
+    ensures: transaction.finalization = pending
+    ensures: current_schema_committed_failure_is_fenced(transaction)
+    ensures: active_claim_retained(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule VerifyCurrentSchemaUnchangedAfterFailure {
+    when: CurrentSchemaNoWritesVerified(transaction)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = activating
+    requires: transaction.database_state = unknown
+    requires: current_schema_source_unchanged(transaction)
+    ensures: transaction.database_state = source_unchanged
+    ensures: DurableStatusWritten(transaction)
+}
+
+-- CurrentSchemaPreflightVerified(transaction, proof)
+--   Carries the independently verified exact source ledger and immutable bindings.
+-- CurrentSchemaOfflineOwnershipVerified(transaction, ownership)
+--   Carries stopped-service and exclusive DB/WAL/SHM proof.
+-- CurrentSchemaSnapshotVerifiedEvent(transaction, proof)
+--   Carries private durable SQLite backup proof bound to the preflight and identities.
+-- CurrentSchemaSnapshotProofPersisted(transaction)
+--   Matching verified proof was fsynced before any migration.
+-- CurrentSchemaMigrationRequested(transaction)
+--   Begins a bounded offline migration on the exact installed candidate.
+-- CurrentSchemaTargetLedgerVerified(transaction)
+--   Exact target 127 ledger/integrity/FK proof is durable.
+-- CurrentSchemaWritesCommitted(transaction)
+--   A complete or partial DB write crossed the irreversible boundary.
+-- CurrentSchemaNoWritesVerified(transaction)
+--   Exact original logical contents and absence of committed writes are proven.
+-- CurrentSchemaMigrationUncertain(transaction)
+--   Unproven write boundary fences predecessor and snapshot replay.
+-- CurrentSchemaActivationInterrupted(transaction)
+--   Exact target ledger was verified, but start or publication remains pending.
+
 rule ReserveHelperCapacity {
     when: HelperCapacityVerified(transaction)
     requires: transaction.state = prepared
@@ -394,7 +652,8 @@ rule ActivateCandidate {
     @guidance
         -- Revalidate hashes and acquire the host lock. Stop/quiesce the predecessor
         -- and poll teardown; do not install/bootstrap the candidate here. Offline
-        -- ownership/snapshot observations must precede CandidateStartupPrepared.
+        -- ownership/snapshot observations must precede CandidateStartupPrepared;
+        -- current-schema migration and target verification also precede startup.
 }
 
 rule HelperCapacityFailureBeforeStop {
@@ -411,18 +670,40 @@ rule HelperCapacityFailureBeforeStop {
 -- PairedSnapshotProofPersisted(transaction)
 --   The verified context-bound snapshot proof was atomically written and fsynced.
 
+rule MarkOrdinaryForwardStartAttempt {
+    when: OrdinaryForwardCandidateStartupRequested(transaction)
+    requires: transaction.state = activating
+    requires: ordinary_forward_boundary_qualified(transaction)
+    requires: candidate_startup_proof_is_valid(transaction)
+    ensures: ordinary_forward_start_attempt_recorded(transaction)
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Persist the first-attempt checkpoint before bootstrap. A missing or
+        -- uncertain checkpoint cannot authorize predecessor rollback.
+}
+
 rule CandidateStartupPrepared {
     when: CandidateStartupReady(transaction)
     requires: transaction.state = activating
     requires: candidate_startup_proof_is_valid(transaction)
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.paired_lifecycle_observation.kind = PreparedArtifactSnapshotVerified
-    requires: transaction.kind != PreparedArtifactDeployment or snapshot_proof_durable(transaction)
+    requires: transaction.kind != CurrentSchemaDeployment
+        or transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
+    requires: transaction.kind not in { PreparedArtifactDeployment, CurrentSchemaDeployment }
+        or snapshot_proof_durable(transaction)
+    requires: transaction.kind != CurrentSchemaDeployment
+        or transaction.database_state = target_verified
+    requires: not ordinary_forward_boundary_qualified(transaction)
+        or ordinary_forward_start_attempt_recorded(transaction)
     ensures: atomic_candidate_install(transaction)
 
     @guidance
-        -- Only after snapshot-ready proof: install candidate binary, bootstrap
-        -- private candidate plist, check result and poll PID to bounded deadline.
+        -- Only after snapshot proof (and, for current schema, offline migration
+        -- plus exact target verification): bootstrap the private candidate plist,
+        -- check result and poll PID to bounded deadline. Current schema already
+        -- installed the candidate binary before --migrate-only.
 }
 
 rule CommitVerifiedCandidate {
@@ -430,15 +711,18 @@ rule CommitVerifiedCandidate {
     requires: transaction.state = activating
     requires: exact_identity_running(service, transaction.expected)
     requires: candidate_startup_proof_is_valid(transaction)
+    requires: transaction.kind != CurrentSchemaDeployment
+        or transaction.database_state = target_verified
     requires: atomic_candidate_install(transaction)
     ensures: transaction.state = committed
-    ensures: transaction.kind = PreparedArtifactDeployment implies transaction.finalization = pending
+    ensures: transaction.kind in { PreparedArtifactDeployment, CurrentSchemaDeployment }
+        implies transaction.finalization = pending
     ensures: DeployedShaWritten(transaction.source_commit)
     ensures: DurableStatusWritten(transaction)
 
     @guidance
         -- Persist pending publication/cleanup diagnostic with durable commit.
-        -- For paired launchd, after durable commit release only the temporary
+        -- For paired legacy, after durable commit release only the temporary
         -- restore reservation and fsync its parent; retain audit snapshot/proof.
         -- Publish the prepared candidate plist last. Publication/cleanup errors
         -- remain committed diagnostics, do not authorize rollback, and do not
@@ -511,10 +795,134 @@ rule RecordPairedFinalizationOutcome {
         -- Errors remain committed diagnostics; interruption retains pending and claim.
 }
 
+rule ResumeCurrentSchemaFinalization {
+    when: CurrentSchemaFinalizationRequested(transaction)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state in { activating, committed }
+    requires: transaction.database_state = target_verified
+    requires: transaction.finalization != complete
+    requires: current_schema_finalization_context_is_valid(transaction)
+    ensures: CurrentSchemaCompatibleCandidateOnly(transaction)
+    ensures: CurrentSchemaOfflineMigrationNotRepeated(transaction)
+    ensures: CurrentSchemaSnapshotNotReplayed(transaction)
+    ensures: transaction.finalization = pending
+
+    @guidance
+        -- Finalize-current may bootstrap only the retained compatible candidate
+        -- if not already running. Verify its exact identity before publishing the
+        -- captured private plist and removing temporary restore capacity.
+        -- Re-verify the retained helper, candidate, private plist, database
+        -- commit proof and claim before startup. Do not invoke offline migration
+        -- again or replay the snapshot. Normal startup of this exact candidate
+        -- may perform its own idempotent initialization and reconciliation.
+        -- Keep the claim and pending status on interruption or failure.
+}
+
+rule CompleteCurrentSchemaFinalization {
+    when: CurrentSchemaFinalizationFinished(transaction, service)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = committed
+    requires: transaction.database_state = target_verified
+    requires: transaction.finalization = pending
+    requires: exact_identity_running(service, transaction.expected)
+    requires: current_schema_finalization_context_is_valid(transaction)
+    requires: current_schema_publication_and_cleanup_durable(transaction)
+    ensures: transaction.finalization = complete
+    ensures: DurableStatusWritten(transaction)
+    ensures: CurrentSchemaOfflineMigrationNotRepeated(transaction)
+    ensures: CurrentSchemaSnapshotNotReplayed(transaction)
+}
+
+rule RecoverUnchangedCurrentSchemaSource {
+    when: CurrentSchemaRecoveryRequested(transaction, service)
+    requires: transaction.kind = CurrentSchemaDeployment
+    requires: transaction.state = activating
+    requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
+    requires: snapshot_proof_durable(transaction)
+    requires: transaction.database_state = source_unchanged
+    requires: current_schema_predecessor_recovery_is_valid(transaction)
+    requires: active_claim_retained(transaction)
+    requires: exact_previous_restored(transaction, service)
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: DatabaseRollbackCompleted(transaction)
+    ensures: current_schema_recovery_verified(transaction)
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Recover-current restores only the exact matched verified snapshot and
+        -- captured predecessor binary/configuration after confirmed candidate
+        -- teardown and exclusive offline ownership. Verify integrity, source
+        -- ledger, logical contents and predecessor identity before claim release.
+        -- Unknown or any committed DB write forbids restoration and predecessor start.
+}
+
+-- CurrentSchemaFinalizationRequested(transaction)
+--   Operator invoked prod finalize-current for retained exact-target transaction.
+-- CurrentSchemaFinalizationFinished(transaction, service)
+--   Candidate identity, persistent publication and cleanup were verified.
+-- CurrentSchemaRecoveryRequested(transaction, service)
+--   Operator invoked prod recover-current for a proven unchanged source.
+-- current_schema_publication_and_cleanup_durable(transaction) -> Boolean
+--   Candidate plist publication and temporary restore capacity cleanup/fsync
+--   completed; audit snapshot and proof remain retained.
+-- CurrentSchemaCompatibleCandidateOnly(transaction)
+--   Only captured target-compatible candidate may start; no predecessor starts.
+-- CurrentSchemaOfflineMigrationNotRepeated(transaction)
+--   Finalization never invokes offline --migrate-only again; candidate startup
+--   may perform its normal idempotent initialization and reconciliation.
+-- CurrentSchemaSnapshotNotReplayed(transaction)
+--   Finalization does not restore or replay the audit snapshot.
+-- OrdinaryForwardCandidateStartupRequested(transaction)
+--   Exact 123 -> 127 ordinary activation is about to attempt candidate startup.
+-- OrdinaryForwardActivationFailed(transaction, failure)
+--   Candidate startup or health failed, or absence of a start attempt is unproven.
+-- OrdinaryForwardResumeRequested(transaction)
+--   Operator explicitly invoked prod resume-forward for the retained transaction.
+
+rule FenceFailedOrdinaryForwardActivation {
+    when: OrdinaryForwardActivationFailed(transaction, failure)
+    requires: transaction.state = activating
+    requires: ordinary_forward_boundary_qualified(transaction)
+    requires: not ordinary_forward_no_start_proven(transaction)
+    ensures: transaction.state = ordinary_forward_only_failed
+    ensures: transaction.failure = failure
+    ensures: ordinary_forward_failure_fenced(transaction)
+    ensures: active_claim_retained(transaction)
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- A failed or unknown start may have committed migrations 126/127 or
+        -- coordinator-home initialization. Stop the candidate where possible;
+        -- never bootstrap the predecessor or clear the claim on uncertainty.
+}
+
+rule ResumeFailedOrdinaryForwardActivation {
+    when: OrdinaryForwardResumeRequested(transaction)
+    requires: transaction.state = ordinary_forward_only_failed
+    requires: ordinary_forward_boundary_qualified(transaction)
+    requires: ordinary_forward_resume_context_is_valid(transaction)
+    requires: active_claim_retained(transaction)
+    ensures: transaction.state = activating
+    ensures: ordinary_forward_start_attempt_recorded(transaction)
+    ensures: OrdinaryExactRetainedCandidateOnly(transaction)
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Start only the re-verified retained candidate. Another start/health
+        -- failure returns to ordinary_forward_only_failed with its claim and
+        -- evidence intact; predecessor rollback never becomes eligible again.
+}
+
+-- OrdinaryExactRetainedCandidateOnly(transaction)
+--   Resume authorizes only the transaction's exact retained candidate binary,
+--   configuration and registry, not a replacement or predecessor.
+
 rule RollBackFailedOrdinaryActivation {
     when: ActivationFailed(transaction, service, failure)
     requires: transaction.state = activating
-    requires: transaction.kind != PreparedArtifactDeployment
+    requires: transaction.kind not in { PreparedArtifactDeployment, CurrentSchemaDeployment }
+    requires: not ordinary_forward_boundary_qualified(transaction)
+        or ordinary_forward_no_start_proven(transaction)
     requires: exact_previous_restored(transaction, service)
     ensures: transaction.state = activation_failed_rolled_back
     ensures: transaction.failure = failure
@@ -597,8 +1005,12 @@ rule RollBackFailedPreparedPairedActivation {
 rule PreserveRollbackFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
     requires: transaction.state = activating
+    requires: transaction.kind != CurrentSchemaDeployment
+    requires: not ordinary_forward_boundary_qualified(transaction)
+        or ordinary_forward_no_start_proven(transaction)
     ensures: transaction.kind = PreparedArtifactDeployment implies transaction.state = activation_failed_rollback_failed
-    ensures: transaction.kind != PreparedArtifactDeployment implies transaction.state = ordinary_activation_failed_rollback_failed
+    ensures: transaction.kind not in { PreparedArtifactDeployment, CurrentSchemaDeployment }
+        implies transaction.state = ordinary_activation_failed_rollback_failed
     ensures: transaction.failure = failure
     ensures: transaction.rollback_failure = rollback_failure
     ensures: DurableStatusWritten(transaction)
@@ -637,7 +1049,7 @@ rule PreservePreparedRecoveryFailure {
 
 rule VerifyOrdinaryAbandonedPreparation {
     when: OperatorVerifiedOrdinaryPreparationAbandoned(transaction)
-    requires: transaction.kind != PreparedArtifactDeployment
+    requires: transaction.kind not in { PreparedArtifactDeployment, CurrentSchemaDeployment }
     requires: transaction.state = preparing
     requires: ordinary_preparation_abandonment_verified(transaction)
     ensures: transaction.state = precondition_failed
@@ -669,9 +1081,12 @@ rule AbandonInterruptedPreparation {
 rule ReleaseMatchingTerminalClaim {
     when: TerminalStatusPersisted(transaction)
     requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, ordinary_activation_failed_rollback_failed, rejected_concurrent }
-    requires: transaction.kind != PreparedArtifactDeployment
+    requires: transaction.kind not in { PreparedArtifactDeployment, CurrentSchemaDeployment }
         or transaction.state != committed
         or transaction.finalization = complete
+    requires: transaction.kind != CurrentSchemaDeployment
+        or transaction.state != activation_failed_rolled_back
+        or current_schema_recovery_verified(transaction)
     requires: transaction.kind != PreparedArtifactDeployment
         or transaction.state != activation_failed_rolled_back
         or supported_recovery_verified(transaction)
@@ -757,10 +1172,73 @@ invariant LegacyIdentityIsRollbackOnly {
 
 invariant OrdinaryRollbackIsRuntimeOnly {
     for transaction in DeployTransactions:
-        transaction.kind != PreparedArtifactDeployment
+        transaction.kind not in { PreparedArtifactDeployment, CurrentSchemaDeployment }
         and transaction.state = activation_failed_rolled_back implies
             RuntimeArtifactRollbackRecorded(transaction)
             and not DatabaseRollbackClaimed(transaction)
+}
+
+invariant OrdinaryForwardStartupHasDurableBoundary {
+    for transaction in DeployTransactions:
+        ordinary_forward_boundary_qualified(transaction)
+        and CandidateStartupReady(transaction) implies
+            ordinary_forward_start_attempt_recorded(transaction)
+}
+
+invariant OrdinaryForwardRollbackOnlyBeforeFirstStart {
+    for transaction in DeployTransactions:
+        ordinary_forward_boundary_qualified(transaction)
+        and transaction.state = activation_failed_rolled_back implies
+            ordinary_forward_no_start_proven(transaction)
+            and not DatabaseRollbackClaimed(transaction)
+}
+
+invariant OrdinaryForwardFailureRetainsFence {
+    for transaction in DeployTransactions:
+        transaction.state = ordinary_forward_only_failed implies
+            ordinary_forward_boundary_qualified(transaction)
+            and ordinary_forward_failure_fenced(transaction)
+            and active_claim_retained(transaction)
+            and not PredecessorStartAuthorized(transaction)
+            and not DatabaseRollbackCompleted(transaction)
+}
+
+invariant OrdinaryForwardAttemptNeverReauthorizesPredecessor {
+    for transaction in DeployTransactions:
+        ordinary_forward_boundary_qualified(transaction)
+        and ordinary_forward_start_attempt_recorded(transaction)
+        and transaction.state in { activating, ordinary_forward_only_failed } implies
+            not PredecessorStartAuthorized(transaction)
+            and active_claim_retained(transaction)
+}
+
+invariant CurrentSchemaPreparedModeIsDistinct {
+    for transaction in DeployTransactions:
+        transaction.kind = CurrentSchemaDeployment
+        and transaction.state not in { preparing, rejected_concurrent, precondition_failed } implies
+            prepared_artifact_source_is_valid(transaction)
+            and current_schema_preflight_is_valid(transaction)
+            and controller_identity_is_independently_bound(transaction)
+            and transaction.previous != null
+}
+
+invariant CurrentSchemaCommittedWritesForbidPredecessor {
+    for transaction in DeployTransactions:
+        transaction.kind = CurrentSchemaDeployment
+        and transaction.state in { activating, committed }
+        and transaction.database_state in { unknown, writes_committed, target_verified } implies
+            not DatabaseRollbackCompleted(transaction)
+            and not PredecessorStartAuthorized(transaction)
+            and (transaction.finalization = complete or active_claim_retained(transaction))
+}
+
+invariant CurrentSchemaCandidateStartupRequiresTarget {
+    for transaction in DeployTransactions:
+        transaction.kind = CurrentSchemaDeployment
+        and CandidateStartupReady(transaction) implies
+            transaction.database_state = target_verified
+            and current_schema_target_verified(transaction)
+            and snapshot_proof_durable(transaction)
 }
 
 invariant PreparedArtifactIsPairedLaunchdOnly {
