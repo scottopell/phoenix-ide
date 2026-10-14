@@ -139,6 +139,26 @@ impl FederationQueryDatabaseEndpoint {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationPeerOwnerContinueEndpoint(url::Url);
+
+impl FederationPeerOwnerContinueEndpoint {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationOwnerContinueEndpoint(url::Url);
+
+impl FederationOwnerContinueEndpoint {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
 impl PeerBaseUrl {
     /// Return the typed normalized host.
     ///
@@ -181,6 +201,32 @@ impl PeerBaseUrl {
         FederationQueryDatabaseEndpoint(
             self.0
                 .join("/api/federation/peer/query-database")
+                .expect("fixed federation route is a valid URL path"),
+        )
+    }
+
+    /// Return the fixed endpoint for the destination owner's bounded Continue operation.
+    ///
+    /// # Panics
+    /// Panics only if the fixed compile-time route is not a valid URL path.
+    #[must_use]
+    pub fn owner_continue_endpoint(&self) -> FederationOwnerContinueEndpoint {
+        FederationOwnerContinueEndpoint(
+            self.0
+                .join("/api/federation/owner-continue")
+                .expect("fixed federation route is a valid URL path"),
+        )
+    }
+
+    /// Return the fixed endpoint for explicitly delegated peer owner Continue.
+    ///
+    /// # Panics
+    /// Panics only if the fixed compile-time route is not a valid URL path.
+    #[must_use]
+    pub fn peer_owner_continue_endpoint(&self) -> FederationPeerOwnerContinueEndpoint {
+        FederationPeerOwnerContinueEndpoint(
+            self.0
+                .join("/api/federation/peer/owner-continue")
                 .expect("fixed federation route is a valid URL path"),
         )
     }
@@ -506,6 +552,20 @@ mod tests {
         assert_eq!(
             endpoint.as_url().as_str(),
             "https://peer.example:8443/api/federation/peer/query-database"
+        );
+        let owner_continue = PeerBaseUrl::from_str("https://peer.example:8443")
+            .unwrap()
+            .owner_continue_endpoint();
+        assert_eq!(
+            owner_continue.as_url().as_str(),
+            "https://peer.example:8443/api/federation/owner-continue"
+        );
+        let peer_owner_continue = PeerBaseUrl::from_str("https://peer.example:8443")
+            .unwrap()
+            .peer_owner_continue_endpoint();
+        assert_eq!(
+            peer_owner_continue.as_url().as_str(),
+            "https://peer.example:8443/api/federation/peer/owner-continue"
         );
         let ipv6 = PeerBaseUrl::from_str("https://[2001:db8::1]:8031").unwrap();
         assert_eq!(ipv6.host(), PeerHost::Ipv6("2001:db8::1".parse().unwrap()));

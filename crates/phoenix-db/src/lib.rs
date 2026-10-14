@@ -687,12 +687,41 @@ pub struct ContinuationDispatchIntent {
     pub opening_authority: ContinuationOpeningAuthority,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedContinuationHandoff {
+    pub successor_conversation_id: String,
+    pub accepted_successor_message_id: String,
+    pub handoff: String,
+    pub user_agent: Option<String>,
+    pub opening_authority: ContinuationOpeningAuthority,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewContinuationDispatchIntent {
     pub message_id: ClientTurnKey,
     pub handoff: String,
     pub user_agent: Option<String>,
     pub opening_authority: ContinuationOpeningAuthority,
+}
+
+/// Product and work-scope identity expected for a checked continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuationExpectation {
+    pub product_conversation_id: ProductConversationId,
+    pub work_scope_id: Option<WorkScopeId>,
+}
+
+impl ContinuationExpectation {
+    #[must_use]
+    pub fn new(
+        product_conversation_id: ProductConversationId,
+        work_scope_id: Option<WorkScopeId>,
+    ) -> Self {
+        Self {
+            product_conversation_id,
+            work_scope_id,
+        }
+    }
 }
 
 impl NewContinuationDispatchIntent {
@@ -4683,6 +4712,42 @@ impl Database {
                 )
                 .ok_or_else(|| {
                     DbError::Serialization("unknown continuation opening authority".to_string())
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Returns the durable receipt for a settled continuation handoff.
+    ///
+    /// # Errors
+    /// Returns a database error when the query fails or persisted authority is invalid.
+    pub async fn completed_continuation_handoff(
+        &self,
+        parent_id: &str,
+    ) -> DbResult<Option<CompletedContinuationHandoff>> {
+        let row = sqlx::query(
+            "SELECT successor_conversation_id, accepted_successor_message_id,
+                    handoff, user_agent, opening_authority
+             FROM completed_continuation_handoffs
+             WHERE predecessor_conversation_id = ?1 AND intent_metadata_known = 1",
+        )
+        .bind(parent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(CompletedContinuationHandoff {
+                successor_conversation_id: row.get("successor_conversation_id"),
+                accepted_successor_message_id: row.get("accepted_successor_message_id"),
+                handoff: row.get("handoff"),
+                user_agent: row.get("user_agent"),
+                opening_authority: ContinuationOpeningAuthority::from_db_str(
+                    &row.get::<String, _>("opening_authority"),
+                )
+                .ok_or_else(|| {
+                    DbError::Serialization(
+                        "unknown completed continuation opening authority".to_string(),
+                    )
                 })?,
             })
         })
@@ -9184,7 +9249,8 @@ impl Database {
     /// Panics if persisted JSON columns cannot be (de)serialized.
     #[allow(clippy::too_many_lines)] // single atomic flow; splitting hurts readability
     pub async fn continue_conversation(&self, parent_id: &str) -> DbResult<ContinueOutcome> {
-        self.continue_conversation_inner(parent_id, None).await
+        self.continue_conversation_inner(parent_id, None, None)
+            .await
     }
 
     /// Creates a continuation and its opening-handoff intent atomically.
@@ -9197,8 +9263,35 @@ impl Database {
         parent_id: &str,
         intent: NewContinuationDispatchIntent,
     ) -> DbResult<(ContinueOutcome, Option<ContinuationDispatchIntent>)> {
+        self.continue_conversation_with_intent_inner(parent_id, intent, None)
+            .await
+    }
+
+    /// Creates a continuation only if the predecessor still matches the expected identity.
+    /// Continue only when the destination-owned predecessor still matches the caller's
+    /// exact product and `WorkScope` expectations.
+    ///
+    /// # Errors
+    /// Returns a typed database error when the predecessor is absent, stale, belongs to a
+    /// different product or `WorkScope`, is fenced by `Close`, or persistence fails.
+    pub async fn continue_conversation_with_intent_checked(
+        &self,
+        parent_id: &str,
+        intent: NewContinuationDispatchIntent,
+        expectation: ContinuationExpectation,
+    ) -> DbResult<(ContinueOutcome, Option<ContinuationDispatchIntent>)> {
+        self.continue_conversation_with_intent_inner(parent_id, intent, Some(&expectation))
+            .await
+    }
+
+    async fn continue_conversation_with_intent_inner(
+        &self,
+        parent_id: &str,
+        intent: NewContinuationDispatchIntent,
+        expectation: Option<&ContinuationExpectation>,
+    ) -> DbResult<(ContinueOutcome, Option<ContinuationDispatchIntent>)> {
         let outcome = self
-            .continue_conversation_inner(parent_id, Some(&intent))
+            .continue_conversation_inner(parent_id, Some(&intent), expectation)
             .await?;
         let stored = self.continuation_dispatch_intent(parent_id).await?;
         let accepted = match (&outcome, stored) {
@@ -9221,37 +9314,42 @@ impl Database {
         &self,
         parent_id: &str,
         intent: Option<&NewContinuationDispatchIntent>,
+        expectation: Option<&ContinuationExpectation>,
     ) -> DbResult<ContinueOutcome> {
         // Fetch parent outside the transaction — the subsequent INSERT+UPDATE
         // guards against concurrent continuation via the parent's
         // `continued_in_conv_id` still being NULL at UPDATE time.
         let parent = self.get_conversation(parent_id).await?;
 
-        let lifecycle = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
-        )
-        .bind(parent.product_conversation_id.as_str())
-        .fetch_one(&self.pool)
-        .await?;
-        if matches!(lifecycle.as_deref(), Some("history")) {
-            return Err(DbError::ProductConversationUnavailable(
-                parent.product_conversation_id.clone(),
-            ));
+        if expectation.is_none() {
+            let lifecycle = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
+            )
+            .bind(parent.product_conversation_id.as_str())
+            .fetch_one(&self.pool)
+            .await?;
+            if matches!(lifecycle.as_deref(), Some("history")) {
+                return Err(DbError::ProductConversationUnavailable(
+                    parent.product_conversation_id.clone(),
+                ));
+            }
         }
 
         // Idempotent shortcut: parent already has a continuation.
         if let Some(ref existing_id) = parent.continued_in_conv_id {
-            tracing::info!(
-                parent_id = %parent_id,
-                existing_continuation = %existing_id,
-                "continue_conversation: idempotent return of existing continuation",
-            );
-            let existing = self.get_conversation(existing_id).await?;
-            return Ok(ContinueOutcome::AlreadyContinued(existing));
+            if expectation.is_none() {
+                tracing::info!(
+                    parent_id = %parent_id,
+                    existing_continuation = %existing_id,
+                    "continue_conversation: idempotent return of existing continuation",
+                );
+                let existing = self.get_conversation(existing_id).await?;
+                return Ok(ContinueOutcome::AlreadyContinued(existing));
+            }
         }
 
         // Gate on context-exhausted state.
-        if !matches!(parent.state, ConvState::ContextExhausted { .. }) {
+        if !matches!(parent.state, ConvState::ContextExhausted { .. }) && expectation.is_none() {
             return Ok(ContinueOutcome::ParentNotContextExhausted {
                 state_variant: parent.state.variant_name(),
             });
@@ -9317,7 +9415,72 @@ impl Database {
         }
         let mut tx = begin_immediate.await?;
 
-        require_product_conversation_admission_tx(&mut tx, parent_id).await?;
+        let admitted_product =
+            require_product_conversation_admission_tx(&mut tx, parent_id).await?;
+        if let Some(expectation) = expectation {
+            if admitted_product != expectation.product_conversation_id {
+                return Err(DbError::ContinuationPrecondition(
+                    "predecessor belongs to a different product conversation".to_string(),
+                ));
+            }
+            let authoritative = sqlx::query(
+                "SELECT product_conversation_id, state_kind, continued_in_conv_id, work_scope_id
+                 FROM conversations WHERE id = ?1",
+            )
+            .bind(parent_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(parent_id.to_string()))?;
+            let product_id = ProductConversationId::parse(
+                authoritative.get::<String, _>("product_conversation_id"),
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            if product_id != expectation.product_conversation_id {
+                return Err(DbError::ContinuationPrecondition(
+                    "predecessor membership changed".to_string(),
+                ));
+            }
+            let actual_scope = authoritative
+                .get::<Option<String>, _>("work_scope_id")
+                .map(WorkScopeId::parse)
+                .transpose()
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            if let Some(scope) = actual_scope.as_ref() {
+                let belongs_to_product: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM product_conversation_work_scopes
+                     WHERE work_scope_id = ?1 AND product_conversation_id = ?2",
+                )
+                .bind(scope.as_str())
+                .bind(expectation.product_conversation_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+                if belongs_to_product.is_none() {
+                    return Err(DbError::ContinuationPrecondition(
+                        "predecessor work scope is not associated with its product conversation"
+                            .to_string(),
+                    ));
+                }
+            }
+            if actual_scope != expectation.work_scope_id {
+                return Err(DbError::ContinuationPrecondition(
+                    "predecessor work scope changed".to_string(),
+                ));
+            }
+            if let Some(existing_id) =
+                authoritative.get::<Option<String>, _>("continued_in_conv_id")
+            {
+                drop(tx);
+                drop(conn);
+                return Ok(ContinueOutcome::AlreadyContinued(
+                    self.get_conversation(&existing_id).await?,
+                ));
+            }
+            if authoritative.get::<String, _>("state_kind") != "context_exhausted" {
+                return Err(DbError::ContinuationPrecondition(
+                    "predecessor is no longer context-exhausted".to_string(),
+                ));
+            }
+        }
         sqlx::query("PRAGMA defer_foreign_keys = ON")
             .execute(&mut *tx)
             .await?;
@@ -9383,22 +9546,6 @@ impl Database {
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
 
-        let mapped_product_work_scope_id: Option<String> = sqlx::query_scalar(
-            "SELECT work_scope_id FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
-        )
-        .bind(parent.product_conversation_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
-        let mapped_product_work_scope_id = mapped_product_work_scope_id
-            .map(|scope_id| {
-                scope_id.parse::<WorkScopeId>().map_err(|error| {
-                    DbError::Serialization(format!(
-                        "invalid mapped work scope for product conversation {}: {error}",
-                        parent.product_conversation_id
-                    ))
-                })
-            })
-            .transpose()?;
         let continuation_work_scope_id = if parent.runtime_role == RuntimeRole::Coordinator {
             let owned = Self::coordinator_work_scope_tx(&mut tx)
                 .await?
@@ -9415,8 +9562,6 @@ impl Database {
             Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
                 .await?;
             Some(scope_id)
-        } else if let Some(mapped_scope_id) = mapped_product_work_scope_id {
-            Some(mapped_scope_id)
         } else {
             parent.attached_work_scope_id.clone()
         };
@@ -27076,6 +27221,180 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn checked_continuation_rejects_foreign_or_stale_authority_without_successor() {
+        let db = Database::open_in_memory().await.unwrap();
+        let exact = setup_exhausted_parent(
+            &db,
+            "checked-exact",
+            "checked-exact",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let exact_expectation = ContinuationExpectation::new(
+            exact.product_conversation_id.clone(),
+            exact.attached_work_scope_id.clone(),
+        );
+        let (outcome, _) = db
+            .continue_conversation_with_intent_checked(
+                &exact.id,
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("checked-exact-message").unwrap(),
+                    "exact handoff".to_string(),
+                    None,
+                ),
+                exact_expectation,
+            )
+            .await
+            .unwrap();
+        let first_successor = match outcome {
+            ContinueOutcome::Created(successor) => successor,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected checked continuation creation, got {other:?}")
+            }
+        };
+        assert_ne!(
+            first_successor.attached_work_scope_id,
+            exact.attached_work_scope_id
+        );
+        db.update_conversation_mode(&first_successor.id, &work_mode_fixture())
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &first_successor.id,
+            &ConvState::ContextExhausted {
+                summary: "second-generation summary".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let (second_outcome, _) = db
+            .continue_conversation_with_intent_checked(
+                &first_successor.id,
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("checked-second-generation-message").unwrap(),
+                    "second generation".to_string(),
+                    None,
+                ),
+                ContinuationExpectation::new(
+                    first_successor.product_conversation_id.clone(),
+                    first_successor.attached_work_scope_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let second_successor = match second_outcome {
+            ContinueOutcome::Created(successor) => successor,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected second-generation creation, got {other:?}")
+            }
+        };
+        assert_eq!(
+            second_successor.attached_work_scope_id,
+            first_successor.attached_work_scope_id
+        );
+
+        let wrong_product = setup_exhausted_parent(
+            &db,
+            "checked-wrong-product",
+            "checked-wrong-product",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let error = db
+            .continue_conversation_with_intent_checked(
+                &wrong_product.id,
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("checked-product-message").unwrap(),
+                    "handoff".to_string(),
+                    None,
+                ),
+                ContinuationExpectation::new(
+                    ProductConversationId::new(),
+                    wrong_product.attached_work_scope_id.clone(),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::ContinuationPrecondition(_)));
+        assert!(db
+            .get_conversation(&wrong_product.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+
+        let wrong_scope = setup_exhausted_parent(
+            &db,
+            "checked-wrong-scope",
+            "checked-wrong-scope",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let error = db
+            .continue_conversation_with_intent_checked(
+                &wrong_scope.id,
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("checked-scope-message").unwrap(),
+                    "handoff".to_string(),
+                    None,
+                ),
+                ContinuationExpectation::new(
+                    wrong_scope.product_conversation_id.clone(),
+                    Some(WorkScopeId::new()),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::ContinuationPrecondition(_)));
+        assert!(db
+            .get_conversation(&wrong_scope.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+
+        let stale_state = setup_exhausted_parent(
+            &db,
+            "checked-stale-state",
+            "checked-stale-state",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        db.update_conversation_state(&stale_state.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let error = db
+            .continue_conversation_with_intent_checked(
+                &stale_state.id,
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("checked-stale-message").unwrap(),
+                    "handoff".to_string(),
+                    None,
+                ),
+                ContinuationExpectation::new(
+                    stale_state.product_conversation_id.clone(),
+                    stale_state.attached_work_scope_id.clone(),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::ContinuationPrecondition(_)));
+        assert!(db
+            .get_conversation(&stale_state.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn generated_context_authority_survives_dispatch_settlement() {
         let db = Database::open_in_memory().await.unwrap();
         setup_exhausted_parent(
@@ -27136,6 +27455,73 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(authority, "generated_predecessor_context");
+    }
+
+    #[tokio::test]
+    async fn settled_continuation_receipt_preserves_complete_user_intent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = setup_exhausted_parent(
+            &db,
+            "settled-user-intent",
+            "settled-user-intent",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let client_key = ClientTurnKey::try_from("settled-user-message").unwrap();
+        let (outcome, _) = db
+            .continue_conversation_with_intent(
+                &parent.id,
+                NewContinuationDispatchIntent::user_authorized(
+                    client_key.clone(),
+                    "literal handoff".to_string(),
+                    Some("federation-owner-control".to_string()),
+                ),
+            )
+            .await
+            .unwrap();
+        let successor = match outcome {
+            ContinueOutcome::Created(successor) => successor,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation creation, got {other:?}")
+            }
+        };
+        db.add_message(
+            "settled-user-continuation",
+            &parent.id,
+            &MessageContent::continuation("parent summary"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            client_key.as_str(),
+            &successor.id,
+            &MessageContent::user("literal handoff"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let receipt = db
+            .completed_continuation_handoff(&parent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.successor_conversation_id, successor.id);
+        assert_eq!(receipt.accepted_successor_message_id, client_key.as_str());
+        assert_eq!(receipt.handoff, "literal handoff");
+        assert_eq!(
+            receipt.user_agent.as_deref(),
+            Some("federation-owner-control")
+        );
+        assert_eq!(
+            receipt.opening_authority,
+            ContinuationOpeningAuthority::UserAuthorizedInstruction
+        );
     }
 
     #[tokio::test]
@@ -27474,9 +27860,21 @@ mod tests {
 
         let continuation_immediate_attempted = continuation_immediate_attempted.notified();
         let continuation_parent_id = parent.id.clone();
+        let continuation_expectation = ContinuationExpectation::new(
+            parent.product_conversation_id.clone(),
+            parent.attached_work_scope_id.clone(),
+        );
         let continuation = tokio::spawn(async move {
             continuation_db
-                .continue_conversation(&continuation_parent_id)
+                .continue_conversation_with_intent_checked(
+                    &continuation_parent_id,
+                    NewContinuationDispatchIntent::user_authorized(
+                        ClientTurnKey::try_from("checked-close-race-message").unwrap(),
+                        "checked close race".to_string(),
+                        None,
+                    ),
+                    continuation_expectation,
+                )
                 .await
         });
         continuation_immediate_attempted.await;

@@ -118,6 +118,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
 | [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
+| [102](102_destination-owner-continue-is-a-narrow-borrowed-authority.md) | Destination owner Continue uses explicit local delegation without promoting peers | Accepted | REQ-FOC-001–006, REQ-AUTH-002/009, REQ-PROJ-003/004 |
 
 ## For agents: which decisions bind your task
 

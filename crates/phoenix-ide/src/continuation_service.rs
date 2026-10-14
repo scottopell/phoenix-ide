@@ -70,10 +70,239 @@ pub(crate) struct ContinuationApplicationService {
     runtime: Arc<RuntimeManager>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OwnerContinuationRequest {
+    pub destination_product_conversation_id:
+        phoenix_core::domain::product_conversation::ProductConversationId,
+    pub predecessor_conversation_id: String,
+    pub expected_work_scope_id: Option<phoenix_core::work_scope::WorkScopeId>,
+    pub message_id: phoenix_workflow::ClientTurnKey,
+    pub handoff: String,
+    pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerContinuationIntentAdmission {
+    Created,
+    ExactRetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContinuationDispatchStatus {
+    Accepted,
+    AlreadySettled,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnerContinuationResult {
+    pub successor_conversation_id: String,
+    pub successor_slug: Option<String>,
+    pub intent_admission: OwnerContinuationIntentAdmission,
+    pub dispatch: ContinuationDispatchStatus,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OwnerContinuationError {
+    #[error("continuation handoff must not be empty")]
+    EmptyHandoff,
+    #[error("the persisted continuation intent differs from this request")]
+    IntentConflict,
+    #[error("continuation created without a dispatch intent")]
+    MissingIntent,
+    #[error("continuation predecessor is not context-exhausted: {0}")]
+    PredecessorNotContextExhausted(String),
+    #[error(transparent)]
+    Database(#[from] phoenix_db::DbError),
+}
+
+fn settled_owner_intent_matches(
+    receipt: &phoenix_db::CompletedContinuationHandoff,
+    successor_id: &str,
+    requested: &NewContinuationDispatchIntent,
+) -> bool {
+    let direct_message_id = requested.message_id.as_str();
+    let prefixed_message_id = format!("{successor_id}:{direct_message_id}");
+    receipt.successor_conversation_id == successor_id
+        && (receipt.accepted_successor_message_id == direct_message_id
+            || receipt.accepted_successor_message_id == prefixed_message_id)
+        && receipt.opening_authority == requested.opening_authority
+        && receipt.handoff == requested.handoff
+        && receipt.user_agent == requested.user_agent
+}
+
+fn owner_intent_matches(
+    persisted: &crate::db::ContinuationDispatchIntent,
+    requested: &NewContinuationDispatchIntent,
+) -> bool {
+    persisted.message_id == requested.message_id
+        && persisted.handoff == requested.handoff
+        && persisted.user_agent == requested.user_agent
+        && persisted.opening_authority == requested.opening_authority
+}
+
 impl ContinuationApplicationService {
     #[must_use]
     pub(crate) fn new(runtime: Arc<RuntimeManager>) -> Self {
         Self { runtime }
+    }
+
+    pub(crate) async fn continue_owner(
+        &self,
+        request: OwnerContinuationRequest,
+    ) -> Result<OwnerContinuationResult, OwnerContinuationError> {
+        if request.handoff.trim().is_empty() {
+            return Err(OwnerContinuationError::EmptyHandoff);
+        }
+        let _product_admission = self
+            .runtime
+            .lock_product_message_admission(request.destination_product_conversation_id.as_str())
+            .await;
+        let requested_intent = NewContinuationDispatchIntent::user_authorized(
+            request.message_id,
+            request.handoff,
+            request.user_agent,
+        );
+        let (outcome, persisted_intent) = self
+            .runtime
+            .db()
+            .continue_conversation_with_intent_checked(
+                &request.predecessor_conversation_id,
+                requested_intent.clone(),
+                phoenix_db::ContinuationExpectation::new(
+                    request.destination_product_conversation_id,
+                    request.expected_work_scope_id,
+                ),
+            )
+            .await?;
+
+        match outcome {
+            ContinueOutcome::Created(successor) => {
+                let intent = persisted_intent.ok_or(OwnerContinuationError::MissingIntent)?;
+                if !owner_intent_matches(&intent, &requested_intent) {
+                    return Err(OwnerContinuationError::IntentConflict);
+                }
+                self.spawn_successor_runtime(successor.id.clone());
+                let dispatch = self.dispatch_intent(intent).await;
+                Ok(OwnerContinuationResult {
+                    successor_conversation_id: successor.id,
+                    successor_slug: successor.slug,
+                    intent_admission: OwnerContinuationIntentAdmission::Created,
+                    dispatch,
+                })
+            }
+            ContinueOutcome::AlreadyContinued(successor) => {
+                let dispatch = if let Some(intent) = persisted_intent {
+                    if !owner_intent_matches(&intent, &requested_intent) {
+                        return Err(OwnerContinuationError::IntentConflict);
+                    }
+                    self.dispatch_intent(intent).await
+                } else {
+                    self.require_settled_intent_matches(
+                        &request.predecessor_conversation_id,
+                        &successor.id,
+                        &requested_intent,
+                    )
+                    .await?;
+                    ContinuationDispatchStatus::AlreadySettled
+                };
+                Ok(OwnerContinuationResult {
+                    successor_conversation_id: successor.id,
+                    successor_slug: successor.slug,
+                    intent_admission: OwnerContinuationIntentAdmission::ExactRetry,
+                    dispatch,
+                })
+            }
+            ContinueOutcome::ParentNotContextExhausted { state_variant } => Err(
+                OwnerContinuationError::PredecessorNotContextExhausted(state_variant.to_string()),
+            ),
+        }
+    }
+
+    fn spawn_successor_runtime(&self, conversation_id: String) {
+        let runtime = Arc::clone(&self.runtime);
+        tokio::spawn(async move {
+            if let Err(error) = runtime.get_or_create(&conversation_id).await {
+                tracing::warn!(
+                    conv_id = %conversation_id,
+                    %error,
+                    "failed to spawn runtime for continuation",
+                );
+            }
+        });
+    }
+
+    pub(crate) async fn dispatch_intent(
+        &self,
+        intent: crate::db::ContinuationDispatchIntent,
+    ) -> ContinuationDispatchStatus {
+        let parent_id = intent.parent_conversation_id.clone();
+        let successor_id = intent.successor_conversation_id.clone();
+        let outcome =
+            SendChatApplicationService::new(self.runtime.db().clone(), Arc::clone(&self.runtime))
+                .send(SendChatRequest {
+                    conversation_id: successor_id.clone(),
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                    text: intent.handoff,
+                    message_id: intent.message_id.as_str().to_string(),
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    user_agent: intent.user_agent,
+                    expansion_policy: continuation_expansion_policy(intent.opening_authority),
+                })
+                .await;
+        match outcome {
+            Ok(SendChatOutcome::Delivered | SendChatOutcome::QueuedAsSteering) => {
+                ContinuationDispatchStatus::Accepted
+            }
+            Ok(SendChatOutcome::AlreadyPersisted) => {
+                if let Err(error) = self
+                    .runtime
+                    .db()
+                    .delete_continuation_dispatch_intent(&parent_id)
+                    .await
+                {
+                    tracing::warn!(
+                        %parent_id,
+                        continuation_id = %successor_id,
+                        %error,
+                        "handoff is durable but continuation intent cleanup failed",
+                    );
+                }
+                ContinuationDispatchStatus::Accepted
+            }
+            Ok(SendChatOutcome::Rejected { message, .. }) => {
+                ContinuationDispatchStatus::Failed(message)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %parent_id,
+                    continuation_id = %successor_id,
+                    %error,
+                    "continuation exists but opening handoff dispatch failed",
+                );
+                ContinuationDispatchStatus::Failed(error.to_string())
+            }
+        }
+    }
+
+    async fn require_settled_intent_matches(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+        requested: &NewContinuationDispatchIntent,
+    ) -> Result<(), OwnerContinuationError> {
+        let receipt = self
+            .runtime
+            .db()
+            .completed_continuation_handoff(predecessor_id)
+            .await?
+            .ok_or(OwnerContinuationError::IntentConflict)?;
+        if settled_owner_intent_matches(&receipt, successor_id, requested) {
+            Ok(())
+        } else {
+            Err(OwnerContinuationError::IntentConflict)
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -413,6 +642,69 @@ mod tests {
         };
 
         assert!(winning_intent_is_automatic(&admission, &intent));
+    }
+
+    #[test]
+    fn owner_retry_requires_the_exact_persisted_intent() {
+        let persisted = crate::db::ContinuationDispatchIntent {
+            parent_conversation_id: "parent".to_string(),
+            successor_conversation_id: "successor".to_string(),
+            message_id: phoenix_workflow::ClientTurnKey::try_from("message").unwrap(),
+            handoff: "exact handoff".to_string(),
+            user_agent: Some("agent".to_string()),
+            opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        };
+        let exact = NewContinuationDispatchIntent::user_authorized(
+            phoenix_workflow::ClientTurnKey::try_from("message").unwrap(),
+            "exact handoff".to_string(),
+            Some("agent".to_string()),
+        );
+        assert!(owner_intent_matches(&persisted, &exact));
+
+        let changed = NewContinuationDispatchIntent::user_authorized(
+            phoenix_workflow::ClientTurnKey::try_from("message").unwrap(),
+            "changed handoff".to_string(),
+            Some("agent".to_string()),
+        );
+        assert!(!owner_intent_matches(&persisted, &changed));
+    }
+
+    #[test]
+    fn settled_owner_retry_rejects_changed_metadata_or_authority() {
+        let receipt = phoenix_db::CompletedContinuationHandoff {
+            successor_conversation_id: "successor".to_string(),
+            accepted_successor_message_id: "successor:message".to_string(),
+            handoff: "exact handoff".to_string(),
+            user_agent: Some("agent".to_string()),
+            opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        };
+        let exact = NewContinuationDispatchIntent::user_authorized(
+            phoenix_workflow::ClientTurnKey::try_from("message").unwrap(),
+            "exact handoff".to_string(),
+            Some("agent".to_string()),
+        );
+        assert!(settled_owner_intent_matches(&receipt, "successor", &exact));
+
+        let changed_agent = NewContinuationDispatchIntent::user_authorized(
+            phoenix_workflow::ClientTurnKey::try_from("message").unwrap(),
+            "exact handoff".to_string(),
+            Some("other-agent".to_string()),
+        );
+        assert!(!settled_owner_intent_matches(
+            &receipt,
+            "successor",
+            &changed_agent
+        ));
+
+        let changed_authority = NewContinuationDispatchIntent::generated_predecessor_context(
+            phoenix_workflow::ClientTurnKey::try_from("message").unwrap(),
+            "exact handoff".to_string(),
+        );
+        assert!(!settled_owner_intent_matches(
+            &receipt,
+            "successor",
+            &changed_authority
+        ));
     }
 
     #[test]
