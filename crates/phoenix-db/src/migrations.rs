@@ -19450,7 +19450,8 @@ mod tests {
                     (123, 'temporarily_skip_close_startup_interruption'),
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
-                    (126, 'temporarily_skip_wake_feature_retirement')",
+                    (126, 'temporarily_skip_wake_feature_retirement'),
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home')",
         )
         .execute(&pool)
         .await
@@ -20314,7 +20315,8 @@ mod tests {
                     (123, 'temporarily_skip_close_startup_interruption'),
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
-                    (126, 'temporarily_skip_wake_feature_retirement')",
+                    (126, 'temporarily_skip_wake_feature_retirement'),
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home')",
         )
         .execute(pool)
         .await
