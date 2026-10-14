@@ -6,6 +6,7 @@
 """Disposable loopback OTLP receiver for existing candidate qualification only."""
 import argparse
 import json
+import uuid
 import math
 import threading
 import time
@@ -122,10 +123,26 @@ def final_index(output):
         raise ValueError("raw/index retention mismatch")
     if index["errors"]:
         raise ValueError("late export/drain failure")
+    if len(batches) > MAX_BATCHES or index["bytes"] > MAX_BYTES or index["spans"] > MAX_SPANS:
+        raise ValueError("final retention budget exceeded")
+    records = []
+    for ordinal, path in enumerate(batches):
+        if path.name != f"batch-{ordinal:03d}.pb" or path.stat().st_size > MAX_BODY:
+            raise ValueError("invalid retained batch inventory")
+        records.extend(decode(path.read_bytes()))
+        if len(records) > MAX_SPANS:
+            raise ValueError("final span budget exceeded")
+    if records != index["records"] or len(records) != index["spans"]:
+        raise ValueError("raw/decoded content mismatch")
     return index
 
 
 def retrieve(capture, service, open_id):
+    try:
+        if not isinstance(open_id, str) or str(uuid.UUID(open_id)) != open_id:
+            raise ValueError("invalid journey identity")
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError("invalid journey identity") from None
     if capture["errors"]:
         raise ValueError("export capture failed")
     records = [r for r in capture["records"] if r["service"] == service and r["attributes"].get("open.id") == open_id]

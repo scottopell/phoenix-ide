@@ -27,7 +27,7 @@ export function captureReport(body, forbidden = []) {
 export function summarizeTrials(trials, minimum = 8) {
   const strata = {};
   for (const route of ['ordinary', 'global']) {
-    const measured = trials.filter(t => t.route === route && !t.warmup && !t.metric_reset);
+    const measured = trials.filter(t => t.route === route && !t.warmup && !t.metric_reset && !Object.hasOwn(t, 'failure'));
     const sampled = measured.filter(t => t.sampled);
     const unsampled = measured.filter(t => !t.sampled);
     strata[route] = { sampled: sampled.length, unsampled: unsampled.length,
@@ -104,78 +104,110 @@ export function journeyExpectation(report, identity) {
 }
 
 export function appendTerminalInventory(result, terminal, identity, forbidden = []) {
+  const added = [];
+  const ids = new Set(result.journeys.map(journey => journey.open_id));
   for (const trial of terminal.trials) for (const report of trial.reports) {
-    assert.ok(forbidden.every(secret => !JSON.stringify(report).includes(secret)));
-    assert.ok(!result.journeys.some(j => j.open_id === report.open_id), 'journey identity must be unique across contexts');
-    result.journeys.push(journeyExpectation(report, identity));
+    captureReport(JSON.stringify(report), forbidden);
+    assert.ok(!ids.has(report.open_id), 'journey identity must be unique across contexts');
+    ids.add(report.open_id);
+    added.push(journeyExpectation(report, identity));
   }
+  assert.ok(result.journeys.length + added.length <= 64, 'final journey inventory bound');
+  result.journeys.push(...added);
   result.terminal = terminal;
   result.capabilities.pagehide_incomplete = terminal.status;
 }
 
-export async function runPendingPagehideCheck({ browser, storageState, baseURL, route, outputDir, forbidden = [], attempts = 8, budgetMs = 40000 }) {
+export async function runPendingPagehideCheck({ browser, storageState, baseURL, route, outputDir, forbidden = [], attempts = 8, budgetMs = 40000, onTrial = () => {} }) {
   assert.ok(Number.isInteger(attempts) && attempts > 0 && attempts <= 8);
   assert.ok(Number.isInteger(budgetMs) && budgetMs > 0 && budgetMs <= 40000);
   const caseDeadline = Date.now() + budgetMs;
   const destination = candidateDestination(route, baseURL);
   const trials = [];
   for (let attempt = 0; attempt < attempts && Date.now() < caseDeadline; attempt++) {
-    const owned = await browser.newContext({ storageState, viewport: { width: 1280, height: 900 } });
+    let owned;
+    let canceled = false;
     const trial = { attempt, sampled: false, reports: [], statuses: [], event: 'actual_cross_document_pagehide' };
     try {
-      const candidate = await owned.newPage();
-      const cdp = await owned.newCDPSession(candidate);
-      await cdp.send('Network.enable');
-      await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 200, downloadThroughput: 1000000, uploadThroughput: 1000000 });
-      let signal;
-      const requestSeen = new Promise(resolveRequest => { signal = resolveRequest; });
-      candidate.on('request', request => {
-        const url = new URL(request.url());
-        if (url.origin === new URL(baseURL).origin && url.searchParams.has('open_id')
-          && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/'))) {
-          trial.sampled = true;
-          trial.requestId = url.searchParams.get('open_id');
-          signal();
+      owned = await boundedObservation(browser.newContext({ storageState, viewport: { width: 1280, height: 900 } }).then(async created => {
+        if (canceled) {
+          await boundedObservation(created.close(), 5000, 'late pagehide context cleanup');
+          throw new Error('pagehide context arrived after cancellation');
         }
-        if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
-          const body = request.postData() ?? '';
-          if (Buffer.byteLength(body) > 8192) trial.failure = 'report byte bound';
-          else {
-            try { trial.reports.push(captureReport(body, forbidden)); } catch { trial.failure = 'invalid or unsafe report JSON'; }
+        return created;
+      }), 5000, 'pagehide context');
+      const operation = (async () => {
+        const candidate = await owned.newPage();
+        const cdp = await owned.newCDPSession(candidate);
+        await cdp.send('Network.enable');
+        await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 200, downloadThroughput: 1000000, uploadThroughput: 1000000 });
+        let signal;
+        const requestSeen = new Promise(resolveRequest => { signal = resolveRequest; });
+        candidate.on('request', request => {
+          const url = new URL(request.url());
+          if (url.origin === new URL(baseURL).origin && url.searchParams.has('open_id')
+            && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/'))) {
+            trial.sampled = true;
+            trial.requestId = url.searchParams.get('open_id');
+            signal();
           }
-        }
-      });
-      candidate.on('response', response => {
-        if (new URL(response.url()).pathname === '/api/telemetry/conversation-view') trial.statuses.push(response.status());
-      });
-      const navigation = candidate.goto(destination, { timeout: 10000, waitUntil: 'domcontentloaded' });
-      const readiness = candidate.waitForFunction(visibleReadiness, undefined, { timeout: 10000 }).then(() => 'ready', () => 'readiness_unavailable');
-      const winner = await Promise.race([requestSeen.then(() => 'request'), readiness]);
-      await navigation;
-      assert.notEqual(winner, 'readiness_unavailable', 'case readiness unavailable before sampled request');
-      if (winner === 'request') {
-        await candidate.goto('about:blank');
-        await readiness.catch(() => {});
-        const deadline = Date.now() + 4000;
-        while (!trial.statuses.length && Date.now() < deadline) await new Promise(resolveWait => setTimeout(resolveWait, 20));
-        assert.ok(!trial.failure, trial.failure);
-        assert.equal(trial.reports.length, 1, 'sampled pagehide must report once');
-        assert.deepEqual(trial.statuses, [204]);
-        const report = trial.reports[0];
-        assert.equal(report.outcome, 'incomplete', 'pagehide outcome is incomplete, not synthetic cancellation');
-        assertRequestCorrelation([trial.requestId], report);
-        assert.equal(report.marks.meaningful_transcript, null, 'incomplete case must precede presentation');
-        trial.status = 'observed_incomplete';
-      } else trial.status = 'unsampled_or_already_ready';
+          if (url.origin === new URL(baseURL).origin && url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
+            if (trial.reports.length >= 2) { trial.failure ??= 'pagehide report count bound'; return; }
+            const body = request.postData() ?? '';
+            if (Buffer.byteLength(body) > 8192) trial.failure = 'report byte bound';
+            else {
+              try { trial.reports.push(captureReport(body, forbidden)); } catch { trial.failure = 'invalid or unsafe report JSON'; }
+            }
+          }
+        });
+        candidate.on('response', response => {
+          if (new URL(response.url()).origin === new URL(baseURL).origin && new URL(response.url()).pathname === '/api/telemetry/conversation-view' && trial.statuses.length < 2) trial.statuses.push(response.status());
+        });
+        const navigation = candidate.goto(destination, { timeout: 10000, waitUntil: 'domcontentloaded' });
+        const readiness = candidate.waitForFunction(visibleReadiness, undefined, { timeout: 10000 }).then(() => 'ready', () => 'readiness_unavailable');
+        const winner = await Promise.race([requestSeen.then(() => 'request'), readiness]);
+        await navigation;
+        assert.notEqual(winner, 'readiness_unavailable', 'case readiness unavailable before sampled request');
+        if (winner === 'request') {
+          await candidate.goto('about:blank');
+          await readiness.catch(() => {});
+          const deadline = Date.now() + 4000;
+          while (!trial.statuses.length && Date.now() < deadline) await new Promise(resolveWait => setTimeout(resolveWait, 20));
+          assert.ok(!trial.failure, trial.failure);
+          assert.equal(trial.reports.length, 1, 'sampled pagehide must report once');
+          assert.deepEqual(trial.statuses, [204]);
+          const report = trial.reports[0];
+          assert.equal(report.outcome, 'incomplete', 'pagehide outcome is incomplete, not synthetic cancellation');
+          assertRequestCorrelation([trial.requestId], report);
+          assert.equal(report.marks.meaningful_transcript, null, 'incomplete case must precede presentation');
+          trial.status = 'observed_incomplete';
+        } else trial.status = 'unsampled_or_already_ready';
+      })();
+      await boundedObservation(operation, Math.max(1, caseDeadline - Date.now()), 'absolute pagehide stage');
     } catch (error) {
       trial.failure = error.message;
       throw error;
     } finally {
-      trials.push(trial);
-      await owned.close();
-      if (outputDir) {
-        mkdirSync(outputDir, { recursive: true });
-        writeFileSync(resolve(outputDir, 'telemetry-pagehide-trials.json'), JSON.stringify({ scope: 'pagehide_incomplete_only_not_canceled_resume_or_background', trials }, null, 2));
+      canceled = true;
+      try {
+        if (owned) await boundedObservation(owned.close(), 5000, 'pagehide context final drain');
+        assert.ok(!trial.failure, 'pagehide late capture failure');
+        if (trial.status === 'observed_incomplete') {
+          assert.equal(trial.reports.length, 1, 'late pagehide duplicate');
+          assert.deepEqual(trial.statuses, [204]);
+        }
+      } catch (error) { trial.failure ??= error.message; throw error; }
+      finally {
+        trials.push(trial);
+        const stage = { status: trial.status ?? 'failed', scope: 'pagehide_incomplete_only_not_canceled_resume_or_background', trials };
+        try { onTrial(trial, stage); }
+        catch (error) { trial.failure ??= error.message; throw error; }
+        finally {
+          if (outputDir) {
+            mkdirSync(outputDir, { recursive: true });
+            writeFileSync(resolve(outputDir, 'telemetry-pagehide-trials.json'), JSON.stringify(stage, null, 2));
+          }
+        }
       }
     }
     if (trial.status === 'observed_incomplete') return { status: 'observed_incomplete', trials };
@@ -613,29 +645,30 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
         const aggregate = aggregates[index % 2];
         const owned = await browser.newContext({ storageState, viewport: { width: 1280, height: 900 } });
         const trial = { index, route: aggregate.kind, warmup: index < 2, sampled: false, posts: 0, payloadBytes: 0, correlatedRequests: 0 };
+        const requests = [];
+        const reports = [];
+        const statuses = [];
+        const captureErrors = [];
         try {
           const candidate = await owned.newPage();
           const cdp = await owned.newCDPSession(candidate);
           await cdp.send('Performance.enable');
           await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
-          const requests = [];
-          const reports = [];
-          const statuses = [];
-          const captureErrors = [];
           candidate.on('request', request => {
             const url = new URL(request.url());
-            if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
+            if (url.origin === new URL(baseURL).origin && url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
+              if (trial.posts >= 2) { if (!captureErrors.length) captureErrors.push('report count bound'); return; }
               trial.posts++;
               const body = request.postData() ?? '';
               trial.payloadBytes += Buffer.byteLength(body);
-              if (Buffer.byteLength(body) > 8192) captureErrors.push('report byte bound');
+              if (Buffer.byteLength(body) > 8192) { if (!captureErrors.length) captureErrors.push('report byte bound'); }
               else {
-                try { reports.push(captureReport(body, fixtures.forbidden ?? [])); } catch { captureErrors.push('invalid or unsafe report JSON'); }
+                try { reports.push(captureReport(body, fixtures.forbidden ?? [])); } catch { if (!captureErrors.length) captureErrors.push('invalid or unsafe report JSON'); }
               }
             } else if (url.origin === new URL(baseURL).origin && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/')) && url.searchParams.has('open_id')) requests.push(url.searchParams.get('open_id'));
           });
           candidate.on('response', response => {
-            if (new URL(response.url()).pathname === '/api/telemetry/conversation-view') statuses.push(response.status());
+            if (new URL(response.url()).origin === new URL(baseURL).origin && new URL(response.url()).pathname === '/api/telemetry/conversation-view' && statuses.length < 2) statuses.push(response.status());
           });
           const before = await cdp.send('Performance.getMetrics');
           const navigationStart = performance.now();
@@ -689,18 +722,29 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
             result.capabilities.tab_visibility = result.visibilityWitness.status;
           }
           assert.ok(trial.posts <= 1, 'no per-frame or repeated POST');
-        } finally {
-          result.trials.push(trial);
-          await owned.close();
+        } catch (error) { trial.failure = error.message; throw error; }
+        finally {
+          try {
+            await boundedObservation(owned.close(), 5000, 'initial context final drain');
+            assert.deepEqual(captureErrors, [], 'late initial capture failure');
+            assert.equal(trial.posts, trial.sampled ? 1 : 0, 'late initial duplicate or unexpected POST');
+            assert.equal(reports.length, trial.sampled ? 1 : 0);
+            assert.deepEqual(statuses, trial.sampled ? [204] : []);
+          } catch (error) { trial.failure ??= error.message; throw error; }
+          finally { trial.reports = reports; result.trials.push(trial); }
         }
         if (Object.values(summarizeTrials(result.trials).strata).every(s => s.status === 'raw_cohorts_ready_for_review')) break;
       }
       assert.ok(negativeTemplate, 'at least one naturally sampled report required for collector negatives');
       result.collectorNegatives = await runCollectorNegativeChecks(context, baseURL, negativeTemplate);
       result.collectorNegatives.push(await runUnauthenticatedCollectorCheck(browser, baseURL, negativeTemplate));
-      const terminal = await runPendingPagehideCheck({ browser, storageState, baseURL,
-        route: aggregates[0].route, outputDir, forbidden: fixtures.forbidden ?? [], attempts: 2, budgetMs: 20000 });
-      appendTerminalInventory(result, terminal, fixtures.identity, fixtures.forbidden ?? []);
+      await runPendingPagehideCheck({ browser, storageState, baseURL,
+        route: aggregates[0].route, outputDir, forbidden: fixtures.forbidden ?? [], attempts: 2, budgetMs: 20000,
+        onTrial: (trial, stage) => {
+          result.terminal = stage;
+          appendTerminalInventory(result, { ...stage, trials: [trial] }, fixtures.identity, fixtures.forbidden ?? []);
+          result.terminal = stage;
+        } });
       await runLifecycleQualificationStage({ browser, storageState, baseURL,
         fixture: fixtures.lifecycle, outputDir, forbidden: fixtures.forbidden ?? [], onTrial: (trial, stage) => {
           result.lifecycle = stage;

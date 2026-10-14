@@ -356,7 +356,8 @@ test('wired lifecycle stage rejects precompleted, preterminal and late duplicate
     if (mode !== 'precompleted') assert.ok(trials[0].reports.length > 0, 'failure reports are preserved');
   }
 });
-test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate'])('main driver executes lifecycle stage with complete success/failure inventory: %s', async mode => {
+test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_late_duplicate', 'initial_late_private', 'pagehide_late_duplicate', 'pagehide_late_private', 'initial_timeout'])('main driver executes lifecycle stage with complete success/failure inventory: %s', async mode => {
+  if (mode === 'initial_timeout') vi.useFakeTimers();
   const outputDir = mkdtempSync(join(tmpdir(), 'cvt-main-contract-'));
   const lifecycle = lifecycleBrowserFixture(mode);
   let contexts = 0;
@@ -392,11 +393,18 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate'])('main dri
           callbacks.request?.({ url: () => `${baseURL}/api/product-conversations/product/history?open_id=${requestId}`, method: () => 'GET' });
           if (!pagehide) post();
         }
-      }, waitForFunction: async () => { if (pagehide) await new Promise(resolve => { readiness = resolve; }); } };
+      }, waitForFunction: async () => { if (pagehide || (index === 0 && mode === 'initial_timeout')) await new Promise(resolve => { readiness = resolve; }); } };
     let pages = 0;
     let contextClosed;
     const owned = { on: (event, fn) => { if (event === 'close') contextClosed = fn; }, newPage: async () => ++pages === 1 ? candidate : { bringToFront: async () => {}, close: async () => {} },
-      newCDPSession: async () => ({ send: async method => method === 'Performance.getMetrics' ? { metrics: [{ name: 'ScriptDuration', value: 1 }] } : {} }), close: async () => { contextClosed?.(); } };
+      newCDPSession: async () => ({ send: async method => method === 'Performance.getMetrics' ? { metrics: [{ name: 'ScriptDuration', value: 1 }] } : {} }), close: async () => {
+        if (index === 0 && mode === 'initial_late_duplicate') post();
+        if (index === 0 && mode === 'initial_timeout') readiness?.();
+        if (pagehide && mode === 'pagehide_late_duplicate') post();
+        if (pagehide && mode === 'pagehide_late_private') callbacks.request?.({ url: () => `${baseURL}/api/telemetry/conversation-view`, method: () => 'POST', postData: () => JSON.stringify({ ...report, reporter_id: 'PRIVATE_CANARY' }) });
+        if (index === 0 && mode === 'initial_late_private') callbacks.request?.({ url: () => `${baseURL}/api/telemetry/conversation-view`, method: () => 'POST', postData: () => JSON.stringify({ ...report, reporter_id: 'PRIVATE_CANARY' }) });
+        contextClosed?.();
+      } };
     return owned;
   } };
   const statuses = [422, 422, 422, 400, 400, 413];
@@ -405,11 +413,35 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate'])('main dri
   try {
     const execution = runTelemetryChecks({ page: { context: () => context }, context, baseURL, serviceName: 'synthetic-main', runId: 'main', outputDir,
       fixtures: { identity, aggregates: [{ kind: 'ordinary', route: '/c/product' }, { kind: 'global', route: '/global/coordinator' }],
-        lifecycle: { route: '/c/product', productConversationId: 'product', spaSelector: 'a[href="/c/successor"]' } } });
+        lifecycle: { route: '/c/product', productConversationId: 'product', spaSelector: 'a[href="/c/successor"]' }, forbidden: ['PRIVATE_CANARY'] } });
     if (mode !== 'normal') {
-      await assert.rejects(execution);
+      const rejection = assert.rejects(execution);
+      if (mode === 'initial_timeout') await vi.advanceTimersByTimeAsync(285000);
+      await rejection;
       const receipt = JSON.parse(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8'));
       assert.ok(receipt.failure);
+      if (mode === 'initial_timeout') {
+        assert.match(receipt.failure, /absolute browser qualification deadline/);
+        assert.equal(receipt.trials.length, 1);
+        assert.equal(contexts, 1, 'no contexts admitted after outer deadline');
+        return;
+      }
+      if (mode.startsWith('initial_late')) {
+        assert.equal(receipt.trials.length, 1);
+        assert.ok(receipt.trials[0].failure);
+        const { forbidden, ...observedReceipt } = receipt;
+        assert.deepEqual(forbidden, ['PRIVATE_CANARY']);
+        assert.equal(JSON.stringify(observedReceipt).includes('PRIVATE_CANARY'), false);
+        return;
+      }
+      if (mode.startsWith('pagehide_late')) {
+        assert.equal(receipt.terminal.trials.length, 1);
+        assert.ok(receipt.terminal.trials[0].failure);
+        const { forbidden, ...observedReceipt } = receipt;
+        assert.deepEqual(forbidden, ['PRIVATE_CANARY']);
+        assert.equal(JSON.stringify(observedReceipt).includes('PRIVATE_CANARY'), false);
+        return;
+      }
       assert.equal(receipt.lifecycle.trials.length, 1);
       assert.ok(receipt.lifecycle.trials[0].failure);
       assert.equal(receipt.journeys.length, 49 + receipt.lifecycle.trials[0].reports.length);
@@ -431,7 +463,7 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate'])('main dri
     assert.equal(result.capabilities.pending_background, 'actual_hidden_response_then_visible_readiness');
     assert.equal(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8').includes('bfcache_resume-resume'), true);
     assert.equal(new Set(result.journeys.map(journey => journey.open_id)).size, 54);
-  } finally { rmSync(outputDir, { recursive: true, force: true }); }
+  } finally { rmSync(outputDir, { recursive: true, force: true }); if (mode === 'initial_timeout') vi.useRealTimers(); }
 });
 test('wired lifecycle receipts reject private payload before writing and record context/callback failures', async () => {
   for (const mode of ['private', 'context_failure', 'callback_failure', 'wrong_resume']) {
@@ -478,6 +510,35 @@ test('absolute lifecycle deadline preserves receipt and closes a context arrivin
     assert.equal(trials.length, 1);
     assert.match(trials[0].failure, /deadline/);
     create({ close: async () => { closed++; }, newPage: async () => { throw new Error('must not create late page'); } });
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(closed, 1);
+  } finally { vi.useRealTimers(); }
+});
+test('raw cohorts exclude failed observations including empty failure flag, warmup and reset without erasing raw records', () => {
+  const trials = Array.from({ length: 16 }, (_, index) => ({ route: 'ordinary', sampled: index < 8 }));
+  trials[0].failure = '';
+  trials[8].metric_reset = true;
+  trials[9].warmup = true;
+  const summary = summarizeTrials(trials);
+  assert.equal(summary.strata.ordinary.sampled, 7);
+  assert.equal(summary.strata.ordinary.unsampled, 6);
+  assert.equal(summary.strata.ordinary.status, 'inconclusive_sampling_budget');
+  assert.equal(summary.overhead_clearance, false);
+  assert.equal(trials.length, 16);
+});
+test('pagehide deadline records failure and closes context arriving after creation guard', async () => {
+  vi.useFakeTimers();
+  let create;
+  let closed = 0;
+  const trials = [];
+  try {
+    const execution = runPendingPagehideCheck({ browser: { newContext: () => new Promise(resolve => { create = resolve; }) }, storageState: {},
+      baseURL: 'http://127.0.0.1:8123', route: '/c/product', onTrial: trial => trials.push(trial) });
+    const rejection = assert.rejects(execution);
+    await vi.advanceTimersByTimeAsync(5000);
+    await rejection;
+    assert.match(trials[0].failure, /pagehide context deadline/);
+    create({ close: async () => { closed++; } });
     await vi.advanceTimersByTimeAsync(0);
     assert.equal(closed, 1);
   } finally { vi.useRealTimers(); }

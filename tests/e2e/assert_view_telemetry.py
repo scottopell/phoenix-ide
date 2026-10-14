@@ -25,9 +25,24 @@ def assertPhoenixTelemetry(output, service_name, run_id, expected_cases, forbidd
             raise ValueError("browser/harness identity mismatch")
         expected_cases = receipt["journeys"]
         forbidden = tuple(forbidden) + tuple(receipt.get("forbidden", []))
-        if receipt.get("failure"):
+        trials = list(receipt.get("trials", []))
+        for stage in ("terminal", "lifecycle"):
+            trials.extend(receipt.get(stage, {}).get("trials", []))
+        if "failure" in receipt or any("failure" in trial for trial in trials):
             raise ValueError("browser checks failed")
-        scope["browser_scope"] = receipt.get("acceptance", "unspecified")
+        observed = [report["open_id"] for trial in trials for report in trial.get("reports", [])]
+        if len(observed) != len(expected_cases) or set(observed) != {case["open_id"] for case in expected_cases}:
+            raise ValueError("browser report/expectation inventory mismatch")
+        identity = receipt.get("identity", {})
+        authority = {"server.backend_source": identity.get("appSource"), "server.instance_id": identity.get("serverInstanceId"),
+                     "browser.frontend_source": identity.get("frontendSource")}
+        if any(not value for value in authority.values()) or any(case["expected"].get(key) != value for case in expected_cases for key, value in authority.items()):
+            raise ValueError("browser/app source identity mismatch")
+        if not isinstance(receipt.get("acceptance"), str) or not receipt["acceptance"].startswith("partial_"):
+            raise ValueError("missing partial browser scope")
+        if receipt.get("comparison", {}).get("overhead_clearance") is not False:
+            raise ValueError("semantic export assertion cannot grant overhead clearance")
+        scope["browser_scope"] = receipt["acceptance"]
         scope["capabilities"] = receipt.get("capabilities", {})
         scope["comparison"] = receipt.get("comparison", {})
     if not 0 < len(expected_cases) <= 64 or len({case["open_id"] for case in expected_cases}) != len(expected_cases):

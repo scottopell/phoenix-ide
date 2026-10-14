@@ -230,6 +230,8 @@ class SinkTests(unittest.TestCase):
             self.assertFalse(assertPhoenixTelemetry(capture.output, service, "final", cases, drain_receipt=drain)["scope"]["full_acceptance"])
             partial = Path(directory) / "partial.json"
             partial.write_text(json.dumps({"runId": "final", "serviceName": service, "journeys": cases,
+                "trials": [{"reports": [{"open_id": OPEN}]}],
+                "identity": {"appSource": "a" * 40, "frontendSource": "b" * 40, "serverInstanceId": "candidate-instance"},
                 "acceptance": "partial_initial_open_retrieval_and_raw_overhead_only",
                 "capabilities": {"bfcache_resume": "not_exercised"}, "comparison": {"overhead_clearance": False}}))
             semantic = assertPhoenixTelemetry(capture.output, service, "final", partial, drain_receipt=drain)
@@ -240,10 +242,46 @@ class SinkTests(unittest.TestCase):
             path.write_text(json.dumps({"runId": "final", "serviceName": service, "journeys": cases, "failure": "oracle failed"}))
             with self.assertRaises(ValueError):
                 assertPhoenixTelemetry(capture.output, service, "final", path, drain_receipt=drain)
+            base_receipt = json.loads(partial.read_text())
+            for extra in ({"failure": ""}, {"failure": None}, {"trials": [{"failure": "failed later"}]},
+                          {"terminal": {"trials": [{"failure": ""}]}}, {"lifecycle": {"trials": [{"failure": ""}]}},
+                          {"acceptance": ""}, {"comparison": {"overhead_clearance": True}}, {"comparison": {}}, {"identity": {}}, {"trials": []},
+                          {"trials": [{"reports": [{"open_id": OPEN}, {"open_id": OPEN}]}]},
+                          {"lifecycle": {"trials": [{"reports": [{"open_id": "unaccounted"}]}]}}):
+                with self.subTest(extra=extra):
+                    path.write_text(json.dumps({**base_receipt, **extra}))
+                    with self.assertRaises(ValueError):
+                        assertPhoenixTelemetry(capture.output, service, "final", path, drain_receipt=drain)
             request.resource_spans[0].scope_spans[0].spans[0].attributes[0].value.string_value = "different-journey"
             capture.accept(request.SerializeToString())
             with self.assertRaises(ValueError):
                 assertPhoenixTelemetry(capture.output, service, "final", cases, drain_receipt=drain)
+
+    def test_final_index_reconciles_decoded_content_not_only_byte_counts(self):
+        for corrupt in ("index", "raw"):
+            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
+                capture = sink.Capture(Path(directory) / "capture")
+                capture.accept(wire().SerializeToString())
+                if corrupt == "index":
+                    path = capture.output / "capture.json"
+                    index = json.loads(path.read_text())
+                    index["records"][0]["attributes"]["browser.outcome"] = "failed"
+                    path.write_text(json.dumps(index))
+                else:
+                    replacement = wire()
+                    replacement.resource_spans[0].scope_spans[0].spans[0].trace_id = b"x" * 16
+                    path = capture.output / "batch-000.pb"
+                    self.assertEqual(len(replacement.SerializeToString()), path.stat().st_size)
+                    path.write_bytes(replacement.SerializeToString())
+                with self.assertRaises(ValueError):
+                    sink.final_index(capture.output)
+
+    def test_retrieval_rejects_missing_or_untyped_journey_identity(self):
+        records = sink.decode(wire(0).SerializeToString())
+        del records[0]["attributes"]["open.id"]
+        for identity in (None, "", "not-a-uuid", 12):
+            with self.subTest(identity=identity), self.assertRaises(ValueError):
+                sink.retrieve({"errors": [], "records": records}, SERVICE, identity)
 
     def test_rejects_excess_correlation_children(self):
         index = {"errors": [], "records": sink.decode(wire(17).SerializeToString())}
