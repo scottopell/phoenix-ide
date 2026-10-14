@@ -169,11 +169,17 @@ pub(crate) fn event_messages(event: &crate::runtime::SseEvent) -> Vec<&Message> 
             transcript,
             pending_events,
             ..
-        } => transcript
-            .messages()
-            .iter()
-            .chain(pending_events.iter().flat_map(event_messages))
-            .collect(),
+        } => {
+            let messages: &[Message] = match transcript {
+                crate::runtime::InitTranscript::Complete(messages)
+                | crate::runtime::InitTranscript::Tail(messages) => messages,
+                crate::runtime::InitTranscript::Preserve => &[],
+            };
+            messages
+                .iter()
+                .chain(pending_events.iter().flat_map(event_messages))
+                .collect()
+        }
         SseEvent::Message { message } => vec![message],
         _ => Vec::new(),
     }
