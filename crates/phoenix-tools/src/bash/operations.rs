@@ -2384,22 +2384,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn waiter_cannot_terminalize_before_reader_drains_unterminated_tail() {
-        // Regression for the codex review: the waiter used to call
-        // transition_to_terminal as soon as child.wait() resolved, but the
-        // stdout reader task could still be holding kernel-buffered bytes
-        // that hadn't yet been appended to the live ring. Once tombstoned,
-        // the next reader append silently dropped those bytes.
-        //
-        // This exercises `drain_then_transition_to_terminal` — the actual
-        // production helper `run_waiter` calls after `child.wait()`
-        // resolves — directly, against a reader deliberately held
-        // mid-flight by a oneshot gate. No real child process, no sleeps:
-        // `start_paused` freezes virtual time, so `READER_DRAIN_TIMEOUT`
-        // cannot elapse unless the test explicitly advances the clock,
-        // which it never does. The ordering under test (reader must drain,
-        // including the unterminated marker, before the handle tombstones)
-        // is therefore deterministic rather than a probabilistic race
-        // against process scheduling.
+        use std::future::Future as _;
         let handle = live_handle();
         let marker = b"final-marker-unterminated".to_vec();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -2413,7 +2398,6 @@ mod tests {
             read_pipe_to_ring(reader, reader_handle, None).await;
         });
 
-        let waiter_handle = handle.clone();
         let context = WaiterContext {
             owner_scope: scope("conv-ops"),
             lifecycle_sink: None,
@@ -2421,37 +2405,23 @@ mod tests {
             sandbox_scratch_dir: None,
             progress_reporter: None,
         };
-        let finalize = tokio::spawn(async move {
-            drain_then_transition_to_terminal(
-                &waiter_handle,
-                Some(stdout_join),
-                None,
-                FinalCause::Exited { exit_code: Some(0) },
-                Instant::now(),
-                SystemTime::now(),
-                &context,
-            )
-            .await;
-        });
-
-        // Drive the single-threaded paused-time runtime to quiescence.
-        // With the reader still gated, `drain_then_transition_to_terminal`
-        // must be parked on the reader join, not past it.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !handle.state().await.is_terminal(),
-            "waiter transitioned to terminal before the reader drained its \
-             buffered, unterminated final chunk"
-        );
-
-        release_tx
-            .send(())
-            .expect("reader task still awaiting the gate");
-        finalize
-            .await
-            .expect("drain_then_transition_to_terminal task");
+        let mut finalize = Box::pin(drain_then_transition_to_terminal(
+            &handle,
+            Some(stdout_join),
+            None,
+            FinalCause::Exited { exit_code: Some(0) },
+            Instant::now(),
+            SystemTime::now(),
+            &context,
+        ));
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(finalize.as_mut().poll(cx).is_pending())
+        })
+        .await;
+        assert!(pending, "finalization must wait for the gated reader");
+        assert!(!handle.state().await.is_terminal());
+        release_tx.send(()).expect("reader still awaits its gate");
+        finalize.await;
 
         let state = handle.state().await;
         let HandleState::Tombstoned(tomb) = state.as_ref() else {

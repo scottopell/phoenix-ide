@@ -1110,6 +1110,7 @@ def scenario_coordinator_home(_base_url: str) -> None:
             assert _get_conv(base_url, conv_id)['conversation']['cwd'] == cwd
             worker_root = root / 'ordinary-worker'
             worker_root.mkdir()
+            worker_root = worker_root.resolve()
             sentinel = worker_root / 'worker-sentinel.txt'
             sentinel.write_text('separate-worker-bytes')
             worker = _new_conv_in(base_url, str(worker_root), '[[scenario:plain_text]] separate ordinary work')
@@ -1127,7 +1128,8 @@ def scenario_coordinator_home(_base_url: str) -> None:
             before = len(_get_conv(base_url, conv_id)['messages'])
             _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
             _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' and m.get('content', {}).get('is_error') is False for m in messages[before:]), 'restarted successor rediscovers owned scope from system context', timeout=SCENARIO_TIMEOUT_SECONDS)
-            assert _get_conv(base_url, worker['id'])['conversation']['cwd'] == worker['cwd']
+            worker_cwd_after_restart = _get_conv(base_url, worker['id'])['conversation']['cwd']
+            assert worker_cwd_after_restart == str(worker_root), (worker_cwd_after_restart, str(worker_root))
             closed = httpx.post(f"{base_url}/api/conversations/{worker['id']}/archive", timeout=10)
             closed.raise_for_status()
             deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
