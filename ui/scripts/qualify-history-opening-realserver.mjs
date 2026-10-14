@@ -147,7 +147,7 @@ export function globalChapterReferencePath(a) {
   assert.equal(a.kind, 'global');
   return a.endpoint + '?message_limit=100&boundary_representation=original_messages';
 }
-export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, reconnect, streamUrls, row, ack, chatRequest, instruction }) {
+export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, seed, reconnect, observedEvents, streamUrls, row, ack, chatRequest, instruction }) {
   assert.equal(a.kind, 'global');
   const latest = evidence.successor_transcript_row_id, id = `${latest}:${evidence.client_turn_key}`;
   assert.equal(evidence.edge, 'committed_intent_before_first_message_persistence');
@@ -163,29 +163,99 @@ export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, re
   validateOwnedAggregate(owned, cached.data, cached.url);
   assert.deepEqual(cached.data.segments.map(s => s.transcript_row_id), owned.members);
   assert.ok(openingMatches(cached.data.latest_opening, evidence, 'pending'));
-  for (const event of [accepted, reconnect]) {
-    assert.equal(new URL(streamUrls.get(event.requestId)).pathname, `/api/conversations/${latest}/stream`);
-    assert.ok(openingMatches(JSON.parse(event.data).opening, evidence, 'accepted'));
+
+  assert.ok(Array.isArray(observedEvents), 'actual captured SSE event sequence required');
+  const acceptedIndex = observedEvents.indexOf(accepted), seedIndex = observedEvents.indexOf(seed);
+  assert.ok(seedIndex >= 0 && seedIndex < acceptedIndex, 'accepted owning seed Init must precede accepted publication');
+  assert.equal(seed.requestId, accepted.requestId, 'accepted owning seed request');
+  assert.equal(seed.eventName, 'init', 'accepted owning seed Init event');
+  assert.strictEqual(observedEvents.slice(0, acceptedIndex).findLast(event => event.requestId === accepted.requestId && event.eventName === 'init'), seed,
+    'selected seed is the actual accepted owning prior Init');
+  const acceptedCursor = acceptedWireCursor(accepted, observedEvents);
+  const seeded = JSON.parse(seed.data), published = JSON.parse(accepted.data), init = JSON.parse(reconnect.data);
+  assert.ok(['complete', 'tail'].includes(seeded.transcript_coverage), 'seed Init complete or tail coverage required');
+  assert.ok(openingMatches(seeded.opening, evidence, 'pending'), 'seed Init Pending full edge/key');
+  assert.equal(seeded.conversation.id, latest, 'seed Init owner');
+  assert.ok(Number.isSafeInteger(seeded.sequence_id) && seeded.sequence_id >= 0, 'seed Init safe sequence');
+  assert.ok(seeded.sequence_id <= published.sequence_id, 'seed Init sequence cannot follow accepted publication');
+
+  for (const event of [seed, accepted, reconnect]) {
+    const streamUrl = streamUrls.get(event.requestId);
+    assert.equal(typeof streamUrl, 'string', 'owning CDP stream URL required');
+    assert.equal(new URL(streamUrl).pathname, `/api/conversations/${latest}/stream`, 'owning CDP stream owner');
   }
   assert.ok(['message', 'message_updated'].includes(accepted.eventName));
-  const published = JSON.parse(accepted.data);
+  assert.ok(openingMatches(published.opening, evidence, 'accepted'), 'accepted publication full opening');
+  assert.ok(Number.isSafeInteger(published.sequence_id) && published.sequence_id >= 0, 'accepted publication safe sequence');
+  assert.equal(published.sequence_id, acceptedCursor.sequence_id, 'accepted publication cursor source');
   assert.equal(published.message?.message_id ?? published.message_id, id);
   assert.equal(reconnect.eventName, 'init'); assert.notEqual(reconnect.requestId, accepted.requestId);
-  const init = JSON.parse(reconnect.data);
-  assert.equal(init.conversation.id, latest); assert.equal(init.transcript_coverage, 'complete');
-  assert.equal(init.messages.filter(m => m.message_id === id).length, 1, 'unique reconnect opening');
-  for (const message of [published.message, init.messages.find(m => m.message_id === id)]) {
+  assert.ok(openingMatches(init.opening, evidence, 'accepted'), 'reconnect Init full opening');
+  assert.equal(init.conversation.id, latest, 'reconnect Init owner');
+
+  const reconnectUrl = new URL(streamUrls.get(reconnect.requestId));
+  const exactQueryInteger = (name, label) => {
+    const values = reconnectUrl.searchParams.getAll(name);
+    assert.equal(values.length, 1, `${label} exact single query value`);
+    assert.match(values[0], /^(0|[1-9][0-9]*)$/, `${label} canonical nonnegative integer`);
+    const value = Number(values[0]);
+    assert.ok(Number.isSafeInteger(value), `${label} safe integer`);
+    return value;
+  };
+  const requestCursor = exactQueryInteger('after_event_sequence', 'reconnect cursor');
+  const requestGeneration = exactQueryInteger('transcript_generation', 'reconnect generation');
+  for (const [value, label] of [
+    [seeded.transcript_generation, 'seed Init generation'],
+    [seeded.conversation.transcript_generation, 'seed conversation generation'],
+    [init.transcript_generation, 'reconnect Init generation'],
+    [init.conversation.transcript_generation, 'reconnect conversation generation'],
+    [row.conversation.transcript_generation, 'durable row generation'],
+  ]) {
+    assert.ok(Number.isSafeInteger(value) && value >= 0, `${label} required`);
+    assert.equal(value, requestGeneration, `${label} matches reconnect request`);
+  }
+  assert.ok(typeof seeded.stream_incarnation === 'string' && seeded.stream_incarnation.length > 0, 'seed stream incarnation required');
+  assert.equal(init.stream_incarnation, seeded.stream_incarnation, 'same stream incarnation across seed/reconnect');
+  assert.equal(row.conversation.id, latest);
+  assert.ok(Number.isSafeInteger(init.last_sequence_id) && init.last_sequence_id >= 0, 'reconnect last sequence required');
+  assert.equal(init.sequence_id, init.last_sequence_id, 'reconnect Init sequence equals tip');
+  assert.ok(requestCursor >= published.sequence_id, 'reconnect cursor covers accepted publication');
+  assert.ok(requestCursor <= init.last_sequence_id, 'reconnect cursor cannot exceed tip');
+  assert.equal(init.pending_truncated, false, 'reconnect pending events not truncated');
+  assert.ok(Array.isArray(init.pending_events), 'reconnect pending events required');
+  let priorPendingSequence = requestCursor;
+  for (const event of init.pending_events) {
+    assert.ok(Number.isSafeInteger(event.sequence_id) && event.sequence_id > priorPendingSequence,
+      'reconnect pending events ordered unique strictly after cursor');
+    assert.ok(event.sequence_id <= init.last_sequence_id, 'reconnect pending event cannot exceed tip');
+    priorPendingSequence = event.sequence_id;
+  }
+
+  const coverage = init.transcript_coverage;
+  if (coverage === 'preserve') {
+    assert.deepEqual(init.messages, [], 'preserve reconnect messages must be empty');
+    assert.ok(Number.isSafeInteger(init.pending_anchor_sequence_id) && init.pending_anchor_sequence_id >= 0,
+      'preserve reconnect anchor required');
+    assert.ok(init.pending_anchor_sequence_id <= requestCursor, 'preserve reconnect anchor cannot exceed cursor');
+  } else {
+    assert.ok(['complete', 'tail'].includes(coverage), 'reconnect coverage must be complete, tail, or preserve');
+    assert.ok(Array.isArray(init.messages) && init.messages.length > 0, 'complete/tail reconnect must bear messages');
+    assert.equal(init.messages.filter(message => message.message_id === id).length, 1, 'unique reconnect opening');
+  }
+  assert.ok(published.message, 'full accepted publication message required');
+  const authoritativeMessages = [published.message];
+  if (coverage !== 'preserve') authoritativeMessages.push(init.messages.find(message => message.message_id === id));
+  for (const message of authoritativeMessages) {
     assert.ok(message, 'full accepted/reconnect message required');
     assert.equal(message.conversation_id, latest, 'accepted/reconnect message owner');
     assert.equal(message.message_type, 'user', 'accepted/reconnect message shape');
     assert.deepEqual(message.content, { text: instruction }, 'accepted/reconnect instruction bytes');
   }
-  assert.equal(row.conversation.id, latest);
-  const persisted = row.messages.filter(m => m.message_id === id);
+  const persisted = row.messages.filter(message => message.message_id === id);
   assert.equal(persisted.length, 1, 'unique durable opening'); assert.equal(persisted[0].conversation_id, latest);
   assert.equal(persisted[0].message_type, 'user'); assert.deepEqual(persisted[0].content, { text: instruction }, 'durable instruction bytes');
   validateChatAck(ack, latest, chatRequest.message_id);
-  const composer = row.messages.filter(m => m.message_id === ack.canonical_message_id);
+  const composer = row.messages.filter(message => message.message_id === ack.canonical_message_id);
   assert.equal(composer.length, 1, 'durable composer ACK');
   assert.equal(composer[0].conversation_id, latest, 'durable ACK owner');
   assert.equal(composer[0].message_type, 'user', 'durable ACK shape');
@@ -905,6 +975,9 @@ async function run() {
       const value = JSON.parse(e.data); return ['message', 'message_updated'].includes(e.eventName) && openingMatches(value.opening, entered, 'accepted');
     }), 'actual accepted opening SSE', 10000);
     const event = JSON.parse(accepted.data); const acceptedCursor = acceptedWireCursor(accepted, events);
+    const acceptedIndex = events.indexOf(accepted);
+    const acceptedSeed = events.slice(0, acceptedIndex).findLast(candidate => candidate.requestId === accepted.requestId && candidate.eventName === 'init');
+    assert.ok(acceptedSeed && streamRequests.has(acceptedSeed.requestId), 'actual accepted owning seed Init and CDP stream request');
     assert.equal(event.message?.message_id ?? event.message_id, acceptedId);
     const failedRoster = globalFaultObservation?.request ?? await poll(() => failed.slice(failureStart).find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')), 'actual failed owned roster GET');
     const failedRosterUrl = new URL(failedRoster.url);
@@ -975,7 +1048,8 @@ async function run() {
       const currentRow = await http('GET', `/api/conversations/${latest}`);
       const cached = snapshots.slice(start, chapterSnapshotStart).find(s => s.data.latest_transcript_row_id === latest && openingMatches(s.data.latest_opening, entered, 'pending'));
       assert.ok(cached, 'actual verified browser Pending full-roster cache');
-      const authority = validateGlobalCacheAuthority(a, { evidence: entered, cached, accepted, reconnect, streamUrls: streamRequests, row: currentRow, ack: chatAck, chatRequest: body, instruction });
+      const authority = validateGlobalCacheAuthority(a, { evidence: entered, cached, accepted, seed: acceptedSeed, reconnect,
+        observedEvents: events, streamUrls: streamRequests, row: currentRow, ack: chatAck, chatRequest: body, instruction });
       record('global-chapter-reference.jsonl', { acquisition: 'INDEPENDENT_reference_NOT_browser_acquisition', method: 'GET', path: referencePath, authority });
       await recorder.sealAndDrain(); recorder.assertQualified();
       const browserSlice = requests.slice(chapterRequestStart);

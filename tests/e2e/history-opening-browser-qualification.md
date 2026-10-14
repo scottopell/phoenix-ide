@@ -759,3 +759,54 @@ Independent exact-HEAD review is required before one successor. Actual Global fi
 The initial independent review of `c97f2ae519652f2302543d1fe82fbb38cdc76dd9` blocked dispatch: known-alias membership alone could falsely pass a real chapter callback that switched to another known Global pathname. The local correction retains the actual pre-click URL before the real click and requires strict post-click pathname equality in addition to exact pin/hash and physical identity; the receipt retains both URLs. Negative tests reject different-but-known historical/product/latest aliases, not merely foreign aliases. This is a strengthened real-click requirement, not proof from the pinned callback unit test. Final exact-HEAD rereview remains required.
 
 The follow-up independent review of `7868a70ce01a5d15d4b8d38ccc79cfc4f6727e11` also blocked dispatch: a receipt-time URL read after asynchronous reference reads/drain could contradict the earlier validated URL while claiming preservation. The local correction now captures the final URL, DOM count, exact persisted identity and physical visibility in **one actual page evaluation** after the reference/drain, revalidates exact pre-click alias/pin/hash and requires full URL equality with the earlier measured checkpoint. The receipt uses those immutable measured values, not a later `page.url()` call. A source-extracted producer unit changes the URL between evaluations and rejects the changed known alias; duplicate physical-ID nodes also reject. This unit is fabricated DOM only, not runtime proof. Final independent rereview remains required.
+
+
+## Global reconnect preserve authority — bounded harness correction
+
+The retained instrumented832 Global run reached its real same-page reconnect on
+CDP request `14288.127`. Its accepted opening was published at sequence 1 on
+request `14288.113`, while the reconnect requested the same generation and
+incarnation after sequence 14 and returned an empty-message `preserve` Init at
+tip 14. The run remains **failed and is not qualification**: the old harness
+incorrectly required that reconnect Init to be `complete`. The click and driver
+reference reads had executed, but the cache authority guard rejected before the
+final Global capture drain and atomic DOM receipt; normal Global cleanup was not
+qualified.
+
+The cache authority validator now has two explicit reconnect forms. A `complete`
+or `tail` Init must carry exactly one full accepted opening message. A `preserve`
+Init must carry no messages and must be rooted in the actual prior `complete` or
+`tail` Pending Init on the accepted publication's request. Runtime selection of
+that seed comes from captured SSE event order and the owning CDP request map; it
+is not reconstructed from opening identity.
+
+The preserve form additionally requires exact single canonical nonnegative safe
+integer `after_event_sequence` and `transcript_generation` query values on the
+owning reconnect stream URL; one conversation owner; one non-null safe generation
+across seed, reconnect and durable row; one nonempty stream incarnation; safe
+accepted/seed/tip/anchor cursors with accepted publication covered and
+`anchor <= cursor <= tip`; `Init.sequence_id == last_sequence_id`; untruncated
+pending events; and unique strictly increasing pending sequence IDs in
+`(cursor, tip]`. Pending seed messages may be empty because the committed Pending
+edge/key is proven directly by the seed Init opening. Exact accepted publication,
+durable opening, composer ACK, cached Pending aggregate, IPC edge, SSE opening,
+independent reference, capture/drain, and final atomic URL/DOM guards are unchanged.
+
+The focused offline selftest replays the authentic832 seed and reconnect URL from
+the retained event/assertion request slice through an explicitly labelled
+retained-log adapter. That adapter is not CDP provenance and creates no positive
+browser response. Authentic0bac complete reconnect coverage remains, with a unit
+coverage variant for the identical message-bearing `tail` branch. Negative cases
+cover missing/wrong seed owner, edge, and coverage; cross-generation seed/Init/
+row/request; incarnation; missing, duplicate, malformed, and unsafe cursor/
+generation values; regressed cursor; anchor/tip/truncation; nonempty preserve
+messages; pending ordering/range; and foreign/missing/content-corrupt accepted,
+opening, and durable values at responsible guards.
+
+Bounded validation executed here: `node --test
+ui/scripts/global-chapter-cache.selftest.mjs` — **83 passed, zero skipped**. No
+runtime/browser/server, build/compiler, network, push, deployment, or qualification
+run was performed. The immutable `target/history-hidden-geometry-repair` source
+and retained evidence were not modified; real temporal stream destruction,
+page-URL preservation, final selection/reference/capture drain, atomic DOM
+identity, and normal cleanup remain runtime obligations.

@@ -13,7 +13,9 @@ const evidence = lines('ipc.jsonl').find(r => r.reply.evidence).reply.evidence;
 const latest = evidence.successor_transcript_row_id, id = `${latest}:${evidence.client_turn_key}`;
 const events = lines('browser-sse.jsonl');
 const accepted = events.find(e => ['message', 'message_updated'].includes(e.eventName) && JSON.parse(e.data).opening?.accepted_message_id === id);
-const reconnect = lines('assertions.jsonl').find(r => r.name === 'same-page transport SSE drop/reconnect preserves accepted full-edge identity').reconnect;
+const seed = events.slice(0, events.indexOf(accepted)).findLast(e => e.requestId === accepted.requestId && e.eventName === 'init');
+const reconnectAssertion = lines('assertions.jsonl').find(r => r.name === 'same-page transport SSE drop/reconnect preserves accepted full-edge identity');
+const reconnect = reconnectAssertion.reconnect;
 const cachedReceipt = lines('browser-responses.jsonl').find(r => r.raw && JSON.parse(r.raw).latest_opening?.client_turn_key === evidence.client_turn_key && JSON.parse(r.raw).segments.length === a.members.length + 1);
 const cached = { ...cachedReceipt, data: JSON.parse(cachedReceipt.raw) };
 const row = JSON.parse(lines('driver-http.jsonl').filter(r => r.method === 'GET' && r.path === `/api/conversations/${latest}`).at(-1).raw);
@@ -21,10 +23,14 @@ const ack = lines('assertions.jsonl').find(r => r.name === 'actual successor cha
 const instruction = lines('driver-http.jsonl').find(r => r.method === 'POST' && r.path.endsWith('/continue')).body.handoff;
 const requests = lines('browser-requests.jsonl');
 const chatRequest = JSON.parse(requests.find(r => r.method === 'POST' && new URL(r.url).pathname === `/api/conversations/${latest}/chat`).body);
-const stream = requests.find(r => new URL(r.url).pathname === `/api/conversations/${latest}/stream`).url;
-// Retained logs lack CDP requestWillBeSent mappings. This URL association is an OFFLINE adapter,
+const streamPath = `/api/conversations/${latest}/stream`;
+const seedStream = requests.find(r => new URL(r.url).pathname === streamPath).url;
+const reconnectStream = reconnectAssertion.requests.find(r => new URL(r.url).pathname === streamPath).url;
+// Retained logs lack CDP requestWillBeSent mappings. These URL associations are an OFFLINE adapter,
 // not new requestId provenance; live validation uses the actual CDP request map.
-const facts = () => structuredClone({ evidence, cached, accepted, reconnect, streamUrls: new Map([[accepted.requestId, stream], [reconnect.requestId, stream]]), row, ack, chatRequest, instruction });
+const sourceFacts = { evidence, cached, accepted, seed, reconnect, observedEvents: events,
+  streamUrls: new Map([[accepted.requestId, seedStream], [reconnect.requestId, reconnectStream]]), row, ack, chatRequest, instruction };
+const facts = () => structuredClone(sourceFacts);
 const selection = `http://127.0.0.1:1/global/${a.members[0]}?source_transcript=${latest}#message-${encodeURIComponent(id)}`;
 const physical = { count: 1, visible: true, persistedMessageID: id }; // UNIT ONLY; no retained DOM claims.
 test('authentic 0bac cache/SSE/ACK bytes support authority; not final Global qualification', () => {
@@ -37,6 +43,13 @@ test('authentic 0bac cache/SSE/ACK bytes support authority; not final Global qua
   assert.equal(slice.filter(r => capturePolicy({ ...a, members: [...a.members, latest] }, r.method, r.url).kind === 'required_aggregate_json').length, 0);
   assert.ok(lines('browser-responses.jsonl').some(r => r.status === 404 && r.url.includes('/api/product-conversations/')));
   assert.ok(slice.length > 0, 'actual observed post-reconnect request slice, not nofetch promise');
+});
+test('tail reconnect uses the message-bearing authority branch (UNIT ONLY coverage variant)', () => {
+  const candidate = facts();
+  const payload = JSON.parse(candidate.reconnect.data);
+  payload.transcript_coverage = 'tail';
+  candidate.reconnect.data = JSON.stringify(payload);
+  assert.equal(validateGlobalCacheAuthority(a, candidate).latest, latest);
 });
 for (const [name, mutate] of Object.entries({
   product: f => { f.evidence.product_conversation_id = 'foreign'; },
@@ -57,6 +70,8 @@ for (const [name, mutate] of Object.entries({
   oversized: f => { f.cached.raw += ' '.repeat(2 * 1024 * 1024); f.cached.body_bytes = Buffer.byteLength(f.cached.raw); f.cached.raw_sha256 = sha(f.cached.raw); },
   accepted_content: f => { const d = JSON.parse(f.accepted.data); d.message.content.text += 'wrong'; f.accepted.data = JSON.stringify(d); },
   reconnect_shape: f => { const d = JSON.parse(f.reconnect.data); d.messages.find(m => m.message_id === id).message_type = 'agent'; f.reconnect.data = JSON.stringify(d); },
+  reconnect_duplicate: f => { const d = JSON.parse(f.reconnect.data); d.messages.push(d.messages.find(m => m.message_id === id)); f.reconnect.data = JSON.stringify(d); },
+  reconnect_empty_complete: f => { const d = JSON.parse(f.reconnect.data); d.messages = []; f.reconnect.data = JSON.stringify(d); },
   ACK_request_key: f => { f.chatRequest.message_id = 'foreign'; },
   ACK_request_content: f => { f.chatRequest.text += 'wrong'; },
   ACK_already_persisted: f => { f.ack.body.already_persisted = true; f.ack.raw = JSON.stringify(f.ack.body); },
@@ -72,14 +87,120 @@ for (const [name, mutate] of Object.entries({
     else assert.notEqual(error.captureReason, 'wrong_aggregate', name);
     const guard = { root: /stable product\/root/, full_roster: /ordered full roster|latest_transcript|strictly equal/,
       product: /committed opening evidence/, current_latest: /ordered full roster/, pending_key: /committed opening evidence/, full_edge: /strictly equal/,
-      accepted_id: /openingMatches/, stream_owner: /strictly equal/, durable_ACK: /durable composer ACK/, repeated_client_id: /unique durable opening/,
+      accepted_id: /accepted event message identity|accepted publication full opening/, stream_owner: /owning CDP stream owner/, durable_ACK: /durable composer ACK/, repeated_client_id: /unique durable opening/,
       instruction_bytes: /instruction bytes/, missing_outcome: /complete received cache body/, hash: /cache raw SHA256/, byte_count: /cache byte count/,
       raw_data: /cache raw\/data parity/, oversized: /cache body bound/, accepted_content: /instruction bytes/, reconnect_shape: /message shape/,
+      reconnect_duplicate: /unique reconnect opening/, reconnect_empty_complete: /complete\/tail reconnect must bear messages/,
       ACK_raw: /deep-equal/, ACK_queued: /strictly equal/, ACK_steering: /steering/, ACK_already_persisted: /already_persisted/,
       ACK_request_key: /strictly equal/, ACK_request_content: /durable ACK request bytes/, truncated: /cache explicitly truncated/, negative_404: /strictly equal/ };
     assert.match(error.message, guard[name], name);
     return true;
   }); });
+const dir832 = process.env.HISTORY_GLOBAL_832_EVIDENCE
+  ?? '.phoenix/evidence/continuous-history/instrumented832-artifact/opening-codegen-832d5ea50f6efba2bd3b926cac4d7229caa12a5f-1/opening-browser-evidence/global';
+const lines832 = name => readFileSync(`${dir832}/${name}`, 'utf8').trim().split('\n').map(JSON.parse);
+const a832 = JSON.parse(readFileSync(`${dir832}/fixture.json`));
+const evidence832 = lines832('ipc.jsonl').find(record => record.reply.evidence).reply.evidence;
+const latest832 = evidence832.successor_transcript_row_id;
+const id832 = `${latest832}:${evidence832.client_turn_key}`;
+const events832 = lines832('browser-sse.jsonl');
+const accepted832 = events832.find(event => ['message', 'message_updated'].includes(event.eventName)
+  && JSON.parse(event.data).opening?.accepted_message_id === id832);
+const seed832 = events832.slice(0, events832.indexOf(accepted832))
+  .findLast(event => event.requestId === accepted832.requestId && event.eventName === 'init');
+const reconnectAssertion832 = lines832('assertions.jsonl')
+  .find(record => record.name === 'same-page transport SSE drop/reconnect preserves accepted full-edge identity');
+const reconnect832 = reconnectAssertion832.reconnect;
+const cachedReceipt832 = lines832('browser-responses.jsonl').find(record => record.raw
+  && JSON.parse(record.raw).latest_opening?.client_turn_key === evidence832.client_turn_key
+  && JSON.parse(record.raw).segments.length === a832.members.length + 1);
+const cached832 = { ...cachedReceipt832, data: JSON.parse(cachedReceipt832.raw) };
+const row832 = JSON.parse(lines832('driver-http.jsonl')
+  .filter(record => record.method === 'GET' && record.path === `/api/conversations/${latest832}`).at(-1).raw);
+const ack832 = lines832('assertions.jsonl').find(record => record.name === 'actual successor chat ACK receipt');
+const instruction832 = lines832('driver-http.jsonl').find(record => record.method === 'POST' && record.path.endsWith('/continue')).body.handoff;
+const requests832 = lines832('browser-requests.jsonl');
+const chatRequest832 = JSON.parse(requests832.find(record => record.method === 'POST'
+  && new URL(record.url).pathname === `/api/conversations/${latest832}/chat`).body);
+const streamPath832 = `/api/conversations/${latest832}/stream`;
+const seedStream832 = requests832.find(record => new URL(record.url).pathname === streamPath832).url;
+const reconnectRequest832 = reconnectAssertion832.requests.find(record => new URL(record.url).pathname === streamPath832);
+const sourceFacts832 = { evidence: evidence832, cached: cached832, accepted: accepted832, seed: seed832,
+  reconnect: reconnect832, observedEvents: events832,
+  // OFFLINE retained-log adapter only: assertion request slice supplies the authentic reconnect URL,
+  // while live qualification requires the CDP requestId map.
+  streamUrls: new Map([[accepted832.requestId, seedStream832], [reconnect832.requestId, reconnectRequest832.url]]),
+  row: row832, ack: ack832, chatRequest: chatRequest832, instruction: instruction832 };
+const facts832 = () => structuredClone(sourceFacts832);
+const changeEvent832 = (factsValue, key, change) => {
+  const payload = JSON.parse(factsValue[key].data); change(payload); factsValue[key].data = JSON.stringify(payload);
+};
+const changeReconnectUrl832 = (factsValue, change) => {
+  const url = new URL(factsValue.streamUrls.get(factsValue.reconnect.requestId));
+  change(url); factsValue.streamUrls.set(factsValue.reconnect.requestId, url.href);
+};
+
+test('authentic 832 preserve reconnect chain passes authority offline; failed run is not qualification', () => {
+  const candidate = facts832();
+  assert.equal(candidate.seed.requestId, '14288.113');
+  assert.equal(candidate.reconnect.requestId, '14288.127');
+  assert.equal(JSON.parse(candidate.seed.data).transcript_coverage, 'complete');
+  assert.equal(JSON.parse(candidate.seed.data).opening.status, 'pending');
+  assert.deepEqual(JSON.parse(candidate.reconnect.data).messages, []);
+  assert.equal(JSON.parse(candidate.reconnect.data).transcript_coverage, 'preserve');
+  assert.equal(new URL(reconnectRequest832.url).searchParams.get('after_event_sequence'), '14');
+  assert.equal(validateGlobalCacheAuthority(a832, candidate).latest, latest832);
+  const result = JSON.parse(readFileSync(`${dir832}/browser-result.json`));
+  assert.equal(result.status, 'failed');
+  assert.match(result.error, /'preserve'[\s\S]*'complete'/);
+});
+
+const preserveNegatives = {
+  missing_seed: [factsValue => { factsValue.seed = undefined; }, /accepted owning seed Init must precede/],
+  fabricated_seed: [factsValue => { factsValue.seed = structuredClone(factsValue.seed); }, /accepted owning seed Init must precede|selected seed is the actual accepted owning prior Init/],
+  wrong_seed_owner: [factsValue => changeEvent832(factsValue, 'seed', payload => { payload.conversation.id = 'foreign'; }), /accepted Init successor|seed Init owner/],
+  wrong_seed_edge: [factsValue => changeEvent832(factsValue, 'seed', payload => { payload.opening.edge.continuation_message_id = 'foreign'; }), /accepted Init full edge|seed Init Pending full edge/],
+  wrong_seed_coverage: [factsValue => changeEvent832(factsValue, 'seed', payload => { payload.transcript_coverage = 'preserve'; }), /seed Init complete or tail coverage/],
+  crossgen_seed: [factsValue => changeEvent832(factsValue, 'seed', payload => { payload.transcript_generation = 2; }), /seed Init generation matches reconnect request/],
+  crossgen_init: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.transcript_generation = 2; }), /reconnect Init generation matches reconnect request/],
+  crossgen_row: [factsValue => { factsValue.row.conversation.transcript_generation = 2; }, /durable row generation matches reconnect request/],
+  crossgen_request: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.set('transcript_generation', '2')), /seed Init generation matches reconnect request/],
+  incarnation: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.stream_incarnation = 'foreign'; }), /same stream incarnation/],
+  missing_cursor: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.delete('after_event_sequence')), /reconnect cursor exact single query value/],
+  duplicate_cursor: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.append('after_event_sequence', '14')), /reconnect cursor exact single query value/],
+  malformed_cursor: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.set('after_event_sequence', '014')), /reconnect cursor canonical nonnegative integer/],
+  unsafe_cursor: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.set('after_event_sequence', '9007199254740992')), /reconnect cursor safe integer/],
+  missing_generation: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.delete('transcript_generation')), /reconnect generation exact single query value/],
+  duplicate_generation: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.append('transcript_generation', '1')), /reconnect generation exact single query value/],
+  malformed_generation: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.set('transcript_generation', '1.0')), /reconnect generation canonical nonnegative integer/],
+  unsafe_generation: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.set('transcript_generation', '9007199254740992')), /reconnect generation safe integer/],
+  regressed_cursor: [factsValue => changeReconnectUrl832(factsValue, url => url.searchParams.set('after_event_sequence', '0')), /reconnect cursor covers accepted publication/],
+  unsafe_accepted_sequence: [factsValue => changeEvent832(factsValue, 'accepted', payload => { payload.sequence_id = 9007199254740992; }), /actual accepted wire sequence required/],
+  anchor_after_cursor: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.pending_anchor_sequence_id = 15; }), /preserve reconnect anchor cannot exceed cursor/],
+  cursor_after_tip: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.sequence_id = 13; payload.last_sequence_id = 13; }), /reconnect cursor cannot exceed tip/],
+  truncated: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.pending_truncated = true; }), /reconnect pending events not truncated/],
+  nonempty_preserve_messages: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.messages = [factsValue.row.messages[0]]; }), /preserve reconnect messages must be empty/],
+  pending_order: [factsValue => changeEvent832(factsValue, 'reconnect', payload => {
+    payload.sequence_id = 16; payload.last_sequence_id = 16;
+    payload.pending_events = [{ type: 'agent_done', sequence_id: 16 }, { type: 'state_change', sequence_id: 15 }];
+  }), /reconnect pending events ordered unique strictly after cursor/],
+  pending_range: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.pending_events = [{ type: 'agent_done', sequence_id: 15 }]; }), /reconnect pending event cannot exceed tip/],
+  missing_accepted_message: [factsValue => changeEvent832(factsValue, 'accepted', payload => { payload.message_id = payload.message.message_id; delete payload.message; }), /full accepted publication message required/],
+  foreign_accepted_owner: [factsValue => changeEvent832(factsValue, 'accepted', payload => { payload.message.conversation_id = 'foreign'; }), /accepted\/reconnect message owner/],
+  foreign_accepted_opening: [factsValue => changeEvent832(factsValue, 'accepted', payload => { payload.opening.edge.continuation_message_id = 'foreign'; }), /accepted Init full edge|accepted publication full opening/],
+  foreign_reconnect_opening: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.opening.edge.continuation_message_id = 'foreign'; }), /reconnect Init full opening/],
+  accepted_content: [factsValue => changeEvent832(factsValue, 'accepted', payload => { payload.message.content.text += 'foreign'; }), /accepted\/reconnect instruction bytes/],
+  durable_content: [factsValue => { factsValue.row.messages.find(message => message.message_id === id832).content.text += 'foreign'; }, /durable instruction bytes/],
+};
+for (const [name, [mutate, guard]] of Object.entries(preserveNegatives)) {
+  test(`832 preserve authority rejects ${name} at responsible guard`, () => {
+    const candidate = facts832();
+    validateGlobalCacheAuthority(a832, candidate);
+    mutate(candidate);
+    assert.throws(() => validateGlobalCacheAuthority(a832, candidate), guard);
+  });
+}
+
 for (const [name, url, box] of [
   ['valid', selection, physical], ['wrong_pin', selection.replace(`source_transcript=${latest}`, 'source_transcript=foreign'), physical],
   ['wrong_hash', selection.replace(encodeURIComponent(id), 'foreign'), physical], ['wrong_route', selection.replace(`/global/${a.members[0]}`, '/global/foreign'), physical],
