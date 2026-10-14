@@ -1,13 +1,20 @@
-# ADR-102: Current-schema prepared activation commits at the database-write boundary
+# ADR-104: Current-schema prepared activation commits at the database-write boundary
 
-**Status:** Accepted
-**Date:** 2026-10-14
+- **Status:** Accepted
+- **Date:** 2026-10-14
+- **Affects:** REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021
 
 ## Context
 
 The prepared-artifact launchd path was deliberately restricted to legacy ProductConversation upgrades at migration 69 or earlier. Production databases at migration 123 contain ProductConversation tables and are correctly rejected by that eligibility gate, even when the signed candidate is the intended next production binary.
 
 The candidate applies migrations independently. Migration 126 retires wake behavior while retaining history, and migration 127 rebuilds coordinator-owned work-scope authority. The binary's existing `--migrate-only` operation also performs startup reconciliation. A migration process can therefore commit a proper prefix or reconciliation writes before a later failure. Replaying an older snapshot after those writes, or starting the predecessor against the migrated database, would create an unowned downgrade and data-loss guarantee.
+
+## Options considered
+
+1. **Relax the paired legacy gate** — reuses one activation path, but makes incompatible database families indistinguishable and weakens the existing paired contract.
+2. **Add an explicit prepared current-schema mode** — preserves supply-chain and legacy invariants while adding an offline, candidate-bound migration boundary at the cost of a separate recovery lifecycle.
+3. **Support only ordinary in-place forward activation** — avoids a new prepared mode, but cannot provide a transaction-bound snapshot or predecessor recovery before migration invocation.
 
 ## Decision
 
