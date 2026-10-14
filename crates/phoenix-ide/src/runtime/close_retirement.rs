@@ -173,6 +173,276 @@ fn process_step_successes_cover(
         })
 }
 
+#[derive(Debug)]
+struct CloseProcessStepFailure {
+    resources: Vec<RetiredResourceIdentity>,
+    reason: String,
+}
+
+#[async_trait::async_trait]
+trait CloseProcessStepExecutor {
+    async fn retire_bash(&mut self) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure>;
+    async fn retire_tmux(&mut self)
+        -> Result<RetirementOutcome, (RetirementFailureReason, String)>;
+    async fn retire_terminal(&mut self)
+        -> Result<CloseProcessStepOutcome, CloseProcessStepFailure>;
+    async fn retire_browser(&mut self) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure>;
+}
+
+#[derive(Debug, Default)]
+struct CloseProcessStepIdentities {
+    bash: Vec<String>,
+    terminal: Vec<String>,
+    browser: Vec<String>,
+}
+
+async fn persist_close_process_step(
+    db: &crate::db::Database,
+    run: &CloseRunRef,
+    scope: &WorkScopeId,
+    resource_kind: CloseProcessResourceKind,
+    identities: Vec<String>,
+    outcome: CloseProcessStepOutcome,
+) -> Result<(), CloseLeaseFailure> {
+    let observed_at_us = chrono::Utc::now().timestamp_micros();
+    for identity in identities {
+        db.record_close_process_step_success(&CloseProcessStepSuccess {
+            run: run.clone(),
+            scope: scope.clone(),
+            resource_kind,
+            identity: OpaqueIdentity::parse(identity)
+                .expect("registry stable instance identity is non-empty"),
+            outcome,
+            observed_at_us,
+        })
+        .await
+        .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_close_process_steps<E: CloseProcessStepExecutor>(
+    db: &crate::db::Database,
+    run: &CloseRunRef,
+    snapshot: &CloseRetirementSnapshot,
+    scope: &WorkScopeId,
+    identities: &CloseProcessStepIdentities,
+    tmux_resources: &[RetiredResourceIdentity],
+    executor: &mut E,
+) -> Result<(), CloseLeaseFailure> {
+    let prior_process_successes = db
+        .list_close_process_step_successes(run)
+        .await
+        .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
+
+    if !process_step_successes_cover(
+        &prior_process_successes,
+        scope,
+        CloseProcessResourceKind::BashProcessGroup,
+        &identities.bash,
+    ) {
+        let outcome = executor.retire_bash().await.map_err(|failure| {
+            CloseLeaseFailure::process_epoch(
+                RetiredResourceKind::BashProcessGroup,
+                failure.resources,
+                failure.reason,
+            )
+        })?;
+        persist_close_process_step(
+            db,
+            run,
+            scope,
+            CloseProcessResourceKind::BashProcessGroup,
+            identities.bash.clone(),
+            outcome,
+        )
+        .await?;
+    }
+
+    let prior_retirement_evidence = db
+        .list_close_retirement_evidence(run.attempt_id.as_str())
+        .await
+        .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
+    let tmux_already_complete = tmux_resources.iter().all(|resource| {
+        prior_retirement_evidence.iter().any(|proof| {
+            proof.scope == *scope
+                && proof.resource == *resource
+                && matches!(
+                    proof.outcome,
+                    RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. }
+                )
+        })
+    });
+    if !tmux_already_complete {
+        let outcome = executor
+            .retire_tmux()
+            .await
+            .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?;
+        for resource in tmux_resources {
+            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: run.attempt_id.clone(),
+                snapshot: snapshot.clone(),
+                scope: scope.clone(),
+                resource: resource.clone(),
+                outcome: outcome.clone(),
+                detail: Some("exact registry permit retirement".to_string()),
+            })
+            .await
+            .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
+        }
+    }
+
+    if !process_step_successes_cover(
+        &prior_process_successes,
+        scope,
+        CloseProcessResourceKind::PtySession,
+        &identities.terminal,
+    ) {
+        let outcome = executor.retire_terminal().await.map_err(|failure| {
+            CloseLeaseFailure::process_epoch(
+                RetiredResourceKind::PtySession,
+                failure.resources,
+                failure.reason,
+            )
+        })?;
+        persist_close_process_step(
+            db,
+            run,
+            scope,
+            CloseProcessResourceKind::PtySession,
+            identities.terminal.clone(),
+            outcome,
+        )
+        .await?;
+    }
+
+    if !process_step_successes_cover(
+        &prior_process_successes,
+        scope,
+        CloseProcessResourceKind::BrowserSession,
+        &identities.browser,
+    ) {
+        let outcome = executor.retire_browser().await.map_err(|failure| {
+            CloseLeaseFailure::process_epoch(
+                RetiredResourceKind::BrowserSession,
+                failure.resources,
+                failure.reason,
+            )
+        })?;
+        persist_close_process_step(
+            db,
+            run,
+            scope,
+            CloseProcessResourceKind::BrowserSession,
+            identities.browser.clone(),
+            outcome,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+struct LiveCloseProcessStepExecutor<'a> {
+    manager: &'a RuntimeManager,
+    lease: &'a CloseResourceLease,
+}
+
+#[async_trait::async_trait]
+impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
+    async fn retire_bash(&mut self) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure> {
+        let outcome = self
+            .manager
+            .bash_handles()
+            .complete_retirement(&self.lease.bash)
+            .await;
+        let generation_is_stale = matches!(&outcome, BashRetirementOutcome::StaleGeneration(_));
+        let failed_resources = self
+            .lease
+            .bash
+            .exact_process_groups
+            .iter()
+            .filter(|target| {
+                generation_is_stale
+                    || outcome.report().kill_failures.iter().any(|(pid, _)| {
+                        *pid == target.pgid
+                            || u32::try_from(*pid)
+                                .ok()
+                                .is_some_and(|pid| target.pid == Some(pid))
+                    })
+            })
+            .map(|target| {
+                opaque_resource(
+                    RetiredResourceKind::BashProcessGroup,
+                    target.stable_resource_identity(),
+                )
+            })
+            .collect::<Vec<_>>();
+        require_absent(outcome).map_err(|reason| CloseProcessStepFailure {
+            resources: failed_resources,
+            reason,
+        })
+    }
+
+    async fn retire_tmux(
+        &mut self,
+    ) -> Result<RetirementOutcome, (RetirementFailureReason, String)> {
+        let outcome = self
+            .manager
+            .tmux_registry()
+            .complete_retirement(&self.lease.tmux)
+            .await
+            .map_err(|error| {
+                (
+                    RetirementFailureReason::IdentityNotProven,
+                    error.to_string(),
+                )
+            })?;
+        tmux_retirement_outcome(outcome)
+    }
+
+    async fn retire_terminal(
+        &mut self,
+    ) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure> {
+        require_terminal_absent(
+            self.manager
+                .terminals
+                .complete_retirement(&self.lease.terminal)
+                .await,
+        )
+        .map_err(|reason| CloseProcessStepFailure {
+            resources: self
+                .lease
+                .resources
+                .iter()
+                .filter(|resource| resource.kind() == RetiredResourceKind::PtySession)
+                .cloned()
+                .collect(),
+            reason,
+        })
+    }
+
+    async fn retire_browser(&mut self) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure> {
+        require_browser_absent(
+            self.manager
+                .browser_sessions()
+                .complete_retirement(&self.lease.browser)
+                .await,
+        )
+        .map_err(|reason| CloseProcessStepFailure {
+            resources: self
+                .lease
+                .resources
+                .iter()
+                .filter(|resource| resource.kind() == RetiredResourceKind::BrowserSession)
+                .cloned()
+                .collect(),
+            reason,
+        })
+    }
+}
+
 enum CloseSafeRetryTmuxError {
     Failed(String),
     PersistenceOrUncertain(String),
@@ -3108,34 +3378,7 @@ impl RuntimeManager {
         Err(request.detail.clone())
     }
 
-    async fn persist_close_process_step(
-        &self,
-        run: &CloseRunRef,
-        scope: &WorkScopeId,
-        resource_kind: CloseProcessResourceKind,
-        identities: Vec<String>,
-        outcome: CloseProcessStepOutcome,
-    ) -> Result<(), CloseLeaseFailure> {
-        let observed_at_us = chrono::Utc::now().timestamp_micros();
-        for identity in identities {
-            self.db()
-                .record_close_process_step_success(&CloseProcessStepSuccess {
-                    run: run.clone(),
-                    scope: scope.clone(),
-                    resource_kind,
-                    identity: OpaqueIdentity::parse(identity)
-                        .expect("registry stable instance identity is non-empty"),
-                    outcome,
-                    observed_at_us,
-                })
-                .await
-                .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
-        }
-        Ok(())
-    }
-
     /// Completes one live lease.
-    #[allow(clippy::too_many_lines)]
     async fn complete_close_resource_lease(
         &self,
         run: &CloseRunRef,
@@ -3149,11 +3392,6 @@ impl RuntimeManager {
             return Err(CloseLeaseFailure::Unavailable);
         };
         let result = async {
-            let prior_process_successes = self
-                .db()
-                .list_close_process_step_successes(run)
-                .await
-                .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
             if expected.iter().any(|resource| {
                 resource.kind() != RetiredResourceKind::TmuxServer
                     || !lease.resources.contains(resource)
@@ -3163,174 +3401,40 @@ impl RuntimeManager {
                     detail: "live Close lease differs from sealed unresolved inventory".to_string(),
                 });
             }
-            let bash_identities = lease
-                .bash
-                .exact_process_groups
-                .iter()
-                .map(phoenix_tools::bash::registry::BashRetirementTarget::stable_resource_identity)
-                .collect::<Vec<_>>();
-            if !process_step_successes_cover(
-                &prior_process_successes,
-                scope,
-                CloseProcessResourceKind::BashProcessGroup,
-                &bash_identities,
-            ) {
-            let bash_outcome = self.bash_handles().complete_retirement(&lease.bash).await;
-            let bash_generation_is_stale =
-                matches!(&bash_outcome, BashRetirementOutcome::StaleGeneration(_));
-            let failed_bash_resources = lease
-                .bash
-                .exact_process_groups
-                .iter()
-                .filter(|target| {
-                    bash_generation_is_stale
-                        || bash_outcome.report().kill_failures.iter().any(|(pid, _)| {
-                        *pid == target.pgid
-                            || u32::try_from(*pid)
-                                .ok()
-                                .is_some_and(|pid| target.pid == Some(pid))
-                        })
-                })
-                .map(|target| {
-                    opaque_resource(
-                        RetiredResourceKind::BashProcessGroup,
-                        target.stable_resource_identity(),
-                    )
-                })
-                .collect();
-            let bash_success = require_absent(bash_outcome).map_err(|reason| {
-                CloseLeaseFailure::process_epoch(
-                    RetiredResourceKind::BashProcessGroup,
-                    failed_bash_resources,
-                    reason,
-                )
-            })?;
-            self.persist_close_process_step(
+            let identities = CloseProcessStepIdentities {
+                bash: lease
+                    .bash
+                    .exact_process_groups
+                    .iter()
+                    .map(phoenix_tools::bash::registry::BashRetirementTarget::stable_resource_identity)
+                    .collect(),
+                terminal: lease
+                    .terminal
+                    .instance
+                    .iter()
+                    .map(phoenix_terminal::session::TerminalInstanceIdentity::stable_identity)
+                    .collect(),
+                browser: lease
+                    .browser
+                    .instances
+                    .iter()
+                    .map(phoenix_tools::browser::session::BrowserSessionInstanceIdentity::stable_identity)
+                    .collect(),
+            };
+            let mut executor = LiveCloseProcessStepExecutor {
+                manager: self,
+                lease: &lease,
+            };
+            run_close_process_steps(
+                self.db(),
                 run,
+                snapshot,
                 scope,
-                CloseProcessResourceKind::BashProcessGroup,
-                bash_identities,
-                bash_success,
+                &identities,
+                expected,
+                &mut executor,
             )
-            .await?;
-            }
-            let retired = self
-                .db()
-                .list_close_retirement_evidence(run.attempt_id.as_str())
-                .await
-                .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
-            let tmux_already_complete = expected.iter().all(|resource| {
-                retired.iter().any(|proof| {
-                    proof.scope == *scope
-                        && proof.resource == *resource
-                        && matches!(
-                            proof.outcome,
-                            RetirementOutcome::Retired
-                                | RetirementOutcome::AbsenceAdopted { .. }
-                        )
-                })
-            });
-            if !tmux_already_complete {
-            let tmux_outcome = self
-                .tmux_registry()
-                .complete_retirement(&lease.tmux)
-                .await
-                .map_err(|error| CloseLeaseFailure::Tmux {
-                    reason: RetirementFailureReason::IdentityNotProven,
-                    detail: error.to_string(),
-                })?;
-            let tmux_outcome = tmux_retirement_outcome(tmux_outcome)
-                .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?;
-            for resource in expected {
-                self.db()
-                    .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-                        attempt_id: run.attempt_id.clone(),
-                        snapshot: snapshot.clone(),
-                        scope: scope.clone(),
-                        resource: resource.clone(),
-                        outcome: tmux_outcome.clone(),
-                        detail: Some("exact registry permit retirement".to_string()),
-                    })
-                    .await
-                    .map_err(|error| CloseLeaseFailure::Persistence(error.to_string()))?;
-            }
-            }
-            let terminal_identities = lease
-                .terminal
-                .instance
-                .iter()
-                .map(phoenix_terminal::session::TerminalInstanceIdentity::stable_identity)
-                .collect::<Vec<_>>();
-            if !process_step_successes_cover(
-                &prior_process_successes,
-                scope,
-                CloseProcessResourceKind::PtySession,
-                &terminal_identities,
-            ) {
-            let terminal_success =
-                require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)
-                    .map_err(|reason| {
-                        CloseLeaseFailure::process_epoch(
-                            RetiredResourceKind::PtySession,
-                            lease
-                                .resources
-                                .iter()
-                                .filter(|resource| {
-                                    resource.kind() == RetiredResourceKind::PtySession
-                                })
-                                .cloned()
-                                .collect(),
-                            reason,
-                        )
-                    })?;
-            self.persist_close_process_step(
-                run,
-                scope,
-                CloseProcessResourceKind::PtySession,
-                terminal_identities,
-                terminal_success,
-            )
-            .await?;
-            }
-            let browser_identities = lease
-                .browser
-                .instances
-                .iter()
-                .map(phoenix_tools::browser::session::BrowserSessionInstanceIdentity::stable_identity)
-                .collect::<Vec<_>>();
-            if !process_step_successes_cover(
-                &prior_process_successes,
-                scope,
-                CloseProcessResourceKind::BrowserSession,
-                &browser_identities,
-            ) {
-            let browser_success = require_browser_absent(
-                self.browser_sessions()
-                    .complete_retirement(&lease.browser)
-                    .await,
-            )
-            .map_err(|reason| {
-                CloseLeaseFailure::process_epoch(
-                    RetiredResourceKind::BrowserSession,
-                    lease
-                        .resources
-                        .iter()
-                        .filter(|resource| resource.kind() == RetiredResourceKind::BrowserSession)
-                        .cloned()
-                        .collect(),
-                    reason,
-                )
-            })?;
-            self.persist_close_process_step(
-                run,
-                scope,
-                CloseProcessResourceKind::BrowserSession,
-                browser_identities,
-                browser_success,
-            )
-            .await?;
-            }
-            Ok(())
+            .await
         }
         .await;
         self.close_retirement_leases.lock().await.insert(key, lease);
@@ -7924,42 +8028,155 @@ mod tests {
     struct ProcessStepFixture {
         manager: super::RuntimeManager,
         run: super::CloseRunRef,
+        snapshot: super::CloseRetirementSnapshot,
         scopes: Vec<super::WorkScopeId>,
+        identities: Vec<super::CloseProcessStepIdentities>,
         bash: Vec<super::RetiredResourceIdentity>,
-        sockets: Vec<std::path::PathBuf>,
-        fake: std::sync::Arc<phoenix_tools::tmux::fake_backend::FakeTmuxBackend>,
-        terminal: std::sync::Arc<phoenix_terminal::session::TerminalHandle>,
-        _relay: tokio::sync::OwnedSemaphorePermit,
-        _socket_dir: tempfile::TempDir,
+        tmux: Vec<Vec<super::RetiredResourceIdentity>>,
+        terminal: Vec<super::RetiredResourceIdentity>,
     }
 
-    impl Drop for ProcessStepFixture {
-        fn drop(&mut self) {
-            // The fixture retains relay authority, so Close cannot reap this child.
-            let _ =
-                nix::sys::signal::kill(self.terminal.child_pid, nix::sys::signal::Signal::SIGKILL);
-            let child_pid = self.terminal.child_pid;
-            if matches!(
-                nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
-                Ok(nix::sys::wait::WaitStatus::StillAlive)
-            ) {
-                // PTY master fds are dropped after this fixture's Drop returns.
-                std::thread::spawn(move || {
-                    let _ = nix::sys::wait::waitpid(child_pid, None);
-                });
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProcessStepCall {
+        Bash,
+        Tmux,
+        Terminal,
+        Browser,
+    }
+
+    #[derive(Debug)]
+    enum ScriptedObservation {
+        Bash(Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure>),
+        Tmux(Result<super::RetirementOutcome, (super::RetirementFailureReason, String)>),
+        Terminal(Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure>),
+        Browser(Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure>),
+    }
+
+    #[derive(Default)]
+    struct ScriptedProcessStepExecutor {
+        observations: std::collections::VecDeque<ScriptedObservation>,
+        calls: Vec<ProcessStepCall>,
+    }
+
+    impl ScriptedProcessStepExecutor {
+        fn new(observations: impl IntoIterator<Item = ScriptedObservation>) -> Self {
+            Self {
+                observations: observations.into_iter().collect(),
+                calls: Vec::new(),
+            }
+        }
+
+        fn next(&mut self, call: ProcessStepCall) -> ScriptedObservation {
+            self.calls.push(call);
+            self.observations
+                .pop_front()
+                .unwrap_or_else(|| panic!("unexpected {call:?} effect"))
+        }
+
+        fn assert_finished(&self) {
+            assert!(
+                self.observations.is_empty(),
+                "unconsumed scripted observations"
+            );
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::CloseProcessStepExecutor for ScriptedProcessStepExecutor {
+        async fn retire_bash(
+            &mut self,
+        ) -> Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure> {
+            match self.next(ProcessStepCall::Bash) {
+                ScriptedObservation::Bash(observation) => observation,
+                other => panic!("unexpected scripted observation: {other:?}"),
+            }
+        }
+
+        async fn retire_tmux(
+            &mut self,
+        ) -> Result<super::RetirementOutcome, (super::RetirementFailureReason, String)> {
+            match self.next(ProcessStepCall::Tmux) {
+                ScriptedObservation::Tmux(observation) => observation,
+                other => panic!("unexpected scripted observation: {other:?}"),
+            }
+        }
+
+        async fn retire_terminal(
+            &mut self,
+        ) -> Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure> {
+            match self.next(ProcessStepCall::Terminal) {
+                ScriptedObservation::Terminal(observation) => observation,
+                other => panic!("unexpected scripted observation: {other:?}"),
+            }
+        }
+
+        async fn retire_browser(
+            &mut self,
+        ) -> Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure> {
+            match self.next(ProcessStepCall::Browser) {
+                ScriptedObservation::Browser(observation) => observation,
+                other => panic!("unexpected scripted observation: {other:?}"),
             }
         }
     }
 
+    fn retired() -> ScriptedObservation {
+        ScriptedObservation::Bash(Ok(super::CloseProcessStepOutcome::Retired))
+    }
+
+    fn successful_process_steps() -> Vec<ScriptedObservation> {
+        vec![
+            retired(),
+            ScriptedObservation::Tmux(Ok(super::RetirementOutcome::Retired)),
+            ScriptedObservation::Terminal(Ok(super::CloseProcessStepOutcome::Retired)),
+            ScriptedObservation::Browser(Ok(super::CloseProcessStepOutcome::Retired)),
+        ]
+    }
+
+    fn process_resource(
+        kind: super::RetiredResourceKind,
+        scope: &super::WorkScopeId,
+    ) -> (String, super::RetiredResourceIdentity) {
+        let identity = format!("{}-{}", kind.as_str(), scope.as_str());
+        (identity.clone(), super::opaque_resource(kind, identity))
+    }
+
+    async fn mark_process_step_scope_allocated(
+        db: &crate::db::Database,
+        scope: &super::WorkScopeId,
+        suffix: &str,
+    ) -> phoenix_core::domain::close::WorktreeIdentity {
+        use phoenix_core::domain::close::{
+            GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
+        };
+
+        let path = format!("/inert/process-step/{suffix}");
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse(format!("process-step-worktree-{suffix}")).unwrap(),
+            WorktreeFingerprint::parse(format!("process-step-fingerprint-{suffix}")).unwrap(),
+            GitPathIdentity::from_bytes(path.as_bytes().to_vec()),
+        );
+        sqlx::query(
+            "UPDATE work_scopes
+             SET environment_kind='allocated_worktree', worktree_path=?1, worktree_id=?2,
+                 worktree_fingerprint=?3, branch_name=?4, base_branch='main'
+             WHERE id=?5",
+        )
+        .bind(path)
+        .bind(identity.id().as_str())
+        .bind(identity.fingerprint().as_str())
+        .bind(format!("process-step-branch-{suffix}"))
+        .bind(scope.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        identity
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn process_step_fixture(two_scopes: bool) -> ProcessStepFixture {
-        use super::*;
-        use phoenix_core::domain::close::TranscriptConversationId;
-        use phoenix_terminal::{
-            session::Dims,
-            spawn::{spawn_pty, PtyExecPlan},
-        };
-        use phoenix_tools::bash::handle::{FinalCause, Handle};
+        use phoenix_core::domain::close::{CloseOwnedResourceInventory, TranscriptConversationId};
+        use std::collections::BTreeSet;
         use std::sync::Arc;
 
         let db = crate::db::Database::open_in_memory().await.unwrap();
@@ -7968,6 +8185,7 @@ mod tests {
             .await
             .unwrap();
         let mut scopes = vec![source.attached_work_scope_id.clone().unwrap()];
+        let mut worktrees = vec![mark_process_step_scope_allocated(&db, &scopes[0], "first").await];
         let mut latest_id = source.id.clone();
         if two_scopes {
             db.update_conversation_state(
@@ -7983,7 +8201,7 @@ mod tests {
             else {
                 panic!("expected continuation");
             };
-            let later_scope = WorkScopeId::parse("z-process-step-later-scope").unwrap();
+            let later_scope = super::WorkScopeId::parse("z-process-step-later-scope").unwrap();
             sqlx::query("INSERT INTO work_scopes (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at) SELECT ?1, 'work', 'active', 'unowned_cwd', '/tmp', created_at, updated_at FROM work_scopes WHERE id=?2")
                 .bind(later_scope.as_str()).bind(scopes[0].as_str()).execute(db.pool()).await.unwrap();
             sqlx::query("UPDATE conversations SET work_scope_id=?1 WHERE id=?2")
@@ -7992,11 +8210,13 @@ mod tests {
                 .execute(db.pool())
                 .await
                 .unwrap();
+            worktrees.push(mark_process_step_scope_allocated(&db, &later_scope, "later").await);
             scopes.push(later_scope);
             latest_id = latest.id;
         }
         scopes.sort();
-        let run = CloseRunRef::initial(CloseAttemptId::parse("process-step-run").unwrap());
+        let run =
+            super::CloseRunRef::initial(super::CloseAttemptId::parse("process-step-run").unwrap());
         db.begin_close_foundation(
             &source.product_conversation_id,
             &TranscriptConversationId::parse(latest_id).unwrap(),
@@ -8013,10 +8233,99 @@ mod tests {
         db.advance_close_settlement_when_quiescent(run.attempt_id.as_str())
             .await
             .unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
-        let fake = phoenix_tools::tmux::fake_backend::FakeTmuxBackend::new();
-        let mut manager = RuntimeManager::new(
-            db.clone(),
+        scopes = db
+            .list_close_attempt_scopes(run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|captured| captured.scope)
+            .collect();
+        scopes.sort();
+        let snapshot = super::CloseRetirementSnapshot::parse(
+            "process-step-generation",
+            "process-step-fingerprint",
+        )
+        .unwrap();
+        db.replace_close_inspection(crate::db::ReplaceCloseInspectionRequest {
+            attempt_id: run.attempt_id.clone(),
+            scopes: scopes
+                .iter()
+                .cloned()
+                .map(|scope| crate::db::ReplaceCloseInspectionScopeRequest {
+                    scope,
+                    snapshot: snapshot.clone(),
+                    losses: vec![],
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+
+        let snapshot = db
+            .get_close_obligation(run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .cloned()
+            .unwrap();
+
+        let mut identities = Vec::new();
+        let mut bash = Vec::new();
+        let mut tmux = Vec::new();
+        let mut terminal = Vec::new();
+        let mut inventories = Vec::new();
+        for (scope_index, scope) in scopes.iter().enumerate() {
+            let (bash_id, bash_resource) =
+                process_resource(super::RetiredResourceKind::BashProcessGroup, scope);
+            let (tmux_id, tmux_resource) =
+                process_resource(super::RetiredResourceKind::TmuxServer, scope);
+            let (terminal_id, terminal_resource) =
+                process_resource(super::RetiredResourceKind::PtySession, scope);
+            let (browser_id, _browser_resource) =
+                process_resource(super::RetiredResourceKind::BrowserSession, scope);
+            identities.push(super::CloseProcessStepIdentities {
+                bash: vec![bash_id.clone()],
+                terminal: vec![],
+                browser: vec![],
+            });
+            bash.push(bash_resource.clone());
+            tmux.push(vec![tmux_resource.clone()]);
+            terminal.push(terminal_resource.clone());
+            inventories.push(crate::db::CaptureCloseRetirementInventoryScopeRequest {
+                scope: scope.clone(),
+                inventory: CloseOwnedResourceInventory {
+                    worktree: Some(worktrees[scope_index].clone()),
+                    work_scopes: BTreeSet::new(),
+                    bash_process_groups: BTreeSet::from([
+                        phoenix_core::domain::close::OpaqueIdentity::parse(bash_id).unwrap(),
+                    ]),
+                    tmux_servers: BTreeSet::from([
+                        phoenix_core::domain::close::OpaqueIdentity::parse(tmux_id).unwrap(),
+                    ]),
+                    pty_sessions: BTreeSet::from([
+                        phoenix_core::domain::close::OpaqueIdentity::parse(terminal_id).unwrap(),
+                    ]),
+                    browser_sessions: BTreeSet::from([
+                        phoenix_core::domain::close::OpaqueIdentity::parse(browser_id).unwrap(),
+                    ]),
+                    equivalent_live_resources: BTreeSet::new(),
+                },
+            });
+            assert_eq!(
+                bash_resource.identity().value(),
+                identities.last().unwrap().bash[0]
+            );
+        }
+        db.capture_close_retirement_inventory(crate::db::CaptureCloseRetirementInventoryRequest {
+            attempt_id: run.attempt_id.clone(),
+            snapshot: snapshot.clone(),
+            scopes: inventories,
+        })
+        .await
+        .unwrap();
+
+        let manager = super::RuntimeManager::new(
+            db,
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),
             crate::platform::PlatformCapability::None {
                 details: "process step tests".into(),
@@ -8024,126 +8333,33 @@ mod tests {
             Arc::new(crate::tools::mcp::McpClientManager::new()),
             None,
         );
-        manager.tmux_registry =
-            Arc::new(phoenix_tools::tmux::registry::TmuxRegistry::with_backend(
-                socket_dir.path().to_path_buf(),
-                fake.clone(),
-                None,
-            ));
-        let mut children = Vec::new();
-        let mut sockets = Vec::new();
-        for scope in &scopes {
-            let key = ResourceScopeKey::Work(scope.clone());
-            let child = tokio::process::Command::new("sleep")
-                .arg("60")
-                .process_group(0)
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let pid = child.id().unwrap();
-            let mut reservation = manager.bash_handles().reserve_spawn(&key).await.unwrap();
-            let handle = Handle::new_live(
-                key.clone(),
-                reservation.handle_id().clone(),
-                "sleep 60".into(),
-                None,
-                PathBuf::from("/tmp"),
-                i32::try_from(pid).unwrap(),
-                pid,
-                1024,
-            );
-            manager
-                .bash_handles()
-                .commit_spawn(&mut reservation, handle.clone())
-                .await
-                .unwrap();
-            children.push((child, handle));
-            let server = manager
-                .tmux_registry()
-                .ensure_live(&key, Path::new("/tmp"), None, None)
-                .await
-                .unwrap();
-            sockets.push(server.read().await.socket_path.clone());
-        }
-        let terminal_scope = ResourceScopeKey::Work(scopes.last().unwrap().clone());
-        let terminal = manager
-            .terminals
-            .try_insert_exact(
-                terminal_scope.clone(),
-                tokio::task::spawn_blocking(|| {
-                    spawn_pty(
-                        Path::new("/tmp"),
-                        Dims::try_new(80, 24).unwrap(),
-                        PtyExecPlan::Shell,
-                    )
-                    .unwrap()
-                })
-                .await
-                .unwrap(),
-            )
-            .unwrap();
-        let relay = terminal
-            .attach_permit
-            .clone()
-            .acquire_owned()
-            .await
-            .unwrap();
-        let snapshot = manager
-            .inspect_close_retirement_only(run.attempt_id.clone())
-            .await
-            .unwrap();
-        manager
-            .capture_close_retirement_inventory(run.attempt_id.clone(), snapshot)
-            .await
-            .unwrap();
-        let mut leases = manager.close_retirement_leases.lock().await;
-        let bash = scopes
-            .iter()
-            .map(|scope| {
-                leases[&(run.attempt_id.as_str().to_string(), scope.clone())]
-                    .resources
-                    .iter()
-                    .find(|resource| resource.kind() == RetiredResourceKind::BashProcessGroup)
-                    .unwrap()
-                    .clone()
-            })
-            .collect();
-        leases
-            .get_mut(&(
-                run.attempt_id.as_str().to_string(),
-                scopes.last().unwrap().clone(),
-            ))
-            .unwrap()
-            .terminal = manager
-            .terminals
-            .begin_retirement_by(&terminal_scope, tokio::time::Instant::now());
-        drop(leases);
-        for (mut child, handle) in children {
-            child.kill().await.unwrap();
-            child.wait().await.unwrap();
-            handle
-                .transition_to_terminal(
-                    FinalCause::Killed {
-                        exit_code: None,
-                        signal_number: Some(libc::SIGKILL),
-                    },
-                    std::time::Duration::ZERO,
-                    std::time::SystemTime::now(),
-                    0,
-                )
-                .await;
-        }
         ProcessStepFixture {
             manager,
             run,
+            snapshot,
             scopes,
+            identities,
             bash,
-            sockets,
-            fake,
+            tmux,
             terminal,
-            _relay: relay,
-            _socket_dir: socket_dir,
         }
+    }
+
+    async fn run_scope(
+        fixture: &ProcessStepFixture,
+        index: usize,
+        executor: &mut ScriptedProcessStepExecutor,
+    ) -> Result<(), super::CloseLeaseFailure> {
+        super::run_close_process_steps(
+            fixture.manager.db(),
+            &fixture.run,
+            &fixture.snapshot,
+            &fixture.scopes[index],
+            &fixture.identities[index],
+            &fixture.tmux[index],
+            executor,
+        )
+        .await
     }
 
     async fn assert_process_step_successes(fixture: &ProcessStepFixture, expected: usize) {
@@ -8154,16 +8370,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(successes.len(), expected, "{successes:?}");
-        for (scope, bash) in fixture.scopes.iter().zip(&fixture.bash).take(expected) {
-            assert!(successes.iter().any(|success| success.run == fixture.run
-                && success.scope == *scope
-                && success.resource_kind == super::CloseProcessResourceKind::BashProcessGroup
-                && super::LossItemIdentity::Opaque(success.identity.clone()) == *bash.identity()
-                && success.outcome == super::CloseProcessStepOutcome::Retired));
+        for (scope, identities) in fixture.scopes.iter().zip(&fixture.identities) {
+            for identity in &identities.bash {
+                if successes.iter().any(|success| success.scope == *scope) {
+                    assert!(successes.iter().any(|success| success.run == fixture.run
+                        && success.scope == *scope
+                        && success.resource_kind
+                            == super::CloseProcessResourceKind::BashProcessGroup
+                        && success.identity.as_str() == identity
+                        && success.outcome == super::CloseProcessStepOutcome::Retired));
+                }
+            }
         }
     }
 
-    async fn assert_process_step_failure_omits_successes(fixture: &ProcessStepFixture) {
+    async fn record_process_failure(
+        fixture: &ProcessStepFixture,
+        scope_index: usize,
+        resource: super::RetiredResourceIdentity,
+        detail: &str,
+    ) -> String {
+        fixture
+            .manager
+            .record_close_process_failure::<()>(
+                &fixture.run,
+                &fixture.scopes[scope_index],
+                Some(resource),
+                vec![],
+                detail,
+            )
+            .await
+            .unwrap_err()
+    }
+
+    async fn assert_one_failure(fixture: &ProcessStepFixture) {
         let failures = fixture
             .manager
             .db()
@@ -8175,27 +8415,28 @@ mod tests {
             failures[0].occurrence.failure_occurrence_id,
             fixture.run.failure_occurrence_id()
         );
-        for bash in &fixture.bash {
-            assert!(!failures[0]
-                .occurrence
-                .remaining_resources
-                .iter()
-                .any(|remaining| remaining.resource == *bash));
-        }
     }
 
     #[tokio::test]
     async fn process_step_stale_bash_generation_cannot_mint_success() {
         let fixture = process_step_fixture(false).await;
-        let key = super::ResourceScopeKey::Work(fixture.scopes[0].clone());
-        let _newer = fixture.manager.bash_handles().begin_retirement(&key).await;
-        let error = fixture
-            .manager
-            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
-            .await
-            .unwrap_err();
-        assert!(error.contains("generation is stale"), "{error}");
+        let failed_resource = fixture.bash[0].clone();
+        let mut executor = ScriptedProcessStepExecutor::new([ScriptedObservation::Bash(Err(
+            super::CloseProcessStepFailure {
+                resources: vec![failed_resource.clone()],
+                reason: "bash retirement generation is stale".into(),
+            },
+        ))]);
+        let failure = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
+        assert!(failure.to_string().contains("generation is stale"));
+        assert_eq!(executor.calls, [ProcessStepCall::Bash]);
+        executor.assert_finished();
         assert_process_step_successes(&fixture, 0).await;
+        let error =
+            record_process_failure(&fixture, 0, failed_resource.clone(), &failure.to_string())
+                .await;
+        assert!(error.contains("generation is stale"), "{error}");
+        assert_one_failure(&fixture).await;
         let failures = fixture
             .manager
             .db()
@@ -8206,59 +8447,44 @@ mod tests {
             .occurrence
             .remaining_resources
             .iter()
-            .any(|item| item.resource == fixture.bash[0]
-                && item.disposition == CloseCleanupResourceDisposition::Failed));
-        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 0);
-        assert_eq!(
-            *fixture.terminal.stop_tx.borrow(),
-            phoenix_terminal::session::StopReason::Running
-        );
+            .any(|item| {
+                item.resource == failed_resource
+                    && item.disposition == CloseCleanupResourceDisposition::Failed
+            }));
     }
 
     #[tokio::test]
     async fn process_step_bash_success_survives_tmux_failure() {
         let fixture = process_step_fixture(false).await;
-        fixture.fake.stall(
-            &fixture.sockets[0],
-            phoenix_tools::tmux::fake_backend::Stall::AfterProbe,
-        );
-        let error = fixture
-            .manager
-            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
-            .await
-            .unwrap_err();
-        assert!(error.contains("tmux"), "{error}");
-        assert_process_step_successes(&fixture, 1).await;
-        assert_process_step_failure_omits_successes(&fixture).await;
+        let mut executor = ScriptedProcessStepExecutor::new([
+            retired(),
+            ScriptedObservation::Tmux(Err((
+                super::RetirementFailureReason::RemovalFailed,
+                "tmux teardown failed".into(),
+            ))),
+        ]);
+        let failure = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
+        assert!(failure.to_string().contains("tmux"));
         assert_eq!(
-            *fixture.terminal.stop_tx.borrow(),
-            phoenix_terminal::session::StopReason::Running
+            executor.calls,
+            [ProcessStepCall::Bash, ProcessStepCall::Tmux]
         );
-        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 0);
-    }
-
-    #[tokio::test]
-    async fn process_step_bash_and_tmux_success_survive_pty_failure() {
-        let fixture = process_step_fixture(false).await;
+        executor.assert_finished();
+        assert_process_step_successes(&fixture, 1).await;
         let error = fixture
             .manager
-            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
+            .record_close_residual::<()>(
+                &fixture.run,
+                &fixture.snapshot,
+                &fixture.scopes[0],
+                fixture.tmux[0][0].clone(),
+                super::RetirementFailureReason::RemovalFailed,
+                "tmux teardown failed",
+            )
             .await
             .unwrap_err();
-        assert!(error.contains("terminal relay"), "{error}");
-        assert_process_step_successes(&fixture, 1).await;
-        assert_process_step_failure_omits_successes(&fixture).await;
-        let evidence = fixture
-            .manager
-            .db()
-            .list_close_retirement_evidence(fixture.run.attempt_id.as_str())
-            .await
-            .unwrap();
-        assert!(evidence
-            .iter()
-            .any(|evidence| evidence.scope == fixture.scopes[0]
-                && evidence.resource.kind() == super::RetiredResourceKind::TmuxServer
-                && evidence.outcome == super::RetirementOutcome::Retired));
+        assert!(error.contains("tmux teardown failed"), "{error}");
+        assert_one_failure(&fixture).await;
         let failures = fixture
             .manager
             .db()
@@ -8269,31 +8495,128 @@ mod tests {
             .occurrence
             .remaining_resources
             .iter()
-            .any(|resource| resource.resource.kind() == super::RetiredResourceKind::TmuxServer));
-        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 1);
+            .any(|remaining| { remaining.resource == fixture.bash[0] }));
+    }
+
+    #[tokio::test]
+    async fn process_step_bash_and_tmux_success_survive_pty_failure() {
+        let fixture = process_step_fixture(false).await;
+        let observations = vec![
+            retired(),
+            ScriptedObservation::Tmux(Ok(super::RetirementOutcome::Retired)),
+            ScriptedObservation::Terminal(Err(super::CloseProcessStepFailure {
+                resources: vec![fixture.terminal[0].clone()],
+                reason: "terminal relay remains attached".into(),
+            })),
+        ];
+        let mut executor = ScriptedProcessStepExecutor::new(observations);
+        let failure = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
+        assert!(failure.to_string().contains("terminal relay"));
+        assert_eq!(
+            executor.calls,
+            [
+                ProcessStepCall::Bash,
+                ProcessStepCall::Tmux,
+                ProcessStepCall::Terminal
+            ]
+        );
+        executor.assert_finished();
+        assert_process_step_successes(&fixture, 1).await;
+        let evidence = fixture
+            .manager
+            .db()
+            .list_close_retirement_evidence(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(evidence.iter().any(|proof| {
+            proof.scope == fixture.scopes[0]
+                && proof.resource == fixture.tmux[0][0]
+                && proof.outcome == super::RetirementOutcome::Retired
+        }));
+        let error = record_process_failure(
+            &fixture,
+            0,
+            fixture.terminal[0].clone(),
+            &failure.to_string(),
+        )
+        .await;
+        assert!(error.contains("terminal relay"), "{error}");
+        assert_one_failure(&fixture).await;
+        let failures = fixture
+            .manager
+            .db()
+            .list_close_cleanup_failures(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(!failures[0]
+            .occurrence
+            .remaining_resources
+            .iter()
+            .any(|remaining| remaining.resource == fixture.bash[0]));
+        assert!(!failures[0]
+            .occurrence
+            .remaining_resources
+            .iter()
+            .any(|remaining| { remaining.resource == fixture.tmux[0][0] }));
     }
 
     #[tokio::test]
     async fn process_step_earlier_scope_success_survives_later_scope_failure() {
         let fixture = process_step_fixture(true).await;
-        fixture.fake.stall(
-            &fixture.sockets[1],
-            phoenix_tools::tmux::fake_backend::Stall::AfterProbe,
+        let mut first = ScriptedProcessStepExecutor::new(successful_process_steps());
+        run_scope(&fixture, 0, &mut first).await.unwrap();
+        assert_eq!(
+            first.calls,
+            [
+                ProcessStepCall::Bash,
+                ProcessStepCall::Tmux,
+                ProcessStepCall::Terminal,
+                ProcessStepCall::Browser
+            ]
         );
-        let error = fixture
+        first.assert_finished();
+
+        let mut later = ScriptedProcessStepExecutor::new([
+            retired(),
+            ScriptedObservation::Tmux(Err((
+                super::RetirementFailureReason::RemovalFailed,
+                "later scope tmux failed".into(),
+            ))),
+        ]);
+        let failure = run_scope(&fixture, 1, &mut later).await.unwrap_err();
+        assert!(failure.to_string().contains("tmux"));
+        assert_eq!(later.calls, [ProcessStepCall::Bash, ProcessStepCall::Tmux]);
+        later.assert_finished();
+        assert_process_step_successes(&fixture, 2).await;
+        fixture
             .manager
-            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
+            .record_close_residual::<()>(
+                &fixture.run,
+                &fixture.snapshot,
+                &fixture.scopes[1],
+                fixture.tmux[1][0].clone(),
+                super::RetirementFailureReason::RemovalFailed,
+                "later scope tmux failed",
+            )
             .await
             .unwrap_err();
-        assert!(error.contains("tmux"), "{error}");
-        assert_process_step_successes(&fixture, 2).await;
-        assert_process_step_failure_omits_successes(&fixture).await;
-        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 1);
-        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[1]), 0);
-        assert_eq!(
-            *fixture.terminal.stop_tx.borrow(),
-            phoenix_terminal::session::StopReason::Running
-        );
+        assert_one_failure(&fixture).await;
+        let failures = fixture
+            .manager
+            .db()
+            .list_close_cleanup_failures(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(!failures[0]
+            .occurrence
+            .remaining_resources
+            .iter()
+            .any(|remaining| { remaining.resource == fixture.bash[0] }));
+        assert!(!failures[0]
+            .occurrence
+            .remaining_resources
+            .iter()
+            .any(|remaining| { remaining.resource == fixture.bash[1] }));
     }
 
     #[tokio::test]
@@ -8309,24 +8632,32 @@ mod tests {
                 .execute(fixture.manager.db().pool())
                 .await
                 .unwrap();
-            let error = fixture
-                .manager
-                .retire_close_runtime_resources(fixture.run.attempt_id.clone())
-                .await
-                .unwrap_err();
+            let observations = if fail_tmux_evidence {
+                vec![
+                    retired(),
+                    ScriptedObservation::Tmux(Ok(super::RetirementOutcome::Retired)),
+                ]
+            } else {
+                vec![retired()]
+            };
+            let mut executor = ScriptedProcessStepExecutor::new(observations);
+            let error = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
             assert!(
-                error.contains("injected step persistence failure"),
+                error
+                    .to_string()
+                    .contains("injected step persistence failure"),
                 "{error}"
             );
+            assert_eq!(
+                executor.calls,
+                if fail_tmux_evidence {
+                    vec![ProcessStepCall::Bash, ProcessStepCall::Tmux]
+                } else {
+                    vec![ProcessStepCall::Bash]
+                }
+            );
+            executor.assert_finished();
             assert_process_step_successes(&fixture, usize::from(fail_tmux_evidence)).await;
-            assert_eq!(
-                fixture.fake.kill_server_count(&fixture.sockets[0]),
-                usize::from(fail_tmux_evidence)
-            );
-            assert_eq!(
-                *fixture.terminal.stop_tx.borrow(),
-                phoenix_terminal::session::StopReason::Running
-            );
             assert!(fixture
                 .manager
                 .db()
@@ -8340,13 +8671,34 @@ mod tests {
     #[tokio::test]
     async fn process_step_successes_survive_failure_transaction_rollback() {
         let fixture = process_step_fixture(false).await;
+        let observations = vec![
+            retired(),
+            ScriptedObservation::Tmux(Ok(super::RetirementOutcome::Retired)),
+            ScriptedObservation::Terminal(Err(super::CloseProcessStepFailure {
+                resources: vec![fixture.terminal[0].clone()],
+                reason: "terminal relay remains attached".into(),
+            })),
+        ];
+        let mut executor = ScriptedProcessStepExecutor::new(observations);
+        let failure = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
+        assert_eq!(
+            executor.calls,
+            [
+                ProcessStepCall::Bash,
+                ProcessStepCall::Tmux,
+                ProcessStepCall::Terminal
+            ]
+        );
+        executor.assert_finished();
         sqlx::query("CREATE TRIGGER reject_step_failure_event BEFORE INSERT ON coordinator_watch_events BEGIN SELECT RAISE(ABORT, 'injected failure transaction rollback'); END")
             .execute(fixture.manager.db().pool()).await.unwrap();
-        let error = fixture
-            .manager
-            .retire_close_runtime_resources(fixture.run.attempt_id.clone())
-            .await
-            .unwrap_err();
+        let error = record_process_failure(
+            &fixture,
+            0,
+            fixture.terminal[0].clone(),
+            &failure.to_string(),
+        )
+        .await;
         assert!(
             error.contains("injected failure transaction rollback"),
             "{error}"
@@ -8359,10 +8711,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(evidence.len(), 1);
-        assert_eq!(
-            evidence[0].resource.kind(),
-            super::RetiredResourceKind::TmuxServer
-        );
+        assert_eq!(evidence[0].resource, fixture.tmux[0][0]);
         assert!(fixture
             .manager
             .db()
@@ -8377,39 +8726,6 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(
-            fixture.manager.close_retirement_leases.lock().await.len(),
-            1
-        );
-        assert_eq!(fixture.fake.kill_server_count(&fixture.sockets[0]), 1);
-        sqlx::query("DROP TRIGGER reject_step_failure_event")
-            .execute(fixture.manager.db().pool())
-            .await
-            .unwrap();
-        let obligation = fixture
-            .manager
-            .db()
-            .get_close_obligation(fixture.run.attempt_id.as_str())
-            .await
-            .unwrap();
-        let snapshot = obligation.snapshot().unwrap().clone();
-        let expected = fixture
-            .manager
-            .db()
-            .list_close_expected_retirement_resources(fixture.run.attempt_id.as_str())
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|target| target.scope == fixture.scopes[0])
-            .map(|target| target.resource)
-            .collect::<Vec<_>>();
-        let replay = fixture
-            .manager
-            .complete_close_resource_lease(&fixture.run, &snapshot, &fixture.scopes[0], &expected)
-            .await;
-        assert!(!format!("{replay:?}").contains("process step success payload mismatch"));
-        assert_process_step_successes(&fixture, 1).await;
-        assert_close_admission_fenced(&fixture.manager, &fixture.scopes[0]).await;
     }
 
     #[test]
