@@ -292,6 +292,9 @@ mod tests {
         let path = dir.path().join("coordinator.db");
         let path = path.to_str().unwrap();
         let db = Database::open(path).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         let second = Database::open(path).await.unwrap();
         let (first, other) = tokio::join!(
             db.initialize_coordinator_work_scope("/owned/coordinator"),
