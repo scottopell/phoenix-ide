@@ -117,7 +117,7 @@ class OpeningQualificationTests(unittest.TestCase):
         stop = workflow.index("      - name: Prepare owned Chromium", start)
         step = workflow[start:stop]
         self.assertIn("working-directory: pinned-app", step)
-        self.assertIn("PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes ui", step)
+        self.assertIn("PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes tsc,ui-lint,vitest", step)
         self.assertIn("ui_status=${PIPESTATUS[0]}", step)
         self.assertIn('exit "$ui_status"', step)
         self.assertNotIn("--no-file-parallelism", step)
@@ -126,6 +126,23 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("pinned-app-full-ui.log", workflow)
         self.assertIn("pinned-app-full-ui-receipt.json", workflow)
         self.assertIn("runs-on: ubuntu-latest", workflow[workflow.index("  qualify-history-realserver:"):start])
+
+    def test_ui_command_is_accepted_by_exact_app_lane_resolver_not_ci_group_alias(self):
+        import ast, subprocess, sys, os
+        app = Path(os.environ.get("HISTORY_PINNED_SOURCE", os.environ.get("APP_ROOT", "target/history-hidden-geometry-repair")))
+        source = subprocess.check_output(["git", "-C", str(app), "show", f"{opening.PIN}:dev.py"], text=True)
+        tree = ast.parse(source)
+        selected = [node for node in tree.body if
+                    isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"_LANE_DEFS", "_LANE_ALIASES"} for t in node.targets)
+                    or isinstance(node, ast.FunctionDef) and node.name == "_resolve_check_lanes"]
+        scope = {"sys": sys}
+        exec(compile(ast.Module(body=selected, type_ignores=[]), "exact-app-lane-resolver", "exec"), scope)
+        scope["_all_lanes"] = lambda: {lane[0] for lane in scope["_LANE_DEFS"]}
+        active, skipped = scope["_resolve_check_lanes"](gate=False, lanes="tsc,ui-lint,vitest")
+        self.assertEqual(active, {"tsc", "ui-lint", "vitest"})
+        self.assertEqual(skipped, {})
+        with self.assertRaises(SystemExit):
+            scope["_resolve_check_lanes"](gate=False, lanes="ui")
 
     def test_each_identity_dimension_fails_closed(self):
         for key in self.value:

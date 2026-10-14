@@ -954,7 +954,7 @@ unchanged until an actual subsequent landing requires a separately identified
 renumbering.
 
 The existing Ubuntu-hosted instrumented job adds one full pinned-app UI lane
-step: `PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes ui`.
+step: `PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes tsc,ui-lint,vitest`.
 It uses standard full-suite scheduling/configuration and tsc/eslint, not a
 render-fixture-only rerun or no-file-parallelism override. It gates capture,
 retains the full console log even on failure, and binds command/exit status,
@@ -973,3 +973,11 @@ rustfmt parsing, Python source compilation and compiler-free harness tests do
 not execute the six Rust guards or provide full-app UI/runtime receipts. A
 single exact-head hosted push/run requires coordinator admission; no local
 build, capture or deployment was performed during base integration.
+
+Exact review of preparation `646023e5` caught that `ui` is a CI group name,
+not an accepted dev.py lane alias. The corrected command explicitly names
+`tsc,ui-lint,vitest`: full app UI type/style checks and **all** Vitest tests,
+not the ancillary ast-grep/Allium/spec group. A pure source-extracted regression
+executes the exact app's lane resolver, accepts that explicit list and rejects
+`ui`, without invoking lane setup/build/tests. The invalid preparation was never
+pushed. Counts/log/exit and scope receipts use the corrected command.

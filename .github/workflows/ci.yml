@@ -343,14 +343,14 @@ jobs:
           receipt={'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
                    'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
                    'harness_source':subprocess.check_output(['git','-C',str(out/'harness'),'rev-parse','HEAD'],text=True).strip(),
-                   'command':'PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes ui',
+                   'command':'PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes tsc,ui-lint,vitest',
                    'vitest_config_sha256':sha(root/'ui/vitest.config.ts'),
                    'ui_lock_sha256':sha(root/'ui/pnpm-lock.yaml'),
-                   'scope':'full pinned app UI lane; no test filtering or retry; no runtime/overhead clearance'}
+                   'scope':'full pinned app UI source/tests (tsc,eslint,all Vitest); not ancillary spec/ast-grep group; no filtering/retry/runtime/overhead clearance'}
           (out/'pinned-app-full-ui-receipt.json').write_text(json.dumps(receipt,indent=2))
           PY
           set +e
-          PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes ui 2>&1 | tee "$GITHUB_WORKSPACE/pinned-app-full-ui.log"
+          PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes tsc,ui-lint,vitest 2>&1 | tee "$GITHUB_WORKSPACE/pinned-app-full-ui.log"
           ui_status=${PIPESTATUS[0]}
           set -e
           python3 - "$ui_status" <<'PY'
