@@ -6144,7 +6144,35 @@ fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-#[allow(clippy::too_many_lines)]
+type StopFsmonitorEffect = Box<dyn FnOnce(&Path) -> Result<FsmonitorStop, String> + Send>;
+type OpenDescriptorsEffect =
+    Box<dyn FnOnce(&Path) -> Result<ExternalWriterEvidence, String> + Send>;
+type ExternalWriterEffect = Box<dyn FnOnce(&Path) -> Result<bool, String> + Send>;
+
+/// Host-interacting effects of exact-worktree quarantine and removal, gathered
+/// at one narrow adapter so a test can supply deterministic observations instead
+/// of launching the real fsmonitor shutdown or scanning the host `/proc`.
+///
+/// Production always uses [`CloseWorktreeEffects::production`], whose fields are
+/// the real functions; there is no test-only global switch. The decision logic
+/// in [`quarantine_and_remove_exact_worktree_with_effects`] is identical whether
+/// the real or an injected adapter is supplied.
+struct CloseWorktreeEffects {
+    stop_fsmonitor: StopFsmonitorEffect,
+    observe_open_descriptors: OpenDescriptorsEffect,
+    observe_external_writer: ExternalWriterEffect,
+}
+
+impl CloseWorktreeEffects {
+    fn production() -> Self {
+        Self {
+            stop_fsmonitor: Box::new(stop_bound_fsmonitor_daemons),
+            observe_open_descriptors: Box::new(quarantine_has_open_descriptors),
+            observe_external_writer: Box::new(quarantine_has_external_writer),
+        }
+    }
+}
+
 async fn quarantine_and_remove_exact_worktree<F, B>(
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
@@ -6158,7 +6186,7 @@ where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
-    quarantine_and_remove_exact_worktree_with_stop(
+    quarantine_and_remove_exact_worktree_with_effects(
         identity,
         confirmed_snapshot,
         planned_administrative_dir,
@@ -6166,14 +6194,14 @@ where
         final_tombstone,
         bind_tombstone,
         after_quarantine,
-        stop_bound_fsmonitor_daemons,
+        CloseWorktreeEffects::production(),
     )
     .await
 }
 
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
-async fn quarantine_and_remove_exact_worktree_with_stop<F, B, S>(
+async fn quarantine_and_remove_exact_worktree_with_effects<F, B>(
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
     planned_administrative_dir: PathBuf,
@@ -6181,13 +6209,17 @@ async fn quarantine_and_remove_exact_worktree_with_stop<F, B, S>(
     final_tombstone: Option<CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
     after_quarantine: F,
-    stop: S,
+    effects: CloseWorktreeEffects,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
-    S: FnOnce(&Path) -> Result<FsmonitorStop, String> + Send + 'static,
 {
+    let CloseWorktreeEffects {
+        stop_fsmonitor,
+        observe_open_descriptors,
+        observe_external_writer,
+    } = effects;
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
     let resuming_quarantine = !path.exists() && quarantine.exists();
@@ -6242,7 +6274,7 @@ where
             return Err("captured worktree administrative incarnation changed".to_string());
         }
 
-        if let Err(detail) = stop(inspection_path) {
+        if let Err(detail) = stop_fsmonitor(inspection_path) {
             return Ok(ExactWorktreeRemoval::StopFailed { detail });
         }
         let verification_runtime = tokio::runtime::Builder::new_current_thread()
@@ -6291,7 +6323,7 @@ where
         }
 
         after_quarantine(&path);
-        if quarantine_has_open_descriptors(&quarantine)?.found() {
+        if observe_open_descriptors(&quarantine)?.found() {
             return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "open descriptors can still modify the confirmed worktree; retained at {}",
@@ -6311,7 +6343,7 @@ where
                 ),
             });
         }
-        if quarantine_has_external_writer(&quarantine)? {
+        if observe_external_writer(&quarantine)? {
             return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "an external process can still write the confirmed worktree; retained at {}",
@@ -7065,9 +7097,9 @@ mod tests {
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
         observe_administrative_dir_incarnation, observe_worktree_fingerprint, parse_status_losses,
-        planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
-        remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
-        remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
+        planned_administrative_dir_is_absent, remove_directory_contents_at_with_hook,
+        remove_exact_worktree_administrative_dir_with_hook, remove_identity_bound_directory,
+        remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
         staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
@@ -8953,7 +8985,7 @@ mod tests {
         let administrative_dir = exact_worktree_administrative_dir(&linked, &bare).unwrap();
         let confirmed = inspect_worktree(&identity).await.unwrap().0;
 
-        let outcome = quarantine_and_remove_exact_worktree(
+        let outcome = super::quarantine_and_remove_exact_worktree_with_effects(
             &identity,
             &confirmed,
             administrative_dir.clone(),
@@ -8961,6 +8993,7 @@ mod tests {
             None,
             |_, _, _| Ok(()),
             |_| {},
+            injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning)),
         )
         .await
         .unwrap();
@@ -9030,22 +9063,25 @@ mod tests {
             locator,
         );
         let (snapshot, _) = inspect_worktree(&identity).await.unwrap();
-        let runtime = tokio::runtime::Handle::current();
         let quarantine = worktree_quarantine_path(&identity).unwrap();
         let late_path = linked.join("late-write");
-        let result = tokio::task::spawn_blocking(move || {
-            inspect_and_remove_exact_worktree_with_hook(
-                &runtime,
-                &identity,
-                &snapshot,
-                move |original| {
-                    std::fs::create_dir(original).unwrap();
-                    std::fs::write(original.join("late-write"), "must survive\n").unwrap();
-                },
-            )
-        })
+        let common = super::exact_worktree_common_git_dir(&linked).unwrap();
+        let administrative = super::exact_worktree_administrative_dir(&linked, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
+        let result = super::quarantine_and_remove_exact_worktree_with_effects(
+            &identity,
+            &snapshot,
+            administrative,
+            incarnation,
+            None,
+            |_, _, _| Ok(()),
+            move |original| {
+                std::fs::create_dir(original).unwrap();
+                std::fs::write(original.join("late-write"), "must survive\n").unwrap();
+            },
+            injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning)),
+        )
         .await
-        .unwrap()
         .unwrap();
 
         let ExactWorktreeRemoval::Residual { detail } = result else {
@@ -9093,13 +9129,25 @@ mod tests {
         let quarantine = worktree_quarantine_path(&identity).unwrap();
         std::fs::rename(&linked, &quarantine).unwrap();
         std::fs::write(quarantine.join("write-after-crash"), "preserve\n").unwrap();
-        let runtime = tokio::runtime::Handle::current();
-
-        let outcome = tokio::task::spawn_blocking(move || {
-            inspect_and_remove_exact_worktree_with_hook(&runtime, &identity, &confirmed, |_| {})
-        })
+        let common = super::exact_worktree_common_git_dir(&quarantine).unwrap();
+        let administrative =
+            super::exact_worktree_administrative_dir(&quarantine, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
+        // Resuming from quarantine with a post-crash write that changed the
+        // snapshot: the production reinspection precondition rejects deletion
+        // before any descriptor/writer scan, so inject deterministic effects
+        // rather than stopping the real fsmonitor daemon.
+        let outcome = super::quarantine_and_remove_exact_worktree_with_effects(
+            &identity,
+            &confirmed,
+            administrative,
+            incarnation,
+            None,
+            |_, _, _| panic!("must not bind a tombstone for a changed resumed quarantine"),
+            |_| panic!("must not re-quarantine a changed resumed worktree"),
+            injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning)),
+        )
         .await
-        .unwrap()
         .unwrap();
 
         assert!(matches!(
@@ -9448,6 +9496,89 @@ mod tests {
         .is_err());
     }
 
+    /// Deterministic quarantine/removal effects for tests: the supplied
+    /// `stop_fsmonitor` observation replaces the real fsmonitor shutdown, while
+    /// the descriptor and external-writer probes report no positive evidence
+    /// without touching the host `/proc`. No default test launches the real
+    /// fsmonitor shutdown or a global host scan through this adapter.
+    fn injected_close_worktree_effects(
+        stop_fsmonitor: impl FnOnce(&Path) -> Result<super::FsmonitorStop, String> + Send + 'static,
+    ) -> super::CloseWorktreeEffects {
+        super::CloseWorktreeEffects {
+            stop_fsmonitor: Box::new(stop_fsmonitor),
+            observe_open_descriptors: Box::new(|_| {
+                Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
+            }),
+            observe_external_writer: Box::new(|_| Ok(false)),
+        }
+    }
+
+    /// Deterministic effects that additionally reject any writer scan, proving a
+    /// control path returns before the quarantine descriptor/writer probes.
+    fn injected_close_worktree_effects_rejecting_scans(
+        stop_fsmonitor: impl FnOnce(&Path) -> Result<super::FsmonitorStop, String> + Send + 'static,
+    ) -> super::CloseWorktreeEffects {
+        super::CloseWorktreeEffects {
+            stop_fsmonitor: Box::new(stop_fsmonitor),
+            observe_open_descriptors: Box::new(|_| {
+                panic!("must not scan for open descriptors before quarantine commits")
+            }),
+            observe_external_writer: Box::new(|_| {
+                panic!("must not scan for an external writer before quarantine commits")
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quarantine_rejects_positive_or_failed_writer_observations_before_deletion() {
+        for observation in 0..4 {
+            let temp = tempfile::tempdir().unwrap();
+            let target = linked_close_worktree(&temp);
+            let identity = inspection_identity(&target);
+            let snapshot = inspect_worktree(&identity).await.unwrap().0;
+            let common = super::exact_worktree_common_git_dir(&target).unwrap();
+            let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+            let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+            let mut effects =
+                injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
+            effects.observe_open_descriptors = Box::new(move |_| match observation {
+                0 => Ok(super::ExternalWriterEvidence::PositiveWriterFound),
+                1 => Err("injected descriptor observation failure".into()),
+                _ => Ok(super::ExternalWriterEvidence::NoPositiveEvidence),
+            });
+            effects.observe_external_writer = Box::new(move |_| match observation {
+                2 => Ok(true),
+                3 => Err("injected writer observation failure".into()),
+                _ => panic!("later writer observation must not run after descriptor rejection"),
+            });
+            let outcome = super::quarantine_and_remove_exact_worktree_with_effects(
+                &identity,
+                &snapshot,
+                admin.clone(),
+                incarnation,
+                None,
+                |_, _, _| panic!("must not bind deletion after rejected writer evidence"),
+                |_| {},
+                effects,
+            )
+            .await;
+            match observation {
+                0 | 2 => assert!(matches!(
+                    outcome.unwrap(),
+                    ExactWorktreeRemoval::Residual { .. }
+                )),
+                _ => assert!(matches!(outcome, Err(ref detail) if detail.contains("injected"))),
+            }
+            let retained = worktree_quarantine_path(&identity).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(retained.join("tracked")).unwrap(),
+                "initial\n"
+            );
+            assert!(admin.exists());
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_fsmonitor_stop_never_reaches_quarantine_or_later_effects() {
@@ -9459,7 +9590,7 @@ mod tests {
         let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
         let confirmed = inspect_worktree(&identity).await.unwrap().0;
         let later_effect = target.with_extension("later-effect");
-        let result = super::quarantine_and_remove_exact_worktree_with_stop(
+        let result = super::quarantine_and_remove_exact_worktree_with_effects(
             &identity,
             &confirmed,
             administrative.clone(),
@@ -9472,7 +9603,9 @@ mod tests {
                     std::fs::write(later_effect, "ran").unwrap();
                 }
             },
-            |_| Err("injected fsmonitor timeout".into()),
+            injected_close_worktree_effects_rejecting_scans(|_| {
+                Err("injected fsmonitor timeout".into())
+            }),
         )
         .await
         .unwrap();
@@ -9498,7 +9631,7 @@ mod tests {
         let confirmed = inspect_worktree(&identity).await.unwrap().0;
         let common = super::exact_worktree_common_git_dir(&target).unwrap();
         let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
-        let result = super::quarantine_and_remove_exact_worktree_with_stop(
+        let result = super::quarantine_and_remove_exact_worktree_with_effects(
             &identity,
             &confirmed,
             administrative,
@@ -9509,10 +9642,10 @@ mod tests {
             None,
             |_, _, _| panic!("must not bind a tombstone"),
             |_| panic!("must not quarantine a changed worktree"),
-            move |_| {
+            injected_close_worktree_effects_rejecting_scans(move |_| {
                 std::fs::write(&tracked, "changed while stopping\n").unwrap();
                 Ok(super::FsmonitorStop::Stopped)
-            },
+            }),
         )
         .await
         .unwrap();
@@ -9528,7 +9661,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_admission_rejects_when_a_target_holds_a_positive_writer() {
+    fn retry_writer_precondition_rejects_when_a_target_holds_a_positive_writer() {
         let original = Path::new("/captured/worktree");
         let quarantine = Path::new("/captured/quarantine");
         let error = super::probe_retry_worktree_writers_with(original, quarantine, None, |path| {
@@ -9552,7 +9685,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_admission_rejects_when_observing_a_target_fails() {
+    fn retry_writer_precondition_rejects_when_observing_a_target_fails() {
         let original = Path::new("/captured/worktree");
         let quarantine = Path::new("/captured/quarantine");
         let error = super::probe_retry_worktree_writers_with(original, quarantine, None, |path| {
@@ -9570,7 +9703,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_admission_admits_when_no_target_holds_a_writer() {
+    fn retry_writer_precondition_accepts_when_no_target_holds_a_writer() {
         let original = Path::new("/captured/worktree");
         let quarantine = Path::new("/captured/quarantine");
         let tombstone = CloseWorktreeFinalTombstone {
@@ -9584,7 +9717,7 @@ mod tests {
         super::probe_retry_worktree_writers_with(original, quarantine, Some(&tombstone), |path| {
             observed.push(path.to_path_buf());
             Ok(if path == original {
-                // Absent targets cannot be held; admission must ignore them.
+                // Absent targets cannot be held; the precondition ignores them.
                 super::RetryTargetObservation::Absent
             } else {
                 super::RetryTargetObservation::Present(
@@ -9592,7 +9725,7 @@ mod tests {
                 )
             })
         })
-        .expect("absent or writer-free targets must admit a fresh retry run");
+        .expect("absent or writer-free targets must pass the retry writer precondition");
         assert_eq!(
             observed,
             vec![
@@ -9600,7 +9733,7 @@ mod tests {
                 quarantine.to_path_buf(),
                 tombstone.root.join("object"),
             ],
-            "admission must observe each candidate once in original, quarantine, object order"
+            "the precondition must observe each candidate once in original, quarantine, object order"
         );
     }
 
@@ -10711,12 +10844,6 @@ mod tests {
         assert!(losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
-    }
-
-    #[test]
-    fn descriptor_scan_has_no_external_executable_dependency() {
-        let source = include_str!("close_retirement.rs");
-        assert!(!source.contains("Command::new(\"lsof\")"));
     }
 
     #[cfg(target_os = "linux")]
