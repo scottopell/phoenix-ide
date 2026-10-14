@@ -21292,6 +21292,11 @@ mod tests {
     #[tokio::test]
     async fn coordinator_continuation_commit_admits_automatic_work() {
         let db = Database::open_in_memory().await.unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let home_scope = db
+            .initialize_coordinator_work_scope(home.path())
+            .await
+            .unwrap();
         let coordinator = db
             .get_or_create_coordinator(
                 Some("test-model"),
@@ -21299,6 +21304,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            coordinator.attached_work_scope_id,
+            Some(home_scope.work_scope_id)
+        );
         db.set_auto_continue_on_context_exhaustion(
             &coordinator.product_conversation_id,
             AutoContinueOnContextExhaustion::Enabled,
