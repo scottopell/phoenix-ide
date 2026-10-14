@@ -929,3 +929,11 @@ joint receipt also hashes its own helper bytes. Helper mutation, receiver early
 expiry, original-view inventory/correlation omissions, late capture and cleanup
 ordering have compiler-free negative regressions. These are source/unit guards,
 not executed app, receiver, Rust or lifecycle readiness receipts.
+
+Rereview of local `e552ff5d` found a report-local trace provenance gap: a trace
+observed for another history journey could satisfy the global captured-record
+lookup. The follow-up requires a matching finite request record owned by the
+current report whose request ID is also explicitly correlated in that report.
+A two-request UNIT regression accepts the report's own trace and rejects both
+borrowing another journey's trace and adding that foreign request ID alongside
+it. The blocked checkpoint was not pushed or activated.

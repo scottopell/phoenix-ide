@@ -169,9 +169,12 @@ export function appendObservedHistory(result, inventory, identity, module) {
     const finite = inventory.requestRecords.filter(record => record.kind === 'request' && record.open_id === report.open_id);
     assert.ok(finite.length > 0, 'history report needs independently observed finite request');
     module.assertRequestCorrelation(finite.map(record => record.open_id), report);
+    const reportedRequests = new Set(report.correlations.filter(c => c.kind === 'request').map(c => c.id));
     for (const correlation of report.correlations) {
       const observed = inventory.requestRecords.some(record => correlation.kind === 'trace'
-        ? record.trace_id === correlation.id : record.kind === correlation.kind && record.open_id === correlation.id);
+        ? record.kind === 'request' && record.open_id === report.open_id && reportedRequests.has(record.open_id)
+          && record.trace_id === correlation.id
+        : record.kind === correlation.kind && record.open_id === correlation.id);
       assert.ok(observed, 'history report correlation must have independent request/response provenance');
     }
     added.push(module.journeyExpectation(report, identity));

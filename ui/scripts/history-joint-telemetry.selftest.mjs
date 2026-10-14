@@ -156,3 +156,16 @@ test('source observer precedes first history navigation and union follows browse
   const stopped = source.indexOf("command({ command: 'stop' })", union);
   assert.ok(closed > 0 && closed < union && union < stopped);
 });
+
+test('UNIT ONLY history trace belongs to the same report request, never a different observed journey', () => {
+  const own = historyInventory();
+  own.requestRecords[0].trace_id = 'a'.repeat(32);
+  own.reports[0].correlations.push({ kind: 'trace', id: 'a'.repeat(32) });
+  own.requestRecords.push({ kind: 'request', open_id: 'unit-other-journey', trace_id: 'b'.repeat(32) });
+  appendObservedHistory(stock(), own, input().fixtures.identity, unitModule);
+  const borrowed = structuredClone(own);
+  borrowed.reports[0].correlations.find(c => c.kind === 'trace').id = 'b'.repeat(32);
+  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule), /independent request\/response provenance/);
+  borrowed.reports[0].correlations.push({ kind: 'request', id: 'unit-other-journey' });
+  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule), /independent request\/response provenance/);
+});
