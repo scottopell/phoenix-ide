@@ -474,3 +474,78 @@ public-control, or app/generated-DTO change was performed. Offline replay is not
 normal runtime completion, Global fault/anchor/reconnect acceptance, shipping,
 provider, or physical-device qualification. The current40 forced cleanup remains
 failed/incomplete runtime evidence, not a retroactive pass.
+
+## Explicit document navigation lifecycle correction on parent bd (offline only)
+
+The actual retained bd ordinary request51 is an owned GET born at **2332.471986ms**,
+navEpoch2, `net::ERR_ABORTED`, expected transport failure **false**. It is distinct
+from actual request126 (expected owned proxy fault **true**) and the retained
+`destroy-roster` preview receipt. The old logger has no failure time or explicit
+goto/document confirmation receipts. Request51 is therefore a **trace candidate**,
+not proven navigation cancellation; this change does not relabel the old failed
+qualification or claim a proven old cause.
+
+### Recorder lifecycle contract
+
+Only the driver's existing `manual_identity` and `pending_historical` explicit
+`page.goto` calls begin a typed document scope, immediately before goto. Requests
+receive immutable birth scope, original metadata and navigation epoch. SPA pins,
+chapter clicks, and arbitrary frame/hash events do not begin scopes. Confirmation
+is called after awaited goto with its actual Playwright Response, never JSON or a
+fabricated runtime Response. The installed handler must have observed that exact
+Response/request object: HTTP200 navigation request, main-frame identity, exact
+original/request/response target URL (strip fragment only), and a subsequent
+main-frame event with matching frame/current URL. Intent, document receipt, frame
+and confirmation URLs/times are logged in `browser-navigation.jsonl`.
+
+A preexisting required request from the immediately replaced scope with exact
+`net::ERR_ABORTED`, observed after intent, may enter
+`awaiting_document_supersession_confirmation`. Its deadline is **11 seconds from
+original failure**, never reset by confirmation or seal. Only actual matching
+document confirmation permits terminal
+`oldrequestCanceledAsSupersededNavigation`. A separate canceled inventory retains
+original request/failure/time/context/intent/document proof; it is not a body
+receipt and fabricates no missing semantics. `partial: false` means the sealed
+inventory contains no pending operations; terminal cancellations and terminal
+fatal failures are both drained, but fatal failures still reject qualification.
+Seal imposes its own maximum11s hard wall. Current/same-context aborts, failures
+before intent, foreign/wrong/failed/unconfirmed documents, non-navigation responses,
+SPA-only events, other error strings and late confirmation remain fatal. HTTP200
+unreadable old required bodies still fail the unchanged strict body validator.
+The existing expected-owned-proxy-fault snapshot at request birth is unchanged.
+
+After explicit navigation, qualification separately requires at least one
+complete strict HTTP aggregate body born in the **current document scope**,
+matching product/root/selected route and the latest registered roster/opening
+identity. Old captured bodies, old canceled requests and current expected proxy
+faults cannot satisfy that obligation. Current bodies must still resolve actual
+independent committed IPC evidence where required. Global prefix fault, real SSE
+body/cursor checks, normal server cleanup and all previous guards are preserved.
+
+### Executed compiler-free audit matrix
+
+| Check | Result / scope |
+|---|---|
+| Six Node selftest files | **92 passed, zero skipped** (all previous48 guards plus44 lifecycle guards). Ordinary and Global cover strict current-body positives; missing/wrong/failed/unconfirmed documents; foreign-frame/not-navigation/unobserved-response; current/no-intent/before-intent/other-error aborts; SPA-only, original11s deadline and seal cap; old-body-only, missing/stale/wrong-owner current body and unreadable old HTTP200 body negatives. |
+| Retained bd installed-handler replay | Actual request51 and retained document-request metadata/full aggregate bytes, with preserved line/file hashes. **Synthetic controlled event ordering and navigation/frame adapters**, explicitly not actual old cause proof. Request51 is required for ordinary, metadata-only for Global. Retained request126 true fault classification/preview destroy are independently checked. |
+| Authentic ordinary/shipping Global offline replays | **25 + 14** unchanged raw bodies, source and provenance hashes retained. Shipping Global still does not prove a Pending transition. |
+| Authentic response-before-IPC staging replays | **25 ordinary + 3 Global** unchanged raw bodies captured; authentic40/5fb IPC sources preserved. |
+| Python opening wrapper | **16 passed**. |
+| Restricted dev.py lanes | Task, spec-shape, dev.py unit tests and spec-anchors passed; no compiler lane. |
+
+Local output manifests, provenance, installed-handler receipts/drains and test logs
+are under `.phoenix/evidence/continuous-history/navigationbd-offline/` (harness-local
+pointers). Reproduce the added lifecycle tests with
+`HISTORY_AUTHORITY_EVIDENCE=.phoenix/evidence/continuous-history node --test ui/scripts/history-opening-navigation.selftest.mjs`.
+The optional `HISTORY_NAVIGATION_OUTPUT` path retains the explicitly labelled
+trace-candidate replay receipts; it is only an offline test output, not a runtime
+control. The first shipping Global CLI staging invocation omitted its actual
+`browser-api.jsonl`/`driver-api.jsonl` inputs and rejected before replay; the corrected
+invocation captured14 bodies. Neither invocation modifies retained inputs.
+
+**Residual gates:** parent independent exact-head review before the one permitted
+instrumented runtime attempt; actual owned main-document response/frame event
+ordering and new intent/failure/confirmation receipts; real Global prefix fault,
+accepted SSE/reconnect/send/anchor and normal cleanup. No runtime, hosted, build,
+production, push, shipping/provider or physical-device action was executed here.
+App source remains unchanged at d4; no app/framework/public controls were added.

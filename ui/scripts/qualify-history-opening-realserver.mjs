@@ -231,6 +231,9 @@ export async function releaseOnce(state, send) {
   assert.equal((await send({ command: 'release', predecessor: state.predecessor, client_turn_key: state.key })).state, 'released');
 }
 
+/** @typedef {{kind: 'explicit_document_navigation', phase: 'manual_identity' | 'pending_historical', target: string}} NavigationIntent */
+const documentUrl = value => { const url = new URL(value); url.hash = ''; return url.href; };
+
 /** @typedef {{kind: 'required_aggregate_json'} | {kind: 'metadata_only'}} CapturePolicy */
 export const REQUIRED_BODY_DEADLINE_MS = 11000;
 export const REQUIRED_BODY_MAX_BYTES = 2 * 1024 * 1024;
@@ -250,17 +253,35 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   expectedRequestFailure = () => false, requestStamp = () => null,
   clock = { now: () => performance.now(), setTimeout, clearTimeout },
 } = {}) {
+  deadlineMs = Math.min(deadlineMs, REQUIRED_BODY_DEADLINE_MS);
   aggregate = { ...aggregate, members: [...aggregate.members], opening_evidence: { ...aggregate.opening_evidence } };
   let reservation = null, reservationEpoch = 0;
   const requests = [], failed = [], applicationErrors = [], captureErrors = [];
   const identities = new WeakMap(), required = new Map(), tasks = new Set();
   let ordinal = 0, navigationEpoch = 0, sealed = false, drain, drainDeadline, drainTimer, drainComplete = false;
+  let scope = 0, transition = null;
+  const documents = new WeakMap();
+  const navigationReceipts = [];
+  const navigationRecord = value => { navigationReceipts.push(value); record('browser-navigation.jsonl', value); };
+  const cancelSuperseded = state => {
+    const t = state.transition;
+    if (!t?.confirmation || clock.now() >= state.confirmation_deadline) return;
+    clock.clearTimeout(state.confirmationTimer);
+    state.outcome = 'oldrequestCanceledAsSupersededNavigation';
+    state.supersession_proof = t.confirmation;
+    record('browser-required-transport.jsonl', { ...state.metadata, failure: state.failure,
+      failure_at: state.failure_at, outcome: state.outcome, navigation_intent: t.intent,
+      supersession_proof: state.supersession_proof });
+    notify();
+  };
   let wake;
   const notify = () => { wake?.(); wake = undefined; };
-  const pending = () => [...required.values()].filter(s => ['awaiting_response', 'reading_body', 'awaiting_independent_committed_evidence'].includes(s.outcome));
+  const pending = () => [...required.values()].filter(s => ['awaiting_response', 'reading_body', 'awaiting_independent_committed_evidence', 'awaiting_document_supersession_confirmation'].includes(s.outcome));
   const inventory = (partial) => ({ sealed, partial, pending_required: pending().length, pending_body_tasks: tasks.size,
     pending_metadata: pending().map(s => ({ ...s.metadata, outcome: s.outcome })),
-    drain_deadline: drainDeadline ?? null,
+    drain_deadline: drainDeadline ?? null, navigation_receipts: navigationReceipts,
+    canceled_inventory: [...required.values()].filter(s => s.outcome === 'oldrequestCanceledAsSupersededNavigation')
+      .map(s => ({ ...s.metadata, failure: s.failure, failure_at: s.failure_at, navigation_intent: s.transition.intent, supersession_proof: s.supersession_proof })),
     required_outcomes: [...required.values()].map(({ metadata, outcome, expected_transport_failure }) => ({ ...metadata, outcome, expected_transport_failure })),
     application_page_errors: applicationErrors, cdp_capture_errors: captureErrors });
   const outside = (req, event) => record('browser-outside-capture.jsonl', { policy: { kind: 'outside_capture' },
@@ -268,7 +289,7 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   const identity = req => {
     if (!identities.has(req)) identities.set(req, Object.freeze({
       request_ordinal: ++ordinal, identity_source: 'playwright_request_local_ordinal',
-      navigation_epoch: navigationEpoch, url: req.url(), method: req.method(), at: clock.now(),
+      navigation_scope: scope, navigation_epoch: navigationEpoch, url: req.url(), method: req.method(), at: clock.now(),
       raw_request_stamp: structuredClone(requestStamp(req)),
       status: null, type: null, response_at: null,
     }));
@@ -288,10 +309,25 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   };
   const onFailed = req => {
     if (sealed && !identities.has(req)) { outside(req, 'requestfailed'); return; }
-    const entry = { ...identity(req), failure: req.failure(), outcome: 'request_failed' };
+    const entry = { ...identity(req), failure: structuredClone(req.failure()), failure_at: clock.now(), outcome: 'request_failed' };
     failed.push(entry); record('browser-failed.jsonl', entry);
     const state = required.get(entry.request_ordinal);
     if (state?.outcome === 'awaiting_response') {
+      state.failure = entry.failure; state.failure_at = entry.failure_at;
+      const t = transition;
+      if (!state.expected_transport_failure && entry.failure?.errorText === 'net::ERR_ABORTED'
+          && t && entry.navigation_scope === t.from_scope && entry.at <= t.intent.at && entry.failure_at >= t.intent.at) {
+        state.outcome = 'awaiting_document_supersession_confirmation'; state.transition = t;
+        state.confirmation_deadline = entry.failure_at + Math.min(deadlineMs, REQUIRED_BODY_DEADLINE_MS);
+        state.confirmationTimer = clock.setTimeout(() => {
+          if (state.outcome !== 'awaiting_document_supersession_confirmation') return;
+          state.outcome = 'capture_failed'; emitFailure(state.metadata, 'navigation_confirmation_deadline', 'original failure confirmation deadline',
+            { failure: state.failure, failure_at: state.failure_at, navigation_intent: t.intent }); notify();
+        }, Math.min(deadlineMs, REQUIRED_BODY_DEADLINE_MS));
+        record('browser-required-transport.jsonl', { ...entry, outcome: state.outcome, navigation_intent: t.intent,
+          absolute_deadline: state.confirmation_deadline });
+        cancelSuperseded(state); notify(); return;
+      }
       state.outcome = 'request_failed';
       record('browser-required-transport.jsonl', { ...entry, expected_transport_failure: state.expected_transport_failure });
       notify();
@@ -301,8 +337,22 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     const entry = { error: String(error), at: performance.now(), navigation_epoch: navigationEpoch };
     applicationErrors.push(entry); record('page-errors.jsonl', entry);
   };
-  const onNavigation = frame => { if (frame === page.mainFrame()) navigationEpoch++; };
+  const onNavigation = frame => {
+    if (frame !== page.mainFrame()) return;
+    navigationEpoch++;
+    if (transition && !transition.confirmation) {
+      transition.frame = frame; transition.frame_url = frame.url(); transition.frame_at = clock.now();
+      transition.frame_epoch = navigationEpoch;
+    }
+  };
   const onResponse = response => {
+    const documentRequest = response.request();
+    if (documentRequest.isNavigationRequest?.() && documentRequest.frame() === page.mainFrame()) {
+      const receipt = { ...identity(documentRequest), document_url: response.url(), status: response.status(),
+        is_navigation_request: true, main_frame: true, document_response_at: clock.now() };
+      documents.set(response, { receipt, request: documentRequest, frame: documentRequest.frame() });
+      navigationRecord({ outcome: 'main_document_response', ...receipt });
+    }
     if (!new URL(response.url()).pathname.startsWith('/api/')) return;
     const req = response.request();
     if (sealed && !identities.has(req)) { outside(req, 'response'); return; }
@@ -383,7 +433,11 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   };
   const terminatePending = reason => {
     for (const state of pending()) {
-      if (state.outcome === 'awaiting_response') {
+      if (state.outcome === 'awaiting_document_supersession_confirmation') {
+        clock.clearTimeout(state.confirmationTimer); state.outcome = 'capture_failed';
+        emitFailure(state.metadata, reason, 'unconfirmed document supersession',
+          { failure: state.failure, failure_at: state.failure_at, navigation_intent: state.transition.intent });
+      } else if (state.outcome === 'awaiting_response') {
         state.outcome = 'capture_failed'; emitFailure(state.metadata, reason, `required request ${reason} before response`);
       } else state.dispose?.(reason);
     }
@@ -427,6 +481,42 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
         for (const state of pending()) if (state.candidate) { state.committed_evidence_source = structuredClone(source); state.commit?.(); }
       } catch (error) { terminatePending('independent_evidence_mismatch'); throw error; }
     },
+    /** @param {NavigationIntent} intent */
+    beginNavigation(intent) {
+      assert.ok(!sealed && (!transition || transition.confirmation), 'navigation must be sequential and unsealed');
+      assert.equal(intent.kind, 'explicit_document_navigation');
+      assert.ok(['manual_identity', 'pending_historical'].includes(intent.phase), 'named driver navigation phase');
+      const target = new URL(intent.target);
+      assert.equal(target.pathname, aggregate.route, 'owned document route');
+      assert.ok(aggregate.members.includes(target.searchParams.get('source_transcript')), 'owned document source');
+      loopback(target.origin);
+      const token = Object.freeze({ ...intent, target: target.href, at: clock.now(), from_scope: scope, to_scope: scope + 1 });
+      transition = { intent: token, from_scope: scope }; scope++;
+      navigationRecord({ outcome: 'navigation_intent', ...token });
+      return token;
+    },
+    confirmNavigation(token, response) {
+      try {
+        assert.ok(transition?.intent === token && !transition.confirmation, 'actual active intent identity');
+        const d = documents.get(response), t = transition;
+        assert.ok(d && d.request === response.request() && d.frame === page.mainFrame(), 'observed main document response/request/frame identity');
+        assert.equal(d.receipt.navigation_scope, token.to_scope); assert.equal(d.receipt.status, 200);
+        assert.equal(documentUrl(d.receipt.url), documentUrl(token.target), 'original exact document target');
+        assert.equal(documentUrl(d.receipt.document_url), documentUrl(token.target), 'response exact document target');
+        assert.ok(d.receipt.at >= token.at && d.receipt.document_response_at >= token.at);
+        assert.ok(t.frame === d.frame && t.frame_at >= d.receipt.document_response_at, 'actual post-response main frame navigation');
+        assert.equal(documentUrl(t.frame_url), documentUrl(token.target));
+        assert.equal(documentUrl(page.mainFrame().url()), documentUrl(token.target));
+        t.confirmation = Object.freeze({ ...d.receipt, outcome: 'document_supersession_confirmed', phase: token.phase,
+          from_scope: token.from_scope, to_scope: token.to_scope, intent_at: token.at,
+          frame_navigation_at: t.frame_at, frame_navigation_epoch: t.frame_epoch, frame_url: t.frame_url, confirmation_at: clock.now() });
+        navigationRecord(t.confirmation);
+        for (const state of pending()) if (state.transition === t) cancelSuperseded(state);
+        return t.confirmation;
+      } catch (error) {
+        emitFailure({ navigation_scope: scope }, 'navigation_confirmation', error); terminatePending('navigation_confirmation'); throw error;
+      }
+    },
     registerKnownOpening(evidence) {
       assert.ok(ordinal === 0 && !sealed && !reservation, 'known facts must precede all requests and reservations');
       assert.ok(EDGE_FIELDS.every(k => typeof evidence[k] === 'string' && evidence[k].length > 0));
@@ -457,9 +547,17 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     },
     assertQualified() {
       assert.ok(sealed && drainComplete && tasks.size === 0 && pending().length === 0, 'sealed completed drain required');
+      if (scope > 0) {
+        assert.ok(transition?.confirmation, 'current document navigation confirmation required');
+        assert.ok(snapshots.some(s => {
+          if (s.navigation_scope !== scope || s.data.latest_transcript_row_id !== aggregate.members.at(-1)) return false;
+          try { validateOwnedAggregate(aggregate, s.data, s.url); return true; } catch { return false; }
+        }), 'complete strict current document aggregate body required');
+      }
       assert.deepEqual(applicationErrors, [], 'application page errors');
       assert.deepEqual(captureErrors, [], 'required API/CDP capture errors');
       assert.ok([...required.values()].every(s => s.outcome === 'captured'
+        || s.outcome === 'oldrequestCanceledAsSupersededNavigation'
         || (s.outcome === 'request_failed' && s.expected_transport_failure === true)), 'all required outcomes captured or exact expected transport failure');
     },
   };
@@ -582,7 +680,9 @@ async function run() {
     const predecessor = await http('GET', `/api/conversations/${oldEdge.predecessor_transcript_row_id}`);
     const boundaryMessage = predecessor.messages.find(m => m.message_id === oldEdge.continuation_message_id);
     assert.ok(boundaryMessage); assert.equal(boundaryMessage.content.summary, openingMessage.content.text);
-    await page.goto(ui + sourceLink(a, gate.predecessor, openingId), { waitUntil: 'domcontentloaded' });
+    const manual_identityNavigation = recorder.beginNavigation({ kind: 'explicit_document_navigation', phase: 'manual_identity', target: ui + sourceLink(a, gate.predecessor, openingId) });
+    const manual_identityDocument = await page.goto(ui + sourceLink(a, gate.predecessor, openingId), { waitUntil: 'domcontentloaded' });
+    recorder.confirmNavigation(manual_identityNavigation, manual_identityDocument);
     await page.locator(persistedMessageSelector(openingId)).first().waitFor({ state: 'visible' });
     checked('manual equal-text accepted opening remains separate', { edge: oldEdge, opening_id: openingId, boundary_id: oldEdge.continuation_message_id });
 
@@ -616,7 +716,9 @@ async function run() {
     updateFault(fault, { streamPath: `/api/conversations/${latest}/stream` });
     const start = snapshots.length;
     const middle = a.occurrences.filter(k => k[0] === 1)[20][2];
-    await page.goto(ui + sourceLink(a, a.members[1], middle), { waitUntil: 'domcontentloaded' });
+    const pending_historicalNavigation = recorder.beginNavigation({ kind: 'explicit_document_navigation', phase: 'pending_historical', target: ui + sourceLink(a, a.members[1], middle) });
+    const pending_historicalDocument = await page.goto(ui + sourceLink(a, a.members[1], middle), { waitUntil: 'domcontentloaded' });
+    recorder.confirmNavigation(pending_historicalNavigation, pending_historicalDocument);
     await poll(() => snapshots.slice(start).find(s => belongsToAggregate(a, s) && s.data.latest_transcript_row_id === latest && openingMatches(s.data.latest_opening, entered, 'pending')), 'browser Pending aggregate');
     await page.locator(persistedMessageSelector(middle)).first().waitFor({ state: 'visible' });
     await poll(composerReadonly, 'Pending composer readonly');
