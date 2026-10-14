@@ -10,13 +10,13 @@
 use super::wire::SseWireEvent;
 use crate::runtime::SseEvent;
 use axum::http::{HeaderMap, HeaderValue};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 const CONVERSATION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -253,7 +253,7 @@ async fn project_sse_wire(
     audience: SseStreamAudience,
     event: SseEvent,
 ) -> SseWireEvent {
-    use super::event_presentation::{event_messages, EventPresentations};
+    use super::event_presentation::{EventPresentations, event_messages};
     let presentations = match audience {
         SseStreamAudience::Authenticated => {
             EventPresentations::load(db, event_messages(&event)).await
@@ -287,7 +287,7 @@ mod tests {
     use crate::runtime::{ConversationMetadataUpdate, EnrichedConversation};
     use crate::state_machine::state::ConvState;
     use chrono::{TimeZone, Utc};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// Legacy `json!()` serialization — kept in tests only. The production
     /// path goes through `SseWireEvent`; this function is the gold-standard
@@ -719,6 +719,36 @@ mod tests {
         let value = serde_json::to_value(projected).unwrap();
         assert_eq!(value["messages"][0], expected);
         assert_eq!(value["pending_events"][0]["message"], expected);
+        for transcript in [
+            crate::runtime::InitTranscript::Tail(vec![message.clone()]),
+            crate::runtime::InitTranscript::Preserve,
+        ] {
+            let preserve = matches!(&transcript, crate::runtime::InitTranscript::Preserve);
+            let mut variant = init.clone();
+            if let SseEvent::Init {
+                transcript: rows,
+                pending_events,
+                ..
+            } = &mut variant
+            {
+                *rows = transcript;
+                pending_events.push(init.clone());
+            }
+            let collected = super::super::event_presentation::event_messages(&variant);
+            assert_eq!(collected.len(), if preserve { 3 } else { 4 });
+            let wire = project_sse_wire(&db, SseStreamAudience::Authenticated, variant).await;
+            let value = serde_json::to_value(wire).unwrap();
+            assert_eq!(
+                value["messages"].as_array().unwrap().len(),
+                usize::from(!preserve)
+            );
+            assert_eq!(value["pending_events"][0]["message"], expected);
+            assert_eq!(value["pending_events"][1]["messages"][0], expected);
+            assert_eq!(
+                value["pending_events"][1]["pending_events"][0]["message"],
+                expected
+            );
+        }
         let shared = project_sse_wire(&db, SseStreamAudience::SharedTranscript, init).await;
         let value = serde_json::to_value(shared).unwrap();
         for projected in [
@@ -727,9 +757,11 @@ mod tests {
         ] {
             assert_eq!(projected["content"], expected["content"]);
             assert_eq!(projected["event_presentation"]["reason"], "redacted");
-            assert!(projected["event_presentation"]
-                .get("display_name")
-                .is_none());
+            assert!(
+                projected["event_presentation"]
+                    .get("display_name")
+                    .is_none()
+            );
         }
         let (tx, rx) = tokio::sync::broadcast::channel(2);
         tx.send(live_event.clone()).unwrap();
@@ -1279,18 +1311,26 @@ mod tests {
             message_id: "msg-steer-1".to_string(),
         };
 
-        assert!(SseStreamAudience::Authenticated
-            .prepare(queued.clone())
-            .is_some());
-        assert!(SseStreamAudience::SharedTranscript
-            .prepare(queued)
-            .is_none());
-        assert!(SseStreamAudience::SharedTranscript
-            .prepare(cancelled)
-            .is_none());
-        assert!(SseStreamAudience::SharedTranscript
-            .prepare(SseEvent::AgentDone { sequence_id: 24 })
-            .is_some());
+        assert!(
+            SseStreamAudience::Authenticated
+                .prepare(queued.clone())
+                .is_some()
+        );
+        assert!(
+            SseStreamAudience::SharedTranscript
+                .prepare(queued)
+                .is_none()
+        );
+        assert!(
+            SseStreamAudience::SharedTranscript
+                .prepare(cancelled)
+                .is_none()
+        );
+        assert!(
+            SseStreamAudience::SharedTranscript
+                .prepare(SseEvent::AgentDone { sequence_id: 24 })
+                .is_some()
+        );
     }
 
     #[test]
