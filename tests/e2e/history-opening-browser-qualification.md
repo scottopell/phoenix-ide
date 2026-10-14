@@ -549,3 +549,69 @@ ordering and new intent/failure/confirmation receipts; real Global prefix fault,
 accepted SSE/reconnect/send/anchor and normal cleanup. No runtime, hosted, build,
 production, push, shipping/provider or physical-device action was executed here.
 App source remains unchanged at d4; no app/framework/public controls were added.
+
+## Global prefix reader-ownership correction on parent b1 (offline only)
+
+Retained **b1e79db667a8f762a52ae2fd198a7ebf86170c6d** Global responses42,95,100
+contain respectively `[0,20,76,4]`, `[0,20,76,4,0]`, `[44,56,0,0,0]`
+segment message counts. All three report `has_older: true` with a nonempty
+`before`; request100 is an already captured positive prefix page, not exhausted
+history. Its next cursor is the target, not request95's earlier cursor. The
+retained request inventory has no subsequent prefix GET, and preview.log has
+no `destroy-roster` receipt. The old run remains **failed**, not qualified.
+
+The offline causal probe loads the **actual pinned d4** import-free
+`conversation/scrollMachine.ts` with Node26 `module.stripTypeScriptTypes` and a
+data-URL import. It checks each input file byte-for-byte against d4 git objects,
+extracts the actual `readerMovedViewport` function and `requestEarlierHistory`
+early-return guard, and executes these extracted expressions without invoking
+a load callback. Actual b1 raw bodies/cursors and independent Entered IPC remain
+unchanged, with retained file/line/raw hashes and source hashes in the output.
+
+**Synthetic offline causal scope:** navigation → measurement → DOM-style
+`scrollerAttached` at top leaves `navigating/positioning`, so the actual guard
+blocks. `upwardIntent` alone also leaves this navigation state ineligible.
+The actual onWheel order is `interactionStarted` then `upwardIntent`; together
+these transition to `navigating/user-returning`, making the **same retained
+cursor** reader-owned and eligible. Loading, older-error, already-scheduled,
+no-older and wrong-view cases still block. Geometry and event ordering here are
+explicitly synthetic; the retained browser log does not contain machine state
+or actual hardware gesture receipts. This is a demonstrated source-level causal
+mechanism, **not proof of the old browser's exact internal state**. REQ-MLRU-014
+intentionally prevents positioning commands acquiring reader ownership.
+
+Only the Global runtime prefix action changes: hover the actual `#messages`
+viewport, observe settled geometry/captured snapshots, then freeze the latest
+strict positive cursor and activate the existing owned preview fault **before**
+the first CDP hardware `page.mouse.wheel`. At most three negative wheels are
+allowed, each derived from observed `scrollTop`, capped at16384px, with observed
+viewport decrease/stability and the actual rendered `data-virtual-index` prefix
+range (`startIndex <= 2`, `scrollTop <= 2`). There is no DOM-top trigger, React
+callback or synthetic event. Missing sentinel/failure is a hard failure, not a
+retry loop. The first failed owned prefix GET must match the frozen current
+cursor; the exact existing proxy-destroy receipt, real earlier-history alert,
+Pending composer/key/gate and pin guards still precede release. Wheel pre/post
+geometry, selected request/cursor and restored premeasurement baseline are
+retained. The original historical DOM restore is allowed **only before anchor
+measurement**, not as evidence of user intent. Ordinary behavior is unchanged.
+
+### Executed bounded audit
+
+- Seven Node selftest files: **95 passed, zero skipped** = all previous48 +44
+  navigation guards +3 causal/action groups (including all five state negatives).
+- Actual b1 full raw response42/95/100 validation/selection replay and pinned d4
+  executable reducer/predicate/guard probe passed. No bytes were regenerated.
+- Python opening wrapper: **16 passed**. `git diff --check` passed.
+- Compiler-free task/spec-shape/spec-anchors dev.py lanes checked separately.
+
+Harness-local receipts/logs: `.phoenix/evidence/continuous-history/prefixb1-offline/`.
+Reproduce the additional probe with
+`HISTORY_PINNED_SOURCE=target/history-hidden-geometry-repair HISTORY_GLOBAL_B1_EVIDENCE=.phoenix/evidence/continuous-history/instrumentedb1-artifact/opening-browser-evidence/global node --test ui/scripts/global-history-prefix-causal.selftest.mjs`.
+`HISTORY_PREFIX_CAUSAL_OUTPUT` optionally retains the labelled offline JSON receipt.
+
+**Gate remains frozen:** parent independent exact-head review is mandatory before
+one successor attempt. No runtime/browser/server, dependency install, compiler,
+UI writer, build, hosted dispatch, push, provider request destruction, production
+or physical-device action was performed. App d4 is unchanged. Actual hardware
+wheel/sentinel timing, current-cursor fault, SSE/reconnect/send/anchor and normal
+cleanup remain runtime obligations, not retroactive acceptance of b1.

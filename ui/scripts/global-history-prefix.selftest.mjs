@@ -48,7 +48,7 @@ test('pinned d4 rendered prefix sentinel/error and exact physical selectors rema
   assert.ok(source.includes('olderHistoryError && hasOlderMessages && onLoadOlderMessages'));
   assert.ok(source.includes('onRangeChange={handleRangeChanged}'));
   const driver = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
-  const trigger = driver.indexOf('el.scrollTop = 0;');
+  const trigger = driver.indexOf('await page.mouse.wheel(0, deltaY);');
   const failed = driver.indexOf("'actual failed Global prefix GET'");
   const destroyed = driver.indexOf("assert.ok(destroyed,");
   const baseline = driver.indexOf("const before = await poll(() => anchor()");

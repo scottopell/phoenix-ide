@@ -563,6 +563,11 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   };
 }
 
+export function globalPrefixWheelDelta(viewport) {
+  assert.ok(Number.isFinite(viewport.scrollTop) && viewport.scrollTop >= 0, 'finite observed viewport');
+  return -Math.min(16384, Math.ceil(viewport.scrollTop) + 64);
+}
+
 export const GLOBAL_PREFIX_ERROR_TEXT = 'Could not load earlier history:';
 
 // Receipts are already validated by the installed recorder; revalidate the frozen selection.
@@ -727,15 +732,44 @@ async function run() {
     const pin = new URL(page.url()).searchParams.get('source_transcript'); assert.equal(pin, a.members[1]);
     if (a.kind === 'global') {
       const owned = { ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } };
-      const target = selectGlobalPrefixFault(owned, snapshots.slice(start), page.url(), latest);
       const prefixDeadline = performance.now() + 20000;
       const prefixBudget = () => { const left = Math.floor(prefixDeadline - performance.now()); assert.ok(left > 0, 'Global prefix action absolute 20s bound'); return Math.min(5000, left); };
-      const savedTop = await page.locator('#messages').evaluate(el => el.scrollTop);
+      const viewport = () => page.locator('#messages').evaluate(el => ({
+        scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight,
+        startIndex: Math.min(...[...el.querySelectorAll('[data-virtual-index]')].map(row => Number(row.dataset.virtualIndex))),
+      }));
+      await page.locator('#messages').hover({ timeout: prefixBudget() });
+      await poll(async () => {
+        const count = snapshots.length, pre = await viewport();
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const post = await viewport();
+        return count === snapshots.length && pre.scrollTop === post.scrollTop && pre.scrollHeight === post.scrollHeight;
+      }, 'settled Global viewport and captured prefix cursor', prefixBudget());
+      const target = selectGlobalPrefixFault(owned, snapshots.slice(start), page.url(), latest);
+      const savedViewport = await viewport(), savedTop = savedViewport.scrollTop;
       const pendingComposerCount = await page.locator(COMPOSER_SELECTOR).count();
       const failureStart = failed.length;
       updateFault(fault, { aggregatePath: target.pathname, failRoster: true });
-      // A DOM scroll uses the rendered transcript's prefix-top sentinel, not React internals.
-      await page.locator('#messages').evaluate(el => { el.scrollTop = 0; });
+      const wheelReceipts = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const pre = await viewport(), deltaY = globalPrefixWheelDelta(pre);
+        assert.equal(selectGlobalPrefixFault(owned, snapshots.slice(start), page.url(), latest).positive_baseline.next_before,
+          target.positive_baseline.next_before, 'no unowned cursor change after fault activation');
+        await page.mouse.wheel(0, deltaY);
+        const post = await poll(async () => {
+          const observed = await viewport();
+          if (!(observed.scrollTop < pre.scrollTop || (pre.scrollTop <= 2 && observed.scrollTop <= 2))) return false;
+          await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+          const settled = await viewport();
+          return settled.scrollTop === observed.scrollTop && settled.startIndex === observed.startIndex && settled;
+        }, 'hardware upward wheel observed viewport decrease', prefixBudget());
+        const atPrefix = post.scrollTop <= 2 && post.startIndex <= 2;
+        const receipt = { kind: 'cdp_hardware_upward_wheel', attempt: attempt + 1, deltaY, pre, post, atPrefix,
+          positive_baseline: target.positive_baseline };
+        wheelReceipts.push(receipt); record('global-prefix-wheels.jsonl', receipt);
+        if (atPrefix) break;
+      }
+      assert.ok(wheelReceipts.at(-1)?.atPrefix, 'bounded three-wheel walk reached rendered prefix sentinel');
       const request = await poll(() => failed.slice(failureStart).find(r =>
         faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')
         && new URL(r.url).searchParams.get('message_limit') === '100'
@@ -754,12 +788,15 @@ async function run() {
       assert.equal(gate.releaseAttempted, false);
       assert.equal(new URL(page.url()).searchParams.get('source_transcript'), pin);
       globalFaultObservation = { ...target, request, destroyed,
-        before_parameter: new URL(request.url).searchParams.get('before'), failed_while_pending: true };
+        before_parameter: new URL(request.url).searchParams.get('before'), failed_while_pending: true,
+        wheel_receipts: wheelReceipts, saved_viewport: savedViewport, pending_key: gate.key, gate_release_attempted: gate.releaseAttempted };
       checked('Global earlier-history acquisition failed while Pending before release', globalFaultObservation);
       await page.locator('#messages').evaluate((el, top) => { el.scrollTop = top; }, savedTop);
       await page.locator(persistedMessageSelector(middle)).first().waitFor({ state: 'visible', timeout: prefixBudget() });
       await page.locator(persistedMessageSelector(middle)).first().evaluate(el => el.scrollIntoView({ block: 'center' }));
       await prefixError.waitFor({ state: 'visible', timeout: prefixBudget() });
+      record('global-prefix-restored.jsonl', { viewport: await viewport(), saved_viewport: savedViewport, pending_key: gate.key,
+        gate_release_attempted: gate.releaseAttempted, positive_baseline: target.positive_baseline });
       prefixBudget();
     }
     const before = await poll(() => anchor(), 'historical physical anchor');
