@@ -111,6 +111,32 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("command = [str(destination), 'opening_qualifier::', '--nocapture', '--test-threads=1']", workflow)
         self.assertIn("'11 passed; 0 failed; 1 ignored'", workflow)
 
+    def test_donor_relative_helper_is_staged_hashed_and_discovered(self):
+        import ast
+        import hashlib
+        import textwrap
+        workflow = (opening.ROOT / ".github/workflows/ci.yml").read_text()
+        relative = "ui/scripts/view-telemetry-diagnostics.mjs"
+        self.assertIn(relative, opening.TELEMETRY_MODULES)
+        source = workflow.split("      - name: Genuine typed-contract codegen", 1)[1]
+        code = source.split("python3 - <<'PY'", 1)[1].split("\n          PY", 1)[0]
+        tree = ast.parse(textwrap.dedent(code))
+        expression = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "telemetry" for target in node.targets))
+        measured = eval(compile(ast.Expression(expression), "workflow telemetry hashes", "eval"),
+                        {"root": self.app, "hashlib": hashlib})
+        self.assertEqual(set(measured), set(opening.TELEMETRY_MODULES))
+        self.assertIn("test -f ../pinned-app/" + relative, workflow)
+        self.assertIn("scripts/view-telemetry-diagnostics.test.mjs", workflow)
+        self.assertIn(str(self.app / relative), self.identity()["runtime_imports"])
+        original_digest = self.digest
+        def changed(path):
+            return "changed-helper" if Path(path) == self.app / relative else original_digest(path)
+        with patch.object(opening.shipping, "git", self.git), \
+                patch.object(opening.shipping, "digest", changed):
+            with self.assertRaisesRegex(ValueError, "module hash mismatch"):
+                opening.identity(self.app, self.exe, self.receipt)
+
     def test_existing_hosted_job_qualifies_full_pinned_app_ui_before_capture(self):
         workflow = (opening.ROOT / ".github/workflows/ci.yml").read_text()
         start = workflow.index("      - name: Full UI source qualification at exact pinned app")
@@ -417,6 +443,76 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertEqual(failures["primary"]["message"], "startup primary")
         self.assertEqual(failures["cleanup"][0]["message"], "process cleanup failed")
         self.assertFalse((output / "global").exists())
+
+    def test_main_partial_forced_receipt_preserves_original_and_publishes_failed_summary(self):
+        from unittest.mock import Mock
+        output = self.root / "main-partial"
+        primary = AssertionError("startup primary")
+        writer = opening.shipping.write_json
+
+        def partial_write(path, value):
+            if path.name == "forced-server-shutdown.json":
+                path.write_text('{"status":')
+                raise OSError("partial forced receipt")
+            return writer(path, value)
+
+        argv = ["qualify", "--app-root", str(self.root), "--instrumented-exe", str(self.exe),
+                "--instrumented-receipt", str(self.root / "input.json"), "--output", str(output)]
+        server = Mock(poll=Mock(return_value=0), pid=1234)
+        with patch.object(opening.sys, "argv", argv), \
+                patch.object(opening.signal, "signal"), patch.object(opening.signal, "alarm"), \
+                patch.object(opening, "identity", return_value={}), \
+                patch.object(opening.shipping, "load_app_harness", return_value=Mock()), \
+                patch.object(opening.shipping.subprocess, "Popen", return_value=server), \
+                patch.object(opening.shipping, "stop"), \
+                patch.object(opening, "readiness", side_effect=primary), \
+                patch.object(opening.shipping, "write_json", side_effect=partial_write):
+            with self.assertRaises(AssertionError) as caught:
+                opening.main()
+        self.assertIs(caught.exception, primary)
+        summary = json.loads((output / "result.json").read_text())
+        self.assertEqual(summary["status"], "failed")
+        self.assertIn("startup primary", summary["error"])
+        self.assertEqual(summary["cases"]["ordinary"]["forced_shutdown"]["status"], "invalid_evidence")
+        self.assertEqual(summary["aggregation_errors"][0]["file"], "forced-server-shutdown.json")
+        self.assertEqual(summary["cases"]["ordinary"]["lifecycle_failures"]["cleanup"][0]["type"], "OSError")
+        self.assertEqual(summary["cases"]["global"]["lifecycle_failures"]["status"], "not_observed")
+
+    def test_main_invalid_receipt_cannot_promote_success(self):
+        output = self.root / "main-invalid"
+        def qualify(*args):
+            case = output / "ordinary"
+            case.mkdir()
+            (case / "lifecycle-failures.json").write_text("[]")
+        argv = ["qualify", "--app-root", str(self.root), "--instrumented-exe", str(self.exe),
+                "--instrumented-receipt", str(self.root / "input.json"), "--output", str(output)]
+        with patch.object(opening.sys, "argv", argv), \
+                patch.object(opening.signal, "signal"), patch.object(opening.signal, "alarm"), \
+                patch.object(opening, "identity", return_value={}), \
+                patch.object(opening, "qualify", side_effect=qualify):
+            with self.assertRaisesRegex(RuntimeError, "receipt aggregation failed"):
+                opening.main()
+        self.assertEqual(json.loads((output / "result.json").read_text())["status"], "failed")
+
+    def test_main_summary_write_failure_preserves_primary(self):
+        output = self.root / "main-summary-write"
+        primary = AssertionError("qualification primary")
+        writer = opening.shipping.write_json
+        def write(path, value):
+            if path.name == "result.json":
+                raise OSError("summary failed")
+            return writer(path, value)
+        argv = ["qualify", "--app-root", str(self.root), "--instrumented-exe", str(self.exe),
+                "--instrumented-receipt", str(self.root / "input.json"), "--output", str(output)]
+        with patch.object(opening.sys, "argv", argv), \
+                patch.object(opening.signal, "signal"), patch.object(opening.signal, "alarm"), \
+                patch.object(opening, "identity", return_value={}), \
+                patch.object(opening, "qualify", side_effect=primary), \
+                patch.object(opening.shipping, "write_json", side_effect=write):
+            with self.assertRaises(AssertionError) as caught:
+                opening.main()
+        self.assertIs(caught.exception, primary)
+        self.assertIsInstance(primary.__cause__, OSError)
 
     def test_normal_server_completion_requires_zero_and_owned_cleanup(self):
         from unittest.mock import Mock

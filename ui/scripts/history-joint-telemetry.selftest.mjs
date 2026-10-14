@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSyn
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
-import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_SPA_SELECTOR, UNIT_ONLY,
+import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, TELEMETRY_SPA_SELECTOR, UNIT_ONLY,
   prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage,
   installObservedHistoryTelemetry, appendObservedHistory } from './history-joint-telemetry.mjs';
 
@@ -29,11 +29,12 @@ function unitFiles() {
   const root = realpathSync(mkdtempSync(resolve(tmpdir(), 'joint-unit-')));
   mkdirSync(resolve(root, 'ui/scripts'), { recursive: true });
   const module = resolve(root, 'ui/scripts/qualify-view-telemetry.mjs'), fixture = resolve(root, 'fixture.json');
-  writeFileSync(module, 'UNIT_ONLY_not_the_donor_module'); writeFileSync(fixture, JSON.stringify(input()));
+  const diagnostics = resolve(root, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE);
+  writeFileSync(module, 'UNIT_ONLY_not_the_donor_module'); writeFileSync(diagnostics, 'UNIT_ONLY_not_the_diagnostics_helper'); writeFileSync(fixture, JSON.stringify(input()));
   const env = { HISTORY_TELEMETRY_JOINT: '1', HISTORY_TELEMETRY_FIXTURE: fixture,
     HISTORY_TELEMETRY_MODULE: module, HISTORY_TELEMETRY_MODULE_SHA256: TELEMETRY_MODULE_SHA256 };
-  const UNIT = { label: UNIT_ONLY, digest: () => TELEMETRY_MODULE_SHA256 };
-  return { root, module, fixture, env, UNIT, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  const UNIT = { label: UNIT_ONLY, digest: path => path === diagnostics ? TELEMETRY_DIAGNOSTICS_SHA256 : TELEMETRY_MODULE_SHA256 };
+  return { root, module, diagnostics, fixture, env, UNIT, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test('disabled stage does not admit imports or contexts (UNIT ONLY)', async () => {
@@ -54,6 +55,9 @@ for (const [name, mutate] of Object.entries({
   expected_hash: f => { f.env.HISTORY_TELEMETRY_MODULE_SHA256 = '0'.repeat(64); },
   actual_hash: f => { f.UNIT.digest = () => '0'.repeat(64); },
   symbolic_module: f => { rmSync(f.module); symlinkSync(f.fixture, f.module); },
+  missing_diagnostics: f => { rmSync(f.diagnostics); },
+  symbolic_diagnostics: f => { rmSync(f.diagnostics); symlinkSync(f.fixture, f.diagnostics); },
+  changed_diagnostics: f => { f.UNIT.digest = path => path === f.diagnostics ? '0'.repeat(64) : TELEMETRY_MODULE_SHA256; },
   app_pin: f => { const i = input(); i.fixtures.identity.appSource = '0'.repeat(40); writeFileSync(f.fixture, JSON.stringify(i)); },
 })) test(`pre-import guard rejects ${name} (UNIT ONLY)`, () => {
   const f = unitFiles(); try { mutate(f); assert.throws(() => prepareJointTelemetry({ env: f.env, appRoot: f.root, UNIT: f.UNIT })); } finally { f.cleanup(); }
@@ -85,6 +89,23 @@ test('UNIT ONLY stage owns a fresh context and closes it without promoting parti
       UNIT: { label: UNIT_ONLY, importModule: async () => ({ runTelemetryChecks: async () => stock() }) } });
     assert.deepEqual(calls, ['fresh', 'close']); assert.equal(result.receipt.classification.overhead_clearance, false);
     assert.match(result.receipt.scope.telemetry, /not telemetry lifecycle physical-target proof/);
+  } finally { f.cleanup(); }
+});
+test('UNIT ONLY donor primary survives context cleanup failure and retains dependency manifests', async () => {
+  const f = unitFiles(); try {
+    const config = prepareJointTelemetry({ env: f.env, appRoot: f.root, UNIT: f.UNIT });
+    const primary = new Error('donor primary');
+    const context = { newPage: async () => ({}), close: async () => { throw new Error('context cleanup'); } };
+    await assert.rejects(runJointTelemetryStage({ config, browser: { newContext: async () => context },
+      baseURL: 'http://127.0.0.1:12345', outputDir: f.root, harnessPath: import.meta.filename,
+      historyPhysical: { count: 1, visible: true, persistedMessageID: 'unit-exact' },
+      UNIT: { label: UNIT_ONLY, importModule: async () => ({ runTelemetryChecks: async () => { throw primary; } }) } }),
+    error => error === primary && error.joint_cleanup_failures[0] === 'context cleanup');
+    const manifest = JSON.parse(readFileSync(resolve(f.root, 'joint-telemetry-dependency-manifest.json'), 'utf8'));
+    assert.equal(manifest.primary_failure, 'donor primary');
+    assert.deepEqual(manifest.cleanup_failures, ['context cleanup']);
+    assert.deepEqual(manifest.before, manifest.after);
+    assert.equal(manifest.before[f.diagnostics], TELEMETRY_DIAGNOSTICS_SHA256);
   } finally { f.cleanup(); }
 });
 test('UNIT ONLY module failure propagates and still closes fresh context', async () => {

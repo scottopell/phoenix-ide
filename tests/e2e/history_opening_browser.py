@@ -5,10 +5,10 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent 2f57bd1 checkout, independently built ignored
+Inputs are a clean independent 4e615ea checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
-Opt-in hosted joint mode runtime-imports three hash-attested telemetry harness
+Opt-in hosted joint mode runtime-imports four hash-attested telemetry harness
 modules from immutable APP_ROOT; history-only behavior remains the default.
 Source/toolchain provenance is the build owner's attestation, not hash proof.
 Only compiler-free selftests may be run locally for this change.
@@ -31,15 +31,16 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "2f57bd1ba22569a01381d63117480cd946b6bd8d"
-TREE_PIN = "61b490ca88624f159a0eb51e35abc200c99220bd"
+PIN = "4e615ea3513bac5ee6f4cff797ec17a7bcb3dac0"
+TREE_PIN = "8535ae2edc92c4333e0e86cf85a7e1e5f89feaf0"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
 TELEMETRY_MODULES = {
-    "ui/scripts/qualify-view-telemetry.mjs": "d0a52f49d583ae55ede9320d6f2ef1bd581fdd2f17dff9f6f989e9a6f75adb83",
+    "ui/scripts/qualify-view-telemetry.mjs": "47850454849f7870c4374c7b071b74f9a436d3123f6e6017533e7305411ca42f",
+    "ui/scripts/view-telemetry-diagnostics.mjs": "2f3bd91d6f8243cbad4790af2ecde77835fefa9be2f9011b65f920c6ce7d233c",
     "tests/e2e/view_telemetry_sink.py": "aa3e704f4cf1ac356f130e8e64ed2733c7b253b9d927dd6544b301065b5790fd",
     "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",
 }
@@ -673,6 +674,20 @@ def qualify(app, exe, output, joint_telemetry=False):
                 failures.write_receipt(case / "lifecycle-failures.json")
 
 
+def retained_evidence(path, missing_status, errors):
+    if not path.is_file():
+        return {"status": missing_status}
+    try:
+        value = json.loads(path.read_text())
+        if not isinstance(value, dict):
+            raise ValueError("evidence receipt must be an object")
+        return value
+    except (OSError, ValueError) as error:
+        fact = {"file": path.name, "error_type": type(error).__name__}
+        errors.append(fact)
+        return {"status": "invalid_evidence", **fact}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app-root", required=True, type=Path)
@@ -692,6 +707,7 @@ def main():
               "uncovered": ["Shipping binary, real providers, production, physical devices.",
                 "Generated authority: pinned manual ContinueConversationRequest cannot select opening_authority."]}
     start = time.monotonic()
+    primary_error = None
     def expired(*_):
         raise TimeoutError("opening qualification whole-run deadline")
     signal.signal(signal.SIGALRM, expired)
@@ -704,27 +720,38 @@ def main():
         assert identity(app, exe, args.instrumented_receipt) == before, "artifact identity changed"
         result["status"] = "passed_assertions"
     except Exception as error:
+        primary_error = error
         result["error"] = f"{type(error).__name__}: {error}"
         raise
     finally:
         signal.alarm(0)
+        aggregation_errors = []
         result["cases"] = {kind: {
             "verified_runtime_startup": (output / kind / "startup.json").is_file(),
-            "server_completion": json.loads((output / kind / "server-completion.json").read_text())
-                if (output / kind / "server-completion.json").is_file() else {"status": "not_completed"},
-            "lifecycle_failures": json.loads((output / kind / "lifecycle-failures.json").read_text())
-                if (output / kind / "lifecycle-failures.json").is_file() else {"status": "not_observed"},
-            "forced_shutdown": json.loads((output / kind / "forced-server-shutdown.json").read_text())
-                if (output / kind / "forced-server-shutdown.json").is_file() else {"status": "not_observed"},
-            "browser": json.loads((output / kind / "browser-result.json").read_text())
-                if (output / kind / "browser-result.json").is_file() else {"status": "not_completed"},
-            "telemetry": json.loads((output / kind / "telemetry-final.json").read_text())
-                if (output / kind / "telemetry-final.json").is_file()
-                else {"status": "not_enabled_or_completed"}}
+            "server_completion": retained_evidence(output / kind / "server-completion.json",
+                                                    "not_completed", aggregation_errors),
+            "lifecycle_failures": retained_evidence(output / kind / "lifecycle-failures.json",
+                                                    "not_observed", aggregation_errors),
+            "forced_shutdown": retained_evidence(output / kind / "forced-server-shutdown.json",
+                                                  "not_observed", aggregation_errors),
+            "browser": retained_evidence(output / kind / "browser-result.json",
+                                         "not_completed", aggregation_errors),
+            "telemetry": retained_evidence(output / kind / "telemetry-final.json",
+                                           "not_enabled_or_completed", aggregation_errors)}
             for kind in ("ordinary", "global")}
         result["runtime_executed"] = any(case["verified_runtime_startup"] for case in result["cases"].values())
         result["elapsed_seconds"] = time.monotonic() - start
-        shipping.write_json(output / "result.json", result)
+        result["aggregation_errors"] = aggregation_errors
+        if aggregation_errors:
+            result["status"] = "failed"
+        try:
+            shipping.write_json(output / "result.json", result)
+        except Exception as publication_error:
+            if primary_error is not None:
+                raise primary_error from publication_error
+            raise
+        if aggregation_errors and primary_error is None:
+            raise RuntimeError("qualification receipt aggregation failed; see result.json")
 
 
 if __name__ == "__main__":

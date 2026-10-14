@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 2f57bd1ba22569a01381d63117480cd946b6bd8d
+          ref: 4e615ea3513bac5ee6f4cff797ec17a7bcb3dac0
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -248,8 +248,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 2f57bd1ba22569a01381d63117480cd946b6bd8d
-          test "$(git rev-parse HEAD^{tree})" = 61b490ca88624f159a0eb51e35abc200c99220bd
+          test "$(git rev-parse HEAD)" = 4e615ea3513bac5ee6f4cff797ec17a7bcb3dac0
+          test "$(git rev-parse HEAD^{tree})" = 8535ae2edc92c4333e0e86cf85a7e1e5f89feaf0
           test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
@@ -262,6 +262,7 @@ jobs:
                    for p in sorted((root / 'ui/src/generated').glob('*.ts'))}
           telemetry = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
                        for path in [root/'ui/scripts/qualify-view-telemetry.mjs',
+                                    root/'ui/scripts/view-telemetry-diagnostics.mjs',
                                     root/'tests/e2e/view_telemetry_sink.py',
                                     root/'tests/e2e/assert_view_telemetry.py']}
           pathlib.Path('../opening-codegen-receipt.json').write_text(json.dumps({
@@ -358,6 +359,12 @@ jobs:
           uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.test.py
           node --test ui/scripts/qualify-history-opening-realserver.selftest.mjs
           node --test ui/scripts/history-joint-telemetry.selftest.mjs
+          test -f ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
+          node --check ../pinned-app/ui/scripts/qualify-view-telemetry.mjs
+          node --check ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
+          cd ../pinned-app/ui
+          pnpm exec vitest run scripts/qualify-view-telemetry.test.mjs scripts/view-telemetry-diagnostics.test.mjs src/hooks/conversationViewDiagnostics.test.ts src/hooks/conversationViewJourney.test.ts src/hooks/conversationViewTelemetry.test.ts src/hooks/conversationViewLifecycle.test.ts src/hooks/useConversationViewJourney.test.tsx --maxWorkers=2
+          cd ../../harness
           node --check ui/scripts/qualify-history-opening-realserver.mjs
       - name: Full UI source qualification at exact pinned app (no filtered retry)
         shell: bash

@@ -981,3 +981,64 @@ not the ancillary ast-grep/Allium/spec group. A pure source-extracted regression
 executes the exact app's lane resolver, accepts that explicit list and rejects
 `ui`, without invoking lane setup/build/tests. The invalid preparation was never
 pushed. Counts/log/exit and scope receipts use the corrected command.
+
+
+## Causal diagnostic source integration after the joint telemetry failure
+
+Retained failure identity: application `2f57bd1ba22569a01381d63117480cd946b6bd8d`,
+harness `614b5d936332dc84649f588425941c805bfe3793`, run `38645213102`,
+instrumented job `116130254846`, artifact `11933141719`. Source gates passed,
+including genuine codegen, the actual one-test Coordinator DB fixture, eleven
+instrumentation guards with one ignored driver, and the full pinned-app UI
+suite. Ordinary history completed nine checks before the first telemetry trial
+failed. Global did not execute; forced cleanup is not normal shutdown proof.
+The separate standard Rust job is `116130356911`, terminal success at
+2026-10-14 22:28:53 UTC; the previously transcribed `116130359816` is invalid.
+
+The retained initial trial contains one correlated request, zero POSTs, no
+reports, and generic visible-readiness latency 1168.533933 ms. Its primary
+missing-report assertion was masked by a later finally POST-count assertion.
+Request correlation IDs can exist independently of producer sampling, so the
+old request-count sampling oracle is invalid. The original artifact lacks the
+producer admission/marks and detailed request facts needed to establish the
+cause of zero reports. It remains causal-unknown, not a demonstrated sampling,
+readiness, or transport bug.
+
+Telemetry donor delta `4d1c1009293e253bb562c8662afc38259fc2f79b` was integrated
+as application `4e615ea3513bac5ee6f4cff797ec17a7bcb3dac0`, tree
+`8535ae2edc92c4333e0e86cf85a7e1e5f89feaf0`, directly atop the retained `2f57bd1`
+application. The pinned `7af06a4` main base and cfg-test initializer correction
+remain present. The nine-file donor delta adds bounded content-free producer
+admission/mark/transport diagnostics, request-object-associated facts, and
+independent primary/cleanup error retention. Natural 0.25 sampling and readiness
+semantics are unchanged. Close-time producer delivery remains `not_proven`.
+
+The new relative-import dependency `ui/scripts/view-telemetry-diagnostics.mjs`
+is included by the exact application checkout, explicitly required by the
+workflow, included in the four-module codegen/runtime identity hashes, and
+attested alongside the donor before import and after the stage/context drain.
+Missing, symlinked, or changed helper bytes fail closed. Its focused test is
+explicitly discovered; no separate donor checkout is imported at runtime.
+
+Owned Python lifecycle glue preserves the original exception across nested
+process/receiver exits, retains up to eight separate cleanup errors with
+bounded messages, and writes distinct forced-stop observations. A forced
+return code zero does not overwrite the normal-completion gate. Main-level
+regressions cover partial receipt writes and final-summary publication errors:
+invalid evidence is explicit and cannot mask the primary exception or promote
+success. The shared Node stage also retains its primary error when context
+cleanup fails and records the executed dependency manifest on failed stages.
+
+Actual source-only checks on the integrated candidate: shipping Python 16,
+base Node 14, opening Python 40, opening Node 27, joint Node 45, and focused
+application Vitest 86 tests across seven files all passed; changed producer
+TypeScript ESLint and Node syntax/diff checks passed. The first local pnpm
+focused-test launch aborted before tests when it attempted dependency
+maintenance (`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`). It is retained
+separately. The passing focused ring used existing installed binaries through
+the verified dev.py Node environment without reinstalling or purging modules.
+Pre-existing SQLite fixture ResourceWarnings remain visible in Python logs.
+
+These are source/mock checks, not a new full UI, Rust/codegen, normal-shutdown,
+export, Global, or overhead qualification. No hosted publication, rerun,
+production mutation, or browser capture follows automatically from this packet.

@@ -4,9 +4,11 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = '2f57bd1ba22569a01381d63117480cd946b6bd8d';
+export const APP_PIN = '4e615ea3513bac5ee6f4cff797ec17a7bcb3dac0';
 export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
-export const TELEMETRY_MODULE_SHA256 = 'd0a52f49d583ae55ede9320d6f2ef1bd581fdd2f17dff9f6f989e9a6f75adb83';
+export const TELEMETRY_MODULE_SHA256 = '47850454849f7870c4374c7b071b74f9a436d3123f6e6017533e7305411ca42f';
+export const TELEMETRY_DIAGNOSTICS_SHA256 = '2f3bd91d6f8243cbad4790af2ecde77835fefa9be2f9011b65f920c6ce7d233c';
+export const TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE = 'ui/scripts/view-telemetry-diagnostics.mjs';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';
 export const TELEMETRY_SPA_SELECTOR = 'a.statebar-slug[href="/"][title="Back to conversations"]:visible';
 const ENV_KEYS = ['HISTORY_TELEMETRY_JOINT', 'HISTORY_TELEMETRY_FIXTURE', 'HISTORY_TELEMETRY_MODULE', 'HISTORY_TELEMETRY_MODULE_SHA256'];
@@ -81,10 +83,15 @@ export function prepareJointTelemetry({ env, appRoot, UNIT } = {}) {
   assert.ok(lstat(modulePath).isFile() && !lstat(modulePath).isSymbolicLink(), 'telemetry module must be a nonsymlink file');
   const digest = unit?.digest ?? (path => sha256(readFileSync(path)));
   assert.equal(digest(modulePath), TELEMETRY_MODULE_SHA256, 'telemetry module actual hash mismatch');
+  const diagnosticsPath = resolve(root, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE);
+  assert.equal(realpath(diagnosticsPath), diagnosticsPath, 'diagnostics helper realpath must remain within APP_ROOT');
+  assert.ok(lstat(diagnosticsPath).isFile() && !lstat(diagnosticsPath).isSymbolicLink(), 'diagnostics helper must be a nonsymlink file');
+  assert.equal(digest(diagnosticsPath), TELEMETRY_DIAGNOSTICS_SHA256, 'diagnostics helper actual hash mismatch');
+  const dependencies = Object.freeze({ [modulePath]: TELEMETRY_MODULE_SHA256, [diagnosticsPath]: TELEMETRY_DIAGNOSTICS_SHA256 });
   const fixturePath = resolve(nonempty(env.HISTORY_TELEMETRY_FIXTURE, 'telemetry fixture required'));
   assert.ok(lstat(fixturePath).isFile() && !lstat(fixturePath).isSymbolicLink(), 'telemetry fixture must be a nonsymlink file');
   const input = validateJointFixtures(JSON.parse(readFileSync(fixturePath, 'utf8')));
-  return Object.freeze({ modulePath, moduleHash: TELEMETRY_MODULE_SHA256, fixturePath, input, unitOnly: Boolean(unit) });
+  return Object.freeze({ modulePath, moduleHash: TELEMETRY_MODULE_SHA256, dependencies, fixturePath, input, unitOnly: Boolean(unit) });
 }
 
 function reportInventory(result) {
@@ -193,17 +200,23 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
   if (UNIT) assert.equal(UNIT.label, UNIT_LABEL);
   assert.ok(historyPhysical?.count === 1 && historyPhysical.visible === true && historyPhysical.persistedMessageID,
     'independent sealed history physical target receipt required');
-  if (!config.unitOnly) assert.equal(sha256(readFileSync(config.modulePath)), config.moduleHash, 'module changed before runtime import');
+  const dependencyManifest = () => Object.fromEntries(Object.keys(config.dependencies).map(path => [path, sha256(readFileSync(path))]));
+  const before = config.unitOnly ? config.dependencies : dependencyManifest();
+  assert.deepEqual(before, config.dependencies, 'telemetry dependency changed before runtime import');
   const load = UNIT?.importModule ?? (url => import(url));
   const module = await load(pathToFileURL(config.modulePath).href);
   assert.equal(typeof module.runTelemetryChecks, 'function', 'installed telemetry module export required');
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  let primaryError = null;
   try {
     const page = await context.newPage();
     const result = await module.runTelemetryChecks({ page, context, baseURL,
       serviceName: config.input.serviceName, runId: config.input.runId, outputDir: resolve(outputDir, 'telemetry'), fixtures: config.input.fixtures });
+    const after = config.unitOnly ? config.dependencies : dependencyManifest();
+    assert.deepEqual(after, before, 'telemetry dependency changed during runtime stage');
     const readyReportOracle = validateTelemetryResult(result);
     const receipt = { status: 'passed_assertions', imported_source: config.modulePath, imported_sha256: config.moduleHash,
+      dependency_manifest_before: before, dependency_manifest_after: after,
       evidence_class: config.unitOnly ? 'UNIT_ONLY_not_runtime' : 'joint_runtime_source_receipt_pending_final_drain',
       helper_source: fileURLToPath(import.meta.url), helper_sha256: sha256(readFileSync(fileURLToPath(import.meta.url))),
       app_pin: APP_PIN, app_base_pin: APP_BASE_PIN, harness_path: resolve(harnessPath),
@@ -220,7 +233,30 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
       writeFileSync(resolve(outputDir, 'telemetry/telemetry-browser-result.json'), JSON.stringify(result, null, 2));
       receipt.additional_history = result.additional_history;
     } };
-  } finally { await context.close(); }
+  } catch (error) { primaryError = error; throw error; }
+  finally {
+    const cleanupErrors = [];
+    try { await context.close(); } catch (error) { cleanupErrors.push(error); }
+    let after = null;
+    try {
+      after = config.unitOnly ? config.dependencies : dependencyManifest();
+      assert.deepEqual(after, before, 'telemetry dependency changed before context drain completed');
+    } catch (error) { cleanupErrors.push(error); }
+    try {
+      writeFileSync(resolve(outputDir, 'joint-telemetry-dependency-manifest.json'), JSON.stringify({
+        evidence_class: config.unitOnly ? 'UNIT_ONLY_not_runtime' : 'runtime_dependency_bytes_not_acceptance',
+        before, after, primary_failure: primaryError ? String(primaryError.message).slice(0, 1024) : null,
+        cleanup_failures: cleanupErrors.map(error => String(error.message).slice(0, 1024)),
+      }, null, 2));
+    } catch (error) { cleanupErrors.push(error); }
+    if (cleanupErrors.length) {
+      if (primaryError) {
+        primaryError.joint_cleanup_failures = cleanupErrors.map(error => String(error.message).slice(0, 1024));
+        throw primaryError;
+      }
+      throw cleanupErrors[0];
+    }
+  }
 }
 
 export const UNIT_ONLY = UNIT_LABEL;
