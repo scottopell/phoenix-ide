@@ -1074,7 +1074,7 @@ def scenario_coordinator_home(_base_url: str) -> None:
             coordinator = response.json()['conversation']
             assert coordinator['cwd'] == cwd
             conv_id = coordinator['id']
-            _send_chat_and_stream(base_url, conv_id, f"[[coordinator_home_bash:{scope}]]", SCENARIO_TIMEOUT_SECONDS)
+            _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
             _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' for m in messages), 'Coordinator home Bash completed', timeout=SCENARIO_TIMEOUT_SECONDS)
             final = _get_conv(base_url, conv_id)
             results = [m.get('content', {}) for m in final['messages'] if m.get('message_type') == 'tool']
@@ -1120,6 +1120,9 @@ def scenario_coordinator_home(_base_url: str) -> None:
             read = httpx.get(f"{base_url}/api/files/read", params={'path': str(Path(cwd) / 'e2e-home-evidence.txt')}, timeout=10)
             read.raise_for_status()
             assert read.json()['content'] == 'coordinator-home-proof'
+            before = len(_get_conv(base_url, conv_id)['messages'])
+            _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
+            _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' and m.get('content', {}).get('is_error') is False for m in messages[before:]), 'restarted successor rediscovers owned scope from system context', timeout=SCENARIO_TIMEOUT_SECONDS)
             assert _get_conv(base_url, worker['id'])['conversation']['cwd'] == worker['cwd']
             closed = httpx.post(f"{base_url}/api/conversations/{worker['id']}/archive", timeout=10)
             closed.raise_for_status()

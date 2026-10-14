@@ -175,6 +175,21 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
         .nth(1)
         .and_then(|s| s.split("]]").next())
     {
+        let scope = if scope == "discover" {
+            request
+                .system
+                .iter()
+                .find_map(|block| {
+                    block
+                        .text
+                        .split("Authoritative local Coordinator home: active work_scope_id=")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                })
+                .unwrap_or("missing-home-context")
+        } else {
+            scope
+        };
         return Some(Scenario::CoordinatorHomeBash {
             scope: scope.to_string(),
         });
@@ -1041,6 +1056,18 @@ mod tests {
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
+    }
+
+    #[test]
+    fn coordinator_home_tool_fixture_discovers_only_system_owned_scope() {
+        let mut request = user_req("[[coordinator_home_bash:discover]]");
+        assert!(
+            matches!(parse_scenario(&request), Some(Scenario::CoordinatorHomeBash { scope }) if scope == "missing-home-context")
+        );
+        request.system.push(crate::types::SystemContent::new("Authoritative local Coordinator home: active work_scope_id=owned-id ; server directory=/home"));
+        assert!(
+            matches!(parse_scenario(&request), Some(Scenario::CoordinatorHomeBash { scope }) if scope == "owned-id")
+        );
     }
 
     #[test]

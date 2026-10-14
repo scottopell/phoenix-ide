@@ -3348,7 +3348,11 @@ mod tests {
         let first = super::attributed_sender_with_cache(&db, &origin, &mut cache)
             .await
             .unwrap();
-        db.delete_conversation(&coordinator.id).await.unwrap();
+        db.pool().close().await;
+        assert!(db
+            .product_conversation_kind(&coordinator.product_conversation_id)
+            .await
+            .is_err());
         let second = super::attributed_sender_with_cache(&db, &origin, &mut cache)
             .await
             .unwrap();
