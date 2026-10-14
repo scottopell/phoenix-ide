@@ -255,6 +255,7 @@ function makeMessage(sequence_id: number, message_type: Message['message_type'] 
     ? { tool_use_id: `tool-${sequence_id}`, content: 'tool result', is_error: false }
     : { text: `message ${sequence_id}` };
   return {
+    event_presentation: null,
     message_id: `msg-${sequence_id}`,
     sequence_id,
     message_type,

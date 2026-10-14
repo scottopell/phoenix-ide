@@ -106,7 +106,7 @@ let latestRow: string;
 const commits: Array<Array<{ key: string; kind: string; text: string }>> = [];
 
 function message(id: string, row: string, sequenceId: number, type: 'user' | 'agent', text: string): Message {
-  return { message_id: id, conversation_id: row, sequence_id: sequenceId, message_type: type,
+  return { event_presentation: null, message_id: id, conversation_id: row, sequence_id: sequenceId, message_type: type,
     content: type === 'agent' ? [{ type: 'text', text }] : { text }, created_at: '2026-01-01T00:00:00Z' };
 }
 function seed(row: string) {

@@ -20,6 +20,7 @@ describe('ConversationNav input provenance', () => {
   it('keeps the latest real prompt navigable across event bursts and reload', () => {
     const units: HistoricalUnit[] = ['human', 'event-1', 'event-2'].map((id, index) => ({
       kind: 'user', key: id, message: {
+        event_presentation: null,
         message_id: id, conversation_id: 'continued-transcript', sequence_id: index + 1,
         message_type: 'user', content: { text: index === 0 ? 'Conversation event quoted by a human' : 'Watch notification' },
         created_at: '', origin: index === 0 ? { kind: 'user_api' } : { kind: 'subscription_event', event_id: id },

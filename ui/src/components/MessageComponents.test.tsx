@@ -84,6 +84,7 @@ describe('Global coordinator tool results', () => {
         <ToolUseBlock
           block={{ type: 'tool_use', id: 'bash-owner', name: 'bash', input: { cmd: 'pwd', wait_seconds: 1 } }}
           result={{
+            event_presentation: null,
             message_id: 'result-owner', sequence_id: 2, conversation_id: 'coordinator', message_type: 'tool', created_at: new Date().toISOString(),
             content: { tool_use_id: 'bash-owner', result: JSON.stringify({ command: 'pwd', output: '/repo', status: 'completed' }) },
             display_data: { coordinator_environment: {
@@ -164,6 +165,7 @@ afterEach(() => {
 
 function agentMessage(messageId: string, blocks: unknown[], sequenceId = 1): Message {
   return {
+    event_presentation: null,
     message_id: messageId,
     sequence_id: sequenceId,
     conversation_id: 'agent-1',
@@ -176,6 +178,7 @@ function agentMessage(messageId: string, blocks: unknown[], sequenceId = 1): Mes
 
 function toolMessage(toolUseId: string, content: string, sequenceId = 2, displayData?: Record<string, unknown>): Message {
   return {
+    event_presentation: null,
     message_id: `tool-${toolUseId}`,
     sequence_id: sequenceId,
     conversation_id: 'agent-1',
@@ -188,6 +191,7 @@ function toolMessage(toolUseId: string, content: string, sequenceId = 2, display
 
 function systemMessage(messageId: string, text: string, sequenceId = 2): Message {
   return {
+    event_presentation: null,
     message_id: messageId,
     sequence_id: sequenceId,
     conversation_id: 'agent-1',
@@ -200,6 +204,7 @@ function systemMessage(messageId: string, text: string, sequenceId = 2): Message
 
 function userMessage(messageId: string, text: string, options: { sequenceId?: number; isMeta?: boolean; displayData?: Record<string, unknown> | null; origin?: InputOrigin } = {}): Message {
   return {
+    event_presentation: null,
     message_id: messageId,
     sequence_id: options.sequenceId ?? 2,
     conversation_id: 'agent-1',
@@ -1157,6 +1162,7 @@ describe('inline tool timers', () => {
     const completed = toolMessage('tool-ok', 'done', 2);
     completed.display_data = { duration_ms: 800 };
     const failed: Message = {
+      event_presentation: null,
       message_id: 'tool-tool-fail',
       sequence_id: 3,
       conversation_id: 'agent-1',
@@ -1198,6 +1204,7 @@ describe('message copy affordances', () => {
     render(
       <UserMessage
         message={{
+          event_presentation: null,
           message_id: 'user-copy',
           origin: { kind: 'user_api' },
           sequence_id: 1,
@@ -1221,6 +1228,7 @@ describe('message copy affordances', () => {
     const { container } = render(
       <UserMessage
         message={{
+          event_presentation: null,
           message_id: 'user-layout',
           sequence_id: 1,
           conversation_id: 'agent-1',
@@ -1270,6 +1278,7 @@ describe('message copy affordances', () => {
       <MemoryRouter>
         <UserMessage
           message={{
+            event_presentation: null,
             message_id: 'user-attachment-only',
             sequence_id: 1,
             conversation_id: 'agent-1',
@@ -1590,6 +1599,7 @@ describe('skill command rendering', () => {
     render(
       <UserMessage
         message={{
+          event_presentation: null,
           message_id: 'user-skill',
           sequence_id: 1,
           conversation_id: 'agent-1',
@@ -3139,6 +3149,7 @@ describe('SubAgentStatus inline activity', () => {
       FakeEventSource.instances[0]!.emit('message', {
         sequence_id: 101,
         message: {
+          event_presentation: null,
           message_id: 'child-live-message',
           origin: { kind: 'unknown_historical' },
           conversation_id: childConversation.id,
@@ -3436,6 +3447,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 
   function forkToolResult(proposalId: string): Message {
     return {
+      event_presentation: null,
       message_id: 'tool-fork',
       sequence_id: 2,
       conversation_id: 'agent-1',

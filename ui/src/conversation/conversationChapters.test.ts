@@ -30,6 +30,7 @@ function userUnit(id: string, text: string, seq = 1): HistoricalUnit {
     kind: 'user',
     key: id,
     message: {
+      event_presentation: null,
       message_id: id,
       sequence_id: seq,
       conversation_id: 'c1',
@@ -45,6 +46,7 @@ function agentTurnUnit(id: string, blocks: ContentBlock[], seq = 2): HistoricalU
     kind: 'agent_turn',
     key: id,
     agent: {
+      event_presentation: null,
       message_id: id,
       sequence_id: seq,
       conversation_id: 'c1',
@@ -62,6 +64,7 @@ function skillUnit(id: string): HistoricalUnit {
     kind: 'skill',
     key: id,
     message: {
+      event_presentation: null,
       message_id: id,
       sequence_id: 0,
       conversation_id: 'c1',
@@ -77,6 +80,7 @@ function systemUnit(id: string): HistoricalUnit {
     kind: 'system',
     key: id,
     message: {
+      event_presentation: null,
       message_id: id,
       sequence_id: 0,
       conversation_id: 'c1',
@@ -245,6 +249,7 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
 
   function userMsg(id: string, text: string, seq: number): Message {
     return {
+      event_presentation: null,
       message_id: id,
       sequence_id: seq,
       conversation_id: 'c1',
@@ -255,6 +260,7 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
   }
   function agentMsg(id: string, blocks: ContentBlock[], seq: number): Message {
     return {
+      event_presentation: null,
       message_id: id,
       sequence_id: seq,
       conversation_id: 'c1',
@@ -265,6 +271,7 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
   }
   function toolMsg(id: string, toolUseId: string): Message {
     return {
+      event_presentation: null,
       message_id: id,
       sequence_id: 0,
       conversation_id: 'c1',

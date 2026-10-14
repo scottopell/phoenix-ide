@@ -231,6 +231,7 @@ describe('parseEvent', () => {
 
   describe('message schema', () => {
     const goodMsg = {
+      event_presentation: null,
       message_id: 'msg-1',
       sequence_id: 5,
       conversation_id: 'conv-1',
