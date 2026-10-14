@@ -2102,6 +2102,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_bash_executes_owned_home_with_zero_ordinary_conversations() {
+        let (tool, context, db, fixture) = tool_and_context().await;
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        let ordinary: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_work_scopes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(ordinary, 0);
+        let output = tool.run(json!({"op":"run", "cmd":"pwd; printf kept > evidence.txt", "work_scope_id":scope.work_scope_id.as_str(), "wait_seconds":10}), context).await;
+        assert!(output.is_success(), "{}", output.output());
+        assert!(output.output().contains(home.to_str().unwrap()));
+        assert_eq!(
+            std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn coordinator_bash_rejects_replaced_home_before_spawn() {
+        let (tool, context, db, fixture) = tool_and_context().await;
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        std::fs::remove_dir(&home).unwrap();
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &home).unwrap();
+        let registry = context.bash_handle_registry().clone();
+        let output = tool.run(json!({"op":"run", "cmd":"touch unauthorized", "work_scope_id":scope.work_scope_id.as_str()}), context).await;
+        assert!(!output.is_success());
+        assert!(!outside.join("unauthorized").exists());
+        assert!(registry.snapshot_live_pgids().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn coordinator_bash_rejects_unknown_work_scope_before_process_dispatch() {
         let (tool, context, db, fixture_dir) = tool_and_context().await;
         let registry = context.bash_handle_registry().clone();

@@ -111,7 +111,7 @@ mod tests {
 
     fn between<'a>(sql: &'a str, start: &str, end: &str) -> &'a str {
         let offset = sql.find(start).unwrap();
-        sql[offset..].split_once(end).unwrap().0
+        sql.get(offset..).unwrap().split_once(end).unwrap().0
     }
 
     async fn prior_schema() -> SqlitePool {

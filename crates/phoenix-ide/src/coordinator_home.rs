@@ -117,6 +117,38 @@ mod tests {
         assert!(!Path::new(cwd).exists());
     }
 
+    #[tokio::test]
+    async fn existing_coordinator_and_regular_home_files_are_reconciled_without_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = PhoenixRuntimeEnvironment::with_root(temp.path());
+        std::fs::create_dir_all(env.data_dir().join("coordinator")).unwrap();
+        std::fs::write(
+            env.data_dir().join("coordinator/retained.txt"),
+            "historical",
+        )
+        .unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let before = db.get_or_create_coordinator("mock").await.unwrap();
+        let scope = initialize(&db, &env).await.unwrap();
+        let after = db.get_or_create_coordinator("mock").await.unwrap();
+        assert_eq!(before.id, after.id);
+        assert_eq!(
+            after.attached_work_scope_id,
+            Some(scope.work_scope_id.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.data_dir().join("coordinator/retained.txt")).unwrap(),
+            "historical"
+        );
+        let other = tempfile::tempdir().unwrap();
+        assert!(
+            initialize(&db, &PhoenixRuntimeEnvironment::with_root(other.path()))
+                .await
+                .is_err()
+        );
+        assert_eq!(db.coordinator_work_scope().await.unwrap().unwrap(), scope);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_symlink_and_preserves_existing_files() {

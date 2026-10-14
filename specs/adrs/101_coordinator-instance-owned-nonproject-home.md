@@ -1,4 +1,4 @@
-# ADR-144: The Coordinator owns a local non-project home through an explicit WorkScope
+# ADR-101: The Coordinator owns a local non-project home through an explicit WorkScope
 
 - **Status:** Accepted
 - **Date:** 2026-10-14

@@ -7,7 +7,7 @@ was chosen; they are authoritative history, not a live behavioral contract.
 The live behavioral contract remains `requirements.md` plus `.allium` where an
 Allium spec exists. Status and verification coverage live in `executive.md`.
 
-The local Coordinator home decision is [ADR-144](144_coordinator-instance-owned-nonproject-home.md), affecting REQ-GR-006/007/013/016–018.
+The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-nonproject-home.md), affecting REQ-GR-006/007/013/016–018.
 
 ## Quick reference
 
@@ -117,6 +117,7 @@ The local Coordinator home decision is [ADR-144](144_coordinator-instance-owned-
 | [099](099_bounded-markdown-disclosures.md) | Recognize bounded Markdown disclosures within native parsing contexts | Accepted | REQ-CONV-025; REQ-CONV-002/019 |
 
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
+| [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
 
 ## For agents: which decisions bind your task
 
