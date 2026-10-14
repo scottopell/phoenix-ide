@@ -3,6 +3,22 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { StrictMode, useEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
+import { ProductConversationAliasRedirect } from '../App';
+import { FocusScopeProvider } from '../hooks/useFocusScope';
+import { transcriptPositioningCommandKey, type TranscriptPositioningCompletion, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
+const actualHistory = vi.hoisted(() => ({ enabled: false, handled: vi.fn() }));
+const historyResizeObservers: Array<{ callback: ResizeObserverCallback; elements: Set<Element> }> = [];
+function observeHistoryGeometry() {
+  act(() => {
+    for (const observer of historyResizeObservers) observer.callback(
+      [...observer.elements].map(target => ({ target, contentRect: target.getBoundingClientRect() }) as ResizeObserverEntry),
+      {} as ResizeObserver,
+    );
+  });
+}
+function currentPositioning(): TranscriptPositioningInput {
+  return conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning as TranscriptPositioningInput;
+}
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 import type { Conversation, ConversationState } from '../api';
@@ -28,6 +44,13 @@ import {
   notifyProductConversationSnapshotChanged,
   notifyProductConversationsReconciled,
 } from '../notifications';
+
+vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
+  const actual = await importOriginal<typeof import('../hooks/conversationViewTelemetry')>();
+  return { ...actual, ViewJourneyReporter: class extends actual.ViewJourneyReporter {
+    constructor() { super({ sampleRate: 1, send: async () => new Response(null, { status: 204 }) }); }
+  } };
+});
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
@@ -83,9 +106,18 @@ vi.mock('../components/MessageViewer', () => ({
   },
 }));
 
-vi.mock('../components/ConversationNavStack', () => ({
+vi.mock('../components/ConversationNavStack', async () => {
+  const actual = await vi.importActual<typeof import('../components/ConversationNavStack')>('../components/ConversationNavStack');
+  return {
   ConversationNavStack: (props: Record<string, unknown>) => {
     conversationNavStackSpy(props);
+    if (actualHistory.enabled) {
+      const typed = props as React.ComponentProps<typeof actual.ConversationNavStack>;
+      return <FocusScopeProvider><actual.ConversationNavStack {...typed} onHistoryScrollCommandHandled={(...args) => {
+        actualHistory.handled(...args);
+        typed.onHistoryScrollCommandHandled?.(...args);
+      }} /></FocusScopeProvider>;
+    }
     const messages = Array.isArray(props['messages']) ? props['messages'] as Array<{
       message_id: string;
       message_type: string;
@@ -101,11 +133,12 @@ vi.mock('../components/ConversationNavStack', () => ({
         <button onClick={() => (props['onLoadOlderMessages'] as ((basis?: unknown) => void) | undefined)?.({ kind: 'reader_anchor', messageId: 'm-3', viewportStartOffset: 17 })}>
           load older with anchor
         </button>
-        <button onClick={() => (props['onHistoryScrollCommandHandled'] as ((token: number, result: string, view: unknown) => void) | undefined)?.(
-          ((props['transcriptPositioning'] as { command?: { token?: number } } | undefined)?.command?.token ?? 0),
-          'applied',
-          {},
-        )}>
+        <button onClick={() => {
+          const input = props['transcriptPositioning'] as TranscriptPositioningInput;
+          if (input.kind === 'positioning') (props['onHistoryScrollCommandHandled'] as ((completion: TranscriptPositioningCompletion) => void) | undefined)?.({
+            commandKey: transcriptPositioningCommandKey(input.command), result: 'applied',
+          });
+        }}>
           complete positioning
         </button>
         <div data-testid="message-count">{messages.length}</div>
@@ -115,7 +148,8 @@ vi.mock('../components/ConversationNavStack', () => ({
       </div>
     );
   },
-}));
+};
+});
 
 vi.mock('./ConversationPage', () => ({
   EmbeddedConversationPage: (props: Record<string, unknown>) => {
@@ -212,6 +246,7 @@ vi.mock('../api', async () => {
       getProductConversationHistorySnapshot: vi.fn(),
       getProductConversationSnapshot: vi.fn(),
       getCoordinatorHistory: vi.fn(),
+      resolveCoordinatorRoute: vi.fn(),
       getProductConversationAutomaticContinuation: vi.fn(),
       updateProductConversationAutomaticContinuation: vi.fn(),
       reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
@@ -377,12 +412,14 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
     <ConversationContext.Provider value={conversationStore}>
     <ConversationReadinessProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
+        {actualHistory.enabled && <style>{'[hidden] { display: none; }'}</style>}
         <ViewerSlotProvider browserSessionActive={false}>
           <ChainProvider>
             <FileExplorerProvider>
             {withRouteSwitch && <ProductRouteSwitch />}
             <HistoryRouteControls />
             <Routes>
+              <Route path="/c/:slug" element={<ProductConversationAliasRedirect reference="pc-1" />} />
               <Route path="/global/:slug" element={<ProductConversationPage productId="row-1" globalShell={{ composerQuickAction: undefined, stateBarExtension: undefined }} />} />
               <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
             </Routes>
@@ -440,6 +477,8 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
 
 beforeEach(() => {
   conversationStore = new ConversationStore();
+  actualHistory.enabled = false;
+  historyResizeObservers.length = 0;
   vi.clearAllMocks();
   localStorage.clear();
   conversationNavStackSpy.mockClear();
@@ -456,6 +495,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 async function waitForPageReady() {
@@ -463,6 +503,93 @@ async function waitForPageReady() {
 }
 
 describe('ProductConversationPage', () => {
+  it.each(['applied', 'superseded'] as const)('keeps a held hidden alias jump when an earlier page arrives before completion (%s)', async (terminal) => {
+    const { api } = await import('../api');
+    actualHistory.enabled = true;
+    vi.stubGlobal('ResizeObserver', class {
+      elements = new Set<Element>();
+      constructor(readonly callback: ResizeObserverCallback) { historyResizeObservers.push(this); }
+      observe(element: Element) { this.elements.add(element); }
+      unobserve(element: Element) { this.elements.delete(element); }
+      disconnect() { this.elements.clear(); }
+    });
+    const nativeTops = new WeakMap<HTMLElement, number>();
+    vi.spyOn(HTMLElement.prototype, 'scrollTop', 'get').mockImplementation(function (this: HTMLElement) { return nativeTops.get(this) ?? 0; });
+    vi.spyOn(HTMLElement.prototype, 'scrollTop', 'set').mockImplementation(function (this: HTMLElement, top: number) {
+      if (!this.closest('[hidden]')) nativeTops.set(this, top);
+    });
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(100);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return { top: 0, bottom: 20, height: this.id === 'messages' ? 100 : 20, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON() {} };
+    });
+    let resolveOlder!: (page: ProductConversationSnapshotView) => void;
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot())
+      .mockReturnValueOnce(new Promise(resolve => { resolveOlder = resolve; }));
+    vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: null });
+    const aliasSnapshot = makeSnapshot({ canonical_route: '/c/pc-1' });
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({ ...aliasSnapshot,
+      segments: aliasSnapshot.segments.map(segment => ({ ...segment, handoff: null })),
+    });
+    renderPage('/c/pc-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.onLoadOlderMessages).toBeTypeOf('function'));
+    // Start acquisition with a reader viewport; then navigation takes ownership.
+    await act(async () => {
+      const load = conversationNavStackSpy.mock.lastCall?.[0]?.onLoadOlderMessages as (basis: unknown) => Promise<void>;
+      void load({ kind: 'reader_viewport' });
+    });
+    const aliasWrapper = document.querySelector('.product-conversation-page')!.parentElement!;
+    await waitFor(() => expect(aliasWrapper.hidden).toBe(false));
+    aliasWrapper.hidden = true;
+    fireEvent.click(screen.getByRole('button', { name: 'jump latest message', hidden: true }));
+    const oldInput = currentPositioning();
+    expect(oldInput).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-3' } });
+    expect(actualHistory.handled).not.toHaveBeenCalled();
+    await act(async () => resolveOlder(makeSnapshot({ before: null, has_older: false,
+      segments: [{ segment_ordinal: 0, transcript_row_id: 'older', slug: 'older', title: 'Older', messages: [makeMessage('old-message', 1, 'older')], handoff: null }],
+    })));
+    const replacement = currentPositioning();
+    expect(replacement).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-3', view: { generation: 1 } } });
+    if (oldInput.kind !== 'positioning' || replacement.kind !== 'positioning') throw new Error('expected owned jump commands');
+    expect(replacement.command.token).toBe(oldInput.command.token);
+    expect(transcriptPositioningCommandKey(replacement.command)).not.toBe(transcriptPositioningCommandKey(oldInput.command));
+    if (terminal === 'superseded') {
+      fireEvent.wheel(document.getElementById('messages')!, { deltaY: 10 });
+      expect(currentPositioning().kind).toBe('idle');
+    }
+    aliasWrapper.hidden = false;
+    observeHistoryGeometry();
+    observeHistoryGeometry();
+    await waitFor(() => expect(currentPositioning().kind).toBe('idle'));
+    expect(actualHistory.handled.mock.calls).toEqual([
+      [{ commandKey: transcriptPositioningCommandKey(oldInput.command), result: 'superseded' }],
+      [{ commandKey: transcriptPositioningCommandKey(replacement.command), result: terminal }],
+    ]);
+    if (terminal === 'applied') expect(document.getElementById('message-m-3')).not.toBeNull();
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/c/pc-1#message-m-3');
+  });
+
+  it('acknowledges the exact current missing target without accepting another semantic command', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot({ before: null, has_older: false }));
+    renderPage('/product-conversations/pc-1#message-m-3');
+    await waitForPageReady();
+    const input = currentPositioning();
+    if (input.kind !== 'positioning' || input.command.kind !== 'jump_to_message') throw new Error('expected jump');
+    const finish = conversationNavStackSpy.mock.lastCall?.[0]?.onHistoryScrollCommandHandled as (completion: TranscriptPositioningCompletion) => void;
+    for (const other of [
+      { ...input.command, targetMessageId: 'm-1' },
+      { ...input.command, requestToken: 99 },
+      { ...input.command, view: { ...input.command.view, transcriptGeneration: 99 } },
+    ]) {
+      act(() => finish({ commandKey: transcriptPositioningCommandKey(other), result: 'superseded' }));
+      expect(currentPositioning()).toEqual(input);
+    }
+    act(() => finish({ commandKey: transcriptPositioningCommandKey(input.command), result: 'target_missing' }));
+    expect(currentPositioning().kind).toBe('idle');
+    fireEvent.click(screen.getByRole('button', { name: 'clear message hash' }));
+    expect(currentPositioning().kind).toBe('idle');
+  });
+
   it('uses aggregate Global history without ordinary lifecycle and keeps newest composer separate from pinned evidence', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })));
@@ -501,6 +628,21 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(true));
     expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+  });
+
+  it('keeps a completed navigation idle after a subsequent reader-anchor restoration finishes', async () => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot();
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce({ ...initial, before: null, has_older: false });
+    renderPage('/product-conversations/pc-1#message-m-3');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    expect(currentPositioning().kind).toBe('idle');
+    fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
+    await waitFor(() => expect(currentPositioning()).toMatchObject({ command: { kind: 'restore_after_prefix_expansion' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    expect(currentPositioning().kind).toBe('idle');
   });
 
   it('does not apply an old prefix anchor after the reader explicitly navigates to another message', async () => {
@@ -1051,7 +1193,9 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot()));
     renderPage('/global/row-2');
     await waitForPageReady();
-    expect(api.getCoordinatorHistory).toHaveBeenCalledWith('row-1', { message_limit: 100 });
+    expect(api.getCoordinatorHistory).toHaveBeenCalledWith('row-1', {
+      message_limit: 100, open_id: expect.any(String), onTelemetry: expect.any(Function),
+    });
     expect(api.reportProductConversationOpen).not.toHaveBeenCalled();
   });
 

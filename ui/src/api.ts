@@ -1,3 +1,4 @@
+import { observeViewResponse, type ViewResponseObserver } from './hooks/conversationViewResponse';
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
@@ -1851,32 +1852,35 @@ export const api = {
 
   async getCoordinatorHistory(
     reference: string,
-    options?: { message_limit?: number; before?: string | null },
+    options?: { message_limit?: number; before?: string | null; open_id?: string; onTelemetry?: ViewResponseObserver },
   ): Promise<CoordinatorConversationSnapshotView> {
     const params = new URLSearchParams();
     if (options?.message_limit !== undefined) params.set('message_limit', String(options.message_limit));
     if (options?.before) params.set('before', options.before);
+    if (options?.open_id && !options.before) params.set('open_id', options.open_id);
     const response = await fetch(`/api/global/coordinator/history/${encodeURIComponent(reference)}?${params}`);
+    observeViewResponse(response, options?.onTelemetry);
     if (!response.ok) throw new ApiResponseError('Unable to read Global conversation history', response.status);
     return response.json();
   },
 
   async getProductConversationHistorySnapshot(
     productConversationId: string,
-    options?: { message_limit?: number; before?: string | null; open_id?: string },
+    options?: { message_limit?: number; before?: string | null; open_id?: string; onTelemetry?: ViewResponseObserver },
   ): Promise<ProductConversationHistorySnapshotView> {
     const params = new URLSearchParams({ boundary_representation: 'original_messages' });
     if (options?.message_limit !== undefined) params.set('message_limit', String(options.message_limit));
     if (options?.before) params.set('before', options.before);
     if (options?.open_id) params.set('open_id', options.open_id);
     const response = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}?${params}`);
+    observeViewResponse(response, options?.onTelemetry);
     if (!response.ok) throw new ApiResponseError('Unable to read product conversation history', response.status);
     return response.json();
   },
 
   async getProductConversationSnapshot(
     productConversationId: string,
-    options?: { message_limit?: number; before?: string | null; open_id?: string },
+    options?: { message_limit?: number; before?: string | null; open_id?: string; onTelemetry?: ViewResponseObserver },
   ): Promise<ProductConversationSnapshotViewType> {
     const params = new URLSearchParams();
     if (typeof options?.message_limit === 'number') {
@@ -1892,6 +1896,7 @@ export const api = {
     const resp = await fetch(
       `/api/product-conversations/${encodeURIComponent(productConversationId)}${query ? `?${query}` : ''}`,
     );
+    observeViewResponse(resp, options?.onTelemetry);
     if (!resp.ok) {
       const detail = resp.status === 404
         ? 'Conversation not found'

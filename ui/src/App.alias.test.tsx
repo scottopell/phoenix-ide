@@ -1,7 +1,7 @@
 import { Suspense, useState } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProductConversationAliasRedirect } from './App';
 import { api, ApiResponseError } from './api';
 
@@ -60,8 +60,29 @@ function renderAlias(reference: string, entry = `/c/${reference}`) {
 describe('ProductConversationAliasRedirect', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
+    vi.spyOn(Math, 'random').mockReturnValue(0);
     vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: null });
   vi.spyOn(api, 'getConversation').mockImplementation(async (id) => ({ conversation: { id } } as never));
+  });
+
+  afterEach(async () => {
+    cleanup();
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('reports a failed admission before any product page mounts without leaking the exact pin', async () => {
+    renderAlias('private-reference', '/c/private-reference?source_transcript=private-pin&source_transcript=another-private-pin');
+    await screen.findByRole('alert');
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    const call = vi.mocked(fetch).mock.calls.find(([url]) => url === '/api/telemetry/conversation-view');
+    expect(call).toBeDefined();
+    const report = JSON.parse(call![1]!.body as string);
+    expect(report).toMatchObject({ route: 'ordinary', outcome: 'failed', marks: { meaningful_transcript: null, anchor_settled: null } });
+    expect(call![1]!.body).not.toMatch(/private-reference|private-pin|source_transcript/);
+    expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
   });
 
   it('routes a historical Global member before ordinary snapshot lookup and retains its anchor', async () => {
@@ -134,7 +155,7 @@ describe('ProductConversationAliasRedirect', () => {
     first.unmount();
     renderAlias('product-1', entry);
     await screen.findByTestId('product-page');
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('old-member', { message_limit: 1 });
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('old-member', expect.objectContaining({ message_limit: 1, open_id: expect.any(String), onTelemetry: expect.any(Function) }));
     expect(embeddedSpy).not.toHaveBeenCalled();
     expect(screen.getByTestId('location')).toHaveTextContent(entry);
   });

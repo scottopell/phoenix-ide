@@ -598,3 +598,43 @@ describe('directory-first resolution query encoding', () => {
     }
   });
 });
+
+describe('conversation-view response transport', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const open = 'a74e65c7-3bd0-43d5-87ed-1e2b3cfb7200';
+  const trace = '1234567890abcdef1234567890abcdef';
+  it.each(['ordinary', 'global', 'alias'] as const)('threads finite %s response correlation without changing data', async kind => {
+    const payload = { synthetic: 'private transcript body' };
+    const response = new Response(JSON.stringify(payload), { headers: { traceparent: `00-${trace}-1234567890abcdef-01`, 'content-length': '42' } });
+    const send = vi.fn().mockResolvedValue(response);
+    vi.stubGlobal('fetch', send);
+    const observer = vi.fn();
+    const options = { message_limit: 100, open_id: open, onTelemetry: observer };
+    const result = kind === 'ordinary' ? await api.getProductConversationHistorySnapshot('product', options)
+      : kind === 'global' ? await api.getCoordinatorHistory('root', options)
+        : await api.getProductConversationSnapshot('product', options);
+    expect(result).toEqual(payload);
+    expect(send.mock.calls[0]![0]).toContain(`open_id=${open}`);
+    expect(observer).toHaveBeenCalledExactlyOnceWith({ trace_id: trace, size_bucket: '0-10k' });
+    expect(JSON.stringify(observer.mock.calls)).not.toContain('private transcript body');
+  });
+  it('observes finite error metadata before throwing and contains observer failure', async () => {
+    const response = new Response('private failure', { status: 404, headers: { traceparent: `00-${trace}-1234567890abcdef-01` } });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
+    const observer = vi.fn();
+    await expect(api.getCoordinatorHistory('root', { open_id: open, onTelemetry: observer })).rejects.toMatchObject({ status: 404 });
+    expect(observer).toHaveBeenCalledExactlyOnceWith({ trace_id: trace, size_bucket: 'unknown' });
+    expect(response.bodyUsed).toBe(false);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}')));
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    await expect(api.getProductConversationSnapshot('product', { onTelemetry: () => { throw new Error('private observer'); } })).resolves.toEqual({});
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('private observer');
+    debug.mockRestore();
+  });
+  it('does not turn a Global older-page read into another correlated initial-open server span', async () => {
+    const send = vi.fn().mockResolvedValue(new Response('{}'));
+    vi.stubGlobal('fetch', send);
+    await api.getCoordinatorHistory('root', { before: 'opaque-cursor', open_id: open, onTelemetry: vi.fn() });
+    expect(send.mock.calls[0]![0]).not.toContain('open_id');
+  });
+});

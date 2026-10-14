@@ -4,6 +4,7 @@ import { api, type ActiveCoordinatorWatch, type LiveCoordinatorBashHandle } from
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
+import { useConversationViewJourney } from '../hooks/useConversationViewJourney';
 
 const ProductConversationPage = lazy(() =>
   import('./ProductConversationPage').then((module) => ({ default: module.ProductConversationPage })),
@@ -138,6 +139,7 @@ function GlobalLiveCommands({ onCount }: { onCount: (count: ActivityCount) => vo
 }
 
 export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
+  const journey = useConversationViewJourney('global');
   const navigate = useNavigate();
   const location = useLocation();
   const locationRef = useRef(location);
@@ -151,6 +153,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
   const [topologyRevision, setTopologyRevision] = useState(0);
+  useEffect(() => { if (error) journey.finish('failed'); }, [error, journey]);
   const [watchCount, setWatchCount] = useState<ActivityCount>(null);
   const [runningCount, setRunningCount] = useState<ActivityCount>(null);
   const [automaticContinuationStatus, setAutomaticContinuationStatus] = useState('…');
@@ -259,7 +262,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   };
 
   return (
-    <main className="coordinator-page">
+    <main className="coordinator-page" ref={journey.attach}>
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
@@ -268,7 +271,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
       <section className="coordinator-conversation" aria-label="Coordinator conversation" hidden={!!error || resolvedSourceSelectionKey !== sourceSelectionKey}>
         {resolvedCoordinatorId !== null ? fixtureData?.conversation ?? (
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
-            <ProductConversationPage productId={resolvedCoordinatorId ?? undefined} globalShell={{ composerQuickAction: COORDINATOR_QUICK_ACTION, stateBarExtension }} />
+            <ProductConversationPage journey={journey} productId={resolvedCoordinatorId ?? undefined} globalShell={{ composerQuickAction: COORDINATOR_QUICK_ACTION, stateBarExtension }} />
           </Suspense>
         ) : null}
       </section>

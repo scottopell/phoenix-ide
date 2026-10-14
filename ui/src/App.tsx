@@ -1,4 +1,6 @@
-import { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import { useConversationViewJourney } from './hooks/useConversationViewJourney';
+import { generateUUID } from './utils/uuid';
 import { BrowserRouter, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
@@ -60,8 +62,8 @@ const MobileConversationListFixturePage = import.meta.env.DEV
   : null;
 
 /** Route loading fallback — blank div sized to the viewport to avoid CLS. */
-function RouteFallback() {
-  return <div style={{ minHeight: '100vh' }} />;
+function RouteFallback({ viewRef }: { viewRef?: ((root: HTMLDivElement | null) => void) | undefined }) {
+  return <div ref={viewRef} style={{ minHeight: '100vh' }} />;
 }
 
 type AuthState =
@@ -119,6 +121,9 @@ function AppRoutes() {
 }
 
 export function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
+  const journey = useConversationViewJourney('ordinary');
+  const journeyRef = useRef(journey);
+  useLayoutEffect(() => { journeyRef.current = journey; }, [journey]);
   const navigate = useNavigate();
   const location = useLocation();
   const [fallbackSnapshot, setFallbackSnapshot] = useState<{
@@ -151,6 +156,15 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       return;
     }
     let cancelled = false;
+    const requestJourney = journeyRef.current;
+    const peek = (id: string) => {
+      const openId = generateUUID();
+      const observation = requestJourney.requestStarted(openId);
+      return api.getProductConversationSnapshot(id, {
+        message_limit: 1,
+        ...(observation ? { open_id: openId, onTelemetry: observation.response } : {}),
+      });
+    };
     api.resolveCoordinatorRoute(reference)
       .then(async ({ coordinator_id }) => {
         if (cancelled) return null;
@@ -162,13 +176,13 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
           if (!cancelled) navigate({ pathname: `/global/${pinned ?? reference}`, search: locationRef.current.search, hash: locationRef.current.hash }, { replace: true });
           return null;
         }
-        return api.getProductConversationSnapshot(reference, { message_limit: 1 });
+        return peek(reference);
       })
       .then(async (snapshot) => {
         if (!snapshot) return;
         if (!cancelled) {
           if (pinned !== undefined) {
-            const source = await api.getProductConversationSnapshot(pinned, { message_limit: 1 });
+            const source = await peek(pinned);
             if (source.product_conversation_id !== snapshot.product_conversation_id || source.requested_transcript_row_id !== pinned) {
               throw new Error('Transcript is not a member of this conversation');
             }
@@ -214,19 +228,23 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     return () => { cancelled = true; };
   }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken, selectionKey]);
 
+  useEffect(() => {
+    if (pinError || activeFallback) journey.finish('failed');
+  }, [journey, pinError, activeFallback]);
+
   if (resolvedProduct && !activeFallback) {
     return <>
-      {pinError && <main><div role="alert">{pinError}</div></main>}
-      <div hidden={!!pinError || validatedSelection !== selectionKey} style={{ height: '100%' }}>
-        <ProductConversationPage productId={resolvedProduct.id} />
+      {pinError && <main ref={journey.attach}><div role="alert">{pinError}</div></main>}
+      <div ref={journey.attach} hidden={!!pinError || validatedSelection !== selectionKey} style={{ height: '100%' }}>
+        <ProductConversationPage productId={resolvedProduct.id} journey={journey} />
       </div>
     </>;
   }
-  if (pinError) return <main><div role="alert">{pinError}</div></main>;
+  if (pinError) return <main ref={journey.attach}><div role="alert">{pinError}</div></main>;
 
   if (activeFallback) {
     return (
-      <main className="conversation-alias-fallback">
+      <main ref={journey.attach} className="conversation-alias-fallback">
         <div role="alert" className="conversation-alias-fallback__status">
           Conversation route unavailable.
           <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
@@ -243,7 +261,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       </main>
     );
   }
-  return <RouteFallback />;
+  return <RouteFallback viewRef={journey.attach} />;
 }
 
 function ConversationRouteRedirect() {

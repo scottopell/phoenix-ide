@@ -72,6 +72,7 @@ pub enum BoundaryRepresentation {
 pub struct CoordinatorHistoryQuery {
     pub before: Option<String>,
     pub message_limit: Option<usize>,
+    pub open_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -472,6 +473,23 @@ pub async fn get_coordinator_history(
     Path(reference): Path<String>,
     Query(query): Query<CoordinatorHistoryQuery>,
 ) -> Result<Json<CoordinatorConversationSnapshotView>, AppError> {
+    let span = if query.before.is_none() && query.open_id.is_some() {
+        tracing::info_span!(target: "phoenix_ide::otel", "coordinator.history_open",
+            "open.id" = query.open_id.as_ref().map(uuid::Uuid::to_string),
+            "product_conversation.id" = tracing::field::Empty)
+    } else {
+        tracing::Span::none()
+    };
+    get_coordinator_history_snapshot(state, reference, query)
+        .instrument(span)
+        .await
+}
+
+async fn get_coordinator_history_snapshot(
+    state: AppState,
+    reference: String,
+    query: CoordinatorHistoryQuery,
+) -> Result<Json<CoordinatorConversationSnapshotView>, AppError> {
     let limit = message_limit(query.message_limit)?;
     let cursor = query.before.as_deref().map(decode_cursor).transpose()?;
     let ceilings = cursor.as_ref().map(|cursor| {
@@ -502,6 +520,10 @@ pub async fn get_coordinator_history(
         .await
         .map_err(db_to_app)?;
     let aggregate = snapshot.aggregate;
+    tracing::Span::current().record(
+        "product_conversation.id",
+        aggregate.product_conversation.id().as_str(),
+    );
     if let Some(cursor) = &cursor {
         validate_cursor(&aggregate, cursor)?;
     }

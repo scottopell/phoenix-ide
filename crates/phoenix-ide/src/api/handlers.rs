@@ -251,6 +251,10 @@ pub fn create_router(state: AppState) -> Router {
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
         .route(
+            "/api/telemetry/conversation-view",
+            post(super::view_journey::report).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route(
             "/api/telemetry/conversation-open",
             post(report_conversation_open),
         )
