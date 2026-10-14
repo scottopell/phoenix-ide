@@ -326,6 +326,8 @@ mod tests {
             "selected destination's identity, authentication, current target, and lifecycle state"
         ));
         assert!(skill.contains("user-identified credential source"));
+        assert!(skill.contains("bound to that destination"));
+        assert!(skill.contains("never an inherited local credential for a nonlocal destination"));
         assert!(skill.contains("authenticated encryption for nonlocal transport"));
         assert!(skill.contains("Use local-only tools and cwd only for the local destination"));
         assert!(skill.contains("destination cwd provenance only when the operation consumes cwd"));
@@ -342,6 +344,11 @@ mod tests {
         );
         assert!(reference.contains("Transport grants no destination authority"));
         assert!(reference.contains("nonlocal credential hop requires authenticated encryption"));
+        assert!(reference.contains("credential source bound to the selected destination"));
+        assert!(reference.contains("per-request `PHOENIX_API_CREDENTIAL`"));
+        assert!(reference
+            .contains("never reuse an inherited `PHOENIX_PASSWORD` for a nonlocal destination"));
+        assert!(!reference.contains("'Authorization: Bearer ' \"$PHOENIX_PASSWORD\""));
         assert!(reference.contains("This creation recipe is local-only"));
         assert!(reference.contains("never send the local executor's `$PWD` as a remote cwd"));
         assert!(reference.contains("base64-of-the-local-workscope-origin"));
@@ -351,7 +358,7 @@ mod tests {
             "Remote Continue through the selected destination's existing API is independent of federated message steering"
         ));
         assert!(reference.contains("^https://"));
-        assert!(reference.contains("^http://(127\\.0\\.0\\.1|\\[::1\\])"));
+        assert!(reference.contains("^http://(localhost|127\\.0\\.0\\.1|\\[::1\\])"));
         assert!(!reference.contains("^https?://"));
         assert!(reference.contains(
             "operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged"

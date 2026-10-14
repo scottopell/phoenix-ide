@@ -221,6 +221,7 @@ rule PhoenixApiDestinationAuthority {
     ensures: action.destination_identity_is_authoritative = true
     ensures: action.local_work_scope_authorizes_execution_only = true
     ensures: action.destination_authentication_is_authoritative = true
+    ensures: action.destination_credential_is_bound_to_selected_destination = true
     ensures: action.destination_target_and_state_are_current = true
     ensures: action.destination_is_nonlocal = false or action.nonlocal_credential_hop_uses_authenticated_encryption = true
     ensures: action.consumes_destination_cwd = false or action.destination_cwd_is_authoritative = true

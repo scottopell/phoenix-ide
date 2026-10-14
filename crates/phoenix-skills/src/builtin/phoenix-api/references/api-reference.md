@@ -6,7 +6,7 @@ This authenticated reference is for the live Phoenix deployment the user named. 
 
 Every HTTP command must run through Global's Bash tool with an explicit active local `work_scope_id` admitted from authoritative Coordinator home context or WorkScope rows. That WorkScope authorizes local execution only. Separately establish the selected destination's identity, authentication, current `ProductConversation` or transcript, and lifecycle state from authoritative, user-authorized sources. Require destination cwd provenance only when the operation consumes cwd.
 
-Transport grants no destination authority. Use only a user-identified credential source for the selected destination. Keep credentials out of arguments, output, and files; any nonlocal credential hop requires authenticated encryption. Apply the operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged.
+Transport grants no destination authority. Use only a user-identified credential source bound to the selected destination; an inherited local credential is not valid for a nonlocal destination. Keep credentials out of arguments, output, and files; any nonlocal credential hop requires authenticated encryption. Apply the operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged.
 
 For the documented Bash recipes, Global interprets each response structurally and retains the request identity and exact intent. Treat payloads as data, not shell syntax. Do not install dependencies or substitute ad-hoc text parsing.
 
@@ -22,7 +22,7 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
    if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
    ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
    [[ "$ORIGIN" =~ ^https://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ||
-      "$ORIGIN" =~ ^http://(127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$ ]] || exit
+      "$ORIGIN" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$ ]] || exit
    CURL_TLS=(--globoff)
    if [[ -n "$CA_CERT_PATH_B64" ]]; then
      CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 "${B64_DEC[@]}") || exit
@@ -34,8 +34,8 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
    ```
 
    This public route returns only `auth_required` and `authenticated`. Repeat the same `ORIGIN_B64` decode in each later scoped Bash call; shell variables do not persist across calls. For private-CA HTTPS, `CA_CERT_PATH_B64` must encode a user-identified or authoritative readable CA certificate path for the selected destination. Browser trust is not sufficient for server-side curl. Do not disable TLS verification; stop if the CA path is unavailable. Repeat the same origin/CA initialization in each later scoped Bash call because shell variables do not persist.
-2. If auth is disabled, send no credential. If auth is required and this request is not authenticated, use only a credential already supplied or explicitly identified by the user for this deployment. A configured password is accepted as `Authorization: Bearer …`; a `phoenix-auth` cookie is an opaque session token, not the password.
-3. Keep secrets out of command arguments, tracing, files, logs, summaries, and tool output. With an already-populated `PHOENIX_PASSWORD`, stream the header through process substitution: `--header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD")`. Never print the variable or inspect databases/process environments to find a credential. Stop on `401` or `403`.
+2. If auth is disabled, send no credential. If auth is required and this request is not authenticated, use only a credential already supplied or explicitly identified by the user for this exact destination. Bind it to a per-request `PHOENIX_API_CREDENTIAL`; never reuse an inherited `PHOENIX_PASSWORD` for a nonlocal destination. Stop if the destination-bound credential is unavailable. A configured password is accepted as `Authorization: Bearer …`; a `phoenix-auth` cookie is an opaque session token, not the password.
+3. Keep secrets out of command arguments, tracing, files, logs, summaries, and tool output. With an already-populated `PHOENIX_API_CREDENTIAL`, stream the header through process substitution: `--header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_API_CREDENTIAL")`. Never print the variable or inspect databases/process environments to find a credential. Stop on `401` or `403`.
 4. Call authenticated `GET /api/models`. Its `models` array and `default` field are the live authority. Select an exact model `id`: preserve a user-selected ID when present, otherwise use `default`.
 5. Call authenticated `GET /api/settings/llm-language`. Its `language` is the default and `available` enumerates supported explicit values. Preserve an explicitly requested supported language on the first POST; use JSON `null` only when the user did not choose one. The selected model's `effort_capabilities` is one of `{"support":"unsupported"}`, `{"support":"unknown"}`, or `{"support":"supported","levels":[...],"native_default":...}`. Use JSON `null` for no override, or only a level listed for that exact model.
 
@@ -44,7 +44,7 @@ For authenticated raw reads, repeat the same origin/CA initialization and then u
 ```bash
 https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
   curl -q --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
-  --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
+  --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_API_CREDENTIAL") \
   -- "$ORIGIN/api/models"
 ```
 
@@ -104,7 +104,7 @@ INTENT_B64='base64-of-the-complete-exact-json-intent'
 if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
 ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
 [[ "$ORIGIN" =~ ^https://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ||
-   "$ORIGIN" =~ ^http://(127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$ ]] || exit
+   "$ORIGIN" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$ ]] || exit
 CURL_TLS=(--globoff)
 if [[ -n "$CA_CERT_PATH_B64" ]]; then
   CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 "${B64_DEC[@]}") || exit
@@ -115,7 +115,7 @@ printf '%s' "$INTENT_B64" | base64 "${B64_DEC[@]}" |
   https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
   curl -q --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
     --header 'Content-Type: application/json' \
-    --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
+    --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_API_CREDENTIAL") \
     --data-binary @- --write-out $'\ncreation_http_status=%{http_code}\n' \
     -- "$ORIGIN/api/product-conversations/new"
 ```
